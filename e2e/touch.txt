@@ -30,8 +30,12 @@ swipe "CI failed" 2 0
 wait 700
 shot g4-tap-open
 
-# Hold the help panel's header and drag it right: it re-places on drop.
-holdmove "help" 500 0
+# Hold the help panel's header and drag it right — mid-drag, the insertion
+# bar previews where it would land; the drop then lands exactly there.
+holdmove "help" 500 0 hold
+wait 400
+shot g5a-drag-preview
+drop
 wait 800
 shot g5-dragged
 quit

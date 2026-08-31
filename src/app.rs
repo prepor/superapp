@@ -23,6 +23,7 @@ use std::time::Instant;
 use makepad_widgets::*;
 // Touch types are not in the curated platform re-export list.
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
+use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
 use crate::core::{self, Dir, Kind, PanelId, Ws};
 use crate::data::{self, MailId, MailState};
@@ -716,6 +717,28 @@ struct State {
     toast: Option<(String, bool, Instant)>,
 }
 
+/// A field's content as one string plus the caret in chars — the shape the
+/// android IME editable mirrors (body lines joined with `\n`).
+fn field_text_caret(state: &State, pid: PanelId, fid: FieldId) -> Option<(String, usize)> {
+    let ui = state.ui.get(&pid)?;
+    Some(match fid {
+        FieldId::Filter => (ui.filter.text.clone(), ui.filter.caret),
+        FieldId::To => (ui.to.text.clone(), ui.to.caret),
+        FieldId::Subject => (ui.subject.text.clone(), ui.subject.caret),
+        FieldId::Body => {
+            let (r, c) = ui.caret;
+            let caret = ui
+                .body
+                .iter()
+                .take(r)
+                .map(|l| l.chars().count() + 1)
+                .sum::<usize>()
+                + c;
+            (ui.body.join("\n"), caret)
+        }
+    })
+}
+
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
 /// unfolded screen and 4×3 on the cover display (the ~600 dp compact/medium
 /// breakpoint — a fold/unfold resize crosses it). `--grid` overrides for
@@ -1333,8 +1356,23 @@ pub struct Stage {
     reported: bool,
     #[rust]
     ime_shown: bool,
+    /// The field the IME is currently shown for (config + seeding follow it).
+    #[rust]
+    ime_field: Option<(PanelId, FieldId)>,
+    /// Last `(text, caret)` pushed to the IME editable, to dedup syncs.
+    #[rust]
+    ime_sent: Option<(String, usize)>,
+    /// The IME is mid-composition: hold app→IME syncs, they would clobber it.
+    #[rust]
+    ime_composing: bool,
+    /// Soft-keyboard bottom occlusion (android), in points.
+    #[rust]
+    kb_h: f64,
     #[rust]
     touch: TouchNav,
+    /// The drop-preview insertion bar while a panel is dragged, strip coords.
+    #[rust]
+    drag_hint: Option<core::Rect>,
     /// Safe-area insets (cutouts, rounded corners): top, right, bottom, left.
     #[rust]
     insets: (f64, f64, f64, f64),
@@ -1431,13 +1469,42 @@ impl Stage {
                 s.ws.focus.is_some()
             }
         });
-        if want_ime != self.ime_shown {
+        let want_field = self.state.as_deref().and_then(|s| s.field);
+        if want_ime != self.ime_shown || (want_ime && self.ime_field != want_field) {
             self.ime_shown = want_ime;
+            self.ime_field = want_field;
+            self.ime_sent = None;
+            self.ime_composing = false;
             if want_ime {
                 cx.set_key_focus(self.area);
-                cx.show_text_ime(self.area, dvec2(0.0, 0.0));
+                cx.show_text_ime_with_config(
+                    self.area,
+                    rect(0.0, 0.0, 0.0, 0.0),
+                    TextInputConfig {
+                        is_multiline: matches!(want_field, Some((_, FieldId::Body))),
+                        ..Default::default()
+                    },
+                );
             } else {
+                // Also resets makepad's "user dismissed the keyboard" latch,
+                // without which the next show request is silently ignored.
                 cx.hide_text_ime();
+            }
+        }
+        // android's IME owns an editable mirroring the focused field; seed it
+        // on focus and after every app-side edit — except mid-composition,
+        // when a push would clobber what the keyboard is composing.
+        if cfg!(target_os = "android") && self.ime_shown && !self.ime_composing {
+            if let Some((text, caret)) = self
+                .state
+                .as_deref()
+                .and_then(|s| s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid)))
+            {
+                let sent = self.ime_sent.as_ref();
+                if sent.map(|(t, c)| (t.as_str(), *c)) != Some((text.as_str(), caret)) {
+                    self.ime_sent = Some((text.clone(), caret));
+                    cx.sync_ime_state(text, CharOffset(caret)..CharOffset(caret), None);
+                }
             }
         }
         if let Some(state) = self.state.as_deref_mut() {
@@ -1576,7 +1643,22 @@ impl Stage {
                     self.touch_stop(cx, 1, dvec2(a.x + dx, a.y));
                     self.touch_stop(cx, 2, dvec2(b.x + dx, b.y));
                 }
-                e2e::Step::HoldMove { label, dx, dy } => {
+                e2e::Step::Drop => {
+                    if let TouchMode::Drag { uid, .. } = self.touch.mode {
+                        let p = self
+                            .touch
+                            .pts
+                            .get(&uid)
+                            .map(|&(_, p)| p)
+                            .unwrap_or(self.origin);
+                        eprintln!("e2e: drop");
+                        self.touch_stop(cx, uid, p);
+                    } else {
+                        eprintln!("e2e: FAIL drop: nothing is being dragged");
+                        runner.failures += 1;
+                    }
+                }
+                e2e::Step::HoldMove { label, dx, dy, hold } => {
                     let needle = label.to_lowercase();
                     // Press the panel's header: only Focus hits carry one.
                     let c = self
@@ -1607,7 +1689,9 @@ impl Stage {
                                     let f = f64::from(i) / 8.0;
                                     self.touch_move(cx, 1, dvec2(c.x + dx * f, c.y + dy * f));
                                 }
-                                self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                                if !hold {
+                                    self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                                }
                             }
                         }
                         None => {
@@ -1877,6 +1961,60 @@ impl Stage {
         self.kick(cx);
     }
 
+    /// The android IME's authoritative field state (`full_state_sync`):
+    /// replace the focused field's text and caret wholesale. Composition is
+    /// tracked so app→IME syncs pause while the keyboard composes.
+    fn handle_ime_state(&mut self, cx: &mut Cx, fs: &FullTextState) {
+        let caret = fs.selection.end.0;
+        self.ime_composing = fs.composition.is_some();
+        self.ime_sent = Some((fs.text.clone(), caret));
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let Some((pid, fid)) = state.field else {
+            return;
+        };
+        let Some(ui) = state.ui.get_mut(&pid) else {
+            return;
+        };
+        match fid {
+            FieldId::Body => {
+                ui.body = fs.text.split('\n').map(str::to_string).collect();
+                if ui.body.is_empty() {
+                    ui.body.push(String::new());
+                }
+                let mut rem = caret;
+                let mut rc = (
+                    ui.body.len() - 1,
+                    ui.body.last().map(|l| l.chars().count()).unwrap_or(0),
+                );
+                for (i, line) in ui.body.iter().enumerate() {
+                    let n = line.chars().count();
+                    if rem <= n {
+                        rc = (i, rem);
+                        break;
+                    }
+                    rem -= n + 1;
+                }
+                ui.caret = rc;
+            }
+            _ => {
+                let f = match fid {
+                    FieldId::Filter => &mut ui.filter,
+                    FieldId::To => &mut ui.to,
+                    FieldId::Subject => &mut ui.subject,
+                    FieldId::Body => unreachable!(),
+                };
+                f.text = fs.text.clone();
+                f.caret = caret.min(f.text.chars().count());
+                if fid == FieldId::Filter {
+                    ui.sel = None;
+                }
+            }
+        }
+        self.kick(cx);
+    }
+
     /// Character input: field typing, or the focused panel's letter keys.
     fn handle_text(&mut self, cx: &mut Cx, input: &str) {
         let Some(state) = self.state.as_deref_mut() else {
@@ -2076,14 +2214,23 @@ impl Stage {
             }
             TouchMode::Drag { uid: u, pid, offset } if *u == uid => {
                 let (pid, off) = (*pid, *offset);
-                let cam_p = p - self.origin + off;
+                let local = p - self.origin;
+                let mut hint = None;
                 if let Some(state) = self.state.as_deref_mut() {
                     let cam = state.anim.camera().value();
                     if let Some(pa) = state.anim.panels.get_mut(&pid) {
-                        pa.x.retarget(cam_p.x + cam);
-                        pa.y.retarget(cam_p.y);
+                        pa.x.retarget(local.x + off.x + cam);
+                        pa.y.retarget(local.y + off.y);
                     }
+                    // The preview is judged by the finger, not the panel.
+                    let vp = state.vp();
+                    let opts = state.opts();
+                    hint = state
+                        .ws
+                        .drop_target(pid, local.x + cam, local.y, vp, opts)
+                        .map(|(_, bar)| bar);
                 }
+                self.drag_hint = hint;
                 self.kick(cx);
             }
             _ => {}
@@ -2109,23 +2256,17 @@ impl Stage {
             TouchMode::Scroll { uid: u, .. } if u == uid => {
                 self.touch.mode = TouchMode::Idle;
             }
-            TouchMode::Drag { uid: u, pid, offset } if u == uid => {
+            TouchMode::Drag { uid: u, pid, .. } if u == uid => {
                 self.touch.mode = TouchMode::Idle;
-                let drop_p = p - self.origin + offset;
+                self.drag_hint = None;
+                let local = p - self.origin;
                 if let Some(state) = self.state.as_deref_mut() {
                     let cam = state.anim.camera().value();
-                    // Judge the drop by the panel's centre, not its corner.
-                    let (w, h) = state
-                        .anim
-                        .panels
-                        .get(&pid)
-                        .map(|pa| (pa.w.value(), pa.h.value()))
-                        .unwrap_or((0.0, 0.0));
                     let vp = state.vp();
                     let opts = state.opts();
-                    state
-                        .ws
-                        .place_at(pid, drop_p.x + cam + w / 2.0, drop_p.y + h / 2.0, vp, opts);
+                    // The drop lands where the finger points — same judgement
+                    // as the preview bar.
+                    state.ws.place_at(pid, local.x + cam, local.y, vp, opts);
                 }
                 self.sync(cx);
             }
@@ -2255,8 +2396,52 @@ impl Widget for Stage {
             Event::KeyDown(k) => self.handle_key_down(cx, k),
 
             Event::TextInput(e) => {
-                let input = e.input.clone();
-                self.handle_text(cx, &input);
+                // android's IME sends the authoritative full field state;
+                // plain characters (macOS, hardware keys) come as `input`.
+                if let Some(fs) = e.full_state_sync.clone() {
+                    self.handle_ime_state(cx, &fs);
+                } else {
+                    let input = e.input.clone();
+                    self.handle_text(cx, &input);
+                }
+            }
+
+            Event::VirtualKeyboard(e) => {
+                // adjustNothing manifest: the app makes room itself. The
+                // occlusion shrinks the viewport bottom; panels spring up.
+                match e {
+                    VirtualKeyboardEvent::WillShow { height, .. }
+                    | VirtualKeyboardEvent::DidShow { height, .. } => self.kb_h = *height,
+                    VirtualKeyboardEvent::WillHide { .. } => self.kb_h = 0.0,
+                    VirtualKeyboardEvent::DidHide { .. } => {
+                        self.kb_h = 0.0;
+                        // The user dismissed the keyboard: that leaves the
+                        // field, and kick()'s hide resets makepad's dismissed
+                        // latch so the next field tap re-shows it.
+                        if let Some(state) = self.state.as_deref_mut() {
+                            state.field = None;
+                        }
+                    }
+                }
+                self.kick(cx);
+            }
+
+            Event::ImeAction(_) => {
+                // The soft keyboard's action button ≈ Enter for single-line
+                // fields (filter: select the first row and leave).
+                let single_line = self
+                    .state
+                    .as_deref()
+                    .is_some_and(|s| matches!(s.field, Some((_, f)) if f != FieldId::Body));
+                if single_line {
+                    let k = KeyEvent {
+                        key_code: KeyCode::ReturnKey,
+                        modifiers: KeyModifiers::default(),
+                        is_repeat: false,
+                        time: 0.0,
+                    };
+                    self.handle_key_down(cx, &k);
+                }
             }
 
             Event::MouseMove(e) => {
@@ -2336,6 +2521,39 @@ impl Widget for Stage {
                     .clamp(0.0, 1.0 / 20.0);
                 state.last_frame = Some(now);
                 let springs_active = state.anim.advance(dt);
+                // A held panel near a screen edge pans the camera — that is
+                // how a drag reaches columns beyond the viewport. The grabbed
+                // panel stays glued to the finger; the preview follows.
+                let dragging = if let TouchMode::Drag { uid, pid, offset } = self.touch.mode {
+                    if let Some(&(_, p)) = self.touch.pts.get(&uid) {
+                        let local = p - self.origin;
+                        let margin = 64.0;
+                        let w = state.viewport.x;
+                        let f = if local.x < margin {
+                            -(margin - local.x) / margin
+                        } else if local.x > w - margin {
+                            (local.x - (w - margin)) / margin
+                        } else {
+                            0.0
+                        };
+                        if f != 0.0 {
+                            state.pan(f.clamp(-1.0, 1.0) * 1000.0 * dt);
+                            let cam = state.anim.camera().value();
+                            if let Some(pa) = state.anim.panels.get_mut(&pid) {
+                                pa.x.retarget(local.x + offset.x + cam);
+                            }
+                            let vp = state.vp();
+                            let opts = state.opts();
+                            self.drag_hint = state
+                                .ws
+                                .drop_target(pid, local.x + cam, local.y, vp, opts)
+                                .map(|(_, bar)| bar);
+                        }
+                    }
+                    true
+                } else {
+                    false
+                };
                 let toast_active = match state.toast {
                     Some((_, _, since)) => {
                         if since.elapsed().as_secs_f64() > 3.0 {
@@ -2348,7 +2566,7 @@ impl Widget for Stage {
                     None => false,
                 };
                 state.animating = springs_active;
-                if springs_active || toast_active {
+                if springs_active || toast_active || dragging {
                     self.next_frame = cx.new_next_frame();
                 }
                 cx.redraw_all();
@@ -2379,6 +2597,8 @@ impl Widget for Stage {
             } else {
                 t
             };
+            // The soft keyboard occludes the bottom: panels make room.
+            let b = b.max(self.kb_h);
             rect(
                 r.pos.x + l,
                 r.pos.y + t,
@@ -2603,6 +2823,16 @@ impl Stage {
             self.draw_flat.color = rgba_a(theme::INK, a_min);
             self.draw_flat.draw_abs(cx, rect(x0, y - 2.0, w, 1.0));
             self.draw_flat.draw_abs(cx, rect(x0, y + 1.0, w, 1.0));
+        }
+
+        // The drop preview: an ink insertion bar where a dragged panel would
+        // land — vertical in a gap (fresh column), horizontal across a
+        // column (stack at that row).
+        if let Some(h) = self.drag_hint {
+            let r = to_screen(h);
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 0.85);
+            self.draw_flat.draw_abs(cx, r);
         }
 
         // The toast, above everything.

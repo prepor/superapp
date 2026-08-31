@@ -73,6 +73,8 @@ type "hello"
 swipe "inbox" 0 -160   # one-finger touch drag from the element's centre
 pan2 -400              # two-finger workspace pan
 holdmove "help" 500 0  # long-press the panel's header, drag, drop
+holdmove "help" 500 0 hold   # …or keep holding (screenshot the preview)
+drop                   # release a held drag
 quit
 ```
 

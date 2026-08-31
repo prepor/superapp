@@ -60,10 +60,23 @@ The same grammar, re-based on fingers:
   left, or its right edge one gap in from the right) and springs there.
 - **long-press a panel header** — picks the panel up; it rides the finger
   (spring-following, so it trails with the same physics as everything else).
-  The drop point re-places it: inside a column's middle it **stacks** into
-  that column at the row under the finger; near a column edge, in a gap, or
-  past the strip it becomes a **fresh column** at that boundary.
+  While held, an **ink insertion bar previews the drop**, judged by the
+  *finger* point: a horizontal bar across a column means *stack at that
+  row*; a vertical bar in a gap means *a fresh column here*. Near a screen
+  edge the camera **auto-pans**, so a drag can reach columns beyond the
+  viewport; the drop lands exactly where the preview said.
 
 One finger decides what it is (tap / scroll) after an 8 pt slop; a second
 finger anywhere turns the gesture into a pan. Gestures that come to nothing
 go inert until every finger lifts — no surprise mode flips mid-gesture.
+
+### The soft keyboard
+
+The on-screen keyboard belongs to **text fields**, not panels: it rises when
+a field is tapped and the whole workspace **lifts above it** (the viewport
+shrinks by the keyboard's height — no field ever sits under it). Typing
+mirrors android's authoritative IME state, so autocorrect, composition and
+word-swipe all behave natively. Dismissing the keyboard (back gesture)
+leaves the field — the same meaning as `esc` on desktop — and tapping any
+field brings it straight back. The keyboard's action button acts as Enter
+for single-line fields (in the filter: select the first row and leave).

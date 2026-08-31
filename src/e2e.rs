@@ -66,7 +66,8 @@ pub enum Step {
     /// A two-finger horizontal pan of the workspace by `dx` points.
     Pan2(f64),
     /// Long-press the labelled element (a header picks the panel up), drag by
-    /// `(dx, dy)`, drop.
+    /// `(dx, dy)`, and drop — unless `hold` keeps the drag alive (screenshot
+    /// the preview, then `drop`).
     HoldMove {
         /// Label substring picking the press point.
         label: String,
@@ -74,7 +75,11 @@ pub enum Step {
         dx: f64,
         /// Vertical travel, points.
         dy: f64,
+        /// Keep holding after the move; release with [`Step::Drop`].
+        hold: bool,
     },
+    /// Release a drag left alive by `holdmove … hold`.
+    Drop,
     /// End the run.
     Quit,
 }
@@ -142,9 +147,16 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                 if cmd == "swipe" {
                     Step::Swipe { label, dx, dy }
                 } else {
-                    Step::HoldMove { label, dx, dy }
+                    let hold = it.next() == Some("hold");
+                    Step::HoldMove {
+                        label,
+                        dx,
+                        dy,
+                        hold,
+                    }
                 }
             }
+            "drop" => Step::Drop,
             "pan2" => Step::Pan2(rest.parse().map_err(|_| err("expected dx"))?),
             "quit" => Step::Quit,
             _ => return Err(err("unknown command")),
@@ -276,9 +288,13 @@ mod tests {
             Step::HoldMove {
                 label: "help".into(),
                 dx: 400.0,
-                dy: 12.5
+                dy: 12.5,
+                hold: false
             }
         );
+        let s = parse("holdmove \"help\" 10 0 hold\ndrop").unwrap();
+        assert!(matches!(s[0], Step::HoldMove { hold: true, .. }));
+        assert_eq!(s[1], Step::Drop);
     }
 
     #[test]
