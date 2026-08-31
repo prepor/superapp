@@ -16,6 +16,14 @@ current state; everything else in this book is settled.
 5. **Link hover hints**: the web prototype's tooltips ("opens a joined panel …
    cmd+click: separate") have no native equivalent yet; makepad has no
    tooltip, so it would be our own hover-delay affordance.
+6. **Touch gaps**: column ops (consume/expel, tabs toggle) and the fresh
+   un-joined open have no touch affordance yet — candidates: long-press on a
+   *link* (currently unassigned), a header overflow menu, or drag gestures on
+   the tab strip. Un-answered until the phone build gets real use.
+7. **Small-grid content density**: panels reuse the desktop content on the
+   4×3 cover grid (only the grid clamps). Whether kinds should *adapt* their
+   content to tight columns (fewer inbox columns, shorter dates) is open.
 
-Settled since the last revision: column tabs and the over-full-column
-behaviour (both niri's, see [Panel Model](./panel-model.md)).
+Settled since the last revision: android as a second target — touch grammar,
+grids per screen, fold resize (see [Interaction
+Grammar](./interaction-grammar.md) and [Tech Stack](./tech-stack.md)).

@@ -16,6 +16,9 @@
 //! altclick "subject"  — the same, with alt held (fresh un-joined panel)
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! type "hello"        — text into the focused field / panel keys
+//! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre
+//! pan2 -300           — two-finger horizontal workspace pan
+//! holdmove "inbox" 400 0 — long-press the element, drag the panel, drop
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
 //!
@@ -50,6 +53,28 @@ pub enum Step {
     },
     /// Text input into whatever owns the keyboard.
     Type(String),
+    /// A one-finger touch drag from the labelled element's centre, by
+    /// `(dx, dy)` points: vertical scrolls that panel.
+    Swipe {
+        /// Label substring picking the start element.
+        label: String,
+        /// Horizontal travel, points.
+        dx: f64,
+        /// Vertical travel, points.
+        dy: f64,
+    },
+    /// A two-finger horizontal pan of the workspace by `dx` points.
+    Pan2(f64),
+    /// Long-press the labelled element (a header picks the panel up), drag by
+    /// `(dx, dy)`, drop.
+    HoldMove {
+        /// Label substring picking the press point.
+        label: String,
+        /// Horizontal travel, points.
+        dx: f64,
+        /// Vertical travel, points.
+        dy: f64,
+    },
     /// End the run.
     Quit,
 }
@@ -102,6 +127,25 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                 }
             }
             "type" => Step::Type(quoted()?),
+            "swipe" | "holdmove" => {
+                let label = quoted()?;
+                let after = &rest[rest.rfind('"').unwrap() + 1..];
+                let mut it = after.split_whitespace();
+                let dx: f64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| err("expected dx dy"))?;
+                let dy: f64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| err("expected dx dy"))?;
+                if cmd == "swipe" {
+                    Step::Swipe { label, dx, dy }
+                } else {
+                    Step::HoldMove { label, dx, dy }
+                }
+            }
+            "pan2" => Step::Pan2(rest.parse().map_err(|_| err("expected dx"))?),
             "quit" => Step::Quit,
             _ => return Err(err("unknown command")),
         });
@@ -211,6 +255,28 @@ mod tests {
             Step::Key {
                 chord: "j".into(),
                 times: 5
+            }
+        );
+    }
+
+    #[test]
+    fn touch_steps_parse() {
+        let s = parse("swipe \"inbox\" 0 -120\npan2 -300\nholdmove \"help\" 400 12.5").unwrap();
+        assert_eq!(
+            s[0],
+            Step::Swipe {
+                label: "inbox".into(),
+                dx: 0.0,
+                dy: -120.0
+            }
+        );
+        assert_eq!(s[1], Step::Pan2(-300.0));
+        assert_eq!(
+            s[2],
+            Step::HoldMove {
+                label: "help".into(),
+                dx: 400.0,
+                dy: 12.5
             }
         );
     }

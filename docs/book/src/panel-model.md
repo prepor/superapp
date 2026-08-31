@@ -2,10 +2,15 @@
 
 ## Grid and columns
 
-The viewport is a **12×6 grid** with 8 pt gaps. Every kind requests grid units
-(inbox 4×6, message 4×3, contact 3×2, compose 4×4, help 4×6, about 3×2) and is
-honoured **literally** while a column's requests fit: a 3-row panel in an
-otherwise empty column leaves the remaining rows empty. A column asked to hold
+The viewport is a **unit grid** with 8 pt gaps — **12×6 on desktop, 8×4 on the
+unfolded phone screen, 4×3 on a cover display** (the shell switches at the
+~600 dp breakpoint when a fold/unfold resize crosses it, and the springs
+animate the relayout). Every kind requests grid units (inbox 4×6, message 4×3,
+contact 3×2, compose 4×4, help 4×6, about 3×2); a request larger than the
+active grid **clamps to it** — which is why a phone shows the inbox
+full-screen with no phone-specific layout code. Requests are honoured
+**literally** while a column's requests fit: a 3-row panel in an otherwise
+empty column leaves the remaining rows empty. A column asked to hold
 *more* than the grid (consume/expel deliberately over-fill) ignores the
 requests and **distributes its height evenly** instead. A column is as wide as
 its widest panel. Columns line up left to right on an infinite strip; the

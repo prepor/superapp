@@ -3,8 +3,10 @@
 //! *what* the layout is; the shell owns *how it gets there* (springs).
 //!
 //! The model is the one the web prototype (`web/`) validated:
-//! - a **panel** is kind + params and requests grid units on a 12×6 grid;
-//!   heights are honoured literally — unused rows stay empty;
+//! - a **panel** is kind + params and requests grid units on the workspace
+//!   grid (12×6 on desktop; the android shell switches 8×4 ⇄ 4×3 with the
+//!   fold); requests clamp to the active grid, and heights are honoured
+//!   literally — unused rows stay empty;
 //! - solid links **open joined**, dotted links **replace in place**, buttons
 //!   are side effects (links live in panel content, i.e. the shell);
 //! - a **join** is alive only while the child sits in the column immediately
@@ -18,10 +20,22 @@ use crate::data::MailId;
 /// Stable panel identity.
 pub type PanelId = u64;
 
-/// Grid columns across the viewport.
-pub const GRID_W: u32 = 12;
-/// Grid rows down the viewport.
-pub const GRID_H: u32 = 6;
+/// The workspace grid: how many unit columns and rows the viewport is cut
+/// into. A target picks its grid from screen size — desktop 12×6, a folded
+/// phone as little as 4×3 — and may switch at runtime (fold/unfold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grid {
+    /// Unit columns across the viewport.
+    pub w: u32,
+    /// Unit rows down the viewport.
+    pub h: u32,
+}
+
+impl Default for Grid {
+    fn default() -> Self {
+        Self { w: 12, h: 6 }
+    }
+}
 
 /// A panel's kind, parameters included: the whole identity of what it shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +67,8 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Requested grid size, width × height.
+    /// Requested grid size, width × height — a wish, clamped to the active
+    /// [`Grid`] by the workspace (an inbox asking 4×6 fills a 4×3 screen).
     #[must_use]
     pub fn grid(&self) -> (u32, u32) {
         match self {
@@ -188,6 +203,8 @@ impl Default for LayoutOpts {
 #[derive(Debug, Clone, Default)]
 pub struct Ws {
     next_id: u64,
+    /// The active grid. Swapped by [`Ws::set_grid`] when the screen changes.
+    pub grid: Grid,
     /// Columns, left to right.
     pub columns: Vec<Column>,
     /// Panels by id.
@@ -222,23 +239,34 @@ impl Ws {
         self.locate(pid).map(|(c, _)| c)
     }
 
-    /// Sum of requested grid rows in a column.
-    #[must_use]
-    pub fn col_used_h(&self, col: &Column) -> u32 {
-        col.panels
-            .iter()
-            .filter_map(|pid| self.panels.get(pid))
-            .map(|p| p.kind.grid().1)
-            .sum()
+    /// Switches the layout grid (fold/unfold, desktop ⇄ phone). Targets are
+    /// recomputed on the next [`Ws::scene`]; the shell springs there.
+    pub fn set_grid(&mut self, grid: Grid) {
+        self.grid = grid;
     }
 
-    /// Requested grid width of a column: its widest panel.
+    /// A panel's requested grid size, clamped to the active grid.
+    fn panel_grid(&self, pid: PanelId) -> (u32, u32) {
+        let (w, h) = self
+            .panels
+            .get(&pid)
+            .map(|p| p.kind.grid())
+            .unwrap_or((1, 1));
+        (w.min(self.grid.w), h.min(self.grid.h))
+    }
+
+    /// Sum of requested (clamped) grid rows in a column.
+    #[must_use]
+    pub fn col_used_h(&self, col: &Column) -> u32 {
+        col.panels.iter().map(|&pid| self.panel_grid(pid).1).sum()
+    }
+
+    /// Requested (clamped) grid width of a column: its widest panel.
     #[must_use]
     pub fn col_w(&self, col: &Column) -> u32 {
         col.panels
             .iter()
-            .filter_map(|pid| self.panels.get(pid))
-            .map(|p| p.kind.grid().0)
+            .map(|&pid| self.panel_grid(pid).0)
             .max()
             .unwrap_or(1)
     }
@@ -309,9 +337,9 @@ impl Ws {
     /// the column immediately right of its parent (a join only lives there);
     /// an un-joined open respects an existing pair and goes after it instead.
     fn place_near(&mut self, pid: PanelId, from_col: usize, joined: bool) {
-        let h = self.panels[&pid].kind.grid().1;
+        let h = self.panel_grid(pid).1;
         if let Some(right) = self.columns.get(from_col + 1) {
-            if self.col_used_h(right) + h <= GRID_H {
+            if self.col_used_h(right) + h <= self.grid.h {
                 self.columns[from_col + 1].panels.push(pid);
                 return;
             }
@@ -542,6 +570,96 @@ impl Ws {
         self.validate_joins();
     }
 
+    /// Drops a dragged panel at a strip point (touch drag-and-drop). Inside a
+    /// column's middle it stacks into that column at the row under `y`;
+    /// otherwise — the gaps, the column edges, past the last column — it
+    /// becomes a fresh column at the nearest boundary.
+    pub fn place_at(
+        &mut self,
+        pid: PanelId,
+        x: f64,
+        y: f64,
+        viewport: (f64, f64),
+        opts: LayoutOpts,
+    ) {
+        if self.locate(pid).is_none() {
+            return;
+        }
+        // Column x-ranges, reproduced exactly as layout_panels walks them.
+        let gap = opts.gap;
+        let unit_w = (viewport.0 - gap) / f64::from(self.grid.w);
+        let mut ranges: Vec<(f64, f64)> = Vec::new(); // (x, w) per column
+        let mut cx = gap;
+        for col in &self.columns {
+            let cw = (unit_w * f64::from(self.col_w(col)) - gap).max(40.0);
+            ranges.push((cx, cw));
+            cx += cw + gap;
+        }
+        let into = ranges
+            .iter()
+            .position(|&(rx, rw)| x >= rx + 0.15 * rw && x <= rx + 0.85 * rw);
+        match into {
+            Some(tc) => {
+                // Stack: before the first other panel whose centre sits below
+                // the drop point. Anchored on a panel id — indices shift when
+                // the source column empties out.
+                let (panels, _) = self.layout_panels(viewport, opts);
+                let rows: Vec<PanelId> = self.columns[tc]
+                    .panels
+                    .iter()
+                    .copied()
+                    .filter(|&p| p != pid)
+                    .collect();
+                let Some(&anchor) = rows.first() else {
+                    return; // its own lone column: dropped where it started
+                };
+                let r = rows
+                    .iter()
+                    .filter(|&&p| {
+                        panels
+                            .iter()
+                            .find(|ps| ps.id == p)
+                            .is_some_and(|ps| ps.rect.y + ps.rect.h / 2.0 < y)
+                    })
+                    .count();
+                self.remove_from_layout(pid);
+                if let Some((c2, _)) = self.locate(anchor) {
+                    let at = r.min(self.columns[c2].panels.len());
+                    self.columns[c2].panels.insert(at, pid);
+                }
+            }
+            None => {
+                // New column at the nearest boundary (a boundary sits at each
+                // column's left edge, plus one past the end).
+                let mut best = self.columns.len();
+                let mut bd = (x - cx).abs();
+                for (j, &(rx, _)) in ranges.iter().enumerate() {
+                    let d = (x - rx).abs();
+                    if d < bd {
+                        bd = d;
+                        best = j;
+                    }
+                }
+                let anchor = self
+                    .columns
+                    .get(best)
+                    .and_then(|c| c.panels.iter().find(|&&p| p != pid).copied());
+                self.remove_from_layout(pid);
+                let at = match anchor {
+                    Some(a) => self
+                        .locate(a)
+                        .map(|(c, _)| c)
+                        .unwrap_or(self.columns.len()),
+                    None => best.min(self.columns.len()),
+                };
+                self.columns.insert(at, Column::of(pid));
+            }
+        }
+        self.validate_joins();
+        self.normalize();
+        self.focus = Some(pid);
+    }
+
     /// Moves focus one step. Up/down walk the column; left/right pick the
     /// panel with the nearest vertical centre in the neighbouring column,
     /// judged on the scene's target geometry.
@@ -615,8 +733,9 @@ impl Ws {
     fn layout_panels(&self, viewport: (f64, f64), opts: LayoutOpts) -> (Vec<PanelScene>, f64) {
         let (vw, vh) = viewport;
         let gap = opts.gap;
-        let unit_w = (vw - gap) / f64::from(GRID_W);
-        let row_u = (vh - 2.0 * gap - f64::from(GRID_H - 1) * gap) / f64::from(GRID_H);
+        let unit_w = (vw - gap) / f64::from(self.grid.w);
+        let row_u =
+            (vh - 2.0 * gap - f64::from(self.grid.h - 1) * gap) / f64::from(self.grid.h);
 
         let mut panels = Vec::new();
         let mut x = gap;
@@ -647,14 +766,14 @@ impl Ws {
             // hold more than the grid distributes its space evenly instead
             // (consume/expel deliberately over-fill columns).
             let n = col.panels.len();
-            let even = self.col_used_h(col) > GRID_H && n > 0;
+            let even = self.col_used_h(col) > self.grid.h && n > 0;
             let even_h = (vh - 2.0 * gap - (n.saturating_sub(1)) as f64 * gap) / n.max(1) as f64;
             let mut y = gap;
             for pid in &col.panels {
-                let Some(p) = self.panels.get(pid) else {
+                if !self.panels.contains_key(pid) {
                     continue;
-                };
-                let (_, gh) = p.kind.grid();
+                }
+                let (_, gh) = self.panel_grid(*pid);
                 let ph = if even {
                     even_h.max(40.0)
                 } else {
@@ -914,6 +1033,62 @@ mod tests {
         let msg_r = scene.panels.iter().find(|p| p.id == msg).unwrap().rect;
         assert!((inbox_r.h - msg_r.h).abs() < 0.01, "even split");
         // And a fitting column still honours requests (help alone: 6 rows).
+    }
+
+    /// On a small grid every oversized request clamps: the inbox (asking 4×6)
+    /// fills a 4×3 screen exactly, and a second 4×3 panel cannot share its
+    /// column.
+    #[test]
+    fn small_grid_clamps_requests() {
+        let vp = (400.0, 700.0);
+        let mut ws = Ws::new();
+        ws.set_grid(Grid { w: 4, h: 3 });
+        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let scene = ws.scene(vp, opts());
+        let r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
+        // 4 of 4 units wide, 3 of 3 rows tall: the whole viewport minus gaps.
+        assert!((r.w - (vp.0 - 2.0 * 8.0)).abs() < 0.5, "full width, got {}", r.w);
+        assert!((r.h - (vp.1 - 2.0 * 8.0)).abs() < 0.5, "full height, got {}", r.h);
+        // A message (4×3 clamped) doesn't fit under it → its own column.
+        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        assert_ne!(ws.locate(inbox).unwrap().0, ws.locate(msg).unwrap().0);
+    }
+
+    /// Fold/unfold: switching the grid relayouts the same workspace.
+    #[test]
+    fn set_grid_relayouts() {
+        let vp = (840.0, 700.0);
+        let mut ws = Ws::new();
+        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        ws.set_grid(Grid { w: 8, h: 4 });
+        let scene = ws.scene(vp, opts());
+        let r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
+        // 4 of 8 units: about half the viewport.
+        let unit = (vp.0 - 8.0) / 8.0;
+        assert!((r.w - (unit * 4.0 - 8.0)).abs() < 0.5, "half width, got {}", r.w);
+        ws.set_grid(Grid { w: 4, h: 3 });
+        let scene = ws.scene(vp, opts());
+        let r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
+        assert!((r.w - (vp.0 - 2.0 * 8.0)).abs() < 0.5, "full width, got {}", r.w);
+    }
+
+    /// Touch drag-and-drop: a drop inside a column stacks by y; a drop in the
+    /// space past the strip makes a fresh trailing column.
+    #[test]
+    fn place_at_stacks_and_inserts() {
+        let (mut ws, help, inbox) = boot();
+        // Drop help into the inbox column's middle, below the inbox's centre.
+        let scene = ws.scene(VP, opts());
+        let ir = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
+        ws.place_at(help, ir.x + ir.w / 2.0, ir.bottom() - 1.0, VP, opts());
+        assert_eq!(kinds(&ws), [vec!["inbox", "help"]]);
+        // Drop it far right of everything: a new trailing column.
+        ws.place_at(help, VP.0 * 3.0, 10.0, VP, opts());
+        assert_eq!(kinds(&ws), [vec!["inbox"], vec!["help"]]);
+        // Drop it at the strip's left edge: first column again.
+        ws.place_at(help, 0.0, 10.0, VP, opts());
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"]]);
+        assert_eq!(ws.focus, Some(help));
     }
 
     /// Tabbed columns lay out only the active panel, and left/right focus

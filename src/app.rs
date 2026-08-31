@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use makepad_widgets::*;
+// Touch types are not in the curated platform re-export list.
+use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
 
 use crate::core::{self, Dir, Kind, PanelId, Ws};
 use crate::data::{self, MailId, MailState};
@@ -41,6 +43,15 @@ struct Config {
     out: String,
     /// Keep the window frontmost even during an e2e run.
     front: bool,
+    /// Force a grid (`--grid 4x3`): preview a phone layout on desktop.
+    grid: Option<core::Grid>,
+    /// Force the window size (`--window 380x840`): preview a phone screen.
+    window: Option<(f64, f64)>,
+}
+
+fn parse_wxh(s: &str) -> Option<(f64, f64)> {
+    let (w, h) = s.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
 fn config() -> &'static Config {
@@ -60,6 +71,15 @@ fn config() -> &'static Config {
                     }
                 }
                 "--front" => c.front = true,
+                "--grid" => {
+                    c.grid = args.next().and_then(|s| {
+                        parse_wxh(&s).map(|(w, h)| core::Grid {
+                            w: w as u32,
+                            h: h as u32,
+                        })
+                    });
+                }
+                "--window" => c.window = args.next().and_then(|s| parse_wxh(&s)),
                 other => eprintln!("superapp: ignoring unknown argument {other:?}"),
             }
         }
@@ -70,6 +90,17 @@ fn config() -> &'static Config {
 /// An e2e run stays behind every normal window unless `--front` asks otherwise.
 fn background_run() -> bool {
     config().e2e.is_some() && !config().front
+}
+
+/// The desktop window frame: the display's visible frame, unless `--window`
+/// shrinks it for a phone-screen preview.
+#[cfg(target_os = "macos")]
+fn desired_frame() -> (DVec2, DVec2) {
+    let (pos, size) = crate::mac::visible_frame();
+    match config().window {
+        Some((w, h)) => (pos, dvec2(w.min(size.x), h.min(size.y))),
+        None => (pos, size),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +505,58 @@ struct HitR {
     label: String,
 }
 
+/// The panel an act belongs to.
+fn act_pid(act: &Act) -> PanelId {
+    match act {
+        Act::Focus(pid)
+        | Act::Close(pid)
+        | Act::Btn(pid, _)
+        | Act::Open(pid, _)
+        | Act::Replace(pid, _)
+        | Act::Row(pid, _)
+        | Act::Field(pid, _)
+        | Act::Tab(pid) => *pid,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Touch navigation
+// ---------------------------------------------------------------------------
+
+/// How far a finger may wander and still be a tap, in points.
+const TOUCH_SLOP: f64 = 8.0;
+
+/// What the active fingers are doing. One finger taps or scrolls the panel
+/// under it; two fingers pan the workspace; a native long-press on a panel
+/// header upgrades to a drag that re-places the panel on drop. There is no
+/// touch equivalent of cmd+click — a solid link always follows join
+/// semantics on touch.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum TouchMode {
+    #[default]
+    Idle,
+    /// A finger down, undecided; resolves to a click on lift inside the slop.
+    Tap { uid: u64, act: Option<Act> },
+    /// One finger scrolling a panel body, 1:1.
+    Scroll { uid: u64, pid: PanelId },
+    /// Two fingers panning the workspace horizontally, 1:1.
+    Pan,
+    /// A long-pressed header: the panel rides the finger; the drop point
+    /// picks its new place ([`Ws::place_at`]).
+    Drag { uid: u64, pid: PanelId, offset: DVec2 },
+    /// A gesture that came to nothing (sideways one-finger move, a lifted
+    /// pan finger): inert until every finger lifts.
+    Dead,
+}
+
+/// Live touches and the gesture they add up to.
+#[derive(Debug, Default)]
+struct TouchNav {
+    /// uid → (start, latest) positions.
+    pts: HashMap<u64, (DVec2, DVec2)>,
+    mode: TouchMode,
+}
+
 // ---------------------------------------------------------------------------
 // Animation: springs towards the scene's targets
 // ---------------------------------------------------------------------------
@@ -633,6 +716,25 @@ struct State {
     toast: Option<(String, bool, Instant)>,
 }
 
+/// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
+/// unfolded screen and 4×3 on the cover display (the ~600 dp compact/medium
+/// breakpoint — a fold/unfold resize crosses it). `--grid` overrides for
+/// desktop previews of the phone layouts.
+fn grid_for(vp: DVec2) -> core::Grid {
+    if let Some(g) = config().grid {
+        return g;
+    }
+    if cfg!(target_os = "android") {
+        if vp.x >= 600.0 {
+            core::Grid { w: 8, h: 4 }
+        } else {
+            core::Grid { w: 4, h: 3 }
+        }
+    } else {
+        core::Grid::default()
+    }
+}
+
 impl State {
     fn new() -> Self {
         let mut ws = Ws::new();
@@ -684,6 +786,7 @@ impl State {
     /// Recomputes targets after a mutation and feeds the animator. The camera
     /// follows focus here — and only here, so trackpad pans stay free.
     fn sync(&mut self) {
+        self.ws.set_grid(grid_for(self.viewport));
         let vp = self.vp();
         let opts = self.opts();
         self.ws.ensure_focus_visible(vp, opts);
@@ -894,6 +997,20 @@ fn help_lines() -> Vec<Line> {
         ..Default::default()
     });
     v.push(Line::text("trackpad: scroll the strip and the panels", Style::N));
+    if cfg!(target_os = "android") {
+        v.push(Line::blank());
+        v.push(Line {
+            left: vec![Seg::T("TOUCH".into(), Style::Label)],
+            rule: true,
+            ..Default::default()
+        });
+        v.push(Line::text("tap — follow links, press buttons", Style::N));
+        v.push(Line::text("drag — scroll a panel's content", Style::N));
+        v.push(Line::text("two fingers — scroll the workspace", Style::N));
+        v.push(Line::text("hold a header — pick the panel up;", Style::N));
+        v.push(Line::text("drop on a column to stack, between", Style::N));
+        v.push(Line::text("columns for a fresh one", Style::N));
+    }
     v.push(Line::blank());
     v.push(Line {
         left: vec![Seg::T("TRY".into(), Style::Label)],
@@ -915,7 +1032,7 @@ fn about_lines() -> Vec<Line> {
     vec![
         Line::text("superapp — rust + makepad prototype.", Style::N),
         Line::text("no apps, no windows: specialized panels", Style::N),
-        Line::text("on one scrolling 12×6 workspace.", Style::N),
+        Line::text("on one scrolling gridded workspace.", Style::N),
         Line::blank(),
         Line {
             left: vec![Seg::Link {
@@ -1217,6 +1334,11 @@ pub struct Stage {
     #[rust]
     ime_shown: bool,
     #[rust]
+    touch: TouchNav,
+    /// Safe-area insets (cutouts, rounded corners): top, right, bottom, left.
+    #[rust]
+    insets: (f64, f64, f64, f64),
+    #[rust]
     e2e: Option<e2e::Runner>,
     #[rust]
     e2e_timer: Timer,
@@ -1295,14 +1417,20 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
 impl Stage {
     fn kick(&mut self, cx: &mut Cx) {
         // makepad only routes keys to the system IME — which is what emits
-        // TextInput events — while the IME is shown. Letter keys (j/k/r, "/",
-        // field typing) all arrive that way, so the IME stays on whenever a
-        // panel has focus (mosaic's model: "typing only flows after
-        // show_text_ime"). Every focus transition passes through kick().
-        let want_ime = self
-            .state
-            .as_deref()
-            .is_some_and(|s| s.ws.focus.is_some());
+        // TextInput events — while the IME is shown. On macOS letter keys
+        // (j/k/r, "/", field typing) all arrive that way, so the IME stays on
+        // whenever a panel has focus (mosaic's model: "typing only flows
+        // after show_text_ime"). On android show_text_ime raises the
+        // on-screen keyboard, so it is tied to a text field instead — glass
+        // has no letter keys to lose. Every focus transition passes through
+        // kick().
+        let want_ime = self.state.as_deref().is_some_and(|s| {
+            if cfg!(target_os = "android") {
+                s.field.is_some()
+            } else {
+                s.ws.focus.is_some()
+            }
+        });
         if want_ime != self.ime_shown {
             self.ime_shown = want_ime;
             if want_ime {
@@ -1344,12 +1472,18 @@ impl Stage {
                 e2e::Step::Wait(_) => {}
                 e2e::Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
+                    #[cfg(target_os = "macos")]
                     match crate::mac::screenshot(&path) {
                         Ok(()) => eprintln!("e2e: shot {}", path.display()),
                         Err(e) => {
                             eprintln!("e2e: FAIL shot {name}: {e}");
                             runner.failures += 1;
                         }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        eprintln!("e2e: FAIL shot {}: screenshots need macos", path.display());
+                        runner.failures += 1;
                     }
                 }
                 e2e::Step::Click { label, fresh } => {
@@ -1398,6 +1532,89 @@ impl Stage {
                 e2e::Step::Type(s) => {
                     eprintln!("e2e: type {s:?}");
                     self.handle_text(cx, &s);
+                }
+                e2e::Step::Swipe { label, dx, dy } => {
+                    let needle = label.to_lowercase();
+                    let c = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| h.label.to_lowercase().contains(&needle))
+                        .map(|h| h.rect.pos + h.rect.size / 2.0);
+                    match c {
+                        Some(c) => {
+                            eprintln!("e2e: swipe {label:?} by ({dx}, {dy})");
+                            self.touch_start(1, c);
+                            for i in 1..=8 {
+                                let f = f64::from(i) / 8.0;
+                                self.touch_move(cx, 1, dvec2(c.x + dx * f, c.y + dy * f));
+                            }
+                            self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                        }
+                        None => {
+                            eprintln!("e2e: FAIL swipe {label:?}: no matching element");
+                            runner.failures += 1;
+                        }
+                    }
+                }
+                e2e::Step::Pan2(dx) => {
+                    eprintln!("e2e: pan2 by {dx}");
+                    let vp = self
+                        .state
+                        .as_deref()
+                        .map(|s| s.viewport)
+                        .unwrap_or(dvec2(800.0, 600.0));
+                    let mid = self.origin + dvec2(vp.x / 2.0, vp.y / 2.0);
+                    let (a, b) = (mid - dvec2(40.0, 0.0), mid + dvec2(40.0, 0.0));
+                    self.touch_start(1, a);
+                    self.touch_start(2, b);
+                    for i in 1..=8 {
+                        let f = f64::from(i) / 8.0 * dx;
+                        self.touch_move(cx, 1, dvec2(a.x + f, a.y));
+                        self.touch_move(cx, 2, dvec2(b.x + f, b.y));
+                    }
+                    self.touch_stop(cx, 1, dvec2(a.x + dx, a.y));
+                    self.touch_stop(cx, 2, dvec2(b.x + dx, b.y));
+                }
+                e2e::Step::HoldMove { label, dx, dy } => {
+                    let needle = label.to_lowercase();
+                    // Press the panel's header: only Focus hits carry one.
+                    let c = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| {
+                            matches!(h.act, Act::Focus(_))
+                                && h.label.to_lowercase().contains(&needle)
+                        })
+                        .map(|h| {
+                            dvec2(
+                                h.rect.pos.x + h.rect.size.x / 2.0,
+                                h.rect.pos.y + theme::HEAD_H / 2.0,
+                            )
+                        });
+                    match c {
+                        Some(c) => {
+                            eprintln!("e2e: holdmove {label:?} by ({dx}, {dy})");
+                            self.touch_start(1, c);
+                            self.long_press(cx, 1, c);
+                            if !matches!(self.touch.mode, TouchMode::Drag { .. }) {
+                                eprintln!("e2e: FAIL holdmove {label:?}: header did not grab");
+                                runner.failures += 1;
+                                self.touch_stop(cx, 1, c);
+                            } else {
+                                for i in 1..=8 {
+                                    let f = f64::from(i) / 8.0;
+                                    self.touch_move(cx, 1, dvec2(c.x + dx * f, c.y + dy * f));
+                                }
+                                self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                            }
+                        }
+                        None => {
+                            eprintln!("e2e: FAIL holdmove {label:?}: no matching panel");
+                            runner.failures += 1;
+                        }
+                    }
                 }
                 e2e::Step::Quit => {
                     eprintln!(
@@ -1789,6 +2006,185 @@ impl Stage {
             }
         }
     }
+
+    // -- touch ---------------------------------------------------------------
+
+    fn touch_update(&mut self, cx: &mut Cx, e: &TouchUpdateEvent) {
+        for t in &e.touches {
+            match t.state {
+                TouchState::Start => self.touch_start(t.uid, t.abs),
+                TouchState::Move => self.touch_move(cx, t.uid, t.abs),
+                TouchState::Stop => self.touch_stop(cx, t.uid, t.abs),
+                TouchState::Stable => {}
+            }
+        }
+    }
+
+    fn touch_start(&mut self, uid: u64, p: DVec2) {
+        self.touch.pts.insert(uid, (p, p));
+        match self.touch.mode {
+            // A drag keeps the panel no matter what other fingers do.
+            TouchMode::Drag { .. } => {}
+            _ if self.touch.pts.len() >= 2 => self.touch.mode = TouchMode::Pan,
+            _ => {
+                let act = self.hit_at(p).map(|h| h.act.clone());
+                // logcat is the only window into a device run.
+                if cfg!(target_os = "android") {
+                    log!("touch start uid={uid} p=({:.0},{:.0}) act={act:?}", p.x, p.y);
+                }
+                self.touch.mode = TouchMode::Tap { uid, act };
+            }
+        }
+    }
+
+    fn touch_move(&mut self, cx: &mut Cx, uid: u64, p: DVec2) {
+        let Some(&(start, last)) = self.touch.pts.get(&uid) else {
+            return;
+        };
+        let d = p - last;
+        self.touch.pts.insert(uid, (start, p));
+        match &self.touch.mode {
+            TouchMode::Tap { uid: u, act } if *u == uid => {
+                let t = p - start;
+                if t.x.abs() < TOUCH_SLOP && t.y.abs() < TOUCH_SLOP {
+                    return;
+                }
+                // Vertical wins the panel's scroll; sideways one-finger
+                // movement means nothing (the workspace pans on two).
+                self.touch.mode = match act.as_ref().map(act_pid) {
+                    Some(pid) if t.y.abs() >= t.x.abs() => TouchMode::Scroll { uid, pid },
+                    _ => TouchMode::Dead,
+                };
+            }
+            TouchMode::Scroll { uid: u, pid } if *u == uid => {
+                let pid = *pid;
+                if let Some(state) = self.state.as_deref_mut() {
+                    if let Some(ui) = state.ui.get_mut(&pid) {
+                        ui.scroll = (ui.scroll - d.y).clamp(0.0, ui.max_scroll);
+                    }
+                }
+                self.kick(cx);
+            }
+            TouchMode::Pan => {
+                // Each finger reports its own move; splitting by the finger
+                // count makes the strip track the gesture 1:1.
+                let n = self.touch.pts.len().max(1) as f64;
+                if let Some(state) = self.state.as_deref_mut() {
+                    state.pan(-d.x / n);
+                }
+                self.kick(cx);
+            }
+            TouchMode::Drag { uid: u, pid, offset } if *u == uid => {
+                let (pid, off) = (*pid, *offset);
+                let cam_p = p - self.origin + off;
+                if let Some(state) = self.state.as_deref_mut() {
+                    let cam = state.anim.camera().value();
+                    if let Some(pa) = state.anim.panels.get_mut(&pid) {
+                        pa.x.retarget(cam_p.x + cam);
+                        pa.y.retarget(cam_p.y);
+                    }
+                }
+                self.kick(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn touch_stop(&mut self, cx: &mut Cx, uid: u64, p: DVec2) {
+        let start = self.touch.pts.remove(&uid).map(|(s, _)| s);
+        match self.touch.mode.clone() {
+            TouchMode::Tap { uid: u, act } if u == uid => {
+                self.touch.mode = TouchMode::Idle;
+                let within = start.is_some_and(|s| {
+                    (p.x - s.x).abs() < TOUCH_SLOP && (p.y - s.y).abs() < TOUCH_SLOP
+                });
+                if cfg!(target_os = "android") {
+                    log!("touch tap uid={uid} within={within} act={act:?}");
+                }
+                if let (true, Some(act)) = (within, act) {
+                    // No modifiers on glass: never the fresh-panel variant.
+                    self.resolve_click(cx, act, false);
+                }
+            }
+            TouchMode::Scroll { uid: u, .. } if u == uid => {
+                self.touch.mode = TouchMode::Idle;
+            }
+            TouchMode::Drag { uid: u, pid, offset } if u == uid => {
+                self.touch.mode = TouchMode::Idle;
+                let drop_p = p - self.origin + offset;
+                if let Some(state) = self.state.as_deref_mut() {
+                    let cam = state.anim.camera().value();
+                    // Judge the drop by the panel's centre, not its corner.
+                    let (w, h) = state
+                        .anim
+                        .panels
+                        .get(&pid)
+                        .map(|pa| (pa.w.value(), pa.h.value()))
+                        .unwrap_or((0.0, 0.0));
+                    let vp = state.vp();
+                    let opts = state.opts();
+                    state
+                        .ws
+                        .place_at(pid, drop_p.x + cam + w / 2.0, drop_p.y + h / 2.0, vp, opts);
+                }
+                self.sync(cx);
+            }
+            TouchMode::Drag { .. } => {} // a bystander finger lifted mid-drag
+            _ => {
+                if !self.touch.pts.is_empty() {
+                    self.touch.mode = TouchMode::Dead;
+                }
+            }
+        }
+        if self.touch.pts.is_empty() {
+            self.touch.mode = TouchMode::Idle;
+        }
+    }
+
+    /// The platform's long-press (android's GestureDetector; e2e on desktop):
+    /// on a panel header it picks the panel up.
+    fn long_press(&mut self, cx: &mut Cx, uid: u64, p: DVec2) {
+        match self.touch.mode {
+            TouchMode::Tap { uid: u, .. } if u == uid => {}
+            TouchMode::Idle => {}
+            _ => return,
+        }
+        let Some(pid) = self.hit_at(p).map(|h| act_pid(&h.act)) else {
+            return;
+        };
+        // Only the header (or a tab riding above it) grabs.
+        let Some(head) = self
+            .hits
+            .iter()
+            .find(|h| matches!(h.act, Act::Focus(q) if q == pid))
+            .map(|h| h.rect)
+        else {
+            return;
+        };
+        if p.y > head.pos.y + theme::HEAD_H {
+            return;
+        }
+        let grab = p - self.origin;
+        if let Some(state) = self.state.as_deref_mut() {
+            let cam = state.anim.camera().value();
+            let pa_pos = state
+                .anim
+                .panels
+                .get(&pid)
+                .map(|pa| dvec2(pa.x.value() - cam, pa.y.value()))
+                .unwrap_or(grab);
+            state.ws.focus = Some(pid);
+            if cfg!(target_os = "android") {
+                log!("touch drag grab uid={uid} pid={pid}");
+            }
+            self.touch.mode = TouchMode::Drag {
+                uid,
+                pid,
+                offset: pa_pos - grab,
+            };
+        }
+        self.kick(cx);
+    }
 }
 
 impl Widget for Stage {
@@ -1828,12 +2224,17 @@ impl Widget for Stage {
 
         match event {
             Event::WindowGeomChange(e) => {
-                if let Some(state) = self.state.as_deref_mut() {
-                    state.viewport = e.new_geom.inner_size;
-                    state.sync();
-                }
+                // The viewport itself follows the drawn turtle (draw_walk);
+                // here we only capture the safe-area insets a fold/notch
+                // carves out. The next draw picks up both.
+                let ins = e.new_geom.safe_area_insets;
+                self.insets = (ins.top, ins.right, ins.bottom, ins.left);
                 cx.redraw_all();
             }
+
+            Event::TouchUpdate(e) => self.touch_update(cx, e),
+
+            Event::LongPress(e) => self.long_press(cx, e.uid, e.abs),
 
             Event::KeyDown(k) => self.handle_key_down(cx, k),
 
@@ -1950,7 +2351,25 @@ impl Widget for Stage {
                 ..self.layout
             },
         );
-        let vp = cx.turtle().rect();
+        // The workspace lives inside the safe area (zero on desktop). Android
+        // additionally swallows touches in the notification-shade pull zone
+        // at the very top of the window (~22 dp observed on gesture nav), so
+        // panel headers — the drag grip, close, archive — stay below it.
+        let vp = {
+            let r = cx.turtle().rect();
+            let (t, rt, b, l) = self.insets;
+            let t = if cfg!(target_os = "android") {
+                t.max(28.0)
+            } else {
+                t
+            };
+            rect(
+                r.pos.x + l,
+                r.pos.y + t,
+                (r.size.x - l - rt).max(40.0),
+                (r.size.y - t - b).max(40.0),
+            )
+        };
         self.origin = vp.pos;
         let dpi = cx.current_dpi_factor();
 
@@ -2725,21 +3144,27 @@ impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         // A borderless window over the display's visible frame (menu bar and
         // Dock stay) — mosaic's shape, deliberately NOT a fullscreen Space.
-        let win = self.ui.window(cx, ids!(main_window));
-        win.configure_macos_window(
-            cx,
-            MacosWindowConfig {
-                chrome: MacosWindowChrome::Borderless,
-                resizable: false,
-                miniaturizable: false,
-                ..MacosWindowConfig::default()
-            },
-        );
-        let (pos, size) = crate::mac::visible_frame();
-        win.configure_window(cx, size, pos, false, "superapp".to_string());
-        if !background_run() {
-            crate::mac::activate();
+        // Android has no window to shape: the surface is the screen.
+        #[cfg(target_os = "macos")]
+        {
+            let win = self.ui.window(cx, ids!(main_window));
+            win.configure_macos_window(
+                cx,
+                MacosWindowConfig {
+                    chrome: MacosWindowChrome::Borderless,
+                    resizable: false,
+                    miniaturizable: false,
+                    ..MacosWindowConfig::default()
+                },
+            );
+            let (pos, size) = desired_frame();
+            win.configure_window(cx, size, pos, false, "superapp".to_string());
+            if !background_run() {
+                crate::mac::activate();
+            }
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
     }
 }
 
@@ -2756,12 +3181,13 @@ impl AppMain for App {
         // Enforce the window shape once the widget tree exists: at Startup the
         // script has not instantiated it, so the configure call above no-ops
         // (mosaic spike B, TASK 2 — same workaround).
+        #[cfg(target_os = "macos")]
         if !self.shaped && self.shape_tries < 240 {
             if let Event::NextFrame(_) | Event::Draw(_) = event {
                 self.shape_tries += 1;
                 let win = self.ui.window(cx, ids!(main_window));
                 if win.window_id().is_some() {
-                    let (pos, size) = crate::mac::visible_frame();
+                    let (pos, size) = desired_frame();
                     let cur = win.get_inner_size(cx);
                     if (cur.x - size.x).abs() > 1.0 || (cur.y - size.y).abs() > 1.0 {
                         win.resize(cx, size);
@@ -2784,7 +3210,9 @@ impl AppMain for App {
 }
 
 /// Entry point. `app_main!` generates the real `fn main`; this is the hook the
-/// binary calls.
+/// desktop binary calls. On android the same macro generates the JNI
+/// `activityOnCreate` symbol instead and nothing calls `run`.
+#[cfg(not(target_os = "android"))]
 pub fn run() {
     let _ = config();
     if background_run() {

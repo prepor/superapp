@@ -23,10 +23,6 @@ pub const SEL: Rgba = [0.906, 0.906, 0.906, 1.0];
 /// The only non-monochrome colour: errors.
 pub const ERR: Rgba = [0.627, 0.082, 0.0, 1.0];
 
-/// Grid columns across the viewport.
-pub const GRID_W: u32 = 12;
-/// Grid rows down the viewport.
-pub const GRID_H: u32 = 6;
 /// Gap between panels and viewport edges, in points.
 pub const GAP: f64 = 8.0;
 /// Panel header height, in points.

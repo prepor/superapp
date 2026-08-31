@@ -1,0 +1,23 @@
+# The cover-display preview: run with --window 380x780 --grid 4x3.
+# Panels clamp to the small grid — the inbox fills the screen.
+wait 900
+shot p1-cover-boot
+
+# One-finger scroll still works at this size — and back to the top rows.
+swipe "inbox" 0 -140
+wait 400
+shot p2-cover-scroll
+swipe "inbox" 0 140
+wait 400
+
+# Tapping a subject opens the message — full-screen on this grid, so the
+# camera follows focus to it.
+swipe "Q3 infra" 2 0
+wait 800
+shot p3-cover-message
+
+# Two fingers pan back to the inbox.
+pan2 400
+wait 700
+shot p4-cover-panned
+quit

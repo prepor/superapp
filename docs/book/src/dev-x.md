@@ -14,6 +14,32 @@ mise exec -- cargo run
 prototype's whole smoke scenario is a test) and the spring maths — with no
 window.
 
+## Android build & run
+
+```sh
+# once: cargo-makepad + SDK/NDK (~4 GB, self-contained under ~/.cache)
+cargo +stable install --path ../rel.systems/mosaic/third_party/makepad/tools/cargo_makepad --locked
+cargo-makepad android --sdk-path=$HOME/.cache/makepad-android-sdk install-toolchain
+
+# build the APK / install & launch on the connected device
+cargo-makepad android --sdk-path=$HOME/.cache/makepad-android-sdk \
+  --package-name=dev.prepor.superapp --app-label=superapp build -p superapp
+cargo-makepad android --sdk-path=$HOME/.cache/makepad-android-sdk \
+  --package-name=dev.prepor.superapp --app-label=superapp run -p superapp
+```
+
+Note: `cargo-makepad` shells out to **rustup's** `stable` (mise and rustup
+share `~/.rustup` here; the rustup *default* is old — always `+stable`).
+
+## Phone preview on desktop
+
+The android grids and every touch gesture run on macOS too:
+
+```sh
+mise exec -- cargo run -- --window 380x780 --grid 4x3   # cover display
+mise exec -- cargo run -- --grid 8x4                     # unfolded, full frame
+```
+
 ## The book
 
 ```sh
@@ -44,8 +70,15 @@ cmdclick "Q3"       # cmd held: fresh un-joined panel
 key cmd+shift+left  # chords; plain letters flow as text, like real typing
 key j 45            # optional repeat count
 type "hello"
+swipe "inbox" 0 -160   # one-finger touch drag from the element's centre
+pan2 -400              # two-finger workspace pan
+holdmove "help" 500 0  # long-press the panel's header, drag, drop
 quit
 ```
+
+The touch steps drive the same gesture state machine android uses, so
+`e2e/touch.txt` and `e2e/phone.txt` (run with `--window 380x780 --grid 4x3`)
+verify the android interactions on the desktop.
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
 rows (by subject) and panel titles. Steps that mutate the workspace need a

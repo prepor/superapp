@@ -43,3 +43,24 @@ Horizontal trackpad scroll pans the strip 1:1; vertical scroll scrolls the
 panel body under the pointer. A scrollable body shows a minimal grey thumb on
 its right edge; list panels pin their filter and table header above the
 scrolling region.
+
+## Touch (android)
+
+The same grammar, re-based on fingers:
+
+- **tap** — exactly a click: follow a link, press a button, focus a panel.
+  There is **no touch equivalent of cmd+click**; a solid link always follows
+  join semantics on glass.
+- **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
+  A sideways one-finger drag means nothing (deliberately: it would fight
+  taps and the workspace pan).
+- **two-finger horizontal drag** — pans the workspace strip, 1:1.
+- **long-press a panel header** — picks the panel up; it rides the finger
+  (spring-following, so it trails with the same physics as everything else).
+  The drop point re-places it: inside a column's middle it **stacks** into
+  that column at the row under the finger; near a column edge, in a gap, or
+  past the strip it becomes a **fresh column** at that boundary.
+
+One finger decides what it is (tap / scroll) after an 8 pt slop; a second
+finger anywhere turns the gesture into a pan. Gestures that come to nothing
+go inert until every finger lifts — no surprise mode flips mid-gesture.
