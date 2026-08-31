@@ -1,0 +1,46 @@
+# The join/replace journey — the model's whole grammar in one run.
+wait 900
+shot 01-boot
+
+# Solid link: a message opens to the right, joined (bridge).
+click "Q3 infra"
+wait 700
+shot 02-message-joined
+
+# Next solid link in the parent replaces the joined panel.
+click "Sat hike"
+wait 700
+shot 03-joined-replaced
+
+# From → contact: a joined chain.
+click "Elena Petrova"
+wait 700
+shot 04-contact-chain
+
+# Another subject collapses the stale chain with the replacement.
+click "[stelaxis]"
+wait 700
+shot 05-chain-collapsed
+
+# Reply opens a compose; typing goes to its body.
+click "reply"
+wait 600
+type "On it — checking the logs tomorrow."
+wait 400
+shot 06-compose
+
+# Send is a side effect: toast + close.
+click "send"
+wait 500
+shot 07-sent
+
+# Moving the joined message away un-joins it.
+key cmd+shift+left
+wait 700
+shot 08-moved-unjoined
+
+# And cmd+w closes the focused panel.
+key cmd+w
+wait 700
+shot 09-closed
+quit

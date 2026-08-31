@@ -1,0 +1,5 @@
+# Toolchain (same shape as rel.systems):
+#   mise trust && mise install
+#   mise exec -- cargo run --release
+[tools]
+rust = { version = "stable", components = "rust-analyzer" }

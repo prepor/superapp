@@ -1,0 +1,54 @@
+# Web-parity sweep: everything basic.txt doesn't cover.
+wait 900
+
+# Dotted replace in place (newer/older swap the message).
+click "Q3 infra"
+wait 700
+click "older"
+wait 600
+shot p1-dotted-replace
+
+# A joined chain, then a dotted replace cascades it away.
+click "GitHub <notifications"
+wait 700
+click "older"
+wait 700
+shot p2-dotted-cascade
+
+# cmd+click: a fresh, un-joined panel (stacks under the joined one).
+cmdclick "Sat hike"
+wait 700
+shot p3-cmdclick-fresh
+
+# In-panel scroll: the selection walks down and drags the view; the pinned
+# filter and header stay put; the thumb moves.
+click "inbox"
+wait 300
+key j 45
+wait 500
+shot p4-scrolled
+key k 45
+wait 400
+
+# Filter: / focuses it, typing narrows, enter selects the first row and
+# leaves the field, enter again opens it.
+key /
+wait 300
+type "vera"
+wait 400
+shot p5-filtered
+key enter
+wait 300
+key enter
+wait 700
+shot p6-opened-from-filter
+
+# Message keys: r replies; esc leaves the draft body; discard closes it.
+key r
+wait 600
+key esc
+wait 200
+click "discard"
+wait 600
+shot p7-discarded
+quit

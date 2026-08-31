@@ -1,0 +1,35 @@
+# Standalone package; the empty [workspace] table stops cargo from walking up
+# the tree looking for a workspace root (same defence as mosaic's crates).
+[workspace]
+
+[package]
+name = "superapp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Personal user-space OS: specialized panels on one scrolling workspace."
+publish = false
+
+[lib]
+name = "superapp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "superapp"
+path = "src/main.rs"
+
+[dependencies]
+# The same vendored, patched makepad mosaic builds against (pin + patches are
+# owned by rel.systems: run `mosaic/scripts/vendor-makepad.sh` there once to
+# materialise it). Path dep by design — both repos live side by side in ~/code.
+makepad-widgets = { path = "../rel.systems/mosaic/third_party/makepad/widgets", version = "2.0.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+makepad-objc-sys = { path = "../rel.systems/mosaic/third_party/makepad/libs/objc-sys", version = "1.0.0" }
+makepad-apple-sys = { path = "../rel.systems/mosaic/third_party/makepad/libs/apple_sys", version = "1.0.0" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3

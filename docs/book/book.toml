@@ -1,0 +1,8 @@
+[book]
+title = "Superapp Book"
+authors = ["Andrew Rudenko"]
+language = "en"
+
+[output]
+
+[output.html]

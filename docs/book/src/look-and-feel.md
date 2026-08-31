@@ -1,0 +1,29 @@
+# Look & Feel
+
+Black on white, almost fully monochrome. Colour appears in exactly one role:
+errors (`#a01500`-ish ink red). There is no second accent; hover and selection
+are grey backings; focus is the inverted panel header.
+
+## Type
+
+Everything is monospace (Menlo fronts the family; makepad's bundled fonts fill
+in symbols), body ≈14 px. Labels — panel titles, table headers, buttons — are
+uppercase, smaller, and letter-tracked (the stelaxis register style). Bold is
+a nudged double-draw (unread rows, the contact name). Panel content is laid
+out on the character grid the face is measured to, which is what keeps tables,
+fields and buttons aligned by construction.
+
+## Chrome
+
+1 pt near-black borders, sharp corners, 8 pt gaps, no shadows. Panel header:
+26 pt, tracked title, side-effect buttons right, × last. Focused header
+inverts; unfocused headers carry a 1 pt rule. Tables: strong rule under the
+header row, hairline rules between rows.
+
+## Motion
+
+niri's spring (`k=800, ζ=1`, closed-form, ~330 ms) drives every rect and the
+camera; retargeting preserves velocity, so chained motions keep momentum.
+Panels are born slightly inset and fade in; closed panels fade out as ghosts.
+Trackpad pans are 1:1 and deliberately not springed. The shell idles at zero
+frames — springs, not timers, request the next frame.
