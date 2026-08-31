@@ -17,9 +17,12 @@ key cmd+t
 wait 700
 shot t2-tabbed
 
-# cmd+k — focus up switches tabs.
+# cmd+k — focus up switches tabs. Mid-switch and settled shots must show the
+# panel and strip at identical rects: a crossfade, not an open/close.
 key cmd+k
-wait 700
+wait 120
+shot t3-mid-switch
+wait 500
 shot t3-tab-switched
 
 # Clicking a tab segment switches back.

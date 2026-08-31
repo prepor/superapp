@@ -489,9 +489,10 @@ struct PanelAnim {
 }
 
 impl PanelAnim {
-    fn spawn(target: core::Rect, title: String) -> Self {
-        // Born slightly inset and transparent; springs carry it to place.
-        let inset = 12.0;
+    fn spawn(target: core::Rect, title: String, visible: bool) -> Self {
+        // Born slightly inset and transparent; springs carry it to place. A
+        // panel born hidden (an inactive tab) just sits at its rect at rest.
+        let inset = if visible { 12.0 } else { 0.0 };
         let mk = |v| Spring::at_rest(v, SpringParams::movement());
         let mut pa = PanelAnim {
             x: mk(target.x + inset),
@@ -502,7 +503,9 @@ impl PanelAnim {
             title,
         };
         pa.retarget(target);
-        pa.alpha.retarget(1.0);
+        if visible {
+            pa.alpha.retarget(1.0);
+        }
         pa
     }
     fn retarget(&mut self, t: core::Rect) {
@@ -566,10 +569,13 @@ impl Anim {
             match self.panels.get_mut(&ps.id) {
                 Some(pa) => {
                     pa.retarget(ps.rect);
+                    // A tab switch is a crossfade in place, never open/close.
+                    pa.alpha.retarget(if ps.visible { 1.0 } else { 0.0 });
                     pa.title = title;
                 }
                 None => {
-                    self.panels.insert(ps.id, PanelAnim::spawn(ps.rect, title));
+                    self.panels
+                        .insert(ps.id, PanelAnim::spawn(ps.rect, title, ps.visible));
                 }
             }
         }
@@ -2031,6 +2037,14 @@ impl Stage {
                 order.push(f);
             }
         }
+        // A panel is interactive only if its column actually shows it (the
+        // active tab, or any panel of a normal column).
+        let shown = |ws: &Ws, pid: PanelId| -> bool {
+            ws.locate(pid).is_none_or(|(c, r)| {
+                let col = &ws.columns[c];
+                !col.tabbed || col.active.min(col.panels.len() - 1) == r
+            })
+        };
         for pid in order {
             let Some(pa) = state.anim.panels.get(&pid) else {
                 continue;
@@ -2040,7 +2054,16 @@ impl Stage {
                 continue;
             }
             let alpha = pa.alpha.value();
+            let interactive = shown(&state.ws, pid);
+            if !interactive && alpha < 0.02 {
+                continue; // a fully faded hidden tab
+            }
+            let hits_before = self.hits.len();
             self.draw_panel_full(cx, state, pid, r, alpha);
+            if !interactive {
+                // Mid-crossfade: visible, but only the active tab is hittable.
+                self.hits.truncate(hits_before);
+            }
         }
 
         // Tab strips above tabbed columns: one title segment per panel, the

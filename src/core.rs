@@ -149,6 +149,10 @@ pub struct PanelScene {
     pub id: PanelId,
     /// Target rect in strip coordinates.
     pub rect: Rect,
+    /// Whether the panel is shown. Hidden tabs of a tabbed column keep their
+    /// target rect (the column's full tabbed rect) so a tab switch is a pure
+    /// in-place crossfade — never an open/close animation.
+    pub visible: bool,
 }
 
 /// Discrete layout targets for the whole workspace — the analogue of
@@ -619,18 +623,21 @@ impl Ws {
         for col in &self.columns {
             let cw = (unit_w * f64::from(self.col_w(col)) - gap).max(40.0);
             if col.tabbed {
-                // Tabbed: only the active panel, full height under the strip.
+                // Tabbed: every panel targets the same full-height rect under
+                // the strip; only the active one is visible.
                 let active = col.active.min(col.panels.len().saturating_sub(1));
-                if let Some(pid) = col.panels.get(active) {
-                    let top = gap + crate::theme::TAB_H + crate::theme::TAB_GAP;
+                let top = gap + crate::theme::TAB_H + crate::theme::TAB_GAP;
+                let rect = Rect {
+                    x,
+                    y: top,
+                    w: cw,
+                    h: (vh - top - gap).max(40.0),
+                };
+                for (i, pid) in col.panels.iter().enumerate() {
                     panels.push(PanelScene {
                         id: *pid,
-                        rect: Rect {
-                            x,
-                            y: top,
-                            w: cw,
-                            h: (vh - top - gap).max(40.0),
-                        },
+                        rect,
+                        visible: i == active,
                     });
                 }
                 x += cw + gap;
@@ -661,6 +668,7 @@ impl Ws {
                         w: cw,
                         h: ph,
                     },
+                    visible: true,
                 });
                 y += ph + gap;
             }
@@ -917,15 +925,19 @@ mod tests {
         ws.consume_or_expel(msg, Dir::Left); // [help][inbox+msg], focus msg
         ws.toggle_tabbed(msg);
         let scene = ws.scene(VP, opts());
-        // Only the active tab (msg, focused) is in the scene.
-        assert!(scene.panels.iter().any(|p| p.id == msg));
-        assert!(!scene.panels.iter().any(|p| p.id == inbox));
-        // Up switches tabs; the scene follows.
+        // Every tab is in the scene at the SAME rect (a switch must be a pure
+        // crossfade, no movement); only the active one is visible.
+        let msg_s = scene.panels.iter().find(|p| p.id == msg).unwrap();
+        let inbox_s = scene.panels.iter().find(|p| p.id == inbox).unwrap();
+        assert!(msg_s.visible);
+        assert!(!inbox_s.visible);
+        assert_eq!(msg_s.rect, inbox_s.rect);
+        // Up switches tabs; visibility follows, rects stay put.
         ws.focus_dir(Dir::Up, VP, opts());
         assert_eq!(ws.focus, Some(inbox));
         let scene = ws.scene(VP, opts());
-        assert!(scene.panels.iter().any(|p| p.id == inbox));
-        assert!(!scene.panels.iter().any(|p| p.id == msg));
+        assert!(scene.panels.iter().find(|p| p.id == inbox).unwrap().visible);
+        assert!(!scene.panels.iter().find(|p| p.id == msg).unwrap().visible);
         // Entering from the left lands on the active tab, not "nearest".
         ws.focus = Some(help);
         ws.focus_dir(Dir::Right, VP, opts());
