@@ -4,10 +4,27 @@
 
 The viewport is a **12×6 grid** with 8 pt gaps. Every kind requests grid units
 (inbox 4×6, message 4×3, contact 3×2, compose 4×4, help 4×6, about 3×2) and is
-honoured **literally**: a 3-row panel in an otherwise empty column leaves the
-remaining rows empty. A column is as wide as its widest panel. Columns line up
-left to right on an infinite strip; the workspace scrolls horizontally when
-they overflow the viewport (niri's scrolling model).
+honoured **literally** while a column's requests fit: a 3-row panel in an
+otherwise empty column leaves the remaining rows empty. A column asked to hold
+*more* than the grid (consume/expel deliberately over-fill) ignores the
+requests and **distributes its height evenly** instead. A column is as wide as
+its widest panel. Columns line up left to right on an infinite strip; the
+workspace scrolls horizontally when they overflow the viewport (niri's
+scrolling model).
+
+## Column operations and tabs (niri's)
+
+- `cmd+[` / `cmd+]` — **consume-or-expel**: a lone panel is consumed into the
+  neighbouring column on that side; a stacked panel is expelled into a fresh
+  column there.
+- `cmd+,` — consume the first panel of the column to the right into the
+  bottom of the focused column; `cmd+.` — expel the focused column's bottom
+  panel out to the right.
+- `cmd+t` — **tabbed display**: the column shows only its active panel at
+  full height, under a strip of title segments (active inverted). Click a
+  segment, or move focus up/down, to switch tabs; the panel crossfades.
+  A tabbed column remembers its active tab while unfocused, and left/right
+  focus enters it on that tab.
 
 The camera follows focus — the minimal scroll that keeps the focused panel
 fully visible with one gap of margin — and pans 1:1 under a horizontal

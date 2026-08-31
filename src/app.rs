@@ -461,6 +461,8 @@ enum Act {
     Replace(PanelId, Kind),
     Row(PanelId, MailId),
     Field(PanelId, FieldId),
+    /// Activate this panel's tab in its tabbed column.
+    Tab(PanelId),
 }
 
 #[derive(Debug, Clone)]
@@ -838,6 +840,32 @@ fn help_lines() -> Vec<Line> {
     });
     v.push(Line {
         left: vec![kbd("cmd"), kbd("w"), Seg::T(" — close the focused panel".into(), Style::N)],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("["),
+            kbd("]"),
+            Seg::T(" — consume into / expel out of a column".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd(","),
+            kbd("."),
+            Seg::T(" — pull from the right / push bottom out".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("t"),
+            Seg::T(" — column tabs (click a tab or cmd+j/k)".into(), Style::N),
+        ],
         ..Default::default()
     });
     v.push(Line::text("plain keys belong to the focused panel:", Style::N));
@@ -1224,6 +1252,11 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "k" => Some(KeyCode::KeyK),
         "l" => Some(KeyCode::KeyL),
         "w" => Some(KeyCode::KeyW),
+        "t" => Some(KeyCode::KeyT),
+        "comma" | "," => Some(KeyCode::Comma),
+        "period" | "." => Some(KeyCode::Period),
+        "bracketleft" | "[" => Some(KeyCode::LBracket),
+        "bracketright" | "]" => Some(KeyCode::RBracket),
         _ => None,
     };
     let plain = !mods.logo && !mods.control && !mods.alt;
@@ -1410,6 +1443,37 @@ impl Stage {
                     self.sync(cx);
                 }
                 return;
+            }
+            // niri's column operations.
+            if let Some(f) = state.ws.focus {
+                match k.key_code {
+                    KeyCode::LBracket => {
+                        state.ws.consume_or_expel(f, Dir::Left);
+                        self.sync(cx);
+                        return;
+                    }
+                    KeyCode::RBracket => {
+                        state.ws.consume_or_expel(f, Dir::Right);
+                        self.sync(cx);
+                        return;
+                    }
+                    KeyCode::Comma => {
+                        state.ws.consume_from_right(f);
+                        self.sync(cx);
+                        return;
+                    }
+                    KeyCode::Period => {
+                        state.ws.expel_bottom(f);
+                        self.sync(cx);
+                        return;
+                    }
+                    KeyCode::KeyT => {
+                        state.ws.toggle_tabbed(f);
+                        self.sync(cx);
+                        return;
+                    }
+                    _ => {}
+                }
             }
             if k.key_code != KeyCode::ReturnKey {
                 return;
@@ -1680,6 +1744,11 @@ impl Stage {
                 state.field = Some((pid, fid));
                 self.sync(cx);
             }
+            Act::Tab(pid) => {
+                state.ws.focus = Some(pid);
+                state.field = None;
+                self.sync(cx);
+            }
             Act::Btn(pid, b) => {
                 match b {
                     BtnAct::TryIt => {
@@ -1817,7 +1886,8 @@ impl Widget for Stage {
                             | Act::Open(pid, _)
                             | Act::Replace(pid, _)
                             | Act::Row(pid, _)
-                            | Act::Field(pid, _) => *pid,
+                            | Act::Field(pid, _)
+                            | Act::Tab(pid) => *pid,
                         });
                     if let Some(pid) = pid {
                         if let Some(ui) = state.ui.get_mut(&pid) {
@@ -1971,6 +2041,68 @@ impl Stage {
             }
             let alpha = pa.alpha.value();
             self.draw_panel_full(cx, state, pid, r, alpha);
+        }
+
+        // Tab strips above tabbed columns: one title segment per panel, the
+        // active one inverted. They ride the active panel's animated rect.
+        let hover = state.hover.clone();
+        let columns = state.ws.columns.clone();
+        for col in &columns {
+            if !col.tabbed || col.panels.is_empty() {
+                continue;
+            }
+            let active_idx = col.active.min(col.panels.len() - 1);
+            let Some(pa) = state.anim.panels.get(&col.panels[active_idx]) else {
+                continue;
+            };
+            let r = to_screen(pa.rect());
+            let alpha = pa.alpha.value();
+            let strip = rect(
+                r.pos.x,
+                r.pos.y - theme::TAB_GAP - theme::TAB_H,
+                r.size.x,
+                theme::TAB_H,
+            );
+            if strip.pos.x > vp.pos.x + vp.size.x || strip.pos.x + strip.size.x < vp.pos.x {
+                continue;
+            }
+            let n = col.panels.len() as f64;
+            let seg_gap = 2.0;
+            let seg_w = ((strip.size.x - (n - 1.0) * seg_gap) / n).max(24.0);
+            for (i, pid) in col.panels.iter().enumerate() {
+                let sx = strip.pos.x + i as f64 * (seg_w + seg_gap);
+                let sr = rect(sx, strip.pos.y, seg_w, theme::TAB_H);
+                let act = Act::Tab(*pid);
+                let active = i == active_idx;
+                let hovered = hover.as_ref() == Some(&act);
+                let (bg, fg) = match (active, hovered) {
+                    (true, _) => (theme::INK, theme::BG),
+                    (false, true) => (theme::HOVER, theme::INK),
+                    (false, false) => (theme::BG, theme::INK),
+                };
+                self.draw_panel.color = rgba_a(bg, alpha);
+                self.draw_panel.border_color = rgba_a(theme::INK, alpha);
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = alpha as f32;
+                self.draw_panel.draw_abs(cx, sr);
+                let title = state
+                    .ws
+                    .panels
+                    .get(pid)
+                    .map(|p| state.panel_title(&p.kind))
+                    .unwrap_or_default();
+                let title_cols = (((seg_w - 12.0) / self.cell.label_step()).max(2.0)) as usize;
+                let t = trunc(&title, title_cols);
+                let tw = self.cell.label_w(t.chars().count());
+                let ty = sr.pos.y + (theme::TAB_H - self.cell.label_line()) / 2.0;
+                self.draw_label(cx, sx + ((seg_w - tw) / 2.0).max(6.0), ty, &t, fg, alpha);
+                self.hits.push(HitR {
+                    rect: sr,
+                    act,
+                    cursor: MouseCursor::Hand,
+                    label: title,
+                });
+            }
         }
 
         // Bridges above panels: the join indicator.

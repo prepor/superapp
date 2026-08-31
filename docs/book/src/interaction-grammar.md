@@ -24,6 +24,9 @@ future text-editor panel needs: the whole plain keyboard, no modes.
 
 - `cmd` + `←↓↑→` / `hjkl` — focus panels; `+shift` — move the focused panel
 - `cmd+w` — close the focused panel
+- `cmd+[` / `cmd+]` — consume into / expel out of a column;
+  `cmd+,` / `cmd+.` — pull from the right / push the bottom out
+- `cmd+t` — toggle column tabs
 - inbox: `j`/`k` row cursor (scrolls the list to keep it visible), `enter`
   opens (`cmd+enter` un-joined), `/` filter
 - message: `j`/`k` older/newer in place, `r` reply

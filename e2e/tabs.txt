@@ -1,0 +1,41 @@
+# niri column ops + tabs.
+wait 900
+
+# A joined message right of the inbox…
+click "Q3 infra"
+wait 700
+
+# cmd+[ — the lone message is consumed into the inbox column; the column now
+# over-fills its grid, so heights distribute evenly.
+key cmd+bracketleft
+wait 700
+shot t1-consumed-even
+
+# cmd+t — the column turns tabbed: only the active tab shows, full height,
+# under a strip of title segments.
+key cmd+t
+wait 700
+shot t2-tabbed
+
+# cmd+k — focus up switches tabs.
+key cmd+k
+wait 700
+shot t3-tab-switched
+
+# Clicking a tab segment switches back.
+click "Q3 infra"
+wait 700
+shot t4-tab-clicked
+
+# cmd+t — back to an even split; cmd+. expels the bottom panel out right.
+key cmd+t
+wait 500
+key cmd+period
+wait 700
+shot t5-expelled
+
+# cmd+, pulls it back in.
+key cmd+comma
+wait 700
+shot t6-consumed-back
+quit

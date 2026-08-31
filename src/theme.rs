@@ -43,3 +43,7 @@ pub const PAD_X: f64 = 10.0;
 pub const PAD_Y: f64 = 8.0;
 /// Button box height, in points.
 pub const BTN_H: f64 = 18.0;
+/// Tab strip height above a tabbed column, in points.
+pub const TAB_H: f64 = 24.0;
+/// Gap between the tab strip and the active panel, in points.
+pub const TAB_GAP: f64 = 4.0;

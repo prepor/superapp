@@ -76,11 +76,26 @@ pub struct Panel {
     pub kind: Kind,
 }
 
-/// One column: panel ids, top to bottom.
+/// One column: panel ids, top to bottom, plus its display mode.
 #[derive(Debug, Clone, Default)]
 pub struct Column {
     /// Panels, top to bottom.
     pub panels: Vec<PanelId>,
+    /// niri-style tabbed display: only the active panel shows, full height,
+    /// under a tab strip.
+    pub tabbed: bool,
+    /// Which panel a tabbed column shows while unfocused. Kept in sync with
+    /// focus by [`Ws::normalize`].
+    pub active: usize,
+}
+
+impl Column {
+    fn of(pid: PanelId) -> Self {
+        Column {
+            panels: vec![pid],
+            ..Default::default()
+        }
+    }
 }
 
 /// A focus/move direction.
@@ -309,7 +324,7 @@ impl Ws {
             }
         }
         let at = at.min(self.columns.len());
-        self.columns.insert(at, Column { panels: vec![pid] });
+        self.columns.insert(at, Column::of(pid));
     }
 
     /// Opens a panel. With `from`, it lands to the right of that panel's
@@ -326,7 +341,7 @@ impl Ws {
                     }
                 }
             }
-            None => self.columns.push(Column { panels: vec![pid] }),
+            None => self.columns.push(Column::of(pid)),
         }
         self.validate_joins();
         self.focus = Some(pid);
@@ -395,6 +410,90 @@ impl Ws {
         }
     }
 
+    /// Keeps per-column invariants: `active` clamped, and following focus.
+    fn normalize(&mut self) {
+        for col in &mut self.columns {
+            col.active = col.active.min(col.panels.len().saturating_sub(1));
+        }
+        if let Some(f) = self.focus {
+            if let Some((c, r)) = self.locate(f) {
+                self.columns[c].active = r;
+            }
+        }
+    }
+
+    /// niri's `consume-or-expel-window-left/right`: a lone panel is consumed
+    /// into the neighbouring column on that side (at its bottom); a stacked
+    /// panel is expelled into a fresh column on that side.
+    pub fn consume_or_expel(&mut self, pid: PanelId, dir: Dir) {
+        let Some((c, r)) = self.locate(pid) else {
+            return;
+        };
+        let d: isize = match dir {
+            Dir::Left => -1,
+            Dir::Right => 1,
+            _ => return,
+        };
+        if self.columns[c].panels.len() == 1 {
+            let t = c as isize + d;
+            if t < 0 || t as usize >= self.columns.len() {
+                return;
+            }
+            let t = t as usize;
+            self.columns.remove(c);
+            let t = if t > c { t - 1 } else { t };
+            self.columns[t].panels.push(pid);
+            self.columns[t].active = self.columns[t].panels.len() - 1;
+        } else {
+            self.columns[c].panels.remove(r);
+            let at = if d < 0 { c } else { c + 1 };
+            self.columns.insert(at, Column::of(pid));
+        }
+        self.validate_joins();
+        self.normalize();
+    }
+
+    /// niri's `consume-window-into-column`: the first panel of the column to
+    /// the right joins the bottom of `pid`'s column.
+    pub fn consume_from_right(&mut self, pid: PanelId) {
+        let Some((c, _)) = self.locate(pid) else {
+            return;
+        };
+        if c + 1 >= self.columns.len() {
+            return;
+        }
+        let moved = self.columns[c + 1].panels.remove(0);
+        if self.columns[c + 1].panels.is_empty() {
+            self.columns.remove(c + 1);
+        }
+        self.columns[c].panels.push(moved);
+        self.validate_joins();
+        self.normalize();
+    }
+
+    /// niri's `expel-window-from-column`: the bottom panel of `pid`'s column
+    /// expels into a fresh column to the right.
+    pub fn expel_bottom(&mut self, pid: PanelId) {
+        let Some((c, _)) = self.locate(pid) else {
+            return;
+        };
+        if self.columns[c].panels.len() < 2 {
+            return;
+        }
+        let moved = self.columns[c].panels.pop().expect("len checked");
+        self.columns.insert(c + 1, Column::of(moved));
+        self.validate_joins();
+        self.normalize();
+    }
+
+    /// niri's `toggle-column-tabbed-display` on the panel's column.
+    pub fn toggle_tabbed(&mut self, pid: PanelId) {
+        if let Some((c, _)) = self.locate(pid) {
+            self.columns[c].tabbed = !self.columns[c].tabbed;
+            self.normalize();
+        }
+    }
+
     /// Moves a panel one step. Within a column it swaps; across columns it
     /// merges into the neighbour (or swaps whole columns when it travels
     /// alone); at the edges a stacked panel expels into a fresh column.
@@ -427,7 +526,7 @@ impl Ws {
                     self.columns[c].panels.remove(r);
                     if t < 0 || t as usize >= self.columns.len() {
                         let at = if d < 0 { c } else { c + 1 };
-                        self.columns.insert(at, Column { panels: vec![pid] });
+                        self.columns.insert(at, Column::of(pid));
                     } else {
                         let tc = &mut self.columns[t as usize];
                         let at = r.min(tc.panels.len());
@@ -470,6 +569,16 @@ impl Ws {
                 let Some(t) = t.filter(|&t| t < self.columns.len()) else {
                     return;
                 };
+                // A tabbed column is entered on its active tab — the hidden
+                // panels have no geometry to be "nearest" by.
+                if self.columns[t].tabbed {
+                    let col = &self.columns[t];
+                    if let Some(&pid) = col.panels.get(col.active.min(col.panels.len() - 1)) {
+                        self.focus = Some(pid);
+                        self.normalize();
+                    }
+                    return;
+                }
                 let scene = self.scene(viewport, opts);
                 let rect_of = |pid: PanelId| {
                     scene
@@ -509,13 +618,41 @@ impl Ws {
         let mut x = gap;
         for col in &self.columns {
             let cw = (unit_w * f64::from(self.col_w(col)) - gap).max(40.0);
+            if col.tabbed {
+                // Tabbed: only the active panel, full height under the strip.
+                let active = col.active.min(col.panels.len().saturating_sub(1));
+                if let Some(pid) = col.panels.get(active) {
+                    let top = gap + crate::theme::TAB_H + crate::theme::TAB_GAP;
+                    panels.push(PanelScene {
+                        id: *pid,
+                        rect: Rect {
+                            x,
+                            y: top,
+                            w: cw,
+                            h: (vh - top - gap).max(40.0),
+                        },
+                    });
+                }
+                x += cw + gap;
+                continue;
+            }
+            // Requested heights are honoured while they fit; a column asked to
+            // hold more than the grid distributes its space evenly instead
+            // (consume/expel deliberately over-fill columns).
+            let n = col.panels.len();
+            let even = self.col_used_h(col) > GRID_H && n > 0;
+            let even_h = (vh - 2.0 * gap - (n.saturating_sub(1)) as f64 * gap) / n.max(1) as f64;
             let mut y = gap;
             for pid in &col.panels {
                 let Some(p) = self.panels.get(pid) else {
                     continue;
                 };
                 let (_, gh) = p.kind.grid();
-                let ph = f64::from(gh) * row_u + f64::from(gh - 1) * gap;
+                let ph = if even {
+                    even_h.max(40.0)
+                } else {
+                    f64::from(gh) * row_u + f64::from(gh - 1) * gap
+                };
                 panels.push(PanelScene {
                     id: *pid,
                     rect: Rect {
@@ -550,6 +687,7 @@ impl Ws {
     /// clamped to the strip's bounds only; focus-following is
     /// [`Ws::ensure_focus_visible`]'s job.
     pub fn scene(&mut self, viewport: (f64, f64), opts: LayoutOpts) -> Scene {
+        self.normalize();
         let (panels, strip_w) = self.layout_panels(viewport, opts);
         let max_cam = (strip_w - viewport.0).max(0.0);
         self.camera_x = self.camera_x.clamp(0.0, max_cam);
@@ -725,5 +863,72 @@ mod tests {
         ws.close(inbox);
         assert_eq!(ws.focus, Some(help));
         assert_eq!(kinds(&ws), [vec!["help"]]);
+    }
+
+    /// niri's bracket binds: alone → consume into the neighbour; stacked →
+    /// expel into a fresh column.
+    #[test]
+    fn consume_or_expel_round_trip() {
+        let (mut ws, _help, inbox) = boot();
+        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        // msg is alone right of the inbox: cmd+[ consumes it into the inbox
+        // column, at the bottom.
+        ws.consume_or_expel(msg, Dir::Left);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox", "msg"]]);
+        // Consuming broke column adjacency, so the join died with it.
+        assert!(ws.joins.is_empty());
+        // Stacked now: cmd+] expels it back out to the right.
+        ws.consume_or_expel(msg, Dir::Right);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
+    }
+
+    #[test]
+    fn consume_from_right_and_expel_bottom() {
+        let (mut ws, _help, inbox) = boot();
+        ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        // cmd+, pulls the message into the inbox column.
+        ws.consume_from_right(inbox);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox", "msg"]]);
+        // cmd+. pushes the bottom panel back out.
+        ws.expel_bottom(inbox);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
+    }
+
+    /// A column asked to hold more grid rows than exist distributes its
+    /// height evenly instead of overflowing.
+    #[test]
+    fn overfull_column_distributes_evenly() {
+        let (mut ws, _help, inbox) = boot();
+        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        ws.consume_or_expel(msg, Dir::Left); // inbox(6) + msg(3) = 9 > 6
+        let scene = ws.scene(VP, opts());
+        let inbox_r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
+        let msg_r = scene.panels.iter().find(|p| p.id == msg).unwrap().rect;
+        assert!((inbox_r.h - msg_r.h).abs() < 0.01, "even split");
+        // And a fitting column still honours requests (help alone: 6 rows).
+    }
+
+    /// Tabbed columns lay out only the active panel, and left/right focus
+    /// enters them on it.
+    #[test]
+    fn tabbed_column_shows_active_only() {
+        let (mut ws, help, inbox) = boot();
+        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        ws.consume_or_expel(msg, Dir::Left); // [help][inbox+msg], focus msg
+        ws.toggle_tabbed(msg);
+        let scene = ws.scene(VP, opts());
+        // Only the active tab (msg, focused) is in the scene.
+        assert!(scene.panels.iter().any(|p| p.id == msg));
+        assert!(!scene.panels.iter().any(|p| p.id == inbox));
+        // Up switches tabs; the scene follows.
+        ws.focus_dir(Dir::Up, VP, opts());
+        assert_eq!(ws.focus, Some(inbox));
+        let scene = ws.scene(VP, opts());
+        assert!(scene.panels.iter().any(|p| p.id == inbox));
+        assert!(!scene.panels.iter().any(|p| p.id == msg));
+        // Entering from the left lands on the active tab, not "nearest".
+        ws.focus = Some(help);
+        ws.focus_dir(Dir::Right, VP, opts());
+        assert_eq!(ws.focus, Some(inbox));
     }
 }
