@@ -585,16 +585,7 @@ impl Ws {
         if self.locate(pid).is_none() {
             return;
         }
-        // Column x-ranges, reproduced exactly as layout_panels walks them.
-        let gap = opts.gap;
-        let unit_w = (viewport.0 - gap) / f64::from(self.grid.w);
-        let mut ranges: Vec<(f64, f64)> = Vec::new(); // (x, w) per column
-        let mut cx = gap;
-        for col in &self.columns {
-            let cw = (unit_w * f64::from(self.col_w(col)) - gap).max(40.0);
-            ranges.push((cx, cw));
-            cx += cw + gap;
-        }
+        let (ranges, strip_end) = self.col_ranges(viewport, opts);
         let into = ranges
             .iter()
             .position(|&(rx, rw)| x >= rx + 0.15 * rw && x <= rx + 0.85 * rw);
@@ -632,7 +623,7 @@ impl Ws {
                 // New column at the nearest boundary (a boundary sits at each
                 // column's left edge, plus one past the end).
                 let mut best = self.columns.len();
-                let mut bd = (x - cx).abs();
+                let mut bd = (x - strip_end).abs();
                 for (j, &(rx, _)) in ranges.iter().enumerate() {
                     let d = (x - rx).abs();
                     if d < bd {
@@ -658,6 +649,48 @@ impl Ws {
         self.validate_joins();
         self.normalize();
         self.focus = Some(pid);
+    }
+
+    /// Each column's `(x, width)` on the strip plus the strip's total width —
+    /// exactly as [`Ws::layout_panels`] walks them.
+    fn col_ranges(&self, viewport: (f64, f64), opts: LayoutOpts) -> (Vec<(f64, f64)>, f64) {
+        let gap = opts.gap;
+        let unit_w = (viewport.0 - gap) / f64::from(self.grid.w);
+        let mut ranges = Vec::new();
+        let mut x = gap;
+        for col in &self.columns {
+            let cw = (unit_w * f64::from(self.col_w(col)) - gap).max(40.0);
+            ranges.push((x, cw));
+            x += cw + gap;
+        }
+        (ranges, x)
+    }
+
+    /// Magnetises a freely panned camera to the nearest column alignment —
+    /// a column's left edge one gap in from the viewport's left, a column's
+    /// right edge one gap in from its right, or a strip end. The pan itself
+    /// stays free; the shell calls this when the fingers lift and springs
+    /// towards the result.
+    pub fn snap_camera(&mut self, viewport: (f64, f64), opts: LayoutOpts) {
+        let (ranges, strip_w) = self.col_ranges(viewport, opts);
+        let gap = opts.gap;
+        let max_cam = (strip_w - viewport.0).max(0.0);
+        let cur = self.camera_x.clamp(0.0, max_cam);
+        let mut best = 0.0;
+        let mut bd = f64::MAX;
+        let mut consider = |c: f64| {
+            let c = c.clamp(0.0, max_cam);
+            let d = (cur - c).abs();
+            if d < bd {
+                bd = d;
+                best = c;
+            }
+        };
+        for &(rx, rw) in &ranges {
+            consider(rx - gap);
+            consider(rx + rw + gap - viewport.0);
+        }
+        self.camera_x = best;
     }
 
     /// Moves focus one step. Up/down walk the column; left/right pick the
@@ -1089,6 +1122,30 @@ mod tests {
         ws.place_at(help, 0.0, 10.0, VP, opts());
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"]]);
         assert_eq!(ws.focus, Some(help));
+    }
+
+    /// A released two-finger pan magnetises the camera to the nearest column
+    /// alignment; the pan itself stays free.
+    #[test]
+    fn snap_camera_aligns_to_columns() {
+        let mut ws = Ws::new();
+        let mut last = ws.open(Kind::Help, None, false);
+        for id in ["m1", "m2", "m3"] {
+            last = ws.open(Kind::Message { id }, Some(last), false);
+        }
+        // Four 4-unit columns on a 12-unit grid: one column of overflow.
+        let unit = (VP.0 - 8.0) / 12.0;
+        let col2 = unit * 4.0; // camera with column 2's left edge at the left gap
+        ws.camera_x = 100.0;
+        ws.snap_camera(VP, opts());
+        assert!((ws.camera_x - 0.0).abs() < 0.5, "close to home snaps home, got {}", ws.camera_x);
+        ws.camera_x = 400.0;
+        ws.snap_camera(VP, opts());
+        assert!(
+            (ws.camera_x - col2).abs() < 0.5,
+            "snaps to column 2, got {} want {col2}",
+            ws.camera_x
+        );
     }
 
     /// Tabbed columns lay out only the active panel, and left/right focus

@@ -2130,6 +2130,22 @@ impl Stage {
                 self.sync(cx);
             }
             TouchMode::Drag { .. } => {} // a bystander finger lifted mid-drag
+            TouchMode::Pan => {
+                // The pan ends with the first lifted finger; the camera
+                // magnetises to the nearest column alignment — a spring, so
+                // it settles rather than jumps. A leftover finger is inert.
+                if !self.touch.pts.is_empty() {
+                    self.touch.mode = TouchMode::Dead;
+                }
+                if let Some(state) = self.state.as_deref_mut() {
+                    let vp = state.vp();
+                    let opts = state.opts();
+                    state.ws.snap_camera(vp, opts);
+                    let cam = state.ws.camera_x;
+                    state.anim.camera().retarget(cam);
+                }
+                self.kick(cx);
+            }
             _ => {
                 if !self.touch.pts.is_empty() {
                     self.touch.mode = TouchMode::Dead;

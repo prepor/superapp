@@ -54,7 +54,10 @@ The same grammar, re-based on fingers:
 - **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
   A sideways one-finger drag means nothing (deliberately: it would fight
   taps and the workspace pan).
-- **two-finger horizontal drag** — pans the workspace strip, 1:1.
+- **two-finger horizontal drag** — pans the workspace strip, 1:1 while the
+  fingers are down; on release the camera **magnetises** to the nearest
+  column alignment (a column's left edge one gap in from the viewport's
+  left, or its right edge one gap in from the right) and springs there.
 - **long-press a panel header** — picks the panel up; it rides the finger
   (spring-following, so it trails with the same physics as everything else).
   The drop point re-places it: inside a column's middle it **stacks** into

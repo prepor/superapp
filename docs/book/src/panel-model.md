@@ -33,7 +33,8 @@ scrolling model).
 
 The camera follows focus — the minimal scroll that keeps the focused panel
 fully visible with one gap of margin — and pans 1:1 under a horizontal
-trackpad scroll.
+trackpad scroll. A touch pan is free while the fingers are down and
+magnetises on release to the nearest column alignment.
 
 ## Placement
 
