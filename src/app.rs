@@ -2079,7 +2079,16 @@ impl Stage {
                 continue;
             };
             let r = to_screen(pa.rect());
-            let alpha = pa.alpha.value();
+            // The strip belongs to the column, not to one tab: during a
+            // crossfade the outgoing+incoming alphas sum to ~1, so the strip
+            // holds steady; when a column first appears it still fades in.
+            let alpha = col
+                .panels
+                .iter()
+                .filter_map(|pid| state.anim.panels.get(pid))
+                .map(|pa| pa.alpha.value())
+                .sum::<f64>()
+                .min(1.0);
             let strip = rect(
                 r.pos.x,
                 r.pos.y - theme::TAB_GAP - theme::TAB_H,
