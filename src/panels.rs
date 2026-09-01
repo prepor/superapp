@@ -165,6 +165,55 @@ script_mod! {
         }
     }
 
+    /** Selectable body text (CR-003): makepad's TextInput held read-only and
+        stripped of every field affordance — no well, no border, no caret —
+        so it reads exactly as an `SLabel` but can be dragged over,
+        double-clicked and copied. Editing is impossible, and a read-only
+        input gates off `Hit::TextInput`, so it cannot swallow a panel's
+        letters; copy still arrives as a platform TextCopy hit. */
+    mod.widgets.SText = TextInputFlat {
+        width: Fill, height: Fit
+        padding: 0
+        margin: 0
+        empty_text: ""
+        is_read_only: true
+        draw_bg +: {
+            border_size: 0.0
+            color: #00000000
+            color_hover: #00000000
+            color_focus: #00000000
+            color_down: #00000000
+            color_empty: #00000000
+            color_disabled: #00000000
+            border_color: #00000000
+            border_color_hover: #00000000
+            border_color_focus: #00000000
+            border_color_down: #00000000
+            border_color_empty: #00000000
+            border_color_disabled: #00000000
+        }
+        draw_text +: {
+            color: #141414
+            color_hover: #141414
+            color_focus: #141414
+            color_down: #141414
+            color_empty: #141414
+            color_empty_hover: #141414
+            color_empty_focus: #141414
+            color_disabled: #141414
+            text_style: mod.widgets.SMonoStyle{}
+        }
+        // Nothing is being typed, so the caret never shows.
+        draw_cursor +: { color: #00000000 }
+        draw_selection +: {
+            color: #00000020
+            color_hover: #00000020
+            color_focus: #00000020
+            color_down: #00000020
+            color_empty: #00000000
+        }
+    }
+
     /** The bordered side-effect button (the design language's one button). */
     mod.widgets.SBtn = ButtonFlat {
         width: Fit, height: Fit
@@ -207,9 +256,18 @@ script_mod! {
         View {
             width: Fill, height: Fit
             align: Align{y: 0.5}
-            email_lbl := mod.widgets.SLabel { text: "" }
+            email_lbl := mod.widgets.SText { width: Fit, is_multiline: false }
             View { width: 12, height: 1 }
-            host_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+            host_lbl := mod.widgets.SText {
+                width: Fit
+                is_multiline: false
+                draw_text +: {
+                    color: #909090
+                    color_hover: #909090
+                    color_focus: #909090
+                    color_down: #909090
+                }
+            }
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
@@ -515,12 +573,20 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 60, text: "TO" }
-            to_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+            to_lbl := mod.widgets.SText {
+                is_multiline: false
+                draw_text +: {
+                    color: #909090
+                    color_hover: #909090
+                    color_focus: #909090
+                    color_down: #909090
+                }
+            }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 60, text: "DATE" }
-            date_lbl := mod.widgets.SLabel { text: "" }
+            date_lbl := mod.widgets.SText { is_multiline: false }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
         status_lbl := mod.widgets.SLabel {
@@ -532,7 +598,7 @@ script_mod! {
         body_scroll := View {
             width: Fill, height: Fill
             scroll_bars: ScrollBars{ show_scroll_x: false }
-            body_lbl := mod.widgets.SLabel { width: Fill, height: Fit, text: "" }
+            body_lbl := mod.widgets.SText { is_multiline: true }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -643,8 +709,8 @@ impl AccountRowRef {
         };
         row.account_id = a.id;
         let host = a.imap_host.clone().unwrap_or_default();
-        row.view.label(cx, ids!(email_lbl)).set_text(cx, &a.email);
-        row.view.label(cx, ids!(host_lbl)).set_text(
+        row.view.text_input(cx, ids!(email_lbl)).set_text(cx, &a.email);
+        row.view.text_input(cx, ids!(host_lbl)).set_text(
             cx,
             if host.is_empty() { "local demo" } else { &host },
         );
@@ -1378,9 +1444,10 @@ impl Widget for MessagePanel {
                         },
                         false,
                     );
-                    self.view.label(cx, ids!(to_lbl)).set_text(cx, &m.to);
+                    // Selectable now, so they are TextInputs, not labels.
+                    self.view.text_input(cx, ids!(to_lbl)).set_text(cx, &m.to);
                     self.view
-                        .label(cx, ids!(date_lbl))
+                        .text_input(cx, ids!(date_lbl))
                         .set_text(cx, &mail::fmt_date(m.head.date));
                     let (ok_l, err_l) = (
                         self.view.label(cx, ids!(status_lbl)),
@@ -1402,7 +1469,7 @@ impl Widget for MessagePanel {
                             err_l.set_visible(cx, false);
                         }
                     }
-                    self.view.label(cx, ids!(body_lbl)).set_text(cx, &m.body);
+                    self.view.text_input(cx, ids!(body_lbl)).set_text(cx, &m.body);
                     let (newer, older) = mail::neighbours(&p.store, id);
                     let nl = self.view.link(cx, ids!(newer_link));
                     let no = self.view.label(cx, ids!(newer_off));

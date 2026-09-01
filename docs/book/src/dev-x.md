@@ -78,8 +78,10 @@ shot inbox          # e2e/out/inbox.png
 click "reply"       # label substring, case-insensitive
 cmdclick "Q3"       # cmd held: fresh un-joined panel
 key cmd+shift+left  # chords; plain letters flow as text, like real typing
-key j 45            # optional repeat count
+key down 45         # optional repeat count
+key cmd+a           # a panel accelerator (every letter parses)
 type "hello"
+drag "mail body" 420 0   # press-drag-release: text selection (see below)
 key cmd+3           # digits work: workspace chords
 key cmd 2           # a bare modifier taps (down+up); ×2 = double-cmd, the launcher
 swipe "inbox" 0 -160   # one-finger touch drag from the element's centre
@@ -105,6 +107,17 @@ line through the real signal path — then remove), `e2e/send.txt` walks the
 send window (run with `--send-delay 1`: cancel inside the window, an
 honest no-smtp failure, cmd+z reopening the draft), and `e2e/history.txt`
 walks the history overlay (travel back, to the beginning, and forward).
+`e2e/keys.txt` drives every panel accelerator, asserting through label
+resolution — a walk that lands on the wrong mail fails the run, no picture
+needed — and `e2e/select.txt` covers selectable content.
+
+`drag` is weaker than it looks: drag-selection runs on `Hit::FingerMove`,
+which fires only for the area that **captured** the finger, and that
+capture is platform state the harness never establishes. So a scripted drag
+proves the run is addressable and that dragging breaks nothing — never that
+a selection appeared. Keyboard selection (`cmd+a`) needs no capture and is
+the assertion to reach for; drag-select itself belongs to a real mouse or
+`e2e/cgpost.c`.
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
 rows (by subject) and panel titles. Steps that mutate the workspace need a

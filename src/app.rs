@@ -2139,6 +2139,27 @@ impl Stage {
                     eprintln!("e2e: type {s:?}");
                     self.handle_text(cx, &s);
                 }
+                e2e::Step::Drag { label, dx, dy } => {
+                    let needle = label.to_lowercase();
+                    // From the left edge, so a horizontal drag sweeps the
+                    // run rather than starting halfway through it.
+                    let c = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| h.label.to_lowercase().contains(&needle))
+                        .map(|h| dvec2(h.rect.pos.x + 2.0, h.rect.pos.y + h.rect.size.y / 2.0));
+                    match c {
+                        Some(c) => {
+                            eprintln!("e2e: drag {label:?} by ({dx}, {dy})");
+                            self.synth_drag(cx, c, dvec2(c.x + dx, c.y + dy));
+                        }
+                        None => {
+                            eprintln!("e2e: FAIL drag {label:?}: no matching element");
+                            runner.failures += 1;
+                        }
+                    }
+                }
                 e2e::Step::Swipe { label, dx, dy } => {
                     let needle = label.to_lowercase();
                     let c = self
@@ -3785,6 +3806,41 @@ impl Stage {
         self.forward_to_hosted(cx, &up);
     }
 
+    /// A press-drag-release, the gesture text selection is made of. The
+    /// moves carry PRIMARY down so the widget reads them as a drag.
+    fn synth_drag(&mut self, cx: &mut Cx, from: DVec2, to: DVec2) {
+        let down = Event::MouseDown(MouseDownEvent {
+            abs: from,
+            button: MouseButton::PRIMARY,
+            window_id: CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(),
+            handled: std::cell::Cell::new(Area::Empty),
+            time: 0.0,
+        });
+        self.forward_to_hosted(cx, &down);
+        for i in 1..=8 {
+            let f = f64::from(i) / 8.0;
+            let p = from + (to - from) * f;
+            let mv = Event::MouseMove(MouseMoveEvent {
+                abs: p,
+                window_id: CxWindowPool::id_zero(),
+                modifiers: KeyModifiers::default(),
+                time: f * 0.1,
+                handled: std::cell::Cell::new(Area::Empty),
+                lock_delta: Default::default(),
+            });
+            self.forward_to_hosted(cx, &mv);
+        }
+        let up = Event::MouseUp(MouseUpEvent {
+            abs: to,
+            button: MouseButton::PRIMARY,
+            window_id: CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(),
+            time: 0.2,
+        });
+        self.forward_to_hosted(cx, &up);
+    }
+
     /// Whether the focused panel's content is a retained widget tree —
     /// keys and text then belong to it, not to the char-grid machinery.
     fn hosted_focus(&self) -> bool {
@@ -5134,6 +5190,26 @@ impl Stage {
                                 ));
                             }
                         }
+                        // The row's selectable runs (CR-003).
+                        for (path, text) in [
+                            (ids!(email_lbl), accounts.get(*idx).map(|a| a.email.clone())),
+                            (
+                                ids!(host_lbl),
+                                accounts.get(*idx).map(|a| {
+                                    a.imap_host
+                                        .clone()
+                                        .filter(|h| !h.is_empty())
+                                        .unwrap_or_else(|| "local demo".into())
+                                }),
+                            ),
+                        ] {
+                            let rr = item.widget.widget(cx, path).area().rect(cx);
+                            if rr.size.x > 0.0 {
+                                if let Some(t) = text {
+                                    reg.push((t, rr, Act::Pointer(pid)));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5240,6 +5316,19 @@ impl Stage {
                     "reply".into(),
                     Act::Open(pid, Kind::Compose { re: id }),
                 );
+                // The selectable runs (CR-003). Registered like any hosted
+                // field: scripts drag them, and a real click on one keeps
+                // the key focus the TextInput just took.
+                for (label, path) in [
+                    ("mail body", ids!(body_lbl)),
+                    ("mail to", ids!(to_lbl)),
+                    ("mail date", ids!(date_lbl)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
             }
             Some(Kind::Contact { email }) => {
                 let r = w.widget(cx, ids!(from_link)).area().rect(cx);

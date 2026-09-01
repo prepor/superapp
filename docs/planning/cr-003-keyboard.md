@@ -122,6 +122,26 @@ Two facts make it safe:
 Applied to: the message body, the from/to/date headers, and the settings
 account rows.
 
+### What the harness can and cannot prove (2026-09-01)
+
+A `drag` step was added — mouse down, eight moves, up — and it does not
+select anything. The reason is CR-002's lesson arriving in a new place:
+drag-selection runs on `Hit::FingerMove`, which fires only for the area
+that **captured** the finger, and that capture is platform state the
+harness never establishes. Synthesized moves land in the widget with no
+capture behind them.
+
+So the suite splits its claims: `drag` is a smoke test (the runs are
+addressable, dragging them breaks nothing), and **`cmd+a` is the real
+assertion** — keyboard selection needs no capture, and the wash it leaves
+proves `SText` selects and paints, *including inside a PortalList item*,
+which was the risk worth checking. Drag-select itself is verifiable only by
+a real mouse or `e2e/cgpost.c`.
+
+(The slept-display failure mode this ran into — every shot *could not create
+image from window* — is already in [Developer
+Experience](../book/src/dev-x.md); `caffeinate -du` around a run.)
+
 ## Costs, named honestly
 
 - **Cmd is busier.** The reserved set is now something a panel author must
