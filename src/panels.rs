@@ -23,12 +23,39 @@ pub struct PanelProps {
     pub kind: crate::core::Kind,
 }
 
+/// One row of a modal overlay, already reduced to what it draws. The shell
+/// assembles these per draw — overlays read no store of their own.
+#[derive(Clone, Default)]
+pub struct OverlayRowData {
+    /// The big left-hand number (workspaces) — empty elsewhere.
+    pub num: String,
+    /// The row's subject: a workspace summary, an action label, a hit.
+    pub main: String,
+    /// Dimmed trailing text on the same line (a launcher hit's detail).
+    pub detail: String,
+    /// Right-aligned: a date, a workspace badge.
+    pub right: String,
+    /// Inverted: the current workspace, the selected hit, the DAG's head.
+    pub current: bool,
+    /// Undone history branches draw muted but stay walkable.
+    pub muted: bool,
+}
+
+/// What an overlay widget draws. Assembled by the shell each frame from the
+/// workspace roster, the undo DAG, or the launcher's live search.
+#[derive(Clone, Default)]
+pub struct OverlayProps {
+    pub rows: Vec<OverlayRowData>,
+    /// The launcher's query, pushed into the field when the overlay opens.
+    pub query: String,
+}
+
 /// Intent bubbled from panel widgets to the shell. The shell owns turning
 /// these into undoable store actions.
 #[derive(Debug, Clone)]
 pub enum PanelAction {
     AddAccount {
-        /// The settings panel that submitted (its form clears on success).
+        /// The add-account panel that submitted (its form clears on success).
         pid: u64,
         email: String,
         pass: String,
@@ -57,6 +84,9 @@ pub enum PanelAction {
         dotted: bool,
         fresh: bool,
     },
+    /// Help's demo button: the one side effect that does nothing, so the
+    /// legend can show what a button is without moving anything.
+    TryIt { pid: u64 },
 }
 
 script_mod! {
@@ -70,11 +100,71 @@ script_mod! {
     // Sizes mirror theme.rs: FONT_SIZE 10.5 body, LABEL_SIZE 8.25 labels —
     // the same numbers the char-grid renderer draws with, so migrated and
     // unmigrated panels read as one app.
+    // The one face, carried rather than borrowed. Menlo fronted the family
+    // until HTML mail asked it for a weight it does not have: Menlo.ttc
+    // yields only its regular face, so `<b>` drew as body text. It was
+    // also macOS furniture — the Fold never had it and fell through to
+    // Liberation, so "the app's face" was already two faces depending on
+    // which screen you read it from.
+    //
+    // Geist Mono replaces it on both, from `resources/` (OFL, shipped
+    // alongside in OFL.txt). It is 0.600 em wide against Menlo's 0.6021,
+    // so the character grid moves by a third of a percent — and that is
+    // Liberation's ratio to four places, so the Fold has been drawing this
+    // width all along. macOS is the side that changes.
+    //
+    // Two files, four styles: both faces are variable on `wght` (100–900),
+    // and the second is a true italic rather than a slant. makepad has no
+    // synthetic oblique — `FontMember` exposes only `weight`, and nothing
+    // in `TextStyle` skews — so italic could only ever come from its own
+    // file. The `[wght]` of the upstream filenames is dropped because the
+    // brackets are awkward in a resource path; the fonts are unmodified.
     mod.widgets.SMonoStyle = TextStyle{
         font_family: FontFamily{
-            latin := FontMember{res: file_resource("/System/Library/Fonts/Menlo.ttc") asc: 0.0 desc: 0.0}
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0}
             fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
             symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** The same face leaning on its weight axis. This is what retired the
+        char grid's fake bold: unread rows, contact headers and the
+        accelerator marks were all the same run drawn two or three times,
+        each copy nudged a fraction of a pixel, because Menlo had no weight
+        to ask for. See `SBoldLabel`. */
+    mod.widgets.SMonoBoldStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** The drawn italic, not a skewed roman: Geist Mono ships its own. */
+    mod.widgets.SMonoItalicStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** Both at once — `<b><i>`, and the `<em>` inside a heading. */
+    mod.widgets.SMonoBoldItalicStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
         }
         font_size: 10.5
         line_spacing: 1.0
@@ -98,14 +188,14 @@ script_mod! {
         }
     }
 
-    /** Fake-bold text, the char grid's way: the same run twice, the twin
-        nudged 0.4 px — Menlo ships no variable weight to ask for. */
-    mod.widgets.SBold = set_type_default() do #(SBold::register_widget(vm)) {
-        ..mod.widgets.View
-        width: Fit, height: Fit
-        flow: Overlay
-        a := mod.widgets.SLabel { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
-        b := mod.widgets.SLabel { width: Fill, margin: Inset{left: 0.4}, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
+    /** Body text at the family's bold weight.
+
+        This used to be a widget that drew the same run twice with the twin
+        nudged 0.4 px, because Menlo ships no weight to ask for. Geist Mono
+        does, so the trick is gone and with it the overlays, the twin
+        labels and the pair of set_texts each one needed. */
+    mod.widgets.SBoldLabel = mod.widgets.SLabel {
+        draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
     }
 
     /** The flat monochrome text field: white well, hairline border that
@@ -214,6 +304,72 @@ script_mod! {
         }
     }
 
+    /** An HTML mail body, in the app's one face.
+
+        makepad's `Html` draws a semantic vocabulary and no CSS, which is
+        the whole reason it suits this app: a sender's brand colours never
+        arrive to fight the monochrome, because there is no mechanism by
+        which they could. What arrives is structure — lists, quotes,
+        emphasis, links — drawn in Menlo at body size like everything else.
+        [`crate::html`] narrows the letter to this vocabulary first.
+
+        Links need no colour: `HtmlLink` underlines, and in this app the
+        underline *is* the link (CR-003's grammar), so they read correctly
+        in plain #141414.
+
+        Emphasis is real: `<b>` is the weight axis and `<i>` is Geist
+        Mono's drawn italic, so the four `text_style_*` slots are four
+        actual faces rather than one face repeated (see `SMonoStyle`). */
+    mod.widgets.SHtml = Html {
+        width: Fill, height: Fit
+        padding: 0
+        margin: 0
+        // The body is prose, and CR-003 made prose selectable.
+        selectable: true
+
+        font_size: 10.5
+        font_color: #141414
+        draw_text +: { color: #141414 }
+
+        text_style_normal: mod.widgets.SMonoStyle{}
+        text_style_italic: mod.widgets.SMonoItalicStyle{}
+        text_style_bold: mod.widgets.SMonoBoldStyle{}
+        text_style_bold_italic: mod.widgets.SMonoBoldItalicStyle{}
+        text_style_fixed: mod.widgets.SMonoStyle{}
+
+        // `-` for the nested level: `•` comes from the symbol fallback,
+        // whose advance is not the mono cell, and two of them stacked read
+        // as a smudge rather than a hierarchy.
+        ul_markers: ["•", "-"]
+        ol_separator: "."
+
+        a := mod.widgets.HtmlLink {
+            color: #141414
+            pressed_color: #5a5a5a
+        }
+
+        // The wash SText already wears. `Html` is its own widget type, not
+        // a `TextFlow` derivation, so it inherits none of `TextFlowBase`'s
+        // theming — including `draw_call_group`, without which the quad
+        // merges into the call that paints under the panel background and
+        // the selection never appears (CR-002's sixth defect, again).
+        draw_selection +: {
+            draw_call_group: @selection
+            color: #00000020
+        }
+
+        draw_block +: {
+            line_color: #141414
+            sep_color: #dcdcdc
+            quote_bg_color: #f4f4f4
+            quote_fg_color: #141414
+            code_color: #f4f4f4
+            table_border_color: #dcdcdc
+            table_header_bg_color: #f4f4f4
+            selection_color: #00000020
+        }
+    }
+
     /** The bordered side-effect button (the design language's one button). */
     mod.widgets.SBtn = ButtonFlat {
         width: Fit, height: Fit
@@ -242,6 +398,121 @@ script_mod! {
             color_focus: #141414
             color_disabled: #909090
             text_style: mod.widgets.SMonoStyle{font_size: 8.25}
+        }
+    }
+
+    /** The link grammar as a widget: label over a 1 px underline — solid
+        opens joined, dotted replaces in place (the dashes are shader-drawn). */
+    mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Down
+        cursor: MouseCursor.Hand
+        // The label is split so one character can carry the accelerator
+        // mark (CR-003): prefix, the key, suffix. The split stays even now
+        // that the key is real bold — `←` arrives from the symbol
+        // fallback, whose advance is not the mono cell, so padding a twin
+        // with spaces would not line up.
+        // Label's base padding is mspace_1 — invisible around a single run,
+        // but it would open a gap between each of the three, so the split
+        // parts zero it and the row carries the word's own spacing.
+        row := View {
+            width: Fit, height: Fit
+            flow: Right
+            pre := mod.widgets.SLabel { padding: 0, text: "" }
+            // One pass. It took three nudged copies to make a single
+            // character read as bold at this size; the weight axis does it
+            // properly.
+            key := mod.widgets.SBoldLabel { padding: 0, text: "" }
+            post := mod.widgets.SLabel { padding: 0, text: "" }
+        }
+        // The solid underline needs its own `pixel` for the same reason the
+        // row wash does (CR-002's sixth defect): a stock-shader quad merges
+        // into a draw call that paints *under* the panel background, so it
+        // never appears. A distinct shader earns a correctly-ordered call.
+        ul := View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        ul_dotted := View {
+            visible: false
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                // `Math` carries only rotate_2d/random_2d on this pin, so
+                // the period comes from fract, not a mod that never
+                // compiled (and so never dashed anything).
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if fract(x / 6.0) > 0.5 {
+                        return vec4(0.0, 0.0, 0.0, 0.0)
+                    }
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** A key cap: the char grid's `Seg::Kbd` as a widget — a hairline box
+        around the key's name, sized to it. Built on ButtonFlat because it
+        carries `text` on the instance (a named child's properties cannot be
+        overridden per instance at this makepad generation: the override
+        parses and is silently dropped). It is inert by construction — no
+        action reads it, and it never takes key focus. */
+    mod.widgets.SKbd = ButtonFlat {
+        width: Fit, height: Fit
+        margin: Inset{left: 1, right: 1}
+        padding: Inset{left: 4, right: 4, top: 1, bottom: 1}
+        grab_key_focus: false
+        draw_bg +: {
+            border_radius: 1.0
+            border_size: 1.0
+            color: #ffffff
+            color_hover: #ffffff
+            color_down: #ffffff
+            color_focus: #ffffff
+            color_disabled: #ffffff
+            border_color: #5a5a5a
+            border_color_hover: #5a5a5a
+            border_color_down: #5a5a5a
+            border_color_focus: #5a5a5a
+            border_color_disabled: #5a5a5a
+        }
+        draw_text +: {
+            color: #5a5a5a
+            color_hover: #5a5a5a
+            color_down: #5a5a5a
+            color_focus: #5a5a5a
+            color_disabled: #5a5a5a
+            text_style: mod.widgets.SMonoStyle{font_size: 8.25}
+        }
+    }
+
+    /** One line of prose: children laid out left to right, shared baseline. */
+    mod.widgets.SRow = View {
+        width: Fill, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{top: 1, bottom: 1}
+    }
+
+    /** The hairline under a section label. */
+    mod.widgets.SRule = View {
+        width: Fill, height: 1
+        margin: Inset{top: 3, bottom: 5}
+        show_bg: true
+        draw_bg +: {
+            color: #141414
+            pixel: fn() {
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
         }
     }
 
@@ -295,8 +566,8 @@ script_mod! {
         }
     }
 
-    /** The settings panel: accounts fill the middle; the add form keeps a
-        compact, fixed shape at the bottom. */
+    /** The settings panel: the accounts and their sync state, then the link
+        to the form (solid: the add-account panel opens joined to the right). */
     mod.widgets.SettingsPanel = set_type_default() do #(SettingsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -310,17 +581,26 @@ script_mod! {
 
         accounts_list := PortalList {
             // PortalList virtualizes against a fixed viewport (Fit would
-            // collapse it) — so it takes whatever the form leaves.
+            // collapse it) — so it fills the panel above the link.
             width: Fill, height: Fill
             flow: Down
             account_row := mod.widgets.AccountRow {}
         }
 
-        View { width: Fill, height: 14 }
-        mod.widgets.SSection { text: "ADD ACCOUNT" }
-        View { width: Fill, height: 5 }
-        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
-        View { width: Fill, height: 10 }
+        // The link belongs to the content, not to the section label: a
+        // heading row is not where this language puts navigation.
+        View { width: Fill, height: 8 }
+        add_link := mod.widgets.SLink {}
+    }
+
+    /** The add-account form, a panel of its own: four labelled fields and
+        the one button, top-aligned in a compact panel. */
+    mod.widgets.AddAccountPanel = set_type_default() do #(AddAccountPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -335,7 +615,12 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "PASSWORD" }
-            pass_input := mod.widgets.SField { is_password: true }
+            pass_input := mod.widgets.SField {
+                is_password: true
+                // The placeholder carries the one hint worth keeping (the
+                // masking skips empty text — it renders plain).
+                empty_text: "app password"
+            }
         }
         View { width: Fill, height: 7 }
         View {
@@ -360,11 +645,7 @@ script_mod! {
         }
         View { width: Fill, height: 12 }
         View {
-            width: Fill, height: Fit, align: Align{y: 0.5}
-            hint_lbl := mod.widgets.SLabel {
-                text: "an app password — tab walks, enter submits"
-                draw_text +: { color: #909090, text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
-            }
+            width: Fill, height: Fit
             View { width: Fill, height: 1 }
             add_btn := mod.widgets.SBtn { text: "add account" }
         }
@@ -438,7 +719,10 @@ script_mod! {
                 from_lbl := mod.widgets.SLabel {
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
-                from_b := mod.widgets.SBold { visible: false, width: Fill }
+                from_b := mod.widgets.SBoldLabel {
+                    visible: false
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
             }
             View { width: 10, height: 1 }
             date_lbl := mod.widgets.SLabel {
@@ -448,7 +732,10 @@ script_mod! {
         subject_lbl := mod.widgets.SLabel {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
-        subject_b := mod.widgets.SBold { visible: false, width: Fill }
+        subject_b := mod.widgets.SBoldLabel {
+            visible: false
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
     }
 
     mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
@@ -518,71 +805,7 @@ script_mod! {
         }
     }
 
-    // ---- links and the read panels ----------------------------------------
-
-    /** The link grammar as a widget: label over a 1 px underline — solid
-        opens joined, dotted replaces in place (the dashes are shader-drawn). */
-    mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
-        ..mod.widgets.View
-        width: Fit, height: Fit
-        flow: Down
-        cursor: MouseCursor.Hand
-        // The label is split so one character can carry the accelerator
-        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
-        // beats padding a twin with spaces — `←` arrives from the symbol
-        // fallback, whose advance is not the mono cell.
-        // Label's base padding is mspace_1 — invisible around a single run,
-        // but it would open a gap between each of the three, so the split
-        // parts zero it and the row carries the word's own spacing.
-        row := View {
-            width: Fit, height: Fit
-            flow: Right
-            pre := mod.widgets.SLabel { padding: 0, text: "" }
-            // Three passes, not the usual two: one nudge is legible in a
-            // run of body text but disappears in a short label, and the
-            // mark has to read at a glance to be worth anything.
-            key := View {
-                width: Fit, height: Fit
-                flow: Overlay
-                k1 := mod.widgets.SLabel { padding: 0, text: "" }
-                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
-                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
-            }
-            post := mod.widgets.SLabel { padding: 0, text: "" }
-        }
-        // The solid underline needs its own `pixel` for the same reason the
-        // row wash does (CR-002's sixth defect): a stock-shader quad merges
-        // into a draw call that paints *under* the panel background, so it
-        // never appears. A distinct shader earns a correctly-ordered call.
-        ul := View {
-            width: Fill, height: 1
-            show_bg: true
-            draw_bg +: {
-                color: #141414
-                pixel: fn() {
-                    return vec4(self.color.xyz * self.color.w, self.color.w)
-                }
-            }
-        }
-        ul_dotted := View {
-            visible: false
-            width: Fill, height: 1
-            show_bg: true
-            draw_bg +: {
-                color: #141414
-                // `Math` carries only rotate_2d/random_2d on this pin, so
-                // the period comes from fract, not a mod that never
-                // compiled (and so never dashed anything).
-                pixel: fn() {
-                    let x = self.pos.x * self.rect_size.x
-                    if fract(x / 6.0) > 0.5 {
-                        return vec4(0.0, 0.0, 0.0, 0.0)
-                    }
-                    return vec4(self.color.xyz * self.color.w, self.color.w)
-                }
-            }
-        }
-    }
+    // ---- the read panels ---------------------------------------------------
 
     /** One mail, whole: headers with a contact link, the body, the walk. */
     mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
@@ -622,10 +845,24 @@ script_mod! {
         status_err_lbl := mod.widgets.SLabel {
             visible: false, text: "", draw_text +: { color: #a01500 }
         }
+        // Two readings of one letter; the panel shows whichever the mail
+        // actually carries, never both. Each sits in its own View because
+        // that is the widget that honours `visible` — neither `Html` nor
+        // `TextInput` carries one, so hiding either directly is a silent
+        // no-op, and the previous mail reads on under the next.
         body_scroll := View {
             width: Fill, height: Fill
+            flow: Down
             scroll_bars: ScrollBars{ show_scroll_x: false }
-            body_lbl := mod.widgets.SText { is_multiline: true }
+            text_wrap := View {
+                width: Fill, height: Fit
+                body_lbl := mod.widgets.SText { is_multiline: true }
+            }
+            html_wrap := View {
+                width: Fill, height: Fit
+                visible: false
+                body_html := mod.widgets.SHtml {}
+            }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -652,14 +889,10 @@ script_mod! {
         spacing: 6
 
         View {
-            width: Fill, height: Fit, flow: Overlay
-            name_lbl := mod.widgets.SLabel {
+            width: Fill, height: Fit
+            name_lbl := mod.widgets.SBoldLabel {
                 width: Fill
-                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
-            }
-            name_lbl2 := mod.widgets.SLabel {
-                width: Fill, margin: Inset{left: 0.4}
-                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+                draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
             }
         }
         email_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
@@ -668,37 +901,316 @@ script_mod! {
         View { width: Fill, height: 6 }
         from_link := mod.widgets.SLink {}
     }
-}
 
-// ---------------------------------------------------------------------------
-// SBold
-// ---------------------------------------------------------------------------
+    // ---- help and about ----------------------------------------------------
 
-/// The char grid's fake bold as a widget: the same text on two overlaid
-/// labels, the twin nudged 0.4 px right.
-#[derive(Script, ScriptHook, Widget)]
-pub struct SBold {
-    #[source]
-    source: ScriptObjectRef,
-    #[deref]
-    view: View,
-}
+    /** The manual, and the design language's own showcase: every grammar it
+        describes is drawn with the widget that implements it — the links
+        really open and replace, the button really fires a side effect, the
+        key caps are the same `SKbd` the rest of the app would use.
 
-impl Widget for SBold {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
+        Platform-specific rows are all here and hidden per target in
+        `HelpPanel::draw_walk` (the DSL cannot see `cfg!`). */
+    mod.widgets.HelpPanel = set_type_default() do #(HelpPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        scroll_bars: ScrollBars{ show_scroll_x: false }
+
+        mod.widgets.SSection { text: "LEGEND" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            solid_link := mod.widgets.SLink {}
+            mod.widgets.SLabel { text: " — opens a panel to the right, joined" }
+        }
+        mod.widgets.SRow {
+            dotted_link := mod.widgets.SLink {}
+            mod.widgets.SLabel { text: " — replaces this panel in place" }
+        }
+        mod.widgets.SRow {
+            try_btn := mod.widgets.SBtn { text: "button" }
+            mod.widgets.SLabel { text: " — side effect only, never navigation" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SLabel { text: "+click / " }
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "enter" }
+            mod.widgets.SLabel { text: " — always a fresh, un-joined panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "a ═ bridge marks a joined pair: the next solid link in the parent replaces the joined panel; replacing a panel closes its joined chain" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "color is reserved for errors: " }
+            mod.widgets.SLabel { text: "like this", draw_text +: { color: #a01500 } }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "KEYS" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SLabel { text: "+arrows — focus panels" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+same — move the panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "w" }
+            mod.widgets.SLabel { text: " — close the focused panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "z" }
+            mod.widgets.SLabel { text: " — undo (open, close, move, archive…)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SKbd { text: "z" }
+            mod.widgets.SLabel { text: " — redo" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "u" }
+            mod.widgets.SLabel { text: " — history: the whole tree, walkable" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "i" }
+            mod.widgets.SLabel { text: " — copy the panel's context (its queries)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "[" }
+            mod.widgets.SKbd { text: "]" }
+            mod.widgets.SLabel { text: " — consume into / expel out of a column" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "," }
+            mod.widgets.SKbd { text: "." }
+            mod.widgets.SLabel { text: " — pull from the right / push bottom out" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "t" }
+            mod.widgets.SLabel { text: " — column tabs (click a tab or cmd+↑/↓)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "a control wearing a bold letter is cmd+that letter:" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  message " }
+            mod.widgets.SKbd { text: "cmd+a" }
+            mod.widgets.SLabel { text: "rchive " }
+            mod.widgets.SKbd { text: "cmd+r" }
+            mod.widgets.SLabel { text: "eply " }
+            mod.widgets.SKbd { text: "cmd+n" }
+            mod.widgets.SLabel { text: "/" }
+            mod.widgets.SKbd { text: "cmd+o" }
+            mod.widgets.SLabel { text: " walk" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  inbox " }
+            mod.widgets.SKbd { text: "cmd+r" }
+            mod.widgets.SLabel { text: "efresh  " }
+            mod.widgets.SKbd { text: "enter" }
+            mod.widgets.SLabel { text: " opens  " }
+            mod.widgets.SKbd { text: "/" }
+            mod.widgets.SLabel { text: " filters  arrows walk the rows" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "esc" }
+            mod.widgets.SLabel { text: " leaves a text field" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "trackpad: scroll the strip and the panels" }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "WORKSPACES" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "1" }
+            mod.widgets.SLabel { text: "…" }
+            mod.widgets.SKbd { text: "9" }
+            mod.widgets.SLabel { text: " — switch workspace" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+№ — move the panel there" }
+        }
+        menu_row := mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "the menu bar lists them; [n] is current" }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "LAUNCHER" }
+        mod.widgets.SRule {}
+        desk_launch := View {
+            width: Fill, height: Fit, flow: Down
+            mod.widgets.SRow {
+                mod.widgets.SKbd { text: "cmd" }
+                mod.widgets.SKbd { text: "cmd" }
+                mod.widgets.SLabel { text: " — the launcher: search everything" }
+            }
+            mod.widgets.SRow {
+                mod.widgets.SLabel { width: Fill, text: "type to find panels, mail, people; enter goes to it — or opens it fresh" }
+            }
+        }
+        touch_launch := View {
+            visible: false
+            width: Fill, height: Fit, flow: Down
+            mod.widgets.SRow {
+                mod.widgets.SLabel { width: Fill, text: "the overlay's search row opens it: find open panels, mail, people" }
+            }
+        }
+
+        touch_help := View {
+            visible: false
+            width: Fill, height: Fit, flow: Down
+            View { width: Fill, height: 10 }
+            mod.widgets.SSection { text: "TOUCH" }
+            mod.widgets.SRule {}
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "tap — follow links, press buttons" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "drag — scroll a panel's content" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers — scroll the workspace" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers down — workspaces overlay" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "hold a header — pick the panel up; drop on a column to stack, between columns for a fresh one" } }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "TRY" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "1. click a subject — a message opens, joined (bridge)" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "2. click another subject — it replaces the joined message" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "3. from → contact joins the chain; the next subject click closes the chain" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "4. cmd+shift+← the message — moved away, it un-joins" } }
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.view.draw_walk(cx, scope, walk)
-    }
-}
+    /** The colophon. */
+    mod.widgets.AboutPanel = set_type_default() do #(AboutPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 2
 
-impl SBoldRef {
-    pub fn set_text(&self, cx: &mut Cx, text: &str) {
-        let Some(inner) = self.borrow() else { return };
-        inner.view.label(cx, ids!(a)).set_text(cx, text);
-        inner.view.label(cx, ids!(b)).set_text(cx, text);
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "superapp — rust + makepad prototype." } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "no apps, no windows: specialized panels" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "on one scrolling gridded workspace." } }
+        View { width: Fill, height: 8 }
+        mod.widgets.SRow { help_link := mod.widgets.SLink {} }
+    }
+
+    // ---- the modal overlays ------------------------------------------------
+
+    /** One overlay row: a bordered card, inverted while current. The
+        shell registers the click (rows live in a PortalList, whose item
+        areas go stale mid-gesture — CR-002's fifth defect), so this is
+        presentation only. */
+    /** The card, in the one shape both variants share. A hand-drawn 1 px
+        frame on its own shader — a stock-shader quad merges into a call
+        that paints under the wash (CR-002's sixth defect). */
+    mod.widgets.OverlayCard = View {
+        width: Fill, height: 40
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{left: 16, right: 16}
+        show_bg: true
+        draw_bg +: {
+            color: #ffffff
+            border_color: #141414
+            pixel: fn() {
+                let p = self.pos * self.rect_size
+                if p.x < 1.0 || p.y < 1.0
+                    || p.x > self.rect_size.x - 1.0
+                    || p.y > self.rect_size.y - 1.0 {
+                    return vec4(self.border_color.xyz, 1.0)
+                }
+                return vec4(self.color.xyz, 1.0)
+            }
+        }
+        num_lbl := mod.widgets.SLabel {
+            width: Fit, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+        }
+        num_gap := View { width: 20, height: 1, visible: false }
+        main_lbl := mod.widgets.SLabel {
+            width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
+        detail_lbl := mod.widgets.SLabel {
+            width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            margin: Inset{left: 8}
+            draw_text +: { color: #5a5a5a }
+        }
+        View { width: Fill, height: 1 }
+        right_lbl := mod.widgets.SLabel {
+            width: Fit, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
+    }
+
+    mod.widgets.OverlayRow = set_type_default() do #(OverlayRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{bottom: 8}
+        // Twin cards rather than one card recoloured: a DrawQuad's shader
+        // vars are not struct fields, so a quad's colour cannot be set at
+        // draw time — and an Overlay-flow wash never resolves its walk.
+        // Exactly one of these draws; text colours stay static in the DSL.
+        // Label colours are painted per draw (a Label's draw_text.color IS
+        // reachable); only the quad needs a twin.
+        card := mod.widgets.OverlayCard {}
+        card_inv := mod.widgets.OverlayCard {
+            visible: false
+            draw_bg +: { color: #141414, border_color: #141414 }
+        }
+    }
+
+    /** The overlay chassis: a centred column of rows over the shell's wash.
+        Workspaces and history use it bare; the launcher puts a field on top. */
+    mod.widgets.RowsOverlay = set_type_default() do #(RowsOverlay::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            row := mod.widgets.OverlayRow {}
+        }
+    }
+
+    /** The launcher: one field over the hits. The field is a real `SField`,
+        so the query has a caret, selection, and the platform IME — the char
+        grid drew a rectangle and tracked an index. */
+    mod.widgets.LauncherOverlay = set_type_default() do #(LauncherOverlay::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        query_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "search panels, mail, people…"
+            return_key_type: ReturnKeyType.Go
+            autocapitalize: AutoCapitalize.None
+            autocorrect: AutoCorrect.Disabled
+            padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
+        }
+        View { width: Fill, height: 12 }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            row := mod.widgets.OverlayRow {}
+        }
     }
 }
 
@@ -783,33 +1295,40 @@ impl RingStop {
 
     fn focus(&self, cx: &mut Cx) {
         match self {
-            RingStop::Input(t) => SettingsPanel::focus_input(cx, t),
+            RingStop::Input(t) => focus_input(cx, t),
             RingStop::Remove(b, _) | RingStop::Add(b) => cx.set_key_focus(b.area()),
         }
     }
 }
 
+/// Advance focus the way forms expect: focus + select-all, so typing
+/// replaces and backspace clears.
+fn focus_input(cx: &mut Cx, input: &TextInputRef) {
+    input.set_key_focus(cx);
+    if let Some(mut t) = input.borrow_mut() {
+        t.select_all(cx);
+    }
+}
+
+/// Walk a tab ring one step: wrap around; when the panel itself holds
+/// focus, the first Tab lands on the first stop (last, shifted).
+fn tab_ring(cx: &mut Cx, ring: &[RingStop], shift: bool) {
+    if ring.is_empty() {
+        return;
+    }
+    let dir: isize = if shift { -1 } else { 1 };
+    let n = ring.len() as isize;
+    let j = match ring.iter().position(|s| s.is_focused(cx)) {
+        Some(i) => (i as isize + dir).rem_euclid(n),
+        None if dir > 0 => 0,
+        None => n - 1,
+    };
+    ring[j as usize].focus(cx);
+}
+
 impl SettingsPanel {
-    /// Advance focus the way forms expect: focus + select-all, so typing
-    /// replaces and backspace clears.
-    pub(crate) fn focus_input(cx: &mut Cx, input: &TextInputRef) {
-        input.set_key_focus(cx);
-        if let Some(mut t) = input.borrow_mut() {
-            t.select_all(cx);
-        }
-    }
-
-    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 4] {
-        [
-            self.view.text_input(cx, ids!(email_input)),
-            self.view.text_input(cx, ids!(pass_input)),
-            self.view.text_input(cx, ids!(imap_input)),
-            self.view.text_input(cx, ids!(smtp_input)),
-        ]
-    }
-
-    /// The tab ring in visual order: remove buttons (visible account rows),
-    /// the form fields, the add button.
+    /// The tab ring in visual order: the visible account rows' remove
+    /// buttons.
     fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
         let mut v = Vec::new();
         if let Some(list) = self
@@ -829,9 +1348,102 @@ impl SettingsPanel {
                 v.push(RingStop::Remove(row.button(cx, ids!(remove_btn)), id));
             }
         }
-        for t in self.inputs(cx) {
-            v.push(RingStop::Input(t));
+        v
+    }
+}
+
+impl Widget for SettingsPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+
+        // Tab walks the remove buttons; enter/space press the focused one.
+        // The add-account link wears its own chord instead (CR-003): it is
+        // the one control this panel has exactly one of.
+        if let Event::KeyDown(k) = event {
+            if k.modifiers.logo {
+                if k.key_code == KeyCode::KeyD {
+                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                    cx.action(PanelAction::FollowLink {
+                        pid,
+                        target: crate::core::Kind::AddAccount,
+                        dotted: false,
+                        fresh: false,
+                    });
+                }
+                return;
+            }
+            if k.key_code == KeyCode::Tab {
+                let ring = self.ring(cx);
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
+            }
+            if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+                for stop in self.ring(cx) {
+                    if stop.is_focused(cx) {
+                        if let RingStop::Remove(_, id) = stop {
+                            cx.action(PanelAction::RemoveAccount(id));
+                        }
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let props = scope.props.get::<PanelProps>();
+        let pid = props.map_or(0, |p| p.pid);
+        let accounts = props.map(|p| mail::accounts(&p.store));
+        self.view.link(cx, ids!(add_link)).set_accel(
+            cx,
+            pid,
+            "add account",
+            crate::core::Kind::AddAccount,
+            false,
+            Some(ui::ACCEL_ADD_ACCOUNT),
+        );
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                let accounts = accounts.as_deref().map_or(&[][..], |a| &a[..]);
+                list.set_item_range(cx, 0, accounts.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(a) = accounts.get(idx) {
+                        let row = list.item(cx, idx, live_id!(account_row));
+                        row.as_account_row().populate(cx, a);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AddAccountPanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct AddAccountPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl AddAccountPanel {
+    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 4] {
+        [
+            self.view.text_input(cx, ids!(email_input)),
+            self.view.text_input(cx, ids!(pass_input)),
+            self.view.text_input(cx, ids!(imap_input)),
+            self.view.text_input(cx, ids!(smtp_input)),
+        ]
+    }
+
+    /// The tab ring in visual order: the fields, the add button.
+    fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
+        let mut v: Vec<RingStop> = self.inputs(cx).into_iter().map(RingStop::Input).collect();
         v.push(RingStop::Add(self.view.button(cx, ids!(add_btn))));
         v
     }
@@ -867,42 +1479,22 @@ impl SettingsPanel {
     }
 }
 
-impl Widget for SettingsPanel {
+impl Widget for AddAccountPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
-        // Tab walks the whole ring — fields AND buttons — with the
-        // frameworks' rules: wrap around; when the panel itself holds
-        // focus, the first Tab lands on the first stop (last, shifted).
-        // Enter/Space press a focused button.
+        // Tab walks the fields and the button; enter/space press it.
         if let Event::KeyDown(k) = event {
             if k.key_code == KeyCode::Tab {
                 let ring = self.ring(cx);
-                if !ring.is_empty() {
-                    let dir: isize = if k.modifiers.shift { -1 } else { 1 };
-                    let n = ring.len() as isize;
-                    let j = match ring.iter().position(|s| s.is_focused(cx)) {
-                        Some(i) => (i as isize + dir).rem_euclid(n),
-                        None if dir > 0 => 0,
-                        None => n - 1,
-                    };
-                    ring[j as usize].focus(cx);
-                    self.redraw(cx);
-                }
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
             }
             if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
-                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
-                for stop in self.ring(cx) {
-                    if stop.is_focused(cx) {
-                        match stop {
-                            RingStop::Remove(_, id) => {
-                                cx.action(PanelAction::RemoveAccount(id));
-                            }
-                            RingStop::Add(_) => self.submit(cx, pid),
-                            RingStop::Input(_) => {}
-                        }
-                        break;
-                    }
+                let add = self.view.button(cx, ids!(add_btn));
+                if cx.has_key_focus(add.area()) {
+                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                    self.submit(cx, pid);
                 }
             }
         }
@@ -918,11 +1510,11 @@ impl Widget for SettingsPanel {
             }
             // Enter advances; past the last field it submits.
             if email.returned(actions).is_some() {
-                Self::focus_input(cx, &pass);
+                focus_input(cx, &pass);
             } else if pass.returned(actions).is_some() {
-                Self::focus_input(cx, &imap);
+                focus_input(cx, &imap);
             } else if imap.returned(actions).is_some() {
-                Self::focus_input(cx, &smtp);
+                focus_input(cx, &smtp);
             } else if smtp.returned(actions).is_some()
                 || self.view.button(cx, ids!(add_btn)).clicked(actions)
             {
@@ -933,24 +1525,7 @@ impl Widget for SettingsPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let accounts = scope
-            .props
-            .get::<PanelProps>()
-            .map(|p| mail::accounts(&p.store));
-        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
-            if let Some(mut list) = item.as_portal_list().borrow_mut() {
-                let accounts = accounts.as_deref().map_or(&[][..], |a| &a[..]);
-                list.set_item_range(cx, 0, accounts.len());
-                while let Some(idx) = list.next_visible_item(cx) {
-                    if let Some(a) = accounts.get(idx) {
-                        let row = list.item(cx, idx, live_id!(account_row));
-                        row.as_account_row().populate(cx, a);
-                        row.draw_all(cx, scope);
-                    }
-                }
-            }
-        }
-        DrawStep::done()
+        self.view.draw_walk(cx, scope, walk)
     }
 }
 
@@ -994,7 +1569,7 @@ impl Widget for ComposePanel {
                     None if dir > 0 => 0,
                     None => n - 1,
                 };
-                SettingsPanel::focus_input(cx, &inputs[j as usize]);
+                focus_input(cx, &inputs[j as usize]);
             }
         }
 
@@ -1006,9 +1581,9 @@ impl Widget for ComposePanel {
                 }
             }
             if to.returned(actions).is_some() {
-                SettingsPanel::focus_input(cx, &subject);
+                focus_input(cx, &subject);
             } else if subject.returned(actions).is_some() {
-                SettingsPanel::focus_input(cx, &body);
+                focus_input(cx, &body);
             }
             if to.changed(actions).is_some()
                 || subject.changed(actions).is_some()
@@ -1092,15 +1667,15 @@ impl InboxLineRef {
         let Some(inner) = self.borrow() else { return };
         let from = &m.from_name;
         let fp = inner.view.label(cx, ids!(from_lbl));
-        let fb = inner.view.widget(cx, ids!(from_b));
+        let fb = inner.view.label(cx, ids!(from_b));
         let sp = inner.view.label(cx, ids!(subject_lbl));
-        let sb = inner.view.widget(cx, ids!(subject_b));
+        let sb = inner.view.label(cx, ids!(subject_b));
         fp.set_text(cx, if m.unread { "" } else { from });
-        fb.as_sbold().set_text(cx, if m.unread { from } else { "" });
+        fb.set_text(cx, if m.unread { from } else { "" });
         fp.set_visible(cx, !m.unread);
         fb.set_visible(cx, m.unread);
         sp.set_text(cx, if m.unread { "" } else { &m.subject });
-        sb.as_sbold().set_text(cx, if m.unread { &m.subject } else { "" });
+        sb.set_text(cx, if m.unread { &m.subject } else { "" });
         sp.set_visible(cx, !m.unread);
         sb.set_visible(cx, m.unread);
         inner
@@ -1207,7 +1782,7 @@ impl Widget for InboxPanel {
         // It arrives as a TextInput event, exactly like real typing.
         if let Event::TextInput(t) = event {
             if !filter_focused && t.input == "/" {
-                SettingsPanel::focus_input(cx, &filter);
+                focus_input(cx, &filter);
             }
         }
         if let Event::KeyDown(k) = event {
@@ -1232,7 +1807,7 @@ impl Widget for InboxPanel {
                     KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
                     // The inbox's one-stop tab ring: the filter.
-                    KeyCode::Tab => SettingsPanel::focus_input(cx, &filter),
+                    KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
                 }
             }
@@ -1372,10 +1947,9 @@ impl SLinkRef {
         let post_l = l.view.label(cx, ids!(row.post));
         post_l.set_text(cx, &post);
         post_l.set_visible(cx, !post.is_empty());
-        for p in [ids!(row.key.k1), ids!(row.key.k2), ids!(row.key.k3)] {
-            l.view.label(cx, p).set_text(cx, &key);
-        }
-        l.view.view(cx, ids!(row.key)).set_visible(cx, !key.is_empty());
+        let key_l = l.view.label(cx, ids!(row.key));
+        key_l.set_text(cx, &key);
+        key_l.set_visible(cx, !key.is_empty());
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
     }
@@ -1505,7 +2079,23 @@ impl Widget for MessagePanel {
                             err_l.set_visible(cx, false);
                         }
                     }
-                    self.view.text_input(cx, ids!(body_lbl)).set_text(cx, &m.body);
+                    // The HTML reading wins when the sender sent one: it
+                    // keeps the lists, the emphasis and the links that
+                    // flattening to text throws away. Both are written
+                    // every time — the hidden one is emptied rather than
+                    // merely hidden, so no mail can leave its text behind
+                    // for the next one to show.
+                    let html = m.html.as_deref().unwrap_or("");
+                    self.view
+                        .text_input(cx, ids!(body_lbl))
+                        .set_text(cx, if m.html.is_some() { "" } else { &m.body });
+                    self.view.html(cx, ids!(body_html)).set_text(cx, html);
+                    self.view
+                        .view(cx, ids!(text_wrap))
+                        .set_visible(cx, m.html.is_none());
+                    self.view
+                        .view(cx, ids!(html_wrap))
+                        .set_visible(cx, m.html.is_some());
                     let (newer, older) = mail::neighbours(&p.store, id);
                     let nl = self.view.link(cx, ids!(newer_link));
                     let no = self.view.label(cx, ids!(newer_off));
@@ -1573,7 +2163,6 @@ impl Widget for ContactPanel {
                 let (name, count) = mail::contact(&p.store, email);
                 let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
                 self.view.label(cx, ids!(name_lbl)).set_text(cx, &name);
-                self.view.label(cx, ids!(name_lbl2)).set_text(cx, &name);
                 self.view.label(cx, ids!(email_lbl)).set_text(cx, email);
                 self.view
                     .label(cx, ids!(count_lbl))
@@ -1591,6 +2180,271 @@ impl Widget for ContactPanel {
         }
         self.view.draw_walk(cx, scope, walk)
     }
+}
+
+// ---------------------------------------------------------------------------
+// HelpPanel / AboutPanel
+// ---------------------------------------------------------------------------
+
+/// The manual. Static prose in the DSL; the live parts — the two demo links,
+/// the demo button, and which platform's rows are visible — are settled here.
+#[derive(Script, ScriptHook, Widget)]
+pub struct HelpPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for HelpPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            if self.view.button(cx, ids!(try_btn)).clicked(actions) {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                cx.action(PanelAction::TryIt { pid });
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        // The legend demonstrates the grammar with the real thing: these
+        // links open and replace exactly like any other.
+        self.view.link(cx, ids!(solid_link)).set(
+            cx,
+            pid,
+            "solid underline",
+            crate::core::Kind::About,
+            false,
+        );
+        self.view.link(cx, ids!(dotted_link)).set(
+            cx,
+            pid,
+            "dotted underline",
+            crate::core::Kind::About,
+            true,
+        );
+        // Platform rows: the DSL holds every variant, `cfg!` picks.
+        let android = cfg!(target_os = "android");
+        self.view
+            .view(cx, ids!(menu_row))
+            .set_visible(cx, cfg!(target_os = "macos"));
+        self.view.view(cx, ids!(desk_launch)).set_visible(cx, !android);
+        self.view.view(cx, ids!(touch_launch)).set_visible(cx, android);
+        self.view.view(cx, ids!(touch_help)).set_visible(cx, android);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// The colophon: three lines and the way back.
+#[derive(Script, ScriptHook, Widget)]
+pub struct AboutPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for AboutPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        self.view.link(cx, ids!(help_link)).set(
+            cx,
+            pid,
+            "back to help",
+            crate::core::Kind::Help,
+            true,
+        );
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The overlays
+// ---------------------------------------------------------------------------
+
+/// One overlay row. Presentation only — the shell owns the click.
+#[derive(Script, ScriptHook, Widget)]
+pub struct OverlayRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for OverlayRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.area()) {
+            cx.set_cursor(MouseCursor::Hand);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl OverlayRowRef {
+    fn populate(&self, cx: &mut Cx, d: &OverlayRowData) {
+        let Some(row) = self.borrow() else { return };
+        // Inverted while current; an undone branch stays legible but quiet.
+        let (bg, fg, dim) = if d.current {
+            (vec4(0.078, 0.078, 0.078, 1.0), vec4(1.0, 1.0, 1.0, 1.0), vec4(0.75, 0.75, 0.75, 1.0))
+        } else if d.muted {
+            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.565, 0.565, 0.565, 1.0), vec4(0.72, 0.72, 0.72, 1.0))
+        } else {
+            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.078, 0.078, 0.078, 1.0), vec4(0.353, 0.353, 0.353, 1.0))
+        };
+        // One card draws; the other stands down. A quad's shader vars are
+        // not struct fields (no runtime colour), but a Label's draw_text
+        // colour is — so the twin is only for the background.
+        row.view.view(cx, ids!(card)).set_visible(cx, !d.current);
+        row.view.view(cx, ids!(card_inv)).set_visible(cx, d.current);
+        let c = if d.current {
+            ids!(card_inv)
+        } else {
+            ids!(card)
+        };
+        let paint = |_cx: &mut Cx, lbl: &LabelRef, col: Vec4f| {
+            if let Some(mut l) = lbl.borrow_mut() {
+                l.draw_text.color = col;
+            }
+        };
+        let num = row.view.label(cx, &[c[0], live_id!(num_lbl)]);
+        num.set_text(cx, &d.num);
+        num.set_visible(cx, !d.num.is_empty());
+        paint(cx, &num, fg);
+        row.view
+            .view(cx, &[c[0], live_id!(num_gap)])
+            .set_visible(cx, !d.num.is_empty());
+        let main = row.view.label(cx, &[c[0], live_id!(main_lbl)]);
+        main.set_text(cx, &d.main);
+        paint(cx, &main, fg);
+        let detail = row.view.label(cx, &[c[0], live_id!(detail_lbl)]);
+        detail.set_text(cx, &d.detail);
+        detail.set_visible(cx, !d.detail.is_empty());
+        paint(cx, &detail, dim);
+        let right = row.view.label(cx, &[c[0], live_id!(right_lbl)]);
+        right.set_text(cx, &d.right);
+        right.set_visible(cx, !d.right.is_empty());
+        paint(cx, &right, dim);
+        let _ = bg;
+    }
+}
+
+/// A column of overlay rows — the workspaces roster, the undo DAG.
+#[derive(Script, ScriptHook, Widget)]
+pub struct RowsOverlay {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for RowsOverlay {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rows = scope
+            .props
+            .get::<OverlayProps>()
+            .map(|p| p.rows.clone())
+            .unwrap_or_default();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, rows.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(d) = rows.get(idx) {
+                        let row = list.item(cx, idx, live_id!(row));
+                        row.as_overlay_row().populate(cx, d);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+/// The launcher: a real text field over the hits.
+#[derive(Script, ScriptHook, Widget)]
+pub struct LauncherOverlay {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for LauncherOverlay {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            let q = self.view.text_input(cx, ids!(query_input));
+            if q.changed(actions).is_some() {
+                cx.action(OverlayAction::Query(q.text()));
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rows = scope
+            .props
+            .get::<OverlayProps>()
+            .map(|p| p.rows.clone())
+            .unwrap_or_default();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, rows.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(d) = rows.get(idx) {
+                        let row = list.item(cx, idx, live_id!(row));
+                        row.as_overlay_row().populate(cx, d);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+impl LauncherOverlayRef {
+    /// Seeds the field and takes the keyboard — called when the overlay
+    /// opens, so typing lands in the query without a tap.
+    pub fn focus_query(&self, cx: &mut Cx, text: &str) {
+        let Some(inner) = self.borrow() else { return };
+        let q = inner.view.text_input(cx, ids!(query_input));
+        q.set_text(cx, text);
+        q.set_key_focus(cx);
+    }
+
+    /// Keeps the selected hit on screen as arrows walk it.
+    pub fn scroll_to(&self, cx: &mut Cx, idx: usize) {
+        let Some(inner) = self.borrow() else { return };
+        let list = inner.view.widget(cx, ids!(list)).as_portal_list();
+        let visible = list
+            .borrow()
+            .is_some_and(|l| l.items().iter().any(|(i, _)| *i == idx));
+        if !visible {
+            list.smooth_scroll_to(cx, idx, 90.0, None, 0.0);
+        }
+    }
+}
+
+/// Intent from an overlay widget. Rows resolve through the shell's own hit
+/// table (they live in a PortalList), so only the query field speaks here.
+#[derive(Debug, Clone)]
+pub enum OverlayAction {
+    /// The launcher's field changed — re-run the search.
+    Query(String),
 }
 
 /// `WidgetRef → SLinkRef` convenience mirroring the generated accessors.

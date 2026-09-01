@@ -56,6 +56,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Contact { .. } => "contact",
         Kind::Compose { .. } => "draft",
         Kind::Settings => "settings",
+        Kind::AddAccount => "add account",
     }
 }
 

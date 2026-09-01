@@ -10,6 +10,7 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/effect.rs` | the boundary: what leaves the process, and the job queue | no |
 | `src/history.rs` | the in-memory tree of actions and their claims | no |
 | `src/mail.rs` | the mail domain: queries, titles, seed, effects, intents | no |
+| `src/html.rs` | narrowing a mail's HTML to what a panel can draw | no |
 | `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |
 | `src/send.rs` | drafts → outbox → SMTP, with the undo window | no |
 | `src/secret.rs` | passwords: keychain (macOS) / private file | no |

@@ -34,6 +34,10 @@ pub struct MailFull {
     pub head: MailHead,
     /// Paragraphs, `\n\n`-separated in the store.
     pub body: String,
+    /// The HTML reading, narrowed at ingest to what the panel draws. When
+    /// present the panel shows this instead of [`Self::body`] — the letter
+    /// keeps its lists, emphasis and links.
+    pub html: Option<String>,
     /// An optional status line; `true` marks it as an error.
     pub status: Option<(String, bool)>,
     /// The receiving account's address (the TO line).
@@ -66,10 +70,10 @@ static Q_ALL: Q = Q {
 static Q_MAIL: Q = Q {
     id: "mail",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email
+                 m.body, m.status, m.status_err, a.email, m.html
           FROM message m JOIN account a ON a.id = m.account
           WHERE m.id = ?1",
-    describe: "one mail, body included, with its account's address",
+    describe: "one mail, both bodies included, with its account's address",
 };
 
 static Q_SENDERS: Q = Q {
@@ -115,6 +119,7 @@ fn full_row(r: &rusqlite::Row) -> rusqlite::Result<MailFull> {
     Ok(MailFull {
         head: head_row(r)?,
         body: r.get(6)?,
+        html: r.get(10)?,
         status: status.map(|s| (s, err)),
         to: r.get(9)?,
     })
@@ -208,7 +213,7 @@ pub fn accounts(store: &Store) -> Rc<Vec<Account>> {
     store.rows(&Q_ACCOUNTS, &[], account_row)
 }
 
-/// Creates an account (the settings form's action). Folders arrive with the
+/// Creates an account (the add-account form's action). Folders arrive with the
 /// first sync; the password goes to the keychain, never here.
 pub fn add_account_tx(
     c: &rusqlite::Connection,
@@ -269,6 +274,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
             .map(|m| format!("re: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
+        Kind::AddAccount => "add account".into(),
     }
 }
 
@@ -1018,6 +1024,10 @@ struct SeedMail {
     date: f64,
     unread: bool,
     body: &'static str,
+    /// The HTML reading, when the demo sender sent one. Stored raw here
+    /// and narrowed on the way in, exactly as a synced mail would be — the
+    /// seed exercises the real path rather than a tidied version of it.
+    html: Option<&'static str>,
     status: Option<(&'static str, bool)>,
 }
 
@@ -1032,6 +1042,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 31, 9, 14),
             unread: true,
             body: "Draft for Q3 infra spend is ready. Main deltas: the old staging cluster goes away and CI runners move to the new box.\n\nCan you sanity-check the numbers before Thursday? Especially egress — I suspect the CDN line is stale.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1041,6 +1052,27 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 31, 8, 2),
             unread: true,
             body: "Workflow main #4128 failed on push 9f3c2a1.\n\nFailed steps: mix test (2 failures), credo --strict (1 warning). Full logs are attached to the run.",
+            // The one demo sender that writes HTML — and it writes it the
+            // way real senders do: a stylesheet, tables holding the page
+            // together, a pixel counting the open, a `javascript:` link.
+            // What survives the narrowing is the letter.
+            html: Some(
+                "<html><head><style>.hd{background:#24292f;color:#fff}</style></head>\
+                 <body><table width=\"100%\"><tr><td class=\"hd\">\
+                 <div><b>Workflow failed</b> in \
+                 <a href=\"https://github.com/x/stelaxis\">stelaxis</a></div>\
+                 </td></tr><tr><td>\
+                 <p>Run <b>main #4128</b> failed on push <code>9f3c2a1</code>.</p>\
+                 <p>Failed steps:</p>\
+                 <ul><li>mix test &mdash; <b>2 failures</b></li>\
+                 <li>credo --strict &mdash; <i>1 warning</i></li></ul>\
+                 <p><i>This run was triggered by a push to </i><b><i>main</i></b>.</p>\
+                 <p><a href=\"https://github.com/x/stelaxis/actions/runs/4128\">View the run</a> \
+                 or <a href=\"javascript:unsub()\">unsubscribe</a>.</p>\
+                 </td></tr></table>\
+                 <img src=\"https://github.com/pixel.gif\" width=\"1\" height=\"1\">\
+                 </body></html>",
+            ),
             status: Some(("ci: FAILED — build (2m 14s), tests (41s)", true)),
         },
         SeedMail {
@@ -1050,6 +1082,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 30, 22, 47),
             unread: false,
             body: "Read your note on panels. The joined/replace rule feels like the right default — it is the preview-pane pattern, but generalized to everything.\n\nOne question though: what happens to a half-written draft if a joined compose panel gets replaced by the next link? Feels like some panels need a way to resist replacement.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1059,6 +1092,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 30, 18, 20),
             unread: false,
             body: "Weather looks fine for Saturday. Early start (7:30) or lazy start (10:00)?\n\nThere is a new trail variant, ~14 km, one café stop. Bring the good thermos.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1068,6 +1102,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 30, 7, 0),
             unread: false,
             body: "Unread this week: niri release notes (2), simonwillison.net (9), lobste.rs top (3).\n\nThis digest is itself a candidate for an rss/feed panel, by the way.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1077,6 +1112,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 29, 16, 41),
             unread: false,
             body: "Dentist, Tuesday 10:00–10:45. Reminder set for 30 minutes before.\n\nReply yes to confirm, or propose a new time.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1086,6 +1122,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 29, 11, 5),
             unread: false,
             body: "Invoice 2026-08 for €46.20 is available. Auto-charge on Sep 3.\n\nUsage: 2× CX32, 1× volume 100 GB, egress 214 GB.",
+            html: None,
             status: None,
         },
         SeedMail {
@@ -1095,6 +1132,7 @@ fn base_mails() -> Vec<SeedMail> {
             date: ts(2026, 8, 28, 20, 33),
             unread: false,
             body: "Found it — the airport design book you mentioned at dinner. Ordering a copy tomorrow.\n\nBorrowing rights claimed for after you finish, obviously.",
+            html: None,
             status: None,
         },
     ]
@@ -1131,8 +1169,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         let insert = |m: &SeedMail| -> rusqlite::Result<()> {
             c.execute(
                 "INSERT INTO message(account, folder, from_name, from_email,
-                                     subject, date, unread, body, status, status_err)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                                     subject, date, unread, body, html,
+                                     status, status_err)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 rusqlite::params![
                     acct,
                     inbox,
@@ -1142,6 +1181,7 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                     m.date,
                     m.unread,
                     m.body,
+                    m.html.map(crate::html::sanitize),
                     m.status.map(|(s, _)| s),
                     m.status.map(|(_, e)| e).unwrap_or(false),
                 ],
@@ -1208,6 +1248,27 @@ mod tests {
         // Seeding an already-seeded store is a no-op.
         seed_if_empty(&s).unwrap();
         assert_eq!(inbox(&s).len(), 68);
+    }
+
+    /// The demo world carries one HTML sender, narrowed on the way in: the
+    /// letter survives, the stylesheet, the layout table, the tracking
+    /// pixel and the `javascript:` link do not.
+    #[test]
+    fn the_seeded_html_mail_is_narrowed() {
+        let s = store();
+        let h = mail(&s, 2).expect("the github mail").html.expect("html");
+        assert!(h.contains("<ul><li>mix test"), "the list survives: {h}");
+        assert!(h.contains(r#"<a href="https://github.com/x/stelaxis">"#));
+        assert!(h.contains("&mdash;"), "entities are makepad's to decode");
+        assert!(!h.contains("background:#24292f"), "the stylesheet is gone");
+        assert!(!h.contains("<table") && !h.contains("<td"), "layout is gone");
+        assert!(!h.contains("pixel.gif"), "the tracking pixel is gone");
+        assert!(!h.contains("javascript:"), "the script link is defused");
+        assert!(h.contains("unsubscribe"), "but its text is kept");
+        // Its plain reading is still there for quoting a reply.
+        assert!(mail(&s, 2).expect("mail").body.starts_with("Workflow main"));
+        // And a text-only sender stays on the plain path.
+        assert_eq!(mail(&s, 1).expect("vera").html, None);
     }
 
     /// Filter semantics are the shell's: one substring, sender + subject.

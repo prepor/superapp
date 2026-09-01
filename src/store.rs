@@ -253,23 +253,38 @@ CREATE TABLE outbox(
 );
 ";
 
-/// Schema v7 (CR-004): history moved into memory, so the durable action log
+/// Schema v6 (main): the HTML half of a mail. `body` stays the plain-text
+/// reading — it is what compose quotes, and what search will want — and
+/// `html` holds the same letter narrowed to what the panel can draw (see
+/// [`crate::html`]), or NULL when the sender sent text alone.
+///
+/// The column back-fills from `raw`, which every synced mail already
+/// keeps, so mail that arrived before this migration gains its HTML
+/// without a refetch. Narrowing at ingest rather than at draw leaves the
+/// panel a plain `set_text`; `raw` stays the source to re-derive from when
+/// the narrowing improves.
+const SCHEMA_V6: &str = "
+ALTER TABLE message ADD COLUMN html TEXT;
+";
+
+/// Schema v8 (CR-004): history moved into memory, so the durable action log
 /// and its head pointer go. What an action claimed of the world is now an
 /// `Intent` on an in-memory node; what it *wrote* is ordinary rows, which is
-/// all the passes ever read.
-const SCHEMA_V7: &str = "
+/// all the passes ever read. `ACTION_TABLES` went with it — nothing records
+/// changesets any more.
+const SCHEMA_V8: &str = "
 DROP TABLE IF EXISTS action;
 DELETE FROM meta WHERE key = 'head';
 ";
 
-/// Schema v6 (CR-004): the effect table — one queue for every deferred
+/// Schema v7 (CR-004): the effect table — one queue for every deferred
 /// effect, whatever domain it came from. `payload` and `reply` are JSON
 /// *text*, not JSONB: SQLite has no JSON type, and a BLOB encoding would
 /// make `SELECT reply FROM effect` unreadable in a shell — inspectability
 /// is why this lives in the store at all. `idempotent` is copied onto the
 /// row at enqueue time so the crash sweep is pure SQL and never has to
 /// decode a payload to know whether retrying is safe.
-const SCHEMA_V6: &str = "
+const SCHEMA_V7: &str = "
 CREATE TABLE effect(
   id         INTEGER PRIMARY KEY,
   kind       TEXT NOT NULL,
@@ -287,6 +302,26 @@ CREATE TABLE effect(
 CREATE INDEX idx_effect_due    ON effect(status, not_before);
 CREATE INDEX idx_effect_entity ON effect(entity);
 ";
+
+/// Fills `message.html` for mail that arrived before schema v6, reading
+/// the `raw` blob each one already keeps. Messages without `raw` — the demo
+/// seed — are left alone, and a mail whose sender wrote text only stays
+/// NULL. Runs once, inside the migration.
+pub(crate) fn backfill_html(conn: &Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, Vec<u8>)> = conn
+        .prepare("SELECT id, raw FROM message WHERE raw IS NOT NULL AND html IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, raw) in rows {
+        if let Some(html) = crate::sync::parse_mail(&raw).html {
+            conn.execute(
+                "UPDATE message SET html = ?2 WHERE id = ?1",
+                rusqlite::params![id, html],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 impl Store {
     /// Opens (and migrates) the store; `None` is in-memory, for tests.
@@ -325,11 +360,16 @@ impl Store {
         }
         if version < 6 {
             conn.execute_batch(SCHEMA_V6)?;
+            backfill_html(&conn)?;
             conn.pragma_update(None, "user_version", 6)?;
         }
         if version < 7 {
             conn.execute_batch(SCHEMA_V7)?;
             conn.pragma_update(None, "user_version", 7)?;
+        }
+        if version < 8 {
+            conn.execute_batch(SCHEMA_V8)?;
+            conn.pragma_update(None, "user_version", 8)?;
         }
         sweep_effects(&conn)?;
 
@@ -732,6 +772,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
         Kind::Compose { re } => ("compose", Some(*re), None),
         Kind::Settings => ("settings", None, None),
+        Kind::AddAccount => ("add_account", None, None),
     }
 }
 
@@ -745,6 +786,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "contact" => Kind::Contact { email: p_txt? },
         "compose" => Kind::Compose { re: p_int? },
         "settings" => Kind::Settings,
+        "add_account" => Kind::AddAccount,
         _ => return None,
     })
 }

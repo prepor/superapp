@@ -22,10 +22,12 @@ use std::time::Instant;
 
 use makepad_widgets::*;
 // Touch types are not in the curated platform re-export list.
-use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
+use makepad_widgets::makepad_platform::event::{
+    ScrollEvent, ScrollPhase, TouchState, TouchUpdateEvent,
+};
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, MailId, PanelId, Wm, Ws, WS_N};
+use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
@@ -34,9 +36,7 @@ use crate::store::Store;
 use crate::sync;
 use crate::spring::{Spring, SpringParams};
 use crate::theme;
-use crate::ui::{
-    self, char_byte, kbd, pad_to, trunc, wrap, BtnAct, FieldId, Line, Seg, Style, TextField,
-};
+use crate::ui::{self, trunc, BtnAct, Style};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -223,6 +223,7 @@ script_mod! {
                     latin := FontMember{res: file_resource("/System/Library/Fonts/Menlo.ttc") asc: 0.0 desc: 0.0}
                     fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
                     symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+                    emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
                 }
                 line_spacing: 1.0
             }
@@ -244,10 +245,17 @@ script_mod! {
                         // they are collected as templates and instantiated
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
+                        add_account_tpl := mod.widgets.AddAccountPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
                         inbox_tpl := mod.widgets.InboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
                         contact_tpl := mod.widgets.ContactPanel{}
+                        help_tpl := mod.widgets.HelpPanel{}
+                        about_tpl := mod.widgets.AboutPanel{}
+                        // The modal overlays are hosted the same way, keyed
+                        // by a reserved id rather than a panel.
+                        rows_overlay_tpl := mod.widgets.RowsOverlay{}
+                        launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                     }
                 }
             }
@@ -297,104 +305,6 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
 }
 
 
-/// What a panel keeps between frames and loses on replacement.
-#[derive(Debug, Clone)]
-struct PanelUi {
-    kind: Kind,
-    sel: Option<MailId>,
-    scroll: f64,
-    max_scroll: f64,
-    /// Visible height of the scrolling region, written during draw.
-    view_h: f64,
-    filter: TextField,
-    to: TextField,
-    subject: TextField,
-    body: Vec<String>,
-    caret: (usize, usize), // row, col in chars
-    set_email: TextField,
-    set_pass: TextField,
-    set_imap: TextField,
-    set_smtp: TextField,
-    /// The draft as last persisted (compose panels; skip no-op saves).
-    draft_saved: Option<mail::Draft>,
-}
-
-impl PanelUi {
-    /// Every single-line field by id (`Body` is the multi-line exception).
-    fn field_mut(&mut self, fid: FieldId) -> Option<&mut TextField> {
-        Some(match fid {
-            FieldId::Filter => &mut self.filter,
-            FieldId::To => &mut self.to,
-            FieldId::Subject => &mut self.subject,
-            FieldId::SetEmail => &mut self.set_email,
-            FieldId::SetPass => &mut self.set_pass,
-            FieldId::SetImap => &mut self.set_imap,
-            FieldId::SetSmtp => &mut self.set_smtp,
-            FieldId::Body => return None,
-        })
-    }
-}
-
-impl PanelUi {
-    fn for_kind(kind: &Kind, store: &Store, pid: PanelId) -> Self {
-        let mut ui = PanelUi {
-            kind: kind.clone(),
-            sel: None,
-            scroll: 0.0,
-            max_scroll: 0.0,
-            view_h: 0.0,
-            filter: TextField::default(),
-            to: TextField::default(),
-            subject: TextField::default(),
-            body: vec![String::new()],
-            caret: (0, 0),
-            set_email: TextField::default(),
-            set_pass: TextField::default(),
-            set_imap: TextField::default(),
-            set_smtp: TextField::default(),
-            draft_saved: None,
-        };
-        match kind {
-            Kind::Inbox { filter } => {
-                if let Some(f) = filter {
-                    ui.filter.text = f.clone();
-                    ui.filter.caret = ui.filter.text.chars().count();
-                }
-            }
-            // Read flags are the *opening action's* business (its changeset
-            // carries the flag flip, so undo restores unread) — not this
-            // constructor's, which also runs on boot restore.
-            Kind::Message { .. } => {}
-            Kind::Compose { re } => {
-                // A persisted draft (boot restore, undo) wins over the
-                // reply prefill.
-                if let Some(d) = mail::draft(store, pid as i64) {
-                    ui.to.text = d.to;
-                    ui.subject.text = d.subject;
-                    ui.body = if d.body.is_empty() {
-                        vec![String::new()]
-                    } else {
-                        d.body.split('\n').map(str::to_string).collect()
-                    };
-                    ui.caret = (ui.body.len() - 1, ui.body.last().map_or(0, |l| l.chars().count()));
-                    ui.draft_saved = Some(mail::Draft {
-                        to: ui.to.text.clone(),
-                        subject: ui.subject.text.clone(),
-                        body: ui.body.join("\n"),
-                    });
-                } else if let Some(m) = mail::mail(store, *re) {
-                    ui.to.text = m.head.from_email;
-                    ui.subject.text = format!("Re: {}", m.head.subject);
-                }
-                ui.to.caret = ui.to.text.chars().count();
-                ui.subject.caret = ui.subject.text.chars().count();
-            }
-            _ => {}
-        }
-        ui
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Hit testing
 // ---------------------------------------------------------------------------
@@ -407,8 +317,6 @@ enum Act {
     Btn(PanelId, BtnAct),
     Open(PanelId, Kind),
     Replace(PanelId, Kind),
-    Row(PanelId, MailId),
-    Field(PanelId, FieldId),
     /// Activate this panel's tab in its tabbed column.
     Tab(PanelId),
     /// A row of the workspaces overlay: switch to workspace `k`.
@@ -455,8 +363,6 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Btn(pid, _)
         | Act::Open(pid, _)
         | Act::Replace(pid, _)
-        | Act::Row(pid, _)
-        | Act::Field(pid, _)
         | Act::Tab(pid) => Some(*pid),
         Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) => None,
     }
@@ -757,8 +663,6 @@ enum Overlay {
 #[derive(Debug, Default)]
 struct LauncherUi {
     query: String,
-    /// Caret, in chars.
-    caret: usize,
     /// Selected row (enter activates it).
     sel: usize,
     hits: Vec<launcher::Hit>,
@@ -792,44 +696,16 @@ struct State {
     /// The last persisted logical snapshot — [`State::sync`] only writes
     /// when the state actually changed.
     last_saved: Option<core::WmSnap>,
-    ui: HashMap<PanelId, PanelUi>,
     anim: Anim,
     viewport: DVec2,
     last_frame: Option<Instant>,
     animating: bool,
     hover: Option<Act>,
-    field: Option<(PanelId, FieldId)>,
     /// `(message, is_error, when)` — `when` on the world's clock, not the
     /// wall's, so a toast fades by the same amount on every run.
     toast: Option<(String, bool, f64)>,
     overlay: Overlay,
     launcher: LauncherUi,
-}
-
-/// A field's content as one string plus the caret in chars — the shape the
-/// android IME editable mirrors (body lines joined with `\n`).
-fn field_text_caret(state: &State, pid: PanelId, fid: FieldId) -> Option<(String, usize)> {
-    let ui = state.ui.get(&pid)?;
-    Some(match fid {
-        FieldId::Filter => (ui.filter.text.clone(), ui.filter.caret),
-        FieldId::To => (ui.to.text.clone(), ui.to.caret),
-        FieldId::Subject => (ui.subject.text.clone(), ui.subject.caret),
-        FieldId::SetEmail => (ui.set_email.text.clone(), ui.set_email.caret),
-        FieldId::SetPass => (ui.set_pass.text.clone(), ui.set_pass.caret),
-        FieldId::SetImap => (ui.set_imap.text.clone(), ui.set_imap.caret),
-        FieldId::SetSmtp => (ui.set_smtp.text.clone(), ui.set_smtp.caret),
-        FieldId::Body => {
-            let (r, c) = ui.caret;
-            let caret = ui
-                .body
-                .iter()
-                .take(r)
-                .map(|l| l.chars().count() + 1)
-                .sum::<usize>()
-                + c;
-            (ui.body.join("\n"), caret)
-        }
-    })
 }
 
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
@@ -911,13 +787,11 @@ impl State {
             pump: sync::Pump::threads(),
             failed_seen: 0,
             last_saved: None,
-            ui: HashMap::new(),
             anim: Anim::default(),
             viewport: dvec2(1440.0, 900.0),
             last_frame: None,
             animating: false,
             hover: None,
-            field: None,
             toast: None,
             overlay: Overlay::None,
             launcher: LauncherUi::default(),
@@ -943,40 +817,6 @@ impl State {
         let vp = self.vp();
         let opts = self.opts();
         self.ws.ensure_focus_visible(vp, opts);
-        // Per-panel ui: create/reset entries, drop dead ones — across every
-        // workspace, so panels on inactive spaces keep drafts and scrolls.
-        let ids: Vec<(PanelId, Kind)> = self
-            .ws
-            .wss
-            .iter()
-            .flat_map(|w| w.panels.values().map(|p| (p.id, p.kind.clone())))
-            .collect();
-        for (pid, kind) in &ids {
-            let fresh = match self.ui.get(pid) {
-                Some(ui) => ui.kind != *kind,
-                None => true,
-            };
-            if fresh {
-                let ui = PanelUi::for_kind(kind, &self.store, *pid);
-                // Hosted kinds own their focus (the widget's TextInputs);
-                // the char-grid field must stay out of their way.
-                if matches!(kind, Kind::Compose { .. }) && hosted_tpl(kind).is_none() {
-                    self.field = Some((*pid, FieldId::Body));
-                }
-                self.ui.insert(*pid, ui);
-            }
-        }
-        self.ui.retain(|pid, _| {
-            let pid = *pid;
-            ids.iter().any(|(id, _)| *id == pid)
-        });
-        // A field only makes sense on the visible workspace: switching away
-        // (or moving the panel away) blurs it, which also parks the IME.
-        if let Some((pid, _)) = self.field {
-            if !self.ws.panels.contains_key(&pid) {
-                self.field = None;
-            }
-        }
 
         // Every workspace computes its scene: the animator needs the union
         // (a switch retargets both spaces mid-slide, and must never ghost
@@ -1091,39 +931,7 @@ impl State {
         }
         self.last_saved = Some(step.snap.clone());
         self.ws = Wm::restore(step.snap);
-        self.field = None;
         step.label
-    }
-
-    /// Persists compose drafts that changed since their last save — typing
-    /// upkeep, not actions (see the book on what undo deliberately isn't).
-    fn persist_drafts(&mut self) {
-        let composes: Vec<(PanelId, Option<MailId>)> = self
-            .ws
-            .wss
-            .iter()
-            .flat_map(|w| w.panels.values())
-            .filter_map(|p| match p.kind {
-                // Hosted composes persist through DraftEdited actions.
-                Kind::Compose { re } if hosted_tpl(&p.kind).is_none() => {
-                    Some((p.id, (re != 0).then_some(re)))
-                }
-                _ => None,
-            })
-            .collect();
-        for (pid, re) in composes {
-            let Some(ui) = self.ui.get_mut(&pid) else { continue };
-            let d = mail::Draft {
-                to: ui.to.text.clone(),
-                subject: ui.subject.text.clone(),
-                body: ui.body.join("\n"),
-            };
-            if ui.draft_saved.as_ref() == Some(&d) {
-                continue;
-            }
-            mail::save_draft(&self.store, pid as i64, re, &d, self.world.now());
-            ui.draft_saved = Some(d);
-        }
     }
 
     /// Spawns a sync worker for every configured account that lacks one.
@@ -1140,509 +948,18 @@ impl State {
             SignalToUI::set_ui_signal();
         });
     }
-
-    /// Rows the inbox panel currently shows.
-    fn inbox_rows(&self, pid: PanelId) -> Vec<mail::MailHead> {
-        let filter = self
-            .ui
-            .get(&pid)
-            .map(|u| u.filter.text.clone())
-            .unwrap_or_default();
-        mail::inbox_filtered(&self.store, &filter)
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Content builders
 
-fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
-    // Cross-workspace lookup: panels on inactive spaces draw mid-slide too.
-    let Some(panel) = state.ws.panel(pid) else {
-        return Vec::new();
-    };
-    let ui = state.ui.get(&pid);
-    match &panel.kind {
-        Kind::Help => help_lines(),
-        Kind::About => about_lines(),
-        Kind::Inbox { .. } => inbox_lines(state, pid, cols),
-        Kind::Message { id } => message_lines(state, id, cols),
-        Kind::Contact { email } => contact_lines(state, email),
-        Kind::Compose { re } => compose_lines(ui, re),
-        Kind::Settings => Vec::new(), // retained content (CR-002)
-    }
-}
-
-
-fn help_lines() -> Vec<Line> {
-    let about = Kind::About;
-    let mut v = Vec::new();
-    v.push(Line {
-        left: vec![Seg::T("LEGEND".into(), Style::Label)],
-        rule: true,
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::Link {
-                label: "solid underline".into(),
-                target: about.clone(),
-                dotted: false,
-            },
-            Seg::T(" — opens a panel to the right, joined".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::Link {
-                label: "dotted underline".into(),
-                target: about.clone(),
-                dotted: true,
-            },
-            Seg::T(" — replaces this panel in place".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::Btn {
-                label: "button".into(),
-                act: BtnAct::TryIt,
-            },
-            Seg::T(" — side effect only, never navigation".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            Seg::T("+click / ".into(), Style::N),
-            kbd("cmd"),
-            kbd("enter"),
-            Seg::T(" — always a fresh,".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line::text("un-joined panel", Style::N));
-    v.push(Line::text("a ═ bridge marks a joined pair: the next", Style::N));
-    v.push(Line::text("solid link in the parent replaces the", Style::N));
-    v.push(Line::text("joined panel; replacing a panel closes", Style::N));
-    v.push(Line::text("its joined chain", Style::N));
-    v.push(Line {
-        left: vec![
-            Seg::T("color is reserved for errors: ".into(), Style::N),
-            Seg::T("like this".into(), Style::Err),
-        ],
-        ..Default::default()
-    });
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T("KEYS".into(), Style::Label)],
-        rule: true,
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![kbd("cmd"), Seg::T("+arrows — focus panels".into(), Style::N)],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![kbd("cmd"), kbd("shift"), Seg::T("+same — move the panel".into(), Style::N)],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![kbd("cmd"), kbd("w"), Seg::T(" — close the focused panel".into(), Style::N)],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("z"),
-            Seg::T(" — undo (open, close, move, archive…)".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("shift"),
-            kbd("z"),
-            Seg::T(" — redo".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("u"),
-            Seg::T(" — history: the whole tree, walkable".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("i"),
-            Seg::T(" — copy the panel's context (its queries)".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("["),
-            kbd("]"),
-            Seg::T(" — consume into / expel out of a column".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd(","),
-            kbd("."),
-            Seg::T(" — pull from the right / push bottom out".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("t"),
-            Seg::T(" — column tabs (click a tab or cmd+↑/↓)".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line::text(
-        "a control wearing a bold letter is cmd+that letter:",
-        Style::N,
-    ));
-    v.push(Line {
-        left: vec![
-            Seg::T("  message ".into(), Style::N),
-            kbd("cmd+a"),
-            Seg::T("rchive ".into(), Style::N),
-            kbd("cmd+r"),
-            Seg::T("eply ".into(), Style::N),
-            kbd("cmd+n"),
-            Seg::T("/".into(), Style::N),
-            kbd("cmd+o"),
-            Seg::T(" walk".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::T("  inbox ".into(), Style::N),
-            kbd("cmd+r"),
-            Seg::T("efresh  ".into(), Style::N),
-            kbd("enter"),
-            Seg::T(" opens  ".into(), Style::N),
-            kbd("/"),
-            Seg::T(" filters  arrows walk the rows".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![kbd("esc"), Seg::T(" leaves a text field".into(), Style::N)],
-        ..Default::default()
-    });
-    v.push(Line::text("trackpad: scroll the strip and the panels", Style::N));
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T("WORKSPACES".into(), Style::Label)],
-        rule: true,
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("1"),
-            Seg::T("…".into(), Style::N),
-            kbd("9"),
-            Seg::T(" — switch workspace".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            kbd("cmd"),
-            kbd("shift"),
-            Seg::T("+№ — move the panel there".into(), Style::N),
-        ],
-        ..Default::default()
-    });
-    if cfg!(target_os = "macos") {
-        v.push(Line::text("the menu bar lists them; [n] is current", Style::N));
-    }
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T("LAUNCHER".into(), Style::Label)],
-        rule: true,
-        ..Default::default()
-    });
-    if !cfg!(target_os = "android") {
-        v.push(Line {
-            left: vec![
-                kbd("cmd"),
-                kbd("cmd"),
-                Seg::T(" — the launcher: search everything".into(), Style::N),
-            ],
-            ..Default::default()
-        });
-        v.push(Line::text("type to find panels, mail, people;", Style::N));
-        v.push(Line::text("enter goes to it — or opens it fresh", Style::N));
-    } else {
-        v.push(Line::text("the overlay's search row opens it:", Style::N));
-        v.push(Line::text("find open panels, mail, people", Style::N));
-    }
-    if cfg!(target_os = "android") {
-        v.push(Line::blank());
-        v.push(Line {
-            left: vec![Seg::T("TOUCH".into(), Style::Label)],
-            rule: true,
-            ..Default::default()
-        });
-        v.push(Line::text("tap — follow links, press buttons", Style::N));
-        v.push(Line::text("drag — scroll a panel's content", Style::N));
-        v.push(Line::text("two fingers — scroll the workspace", Style::N));
-        v.push(Line::text("two fingers down — workspaces overlay", Style::N));
-        v.push(Line::text("hold a header — pick the panel up;", Style::N));
-        v.push(Line::text("drop on a column to stack, between", Style::N));
-        v.push(Line::text("columns for a fresh one", Style::N));
-    }
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T("TRY".into(), Style::Label)],
-        rule: true,
-        ..Default::default()
-    });
-    v.push(Line::text("1. click a subject — a message opens,", Style::N));
-    v.push(Line::text("   joined (bridge)", Style::N));
-    v.push(Line::text("2. click another subject — it replaces", Style::N));
-    v.push(Line::text("   the joined message", Style::N));
-    v.push(Line::text("3. from → contact joins the chain; the", Style::N));
-    v.push(Line::text("   next subject click closes the chain", Style::N));
-    v.push(Line::text("4. cmd+shift+← the message — moved away,", Style::N));
-    v.push(Line::text("   it un-joins", Style::N));
-    v
-}
-
-fn about_lines() -> Vec<Line> {
-    vec![
-        Line::text("superapp — rust + makepad prototype.", Style::N),
-        Line::text("no apps, no windows: specialized panels", Style::N),
-        Line::text("on one scrolling gridded workspace.", Style::N),
-        Line::blank(),
-        Line {
-            left: vec![Seg::Link {
-                label: "back to help".into(),
-                target: Kind::Help,
-                dotted: true,
-            }],
-            ..Default::default()
-        },
-    ]
-}
-
-fn inbox_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
-    let mut v = Vec::new();
-    v.push(Line {
-        left: vec![Seg::Fld {
-            id: FieldId::Filter,
-            w: cols.saturating_sub(2).max(10),
-        }],
-        pin: true,
-        ..Default::default()
-    });
-    let from_w = 11usize;
-    let date_w = 12usize;
-    let subj_w = cols.saturating_sub(from_w + date_w + 3).max(8);
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("FROM", from_w), Style::Label),
-            Seg::Sp(1),
-            Seg::T("SUBJECT".into(), Style::Label),
-        ],
-        right: vec![Seg::T("DATE".into(), Style::Label)],
-        rule: true,
-        rule_ink: true,
-        pin: true,
-        ..Default::default()
-    });
-    let rows = state.inbox_rows(pid);
-    if rows.is_empty() {
-        v.push(Line::text("no messages", Style::Muted));
-    }
-    for m in rows {
-        let st = if m.unread { Style::Bold } else { Style::N };
-        v.push(Line {
-            left: vec![
-                Seg::T(pad_to(&m.from_name, from_w), st),
-                Seg::Sp(1),
-                Seg::Link {
-                    label: trunc(&m.subject, subj_w),
-                    target: Kind::Message { id: m.id },
-                    dotted: false,
-                },
-            ],
-            right: vec![Seg::T(mail::fmt_date(m.date), Style::Muted)],
-            row: Some(m.id),
-            rule: true,
-            ..Default::default()
-        });
-    }
-    v
-}
-
-fn message_lines(state: &State, id: &MailId, cols: usize) -> Vec<Line> {
-    let Some(m) = mail::mail(&state.store, *id) else {
-        return vec![Line::text("message not found", Style::Muted)];
-    };
-    let (newer, older) = mail::neighbours(&state.store, *id);
-    let mut v = Vec::new();
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("FROM", 6), Style::Label),
-            Seg::Link {
-                label: format!("{} <{}>", m.head.from_name, m.head.from_email),
-                target: Kind::Contact {
-                    email: m.head.from_email.clone(),
-                },
-                dotted: false,
-            },
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("TO", 6), Style::Label),
-            Seg::T(m.to.clone(), Style::Muted),
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("DATE", 6), Style::Label),
-            Seg::T(mail::fmt_date(m.head.date), Style::N),
-        ],
-        rule: true,
-        ..Default::default()
-    });
-    if let Some((s, err)) = &m.status {
-        v.push(Line::text(s.clone(), if *err { Style::Err } else { Style::T2 }));
-        v.push(Line::blank());
-    }
-    for para in m.body.split("\n\n") {
-        for l in wrap(para, cols) {
-            v.push(Line::text(l, Style::N));
-        }
-        v.push(Line::blank());
-    }
-    let mut nav = Line {
-        rule: false,
-        ..Default::default()
-    };
-    nav.left = vec![
-        if let Some(n) = newer {
-            Seg::Link {
-                label: "← newer".into(),
-                target: Kind::Message { id: n },
-                dotted: true,
-            }
-        } else {
-            Seg::T("← newer".into(), Style::Muted)
-        },
-        Seg::Sp(2),
-        if let Some(o) = older {
-            Seg::Link {
-                label: "older →".into(),
-                target: Kind::Message { id: o },
-                dotted: true,
-            }
-        } else {
-            Seg::T("older →".into(), Style::Muted)
-        },
-    ];
-    nav.right = vec![Seg::Link {
-        label: "reply".into(),
-        target: Kind::Compose { re: m.head.id },
-        dotted: false,
-    }];
-    v.push(nav);
-    v
-}
-
-fn contact_lines(state: &State, email: &str) -> Vec<Line> {
-    let (name, count) = mail::contact(&state.store, email);
-    let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
-    vec![
-        Line::text(name.clone(), Style::Big),
-        Line::text(email, Style::Muted),
-        Line::blank(),
-        Line::text(format!("{count} message(s) in mail"), Style::N),
-        Line::blank(),
-        Line {
-            left: vec![Seg::Link {
-                label: format!("messages from {first}"),
-                target: Kind::Inbox {
-                    filter: Some(email.to_string()),
-                },
-                dotted: false,
-            }],
-            ..Default::default()
-        },
-    ]
-}
-
-fn compose_lines(ui: Option<&PanelUi>, _re: &MailId) -> Vec<Line> {
-    let body_rows = ui.map(|u| u.body.len()).unwrap_or(1);
-    let mut v = Vec::new();
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("TO", 8), Style::Label),
-            Seg::Fld {
-                id: FieldId::To,
-                w: 30,
-            },
-        ],
-        ..Default::default()
-    });
-    v.push(Line {
-        left: vec![
-            Seg::T(pad_to("SUBJECT", 8), Style::Label),
-            Seg::Fld {
-                id: FieldId::Subject,
-                w: 30,
-            },
-        ],
-        rule: true,
-        ..Default::default()
-    });
-    // The body: free lines; the whole region is one Field hit (built in
-    // draw). Send and discard live in the header, with the other side
-    // effects — nothing floats below the text.
-    for i in 0..body_rows {
-        let text = ui.map(|u| u.body[i].clone()).unwrap_or_default();
-        v.push(Line {
-            left: vec![Seg::T(text, Style::N), Seg::Fld { id: FieldId::Body, w: 0 }],
-            ..Default::default()
-        });
-    }
-    v
-}
-
-// ---------------------------------------------------------------------------
-// Stage
-// ---------------------------------------------------------------------------
-
 /// Measured mono metrics at [`theme::FONT_SIZE`], in points: advance per char,
-/// the line grid, the ascender (underlines hang off it), and the natural
-/// (ascender−descender) line for vertical centering.
+/// the line grid, and the natural (ascender−descender) line for vertical
+/// centering.
 #[derive(Debug, Clone, Copy)]
 struct CellFont {
     adv: f64,
     line_h: f64,
-    asc: f64,
     natural: f64,
     dpi: f64,
 }
@@ -1652,7 +969,6 @@ impl Default for CellFont {
         CellFont {
             adv: theme::FONT_SIZE * 0.8,
             line_h: theme::FONT_SIZE * 2.0,
-            asc: theme::FONT_SIZE * 1.24,
             natural: theme::FONT_SIZE * 1.55,
             dpi: 0.0,
         }
@@ -1724,15 +1040,6 @@ pub struct Stage {
     reported: bool,
     #[rust]
     ime_shown: bool,
-    /// The field the IME is currently shown for (config + seeding follow it).
-    #[rust]
-    ime_field: Option<(PanelId, FieldId)>,
-    /// Last `(text, caret)` pushed to the IME editable, to dedup syncs.
-    #[rust]
-    ime_sent: Option<(String, usize)>,
-    /// The IME is mid-composition: hold app→IME syncs, they would clobber it.
-    #[rust]
-    ime_composing: bool,
     /// Soft-keyboard bottom occlusion (android), in points.
     #[rust]
     kb_h: f64,
@@ -1784,6 +1091,12 @@ const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
+
+/// The overlays are hosted like panels, so they need keys in the same map.
+/// Panel ids are workspace-tagged (`k << 32`) and allocated upward, so the
+/// top of the range is free forever.
+const OVERLAY_PID_R: PanelId = u64::MAX;
+const OVERLAY_PID_L: PanelId = u64::MAX - 1;
 
 /// How a `key` chord executes: as a synthesized key event, as text (plain
 /// letters reach panels the same way real typing does), or as a bare
@@ -1912,85 +1225,44 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
 
 impl Stage {
     fn kick(&mut self, cx: &mut Cx) {
-        // Compose drafts persist as they are typed (plain upkeep, not
-        // actions): every edit path funnels through kick.
-        if let Some(state) = self.state.as_deref_mut() {
-            state.persist_drafts();
-        }
         // makepad only routes keys to the system IME — which is what emits
         // TextInput events — while the IME is shown. On macOS letter keys
         // (j/k/r, "/", field typing) all arrive that way, so the IME stays on
         // whenever a panel has focus (mosaic's model: "typing only flows
         // after show_text_ime"). On android show_text_ime raises the
-        // on-screen keyboard, so it is tied to a text field instead — glass
-        // has no letter keys to lose. Every focus transition passes through
-        // kick().
-        // The launcher's query field wants the IME on both targets — on
-        // android that is what raises the soft keyboard with the overlay.
+        // on-screen keyboard, which every retained panel's TextInputs now do
+        // for themselves — so the shell only asks for the launcher's field.
+        // Every focus transition passes through kick().
         let launcher = self
             .state
             .as_deref()
             .is_some_and(|s| s.overlay == Overlay::Launcher);
         // A retained panel's TextInputs own their key focus and (on android)
-        // the soft keyboard — the char-grid machinery must not fight them.
-        // But on macOS the IME must stay on for hosted panels too: letters
-        // only arrive as TextInput events while it is shown, and the letter
-        // grammar (j/k, "/", r) is made of them.
+        // the soft keyboard — the shell must not fight them. But on macOS the
+        // IME must stay on for hosted panels too: letters only arrive as
+        // TextInput events while it is shown, and the letter grammar is made
+        // of them.
         let hosted = self.hosted_focus();
         let want_ime = launcher
-            || self.state.as_deref().is_some_and(|s| {
-                if cfg!(target_os = "android") {
-                    !hosted && s.field.is_some()
-                } else {
-                    s.ws.focus.is_some()
-                }
-            });
-        let want_field = if launcher {
-            None
-        } else {
-            self.state.as_deref().and_then(|s| s.field)
-        };
-        if want_ime != self.ime_shown || (want_ime && self.ime_field != want_field) {
+            || (!cfg!(target_os = "android")
+                && self.state.as_deref().is_some_and(|s| s.ws.focus.is_some()));
+        if want_ime != self.ime_shown {
             self.ime_shown = want_ime;
-            self.ime_field = want_field;
-            self.ime_sent = None;
-            self.ime_composing = false;
             if want_ime {
-                // With a hosted panel the key focus belongs to whichever
-                // TextInput holds it — only the char grid claims it here.
-                if !hosted {
+                // With a hosted panel — or the launcher's field — the key
+                // focus belongs to whichever TextInput holds it.
+                if !hosted && !launcher {
                     cx.set_key_focus(self.area);
                 }
                 cx.show_text_ime_with_config(
                     self.area,
                     rect(0.0, 0.0, 0.0, 0.0),
-                    TextInputConfig {
-                        is_multiline: matches!(want_field, Some((_, FieldId::Body))),
-                        ..Default::default()
-                    },
+                    TextInputConfig::default(),
                 );
             } else if !hosted {
                 // Also resets makepad's "user dismissed the keyboard" latch,
                 // without which the next show request is silently ignored.
                 cx.hide_text_ime();
-            }
-        }
-        // android's IME owns an editable mirroring the focused field; seed it
-        // on focus and after every app-side edit — except mid-composition,
-        // when a push would clobber what the keyboard is composing.
-        if cfg!(target_os = "android") && self.ime_shown && !self.ime_composing {
-            if let Some((text, caret)) = self.state.as_deref().and_then(|s| {
-                if launcher {
-                    Some((s.launcher.query.clone(), s.launcher.caret))
-                } else {
-                    s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid))
-                }
-            }) {
-                let sent = self.ime_sent.as_ref();
-                if sent.map(|(t, c)| (t.as_str(), *c)) != Some((text.as_str(), caret)) {
-                    self.ime_sent = Some((text.clone(), caret));
-                    cx.sync_ime_state(text, CharOffset(caret)..CharOffset(caret), None);
-                }
             }
         }
         if let Some(state) = self.state.as_deref_mut() {
@@ -2365,9 +1637,10 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // The launcher owns the keyboard while it is up: arrows pick, enter
-        // goes, esc closes; characters edit the query (they arrive as
-        // TextInput, backspace and caret moves are handled here).
+        // The launcher owns the keyboard while it is up: arrows pick the
+        // hit, enter goes, esc closes. Everything else — the query's own
+        // editing, caret, selection — belongs to its `SField` now, so it is
+        // forwarded rather than re-implemented (CR-002 F).
         if state.overlay == Overlay::Launcher {
             match k.key_code {
                 KeyCode::Escape => {
@@ -2388,27 +1661,10 @@ impl Stage {
                     state.launcher.sel = state.launcher.sel.saturating_sub(1);
                     self.kick(cx);
                 }
-                KeyCode::ArrowLeft => {
-                    state.launcher.caret = state.launcher.caret.saturating_sub(1);
+                _ => {
+                    self.forward_to_overlay(cx, &Event::KeyDown(k.clone()));
                     self.kick(cx);
                 }
-                KeyCode::ArrowRight => {
-                    let len = state.launcher.query.chars().count();
-                    state.launcher.caret = (state.launcher.caret + 1).min(len);
-                    self.kick(cx);
-                }
-                KeyCode::Backspace => {
-                    let c = state.launcher.caret;
-                    if c > 0 {
-                        let b0 = char_byte(&state.launcher.query, c - 1);
-                        let b1 = char_byte(&state.launcher.query, c);
-                        state.launcher.query.replace_range(b0..b1, "");
-                        state.launcher.caret = c - 1;
-                        state.launcher.sel = 0;
-                    }
-                    self.kick(cx);
-                }
-                _ => {}
             }
             return;
         }
@@ -2453,7 +1709,6 @@ impl Stage {
                 _ => None,
             };
             if let Some(dir) = dir {
-                state.field = None;
                 if k.modifiers.shift {
                     if let Some(f) = state.ws.focus {
                         let label = format!("move “{}”", state.title_of(f));
@@ -2493,7 +1748,6 @@ impl Stage {
             }
             if k.key_code == KeyCode::KeyW {
                 if let Some(f) = state.ws.focus {
-                    state.field = None;
                     let label = format!("close “{}”", state.title_of(f));
                     state.act_nav("close", label, None, move |ws| {
                         ws.close(f);
@@ -2554,217 +1808,18 @@ impl Stage {
                 self.resolve_click(cx, Act::Btn(f, act), false);
                 return;
             }
-            if k.key_code != KeyCode::ReturnKey {
-                if hosted && state.field.is_none() {
-                    self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
-                    self.kick(cx);
-                }
-                return;
-            }
-            // cmd+enter falls through: fresh un-joined open in the inbox.
+            // An unclaimed chord — cmd+enter included, which the inbox reads
+            // as "open un-joined" — falls through to the panel below.
         }
 
-        // A focused text field owns the keyboard (chars arrive via TextInput).
         // A retained panel owns plain keys (its widgets gate on key focus)
         // — cmd chords and overlays were already handled above.
-        if hosted && state.field.is_none() {
+        if hosted {
             self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
             self.kick(cx);
-            return;
-        }
-        if let Some((pid, fid)) = state.field {
-            let kind = state.ws.panels.get(&pid).map(|p| p.kind.clone());
-            // Tab walks the form (shift reverses).
-            if k.key_code == KeyCode::Tab {
-                if let Some(kind) = &kind {
-                    let dir = if k.modifiers.shift { -1 } else { 1 };
-                    if let Some(next) = ui::next_field(kind, fid, dir) {
-                        state.field = Some((pid, next));
-                    }
-                }
-                self.kick(cx);
-                return;
-            }
-            let Some(ui) = state.ui.get_mut(&pid) else {
-                state.field = None;
-                return;
-            };
-            match fid {
-                FieldId::Body => match k.key_code {
-                    KeyCode::Escape => state.field = None,
-                    KeyCode::ReturnKey => {
-                        let (r, c) = ui.caret;
-                        let byte = char_byte(&ui.body[r], c);
-                        let rest = ui.body[r].split_off(byte);
-                        ui.body.insert(r + 1, rest);
-                        ui.caret = (r + 1, 0);
-                    }
-                    KeyCode::Backspace => {
-                        let (r, c) = ui.caret;
-                        if c > 0 {
-                            let b0 = char_byte(&ui.body[r], c - 1);
-                            let b1 = char_byte(&ui.body[r], c);
-                            ui.body[r].replace_range(b0..b1, "");
-                            ui.caret = (r, c - 1);
-                        } else if r > 0 {
-                            let line = ui.body.remove(r);
-                            let plen = ui.body[r - 1].chars().count();
-                            ui.body[r - 1].push_str(&line);
-                            ui.caret = (r - 1, plen);
-                        }
-                    }
-                    KeyCode::ArrowLeft => {
-                        let (r, c) = ui.caret;
-                        ui.caret = if c > 0 {
-                            (r, c - 1)
-                        } else if r > 0 {
-                            (r - 1, ui.body[r - 1].chars().count())
-                        } else {
-                            (r, c)
-                        };
-                    }
-                    KeyCode::ArrowRight => {
-                        let (r, c) = ui.caret;
-                        let len = ui.body[r].chars().count();
-                        ui.caret = if c < len {
-                            (r, c + 1)
-                        } else if r + 1 < ui.body.len() {
-                            (r + 1, 0)
-                        } else {
-                            (r, c)
-                        };
-                    }
-                    KeyCode::ArrowUp => {
-                        let (r, c) = ui.caret;
-                        if r > 0 {
-                            ui.caret = (r - 1, c.min(ui.body[r - 1].chars().count()));
-                        }
-                    }
-                    KeyCode::ArrowDown => {
-                        let (r, c) = ui.caret;
-                        if r + 1 < ui.body.len() {
-                            ui.caret = (r + 1, c.min(ui.body[r + 1].chars().count()));
-                        }
-                    }
-                    _ => return,
-                },
-                _ => {
-                    let f = ui.field_mut(fid).expect("single-line field");
-                    match k.key_code {
-                        KeyCode::Escape => state.field = None,
-                        KeyCode::ReturnKey => {
-                            if fid == FieldId::Filter {
-                                // Select the first visible row and leave the field.
-                                let first = state.inbox_rows(pid).first().map(|m| m.id);
-                                if let Some(ui) = state.ui.get_mut(&pid) {
-                                    ui.sel = first;
-                                }
-                            }
-                            state.field = None;
-                        }
-                        KeyCode::Backspace => f.backspace(),
-                        KeyCode::Delete => f.delete(),
-                        KeyCode::ArrowLeft => f.left(),
-                        KeyCode::ArrowRight => f.right(),
-                        _ => return,
-                    }
-                }
-            }
-            self.kick(cx);
-            return;
-        }
-
-        // Plain keys to the focused panel: the non-character ones.
-        let Some(f) = state.ws.focus else {
-            return;
-        };
-        let kind = state.ws.panels.get(&f).map(|p| p.kind.clone());
-        match kind {
-            Some(Kind::Inbox { .. }) => match k.key_code {
-                KeyCode::ArrowDown => self.inbox_move_sel(cx, f, 1),
-                KeyCode::ArrowUp => self.inbox_move_sel(cx, f, -1),
-                KeyCode::ReturnKey => {
-                    let rows = state.inbox_rows(f);
-                    let sel = state.ui.get(&f).and_then(|u| u.sel);
-                    let target = sel
-                        .filter(|s| rows.iter().any(|m| m.id == *s))
-                        .or_else(|| rows.first().map(|m| m.id));
-                    if let Some(id) = target {
-                        let fresh = k.modifiers.logo || k.modifiers.alt;
-                        let kind = Kind::Message { id };
-                        let label = format!("open “{}”", state.panel_title(&kind));
-                        state.act(
-                            "open",
-                            label,
-                            None,
-                            move |ws| {
-                                ws.follow_open(f, kind, fresh);
-                            },
-                            move |tx| mail::mark_read_tx(tx, id),
-                            vec![Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>],
-                        );
-                        self.sync(cx);
-                    }
-                }
-                _ => {}
-            },
-            _ => match k.key_code {
-                KeyCode::ArrowDown | KeyCode::ArrowUp => {
-                    let d = if k.key_code == KeyCode::ArrowDown {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    if let Some(ui) = state.ui.get_mut(&f) {
-                        ui.scroll = (ui.scroll + d * self.cell.line_h * 3.0)
-                            .clamp(0.0, ui.max_scroll);
-                    }
-                    self.kick(cx);
-                }
-                _ => {}
-            },
         }
     }
 
-    fn inbox_move_sel(&mut self, cx: &mut Cx, pid: PanelId, d: isize) {
-        let Some(state) = self.state.as_deref_mut() else {
-            return;
-        };
-        let rows = state.inbox_rows(pid);
-        if rows.is_empty() {
-            return;
-        }
-        let Some(ui) = state.ui.get_mut(&pid) else {
-            return;
-        };
-        let cur = ui.sel.and_then(|s| rows.iter().position(|m| m.id == s));
-        let next = match cur {
-            None => {
-                if d > 0 {
-                    0
-                } else {
-                    rows.len() - 1
-                }
-            }
-            Some(i) => (i as isize + d).clamp(0, rows.len() as isize - 1) as usize,
-        };
-        ui.sel = Some(rows[next].id);
-        // Keep the selection inside the scrolling region.
-        let line_h = self.cell.line_h;
-        let row_top = next as f64 * line_h;
-        let row_bot = row_top + line_h;
-        let view = ui.view_h.max(line_h);
-        if row_top < ui.scroll {
-            ui.scroll = row_top;
-        } else if row_bot > ui.scroll + view {
-            ui.scroll = row_bot - view;
-        }
-        self.kick(cx);
-    }
-
-    /// The android IME's authoritative field state (`full_state_sync`):
-    /// replace the focused field's text and caret wholesale. Composition is
-    /// tracked so app→IME syncs pause while the keyboard composes.
     /// Only the launcher trigger cares about key releases: a clean second
     /// cmd tap fires here.
     fn handle_key_up(&mut self, cx: &mut Cx, k: &KeyEvent) {
@@ -2961,7 +2016,6 @@ impl Stage {
             launcher::Go::Focus(pid) => {
                 let was = state.ws.active;
                 if let Some(k) = state.ws.focus_panel(pid) {
-                    state.field = None;
                     state.sync();
                     if k != was {
                         // The same jump-under-the-slide as a cmd+№ switch.
@@ -2985,7 +2039,6 @@ impl Stage {
                         .into_iter()
                         .collect(),
                 );
-                state.field = None;
                 state.sync();
             }
         }
@@ -2994,64 +2047,24 @@ impl Stage {
     }
 
     fn handle_ime_state(&mut self, cx: &mut Cx, fs: &FullTextState) {
-        let caret = fs.selection.end.0;
-        self.ime_composing = fs.composition.is_some();
-        self.ime_sent = Some((fs.text.clone(), caret));
-        let Some(state) = self.state.as_deref_mut() else {
+        let Some(state) = self.state.as_deref() else {
             return;
         };
-        // The launcher's query mirrors the IME editable wholesale, like any
-        // field (this is the android typing path).
+        // The launcher's query is an `SField`, and a TextInput owns the
+        // whole android full-state protocol itself — hand it the event
+        // untouched rather than mirroring it here.
         if state.overlay == Overlay::Launcher {
-            let text = fs.text.replace('\n', "");
-            state.launcher.caret = caret.min(text.chars().count());
-            if state.launcher.query != text {
-                state.launcher.query = text;
-                state.launcher.sel = 0;
-            }
+            let ev = Event::TextInput(TextInputEvent {
+                input: String::new(),
+                full_state_sync: Some(fs.clone()),
+                ..Default::default()
+            });
+            self.forward_to_overlay(cx, &ev);
             self.kick(cx);
-            return;
         }
-        let Some((pid, fid)) = state.field else {
-            return;
-        };
-        let Some(ui) = state.ui.get_mut(&pid) else {
-            return;
-        };
-        match fid {
-            FieldId::Body => {
-                ui.body = fs.text.split('\n').map(str::to_string).collect();
-                if ui.body.is_empty() {
-                    ui.body.push(String::new());
-                }
-                let mut rem = caret;
-                let mut rc = (
-                    ui.body.len() - 1,
-                    ui.body.last().map(|l| l.chars().count()).unwrap_or(0),
-                );
-                for (i, line) in ui.body.iter().enumerate() {
-                    let n = line.chars().count();
-                    if rem <= n {
-                        rc = (i, rem);
-                        break;
-                    }
-                    rem -= n + 1;
-                }
-                ui.caret = rc;
-            }
-            _ => {
-                let f = ui.field_mut(fid).expect("single-line field");
-                f.text = fs.text.clone();
-                f.caret = caret.min(f.text.chars().count());
-                if fid == FieldId::Filter {
-                    ui.sel = None;
-                }
-            }
-        }
-        self.kick(cx);
     }
 
-    /// Character input: field typing, or the focused panel's letter keys.
+    /// Character input: the focused panel's typing, or the launcher's query.
     fn handle_text(&mut self, cx: &mut Cx, input: &str) {
         let hosted = self.hosted_focus();
         let Some(state) = self.state.as_deref_mut() else {
@@ -3062,7 +2075,7 @@ impl Stage {
         }
         // A retained panel owns typing (its TextInputs gate on key focus);
         // overlays still win above it.
-        if hosted && state.overlay == Overlay::None && state.field.is_none() {
+        if hosted && state.overlay == Overlay::None {
             let ev = Event::TextInput(TextInputEvent {
                 input: input.to_string(),
                 ..Default::default()
@@ -3071,47 +2084,17 @@ impl Stage {
             self.kick(cx);
             return;
         }
+        // The launcher's query is an `SField` now: hand it the character
+        // and let the widget's own editing take it (the shell hears the
+        // result back as `OverlayAction::Query`).
         if state.overlay == Overlay::Launcher {
-            let byte = char_byte(&state.launcher.query, state.launcher.caret);
-            state.launcher.query.insert_str(byte, input);
-            state.launcher.caret += input.chars().count();
-            state.launcher.sel = 0;
+            let ev = Event::TextInput(TextInputEvent {
+                input: input.to_string(),
+                ..Default::default()
+            });
+            self.forward_to_overlay(cx, &ev);
             self.kick(cx);
             return;
-        }
-        if let Some((pid, fid)) = state.field {
-            if let Some(ui) = state.ui.get_mut(&pid) {
-                match fid {
-                    FieldId::Filter => {
-                        ui.filter.insert(input);
-                        ui.sel = None;
-                    }
-                    FieldId::Body => {
-                        let (r, c) = ui.caret;
-                        let byte = char_byte(&ui.body[r], c);
-                        ui.body[r].insert_str(byte, input);
-                        ui.caret = (r, c + input.chars().count());
-                    }
-                    _ => {
-                        if let Some(f) = ui.field_mut(fid) {
-                            f.insert(input);
-                        }
-                    }
-                }
-                self.kick(cx);
-            }
-            return;
-        }
-        let Some(f) = state.ws.focus else {
-            return;
-        };
-        // Only the char-grid kinds reach here — hosted panels took their
-        // typing above. The vim walk and `r` left with CR-003; `/` is the
-        // one plain letter the grammar keeps.
-        let kind = state.ws.panels.get(&f).map(|p| p.kind.clone());
-        if let (Some(Kind::Inbox { .. }), "/") = (kind, input) {
-            state.field = Some((f, FieldId::Filter));
-            self.kick(cx);
         }
     }
 
@@ -3124,7 +2107,6 @@ impl Stage {
         };
         state.overlay = Overlay::None;
         if state.ws.switch(k) {
-            state.field = None;
             state.sync();
             let cam = state.ws.camera_x;
             state.anim.camera().jump_to(cam);
@@ -3147,7 +2129,6 @@ impl Stage {
                 moved = ws.send_focused_to(k).is_some();
             });
             if moved {
-                state.field = None;
                 state.sync();
                 let cam = state.ws.camera_x;
                 state.anim.camera().jump_to(cam);
@@ -3205,9 +2186,8 @@ impl Stage {
                 // the shell's share is panel focus. A no-op focus must not
                 // redraw the world: a mid-gesture rebuild reissues areas
                 // and breaks the widget's own down/up pairing.
-                if state.ws.focus != Some(pid) || state.field.is_some() {
+                if state.ws.focus != Some(pid) {
                     state.ws.focus = Some(pid);
-                    state.field = None;
                     self.sync(cx);
                 }
                 return;
@@ -3216,8 +2196,8 @@ impl Stage {
                 match op {
                     WidgetOp::AddAccount => {
                         if let Some(w) = self.hosted.get(&pid) {
-                            if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
-                                let (email, pass, imap, smtp) = sp.form_values(cx);
+                            if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
+                                let (email, pass, imap, smtp) = ap.form_values(cx);
                                 cx.action(crate::panels::PanelAction::AddAccount {
                                     pid, email, pass, imap, smtp,
                                 });
@@ -3241,9 +2221,8 @@ impl Stage {
         }
         match act {
             Act::Focus(pid) => {
-                if state.ws.focus != Some(pid) || state.field.is_some() {
+                if state.ws.focus != Some(pid) {
                     state.ws.focus = Some(pid);
-                    state.field = None;
                     self.sync(cx);
                 }
             }
@@ -3297,22 +2276,8 @@ impl Stage {
                 );
                 self.sync(cx);
             }
-            Act::Row(pid, id) => {
-                state.ws.focus = Some(pid);
-                state.field = None;
-                if let Some(ui) = state.ui.get_mut(&pid) {
-                    ui.sel = Some(id);
-                }
-                self.sync(cx);
-            }
-            Act::Field(pid, fid) => {
-                state.ws.focus = Some(pid);
-                state.field = Some((pid, fid));
-                self.sync(cx);
-            }
             Act::Tab(pid) => {
                 state.ws.focus = Some(pid);
-                state.field = None;
                 self.sync(cx);
             }
             Act::Btn(pid, b) => {
@@ -3368,13 +2333,6 @@ impl Stage {
                             .hosted
                             .get(&pid)
                             .map(|w| w.as_compose_panel().values(cx))
-                            .or_else(|| {
-                                state.ui.get(&pid).map(|u| mail::Draft {
-                                    to: u.to.text.trim().to_string(),
-                                    subject: u.subject.text.clone(),
-                                    body: u.body.join("\n"),
-                                })
-                            })
                             .unwrap_or_default();
                         if d.to.is_empty() {
                             state.toast("no recipient", true);
@@ -3487,13 +2445,23 @@ impl Stage {
                     _ => TouchMode::Dead,
                 };
             }
-            TouchMode::Scroll { uid: u, pid } if *u == uid => {
-                let pid = *pid;
-                if let Some(state) = self.state.as_deref_mut() {
-                    if let Some(ui) = state.ui.get_mut(&pid) {
-                        ui.scroll = (ui.scroll - d.y).clamp(0.0, ui.max_scroll);
-                    }
-                }
+            TouchMode::Scroll { uid: u, pid: _ } if *u == uid => {
+                // Retained content scrolls itself: the drag becomes a
+                // Scroll event for the widget under the finger, so its own
+                // PortalList / ScrollBars clamp it (CR-002 F — the char
+                // grid's scroll offset no longer draws anything).
+                let ev = Event::Scroll(ScrollEvent {
+                    window_id: CxWindowPool::id_zero(),
+                    scroll: dvec2(0.0, -d.y),
+                    abs: p,
+                    modifiers: KeyModifiers::default(),
+                    handled_x: std::cell::Cell::new(false),
+                    handled_y: std::cell::Cell::new(false),
+                    is_mouse: false,
+                    time: 0.0,
+                    phase: ScrollPhase::None,
+                });
+                self.forward_to_hosted(cx, &ev);
                 self.kick(cx);
             }
             TouchMode::Pan { horizontal } => {
@@ -3716,11 +2684,13 @@ impl ScriptHook for Stage {
 fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
+        Kind::AddAccount => Some(live_id!(add_account_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
         Kind::Contact { .. } => Some(live_id!(contact_tpl)),
-        _ => None,
+        Kind::Help => Some(live_id!(help_tpl)),
+        Kind::About => Some(live_id!(about_tpl)),
     }
 }
 
@@ -3749,6 +2719,21 @@ impl Stage {
     /// the one place retained content meets the undo system.
     fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let mut refresh = false;
+        // A link in an HTML mail body leaves the app: panels are for this
+        // app's own nouns — a mail, a contact — and the web is neither, so
+        // the system browser takes it. The narrowing already vetted the
+        // scheme (see [`crate::html`]), so nothing is left to check here.
+        //
+        // It lives at the app rather than on MessagePanel because every
+        // open panel is handed the same action list: one click would
+        // otherwise open as many browser windows as there are panels.
+        for a in actions {
+            if let Some(wa) = a.as_widget_action() {
+                if let HtmlLinkAction::Clicked { url, .. } = wa.cast() {
+                    cx.open_url(&url, OpenUrlInPlace::No);
+                }
+            }
+        }
         for a in actions {
             let Some(pa) = a.downcast_ref::<crate::panels::PanelAction>() else {
                 continue;
@@ -3802,8 +2787,8 @@ impl Stage {
                             state.spawn_workers();
                             state.toast("account added — syncing", false);
                             if let Some(w) = self.hosted.get(&pid) {
-                                if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
-                                    sp.clear_form(cx);
+                                if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
+                                    ap.clear_form(cx);
                                 }
                             }
                         }
@@ -3870,6 +2855,27 @@ impl Stage {
                     state.spawn_workers();
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
                     refresh = true;
+                }
+                crate::panels::PanelAction::TryIt { pid: _ } => {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        state.toast("side effect: nothing was opened or replaced", false);
+                    }
+                    refresh = true;
+                }
+            }
+        }
+        // The launcher's field reports its own edits; the search re-runs on
+        // the next draw from this query.
+        for a in actions {
+            if let Some(crate::panels::OverlayAction::Query(q)) =
+                a.downcast_ref::<crate::panels::OverlayAction>()
+            {
+                if let Some(state) = self.state.as_deref_mut() {
+                    if state.launcher.query != *q {
+                        state.launcher.query = q.clone();
+                        state.launcher.sel = 0;
+                        refresh = true;
+                    }
                 }
             }
         }
@@ -3938,8 +2944,9 @@ impl Stage {
         self.forward_to_hosted(cx, &up);
     }
 
-    /// Whether the focused panel's content is a retained widget tree —
-    /// keys and text then belong to it, not to the char-grid machinery.
+    /// Whether the focused panel's content is a retained widget tree — keys
+    /// and text then belong to it rather than to the shell. Every kind is
+    /// hosted since CR-002 F, so this is "something is focused" in practice.
     fn hosted_focus(&self) -> bool {
         self.state
             .as_deref()
@@ -3968,6 +2975,26 @@ impl Stage {
             let mut scope = Scope::with_props(&props);
             w.handle_event(cx, event, &mut scope);
         }
+    }
+
+    /// Hands an event to whichever overlay widget is up. Its rows are
+    /// presentation, so in practice this feeds the launcher's query field.
+    fn forward_to_overlay(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        let key = match state.overlay {
+            Overlay::Launcher => OVERLAY_PID_L,
+            Overlay::Ws | Overlay::History => OVERLAY_PID_R,
+            Overlay::None => return,
+        };
+        let Some(w) = self.hosted.get(&key).cloned() else {
+            return;
+        };
+        // Rows come from the shell each draw; event handling needs none.
+        let props = crate::panels::OverlayProps::default();
+        let mut scope = Scope::with_props(&props);
+        w.handle_event(cx, event, &mut scope);
     }
 
     /// Keys and text go to the focused panel's widget alone — pointer
@@ -4007,10 +3034,23 @@ impl Widget for Stage {
             Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
         ) {
             self.forward_to_hosted(cx, event);
+            // The overlay is hosted too, but keyed outside the panel map —
+            // without this its field would never hear its own Changed
+            // action, and the query would type but never search.
+            self.forward_to_overlay(cx, event);
         }
         if let Some(pid) = self.pending_focus.take() {
-            if let Some(w) = self.hosted.get(&pid) {
-                w.as_compose_panel().focus_body(cx);
+            if let Some(w) = self.hosted.get(&pid).cloned() {
+                if pid == OVERLAY_PID_L {
+                    let q = self
+                        .state
+                        .as_deref()
+                        .map(|s| s.launcher.query.clone())
+                        .unwrap_or_default();
+                    w.as_launcher_overlay().focus_query(cx, &q);
+                } else {
+                    w.as_compose_panel().focus_body(cx);
+                }
             }
         }
         // A blurring TextInput hides the platform IME (its own lifecycle);
@@ -4188,13 +3228,14 @@ impl Widget for Stage {
                 // android's authoritative full-state syncs and plain chars
                 // alike — so they get the original event first, untouched.
                 // The e2e text path stays on handle_text, which synthesizes
-                // the same event: one route, two doors. Everything else
-                // splits as before: full state to the char-grid mirror,
-                // chars to handle_text.
+                // the same event: one route, two doors. What is left over
+                // (an overlay is up, or nothing is focused) splits by shape:
+                // full state to handle_ime_state, chars to handle_text.
                 if self.hosted_focus()
-                    && self.state.as_deref().is_some_and(|s| {
-                        s.overlay == Overlay::None && s.field.is_none()
-                    })
+                    && self
+                        .state
+                        .as_deref()
+                        .is_some_and(|s| s.overlay == Overlay::None)
                 {
                     self.forward_to_focused(cx, event);
                     self.kick(cx);
@@ -4216,35 +3257,9 @@ impl Widget for Stage {
                     VirtualKeyboardEvent::WillShow { height, .. }
                     | VirtualKeyboardEvent::DidShow { height, .. } => self.kb_h = *height,
                     VirtualKeyboardEvent::WillHide { .. } => self.kb_h = 0.0,
-                    VirtualKeyboardEvent::DidHide { .. } => {
-                        self.kb_h = 0.0;
-                        // The user dismissed the keyboard: that leaves the
-                        // field, and kick()'s hide resets makepad's dismissed
-                        // latch so the next field tap re-shows it.
-                        if let Some(state) = self.state.as_deref_mut() {
-                            state.field = None;
-                        }
-                    }
+                    VirtualKeyboardEvent::DidHide { .. } => self.kb_h = 0.0,
                 }
                 self.kick(cx);
-            }
-
-            Event::ImeAction(_) => {
-                // The soft keyboard's action button ≈ Enter for single-line
-                // fields (filter: select the first row and leave).
-                let single_line = self
-                    .state
-                    .as_deref()
-                    .is_some_and(|s| matches!(s.field, Some((_, f)) if f != FieldId::Body));
-                if single_line {
-                    let k = KeyEvent {
-                        key_code: KeyCode::ReturnKey,
-                        modifiers: KeyModifiers::default(),
-                        is_repeat: false,
-                        time: 0.0,
-                    };
-                    self.handle_key_down(cx, &k);
-                }
             }
 
             Event::MouseMove(e) => {
@@ -4298,22 +3313,10 @@ impl Widget for Stage {
                 };
                 e.handled_x.set(true);
                 e.handled_y.set(true);
+                // Vertical scrolling belongs to the retained content, which
+                // saw this event first (`forward_to_hosted`).
                 if e.scroll.x.abs() > e.scroll.y.abs() {
                     state.pan(e.scroll.x);
-                } else if e.scroll.y != 0.0 {
-                    // Vertical: scroll the panel body under the pointer.
-                    let p = e.abs;
-                    let pid = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| h.rect.contains(p))
-                        .and_then(|h| act_pid(&h.act));
-                    if let Some(pid) = pid {
-                        if let Some(ui) = state.ui.get_mut(&pid) {
-                            ui.scroll = (ui.scroll + e.scroll.y).clamp(0.0, ui.max_scroll);
-                        }
-                    }
                 }
                 self.kick(cx);
             }
@@ -4487,7 +3490,6 @@ impl Widget for Stage {
                         adv: width,
                         // The web prototype's 1.5 line-height, on this grid.
                         line_h: (line * 1.28).ceil(),
-                        asc,
                         natural: line,
                         dpi,
                     };
@@ -4786,322 +3788,11 @@ impl Stage {
             });
         }
 
-        // The workspaces overlay: a column of tappable rows — the current
-        // space inverted, panel titles as the summary, the first empty slot
-        // offered as a fresh space — under a search row, the launcher's
-        // touch entry.
-        if state.overlay == Overlay::Ws {
-            let roster = state.ws.roster();
-            let row_h: f64 = 54.0;
-            let row_gap: f64 = 10.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(430.0);
-            let total = (roster.len() + 1) as f64 * (row_h + row_gap) - row_gap;
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let mut y = vp.pos.y + ((vp.size.y - total) / 2.0).max(2.0 * theme::GAP);
-            self.draw_panel.new_draw_call(cx);
-            self.draw_mono.new_draw_call(cx);
-            let r = rect(x, y, w, row_h);
-            self.draw_panel.color = rgba_a(theme::BG, 1.0);
-            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-            self.draw_panel.border_size = 1.0;
-            self.draw_panel.alpha = 1.0;
-            self.draw_panel.draw_abs(cx, r);
-            self.set_text(Style::Muted, 1.0);
-            self.draw_mono.draw_abs(
-                cx,
-                dvec2(x + 16.0, y + (row_h - self.cell.natural) / 2.0),
-                "search",
-            );
-            self.hits.push(HitR {
-                rect: r,
-                act: Act::LauncherOpen,
-                cursor: MouseCursor::Hand,
-                label: "search".into(),
-            });
-            y += row_h + row_gap;
-            for k in roster {
-                let r = rect(x, y, w, row_h);
-                let current = k == state.ws.active;
-                let (bg, fg) = if current {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, r);
-                self.set_text(Style::Big, 1.0);
-                self.draw_mono.color = rgba_a(fg, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, y + (row_h - self.cell.natural * 1.25) / 2.0),
-                    &format!("{}", k + 1),
-                );
-                let ws = &state.ws.wss[k];
-                let summary = if ws.is_empty() {
-                    "new".to_string()
-                } else {
-                    let names: Vec<String> = ws
-                        .columns
-                        .iter()
-                        .flat_map(|c| c.panels.iter())
-                        .filter_map(|pid| ws.panels.get(pid).map(|p| state.panel_title(&p.kind)))
-                        .collect();
-                    names.join(" · ")
-                };
-                let cols = (((w - 56.0) / self.cell.adv).max(4.0)) as usize;
-                let summary = trunc(&summary, cols);
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(fg, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 48.0, y + (row_h - self.cell.natural) / 2.0),
-                    &summary,
-                );
-                self.hits.push(HitR {
-                    rect: r,
-                    act: Act::WsRow(k),
-                    cursor: MouseCursor::Hand,
-                    label: format!("workspace {}", k + 1),
-                });
-                y += row_h + row_gap;
-            }
-        }
+        // The overlays are retained widgets now (CR-002 F): the shell
+        // supplies their rows and owns their clicks, exactly as it does for
+        // a panel's in-list controls.
+        self.draw_overlay(cx, state, vp);
 
-        // The launcher: a query field over the result rows, windowed around
-        // the selection. Hits are recomputed here, on what is actually
-        // drawn, so clicks and enter resolve against the visible list.
-        // The history overlay: the action DAG as rows, newest first, indented
-        // by branch depth. The row under HEAD is inverted; undone branches
-        // are muted but clickable — travel goes anywhere, including the
-        // beginning. Expired sends are physics: marked, never re-walked.
-        if state.overlay == Overlay::History {
-            let (nodes, head) = state.history.rows();
-            let mut depth: HashMap<i64, usize> = HashMap::new();
-            for n in &nodes {
-                let d = depth.get(&n.parent).map_or(0, |d| d + 1);
-                depth.insert(n.id, d);
-            }
-            struct HRow {
-                id: i64,
-                text: String,
-                right: String,
-                state: &'static str,
-            }
-            let mut rows: Vec<HRow> = nodes
-                .iter()
-                .rev()
-                .map(|n| {
-                    let ind = "  ".repeat((*depth.get(&n.id).unwrap_or(&0)).min(6));
-                    HRow {
-                        id: n.id,
-                        text: format!("{ind}{}", n.label),
-                        right: match n.state.as_str() {
-                            "expired" => format!("{} · sent", mail::fmt_date(n.ts)),
-                            _ => mail::fmt_date(n.ts),
-                        },
-                        state: match n.state.as_str() {
-                            "applied" => "applied",
-                            "expired" => "expired",
-                            _ => "undone",
-                        },
-                    }
-                })
-                .collect();
-            rows.push(HRow {
-                id: 0,
-                text: "the beginning".into(),
-                right: String::new(),
-                state: "applied",
-            });
-
-            let row_h: f64 = 40.0;
-            let row_gap: f64 = 8.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(560.0);
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let top = vp.pos.y + 2.0 * theme::GAP;
-            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - top).max(0.0);
-            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
-            let head_idx = rows.iter().position(|r| r.id == head).unwrap_or(0);
-            let start = (head_idx + 1).saturating_sub(max_rows.max(3) - 2).min(
-                rows.len().saturating_sub(max_rows),
-            );
-            let end = (start + max_rows).min(rows.len());
-
-            self.draw_panel.new_draw_call(cx);
-            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
-            let mut y = top;
-            for r in &rows[start..end] {
-                let rr = rect(x, y, w, row_h);
-                let is_head = r.id == head;
-                let (bg, fg) = if is_head {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                let alpha = if r.state == "applied" || is_head { 1.0 } else { 0.45 };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, if is_head { 1.0 } else { alpha });
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, rr);
-                let ty = y + (row_h - self.cell.natural) / 2.0;
-                let rx = x + w - 16.0 - r.right.chars().count() as f64 * self.cell.adv;
-                if !r.right.is_empty() {
-                    texts.push((dvec2(rx, ty), r.right.clone(), fg, 0.5 * alpha + 0.05));
-                }
-                let cols = (((rx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
-                texts.push((dvec2(x + 16.0, ty), trunc(&r.text, cols), fg, alpha));
-                self.hits.push(HitR {
-                    rect: rr,
-                    act: Act::HistoryRow(r.id),
-                    cursor: MouseCursor::Hand,
-                    label: r.text.trim().to_string(),
-                });
-                y += row_h + row_gap;
-            }
-            if end < rows.len() {
-                texts.push((
-                    dvec2(x + 16.0, y + 6.0),
-                    format!("… {} earlier", rows.len() - end),
-                    theme::INK,
-                    0.45,
-                ));
-            }
-            self.draw_mono.new_draw_call(cx);
-            for (pos, s, color, alpha) in texts {
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(color, alpha);
-                self.draw_mono.draw_abs(cx, pos, &s);
-            }
-        }
-
-        if state.overlay == Overlay::Launcher {
-            state.launcher.hits =
-                launcher::search(&state.ws, &state.store, &state.launcher.query);
-            let n_hits = state.launcher.hits.len();
-            state.launcher.sel = state.launcher.sel.min(n_hits.saturating_sub(1));
-            let field_h: f64 = 54.0;
-            let row_h: f64 = 40.0;
-            let row_gap: f64 = 8.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(520.0);
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let top = vp.pos.y + 2.0 * theme::GAP;
-            self.draw_panel.new_draw_call(cx);
-            let fr = rect(x, top, w, field_h);
-            self.draw_panel.color = rgba_a(theme::BG, 1.0);
-            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-            self.draw_panel.border_size = 1.0;
-            self.draw_panel.alpha = 1.0;
-            self.draw_panel.draw_abs(cx, fr);
-            self.hits.push(HitR {
-                rect: fr,
-                act: Act::LauncherOpen,
-                cursor: MouseCursor::Text,
-                label: "search".into(),
-            });
-
-            // Result rows first (they share the panel draw call).
-            let mut y = top + field_h + 12.0;
-            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - y).max(0.0);
-            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
-            let start = (state.launcher.sel + 1).saturating_sub(max_rows);
-            let end = (start + max_rows).min(n_hits);
-            let rows: Vec<launcher::Hit> = state.launcher.hits[start..end].to_vec();
-            let sel = state.launcher.sel;
-            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
-            for (i, hit) in rows.iter().enumerate() {
-                let idx = start + i;
-                let r = rect(x, y, w, row_h);
-                let (bg, fg) = if idx == sel {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, r);
-                let ty = y + (row_h - self.cell.natural) / 2.0;
-                let badge = match hit.ws {
-                    Some(k) => format!("№{}", k + 1),
-                    None => "new".to_string(),
-                };
-                let bx = x + w - 16.0 - badge.chars().count() as f64 * self.cell.adv;
-                texts.push((dvec2(bx, ty), badge, fg, 0.55));
-                let cols = (((bx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
-                let label = trunc(&hit.label, cols);
-                let used = label.chars().count() + 2;
-                texts.push((dvec2(x + 16.0, ty), label, fg, 1.0));
-                if !hit.detail.is_empty() && hit.detail != hit.label && used < cols {
-                    let detail = trunc(&hit.detail, cols - used);
-                    texts.push((
-                        dvec2(x + 16.0 + used as f64 * self.cell.adv, ty),
-                        detail,
-                        fg,
-                        0.55,
-                    ));
-                }
-                self.hits.push(HitR {
-                    rect: r,
-                    act: Act::LauncherRow(idx),
-                    cursor: MouseCursor::Hand,
-                    label: hit.label.clone(),
-                });
-                y += row_h + row_gap;
-            }
-
-            // The caret, above the field's rect.
-            let q_chars = state.launcher.query.chars().count();
-            let caret = state.launcher.caret.min(q_chars);
-            self.draw_flat.new_draw_call(cx);
-            self.draw_flat.color = rgba_a(theme::INK, 1.0);
-            self.draw_flat.draw_abs(
-                cx,
-                rect(
-                    x + 16.0 + caret as f64 * self.cell.adv,
-                    top + (field_h - self.cell.line_h) / 2.0,
-                    2.0,
-                    self.cell.line_h,
-                ),
-            );
-
-            // Text above everything: the query (or its ghost), the rows.
-            self.draw_mono.new_draw_call(cx);
-            let fy = top + (field_h - self.cell.natural) / 2.0;
-            if state.launcher.query.is_empty() {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, fy),
-                    "search — panels, mail, people",
-                );
-            } else {
-                let cols = (((w - 32.0) / self.cell.adv).max(4.0)) as usize;
-                self.set_text(Style::N, 1.0);
-                self.draw_mono
-                    .draw_abs(cx, dvec2(x + 16.0, fy), &trunc(&state.launcher.query, cols));
-            }
-            for (pos, s, color, alpha) in texts {
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(color, alpha);
-                self.draw_mono.draw_abs(cx, pos, &s);
-            }
-            if n_hits == 0 && !state.launcher.query.is_empty() {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(cx, dvec2(x + 16.0, y + 6.0), "nothing matches");
-            } else if end < n_hits {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, y + 2.0),
-                    &format!("… {} more", n_hits - end),
-                );
-            }
-        }
 
         // The toast, above everything.
         if let Some((msg, err, since)) = state.toast.clone() {
@@ -5184,21 +3875,6 @@ impl Stage {
             dx += step;
         }
         dx - x
-    }
-
-    fn draw_text_at(&mut self, cx: &mut Cx2d, x: f64, y: f64, s: &str, st: Style, alpha: f64) {
-        if st == Style::Label {
-            // Labels are tracked and vertically centred in the line.
-            let ly = y + (self.cell.natural - self.cell.label_line()) / 2.0;
-            self.draw_label(cx, x, ly, s, st.color(), alpha);
-            return;
-        }
-        self.set_text(st, alpha);
-        self.draw_mono.draw_abs(cx, dvec2(x, y), s);
-        if st == Style::Bold || st == Style::Big {
-            // Fake bold: a second pass, nudged.
-            self.draw_mono.draw_abs(cx, dvec2(x + 0.4, y), s);
-        }
     }
 
     /// Chrome only: fill, border, header. Used for ghosts and as the first
@@ -5294,6 +3970,215 @@ impl Stage {
         });
     }
 
+    /// Draws whichever modal overlay is up as a retained widget, and
+    /// registers its rows as hits.
+    ///
+    /// The rows live in a `PortalList`, so — like a panel's in-list
+    /// controls — the shell owns their clicks: real presses and scripted
+    /// ones resolve through the same `Act`s the char grid used, and the
+    /// widget is presentation plus (for the launcher) a real text field.
+    fn draw_overlay(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
+        use crate::panels::{OverlayProps, OverlayRowData};
+        if state.overlay == Overlay::None {
+            // Each opening starts clean: the launcher's field seeds and
+            // takes focus only on the frame its widget is created.
+            self.hosted.remove(&OVERLAY_PID_R);
+            self.hosted.remove(&OVERLAY_PID_L);
+            return;
+        }
+        let launcher = state.overlay == Overlay::Launcher;
+        // Rows, plus the Act each one resolves to.
+        let mut acts: Vec<Act> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut rows: Vec<OverlayRowData> = Vec::new();
+        match state.overlay {
+            Overlay::Ws => {
+                for k in state.ws.roster() {
+                    let ws = &state.ws.wss[k];
+                    let summary = if ws.is_empty() {
+                        "new".to_string()
+                    } else {
+                        ws.columns
+                            .iter()
+                            .flat_map(|c| c.panels.iter())
+                            .filter_map(|pid| {
+                                ws.panels.get(pid).map(|p| state.panel_title(&p.kind))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    rows.push(OverlayRowData {
+                        num: format!("{}", k + 1),
+                        main: summary,
+                        current: k == state.ws.active,
+                        ..Default::default()
+                    });
+                    acts.push(Act::WsRow(k));
+                    labels.push(format!("workspace {}", k + 1));
+                }
+            }
+            Overlay::History => {
+                let (nodes, head) = state.history.rows();
+                let mut depth: HashMap<i64, usize> = HashMap::new();
+                for n in &nodes {
+                    let d = depth.get(&n.parent).map_or(0, |d| d + 1);
+                    depth.insert(n.id, d);
+                }
+                for n in nodes.iter().rev() {
+                    let ind = "  ".repeat((*depth.get(&n.id).unwrap_or(&0)).min(6));
+                    rows.push(OverlayRowData {
+                        main: format!("{ind}{}", n.label),
+                        right: match n.state.as_str() {
+                            "expired" => format!("{} · sent", mail::fmt_date(n.ts)),
+                            _ => mail::fmt_date(n.ts),
+                        },
+                        current: n.id == head,
+                        muted: n.state != "applied" && n.state != "expired",
+                        ..Default::default()
+                    });
+                    acts.push(Act::HistoryRow(n.id));
+                    labels.push(n.label.clone());
+                }
+                rows.push(OverlayRowData {
+                    main: "the beginning".into(),
+                    current: head == 0,
+                    ..Default::default()
+                });
+                acts.push(Act::HistoryRow(0));
+                labels.push("the beginning".into());
+            }
+            Overlay::Launcher => {
+                state.launcher.hits =
+                    launcher::search(&state.ws, &state.store, &state.launcher.query);
+                let n = state.launcher.hits.len();
+                state.launcher.sel = state.launcher.sel.min(n.saturating_sub(1));
+                for (i, hit) in state.launcher.hits.iter().enumerate() {
+                    rows.push(OverlayRowData {
+                        main: hit.label.clone(),
+                        detail: if hit.detail == hit.label {
+                            String::new()
+                        } else {
+                            hit.detail.clone()
+                        },
+                        right: match hit.ws {
+                            Some(k) => format!("#{}", k + 1),
+                            None => "new".into(),
+                        },
+                        current: i == state.launcher.sel,
+                        ..Default::default()
+                    });
+                    acts.push(Act::LauncherRow(i));
+                    labels.push(hit.label.clone());
+                }
+            }
+            Overlay::None => return,
+        }
+
+        // A centred column, the width the char grid used. The workspaces
+        // overlay reserves its first band for the search row — the
+        // launcher's entry on glass, which the shell draws.
+        let w = (vp.size.x - 4.0 * theme::GAP).min(if launcher { 520.0 } else { 560.0 });
+        let x = vp.pos.x + (vp.size.x - w) / 2.0;
+        let top = vp.pos.y + 2.0 * theme::GAP;
+        let search_h = if state.overlay == Overlay::Ws { 48.0 } else { 0.0 };
+        let h = (vp.size.y - 4.0 * theme::GAP - search_h).max(80.0);
+        let r = rect(x, top + search_h, w, h);
+
+        let tpl = if launcher {
+            live_id!(launcher_overlay_tpl)
+        } else {
+            live_id!(rows_overlay_tpl)
+        };
+        let key = if launcher { OVERLAY_PID_L } else { OVERLAY_PID_R };
+        let Some((widget, created)) = self.hosted_widget(cx, key, tpl) else {
+            return;
+        };
+        if created && launcher {
+            // Typing lands in the query the moment the launcher opens —
+            // but key focus set during a draw pass does not take, so the
+            // next event tick does it (the compose panel's lesson).
+            self.pending_focus = Some(OVERLAY_PID_L);
+        }
+        if launcher {
+            widget
+                .as_launcher_overlay()
+                .scroll_to(cx, state.launcher.sel);
+        }
+        let props = OverlayProps {
+            rows,
+            query: state.launcher.query.clone(),
+        };
+        let mut scope = Scope::with_props(&props);
+        cx.begin_turtle(
+            Walk::abs_rect(r),
+            Layout {
+                clip_x: true,
+                clip_y: true,
+                ..Default::default()
+            },
+        );
+        widget.draw_all(cx, &mut scope);
+        cx.end_turtle();
+
+        // The rows that actually drew become hits, above the backdrop's
+        // close-everything rect.
+        let list_path = ids!(list);
+        if let Some(list) = widget.widget(cx, list_path).as_portal_list().borrow() {
+            for (idx, item) in list.items().iter() {
+                let ir = item.widget.area().rect(cx);
+                if ir.size.x <= 0.0 {
+                    continue;
+                }
+                if let (Some(act), Some(label)) = (acts.get(*idx), labels.get(*idx)) {
+                    self.hits.push(HitR {
+                        rect: ir,
+                        act: act.clone(),
+                        cursor: MouseCursor::Hand,
+                        label: label.clone(),
+                    });
+                }
+            }
+        }
+        if launcher {
+            // The query field: a real TextInput, so a click just needs to
+            // reach it (the widget owns focus and caret).
+            let fr = widget.widget(cx, ids!(query_input)).area().rect(cx);
+            if fr.size.x > 0.0 {
+                self.hits.push(HitR {
+                    rect: fr,
+                    act: Act::LauncherOpen,
+                    cursor: MouseCursor::Text,
+                    label: "search".into(),
+                });
+            }
+        } else if state.overlay == Overlay::Ws {
+            // The workspaces overlay's search row is the launcher's entry
+            // on glass: a card above the roster, drawn by the shell.
+            let sr = rect(x, top, w, 40.0);
+            {
+                self.draw_panel.new_draw_call(cx);
+                self.draw_panel.color = rgba_a(theme::BG, 1.0);
+                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, sr);
+                self.draw_mono.new_draw_call(cx);
+                self.set_text(Style::Muted, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
+                    "search",
+                );
+                self.hits.push(HitR {
+                    rect: sr,
+                    act: Act::LauncherOpen,
+                    cursor: MouseCursor::Hand,
+                    label: "search".into(),
+                });
+            }
+        }
+    }
+
     /// Draws a panel's retained content widget inside the body rect and
     /// registers its interactive children as e2e-addressable hits.
     fn draw_hosted(&mut self, cx: &mut Cx2d, state: &State, pid: PanelId, tpl: LiveId, body: Rect) {
@@ -5349,23 +4234,12 @@ impl Stage {
         let mut reg: Vec<(String, Rect, Act)> = Vec::new();
         match &kind {
             Some(Kind::Settings) => {
-                for (label, path) in [
-                    ("address", ids!(email_input)),
-                    ("password", ids!(pass_input)),
-                    ("imap", ids!(imap_input)),
-                    ("smtp", ids!(smtp_input)),
-                ] {
-                    let r = w.widget(cx, path).area().rect(cx);
-                    if r.size.x > 0.0 {
-                        reg.push((label.to_string(), r, Act::Pointer(pid)));
-                    }
-                }
-                let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
-                if add_r.size.x > 0.0 {
+                let lr = w.widget(cx, ids!(add_link)).area().rect(cx);
+                if lr.size.x > 0.0 {
                     reg.push((
                         "add account".to_string(),
-                        add_r,
-                        Act::WidgetOp(pid, WidgetOp::AddAccount),
+                        lr,
+                        Act::Open(pid, Kind::AddAccount),
                     ));
                 }
                 let accounts = mail::accounts(&state.store);
@@ -5404,6 +4278,27 @@ impl Stage {
                             }
                         }
                     }
+                }
+            }
+            Some(Kind::AddAccount) => {
+                for (label, path) in [
+                    ("address", ids!(email_input)),
+                    ("password", ids!(pass_input)),
+                    ("imap", ids!(imap_input)),
+                    ("smtp", ids!(smtp_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
+                if add_r.size.x > 0.0 {
+                    reg.push((
+                        "add account".to_string(),
+                        add_r,
+                        Act::WidgetOp(pid, WidgetOp::AddAccount),
+                    ));
                 }
             }
             Some(Kind::Compose { .. }) => {
@@ -5489,8 +4384,11 @@ impl Stage {
                 // The selectable runs (CR-003). Registered like any hosted
                 // field: scripts drag them, and a real click on one keeps
                 // the key focus the TextInput just took.
+                // `mail html` is the same run in its other reading; only
+                // one of the two is ever visible, so only one registers.
                 for (label, path) in [
                     ("mail body", ids!(body_lbl)),
+                    ("mail html", ids!(body_html)),
                     ("mail to", ids!(to_lbl)),
                     ("mail date", ids!(date_lbl)),
                 ] {
@@ -5515,10 +4413,18 @@ impl Stage {
             _ => {}
         }
         for (label, r, act) in reg {
+            // The hand promises a click does something. Text keeps that
+            // promise honest: the fields and the read-only selectable runs
+            // (CR-003) answer to the drag, not the click, so they take the
+            // beam — which is also the only hint that they can be copied.
+            let cursor = match act {
+                Act::Pointer(_) => MouseCursor::Text,
+                _ => MouseCursor::Hand,
+            };
             self.hits.push(HitR {
                 rect: r,
                 act,
-                cursor: MouseCursor::Hand,
+                cursor,
                 label,
             });
         }
@@ -5563,7 +4469,7 @@ impl Stage {
             self.draw_header_btn(cx, br, label, label, focused, alpha, Act::Btn(pid, *act), hover.as_ref());
         }
 
-        // The body: a clipped turtle, content on the char grid.
+        // The body: the rect the retained content draws into.
         let body = rect(
             r.pos.x + 1.0,
             r.pos.y + theme::HEAD_H,
@@ -5573,355 +4479,14 @@ impl Stage {
         if body.size.y < 4.0 {
             return;
         }
-        // Retained content (CR-002): kinds with a widget template draw a
-        // widget tree instead of the char grid. Chrome above still fades;
-        // the content pops — the pilot's accepted trade.
+        // All content is retained now (CR-002 F): every kind has a widget
+        // template, so a panel body is a widget tree. Chrome above still
+        // fades; the content pops — the pilot's accepted trade.
         if let Some(tpl) = hosted_tpl(&kind) {
             self.draw_hosted(cx, state, pid, tpl, body);
-            return;
-        }
-        let pad = theme::PAD_X;
-        let pad_y = theme::PAD_Y;
-        let cols = (((body.size.x - 2.0 * pad) / self.cell.adv).max(8.0)) as usize;
-        let lines = build_lines(state, pid, cols);
-        let line_h = self.cell.line_h;
-        // A leading run of pinned lines (the filter, table headers) stays put;
-        // everything after it scrolls.
-        let pin_count = lines.iter().take_while(|l| l.pin).count();
-        let pinned_h = pin_count as f64 * line_h;
-        let view_h = (body.size.y - 2.0 * pad_y - pinned_h).max(0.0);
-        let content_h = (lines.len() - pin_count) as f64 * line_h;
-        let max_scroll = (content_h - view_h).max(0.0);
-        let (scroll, sel, caret_focus) = {
-            let ui = state.ui.entry(pid).or_insert_with(|| {
-                PanelUi::for_kind(&kind, &state.store, pid)
-            });
-            ui.max_scroll = max_scroll;
-            ui.view_h = view_h;
-            ui.scroll = ui.scroll.clamp(0.0, max_scroll);
-            (ui.scroll, ui.sel, state.field)
-        };
-
-        cx.begin_turtle(
-            Walk::abs_rect(body),
-            Layout {
-                clip_x: true,
-                clip_y: true,
-                ..self.layout
-            },
-        );
-
-        let x0 = body.pos.x + pad;
-        let body_top = body.pos.y;
-        let body_bot = body.pos.y + body.size.y;
-        let mut body_field_rows: Vec<(usize, f64)> = Vec::new(); // (row idx, y)
-
-        // The scrolling region.
-        for (li, line) in lines.iter().enumerate().skip(pin_count) {
-            let y = body.pos.y + pad_y + pinned_h + (li - pin_count) as f64 * line_h - scroll;
-            if y + line_h < body_top || y > body_bot {
-                continue;
-            }
-            self.draw_line(
-                cx, state, pid, line, li, x0, y, cols, body, alpha, sel, caret_focus,
-                &mut body_field_rows,
-            );
-        }
-
-        // Pinned lines: mask what scrolls underneath, then draw on top. The
-        // fresh draw calls put the mask and the pinned text above the
-        // already-batched content.
-        if pin_count > 0 {
-            self.draw_panel.new_draw_call(cx);
-            self.draw_flat.new_draw_call(cx);
-            self.draw_mono.new_draw_call(cx);
-            self.draw_flat.color = rgba_a(theme::BG, alpha);
-            self.draw_flat
-                .draw_abs(cx, rect(body.pos.x, body.pos.y, body.size.x, pad_y + pinned_h));
-            for (li, line) in lines.iter().enumerate().take(pin_count) {
-                let y = body.pos.y + pad_y + li as f64 * line_h;
-                self.draw_line(
-                    cx, state, pid, line, li, x0, y, cols, body, alpha, sel, caret_focus,
-                    &mut body_field_rows,
-                );
-            }
-        }
-
-        // A minimal thumb marks a scrollable body.
-        if max_scroll > 0.0 {
-            let track_y = body.pos.y + pad_y + pinned_h;
-            let track_h = view_h;
-            let thumb_h = (track_h * (view_h / content_h.max(1.0))).clamp(24.0, track_h);
-            let thumb_y = track_y + (scroll / max_scroll) * (track_h - thumb_h);
-            self.draw_flat.color = rgba_a(theme::MUTED, alpha);
-            self.draw_flat
-                .draw_abs(cx, rect(body.pos.x + body.size.x - 5.0, thumb_y, 3.0, thumb_h));
-        }
-
-        // Compose body region: one big field hit + caret.
-        if let Kind::Compose { .. } = kind {
-            if let Some((first_row_y, _)) = body_field_rows.first().map(|&(i, y)| (y, i)) {
-                let region = rect(
-                    body.pos.x,
-                    first_row_y,
-                    body.size.x,
-                    (body_bot - first_row_y).max(0.0),
-                );
-                self.hits.push(HitR {
-                    rect: region,
-                    act: Act::Field(pid, FieldId::Body),
-                    cursor: MouseCursor::Text,
-                    label: "body".to_string(),
-                });
-            }
-            if caret_focus == Some((pid, FieldId::Body)) {
-                if let Some(ui) = state.ui.get(&pid) {
-                    let (cr, cc) = ui.caret;
-                    if let Some(&(_, cy)) = body_field_rows.iter().find(|&&(i, _)| i == cr) {
-                        self.draw_flat.color = rgba_a(theme::INK, alpha);
-                        self.draw_flat.draw_abs(
-                            cx,
-                            rect(x0 + cc as f64 * self.cell.adv, cy + 1.0, 1.5, line_h - 3.0),
-                        );
-                    }
-                }
-            }
-        }
-
-        cx.end_turtle();
-    }
-
-    /// One content line: row backing, left runs, right-aligned runs, rule.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_line(
-        &mut self,
-        cx: &mut Cx2d,
-        state: &State,
-        pid: PanelId,
-        line: &Line,
-        li: usize,
-        x0: f64,
-        y: f64,
-        cols: usize,
-        body: Rect,
-        alpha: f64,
-        sel: Option<MailId>,
-        caret_focus: Option<(PanelId, FieldId)>,
-        body_field_rows: &mut Vec<(usize, f64)>,
-    ) {
-        let line_h = self.cell.line_h;
-        let pad = theme::PAD_X;
-        // Selected row backing.
-        if let Some(mid) = line.row {
-            let row_r = rect(body.pos.x, y - 1.0, body.size.x, line_h);
-            let hovered = state.hover == Some(Act::Row(pid, mid));
-            if sel == Some(mid) {
-                self.draw_flat.color = rgba_a(theme::SEL, alpha);
-                self.draw_flat.draw_abs(cx, row_r);
-            } else if hovered {
-                self.draw_flat.color = rgba_a(theme::HOVER, alpha);
-                self.draw_flat.draw_abs(cx, row_r);
-            }
-            self.hits.push(HitR {
-                rect: row_r,
-                act: Act::Row(pid, mid),
-                cursor: MouseCursor::Default,
-                label: mail::mail(&state.store, mid)
-                    .map(|m| m.head.subject)
-                    .unwrap_or_default(),
-            });
-        }
-
-        let mut cx_chars = 0usize;
-        for seg in &line.left {
-            cx_chars = self.draw_seg(
-                cx, state, pid, seg, x0, y, cx_chars, alpha, caret_focus, li, body_field_rows,
-            );
-        }
-        if !line.right.is_empty() {
-            let rw: usize = line.right.iter().map(Seg::chars).sum();
-            let mut rx = cols.saturating_sub(rw);
-            for seg in &line.right {
-                rx = self.draw_seg(
-                    cx, state, pid, seg, x0, y, rx, alpha, caret_focus, li, body_field_rows,
-                );
-            }
-        }
-        if line.rule {
-            let c = if line.rule_ink { theme::INK } else { theme::RULE };
-            self.draw_flat.color = rgba_a(c, alpha);
-            self.draw_flat
-                .draw_abs(cx, rect(x0, y + line_h - 1.0, body.size.x - 2.0 * pad, 1.0));
         }
     }
 
-    /// Draws one segment at char column `col`; returns the next char column.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_seg(
-        &mut self,
-        cx: &mut Cx2d,
-        state: &State,
-        pid: PanelId,
-        seg: &Seg,
-        x0: f64,
-        y: f64,
-        col: usize,
-        alpha: f64,
-        field_focus: Option<(PanelId, FieldId)>,
-        line_idx: usize,
-        body_rows: &mut Vec<(usize, f64)>,
-    ) -> usize {
-        let adv = self.cell.adv;
-        let line_h = self.cell.line_h;
-        let x = x0 + col as f64 * adv;
-        match seg {
-            Seg::Sp(n) => col + n,
-            Seg::T(s, st) => {
-                self.draw_text_at(cx, x, y, s, *st, alpha);
-                col + s.chars().count()
-            }
-            Seg::Link {
-                label,
-                target,
-                dotted,
-            } => {
-                let n = label.chars().count();
-                let w = n as f64 * adv;
-                let act = if *dotted {
-                    Act::Replace(pid, target.clone())
-                } else {
-                    Act::Open(pid, target.clone())
-                };
-                if state.hover.as_ref() == Some(&act) {
-                    self.draw_flat.color = rgba_a(theme::HOVER, alpha);
-                    self.draw_flat.draw_abs(cx, rect(x - 1.0, y - 1.0, w + 2.0, line_h));
-                }
-                self.draw_text_at(cx, x, y, label, Style::N, alpha);
-                // Underline hangs 3 pt under the measured baseline.
-                let uy = y + self.cell.asc + 3.0;
-                self.draw_flat.color = rgba_a(theme::INK, alpha);
-                if *dotted {
-                    let mut dx = x;
-                    while dx < x + w - 1.0 {
-                        self.draw_flat.draw_abs(cx, rect(dx, uy, 1.6, 1.6));
-                        dx += 4.5;
-                    }
-                } else {
-                    self.draw_flat.draw_abs(cx, rect(x, uy, w, 1.0));
-                }
-                self.hits.push(HitR {
-                    rect: rect(x, y, w, line_h),
-                    act,
-                    cursor: MouseCursor::Hand,
-                    label: label.clone(),
-                });
-                col + n
-            }
-            Seg::Btn { label, act } => {
-                let n = label.chars().count() + 2;
-                let a = Act::Btn(pid, *act);
-                let hovered = state.hover.as_ref() == Some(&a);
-                let (bg, fg) = if hovered {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                let tw = self.cell.label_w(label.chars().count());
-                let bw = tw + 14.0;
-                let br = rect(x, y + (line_h - theme::BTN_H) / 2.0 - 1.0, bw, theme::BTN_H);
-                self.draw_panel.color = rgba_a(bg, alpha);
-                self.draw_panel.border_color = rgba_a(theme::INK, alpha);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = alpha as f32;
-                self.draw_panel.draw_abs(cx, br);
-                let ty = br.pos.y + (theme::BTN_H - self.cell.label_line()) / 2.0;
-                self.draw_label(cx, x + 7.0, ty, label, fg, alpha);
-                self.hits.push(HitR {
-                    rect: br,
-                    act: a,
-                    cursor: MouseCursor::Hand,
-                    label: label.clone(),
-                });
-                col + n
-            }
-            Seg::Kbd(s) => {
-                let n = s.chars().count() + 2;
-                let tw = self.cell.label_w(s.chars().count());
-                let bw = tw + 10.0;
-                let kh = line_h - 5.0;
-                let br = rect(x, y + (line_h - kh) / 2.0 - 1.0, bw, kh);
-                self.draw_panel.color = rgba_a(theme::BG, alpha);
-                self.draw_panel.border_color = rgba_a(theme::INK, alpha);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = alpha as f32;
-                self.draw_panel.draw_abs(cx, br);
-                let ty = br.pos.y + (kh - self.cell.label_line()) / 2.0;
-                self.draw_label(cx, x + 5.0, ty, s, theme::INK, alpha);
-                col + n
-            }
-            Seg::Fld { id, w } => {
-                if *id == FieldId::Body {
-                    // Marker only: remember where this body row is drawn.
-                    body_rows.push((line_idx.saturating_sub(2), y));
-                    return col;
-                }
-                let focused = field_focus == Some((pid, *id));
-                let fr = rect(x, y - 1.0, *w as f64 * adv + 8.0, line_h);
-                self.draw_panel.color = rgba_a(theme::BG, alpha);
-                self.draw_panel.border_color =
-                    rgba_a(if focused { theme::INK } else { theme::RULE }, alpha);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = alpha as f32;
-                self.draw_panel.draw_abs(cx, fr);
-                let ui = state.ui.get(&pid);
-                let (text, caret) = match (id, ui) {
-                    (FieldId::Filter, Some(u)) => (u.filter.text.clone(), u.filter.caret),
-                    (FieldId::To, Some(u)) => (u.to.text.clone(), u.to.caret),
-                    (FieldId::Subject, Some(u)) => (u.subject.text.clone(), u.subject.caret),
-                    (FieldId::SetEmail, Some(u)) => (u.set_email.text.clone(), u.set_email.caret),
-                    (FieldId::SetPass, Some(u)) => (u.set_pass.text.clone(), u.set_pass.caret),
-                    (FieldId::SetImap, Some(u)) => (u.set_imap.text.clone(), u.set_imap.caret),
-                    (FieldId::SetSmtp, Some(u)) => (u.set_smtp.text.clone(), u.set_smtp.caret),
-                    _ => (String::new(), 0),
-                };
-                // A password draws as dots — same length, same caret.
-                let text = if *id == FieldId::SetPass {
-                    "•".repeat(text.chars().count())
-                } else {
-                    text
-                };
-                if text.is_empty() && *id == FieldId::Filter {
-                    self.draw_text_at(cx, x + 4.0, y, "filter…  ( / )", Style::Muted, alpha);
-                } else {
-                    self.draw_text_at(cx, x + 4.0, y, &text, Style::N, alpha);
-                }
-                if focused {
-                    self.draw_flat.color = rgba_a(theme::INK, alpha);
-                    self.draw_flat.draw_abs(
-                        cx,
-                        rect(x + 4.0 + caret as f64 * adv, y + 1.0, 1.5, line_h - 4.0),
-                    );
-                }
-                self.hits.push(HitR {
-                    rect: fr,
-                    act: Act::Field(pid, *id),
-                    cursor: MouseCursor::Text,
-                    label: match id {
-                        FieldId::Filter => "filter",
-                        FieldId::To => "to",
-                        FieldId::Subject => "subject",
-                        FieldId::Body => "body",
-                        FieldId::SetEmail => "address",
-                        FieldId::SetPass => "password",
-                        FieldId::SetImap => "imap",
-                        FieldId::SetSmtp => "smtp",
-                    }
-                    .to_string(),
-                });
-                col + w
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

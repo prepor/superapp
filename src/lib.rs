@@ -9,13 +9,14 @@
 //! | [`store`] | the one SQLite file + the reactive query layer | no |
 //! | [`effect`] | the boundary: what leaves the process, and the job queue | no |
 //! | [`history`] | the in-memory tree of actions and their claims | no |
+//! | [`html`] | narrowing a mail's HTML to what a panel can draw | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
-//! | [`ui`] | the semantic content vocabulary: lines, fields, forms | no |
+//! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
 //! | [`theme`] | the look: sizes and colours | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
 //!
@@ -26,6 +27,7 @@ pub mod core;
 pub mod e2e;
 pub mod effect;
 pub mod history;
+pub mod html;
 pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;

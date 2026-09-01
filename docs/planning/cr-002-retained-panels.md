@@ -127,8 +127,46 @@ E. **Message / Contact** — **landed 2026-09-01**: `SLink` completes the
    from scope. **Help / About stay on the char grid deliberately** —
    static text where the grid is harmless; they migrate with F when the
    overlays go, and only then does the old renderer retire.
-F. **Overlays** onto the same library (launcher field becomes an `SField`,
-   history rows become widgets) — optional, by pain.
+F. **Help/about, the overlays, and the renderer's retirement** —
+   **landed 2026-09-01** (Andrey: "finish migration to widgets, all
+   overlays, help, etc"). Three steps, each green before the next:
+
+   *Help and about* become widget trees. Help is the design language's own
+   showcase drawn with the widgets that implement it: the legend's links
+   really open and replace, the demo button really fires its empty side
+   effect, chords are `SKbd` caps. Platform rows all live in the DSL and
+   `cfg!` picks at draw. `SKbd` sits on `ButtonFlat` because **a named
+   child's properties cannot be overridden per instance** at this makepad
+   generation — `lbl = { text: … }` parses and is silently dropped, which
+   showed up as empty caps; `ButtonFlat` carries `text` on the instance.
+
+   *The overlays* — workspaces, history, launcher — draw as retained
+   widgets over the shell's wash: a `PortalList` of `OverlayRow` cards fed
+   rows the shell assembles each frame. The launcher's query is a real
+   `SField` (caret, selection, click-to-position, platform IME) where the
+   char grid drew a rectangle and tracked an integer, re-implementing
+   backspace and caret motion by hand. Arrows/enter/esc stay with the
+   shell because they drive the hit list, not the text. Rows resolve
+   through the shell's hit table, the in-list rule from the fifth defect.
+   A row's inverted state needs **twin cards**: a `DrawQuad`'s shader vars
+   are not struct fields, so a quad's colour cannot be set at draw time —
+   but a `Label`'s `draw_text.color` can, so only the background needs a
+   twin.
+
+   *The renderer retires.* `build_lines`, `draw_line`, `draw_seg`, every
+   `*_lines` builder, `PanelUi`, `State.field`, `TextField`, `FieldId`'s
+   editing paths, the hand-rolled IME mirror, `Act::Field`/`Act::Row` —
+   about 1700 lines, gone. `app.rs` 5878 → 4405, `ui.rs` 469 → 263. What
+   survives in `ui.rs` is the part that was never about characters: the
+   accelerator rules (CR-003), `BtnAct`, and `Style` for chrome.
+
+   One live regression surfaced on the way, worth the phase by itself:
+   one-finger touch scrolling drove `PanelUi.scroll`, which had drawn
+   nothing since phase D — panels became widgets but the gesture kept
+   moving a number nobody read. It now synthesizes a `Scroll` event into
+   the widget under the finger, so its own `PortalList`/`ScrollBars` clamp
+   it. The suites never caught it: they screenshot after a swipe and
+   nothing asserted the content moved.
 
 Each phase lands green (unit + all e2e suites), book updated, committed.
 
