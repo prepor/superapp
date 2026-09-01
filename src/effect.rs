@@ -1,0 +1,1590 @@
+//! Effects: everything that leaves the process (CR-004).
+//!
+//! The rule, and the whole of it:
+//!
+//! > **An effect is anything whose result the store cannot reproduce.**
+//!
+//! The store is the app's memory — replaying its transactions replays the
+//! app — so SQLite is emphatically *not* an effect. A socket, the keychain,
+//! the clipboard, a file beside the store, the screen and the clock are.
+//! Archiving a mail is a plain store write (intent); *pushing* that archive
+//! to the server is an effect.
+//!
+//! Every effect is a serializable value that describes itself in one line
+//! ([`Effect`]). Effects worth retrying are also [`Deferred`]: they become
+//! rows in the one `effect` table, claimed and performed by one executor,
+//! with a status and a reply anyone can read — including the panel that
+//! asked for them, through the ordinary reactive query layer.
+//!
+//! Two classes, told apart by one question — *would anyone retry it, wait
+//! for it, or want to see that it failed?*
+//!
+//! | | examples | how it runs |
+//! |---|---|---|
+//! | deferred | [`Move`], [`Seen`], [`Submit`] | enqueued, claimed, executed by the pass |
+//! | in-memory | [`Now`], [`Connect`], [`Fetch`], [`SecretGet`] | performed at the call, answer returned, nothing written |
+//!
+//! [`Outside`] is the swappable backend — [`Real`], [`Fake`], [`Deny`] —
+//! and it owns the clock too, so a fake world controls time the same way it
+//! controls everything else.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use rusqlite::{Connection, Transaction};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::store::Store;
+
+// -- what the outside answers with --------------------------------------------
+
+/// A folder as the server lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteFolder {
+    pub name: String,
+    /// inbox | archive | sent | trash — `None` folders are not mirrored.
+    pub role: Option<String>,
+}
+
+/// SELECT results.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FolderMeta {
+    pub uidvalidity: u32,
+    pub uidnext: u32,
+}
+
+/// One fetched message.
+#[derive(Debug, Clone)]
+pub struct RemoteMail {
+    pub uid: u32,
+    pub unread: bool,
+    pub raw: Vec<u8>,
+}
+
+/// A mail on its way out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Outgoing {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    /// The Message-ID this replies to, for threading headers.
+    pub in_reply_to: Option<String>,
+}
+
+/// How to reach a server. `Debug` redacts the password so a stray `{:?}`
+/// cannot leak one, and no [`Effect::describe`] ever prints it — `describe`
+/// is what lands in the table.
+#[derive(Clone)]
+pub struct Creds {
+    pub host: String,
+    pub user: String,
+    pub pass: String,
+}
+
+impl std::fmt::Debug for Creds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Creds")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("pass", &"…")
+            .finish()
+    }
+}
+
+// -- the backend ---------------------------------------------------------------
+
+/// The verbs the outside world understands. Object-safe on purpose: this is
+/// the axis where the compiler still tells you a backend forgot a case.
+///
+/// Errors are strings — they land on a status line, for a human.
+pub trait Outside {
+    /// Unix seconds. The clock is an effect like any other, which is why
+    /// there is no separate `Clock` type.
+    fn now(&mut self) -> f64;
+    /// Opens (or replaces) this account's mail session.
+    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String>;
+    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String>;
+    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String>;
+    /// Messages with `uid >= from`, ascending.
+    fn fetch(&mut self, account: i64, folder: &str, from: u32)
+        -> Result<Vec<RemoteMail>, String>;
+    /// Every uid in the folder, or only the unseen ones.
+    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+        -> Result<HashSet<u32>, String>;
+    /// `UID MOVE`; the new uid when the server says (UIDPLUS' COPYUID),
+    /// `None` otherwise — adoption by Message-ID covers that.
+    fn move_uid(&mut self, account: i64, from: &str, to: &str, uid: u32)
+        -> Result<Option<u32>, String>;
+    /// `UID STORE` the `\Seen` flag.
+    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+        -> Result<(), String>;
+    /// `APPEND` raw bytes (filing sent mail).
+    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String>;
+    /// SMTP submission; answers the formatted RFC 822 bytes.
+    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String>;
+
+    fn secret_get(&mut self, email: &str) -> Option<String>;
+    fn secret_set(&mut self, email: &str, pass: &str) -> bool;
+    fn clip(&mut self, text: &str) -> Result<(), String>;
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
+    fn shot(&mut self, path: &Path) -> Result<(), String>;
+
+    /// Reach the concrete backend — how a test arranges a [`Fake`] world.
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// What an effect is performed against: the outside, plus read-only store
+/// access so a payload can reference a row instead of embedding its
+/// contents. No transaction is ever open here — that is the point.
+pub struct Ctx<'a> {
+    pub out: &'a mut dyn Outside,
+    pub db: &'a Connection,
+}
+
+// -- the traits ----------------------------------------------------------------
+
+/// Something that leaves the process.
+///
+/// Deliberately **not** `Serialize`: an in-memory effect is performed at the
+/// call and written nowhere, so making it serializable would be a lie — and
+/// a dangerous one, since [`Connect`] carries a password. Serializability
+/// belongs to [`Deferred`], where a row actually exists.
+pub trait Effect: Sized {
+    /// Stable, greppable, the table's `kind`.
+    const KIND: &'static str;
+    /// What this call answers.
+    type Reply;
+    /// One line of English — the row's description, the label in a status
+    /// UI, and what an assertion failure prints. Never carries a secret.
+    fn describe(&self) -> String;
+    /// Do it.
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
+}
+
+/// An effect worth persisting: queued, retried, its status and reply
+/// readable from the table. Both the effect and its reply must survive a
+/// round trip through JSON, so an effect that cannot be written down is a
+/// compile error rather than a discovery.
+pub trait Deferred: Effect + Serialize + DeserializeOwned + 'static
+where
+    Self::Reply: Serialize + DeserializeOwned,
+{
+    /// Is running this twice safe? No default — it is the one judgement a
+    /// crash cannot guess, and it drives the boot sweep.
+    fn idempotent(&self) -> bool;
+
+    /// What this job belongs to, in the `action.entity` vocabulary —
+    /// `account:2`, `panel:7`. Lets a panel query its own effects.
+    fn entity(&self) -> Option<String> {
+        None
+    }
+
+    /// Does the world still want this? Checked after the claim and before
+    /// the round trip: if undo landed while the job sat in the queue, it
+    /// goes `obsolete` instead of performing stale work.
+    fn still_wanted(&self, _db: &Connection) -> bool {
+        true
+    }
+
+    /// What the success establishes — runs in the **same transaction** as
+    /// the status update, so "the effect happened" and "the world now looks
+    /// like this" land together or not at all.
+    fn settle(&self, _tx: &Transaction, _reply: &Self::Reply) -> rusqlite::Result<()> {
+        Ok(())
+    }
+}
+
+// -- the app's own in-memory effects -------------------------------------------
+//
+// Not `Deferred`: nobody retries a clipboard write or waits on a row for the
+// time. They exist so that *everything* leaving the process goes through one
+// door, and so a `Deny` world can refuse them.
+
+/// What time it is. An effect like any other, which is why there is no
+/// separate `Clock` type — a fake world moves it like it moves anything.
+pub struct Now;
+
+impl Effect for Now {
+    const KIND: &'static str = "now";
+    type Reply = f64;
+    fn describe(&self) -> String {
+        "read the clock".into()
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<f64, String> {
+        Ok(cx.out.now())
+    }
+}
+
+/// Recall an account's password.
+pub struct SecretGet<'a>(pub &'a str);
+
+impl Effect for SecretGet<'_> {
+    const KIND: &'static str = "secret_get";
+    type Reply = Option<String>;
+    fn describe(&self) -> String {
+        format!("read the password for {}", self.0)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        Ok(cx.out.secret_get(self.0))
+    }
+}
+
+/// Store an account's password. Never persisted, for the obvious reason.
+pub struct SecretSet<'a> {
+    pub email: &'a str,
+    pub pass: &'a str,
+}
+
+impl Effect for SecretSet<'_> {
+    const KIND: &'static str = "secret_set";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("store the password for {}", self.email)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out
+            .secret_set(self.email, self.pass)
+            .then_some(())
+            .ok_or_else(|| "the keychain refused the password".to_string())
+    }
+}
+
+/// Put text on the system clipboard.
+pub struct Clip<'a> {
+    pub text: &'a str,
+    /// What the text is, for the description — the text itself may be long.
+    pub what: &'static str,
+}
+
+impl Effect for Clip<'_> {
+    const KIND: &'static str = "clip";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("copy {} ({} bytes)", self.what, self.text.len())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.clip(self.text)
+    }
+}
+
+/// Write a file outside the store.
+pub struct WriteFile<'a> {
+    pub path: &'a Path,
+    pub bytes: &'a [u8],
+}
+
+impl Effect for WriteFile<'_> {
+    const KIND: &'static str = "write_file";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("write {} ({} bytes)", self.path.display(), self.bytes.len())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.write_file(self.path, self.bytes)
+    }
+}
+
+/// Photograph the window (e2e).
+pub struct Shot<'a>(pub &'a Path);
+
+impl Effect for Shot<'_> {
+    const KIND: &'static str = "shot";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("capture {}", self.0.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.shot(self.0)
+    }
+}
+
+// -- the registry --------------------------------------------------------------
+
+/// The bookkeeping a success carries, committed with its status update.
+type Settle = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<()>>;
+
+/// What running one claimed job produced.
+pub(crate) enum Ran {
+    /// Reply JSON, plus the bookkeeping to commit alongside the status.
+    Done(String, Settle),
+    /// The world moved on; this job is no longer wanted.
+    Obsolete,
+    Failed(String),
+    /// Nobody registered this kind — the loud failure an open set needs.
+    NoHandler,
+}
+
+type Handler = Box<dyn Fn(&str, &mut Ctx<'_>) -> Ran>;
+
+/// Decode-and-perform, per kind. Each domain registers its own effects, so
+/// adding one touches no central list.
+///
+/// The cost of an open set is that a forgotten registration is a runtime
+/// failure — so the executor makes it loud (`no handler for kind …`) rather
+/// than leaving a job `pending` forever.
+#[derive(Default)]
+pub struct Registry {
+    handlers: HashMap<&'static str, Handler>,
+}
+
+impl Registry {
+    #[must_use]
+    pub fn new() -> Registry {
+        Registry::default()
+    }
+
+    /// Registers one deferred effect kind.
+    pub fn register<E: Deferred>(&mut self)
+    where
+        E::Reply: Serialize + DeserializeOwned,
+    {
+        self.handlers.insert(
+            E::KIND,
+            Box::new(|payload, cx| {
+                let e: E = match serde_json::from_str(payload) {
+                    Ok(e) => e,
+                    Err(err) => return Ran::Failed(format!("undecodable payload: {err}")),
+                };
+                if !e.still_wanted(cx.db) {
+                    return Ran::Obsolete;
+                }
+                match e.perform(cx) {
+                    Ok(reply) => match serde_json::to_string(&reply) {
+                        Ok(json) => Ran::Done(json, Box::new(move |tx| e.settle(tx, &reply))),
+                        Err(err) => Ran::Failed(format!("unencodable reply: {err}")),
+                    },
+                    Err(err) => Ran::Failed(err),
+                }
+            }),
+        );
+    }
+
+    /// Decodes and performs one claimed job.
+    pub(crate) fn run(&self, kind: &str, payload: &str, cx: &mut Ctx<'_>) -> Ran {
+        match self.handlers.get(kind) {
+            Some(h) => h(payload, cx),
+            None => Ran::NoHandler,
+        }
+    }
+
+    /// Every registered kind — the completeness test reads this.
+    #[must_use]
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self.handlers.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+// -- the log -------------------------------------------------------------------
+
+/// One row of the effect table, as tests and a status UI read it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: i64,
+    pub kind: String,
+    pub entity: Option<String>,
+    /// pending | processing | done | failed | obsolete
+    pub status: String,
+    pub reply: Option<String>,
+    pub error: Option<String>,
+    pub attempts: i64,
+}
+
+/// How long a failed job waits before its next attempt, by attempt count —
+/// capped, because a mail server that is down stays down for a while.
+fn backoff(attempts: i64) -> f64 {
+    match attempts {
+        0 | 1 => 5.0,
+        2 => 30.0,
+        3 => 120.0,
+        _ => 600.0,
+    }
+}
+
+/// After this many attempts a job stops retrying and waits for a human.
+const MAX_ATTEMPTS: i64 = 6;
+
+// -- reading the table ---------------------------------------------------------
+
+fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        entity: r.get(2)?,
+        status: r.get(3)?,
+        reply: r.get(4)?,
+        error: r.get(5)?,
+        attempts: r.get(6)?,
+    })
+}
+
+const JOB_COLS: &str = "id, kind, entity, status, reply, error, attempts";
+
+/// Every job, oldest first.
+pub fn jobs(db: &Connection) -> Vec<Job> {
+    let Ok(mut stmt) = db.prepare(&format!("SELECT {JOB_COLS} FROM effect ORDER BY id")) else {
+        return Vec::new();
+    };
+    stmt.query_map([], job_row)
+        .map(|it| it.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// Jobs after `id` — how a test marks a point and asserts on what followed.
+pub fn jobs_since(db: &Connection, id: i64) -> Vec<Job> {
+    let Ok(mut stmt) =
+        db.prepare(&format!("SELECT {JOB_COLS} FROM effect WHERE id > ?1 ORDER BY id"))
+    else {
+        return Vec::new();
+    };
+    stmt.query_map([id], job_row)
+        .map(|it| it.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// One entity's jobs — what a panel shows about its own in-flight work.
+pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
+    let Ok(mut stmt) = db.prepare(&format!(
+        "SELECT {JOB_COLS} FROM effect WHERE entity = ?1 ORDER BY id"
+    )) else {
+        return Vec::new();
+    };
+    stmt.query_map([entity], job_row)
+        .map(|it| it.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// The newest job id — the mark for [`jobs_since`].
+pub fn mark(db: &Connection) -> i64 {
+    db.query_row("SELECT COALESCE(MAX(id), 0) FROM effect", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+// -- the world -----------------------------------------------------------------
+
+fn json_err(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// The store, the outside and the registry, as one value you construct —
+/// never a global, never a path, never a thread you cannot see.
+/// Single-threaded: the UI owns one, and each worker thread builds its own.
+pub struct World {
+    store: Rc<Store>,
+    outside: RefCell<Box<dyn Outside>>,
+    registry: Registry,
+}
+
+impl World {
+    #[must_use]
+    pub fn new(store: Rc<Store>, outside: Box<dyn Outside>, registry: Registry) -> World {
+        World {
+            store,
+            outside: RefCell::new(outside),
+            registry,
+        }
+    }
+
+    /// An isolated world: its own in-memory store, a [`Fake`] outside and a
+    /// clock that only moves when a test moves it. Touches nothing beyond
+    /// itself, so any number run in parallel.
+    ///
+    /// # Panics
+    ///
+    /// If SQLite cannot open an in-memory database.
+    #[must_use]
+    pub fn fake(registry: Registry) -> World {
+        let store = Store::open(None).expect("in-memory store");
+        World::new(Rc::new(store), Box::<Fake>::default(), registry)
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Rc<Store> {
+        &self.store
+    }
+
+    #[must_use]
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Unix seconds, from whichever backend this world has. Shorthand for
+    /// `run(&Now)`, because it is on every hot path there is.
+    #[must_use]
+    pub fn now(&self) -> f64 {
+        self.outside.borrow_mut().now()
+    }
+
+    /// Performs an in-memory effect and swallows the failure, after saying
+    /// so on stderr. For the ones a draw pass or a keystroke fires and has
+    /// nowhere better to put an error.
+    pub fn try_run<E: Effect>(&self, e: &E) {
+        if let Err(err) = self.run(e) {
+            eprintln!("effect: {} failed: {err}", e.describe());
+        }
+    }
+
+    /// The backend, for arranging a world (deliver a mail, plant a
+    /// password) or reading what it captured.
+    pub fn outside<T>(&self, f: impl FnOnce(&mut dyn Outside) -> T) -> T {
+        f(&mut **self.outside.borrow_mut())
+    }
+
+    /// The backend as a [`Fake`]. Panics if this world is not fake — which
+    /// is what a test wants, and replaces the unsafe downcast the escape
+    /// hatch used to need.
+    ///
+    /// # Panics
+    ///
+    /// If the backend is not a [`Fake`].
+    pub fn with_fake<T>(&self, f: impl FnOnce(&mut Fake) -> T) -> T {
+        self.outside(|o| {
+            f(o.as_any()
+                .downcast_mut::<Fake>()
+                .expect("this world's outside is not a Fake"))
+        })
+    }
+
+    /// Performs an in-memory effect now and answers it. Nothing is written:
+    /// these are the effects nobody would retry or wait for.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend said, verbatim.
+    pub fn run<E: Effect>(&self, e: &E) -> Result<E::Reply, String> {
+        let mut out = self.outside.borrow_mut();
+        let mut cx = Ctx {
+            out: &mut **out,
+            db: self.store.conn(),
+        };
+        e.perform(&mut cx)
+    }
+
+    /// Files a deferred effect inside the caller's transaction, so the job
+    /// and whatever domain row references it land together. Answers the id.
+    ///
+    /// # Errors
+    ///
+    /// If the payload will not encode, or the insert fails.
+    pub fn enqueue_in<E: Deferred>(&self, tx: &Transaction, e: &E) -> rusqlite::Result<i64>
+    where
+        E::Reply: Serialize + DeserializeOwned,
+    {
+        self.enqueue_at_in(tx, e, 0.0)
+    }
+
+    /// The same, held back until `not_before` — the send window is exactly
+    /// this, and it is why an effect needs no notion of time itself.
+    ///
+    /// # Errors
+    ///
+    /// If the payload will not encode, or the insert fails.
+    pub fn enqueue_at_in<E: Deferred>(
+        &self,
+        tx: &Transaction,
+        e: &E,
+        not_before: f64,
+    ) -> rusqlite::Result<i64>
+    where
+        E::Reply: Serialize + DeserializeOwned,
+    {
+        let payload = serde_json::to_string(e).map_err(json_err)?;
+        let now = self.now();
+        tx.execute(
+            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+                                attempts, not_before, created, updated)
+             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
+            rusqlite::params![E::KIND, payload, e.entity(), e.idempotent(), not_before, now],
+        )?;
+        Ok(tx.last_insert_rowid())
+    }
+
+    /// Files a deferred effect in its own transaction.
+    ///
+    /// # Errors
+    ///
+    /// If the payload will not encode, or the insert fails.
+    pub fn enqueue<E: Deferred>(&self, e: &E) -> rusqlite::Result<i64>
+    where
+        E::Reply: Serialize + DeserializeOwned,
+    {
+        self.store.write(|tx| self.enqueue_in(tx, e))
+    }
+
+    /// Cancels a job that has not been claimed — undo's half of the race
+    /// with the executor. Answers whether it won.
+    ///
+    /// # Errors
+    ///
+    /// If the update fails.
+    pub fn cancel_in(&self, tx: &Transaction, id: i64) -> rusqlite::Result<bool> {
+        let n = tx.execute(
+            "UPDATE effect SET status='obsolete', updated=?2
+             WHERE id=?1 AND status='pending'",
+            rusqlite::params![id, self.now()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// One executor pass: claim every due job and run it. Answers how many
+    /// were claimed.
+    pub fn run_effects(&self) -> usize {
+        let now = self.now();
+        let due: Vec<(i64, String, String)> = {
+            let Ok(mut stmt) = self.store.conn().prepare(
+                "SELECT id, kind, payload FROM effect
+                 WHERE status='pending' AND not_before <= ?1 ORDER BY id",
+            ) else {
+                return 0;
+            };
+            stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map(|it| it.filter_map(Result::ok).collect())
+                .unwrap_or_default()
+        };
+
+        let mut claimed = 0;
+        for (id, kind, payload) in due {
+            // The claim: one winner between this pass and a concurrent
+            // undo, whose cancel only fires while the row is 'pending'.
+            let won = self
+                .store
+                .write(|tx| {
+                    tx.execute(
+                        "UPDATE effect SET status='processing', attempts=attempts+1,
+                                           updated=?2
+                         WHERE id=?1 AND status='pending'",
+                        rusqlite::params![id, now],
+                    )
+                })
+                .unwrap_or(0)
+                == 1;
+            if !won {
+                continue;
+            }
+            claimed += 1;
+
+            // Deliberately outside every transaction: this is the round trip.
+            let ran = {
+                let mut out = self.outside.borrow_mut();
+                let mut cx = Ctx {
+                    out: &mut **out,
+                    db: self.store.conn(),
+                };
+                self.registry.run(&kind, &payload, &mut cx)
+            };
+
+            let closed = match ran {
+                Ran::Done(reply, settle) => self.store.write(|tx| {
+                    settle(tx)?;
+                    tx.execute(
+                        "UPDATE effect SET status='done', reply=?2, error=NULL, updated=?3
+                         WHERE id=?1",
+                        rusqlite::params![id, reply, now],
+                    )?;
+                    Ok(())
+                }),
+                Ran::Obsolete => self.store.write(|tx| {
+                    tx.execute(
+                        "UPDATE effect SET status='obsolete', updated=?2 WHERE id=?1",
+                        rusqlite::params![id, now],
+                    )?;
+                    Ok(())
+                }),
+                Ran::NoHandler => self.fail(id, &format!("no handler for kind {kind}"), true),
+                Ran::Failed(err) => self.fail(id, &err, false),
+            };
+            if let Err(e) = closed {
+                eprintln!("effect: closing job {id} failed: {e}");
+            }
+        }
+        claimed
+    }
+
+    /// Records a failure: retry with backoff while attempts remain, and
+    /// give up (waiting for a human) once they do not. `terminal` skips
+    /// straight to giving up — an unregistered kind will never succeed by
+    /// being tried again.
+    fn fail(&self, id: i64, err: &str, terminal: bool) -> rusqlite::Result<()> {
+        let now = self.now();
+        self.store.write(|tx| {
+            let attempts: i64 = tx
+                .query_row("SELECT attempts FROM effect WHERE id=?1", [id], |r| r.get(0))
+                .unwrap_or(MAX_ATTEMPTS);
+            if terminal || attempts >= MAX_ATTEMPTS {
+                tx.execute(
+                    "UPDATE effect SET status='failed', error=?2, updated=?3 WHERE id=?1",
+                    rusqlite::params![id, err, now],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE effect SET status='pending', error=?2, not_before=?3, updated=?4
+                     WHERE id=?1",
+                    rusqlite::params![id, err, now + backoff(attempts), now],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    // -- reading the table, through this world's store ----------------------
+
+    #[must_use]
+    pub fn jobs(&self) -> Vec<Job> {
+        jobs(self.store.conn())
+    }
+
+    #[must_use]
+    pub fn jobs_since(&self, id: i64) -> Vec<Job> {
+        jobs_since(self.store.conn(), id)
+    }
+
+    #[must_use]
+    pub fn jobs_of(&self, entity: &str) -> Vec<Job> {
+        jobs_of(self.store.conn(), entity)
+    }
+
+    #[must_use]
+    pub fn mark(&self) -> i64 {
+        mark(self.store.conn())
+    }
+}
+
+// -- Deny ----------------------------------------------------------------------
+
+/// A world that refuses. The default for a components-library mount: a
+/// panel that quietly sends mail while you look at it fails loudly instead
+/// of succeeding invisibly.
+pub struct Deny;
+
+impl Deny {
+    fn no<T>(what: &str) -> Result<T, String> {
+        Err(format!("this world has no outside ({what})"))
+    }
+}
+
+impl Outside for Deny {
+    fn now(&mut self) -> f64 {
+        0.0
+    }
+    fn connect(&mut self, _a: i64, _c: &Creds) -> Result<(), String> {
+        Self::no("connect")
+    }
+    fn folders(&mut self, _a: i64) -> Result<Vec<RemoteFolder>, String> {
+        Self::no("folders")
+    }
+    fn folder_meta(&mut self, _a: i64, _f: &str) -> Result<FolderMeta, String> {
+        Self::no("folder_meta")
+    }
+    fn fetch(&mut self, _a: i64, _f: &str, _u: u32) -> Result<Vec<RemoteMail>, String> {
+        Self::no("fetch")
+    }
+    fn uids(&mut self, _a: i64, _f: &str, _n: bool) -> Result<HashSet<u32>, String> {
+        Self::no("uids")
+    }
+    fn move_uid(&mut self, _a: i64, _f: &str, _t: &str, _u: u32) -> Result<Option<u32>, String> {
+        Self::no("move")
+    }
+    fn store_seen(&mut self, _a: i64, _f: &str, _u: u32, _s: bool) -> Result<(), String> {
+        Self::no("seen")
+    }
+    fn append(&mut self, _a: i64, _f: &str, _r: &[u8]) -> Result<(), String> {
+        Self::no("append")
+    }
+    fn submit(&mut self, _c: &Creds, _m: &Outgoing) -> Result<Vec<u8>, String> {
+        Self::no("submit")
+    }
+    fn secret_get(&mut self, _e: &str) -> Option<String> {
+        None
+    }
+    fn secret_set(&mut self, _e: &str, _p: &str) -> bool {
+        false
+    }
+    fn clip(&mut self, _t: &str) -> Result<(), String> {
+        Self::no("clip")
+    }
+    fn write_file(&mut self, _p: &Path, _b: &[u8]) -> Result<(), String> {
+        Self::no("write_file")
+    }
+    fn shot(&mut self, _p: &Path) -> Result<(), String> {
+        Self::no("shot")
+    }
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// -- Fake ----------------------------------------------------------------------
+
+/// One account's in-memory mail server: `folder → (uidvalidity, next uid,
+/// mails)`.
+#[derive(Default, Clone)]
+pub struct FakeServer {
+    pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
+    /// Whether MOVE reports the new uid (UIDPLUS' COPYUID). Both server
+    /// behaviours exist in the wild, so both are testable.
+    pub copyuid: bool,
+    /// Mail this account handed to SMTP.
+    pub submitted: Vec<Outgoing>,
+}
+
+impl FakeServer {
+    /// Puts a mail in a folder, answering its uid.
+    pub fn deliver(&mut self, folder: &str, unread: bool, raw: &str) -> u32 {
+        let f = self
+            .folders
+            .entry(folder.to_string())
+            .or_insert((1, 1, Vec::new()));
+        let uid = f.1;
+        f.1 += 1;
+        f.2.push(RemoteMail {
+            uid,
+            unread,
+            raw: raw.as_bytes().to_vec(),
+        });
+        uid
+    }
+
+    /// Creates an empty folder with a chosen uidvalidity.
+    pub fn folder(&mut self, name: &str, uidvalidity: u32) {
+        self.folders
+            .insert(name.to_string(), (uidvalidity, 1, Vec::new()));
+    }
+
+    pub fn remove(&mut self, folder: &str, uid: u32) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            f.2.retain(|m| m.uid != uid);
+        }
+    }
+
+    pub fn mark_seen(&mut self, folder: &str, uid: u32) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            for m in &mut f.2 {
+                if m.uid == uid {
+                    m.unread = false;
+                }
+            }
+        }
+    }
+
+    fn role_of(name: &str) -> Option<String> {
+        match name {
+            "INBOX" => Some("inbox".into()),
+            "Archive" => Some("archive".into()),
+            "Sent" => Some("sent".into()),
+            "Trash" => Some("trash".into()),
+            _ => None,
+        }
+    }
+
+    fn get(&self, name: &str) -> Result<&(u32, u32, Vec<RemoteMail>), String> {
+        self.folders
+            .get(name)
+            .ok_or_else(|| "no such folder".to_string())
+    }
+}
+
+/// An in-memory outside: mail servers per account, a keychain that is a
+/// map, a clock the test moves, and captured clipboard, files and shots.
+/// Nothing here touches the filesystem, the network or the keychain, which
+/// is what makes any number of fake worlds safe to run in parallel.
+#[derive(Default)]
+pub struct Fake {
+    pub servers: HashMap<i64, FakeServer>,
+    pub secrets: HashMap<String, String>,
+    pub clips: Vec<String>,
+    pub files: HashMap<PathBuf, Vec<u8>>,
+    pub shots: Vec<PathBuf>,
+    /// Accounts with a live session. A verb that reaches a server without
+    /// one is a bug in the pass, and this catches it.
+    pub connected: HashSet<i64>,
+    /// Unix seconds; only moves when a test moves it.
+    pub clock: f64,
+    /// When set, every network verb fails with this — the offline test.
+    pub down: Option<String>,
+}
+
+impl Fake {
+    /// This account's server, created empty on first touch.
+    pub fn server(&mut self, account: i64) -> &mut FakeServer {
+        self.servers.entry(account).or_default()
+    }
+
+    /// Plants a password, as the settings form would.
+    pub fn keychain(&mut self, email: &str, pass: &str) {
+        self.secrets.insert(email.into(), pass.into());
+    }
+
+    fn live(&mut self, account: i64) -> Result<&mut FakeServer, String> {
+        if let Some(e) = &self.down {
+            return Err(e.clone());
+        }
+        if !self.connected.contains(&account) {
+            return Err("not connected".into());
+        }
+        Ok(self.servers.entry(account).or_default())
+    }
+}
+
+impl Outside for Fake {
+    fn now(&mut self) -> f64 {
+        self.clock
+    }
+
+    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+        if let Some(e) = &self.down {
+            return Err(e.clone());
+        }
+        if self.secrets.get(&c.user).map(String::as_str) != Some(c.pass.as_str()) {
+            return Err("authentication failed".into());
+        }
+        self.connected.insert(account);
+        Ok(())
+    }
+
+    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
+        let s = self.live(account)?;
+        let mut names: Vec<String> = s.folders.keys().cloned().collect();
+        names.sort();
+        Ok(names
+            .into_iter()
+            .map(|n| RemoteFolder {
+                role: FakeServer::role_of(&n),
+                name: n,
+            })
+            .collect())
+    }
+
+    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
+        let f = self.live(account)?.get(folder)?;
+        Ok(FolderMeta {
+            uidvalidity: f.0,
+            uidnext: f.1,
+        })
+    }
+
+    fn fetch(&mut self, account: i64, folder: &str, from: u32)
+        -> Result<Vec<RemoteMail>, String>
+    {
+        let f = self.live(account)?.get(folder)?;
+        Ok(f.2.iter().filter(|m| m.uid >= from).cloned().collect())
+    }
+
+    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+        -> Result<HashSet<u32>, String>
+    {
+        let f = self.live(account)?.get(folder)?;
+        Ok(f.2
+            .iter()
+            .filter(|m| !unread_only || m.unread)
+            .map(|m| m.uid)
+            .collect())
+    }
+
+    fn move_uid(&mut self, account: i64, from: &str, to: &str, uid: u32)
+        -> Result<Option<u32>, String>
+    {
+        let s = self.live(account)?;
+        let src = s
+            .folders
+            .get_mut(from)
+            .ok_or_else(|| "no such folder".to_string())?;
+        let i = src
+            .2
+            .iter()
+            .position(|m| m.uid == uid)
+            .ok_or_else(|| "no such uid".to_string())?;
+        let mut m = src.2.remove(i);
+        let dst = s.folders.entry(to.to_string()).or_insert((1, 1, Vec::new()));
+        m.uid = dst.1;
+        dst.1 += 1;
+        let new = m.uid;
+        dst.2.push(m);
+        Ok(s.copyuid.then_some(new))
+    }
+
+    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+        -> Result<(), String>
+    {
+        let s = self.live(account)?;
+        let f = s
+            .folders
+            .get_mut(folder)
+            .ok_or_else(|| "no such folder".to_string())?;
+        for m in &mut f.2 {
+            if m.uid == uid {
+                m.unread = !seen;
+            }
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
+        let s = self.live(account)?;
+        let f = s
+            .folders
+            .entry(folder.to_string())
+            .or_insert((1, 1, Vec::new()));
+        let uid = f.1;
+        f.1 += 1;
+        f.2.push(RemoteMail {
+            uid,
+            unread: false,
+            raw: raw.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
+        if let Some(e) = &self.down {
+            return Err(e.clone());
+        }
+        if self.secrets.get(&c.user).map(String::as_str) != Some(c.pass.as_str()) {
+            return Err("authentication failed".into());
+        }
+        let raw = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\n\r\n{}",
+            c.user, m.to, m.subject, m.body
+        );
+        // Whichever account owns this address; the first server otherwise.
+        let acct = *self.servers.keys().next().unwrap_or(&1);
+        self.server(acct).submitted.push(m.clone());
+        Ok(raw.into_bytes())
+    }
+
+    fn secret_get(&mut self, email: &str) -> Option<String> {
+        self.secrets.get(email).cloned()
+    }
+
+    fn secret_set(&mut self, email: &str, pass: &str) -> bool {
+        self.secrets.insert(email.to_string(), pass.to_string());
+        true
+    }
+
+    fn clip(&mut self, text: &str) -> Result<(), String> {
+        self.clips.push(text.to_string());
+        Ok(())
+    }
+
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        self.files.insert(path.to_path_buf(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn shot(&mut self, path: &Path) -> Result<(), String> {
+        self.shots.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// -- Real ----------------------------------------------------------------------
+
+/// The actual outside: one IMAP session per account (rustls, port 993,
+/// LOGIN with an app password — fastmail-style; OAuth is deliberately
+/// later), lettre over rustls for submission, and the platform for
+/// everything else.
+pub struct Real {
+    sessions: HashMap<i64, imap_session::Imap>,
+    /// Where the file-fallback keychain lives (android); macOS ignores it.
+    secrets_dir: PathBuf,
+}
+
+impl Real {
+    #[must_use]
+    pub fn new(secrets_dir: PathBuf) -> Real {
+        Real {
+            sessions: HashMap::new(),
+            secrets_dir,
+        }
+    }
+
+    fn session(&mut self, account: i64) -> Result<&mut imap_session::Imap, String> {
+        self.sessions
+            .get_mut(&account)
+            .ok_or_else(|| "not connected".to_string())
+    }
+}
+
+impl Outside for Real {
+    fn now(&mut self) -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+        let s = imap_session::connect(&c.host, &c.user, &c.pass)?;
+        self.sessions.insert(account, s);
+        Ok(())
+    }
+
+    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
+        self.session(account)?.folders()
+    }
+
+    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
+        self.session(account)?.select(folder)
+    }
+
+    fn fetch(&mut self, account: i64, folder: &str, from: u32)
+        -> Result<Vec<RemoteMail>, String>
+    {
+        self.session(account)?.fetch_from(folder, from)
+    }
+
+    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+        -> Result<HashSet<u32>, String>
+    {
+        self.session(account)?.uids(folder, unread_only)
+    }
+
+    fn move_uid(&mut self, account: i64, from: &str, to: &str, uid: u32)
+        -> Result<Option<u32>, String>
+    {
+        self.session(account)?.move_uid(from, to, uid)
+    }
+
+    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+        -> Result<(), String>
+    {
+        self.session(account)?.store_seen(folder, uid, seen)
+    }
+
+    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
+        self.session(account)?.append(folder, raw)
+    }
+
+    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
+        use lettre::message::header;
+        use lettre::transport::smtp::authentication::Credentials;
+        use lettre::{Message, SmtpTransport, Transport};
+        let s = |e: &dyn std::fmt::Display| format!("{e}");
+        let mut b = Message::builder()
+            .from(c.user.parse().map_err(|e| s(&e))?)
+            .to(m.to.parse().map_err(|e| s(&e))?)
+            .subject(m.subject.clone());
+        if let Some(mid) = &m.in_reply_to {
+            b = b
+                .header(header::InReplyTo::from(mid.clone()))
+                .header(header::References::from(mid.clone()));
+        }
+        let msg = b.body(m.body.clone()).map_err(|e| s(&e))?;
+        let raw = msg.formatted();
+        let t = SmtpTransport::relay(&c.host)
+            .map_err(|e| s(&e))?
+            .credentials(Credentials::new(c.user.clone(), c.pass.clone()))
+            .build();
+        t.send(&msg).map_err(|e| s(&e))?;
+        Ok(raw)
+    }
+
+    fn secret_get(&mut self, email: &str) -> Option<String> {
+        crate::secret::get(&self.secrets_dir, email)
+    }
+
+    fn secret_set(&mut self, email: &str, pass: &str) -> bool {
+        crate::secret::set(&self.secrets_dir, email, pass)
+    }
+
+    fn clip(&mut self, text: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("/usr/bin/pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("pbcopy: {e}"))?;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin
+                    .write_all(text.as_bytes())
+                    .map_err(|e| format!("pbcopy: {e}"))?;
+            }
+            let _ = child.wait();
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = text;
+            Err("no clipboard on this platform".into())
+        }
+    }
+
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn shot(&mut self, path: &Path) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::screenshot(path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err("no window capture on this platform".into())
+        }
+    }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
+/// suppresses redundant SELECTs — that optimisation stays private.
+mod imap_session {
+    use super::{FolderMeta, RemoteFolder, RemoteMail};
+    use std::collections::HashSet;
+
+    type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
+
+    pub struct Imap {
+        session: ImapSession,
+        selected: Option<String>,
+    }
+
+    fn s<E: std::fmt::Display>(e: E) -> String {
+        format!("{e}")
+    }
+
+    pub fn connect(host: &str, user: &str, pass: &str) -> Result<Imap, String> {
+        let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
+        let session = client.login(user, pass).map_err(|e| s(e.0))?;
+        Ok(Imap {
+            session,
+            selected: None,
+        })
+    }
+
+    impl Imap {
+        pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
+            let mb = self.session.select(name).map_err(s)?;
+            self.selected = Some(name.to_string());
+            Ok(FolderMeta {
+                uidvalidity: mb.uid_validity.unwrap_or(0),
+                uidnext: mb.uid_next.unwrap_or(1),
+            })
+        }
+
+        fn ensure(&mut self, name: &str) -> Result<(), String> {
+            if self.selected.as_deref() != Some(name) {
+                self.select(name)?;
+            }
+            Ok(())
+        }
+
+        pub fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
+            let names = self.session.list(Some(""), Some("*")).map_err(s)?;
+            let mut out = Vec::new();
+            for n in names.iter() {
+                let attrs = format!("{:?}", n.attributes()).to_lowercase();
+                let role = if n.name().eq_ignore_ascii_case("inbox") {
+                    Some("inbox".to_string())
+                } else if attrs.contains("archive") {
+                    Some("archive".to_string())
+                } else if attrs.contains("sent") {
+                    Some("sent".to_string())
+                } else if attrs.contains("trash") {
+                    Some("trash".to_string())
+                } else {
+                    None
+                };
+                out.push(RemoteFolder {
+                    name: n.name().to_string(),
+                    role,
+                });
+            }
+            Ok(out)
+        }
+
+        pub fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+            self.ensure(name)?;
+            let fetches = self
+                .session
+                .uid_fetch(format!("{from}:*"), "(UID FLAGS RFC822)")
+                .map_err(s)?;
+            let mut out: Vec<RemoteMail> = fetches
+                .iter()
+                .filter_map(|f| {
+                    let uid = f.uid?;
+                    let raw = f.body().or_else(|| f.text())?;
+                    let unread = !f
+                        .flags()
+                        .iter()
+                        .any(|fl| matches!(fl, imap::types::Flag::Seen));
+                    Some(RemoteMail {
+                        uid,
+                        unread,
+                        raw: raw.to_vec(),
+                    })
+                })
+                .collect();
+            out.sort_by_key(|m| m.uid);
+            Ok(out)
+        }
+
+        pub fn uids(&mut self, name: &str, unread_only: bool) -> Result<HashSet<u32>, String> {
+            self.ensure(name)?;
+            self.session
+                .uid_search(if unread_only { "UNSEEN" } else { "ALL" })
+                .map_err(s)
+        }
+
+        pub fn move_uid(&mut self, from: &str, to: &str, uid: u32)
+            -> Result<Option<u32>, String>
+        {
+            self.ensure(from)?;
+            self.session.uid_mv(uid.to_string(), to).map_err(s)?;
+            // The crate acks the MOVE but does not surface COPYUID; the new
+            // uid arrives via Message-ID adoption on the next fetch.
+            Ok(None)
+        }
+
+        pub fn store_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String> {
+            self.ensure(folder)?;
+            let flags = if seen {
+                "+FLAGS (\\Seen)"
+            } else {
+                "-FLAGS (\\Seen)"
+            };
+            self.session.uid_store(uid.to_string(), flags).map_err(s)?;
+            Ok(())
+        }
+
+        pub fn append(&mut self, folder: &str, raw: &[u8]) -> Result<(), String> {
+            self.session
+                .append(folder, raw)
+                .flag(imap::types::Flag::Seen)
+                .finish()
+                .map_err(s)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test effect that writes to the fake clipboard, so "did it run?" is
+    /// observable, and whose failure and idempotency are dialable.
+    #[derive(Serialize, Deserialize)]
+    struct Poke {
+        note: String,
+        fails: bool,
+        idem: bool,
+        wanted: bool,
+    }
+
+    impl Poke {
+        fn ok(note: &str) -> Poke {
+            Poke { note: note.into(), fails: false, idem: true, wanted: true }
+        }
+    }
+
+    impl Effect for Poke {
+        const KIND: &'static str = "poke";
+        type Reply = String;
+        fn describe(&self) -> String {
+            format!("poke {}", self.note)
+        }
+        fn perform(&self, cx: &mut Ctx<'_>) -> Result<String, String> {
+            if self.fails {
+                return Err("poke refused".into());
+            }
+            cx.out.clip(&self.note)?;
+            Ok(format!("poked {}", self.note))
+        }
+    }
+
+    impl Deferred for Poke {
+        fn idempotent(&self) -> bool {
+            self.idem
+        }
+        fn entity(&self) -> Option<String> {
+            Some(format!("panel:{}", self.note.len()))
+        }
+        fn still_wanted(&self, _db: &Connection) -> bool {
+            self.wanted
+        }
+    }
+
+    fn world() -> World {
+        let mut reg = Registry::new();
+        reg.register::<Poke>();
+        World::fake(reg)
+    }
+
+    /// The row exists, `pending`, *before* anything is performed — and the
+    /// reply lands on it after.
+    #[test]
+    fn a_job_is_committed_before_it_runs_and_closed_after() {
+        let w = world();
+        w.enqueue(&Poke::ok("hello")).unwrap();
+
+        let j = &w.jobs()[0];
+        assert_eq!((j.kind.as_str(), j.status.as_str()), ("poke", "pending"));
+        assert_eq!(j.entity.as_deref(), Some("panel:5"));
+        assert!(j.reply.is_none(), "nothing has happened yet");
+        assert!(w.with_fake(|f| f.clips.is_empty()));
+
+        assert_eq!(w.run_effects(), 1);
+        let j = &w.jobs()[0];
+        assert_eq!(j.status, "done");
+        assert_eq!(j.reply.as_deref(), Some("\"poked hello\""));
+        assert_eq!(w.with_fake(|f| f.clips.clone()), vec!["hello"]);
+
+        assert_eq!(w.run_effects(), 0, "a closed job is not reclaimed");
+    }
+
+    /// Cancelling beats the executor while the row is `pending`, and the
+    /// effect never happens.
+    #[test]
+    fn cancel_wins_the_race_while_pending() {
+        let w = world();
+        let id = w.enqueue(&Poke::ok("doomed")).unwrap();
+
+        let won = w.store().write(|tx| w.cancel_in(tx, id)).unwrap();
+        assert!(won);
+        assert_eq!(w.jobs()[0].status, "obsolete");
+        assert_eq!(w.run_effects(), 0);
+        assert!(w.with_fake(|f| f.clips.is_empty()), "never performed");
+
+        // A second cancel loses — there is exactly one winner.
+        assert!(!w.store().write(|tx| w.cancel_in(tx, id)).unwrap());
+    }
+
+    /// A job the world no longer wants goes obsolete instead of running.
+    #[test]
+    fn revalidation_skips_stale_work() {
+        let w = world();
+        w.enqueue(&Poke { wanted: false, ..Poke::ok("stale") }).unwrap();
+        assert_eq!(w.run_effects(), 1, "claimed…");
+        assert_eq!(w.jobs()[0].status, "obsolete", "…but not performed");
+        assert!(w.with_fake(|f| f.clips.is_empty()));
+    }
+
+    /// Failures retry with backoff, then give up and wait for a human.
+    #[test]
+    fn failures_retry_with_backoff_then_give_up() {
+        let w = world();
+        w.enqueue(&Poke { fails: true, ..Poke::ok("nope") }).unwrap();
+
+        w.run_effects();
+        let j = &w.jobs()[0];
+        assert_eq!(j.status, "pending", "queued again");
+        assert_eq!(j.error.as_deref(), Some("poke refused"));
+        assert_eq!(j.attempts, 1);
+
+        // Held back: the executor will not touch it until the clock moves.
+        assert_eq!(w.run_effects(), 0, "backoff is respected");
+
+        for _ in 0..MAX_ATTEMPTS {
+            w.with_fake(|f| f.clock += 3600.0);
+            w.run_effects();
+        }
+        let j = &w.jobs()[0];
+        assert_eq!(j.status, "failed", "gave up rather than spinning");
+        assert_eq!(j.attempts, MAX_ATTEMPTS);
+    }
+
+    /// An unregistered kind fails loudly. The price of an open set is that
+    /// this is a runtime error — so it must never be a silent stall.
+    #[test]
+    fn an_unregistered_kind_fails_loudly() {
+        let w = World::fake(Registry::new()); // nothing registered
+        w.enqueue(&Poke::ok("orphan")).unwrap();
+        w.run_effects();
+        let j = &w.jobs()[0];
+        assert_eq!(j.status, "failed");
+        assert_eq!(j.error.as_deref(), Some("no handler for kind poke"));
+    }
+
+    /// The crash sweep: idempotent work is safe to redo, and everything
+    /// else must ask a human rather than guess.
+    #[test]
+    fn the_crash_sweep_never_guesses() {
+        let w = world();
+        let safe = w.enqueue(&Poke::ok("safe")).unwrap();
+        let risky = w.enqueue(&Poke { idem: false, ..Poke::ok("risky") }).unwrap();
+        // Both caught mid-flight by the crash.
+        w.store()
+            .write(|tx| {
+                tx.execute("UPDATE effect SET status='processing'", [])
+                    .map(|_| ())
+            })
+            .unwrap();
+
+        crate::store::sweep_effects(w.store().conn()).unwrap();
+
+        let by_id = |id: i64| w.jobs().into_iter().find(|j| j.id == id).unwrap();
+        assert_eq!(by_id(safe).status, "pending", "idempotent: retry it");
+        let r = by_id(risky);
+        assert_eq!(r.status, "failed", "not idempotent: do not guess");
+        assert_eq!(r.error.as_deref(), Some("interrupted; outcome unknown"));
+    }
+
+    /// A panel can ask what it has in flight — points 6 and 7 of the
+    /// design, through the existing `entity` vocabulary.
+    #[test]
+    fn a_panel_can_query_its_own_effects() {
+        let w = world();
+        w.enqueue(&Poke::ok("aaa")).unwrap();
+        w.enqueue(&Poke::ok("bbbb")).unwrap();
+        assert_eq!(w.jobs_of("panel:3").len(), 1);
+        assert_eq!(w.jobs_of("panel:4").len(), 1);
+        assert_eq!(w.jobs_of("panel:9").len(), 0);
+    }
+
+    /// `Deny` refuses everything, which is what a components-library mount
+    /// wants: a panel that quietly sends mail fails instead of succeeding.
+    #[test]
+    fn deny_refuses_everything() {
+        let mut reg = Registry::new();
+        reg.register::<Poke>();
+        let w = World::new(
+            Rc::new(Store::open(None).unwrap()),
+            Box::new(Deny),
+            reg,
+        );
+        w.enqueue(&Poke::ok("nope")).unwrap();
+        w.run_effects();
+        let j = &w.jobs()[0];
+        assert_eq!(j.status, "pending", "retryable, but refused");
+        assert!(j.error.as_deref().unwrap().contains("no outside"), "{j:?}");
+    }
+
+    /// Two fake worlds share nothing: no file, no keychain, no clock.
+    #[test]
+    fn worlds_are_isolated_from_each_other() {
+        let a = world();
+        let b = world();
+        a.enqueue(&Poke::ok("a")).unwrap();
+        a.run_effects();
+        a.with_fake(|f| f.clock += 500.0);
+
+        assert_eq!(b.jobs().len(), 0);
+        assert!(b.with_fake(|f| f.clips.is_empty()));
+        assert_eq!(b.now(), 0.0);
+        assert_eq!(a.now(), 500.0);
+    }
+
+    /// A password must never reach the record — not via `describe`, and not
+    /// via a stray `{:?}` on the credentials.
+    #[test]
+    fn secrets_never_reach_the_record() {
+        let c = Creds { host: "h".into(), user: "u".into(), pass: "s3cret".into() };
+        assert!(!format!("{c:?}").contains("s3cret"), "{c:?}");
+    }
+}

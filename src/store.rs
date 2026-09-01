@@ -254,6 +254,32 @@ CREATE TABLE outbox(
 );
 ";
 
+/// Schema v6 (CR-004): the effect table — one queue for every deferred
+/// effect, whatever domain it came from. `payload` and `reply` are JSON
+/// *text*, not JSONB: SQLite has no JSON type, and a BLOB encoding would
+/// make `SELECT reply FROM effect` unreadable in a shell — inspectability
+/// is why this lives in the store at all. `idempotent` is copied onto the
+/// row at enqueue time so the crash sweep is pure SQL and never has to
+/// decode a payload to know whether retrying is safe.
+const SCHEMA_V6: &str = "
+CREATE TABLE effect(
+  id         INTEGER PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  payload    TEXT NOT NULL CHECK (json_valid(payload)),
+  entity     TEXT,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  idempotent INTEGER NOT NULL DEFAULT 0,
+  reply      TEXT CHECK (reply IS NULL OR json_valid(reply)),
+  error      TEXT,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  not_before REAL NOT NULL DEFAULT 0,
+  created    REAL NOT NULL,
+  updated    REAL NOT NULL
+);
+CREATE INDEX idx_effect_due    ON effect(status, not_before);
+CREATE INDEX idx_effect_entity ON effect(entity);
+";
+
 /// The tables sessions record — the undoable world. `action` and `meta`
 /// (the head pointer) stay outside it — undo must never rewrite history's
 /// own bookkeeping — and so does `server_msg`: what the server holds is
@@ -315,6 +341,11 @@ impl Store {
             conn.execute_batch(SCHEMA_V5)?;
             conn.pragma_update(None, "user_version", 5)?;
         }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6)?;
+            conn.pragma_update(None, "user_version", 6)?;
+        }
+        sweep_effects(&conn)?;
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         let d = dirty.clone();
@@ -992,6 +1023,29 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((nodes, head))
     }
+}
+
+/// The crash sweep, run at every open: a job left `processing` was in
+/// flight when the process died, and nobody knows whether it reached the
+/// world. Idempotent ones are safe to run again; the rest must **not** be
+/// guessed at — a second `submit` is a second mail — so they fail and wait
+/// for a human. This is the whole reason `Deferred::idempotent` has no
+/// default.
+///
+/// # Errors
+///
+/// If either update fails.
+pub fn sweep_effects(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE effect SET status='pending' WHERE status='processing' AND idempotent=1",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE effect SET status='failed', error='interrupted; outcome unknown'
+         WHERE status='processing' AND idempotent=0",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Query params rendered for humans (and cache keys).

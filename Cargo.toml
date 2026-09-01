@@ -39,6 +39,12 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65ea
 # for both targets (verified on the android cross-build).
 rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 
+# CR-004: effects are serializable values, and the deferred ones are JSON
+# payloads in the `effect` table. serde is already in the graph transitively;
+# serde_json is the one new crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

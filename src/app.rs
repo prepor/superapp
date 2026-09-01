@@ -749,6 +749,10 @@ struct LauncherUi {
 
 struct State {
     ws: Wm,
+    /// Everything that leaves the process, plus the clock (CR-004). Holds
+    /// the same `Rc<Store>` as the field below, so the two cannot diverge —
+    /// `store` stays for the hundred read sites that only want the store.
+    world: std::rc::Rc<crate::effect::World>,
     store: std::rc::Rc<Store>,
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
@@ -822,6 +826,16 @@ fn grid_for(vp: DVec2) -> core::Grid {
 impl State {
     fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
         let store = std::rc::Rc::new(store);
+        let secrets_dir = db_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let world = std::rc::Rc::new(crate::effect::World::new(
+            store.clone(),
+            Box::new(crate::effect::Real::new(secrets_dir)),
+            mail::registry(),
+        ));
         // Boot restores the last session from the store; a store that never
         // booted gets the default layout (and persists it on first sync).
         let ws = match store.load_wm() {
@@ -840,6 +854,7 @@ impl State {
         };
         State {
             ws,
+            world,
             store,
             db_path,
             workers: Vec::new(),
@@ -983,7 +998,7 @@ impl State {
         let snap = self.ws.snapshot();
         let r = self
             .store
-            .act(kind, &label, entity.as_deref(), crate::store::now(), |tx| {
+            .act(kind, &label, entity.as_deref(), self.world.now(), |tx| {
                 crate::store::save_wm_tx(tx, &snap)?;
                 data(tx)
             });
@@ -1039,7 +1054,7 @@ impl State {
             if ui.draft_saved.as_ref() == Some(&d) {
                 continue;
             }
-            mail::save_draft(&self.store, pid as i64, re, &d);
+            mail::save_draft(&self.store, pid as i64, re, &d, self.world.now());
             ui.draft_saved = Some(d);
         }
     }
@@ -2059,20 +2074,25 @@ impl Stage {
         let Some(mut runner) = self.e2e.take() else {
             return;
         };
+        // Screenshots are effects; a run needs the world to take them.
+        let world = self.state.as_ref().map(|s| s.world.clone());
         if let Some(step) = runner.next_step() {
             match step {
                 e2e::Step::Wait(_) => {}
                 e2e::Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
-                    #[cfg(target_os = "macos")]
-                    match crate::mac::screenshot(&path) {
+                    match world
+                        .as_ref()
+                        .ok_or_else(|| "no world yet".to_string())
+                        .and_then(|w| w.run(&crate::effect::Shot(&path)))
+                    {
                         Ok(()) => eprintln!("e2e: shot {}", path.display()),
                         Err(e) => {
                             eprintln!("e2e: FAIL shot {name}: {e}");
                             runner.failures += 1;
                         }
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(any())]
                     {
                         eprintln!("e2e: FAIL shot {}: screenshots need macos", path.display());
                         runner.failures += 1;
@@ -2856,27 +2876,27 @@ impl Stage {
             let sql: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
             md.push_str(&format!("```sql\n{sql}\n```\n"));
         }
-        // Deliver: a file beside the store, and the clipboard on macOS.
+        // Deliver: a file beside the store, and the clipboard. Both are
+        // effects, so a denied world refuses them loudly instead of
+        // silently writing to a developer's machine.
         let mut where_to = String::new();
         if let Some(dir) = state.db_path.as_ref().and_then(|p| p.parent()) {
             let path = dir.join("panel-context.md");
-            if std::fs::write(&path, &md).is_ok() {
+            if state
+                .world
+                .run(&crate::effect::WriteFile {
+                    path: &path,
+                    bytes: md.as_bytes(),
+                })
+                .is_ok()
+            {
                 where_to = path.to_string_lossy().into_owned();
             }
         }
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            if let Ok(mut child) = std::process::Command::new("/usr/bin/pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(md.as_bytes());
-                }
-                let _ = child.wait();
-            }
-        }
+        state.world.try_run(&crate::effect::Clip {
+            text: &md,
+            what: "panel context",
+        });
         state.toast(
             format!(
                 "panel context copied — {} queries{}",
@@ -3305,6 +3325,7 @@ impl Stage {
                             state.toast("no recipient", true);
                         } else {
                             let delay = config().send_delay;
+                            let now = state.world.now();
                             let subject = if d.subject.is_empty() {
                                 "(no subject)".into()
                             } else {
@@ -3318,8 +3339,8 @@ impl Stage {
                                     ws.close(pid);
                                 },
                                 move |tx| {
-                                    mail::upsert_draft_tx(tx, pid as i64, re, &d)?;
-                                    mail::file_send_tx(tx, pid as i64, delay)
+                                    mail::upsert_draft_tx(tx, pid as i64, re, &d, now)?;
+                                    mail::file_send_tx(tx, pid as i64, now + delay)
                                 },
                             );
                             state.toast(
@@ -3681,13 +3702,14 @@ impl Stage {
                     } else if state.db_path.is_none() {
                         state.toast("no store file — accounts need one", true);
                     } else {
-                        let dir = state
-                            .db_path
-                            .as_ref()
-                            .and_then(|p| p.parent())
-                            .map(std::path::Path::to_path_buf)
-                            .unwrap_or_default();
-                        if !crate::secret::set(&dir, &email, &pass) {
+                        let stored = state
+                            .world
+                            .run(&crate::effect::SecretSet {
+                                email: &email,
+                                pass: &pass,
+                            })
+                            .is_ok();
+                        if !stored {
                             state.toast("storing the password failed", true);
                         } else {
                             state.act(
@@ -3728,6 +3750,7 @@ impl Stage {
                         pid as i64,
                         re,
                         &mail::Draft { to, subject, body },
+                        state.world.now(),
                     );
                 }
                 crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
