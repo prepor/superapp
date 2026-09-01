@@ -43,9 +43,8 @@ rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# Two soft-keyboard patches on top of the pin, carried on
-# prepor/makepad@superapp-pin (branched at the pin; rebase them when
-# bumping it). Both are android IME defects with no app-side workaround:
+# Three patches on top of the pin, carried on prepor/makepad@superapp-pin
+# (branched at the pin; rebase them when bumping it):
 #
 #   bdb23508  TextInput hides the IME only when key focus goes to nothing —
 #             the unconditional hide-on-blur closed and reopened the
@@ -54,13 +53,18 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 #             it to replay the animation: dismissals "closed twice"), and a
 #             tap on a field clears the dismissed latch, so a re-tap on the
 #             focused field can raise the keyboard again.
+#   99b2a58f  MAKEPAD_PRESENT_WHEN_OCCLUDED=1 keeps an occluded window
+#             presenting — mosaic's patch 0003, rebased. Headless e2e runs
+#             stay behind the user's windows on purpose and must still
+#             photograph what they draw; without it, captures are stale
+#             frames. background_run() sets the variable itself.
 #
 # A local clone at ../makepad-superapp is the working tree for them; the
 # git rev below is what actually builds, here and anywhere else.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
 
 [profile.dev]
 opt-level = 1

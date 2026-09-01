@@ -243,8 +243,21 @@ pin carrying two commits, wired in via `[patch]` path overrides:
   primary tap on a `TextInput` clears the dismissed latch, so re-tapping
   an already-focused field can raise the keyboard again.
 
-Both are small, general, and worth offering upstream; the path override
-keeps them local until then (publishing the fork branch is Andrey's call).
-Bumping the pin later means rebasing two commits — the mosaic precedent,
-without the vendoring. The app-side timer guard (`ime_guard_*` in
-`app.rs`) stays as a dormant safety net for IMEs that behave differently.
+A third followed once the fork existed, because the reason to avoid one was
+gone:
+
+- `99b2a58f` — **mosaic's patch 0003, rebased**: `MAKEPAD_PRESENT_WHEN_
+  OCCLUDED=1` keeps an occluded window presenting. This restores *honest
+  headless runs* — the e2e window sits behind the user's windows on purpose,
+  and upstream's occlusion present-skip meant its screenshots were whatever
+  stale frame the surface still held (this session caught `s1` and `s2`
+  byte-identical). `background_run()` already set the variable; now
+  something reads it. `--front` reverts to what it should be: a way to
+  *watch* a run, not a prerequisite for trusting its pictures.
+
+The branch lives at `prepor/makepad@superapp-pin` and Cargo pins its rev, so
+the repo builds anywhere; `~/code/makepad-superapp` is the working tree for
+the patches. Bumping the pin means rebasing three commits — the mosaic
+precedent, without the vendoring. No upstream PRs (Andrey's call). The
+app-side timer guard (`ime_guard_*` in `app.rs`) stays as a dormant safety
+net for IMEs that behave differently.

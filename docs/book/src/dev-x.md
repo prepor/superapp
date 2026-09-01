@@ -63,10 +63,13 @@ hit resolution, key handling, text input — and captures window-layer
 screenshots to `e2e/out/`. Every run opens a **fresh seeded temp store**
 (unless `--db` overrides it), so suites are deterministic and never touch
 your session. The window sits behind everything, click-through, so a run
-never takes the screen — but on plain upstream makepad an occluded window
-skips presents, so **screenshots from a background run are stale; run with
-`--front` when the pictures matter**. Steps themselves (hits, labels, keys)
-work either way. Two more capture gotchas: with the display asleep,
+never takes the screen — and its screenshots are honest there: makepad
+skips presents for an occluded window (correct, free power saving), so the
+pin carries mosaic's patch 0003, and `background_run()` sets the
+`MAKEPAD_PRESENT_WHEN_OCCLUDED=1` it reads. Without that patch a background
+run photographs stale frames — byte-identical shots across steps are the
+tell — and `--front` is the only way to trust the pictures. `--front` is
+still there to *watch* a run. Two more capture gotchas: with the display asleep,
 window-layer captures *fail* (`could not create image`), and at the lock
 screen they *succeed but come out black* — `caffeinate -du` around a run
 fixes the first, only a human fixes the second. Failed steps (no element
