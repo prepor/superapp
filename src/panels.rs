@@ -65,13 +65,16 @@ script_mod! {
     // INK #141414 · BG #ffffff · TEXT2 #5a5a5a · MUTED #909090
     // RULE #dcdcdc · HOVER #efefef · SEL #e7e7e7 · ERR #a01500
 
+    // Sizes mirror theme.rs: FONT_SIZE 10.5 body, LABEL_SIZE 8.25 labels —
+    // the same numbers the char-grid renderer draws with, so migrated and
+    // unmigrated panels read as one app.
     mod.widgets.SMonoStyle = TextStyle{
         font_family: FontFamily{
             latin := FontMember{res: file_resource("/System/Library/Fonts/Menlo.ttc") asc: 0.0 desc: 0.0}
             fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
             symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
         }
-        font_size: 8.0
+        font_size: 10.5
         line_spacing: 1.0
     }
 
@@ -84,13 +87,23 @@ script_mod! {
         }
     }
 
-    /** A tracked uppercase section label (the char grid's Style::Label). */
+    /** An uppercase section label (the char grid's Style::Label). */
     mod.widgets.SSection = Label {
         width: Fit, height: Fit
         draw_text +: {
             color: #5a5a5a
-            text_style: mod.widgets.SMonoStyle{font_size: 6.6}
+            text_style: mod.widgets.SMonoStyle{font_size: 8.25}
         }
+    }
+
+    /** Fake-bold text, the char grid's way: the same run twice, the twin
+        nudged 0.4 px — Menlo ships no variable weight to ask for. */
+    mod.widgets.SBold = set_type_default() do #(SBold::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Overlay
+        a := mod.widgets.SLabel { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
+        b := mod.widgets.SLabel { width: Fill, margin: Inset{left: 0.4}, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
     }
 
     /** The flat monochrome text field: white well, hairline border that
@@ -98,8 +111,8 @@ script_mod! {
         makepad's whole TextInput behaviour (click-to-caret, selection,
         IME/soft keyboard). */
     mod.widgets.SField = TextInputFlat {
-        width: 260, height: Fit
-        padding: Inset{left: 6, right: 6, top: 4, bottom: 4}
+        width: Fill, height: Fit
+        padding: Inset{left: 7, right: 7, top: 5, bottom: 5}
         margin: 0
         empty_text: " "
         draw_bg +: {
@@ -144,7 +157,7 @@ script_mod! {
     /** The bordered side-effect button (the design language's one button). */
     mod.widgets.SBtn = ButtonFlat {
         width: Fit, height: Fit
-        padding: Inset{left: 7, right: 7, top: 3, bottom: 3}
+        padding: Inset{left: 12, right: 12, top: 5, bottom: 5}
         margin: 0
         draw_bg +: {
             border_radius: 1.0
@@ -166,7 +179,7 @@ script_mod! {
             color_down: #141414
             color_focus: #141414
             color_disabled: #909090
-            text_style: mod.widgets.SMonoStyle{font_size: 6.6}
+            text_style: mod.widgets.SMonoStyle{font_size: 8.25}
         }
     }
 
@@ -177,78 +190,85 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
-        padding: Inset{bottom: 10}
+        padding: Inset{top: 6, bottom: 6}
         View {
             width: Fill, height: Fit
             align: Align{y: 0.5}
             email_lbl := mod.widgets.SLabel { text: "" }
-            mod.widgets.SLabel { width: 10, text: "" }
+            View { width: 12, height: 1 }
             host_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
         status_lbl := mod.widgets.SLabel {
-            margin: Inset{left: 14, top: 2}
+            margin: Inset{left: 17, top: 3}
             text: "", draw_text +: { color: #909090 }
         }
         status_err_lbl := mod.widgets.SLabel {
             visible: false
-            margin: Inset{left: 14, top: 2}
+            margin: Inset{left: 17, top: 3}
             text: "", draw_text +: { color: #a01500 }
         }
+        View { width: Fill, height: 8 }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
     }
 
-    /** The settings panel: accounts with live status, the add form. */
+    /** The settings panel: accounts fill the middle; the add form keeps a
+        compact, fixed shape at the bottom. */
     mod.widgets.SettingsPanel = set_type_default() do #(SettingsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
-        spacing: 6
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
 
-        mod.widgets.SSection { text: "A C C O U N T S" }
+        mod.widgets.SSection { text: "ACCOUNTS" }
+        View { width: Fill, height: 5 }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
-        View { width: Fill, height: 4 }
 
         accounts_list := PortalList {
-            // PortalList virtualizes against a fixed viewport — Fit would
-            // collapse it. Four rows of air; it scrolls past that.
-            width: Fill, height: 150
+            // PortalList virtualizes against a fixed viewport (Fit would
+            // collapse it) — so it takes whatever the form leaves.
+            width: Fill, height: Fill
             flow: Down
             account_row := mod.widgets.AccountRow {}
         }
 
-        View { width: Fill, height: 10 }
-        mod.widgets.SSection { text: "A D D   A C C O U N T" }
+        View { width: Fill, height: 14 }
+        mod.widgets.SSection { text: "ADD ACCOUNT" }
+        View { width: Fill, height: 5 }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
-        View { width: Fill, height: 4 }
+        View { width: Fill, height: 10 }
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "ADDRESS" }
+            mod.widgets.SSection { width: 82, text: "ADDRESS" }
             email_input := mod.widgets.SField {}
         }
+        View { width: Fill, height: 7 }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "PASSWORD" }
+            mod.widgets.SSection { width: 82, text: "PASSWORD" }
             pass_input := mod.widgets.SField { is_password: true }
         }
+        View { width: Fill, height: 7 }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "IMAP" }
+            mod.widgets.SSection { width: 82, text: "IMAP" }
             imap_input := mod.widgets.SField { text: "imap.fastmail.com" }
         }
+        View { width: Fill, height: 7 }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "SMTP" }
+            mod.widgets.SSection { width: 82, text: "SMTP" }
             smtp_input := mod.widgets.SField { text: "smtp.fastmail.com" }
         }
-        View { width: Fill, height: 4 }
+        View { width: Fill, height: 12 }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             hint_lbl := mod.widgets.SLabel {
                 text: "an app password — tab walks, enter submits"
-                draw_text +: { color: #909090 }
+                draw_text +: { color: #909090, text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
             }
             View { width: Fill, height: 1 }
             add_btn := mod.widgets.SBtn { text: "add account" }
@@ -263,20 +283,20 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
-        spacing: 6
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 7
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "TO" }
+            mod.widgets.SSection { width: 82, text: "TO" }
             to_input := mod.widgets.SField {}
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 74, text: "SUBJECT" }
+            mod.widgets.SSection { width: 82, text: "SUBJECT" }
             subject_input := mod.widgets.SField {}
         }
-        View { width: Fill, height: 4 }
+        View { width: Fill, height: 2 }
         body_input := mod.widgets.SField {
             width: Fill, height: Fill
             is_multiline: true
@@ -287,8 +307,8 @@ script_mod! {
     // ---- inbox -------------------------------------------------------------
 
     /** One mail row: from · subject · date, bold while unread, an inverted
-        wash while selected. Tap the subject to open; tap elsewhere to
-        select (the j/k cursor). */
+        wash while selected. Subjects hold to one line, ellipsized. Tap the
+        subject to open; tap elsewhere to select (the j/k cursor). */
     mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
@@ -300,24 +320,25 @@ script_mod! {
         }
         View {
             width: Fill, height: Fit
-            padding: Inset{left: 4, right: 4, top: 3, bottom: 3}
-            align: Align{y: 0.5}
-            from_lbl := mod.widgets.SLabel { width: 96, text: "" }
-            from_lbl_b := mod.widgets.SLabel {
-                visible: false, width: 96, text: ""
-                draw_text +: { text_style: mod.widgets.SMonoStyle{} }
+            flow: Down
+            View {
+                width: Fill, height: Fit
+                padding: Inset{left: 4, right: 4, top: 5, bottom: 5}
+                align: Align{y: 0.5}
+                from_lbl := mod.widgets.SLabel {
+                    width: 130, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
+                from_b := mod.widgets.SBold { visible: false, width: 130 }
+                View { width: 10, height: 1 }
+                subject_lbl := mod.widgets.SLabel {
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
+                subject_b := mod.widgets.SBold { visible: false, width: Fill }
+                View { width: 10, height: 1 }
+                date_lbl := mod.widgets.SLabel {
+                    width: Fit, text: "", draw_text +: { color: #909090 }
+                }
             }
-            subject_lbl := mod.widgets.SLabel { width: Fill, text: "" }
-            subject_lbl_b := mod.widgets.SLabel {
-                visible: false, width: Fill, text: ""
-            }
-            date_lbl := mod.widgets.SLabel {
-                width: Fit, text: "", draw_text +: { color: #909090 }
-            }
-        }
-        rule := View {
-            width: Fill, height: Fit, flow: Down
-            View { width: Fill, height: 21 }
             View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
         }
     }
@@ -327,8 +348,8 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
-        spacing: 4
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 8}
+        spacing: 6
 
         filter_input := mod.widgets.SField {
             width: Fill
@@ -337,7 +358,7 @@ script_mod! {
         View {
             width: Fill, height: Fit
             padding: Inset{left: 4, right: 4}
-            mod.widgets.SSection { width: 96, text: "FROM" }
+            mod.widgets.SSection { width: 140, text: "FROM" }
             mod.widgets.SSection { width: Fill, text: "SUBJECT" }
             mod.widgets.SSection { width: Fit, text: "DATE" }
         }
@@ -385,22 +406,22 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
-        spacing: 5
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 6
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 52, text: "FROM" }
+            mod.widgets.SSection { width: 60, text: "FROM" }
             from_link := mod.widgets.SLink {}
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 52, text: "TO" }
+            mod.widgets.SSection { width: 60, text: "TO" }
             to_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 52, text: "DATE" }
+            mod.widgets.SSection { width: 60, text: "DATE" }
             date_lbl := mod.widgets.SLabel { text: "" }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
@@ -410,7 +431,11 @@ script_mod! {
         status_err_lbl := mod.widgets.SLabel {
             visible: false, text: "", draw_text +: { color: #a01500 }
         }
-        body_lbl := mod.widgets.SLabel { width: Fill, height: Fill, text: "" }
+        body_scroll := View {
+            width: Fill, height: Fill
+            scroll_bars: ScrollBars{ show_scroll_x: false }
+            body_lbl := mod.widgets.SLabel { width: Fill, height: Fit, text: "" }
+        }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             newer_link := mod.widgets.SLink {}
@@ -432,18 +457,57 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 6
 
-        name_lbl := mod.widgets.SLabel {
-            text: ""
-            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 10.5} }
+        View {
+            width: Fill, height: Fit, flow: Overlay
+            name_lbl := mod.widgets.SLabel {
+                width: Fill
+                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+            }
+            name_lbl2 := mod.widgets.SLabel {
+                width: Fill, margin: Inset{left: 0.4}
+                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+            }
         }
         email_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
-        View { width: Fill, height: 4 }
+        View { width: Fill, height: 6 }
         count_lbl := mod.widgets.SLabel { text: "" }
-        View { width: Fill, height: 4 }
+        View { width: Fill, height: 6 }
         from_link := mod.widgets.SLink {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SBold
+// ---------------------------------------------------------------------------
+
+/// The char grid's fake bold as a widget: the same text on two overlaid
+/// labels, the twin nudged 0.4 px right.
+#[derive(Script, ScriptHook, Widget)]
+pub struct SBold {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for SBold {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl SBoldRef {
+    pub fn set_text(&self, cx: &mut Cx, text: &str) {
+        let Some(inner) = self.borrow() else { return };
+        inner.view.label(cx, ids!(a)).set_text(cx, text);
+        inner.view.label(cx, ids!(b)).set_text(cx, text);
     }
 }
 
@@ -745,7 +809,7 @@ impl Widget for InboxRow {
         match event.hits(cx, self.view.area()) {
             Hit::FingerUp(fe) if fe.is_over && fe.was_tap() => {
                 let subj = self.view.label(cx, ids!(subject_lbl)).area().rect(cx);
-                let subj_b = self.view.label(cx, ids!(subject_lbl_b)).area().rect(cx);
+                let subj_b = self.view.widget(cx, ids!(subject_b)).area().rect(cx);
                 let over_subject = subj.contains(fe.abs) || subj_b.contains(fe.abs);
                 if over_subject {
                     cx.action(PanelAction::OpenMail {
@@ -771,33 +835,22 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    #[allow(clippy::too_many_arguments)]
-    fn populate(
-        &self,
-        cx: &mut Cx,
-        pid: u64,
-        m: &mail::MailHead,
-        selected: bool,
-    ) {
+    fn populate(&self, cx: &mut Cx, pid: u64, m: &mail::MailHead, selected: bool) {
         let Some(mut row) = self.borrow_mut() else { return };
         row.pid = pid;
         row.mail_id = m.id;
         let from = &m.from_name;
         let date = mail::fmt_date(m.date);
-        let (fp, fb) = (
-            row.view.label(cx, ids!(from_lbl)),
-            row.view.label(cx, ids!(from_lbl_b)),
-        );
-        let (sp, sb) = (
-            row.view.label(cx, ids!(subject_lbl)),
-            row.view.label(cx, ids!(subject_lbl_b)),
-        );
+        let fp = row.view.label(cx, ids!(from_lbl));
+        let fb = row.view.widget(cx, ids!(from_b));
+        let sp = row.view.label(cx, ids!(subject_lbl));
+        let sb = row.view.widget(cx, ids!(subject_b));
         fp.set_text(cx, if m.unread { "" } else { from });
-        fb.set_text(cx, if m.unread { from } else { "" });
+        fb.as_sbold().set_text(cx, if m.unread { from } else { "" });
         fp.set_visible(cx, !m.unread);
         fb.set_visible(cx, m.unread);
         sp.set_text(cx, if m.unread { "" } else { &m.subject });
-        sb.set_text(cx, if m.unread { &m.subject } else { "" });
+        sb.as_sbold().set_text(cx, if m.unread { &m.subject } else { "" });
         sp.set_visible(cx, !m.unread);
         sb.set_visible(cx, m.unread);
         row.view.label(cx, ids!(date_lbl)).set_text(cx, &date);
@@ -841,6 +894,14 @@ impl InboxPanel {
                 (i as isize + d).clamp(0, rows.len() as isize - 1) as usize
             });
         self.sel = Some(rows[i].id);
+        // Keep the cursor on screen: a row without a live item is off-view.
+        let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let visible = list
+            .borrow()
+            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == i));
+        if !visible {
+            list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
+        }
         self.redraw(cx);
     }
 }
@@ -865,18 +926,26 @@ impl Widget for InboxPanel {
             }
         }
         if let Event::KeyDown(k) = event {
-            if !filter_focused && k.key_code == KeyCode::ReturnKey {
-                let rows = self.rows(cx, scope);
-                let target = self
-                    .sel
-                    .filter(|s| rows.iter().any(|m| m.id == *s))
-                    .or_else(|| rows.first().map(|m| m.id));
-                if let Some(id) = target {
-                    cx.action(PanelAction::OpenMail {
-                        pid,
-                        id,
-                        fresh: k.modifiers.logo || k.modifiers.alt,
-                    });
+            if !filter_focused {
+                match k.key_code {
+                    KeyCode::ReturnKey => {
+                        let rows = self.rows(cx, scope);
+                        let target = self
+                            .sel
+                            .filter(|s| rows.iter().any(|m| m.id == *s))
+                            .or_else(|| rows.first().map(|m| m.id));
+                        if let Some(id) = target {
+                            cx.action(PanelAction::OpenMail {
+                                pid,
+                                id,
+                                fresh: k.modifiers.logo || k.modifiers.alt,
+                            });
+                        }
+                    }
+                    // Arrows mirror j/k (the char grid's grammar).
+                    KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
+                    _ => {}
                 }
             }
         }
@@ -1125,6 +1194,7 @@ impl Widget for ContactPanel {
                 let (name, count) = mail::contact(&p.store, email);
                 let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
                 self.view.label(cx, ids!(name_lbl)).set_text(cx, &name);
+                self.view.label(cx, ids!(name_lbl2)).set_text(cx, &name);
                 self.view.label(cx, ids!(email_lbl)).set_text(cx, email);
                 self.view
                     .label(cx, ids!(count_lbl))

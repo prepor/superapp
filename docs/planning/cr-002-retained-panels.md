@@ -131,3 +131,47 @@ F. **Overlays** onto the same library (launcher field becomes an `SField`,
    history rows become widgets) — optional, by pain.
 
 Each phase lands green (unit + all e2e suites), book updated, committed.
+
+## Post-E: real input vs the harness (2026-09-01)
+
+The first real-mouse/keyboard session surfaced four defects the suites could
+not see — all in the seam between the char-grid-era input model and hosted
+widgets, none inside the widgets:
+
+- `MouseDown` claimed key focus for the stage on every click (the char
+  grid's need), stealing it back from the TextInput the forwarded event had
+  just focused — every field dead to a real mouse. Skipped now when the
+  click lands on a hosted field rect.
+- macOS delivers letters as `TextInput` events only while the IME is shown,
+  and `kick()` stood the IME down for hosted panels — the letter grammar
+  (j/k, `/`, r) never fired from a real keyboard. The IME now stays on
+  whenever a panel has focus; and since a blurring TextInput hides it (its
+  own lifecycle), a `KeyFocus` watcher re-shows it when key focus returns
+  to the shell.
+- The e2e bridge's semantic rects also resolved under real clicks — a real
+  row/button click fired twice (widget path + shell resolve). Real clicks
+  now take only panel focus from those rects; semantic resolve is the
+  scripts' door alone.
+- Key/text events were forwarded to every hosted widget — a "j" typed into
+  compose walked other inboxes. They go to the focused panel only now.
+
+Why the suites stayed green through all four: the harness enters below the
+platform seam — `handle_text` synthesizes `TextInput` events without any
+IME, and script clicks either synthesize pointers straight at widgets or
+resolve semantic ops directly. Both doors end in the same widget code
+(which is the bridge's point), so the layer above them — IME lifecycle,
+key-focus ownership, real-click resolution — is exactly what scripts cannot
+exercise. That layer is verified store-level now: drive letters through a
+temp db and assert the panels they produce (j·j·enter must open the second
+row, not the first), which proves the path without pixels.
+
+Also in this pass, visual parity: the library draws at the theme's sizes
+(10.5/8.25 — it had hardcoded 8.0, which read as a different font entirely),
+subjects hold to one line (`max_lines: 1` + `Ellipsis`), unread bold is the
+char grid's nudged double-draw reborn as `SBold` (Menlo ships no `wght`
+axis, and makepad's `weight` is variable-font-only), inbox arrows mirror
+j/k with scroll-follow, the message body scrolls, and settings lost its
+fixed-height list (accounts fill the middle, the form holds the bottom).
+Tab between fields stays ours: neither makepad's TextInput nor Robrix
+handles Tab at all — the enter chain is Robrix's ceiling; the Tab walk is
+ours on top of it.

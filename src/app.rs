@@ -1813,18 +1813,20 @@ impl Stage {
             .state
             .as_deref()
             .is_some_and(|s| s.overlay == Overlay::Launcher);
-        // A retained panel's TextInputs own the IME lifecycle and key
-        // focus themselves — the char-grid machinery must not fight them.
+        // A retained panel's TextInputs own their key focus and (on android)
+        // the soft keyboard — the char-grid machinery must not fight them.
+        // But on macOS the IME must stay on for hosted panels too: letters
+        // only arrive as TextInput events while it is shown, and the letter
+        // grammar (j/k, "/", r) is made of them.
         let hosted = self.hosted_focus();
         let want_ime = launcher
-            || (!hosted
-                && self.state.as_deref().is_some_and(|s| {
-                    if cfg!(target_os = "android") {
-                        s.field.is_some()
-                    } else {
-                        s.ws.focus.is_some()
-                    }
-                }));
+            || self.state.as_deref().is_some_and(|s| {
+                if cfg!(target_os = "android") {
+                    !hosted && s.field.is_some()
+                } else {
+                    s.ws.focus.is_some()
+                }
+            });
         let want_field = if launcher {
             None
         } else {
@@ -1836,7 +1838,11 @@ impl Stage {
             self.ime_sent = None;
             self.ime_composing = false;
             if want_ime {
-                cx.set_key_focus(self.area);
+                // With a hosted panel the key focus belongs to whichever
+                // TextInput holds it — only the char grid claims it here.
+                if !hosted {
+                    cx.set_key_focus(self.area);
+                }
                 cx.show_text_ime_with_config(
                     self.area,
                     rect(0.0, 0.0, 0.0, 0.0),
@@ -2388,7 +2394,7 @@ impl Stage {
         // A retained panel owns plain keys (its widgets gate on key focus)
         // — cmd chords and overlays were already handled above.
         if hosted && state.field.is_none() {
-            self.forward_to_hosted(cx, &Event::KeyDown(k.clone()));
+            self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
             self.kick(cx);
             return;
         }
@@ -2591,7 +2597,7 @@ impl Stage {
             self.toggle_launcher(cx);
         }
         if self.hosted_focus() {
-            self.forward_to_hosted(cx, &Event::KeyUp(k.clone()));
+            self.forward_to_focused(cx, &Event::KeyUp(k.clone()));
         }
     }
 
@@ -2887,7 +2893,7 @@ impl Stage {
                 input: input.to_string(),
                 ..Default::default()
             });
-            self.forward_to_hosted(cx, &ev);
+            self.forward_to_focused(cx, &ev);
             self.kick(cx);
             return;
         }
@@ -3728,6 +3734,31 @@ impl Stage {
             w.handle_event(cx, event, &mut scope);
         }
     }
+
+    /// Keys and text go to the focused panel's widget alone — pointer
+    /// events are positional, but the keyboard belongs to one panel, and
+    /// a "j" typed into compose must not walk some other inbox.
+    fn forward_to_focused(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        let Some(f) = state.ws.focus else {
+            return;
+        };
+        let Some(w) = self.hosted.get(&f) else {
+            return;
+        };
+        let Some(kind) = state.ws.panel(f).map(|p| p.kind.clone()) else {
+            return;
+        };
+        let props = crate::panels::PanelProps {
+            store: state.store.clone(),
+            pid: f,
+            kind,
+        };
+        let mut scope = Scope::with_props(&props);
+        w.handle_event(cx, event, &mut scope);
+    }
 }
 
 impl Widget for Stage {
@@ -3745,6 +3776,18 @@ impl Widget for Stage {
         if let Some(pid) = self.pending_focus.take() {
             if let Some(w) = self.hosted.get(&pid) {
                 w.as_compose_panel().focus_body(cx);
+            }
+        }
+        // A blurring TextInput hides the platform IME (its own lifecycle);
+        // if key focus went back to the shell — or nowhere — letters would
+        // stop arriving as TextInput events. Re-show for the letter grammar.
+        if let Event::KeyFocus(ke) = event {
+            if !cfg!(target_os = "android")
+                && self.hosted_focus()
+                && (ke.focus == self.area || ke.focus == Area::Empty)
+            {
+                self.ime_shown = false;
+                self.kick(cx);
             }
         }
         if let Event::Actions(actions) = event {
@@ -3851,6 +3894,18 @@ impl Widget for Stage {
                 // plain characters (macOS, hardware keys) come as `input`.
                 if let Some(fs) = e.full_state_sync.clone() {
                     self.handle_ime_state(cx, &fs);
+                } else if self.hosted_focus()
+                    && self.state.as_deref().is_some_and(|s| {
+                        s.overlay == Overlay::None && s.field.is_none()
+                    })
+                {
+                    // The focused panel is a widget tree: hand the original
+                    // event over whole, composition flags intact (its
+                    // TextInputs strip control chars themselves). The e2e
+                    // text path stays on handle_text, which synthesizes the
+                    // same event — one route, two doors.
+                    self.forward_to_focused(cx, event);
+                    self.kick(cx);
                 } else {
                     let input = e.input.clone();
                     self.handle_text(cx, &input);
@@ -3917,11 +3972,25 @@ impl Widget for Stage {
 
             Event::MouseDown(e) => {
                 self.cmd_tap.other_input();
-                cx.set_key_focus(self.area);
                 let act = self.hit_at(e.abs).map(|h| h.act.clone());
+                // A hosted field under the click already took key focus via
+                // the forwarded event — stealing it back would kill the
+                // caret (and with it all typing).
+                if !matches!(act, Some(Act::Pointer(_))) {
+                    cx.set_key_focus(self.area);
+                }
                 if let Some(act) = act {
                     // cmd+click (alt as a quiet alias): a fresh, un-joined panel.
                     let fresh = e.modifiers.logo || e.modifiers.alt;
+                    // Real clicks on hosted content act through the widgets
+                    // themselves (rows open, buttons submit — the forwarded
+                    // pointer stream). The semantic ops are the e2e bridge's
+                    // route only; resolving them here too would double-fire.
+                    // The shell's share of a content click is panel focus.
+                    let act = match act {
+                        Act::WidgetOp(pid, _) => Act::Pointer(pid),
+                        a => a,
+                    };
                     self.resolve_click(cx, act, fresh);
                 }
             }
