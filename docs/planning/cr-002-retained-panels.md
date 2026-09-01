@@ -81,12 +81,27 @@ for content.
 
 ## Phases
 
-A. **Foundation**: `src/ui/` DSL styles + `SField`/`SButton`/`SSection`;
-   the panel-host plumbing (templates, per-pid instances, Scope data,
-   action bubbling); the e2e label bridge.
-B. **Settings** (pilot — forms hurt most): real field behaviour, the
-   tab/enter walk on widget focus, add/remove accounts through bubbled
-   actions.
+A. **Foundation** — **landed 2026-09-01**: `src/panels.rs` holds the DSL
+   styles (`SMonoStyle`, `SLabel`, `SSection`, `SField` over TextInputFlat,
+   `SBtn` over ButtonFlat, all themed monochrome) and the host plumbing:
+   Stage collects its named DSL children as templates (PortalList-style
+   `on_after_apply`), instantiates one widget per panel id, forwards every
+   event with `PanelProps` (Rc<Store> + pid — Scope props ride an `Any`) on
+   the scope, and catches bubbled `PanelAction`s into `State::act`. The e2e
+   bridge: fields register pointer hits (synthesized mouse events — real
+   TextInput focus/typing); buttons register *semantic* ops resolved to the
+   same PanelAction a real click emits (synthetic pointer capture pairing
+   diverges from the platform's inside PortalList's capture-overload dance;
+   not worth chasing). In-block DSL self-references must be qualified
+   (`mod.widgets.X`) — bare names only resolve across blocks.
+B. **Settings pilot** — **landed 2026-09-01**: the panel is a widget tree
+   (sections, PortalList account rows with live status + remove, the add
+   form); real TextInput behaviour throughout (click-to-caret, selection,
+   IME); tab/shift+tab and the enter chain walk widget key focus with
+   select-all on advance (typing replaces); submit past the last field.
+   PortalList needs a fixed height (Fit collapses it). The char-grid
+   settings path is retired. Chrome fades over popping content — reads
+   fine in practice.
 C. **Compose**: multiline `TextInput`, drafts/send unchanged underneath.
 D. **Inbox** on `PortalList`: virtualized (821+ real messages already),
    row templates, selection/enter/j-k preserved.

@@ -26,6 +26,7 @@ pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod mail;
+pub mod panels;
 pub mod secret;
 pub mod send;
 pub mod spring;

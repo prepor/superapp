@@ -60,10 +60,6 @@ pub enum BtnAct {
     Send,
     Discard,
     TryIt,
-    /// Settings: create the account from the form fields.
-    AddAccount,
-    /// Settings: remove this account (and its mail).
-    RemoveAccount(i64),
 }
 
 /// Text fields.

@@ -30,6 +30,7 @@ use crate::e2e;
 use crate::launcher;
 use crate::mail;
 use crate::send;
+use crate::panels::*;
 use crate::store::Store;
 use crate::sync;
 use crate::spring::{Spring, SpringParams};
@@ -220,7 +221,13 @@ script_mod! {
                 window.inner_size: vec2(1440, 900)
                 pass.clear_color: #ffffffff
                 body +: {
-                    stage := Stage{}
+                    stage := Stage{
+                        // Retained content templates (CR-002): named children
+                        // of a custom-drawn widget are never auto-drawn —
+                        // they are collected as templates and instantiated
+                        // per panel, PortalList-style.
+                        settings_tpl := mod.widgets.SettingsPanel{}
+                    }
                 }
             }
         }
@@ -333,13 +340,6 @@ impl PanelUi {
                     ui.filter.caret = ui.filter.text.chars().count();
                 }
             }
-            Kind::Settings => {
-                // Editable fastmail-style defaults, not placeholders.
-                ui.set_imap.text = "imap.fastmail.com".into();
-                ui.set_imap.caret = ui.set_imap.text.chars().count();
-                ui.set_smtp.text = "smtp.fastmail.com".into();
-                ui.set_smtp.caret = ui.set_smtp.text.chars().count();
-            }
             // Read flags are the *opening action's* business (its changeset
             // carries the flag flip, so undo restores unread) — not this
             // constructor's, which also runs on boot restore.
@@ -401,6 +401,19 @@ enum Act {
     HistoryRow(i64),
     /// The overlay's backdrop: tapping outside the rows dismisses it.
     OverlayClose,
+    /// A retained widget's interactive child (CR-002): the e2e bridge
+    /// synthesizes pointer events at its rect; a real click just focuses.
+    Pointer(PanelId),
+    /// A retained widget's *button*, semantically (CR-002): e2e resolves it
+    /// to the same PanelAction the button's own click emits.
+    WidgetOp(PanelId, WidgetOp),
+}
+
+/// Semantic button operations on retained panels (the e2e bridge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WidgetOp {
+    AddAccount,
+    RemoveAccount(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -423,7 +436,7 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Row(pid, _)
         | Act::Field(pid, _)
         | Act::Tab(pid) => Some(*pid),
-        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => None,
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) => None,
     }
 }
 
@@ -731,7 +744,7 @@ struct LauncherUi {
 
 struct State {
     ws: Wm,
-    store: Store,
+    store: std::rc::Rc<Store>,
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
     db_path: Option<std::path::PathBuf>,
@@ -803,6 +816,7 @@ fn grid_for(vp: DVec2) -> core::Grid {
 
 impl State {
     fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
+        let store = std::rc::Rc::new(store);
         // Boot restores the last session from the store; a store that never
         // booted gets the default layout (and persists it on first sync).
         let ws = match store.load_wm() {
@@ -1092,70 +1106,10 @@ fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
         Kind::Message { id } => message_lines(state, id, cols),
         Kind::Contact { email } => contact_lines(state, email),
         Kind::Compose { re } => compose_lines(ui, re),
-        Kind::Settings => settings_lines(state),
+        Kind::Settings => Vec::new(), // retained content (CR-002)
     }
 }
 
-/// The settings panel: every account with its sync status, and the
-/// add-account form (fastmail-style: address + app password; hosts are
-/// editable defaults; the user name is the address). Built from the
-/// semantic form vocabulary — tab walks the fields, enter submits at the
-/// end.
-fn settings_lines(state: &State) -> Vec<Line> {
-    const LABEL_W: usize = 10;
-    let mut v = Vec::new();
-    v.push(ui::section("ACCOUNTS"));
-    v.push(ui::gap());
-    let accounts = mail::accounts(&state.store);
-    for a in accounts.iter() {
-        let host = a.imap_host.clone().unwrap_or_default();
-        v.push(Line {
-            left: vec![
-                Seg::T(a.email.clone(), Style::Bold),
-                Seg::Sp(2),
-                Seg::T(
-                    if host.is_empty() { "local demo".into() } else { host },
-                    Style::Muted,
-                ),
-            ],
-            right: vec![Seg::Btn {
-                label: "remove".into(),
-                act: BtnAct::RemoveAccount(a.id),
-            }],
-            ..Default::default()
-        });
-        let status = a.status.clone().unwrap_or_else(|| "never synced".into());
-        let err = status.starts_with("error");
-        v.push(Line {
-            left: vec![
-                Seg::Sp(2),
-                Seg::T(status, if err { Style::Err } else { Style::Muted }),
-            ],
-            ..Default::default()
-        });
-        v.push(ui::gap());
-    }
-    if accounts.is_empty() {
-        v.push(Line::text("no accounts", Style::Muted));
-        v.push(ui::gap());
-    }
-    v.push(ui::gap());
-    v.push(ui::section("ADD ACCOUNT"));
-    v.push(ui::gap());
-    v.push(ui::field_row("ADDRESS", LABEL_W, FieldId::SetEmail, 30));
-    v.push(ui::gap());
-    v.push(ui::field_row("PASSWORD", LABEL_W, FieldId::SetPass, 30));
-    v.push(ui::gap());
-    v.push(ui::field_row("IMAP", LABEL_W, FieldId::SetImap, 30));
-    v.push(ui::gap());
-    v.push(ui::field_row("SMTP", LABEL_W, FieldId::SetSmtp, 30));
-    v.push(ui::gap());
-    v.push(ui::actions(
-        "an app password — tab walks, enter submits",
-        &[("add account", BtnAct::AddAccount)],
-    ));
-    v
-}
 
 fn help_lines() -> Vec<Line> {
     let about = Kind::About;
@@ -1651,7 +1605,7 @@ impl CellFont {
 }
 
 /// The widget that owns the workspace and draws it.
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct Stage {
     #[uid]
     uid: WidgetUid,
@@ -1659,6 +1613,13 @@ pub struct Stage {
     walk: Walk,
     #[layout]
     layout: Layout,
+
+    /// Retained content templates by DSL name (CR-002) and the live
+    /// instance per panel id — the PortalList pattern at panel scale.
+    #[rust]
+    tpl: HashMap<LiveId, ScriptObjectRef>,
+    #[rust]
+    hosted: HashMap<PanelId, WidgetRef>,
 
     #[redraw]
     #[live]
@@ -1838,14 +1799,18 @@ impl Stage {
             .state
             .as_deref()
             .is_some_and(|s| s.overlay == Overlay::Launcher);
+        // A retained panel's TextInputs own the IME lifecycle and key
+        // focus themselves — the char-grid machinery must not fight them.
+        let hosted = self.hosted_focus();
         let want_ime = launcher
-            || self.state.as_deref().is_some_and(|s| {
-                if cfg!(target_os = "android") {
-                    s.field.is_some()
-                } else {
-                    s.ws.focus.is_some()
-                }
-            });
+            || (!hosted
+                && self.state.as_deref().is_some_and(|s| {
+                    if cfg!(target_os = "android") {
+                        s.field.is_some()
+                    } else {
+                        s.ws.focus.is_some()
+                    }
+                }));
         let want_field = if launcher {
             None
         } else {
@@ -1866,7 +1831,7 @@ impl Stage {
                         ..Default::default()
                     },
                 );
-            } else {
+            } else if !hosted {
                 // Also resets makepad's "user dismissed the keyboard" latch,
                 // without which the next show request is silently ignored.
                 cx.hide_text_ime();
@@ -2033,7 +1998,7 @@ impl Stage {
                 }
                 e2e::Step::Click { label, fresh } => {
                     let needle = label.to_lowercase();
-                    let act = self
+                    let hit = self
                         .hits
                         .iter()
                         .rev()
@@ -2047,10 +2012,14 @@ impl Stage {
                                 .rev()
                                 .find(|h| h.label.to_lowercase().contains(&needle))
                         })
-                        .map(|h| h.act.clone());
-                    match act {
-                        Some(act) => {
+                        .map(|h| (h.act.clone(), h.rect));
+                    match hit {
+                        Some((act, r)) => {
                             eprintln!("e2e: click {label:?}{}", if fresh { " (cmd)" } else { "" });
+                            if let Act::Pointer(_) = act {
+                                // A retained widget: press it for real.
+                                self.synth_click(cx, r.pos + r.size / 2.0);
+                            }
                             self.resolve_click(cx, act, fresh);
                         }
                         None => {
@@ -2213,6 +2182,7 @@ impl Stage {
     }
 
     fn handle_key_down(&mut self, cx: &mut Cx, k: &KeyEvent) {
+        let hosted = self.hosted_focus();
         // A bare cmd press only feeds the double-tap detector (the launcher
         // trigger); the firing side lives in handle_key_up.
         if k.key_code == KeyCode::Logo {
@@ -2401,30 +2371,21 @@ impl Stage {
         }
 
         // A focused text field owns the keyboard (chars arrive via TextInput).
+        // A retained panel owns plain keys (its widgets gate on key focus)
+        // — cmd chords and overlays were already handled above.
+        if hosted && state.field.is_none() {
+            self.forward_to_hosted(cx, &Event::KeyDown(k.clone()));
+            self.kick(cx);
+            return;
+        }
         if let Some((pid, fid)) = state.field {
             let kind = state.ws.panels.get(&pid).map(|p| p.kind.clone());
-            // Tab walks the form; enter advances too on settings fields —
-            // and past the last one, submits.
+            // Tab walks the form (shift reverses).
             if k.key_code == KeyCode::Tab {
                 if let Some(kind) = &kind {
                     let dir = if k.modifiers.shift { -1 } else { 1 };
                     if let Some(next) = ui::next_field(kind, fid, dir) {
                         state.field = Some((pid, next));
-                    }
-                }
-                self.kick(cx);
-                return;
-            }
-            let settings_field = matches!(
-                fid,
-                FieldId::SetEmail | FieldId::SetPass | FieldId::SetImap | FieldId::SetSmtp
-            );
-            if settings_field && k.key_code == KeyCode::ReturnKey {
-                match kind.as_ref().and_then(|kd| ui::next_field(kd, fid, 1)) {
-                    Some(next) => state.field = Some((pid, next)),
-                    None => {
-                        self.add_account_from(cx, pid);
-                        return;
                     }
                 }
                 self.kick(cx);
@@ -2615,6 +2576,9 @@ impl Stage {
         if k.key_code == KeyCode::Logo && self.cmd_tap.release(k.time) {
             self.toggle_launcher(cx);
         }
+        if self.hosted_focus() {
+            self.forward_to_hosted(cx, &Event::KeyUp(k.clone()));
+        }
     }
 
     /// Double-cmd: raise the launcher, or put it away if it is already up.
@@ -2701,56 +2665,7 @@ impl Stage {
         self.kick(cx);
     }
 
-    /// Submits the settings form (the button, or enter past the last
-    /// field): keychain the password, add the account as an action, spawn
-    /// its worker.
-    fn add_account_from(&mut self, cx: &mut Cx, pid: PanelId) {
-        let Some(state) = self.state.as_deref_mut() else {
-            return;
-        };
-        let form = state.ui.get(&pid).map(|u| {
-            (
-                u.set_email.text.trim().to_string(),
-                u.set_pass.text.clone(),
-                u.set_imap.text.trim().to_string(),
-                u.set_smtp.text.trim().to_string(),
-            )
-        });
-        let Some((email, pass, imap, smtp)) = form else {
-            return;
-        };
-        if email.is_empty() || pass.is_empty() || imap.is_empty() {
-            state.toast("address, password and imap host are required", true);
-        } else if state.db_path.is_none() {
-            state.toast("no store file — accounts need one", true);
-        } else {
-            let dir = state
-                .db_path
-                .as_ref()
-                .and_then(|p| p.parent())
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default();
-            if !crate::secret::set(&dir, &email, &pass) {
-                state.toast("storing the password failed", true);
-            } else {
-                state.act(
-                    "account",
-                    format!("add account {email}"),
-                    None,
-                    |_| {},
-                    move |tx| mail::add_account_tx(tx, &email, &imap, &smtp).map(|_| ()),
-                );
-                if let Some(ui) = state.ui.get_mut(&pid) {
-                    ui.set_email = TextField::default();
-                    ui.set_pass = TextField::default();
-                }
-                state.field = None;
-                state.spawn_workers();
-                state.toast("account added — syncing", false);
-            }
-        }
-        self.sync(cx);
-    }
+
 
     /// Notices foreign commits (sync workers, the sender): re-runs stale
     /// queries, surfaces fresh send failures, redraws. Ridden by the
@@ -2944,10 +2859,22 @@ impl Stage {
 
     /// Character input: field typing, or the focused panel's letter keys.
     fn handle_text(&mut self, cx: &mut Cx, input: &str) {
+        let hosted = self.hosted_focus();
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
         if input.is_empty() || input.chars().any(|c| c.is_control()) {
+            return;
+        }
+        // A retained panel owns typing (its TextInputs gate on key focus);
+        // overlays still win above it.
+        if hosted && state.overlay == Overlay::None && state.field.is_none() {
+            let ev = Event::TextInput(TextInputEvent {
+                input: input.to_string(),
+                ..Default::default()
+            });
+            self.forward_to_hosted(cx, &ev);
+            self.kick(cx);
             return;
         }
         if state.overlay == Overlay::Launcher {
@@ -3115,6 +3042,32 @@ impl Stage {
                 self.kick(cx);
                 return;
             }
+            Act::Pointer(pid) => {
+                // The widget under it got the real event via forwarding;
+                // the shell's share is panel focus.
+                state.ws.focus = Some(pid);
+                state.field = None;
+                self.sync(cx);
+                return;
+            }
+            Act::WidgetOp(pid, op) => {
+                match op {
+                    WidgetOp::AddAccount => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
+                                let (email, pass, imap, smtp) = sp.form_values(cx);
+                                cx.action(crate::panels::PanelAction::AddAccount {
+                                    pid, email, pass, imap, smtp,
+                                });
+                            }
+                        }
+                    }
+                    WidgetOp::RemoveAccount(id) => {
+                        cx.action(crate::panels::PanelAction::RemoveAccount(id));
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         match act {
@@ -3200,26 +3153,6 @@ impl Stage {
                             state.toast("syncing…", false);
                         }
                     }
-                    BtnAct::AddAccount => {
-                        self.add_account_from(cx, pid);
-                        return;
-                    }
-                    BtnAct::RemoveAccount(id) => {
-                        let email = mail::accounts(&state.store)
-                            .iter()
-                            .find(|a| a.id == id)
-                            .map(|a| a.email.clone())
-                            .unwrap_or_default();
-                        state.act(
-                            "account",
-                            format!("remove account {email}"),
-                            None,
-                            |_| {},
-                            move |tx| mail::remove_account_tx(tx, id),
-                        );
-                        state.spawn_workers();
-                        state.toast(format!("removed {email} — ⌘z undoes"), false);
-                    }
                     BtnAct::Archive => {
                         if let Some(Kind::Message { id }) =
                             state.ws.panels.get(&pid).map(|p| p.kind.clone())
@@ -3296,7 +3229,7 @@ impl Stage {
                 self.sync(cx);
             }
             // Handled above — they return before reaching this match.
-            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => {}
+            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) => {}
         }
     }
 
@@ -3531,8 +3464,217 @@ impl Stage {
     }
 }
 
+impl ScriptHook for Stage {
+    fn on_before_apply(
+        &mut self,
+        _vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        _value: ScriptValue,
+    ) {
+        if apply.is_reload() {
+            self.tpl.clear();
+        }
+    }
+
+    fn on_after_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        // Named children of this custom-drawn widget are content templates
+        // (never auto-drawn) — collect them rooted, PortalList-style.
+        if !apply.is_eval() {
+            if let Some(obj) = value.as_object() {
+                vm.vec_with(obj, |vm, vec| {
+                    for kv in vec {
+                        if let Some(id) = kv.key.as_id() {
+                            if let Some(t) = kv.value.as_object() {
+                                self.tpl.insert(id, vm.bx.heap.new_object_ref(t));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Which kinds draw as retained widget trees (CR-002; grows per phase).
+fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
+    match kind {
+        Kind::Settings => Some(live_id!(settings_tpl)),
+        _ => None,
+    }
+}
+
+impl Stage {
+    /// The live content widget for a panel, instantiated from its kind's
+    /// template on first use (mirrors PortalList::item).
+    fn hosted_widget(&mut self, cx: &mut Cx, pid: PanelId, tpl: LiveId) -> Option<WidgetRef> {
+        if let Some(w) = self.hosted.get(&pid) {
+            return Some(w.clone());
+        }
+        let template_ref = self.tpl.get(&tpl)?;
+        let template_value: ScriptValue = template_ref.as_object().into();
+        let vm_id = cx.script_ref_vm_id(template_ref)?;
+        let widget =
+            cx.with_script_vm_id(vm_id, |vm| WidgetRef::script_from_value(vm, template_value));
+        self.hosted.insert(pid, widget.clone());
+        Some(widget)
+    }
+
+    /// Turns bubbled widget intent ([`PanelAction`]) into store actions —
+    /// the one place retained content meets the undo system.
+    fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let mut refresh = false;
+        for a in actions {
+            let Some(pa) = a.downcast_ref::<crate::panels::PanelAction>() else {
+                continue;
+            };
+            match pa.clone() {
+                crate::panels::PanelAction::AddAccount {
+                    pid,
+                    email,
+                    pass,
+                    imap,
+                    smtp,
+                } => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    if email.is_empty() || pass.is_empty() || imap.is_empty() {
+                        state.toast("address, password and imap host are required", true);
+                    } else if state.db_path.is_none() {
+                        state.toast("no store file — accounts need one", true);
+                    } else {
+                        let dir = state
+                            .db_path
+                            .as_ref()
+                            .and_then(|p| p.parent())
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_default();
+                        if !crate::secret::set(&dir, &email, &pass) {
+                            state.toast("storing the password failed", true);
+                        } else {
+                            state.act(
+                                "account",
+                                format!("add account {email}"),
+                                None,
+                                |_| {},
+                                move |tx| {
+                                    mail::add_account_tx(tx, &email, &imap, &smtp).map(|_| ())
+                                },
+                            );
+                            state.spawn_workers();
+                            state.toast("account added — syncing", false);
+                            if let Some(w) = self.hosted.get(&pid) {
+                                if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
+                                    sp.clear_form(cx);
+                                }
+                            }
+                        }
+                    }
+                    refresh = true;
+                }
+                crate::panels::PanelAction::RemoveAccount(id) => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    let email = mail::accounts(&state.store)
+                        .iter()
+                        .find(|acc| acc.id == id)
+                        .map(|acc| acc.email.clone())
+                        .unwrap_or_default();
+                    state.act(
+                        "account",
+                        format!("remove account {email}"),
+                        None,
+                        |_| {},
+                        move |tx| mail::remove_account_tx(tx, id),
+                    );
+                    state.spawn_workers();
+                    state.toast(format!("removed {email} — ⌘z undoes"), false);
+                    refresh = true;
+                }
+            }
+        }
+        if refresh {
+            self.sync(cx);
+        }
+    }
+
+    /// Synthesizes a real pointer press+release at a point — the e2e
+    /// bridge's way of clicking retained widgets through their own event
+    /// system.
+    fn synth_click(&mut self, cx: &mut Cx, p: DVec2) {
+        // hits() converts mouse to finger hits geometrically, so plain
+        // mouse events are the right synthesis level.
+        let down = Event::MouseDown(MouseDownEvent {
+            abs: p,
+            button: MouseButton::PRIMARY,
+            window_id: CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(),
+            handled: std::cell::Cell::new(Area::Empty),
+            time: 0.0,
+        });
+        let up = Event::MouseUp(MouseUpEvent {
+            abs: p,
+            button: MouseButton::PRIMARY,
+            window_id: CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(),
+            time: 0.1,
+        });
+        self.forward_to_hosted(cx, &down);
+        self.forward_to_hosted(cx, &up);
+    }
+
+    /// Whether the focused panel's content is a retained widget tree —
+    /// keys and text then belong to it, not to the char-grid machinery.
+    fn hosted_focus(&self) -> bool {
+        self.state
+            .as_deref()
+            .and_then(|s| s.ws.focus.and_then(|f| s.ws.panels.get(&f)))
+            .is_some_and(|p| hosted_tpl(&p.kind).is_some())
+    }
+
+    /// Forwards an event to every live content widget with its panel's
+    /// props on the scope. Widgets gate themselves (areas, key focus).
+    fn forward_to_hosted(&mut self, cx: &mut Cx, event: &Event) {
+        if self.hosted.is_empty() {
+            return;
+        }
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        for (pid, w) in &self.hosted {
+            let props = crate::panels::PanelProps {
+                store: state.store.clone(),
+                pid: *pid,
+            };
+            let mut scope = Scope::with_props(&props);
+            w.handle_event(cx, event, &mut scope);
+        }
+    }
+}
+
 impl Widget for Stage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        // Retained content (CR-002): hosted widgets see every event through
+        // their own system. Key/text events are forwarded by the inner
+        // handlers instead (so the e2e paths share the exact route);
+        // everything else — pointers, actions, frames — passes through here.
+        if !matches!(
+            event,
+            Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
+        ) {
+            self.forward_to_hosted(cx, event);
+        }
+        if let Event::Actions(actions) = event {
+            self.handle_panel_actions(cx, actions);
+        }
         if matches!(event, Event::Startup) {
             if self.state.is_none() {
                 let path = db_path(cx);
@@ -4648,6 +4790,75 @@ impl Stage {
         });
     }
 
+    /// Draws a panel's retained content widget inside the body rect and
+    /// registers its interactive children as e2e-addressable hits.
+    fn draw_hosted(&mut self, cx: &mut Cx2d, state: &State, pid: PanelId, tpl: LiveId, body: Rect) {
+        let Some(w) = self.hosted_widget(cx, pid, tpl) else {
+            return;
+        };
+        let props = crate::panels::PanelProps {
+            store: state.store.clone(),
+            pid,
+        };
+        let mut scope = Scope::with_props(&props);
+        cx.begin_turtle(
+            Walk::abs_rect(body),
+            Layout {
+                clip_x: true,
+                clip_y: true,
+                ..Default::default()
+            },
+        );
+        w.draw_all(cx, &mut scope);
+        cx.end_turtle();
+
+        // The e2e bridge: known interactive children become labelled hits;
+        // a click on one synthesizes real pointer events at its centre.
+        let mut reg: Vec<(String, Rect, Act)> = Vec::new();
+        for (label, path) in [
+            ("address", ids!(email_input)),
+            ("password", ids!(pass_input)),
+            ("imap", ids!(imap_input)),
+            ("smtp", ids!(smtp_input)),
+        ] {
+            let r = w.widget(cx, path).area().rect(cx);
+            if r.size.x > 0.0 {
+                reg.push((label.to_string(), r, Act::Pointer(pid)));
+            }
+        }
+        let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
+        if add_r.size.x > 0.0 {
+            reg.push((
+                "add account".to_string(),
+                add_r,
+                Act::WidgetOp(pid, WidgetOp::AddAccount),
+            ));
+        }
+        let accounts = mail::accounts(&state.store);
+        if let Some(list) = w.widget(cx, ids!(accounts_list)).as_portal_list().borrow() {
+            for (idx, item) in list.items().iter() {
+                let r = item.widget.button(cx, ids!(remove_btn)).area().rect(cx);
+                if r.size.x > 0.0 {
+                    if let Some(a) = accounts.get(*idx) {
+                        reg.push((
+                            "remove".to_string(),
+                            r,
+                            Act::WidgetOp(pid, WidgetOp::RemoveAccount(a.id)),
+                        ));
+                    }
+                }
+            }
+        }
+        for (label, r, act) in reg {
+            self.hits.push(HitR {
+                rect: r,
+                act,
+                cursor: MouseCursor::Hand,
+                label,
+            });
+        }
+    }
+
     fn draw_panel_full(&mut self, cx: &mut Cx2d, state: &mut State, pid: PanelId, r: Rect, alpha: f64) {
         // Cross-workspace lookup: inactive spaces draw during the slide.
         let Some(panel) = state.ws.panel(pid) else {
@@ -4700,6 +4911,13 @@ impl Stage {
             (r.size.y - theme::HEAD_H - 1.0).max(0.0),
         );
         if body.size.y < 4.0 {
+            return;
+        }
+        // Retained content (CR-002): kinds with a widget template draw a
+        // widget tree instead of the char grid. Chrome above still fades;
+        // the content pops — the pilot's accepted trade.
+        if let Some(tpl) = hosted_tpl(&kind) {
+            self.draw_hosted(cx, state, pid, tpl, body);
             return;
         }
         let pad = theme::PAD_X;
@@ -5092,6 +5310,7 @@ impl MatchEvent for App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         makepad_widgets::script_mod(vm);
+        crate::panels::script_mod(vm);
         self::script_mod(vm)
     }
 
