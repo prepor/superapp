@@ -10,6 +10,8 @@
 //! | [`effect`] | the boundary: what leaves the process, and the job queue | no |
 //! | [`history`] | the in-memory tree of actions and their claims | no |
 //! | [`html`] | narrowing a mail's HTML to what a panel can draw | no |
+//! | [`filter`] | the rich table's filter grammar and completion context | no |
+//! | [`richtable`] | the rich table: datasources, the SQL builder, paging | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
@@ -26,6 +28,7 @@ pub mod app;
 pub mod core;
 pub mod e2e;
 pub mod effect;
+pub mod filter;
 pub mod history;
 pub mod html;
 pub mod launcher;
@@ -33,6 +36,7 @@ pub mod launcher;
 pub mod mac;
 pub mod mail;
 pub mod panels;
+pub mod richtable;
 pub mod secret;
 pub mod send;
 pub mod spring;

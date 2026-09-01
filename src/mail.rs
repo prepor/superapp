@@ -3,8 +3,9 @@
 //!
 //! Everything panels show comes through the registered [`Q`] queries — that
 //! is the reactive contract (see [`crate::store`]) and, later, the panel
-//! context an agent receives. Filtering keeps the shell's semantics: the
-//! typed filter is one lowercase substring over sender + subject; the
+//! context an agent receives. The inbox is a rich table over [`INBOX`]: its
+//! filter is the shared grammar ([`crate::filter`]), whose bare text is one
+//! substring over sender + subject — the shell's original semantics; the
 //! launcher's word-AND lives in [`crate::launcher`].
 
 use std::rc::Rc;
@@ -14,11 +15,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{Kind, MailId};
 use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
+use crate::filter::Op;
 use crate::history::Intent;
+use crate::richtable::{
+    Dir, SqlSource, SqlSpec, Suggestion, Table, TagDef, TagSql, TagType, Values,
+};
 use crate::store::{Q, Store, Val};
 
 /// One list row: what the inbox and the launcher show.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MailHead {
     pub id: MailId,
     pub from_name: String,
@@ -137,20 +142,122 @@ pub fn inbox(store: &Store) -> Rc<Vec<MailHead>> {
     store.rows(&Q_INBOX, &[], head_row)
 }
 
-/// The inbox under the typed filter: one lowercase substring over
-/// sender name + address + subject (the shell's historical semantics).
+/// The inbox as a rich table (CR-006): the fixed parts of its query, which
+/// the builder completes with the filter, the page and the rank. Same
+/// columns and order as [`inbox`]; the account join is for `@account:`.
+static INBOX_SPEC: SqlSpec = SqlSpec {
+    id: "inbox table",
+    describe: "the inbox under the panel's filter, newest first, one page at a time",
+    select: "m.id, m.from_name, m.from_email, m.subject, m.date, m.unread",
+    from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
+    base: "f.role = 'inbox'",
+    text: &["m.from_name", "m.from_email", "m.subject"],
+    tags: &[
+        ("unread", TagSql::Where("m.unread = 1")),
+        ("html", TagSql::Where("m.html IS NOT NULL")),
+        ("from", TagSql::Col("(m.from_name || ' ' || m.from_email)")),
+        ("subject", TagSql::Col("m.subject")),
+        ("date", TagSql::Col("m.date")),
+        ("account", TagSql::Col("a.email")),
+    ],
+    order: &[("m.date", Dir::Desc), ("m.id", Dir::Desc)],
+};
+
+const DATE_OPS: &[Op] = &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte];
+
+/// The inbox filter's tags: what `@` offers.
+static INBOX_TAGS: &[TagDef] = &[
+    TagDef {
+        name: "unread",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "not read yet",
+        values: Values::None,
+    },
+    TagDef {
+        name: "html",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "sent with an html body",
+        values: Values::None,
+    },
+    TagDef {
+        name: "from",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "sender name or address",
+        values: Values::Dynamic,
+    },
+    TagDef {
+        name: "subject",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "words of the subject",
+        values: Values::None,
+    },
+    TagDef {
+        name: "date",
+        kind: TagType::Date,
+        ops: DATE_OPS,
+        describe: "a day, 30.08.2026",
+        values: Values::None,
+    },
+    TagDef {
+        name: "account",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "the receiving address",
+        values: Values::Dynamic,
+    },
+];
+
+/// Values for the inbox's dynamic tags, under what has been typed: senders
+/// (most recently heard from first, by name or address) and accounts. Each
+/// is one cached query; the match is a substring, so `kov` finds Vera.
+fn suggest_inbox(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
+    match tag {
+        "from" => senders(store)
+            .iter()
+            .filter(|s| {
+                s.name.to_lowercase().contains(typed) || s.email.to_lowercase().contains(typed)
+            })
+            .map(|s| {
+                if s.name.is_empty() {
+                    Suggestion::value(s.email.clone())
+                } else {
+                    Suggestion::labeled(s.name.clone(), s.email.clone())
+                }
+            })
+            .collect(),
+        "account" => accounts(store)
+            .iter()
+            .filter(|a| a.email.to_lowercase().contains(typed))
+            .map(|a| Suggestion::value(a.email.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The inbox's datasource: what the inbox panel's rich table runs on.
+pub static INBOX: SqlSource<MailHead> = SqlSource {
+    spec: &INBOX_SPEC,
+    tags: INBOX_TAGS,
+    map: head_row,
+    key: |m| vec![Val::F(m.date), Val::I(m.id)],
+    suggest: suggest_inbox,
+};
+
+/// Rows per page of the inbox table — what one scroll's worth of draws
+/// fetches; the count is separate, so this is a batch size, not a limit.
+pub const INBOX_PAGE: usize = 50;
+
+/// The whole inbox under a filter, materialized — for tests and the odd
+/// one-shot read; panels page through [`INBOX`] instead.
 pub fn inbox_filtered(store: &Store, filter: &str) -> Vec<MailHead> {
-    let q = filter.trim().to_lowercase();
-    inbox(store)
-        .iter()
-        .filter(|m| {
-            q.is_empty()
-                || format!("{} {} {}", m.from_name, m.from_email, m.subject)
-                    .to_lowercase()
-                    .contains(&q)
-        })
-        .cloned()
-        .collect()
+    let mut t = Table::new(&INBOX, INBOX_PAGE);
+    t.set_filter(filter);
+    let n = t.len(store);
+    t.rows(store, 0, n)
 }
 
 /// Every mail, archived included (the launcher's corpus).
@@ -1357,7 +1464,8 @@ mod tests {
         assert_eq!(mail(&s, 1).expect("vera").html, None);
     }
 
-    /// Filter semantics are the shell's: one substring, sender + subject.
+    /// Bare text keeps the shell's original semantics — one substring,
+    /// sender + subject — and the tags reach the same rows.
     #[test]
     fn filter_and_neighbours_match_the_old_semantics() {
         let s = store();
@@ -1365,6 +1473,30 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
         assert!(inbox_filtered(&s, "GITHUB").len() > 10, "case-insensitive");
+        assert_eq!(inbox_filtered(&s, "@unread").len(), 2);
+        assert_eq!(inbox_filtered(&s, "@not:unread").len(), 67);
+        assert_eq!(inbox_filtered(&s, "@from:vera@kovac.io")[0].id, 1);
+        assert_eq!(inbox_filtered(&s, "@html")[0].id, 2);
+        assert_eq!(inbox_filtered(&s, "@date>=31.08.2026").len(), 2);
+        assert_eq!(inbox_filtered(&s, "@date:30.08.2026").len(), 3);
+        assert_eq!(inbox_filtered(&s, "(@unread @or hike) @not:html").len(), 2);
+        assert!(inbox_filtered(&s, "@account:me@prepor.dev").len() == 69);
+        // The table pages: the whole inbox is more than one page, and the
+        // rank query finds any row without a walk.
+        let mut t = Table::new(&INBOX, INBOX_PAGE);
+        assert_eq!(t.len(&s), 69);
+        let last = t.row(&s, 68).expect("the oldest");
+        assert_eq!(t.index_of(&s, &last), Some(68));
+        t.set_filter("digest");
+        assert_eq!(t.len(&s), 61);
+        assert_eq!(t.index_of(&s, &last), Some(60));
+        let (sug_from, sug_acct) = (
+            (INBOX.suggest)(&s, "from", "kov"),
+            (INBOX.suggest)(&s, "account", ""),
+        );
+        assert_eq!(sug_from[0].label, "Vera Kovac");
+        assert_eq!(sug_from[0].value, "vera@kovac.io");
+        assert_eq!(sug_acct[0].value, "me@prepor.dev");
         let (newer, older) = neighbours(&s, 2);
         assert_eq!(newer, Some(1));
         assert_eq!(older, Some(3));

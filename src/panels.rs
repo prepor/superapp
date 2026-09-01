@@ -7,10 +7,15 @@
 //! as [`PanelAction`]s (global actions the shell catches and turns into
 //! store actions — so undo semantics never enter this module).
 
+use std::collections::HashMap;
+
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
+use makepad_widgets::text::selection::Cursor;
 use makepad_widgets::*;
 
+use crate::filter;
 use crate::mail;
+use crate::richtable::{self, SqlSource, Suggestion, Table};
 use crate::store::Store;
 use crate::ui;
 
@@ -782,7 +787,74 @@ script_mod! {
         }
     }
 
-    /** The inbox: the filter over the header over the virtualized list. */
+    /** One autocomplete row: the pick, then what it means, muted. Twin
+        lines again (see `InboxRow`): the highlighted one is inverted, and
+        a quad's colour is not a runtime value. */
+    mod.widgets.SuggestLine = View {
+        width: Fill, height: Fit
+        align: Align{y: 0.5}
+        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
+        lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
+        View { width: 10, height: 1 }
+        desc := mod.widgets.SLabel {
+            padding: 0
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { color: #909090 }
+        }
+    }
+
+    mod.widgets.SuggestRow = View {
+        width: Fill, height: Fit
+        flow: Down
+        line := mod.widgets.SuggestLine {}
+        line_sel := mod.widgets.SuggestLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** The filter's autocomplete (CR-006): a bordered box hung under the
+        field, over the rows, offering `@tag` names and then a tag's values.
+        Eight fixed slots, shown as needed — the offer is capped there. */
+    // Drawn after everything else in the panel, at an absolute position,
+    // so it must land in a draw call *after* the rows it covers. The
+    // background's own pixel fn (a hairline ink border, the design's) makes
+    // it a shader no earlier call shares — the same ordering trap the
+    // selection wash documents, answered the same way.
+    mod.widgets.SuggestBox = View {
+        width: Fill, height: Fit
+        flow: Down
+        show_bg: true
+        padding: Inset{left: 1, right: 1, top: 1, bottom: 1}
+        draw_bg +: {
+            color: #ffffff
+            pixel: fn() {
+                let px = 1.0 / self.rect_size.x
+                let py = 1.0 / self.rect_size.y
+                if self.pos.x < px || self.pos.x > 1.0 - px || self.pos.y < py || self.pos.y > 1.0 - py {
+                    return vec4(0.078, 0.078, 0.078, 1.0)
+                }
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        s0 := mod.widgets.SuggestRow {}
+        s1 := mod.widgets.SuggestRow {}
+        s2 := mod.widgets.SuggestRow {}
+        s3 := mod.widgets.SuggestRow {}
+        s4 := mod.widgets.SuggestRow {}
+        s5 := mod.widgets.SuggestRow {}
+        s6 := mod.widgets.SuggestRow {}
+        s7 := mod.widgets.SuggestRow {}
+    }
+
+    /** The inbox: the filter over the header over the virtualized list —
+        a rich table (CR-006) over `mail::INBOX`. */
     mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -795,10 +867,17 @@ script_mod! {
 
         filter_input := mod.widgets.SField {
             width: Fill
-            empty_text: "filter…  ( / )"
+            empty_text: "filter…  ( / )   @ for tags"
             return_key_type: ReturnKeyType.Search
             autocapitalize: AutoCapitalize.None
             autocorrect: AutoCorrect.Disabled
+        }
+        // What the filter could not read, in the one colour errors get.
+        err_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            margin: Inset{left: 8, top: 4}
+            text: "", draw_text +: { color: #a01500 }
         }
         View { width: Fill, height: 6 }
         // Header cells for the columns only — the subject rides each row's
@@ -820,8 +899,14 @@ script_mod! {
         list := PortalList {
             width: Fill, height: Fill
             flow: Down
+            // A row that scrolls out is kept for the next one that scrolls
+            // in, rather than built again: a long list scrolls without
+            // minting widgets.
+            reuse_items: true
             row := mod.widgets.InboxRow {}
         }
+        // The autocomplete, drawn last and over the rows (see `SuggestBox`).
+        suggest: mod.widgets.SuggestBox {}
     }
 
     // ---- the read panels ---------------------------------------------------
@@ -1759,34 +1844,113 @@ impl InboxRowRef {
 // InboxPanel
 // ---------------------------------------------------------------------------
 
+/// The filter's autocomplete: what it offers under the caret and where
+/// the highlight is. Re-derived from the caret every draw; the one thing
+/// it remembers is a dismissal, which holds until the caret moves on.
+#[derive(Default)]
+struct Suggest {
+    ctx: Option<filter::Context>,
+    items: Vec<Suggestion>,
+    sel: usize,
+    dismissed: Option<filter::Context>,
+}
+
+impl Suggest {
+    fn open(&self) -> bool {
+        self.ctx.is_some() && self.dismissed != self.ctx && !self.items.is_empty()
+    }
+}
+
+/// The inbox's table: the shared engine over the mail datasource.
+type InboxTable = Table<&'static SqlSource<mail::MailHead>>;
+
+/// The eight suggestion slots, by name.
+const SUGGEST_SLOTS: [LiveId; richtable::MAX_SUGGESTIONS] = [
+    live_id!(s0),
+    live_id!(s1),
+    live_id!(s2),
+    live_id!(s3),
+    live_id!(s4),
+    live_id!(s5),
+    live_id!(s6),
+    live_id!(s7),
+];
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct InboxPanel {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    /// The autocomplete box, drawn over the rows after everything else.
+    #[live]
+    suggest: View,
+    /// The rich table (CR-006): the filter and the paging window. It holds
+    /// no rows — every row a draw needs is a page lookup in the store.
+    #[rust(Table::new(&mail::INBOX, mail::INBOX_PAGE))]
+    table: InboxTable,
     /// The cursor: which mail, and the row it sat on. The index is the
     /// fallback — a mail archived out from under the cursor is no longer in
-    /// `rows`, and without it the walk would resolve to nothing and snap back
-    /// to the top of the inbox instead of carrying on where it stood.
+    /// the table, and without it the walk would resolve to nothing and snap
+    /// back to the top of the inbox instead of carrying on where it stood.
     #[rust]
     sel: Option<(i64, usize)>,
+    /// What each live row was last populated with, by index: a draw
+    /// repopulates only the rows whose mail or selection changed, so
+    /// scrolling a long list costs its new rows and nothing else.
+    #[rust]
+    stamps: HashMap<usize, (mail::MailHead, bool)>,
+    #[rust]
+    ac: Suggest,
 }
 
 impl InboxPanel {
-    fn rows(&self, cx: &mut Cx, scope: &Scope) -> Vec<mail::MailHead> {
-        let filter = self.view.text_input(cx, ids!(filter_input)).text();
-        scope
-            .props
-            .get::<PanelProps>()
-            .map(|p| mail::inbox_filtered(&p.store, &filter))
-            .unwrap_or_default()
+    fn store(scope: &Scope) -> Option<std::rc::Rc<Store>> {
+        scope.props.get::<PanelProps>().map(|p| p.store.clone())
     }
 
-    /// Puts the cursor on `i` and previews what it lands on — every cursor
-    /// move goes through here, so walking and previewing can never disagree.
-    fn set_sel(&mut self, cx: &mut Cx, pid: u64, rows: &[mail::MailHead], i: usize) {
-        let Some(m) = rows.get(i) else { return };
+    /// Hands the field's text to the table. The field is the one source of
+    /// the filter — a pick, the shell's seed of a baked param and typing
+    /// all land there — so the table follows it rather than the events.
+    fn sync_filter(&mut self, cx: &mut Cx) {
+        let text = self.view.text_input(cx, ids!(filter_input)).text();
+        if self.table.set_filter(&text) {
+            self.sel = None;
+        }
+    }
+
+    /// Where the cursor stands now: the remembered row if it still holds
+    /// the mail, else the mail's rank (a sync landed above it), else the
+    /// row clamped into the table (the mail left; carry on from there).
+    fn cursor_index(&self, store: &Store) -> Option<usize> {
+        let (id, idx) = self.sel?;
+        if self.table.row(store, idx).is_some_and(|m| m.id == id) {
+            return Some(idx);
+        }
+        if let Some(i) = self.index_of_id(store, id) {
+            return Some(i);
+        }
+        let n = self.table.len(store);
+        (n > 0).then(|| idx.min(n - 1))
+    }
+
+    /// A mail's row: a live row first (it is usually on screen), else its
+    /// rank in the table.
+    fn index_of_id(&self, store: &Store, id: i64) -> Option<usize> {
+        if let Some((i, _)) = self.stamps.iter().find(|(_, (m, _))| m.id == id) {
+            if self.table.row(store, *i).is_some_and(|m| m.id == id) {
+                return Some(*i);
+            }
+        }
+        let head = mail::mail(store, id)?.head;
+        self.table.index_of(store, &head)
+    }
+
+    /// Puts the cursor on row `i` and previews what it lands on — every
+    /// cursor move goes through here, so walking and previewing can never
+    /// disagree.
+    fn set_sel(&mut self, cx: &mut Cx, pid: u64, store: &Store, i: usize) {
+        let Some(m) = self.table.row(store, i) else { return };
         self.sel = Some((m.id, i));
         // Keep the cursor on screen: a row without a live item is off-view.
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
@@ -1800,23 +1964,121 @@ impl InboxPanel {
         self.redraw(cx);
     }
 
-    fn move_sel(&mut self, cx: &mut Cx, scope: &Scope, pid: u64, d: isize) {
-        let rows = self.rows(cx, scope);
-        if rows.is_empty() {
+    fn move_sel(&mut self, cx: &mut Cx, store: &Store, pid: u64, d: isize) {
+        let n = self.table.len(store);
+        if n == 0 {
             return;
         }
-        // Resolve by id, fall back to the remembered row: the mail the cursor
-        // was on may have just been archived away.
-        let at = self.sel.and_then(|(s, i)| {
-            rows.iter()
-                .position(|m| m.id == s)
-                .or(Some(i.min(rows.len() - 1)))
-        });
-        let i = match at {
-            Some(i) => (i as isize + d).clamp(0, rows.len() as isize - 1) as usize,
+        let i = match self.cursor_index(store) {
+            Some(i) => (i as isize + d).clamp(0, n as isize - 1) as usize,
             None => 0,
         };
-        self.set_sel(cx, pid, &rows, i);
+        self.set_sel(cx, pid, store, i);
+    }
+
+    /// Commits suggestion `i`: splices it over what the caret was typing,
+    /// parks the caret after it and keeps the field's focus, so a picked
+    /// `@from:` opens its values without another keystroke.
+    fn pick(&mut self, cx: &mut Cx, i: usize) {
+        let (Some(ctx), Some(item)) = (self.ac.ctx.clone(), self.ac.items.get(i).cloned()) else {
+            return;
+        };
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let text = filter.text();
+        let cursor = filter.cursor().index;
+        let (line, at) = match &ctx {
+            filter::Context::Tag { start, .. } => {
+                let takes_value = self.table.tag(&item.value).is_some_and(|t| t.takes_value());
+                filter::insert_tag(&text, cursor, *start, &item.value, takes_value)
+            }
+            filter::Context::Value { start, .. } => {
+                filter::insert_value(&text, cursor, *start, &item.value)
+            }
+        };
+        filter.set_text(cx, &line);
+        filter.set_cursor(
+            cx,
+            Cursor {
+                index: at,
+                prefer_next_row: false,
+            },
+            false,
+        );
+        filter.set_key_focus(cx);
+        self.ac.dismissed = None;
+        self.redraw(cx);
+    }
+
+    /// Re-derives the offer from the caret, fills the slots and draws the
+    /// box under the field — after the rest of the panel, so it covers the
+    /// rows rather than pushing them.
+    fn draw_suggest(&mut self, cx: &mut Cx2d, scope: &mut Scope, store: &Store, focused: bool) {
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let ctx = if focused {
+            filter::context(&filter.text(), filter.cursor().index)
+        } else {
+            None
+        };
+        if ctx != self.ac.ctx {
+            self.ac.items = ctx
+                .as_ref()
+                .map(|c| self.table.suggestions(store, c))
+                .unwrap_or_default();
+            self.ac.ctx = ctx;
+            self.ac.sel = 0;
+            if self.ac.dismissed != self.ac.ctx {
+                self.ac.dismissed = None;
+            }
+        }
+        let open = self.ac.open();
+        self.suggest.set_visible(cx, open);
+        if !open {
+            return;
+        }
+        let (ink, bg, dim, dim_inv) = (
+            vec4(0.078, 0.078, 0.078, 1.0),
+            vec4(1.0, 1.0, 1.0, 1.0),
+            vec4(0.565, 0.565, 0.565, 1.0),
+            vec4(0.75, 0.75, 0.75, 1.0),
+        );
+        for (i, slot) in SUGGEST_SLOTS.iter().enumerate() {
+            let row = self.suggest.view(cx, &[*slot]);
+            let Some(it) = self.ac.items.get(i) else {
+                row.set_visible(cx, false);
+                continue;
+            };
+            row.set_visible(cx, true);
+            let selected = i == self.ac.sel;
+            for (line, on, fg, fg_dim) in [
+                (live_id!(line), !selected, ink, dim),
+                (live_id!(line_sel), selected, bg, dim_inv),
+            ] {
+                self.suggest.view(cx, &[*slot, line]).set_visible(cx, on);
+                if !on {
+                    continue;
+                }
+                let lbl = self.suggest.label(cx, &[*slot, line, live_id!(lbl)]);
+                lbl.set_text(cx, &it.label);
+                lbl.set_text_color(cx, fg);
+                let desc = self.suggest.label(cx, &[*slot, line, live_id!(desc)]);
+                desc.set_text(cx, &it.describe);
+                desc.set_visible(cx, !it.describe.is_empty());
+                desc.set_text_color(cx, fg_dim);
+            }
+        }
+        let fr = filter.area().rect(cx);
+        if fr.size.x <= 0.0 {
+            return;
+        }
+        self.suggest.draw_walk_all(
+            cx,
+            scope,
+            Walk {
+                abs_pos: Some(dvec2(fr.pos.x, fr.pos.y + fr.size.y + 2.0)),
+                width: Size::Fixed(fr.size.x),
+                ..Walk::fit()
+            },
+        );
     }
 }
 
@@ -1834,14 +2096,84 @@ impl InboxPanelRef {
         self.borrow()
             .is_some_and(|p| p.view.text_input(cx, ids!(filter_input)).key_focus(cx))
     }
+
+    /// Row `i` of the table as this panel has it — its own filter included.
+    pub fn row_at(&self, store: &Store, i: usize) -> Option<mail::MailHead> {
+        self.borrow().and_then(|p| p.table.row(store, i))
+    }
+
+    /// The mail a cursor standing on `id` should land on once it is filed
+    /// away: the next row down, or the one above if it was the last.
+    pub fn neighbour_of(&self, store: &Store, id: i64) -> Option<i64> {
+        let p = self.borrow()?;
+        let i = p.index_of_id(store, id)?;
+        p.table
+            .row(store, i + 1)
+            .or_else(|| i.checked_sub(1).and_then(|j| p.table.row(store, j)))
+            .map(|m| m.id)
+    }
+
+    /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
+    /// table — a click on one is [`InboxPanelRef::pick`].
+    pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        if !p.ac.open() {
+            return Vec::new();
+        }
+        p.ac
+            .items
+            .iter()
+            .zip(SUGGEST_SLOTS.iter())
+            .map(|(it, slot)| (it.label.clone(), p.suggest.view(cx, &[*slot]).area().rect(cx)))
+            .filter(|(_, r)| r.size.x > 0.0)
+            .collect()
+    }
+
+    /// Commits the `i`-th suggestion on offer.
+    pub fn pick(&self, cx: &mut Cx, i: usize) {
+        if let Some(mut p) = self.borrow_mut() {
+            p.pick(cx, i);
+        }
+    }
 }
 
 impl Widget for InboxPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
         let filter = self.view.text_input(cx, ids!(filter_input));
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+
+        // The autocomplete owns these keys while it is open: the arrows
+        // walk the offer, enter and tab take it, esc puts it away. The
+        // field never sees them — a swallowed enter is the point.
+        if let Event::KeyDown(k) = event {
+            if filter_focused && self.ac.open() {
+                match k.key_code {
+                    KeyCode::ArrowDown => {
+                        self.ac.sel = (self.ac.sel + 1).min(self.ac.items.len() - 1);
+                        self.redraw(cx);
+                        return;
+                    }
+                    KeyCode::ArrowUp => {
+                        self.ac.sel = self.ac.sel.saturating_sub(1);
+                        self.redraw(cx);
+                        return;
+                    }
+                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab => {
+                        self.pick(cx, self.ac.sel);
+                        return;
+                    }
+                    KeyCode::Escape => {
+                        self.ac.dismissed = self.ac.ctx.clone();
+                        self.redraw(cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        let Some(store) = Self::store(scope) else { return };
 
         // `/` focuses the filter — the one plain letter the grammar keeps
         // (CR-003 retired the vim walk; the arrows already mirrored it).
@@ -1855,12 +2187,11 @@ impl Widget for InboxPanel {
             if !filter_focused {
                 match k.key_code {
                     KeyCode::ReturnKey => {
-                        let rows = self.rows(cx, scope);
                         let target = self
-                            .sel
-                            .map(|(s, _)| s)
-                            .filter(|s| rows.iter().any(|m| m.id == *s))
-                            .or_else(|| rows.first().map(|m| m.id));
+                            .cursor_index(&store)
+                            .or(Some(0))
+                            .and_then(|i| self.table.row(&store, i))
+                            .map(|m| m.id);
                         if let Some(id) = target {
                             // Enter *goes*: unlike the walk's preview, it
                             // hands focus to the mail (the solid-link rule).
@@ -1874,8 +2205,8 @@ impl Widget for InboxPanel {
                     // The row walk, with scroll-follow (CR-003: the arrows
                     // are the whole walk now, j/k having gone). Each step
                     // previews what it lands on and keeps the keyboard.
-                    KeyCode::ArrowDown => self.move_sel(cx, scope, pid, 1),
-                    KeyCode::ArrowUp => self.move_sel(cx, scope, pid, -1),
+                    KeyCode::ArrowDown => self.move_sel(cx, &store, pid, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, &store, pid, -1),
                     // The inbox's one-stop tab ring: the filter.
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
@@ -1890,13 +2221,21 @@ impl Widget for InboxPanel {
             if filter.returned(actions).is_some() || filter.escaped(actions) {
                 cx.set_key_focus(Area::Empty);
                 if filter.returned(actions).is_some() {
-                    let rows = self.rows(cx, scope);
-                    self.set_sel(cx, pid, &rows, 0);
+                    self.sync_filter(cx);
+                    self.set_sel(cx, pid, &store, 0);
                 }
                 self.redraw(cx);
             }
             if filter.changed(actions).is_some() {
                 self.sel = None;
+                self.redraw(cx);
+            }
+            // The end of the list came on screen: a source without a count
+            // loads its next page here (the inbox counts, so this is its
+            // no-op — the seam is what a remote table will use).
+            if self.view.widget(cx, ids!(list)).as_portal_list().reached_end(actions)
+                && self.table.extend(&store)
+            {
                 self.redraw(cx);
             }
             for a in actions {
@@ -1906,13 +2245,9 @@ impl Widget for InboxPanel {
                     if *p == pid {
                         // The shell moved the cursor for us (a mail opened by
                         // click, or the walk carried past one just filed
-                        // away). Take the row from the live list so the index
+                        // away). Take the row from the table so the index
                         // fallback stays honest.
-                        let i = self
-                            .rows(cx, scope)
-                            .iter()
-                            .position(|m| m.id == *id)
-                            .unwrap_or(0);
+                        let i = self.index_of_id(&store, *id).unwrap_or(0);
                         self.sel = Some((*id, i));
                         self.redraw(cx);
                     }
@@ -1922,24 +2257,48 @@ impl Widget for InboxPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rows = self.rows(cx, scope);
+        let Some(store) = Self::store(scope) else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        self.sync_filter(cx);
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let focused = filter.key_focus(cx);
+        // What the filter could not read — minus the tag still being typed,
+        // which is not wrong yet.
+        let err = if focused {
+            self.table.errors_while_typing().first().map(|e| e.message.clone())
+        } else {
+            self.table.errors().first().map(|e| e.message.clone())
+        };
+        let err_lbl = self.view.label(cx, ids!(err_lbl));
+        err_lbl.set_text(cx, err.as_deref().unwrap_or(""));
+        err_lbl.set_visible(cx, err.is_some());
+
         let sel = self.sel.map(|(id, _)| id);
+        let n = self.table.len(&store);
+        let mut live: Vec<usize> = Vec::new();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
-                list.set_item_range(cx, 0, rows.len());
+                list.set_item_range(cx, 0, n);
                 while let Some(idx) = list.next_visible_item(cx) {
-                    if let Some(m) = rows.get(idx) {
-                        let row = list.item(cx, idx, live_id!(row));
-                        row.as_inbox_row().populate(cx, m, sel == Some(m.id));
-                        row.draw_all(cx, scope);
+                    let Some(m) = self.table.row(&store, idx) else { continue };
+                    let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
+                    let selected = sel == Some(m.id);
+                    let stamp = (m, selected);
+                    if !existed || self.stamps.get(&idx) != Some(&stamp) {
+                        row.as_inbox_row().populate(cx, &stamp.0, selected);
+                        self.stamps.insert(idx, stamp);
                     }
+                    live.push(idx);
+                    row.draw_all(cx, scope);
                 }
             }
         }
+        self.stamps.retain(|k, _| live.contains(k));
+        self.draw_suggest(cx, scope, &store, focused);
         DrawStep::done()
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // SLink

@@ -51,10 +51,12 @@ pub struct Q {
 /// A query parameter — small closed set, so cache keys are trivial.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
-    /// An integer (ids, timestamps).
+    /// An integer (ids).
     I(i64),
     /// Text.
     S(String),
+    /// A real (the store's timestamps, a `@date>` bound).
+    F(f64),
 }
 
 impl rusqlite::ToSql for Val {
@@ -62,6 +64,7 @@ impl rusqlite::ToSql for Val {
         Ok(match self {
             Val::I(i) => rusqlite::types::ToSqlOutput::from(*i),
             Val::S(s) => rusqlite::types::ToSqlOutput::from(s.as_str()),
+            Val::F(f) => rusqlite::types::ToSqlOutput::from(*f),
         })
     }
 }
@@ -80,10 +83,12 @@ pub struct Store {
     dirty: Arc<Mutex<HashSet<String>>>,
     /// Per-table commit generation — the invalidation clock.
     generations: RefCell<HashMap<String, u64>>,
-    /// Authorizer-captured read-set per SQL text.
-    deps: RefCell<HashMap<&'static str, Rc<Vec<String>>>>,
+    /// Authorizer-captured read-set per SQL text. Keyed by the text itself:
+    /// a rich table's queries are *built* from its filter (see
+    /// [`crate::richtable`]), so a query is not always a `static`.
+    deps: RefCell<HashMap<String, Rc<Vec<String>>>>,
     /// Result cache per `(sql, params)`.
-    cache: RefCell<HashMap<(&'static str, String), Cached>>,
+    cache: RefCell<HashMap<(String, String), Cached>>,
     redraw: Cell<bool>,
     /// Last seen `PRAGMA data_version` (foreign-commit detector).
     data_version: Cell<i64>,
@@ -98,7 +103,9 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
     pub id: &'static str,
-    pub sql: &'static str,
+    /// The SQL as it ran — for a built query, the text the builder
+    /// produced, filter and all.
+    pub sql: String,
     pub describe: &'static str,
     pub params: String,
     pub rows: usize,
@@ -461,8 +468,8 @@ impl Store {
 
     /// The tables a query reads, captured by the authorizer at first
     /// prepare. This is dependency tracking *and* provenance in one.
-    fn deps_for(&self, q: &'static Q) -> Rc<Vec<String>> {
-        if let Some(d) = self.deps.borrow().get(q.sql) {
+    fn deps_for(&self, id: &str, sql: &str) -> Rc<Vec<String>> {
+        if let Some(d) = self.deps.borrow().get(sql) {
             return d.clone();
         }
         let seen: Arc<Mutex<BTreeSet<String>>> = Arc::default();
@@ -473,16 +480,16 @@ impl Store {
             }
             Authorization::Allow
         }));
-        let prepared = self.conn.prepare_cached(q.sql);
+        let prepared = self.conn.prepare_cached(sql);
         let _ = self
             .conn
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         if let Err(e) = prepared {
-            eprintln!("store: preparing {} failed: {e}", q.id);
+            eprintln!("store: preparing {id} failed: {e}");
         }
         let tables: Vec<String> = seen.lock().expect("dep set").iter().cloned().collect();
         let rc = Rc::new(tables);
-        self.deps.borrow_mut().insert(q.sql, rc.clone());
+        self.deps.borrow_mut().insert(sql.to_string(), rc.clone());
         rc
     }
 
@@ -501,9 +508,26 @@ impl Store {
         params: &[Val],
         map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
     ) -> Rc<Vec<T>> {
+        self.rows_sql(q.id, q.describe, q.sql, params, map)
+    }
+
+    /// [`Store::rows`] for a query whose text is built at run time — a rich
+    /// table's page, count and rank queries, whose `WHERE` is the operator's
+    /// filter. Same cache, same dependency capture, same trace: the built
+    /// text is the cache key, so two panels on the same filter share one
+    /// result, and the context an agent receives shows the SQL that
+    /// actually ran.
+    pub fn rows_sql<T: 'static>(
+        &self,
+        id: &'static str,
+        describe: &'static str,
+        sql: &str,
+        params: &[Val],
+        map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Rc<Vec<T>> {
         let pkey = fmt_params(params);
-        let key = (q.sql, pkey.clone());
-        let deps = self.deps_for(q);
+        let key = (sql.to_string(), pkey.clone());
+        let deps = self.deps_for(id, sql);
         let cached: Option<Rc<Vec<T>>> = self.cache.borrow().get(&key).and_then(|c| {
             let fresh = c
                 .deps
@@ -518,12 +542,12 @@ impl Store {
         });
         let rows = cached.unwrap_or_else(|| {
             let run = || -> rusqlite::Result<Vec<T>> {
-                let mut stmt = self.conn.prepare_cached(q.sql)?;
+                let mut stmt = self.conn.prepare_cached(sql)?;
                 let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
                 iter.collect()
             };
             let rows = Rc::new(run().unwrap_or_else(|e| {
-                eprintln!("store: query {} failed: {e}", q.id);
+                eprintln!("store: query {id} failed: {e}");
                 Vec::new()
             }));
             let gens = deps.iter().map(|t| self.gen_of(t)).collect();
@@ -540,11 +564,11 @@ impl Store {
         if let Some(k) = self.active_trace.get() {
             let mut traces = self.traces.borrow_mut();
             if let Some(v) = traces.get_mut(&k) {
-                if !v.iter().any(|e| e.id == q.id && e.params == pkey) {
+                if !v.iter().any(|e| e.id == id && e.sql == sql && e.params == pkey) {
                     v.push(TraceEntry {
-                        id: q.id,
-                        sql: q.sql,
-                        describe: q.describe,
+                        id,
+                        sql: sql.to_string(),
+                        describe,
                         params: pkey,
                         rows: rows.len(),
                     });
@@ -757,6 +781,7 @@ fn fmt_params(params: &[Val]) -> String {
         .map(|v| match v {
             Val::I(i) => i.to_string(),
             Val::S(s) => format!("'{s}'"),
+            Val::F(f) => f.to_string(),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -816,7 +841,7 @@ mod tests {
     fn queries_cache_and_invalidate_by_table_generation() {
         let s = store();
         assert!(s.rows(&Q_META, &[], probe).is_empty());
-        assert_eq!(*s.deps_for(&Q_META), vec!["meta".to_string()]);
+        assert_eq!(*s.deps_for(Q_META.id, Q_META.sql), vec!["meta".to_string()]);
 
         s.write(|c| {
             c.execute("INSERT INTO meta(key, value) VALUES('probe', 7)", [])

@@ -9,6 +9,8 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/store.rs` | the one SQLite file + the reactive query layer | no |
 | `src/effect.rs` | the boundary: what leaves the process, and the job queue | no |
 | `src/history.rs` | the in-memory tree of actions and their claims | no |
+| `src/filter.rs` | the rich table's filter grammar and completion context | no |
+| `src/richtable.rs` | the rich table: datasources, the SQL builder, paging | no |
 | `src/mail.rs` | the mail domain: queries, titles, seed, effects, intents | no |
 | `src/html.rs` | narrowing a mail's HTML to what a panel can draw | no |
 | `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |

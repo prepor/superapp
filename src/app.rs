@@ -347,6 +347,8 @@ enum WidgetOp {
     AddAccount,
     RemoveAccount(i64),
     OpenMail(i64),
+    /// The `i`-th row of the inbox filter's autocomplete (CR-006).
+    Suggest(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -1663,6 +1665,54 @@ impl Stage {
                         }
                     }
                 }
+                e2e::Step::Mouse { label } => {
+                    // The physical path: the pair enters the stage's own
+                    // handler, so the forwarding to hosted widgets, the
+                    // hit lookup and the key-focus rule all run as they do
+                    // for a real click. `click` resolves the action
+                    // directly and proves less.
+                    let needle = label.to_lowercase();
+                    let r = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| h.label.eq_ignore_ascii_case(&label))
+                        .or_else(|| {
+                            self.hits
+                                .iter()
+                                .rev()
+                                .find(|h| h.label.to_lowercase().contains(&needle))
+                        })
+                        .map(|h| h.rect);
+                    match r {
+                        Some(r) => {
+                            eprintln!("e2e: mouse {label:?}");
+                            let p = r.pos + r.size / 2.0;
+                            let down = Event::MouseDown(MouseDownEvent {
+                                abs: p,
+                                button: MouseButton::PRIMARY,
+                                window_id: CxWindowPool::id_zero(),
+                                modifiers: KeyModifiers::default(),
+                                handled: std::cell::Cell::new(Area::Empty),
+                                time: 0.0,
+                            });
+                            let up = Event::MouseUp(MouseUpEvent {
+                                abs: p,
+                                button: MouseButton::PRIMARY,
+                                window_id: CxWindowPool::id_zero(),
+                                modifiers: KeyModifiers::default(),
+                                time: 0.1,
+                            });
+                            let mut scope = Scope::empty();
+                            <Self as Widget>::handle_event(self, cx, &down, &mut scope);
+                            <Self as Widget>::handle_event(self, cx, &up, &mut scope);
+                        }
+                        None => {
+                            eprintln!("e2e: FAIL mouse {label:?}: no matching element");
+                            runner.failures += 1;
+                        }
+                    }
+                }
                 e2e::Step::Swipe { label, dx, dy, hold } => {
                     let needle = label.to_lowercase();
                     let c = self
@@ -2432,6 +2482,13 @@ impl Stage {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
                     WidgetOp::OpenMail(id) => {
+                        // A click inside a panel focuses it, as anywhere
+                        // else. The preview below keeps *whoever* holds
+                        // focus — right for the walk, which must not snap
+                        // back — so the list has to take it here first.
+                        if state.ws.focus != Some(pid) {
+                            state.ws.focus = Some(pid);
+                        }
                         // The cursor follows what you clicked, so the wash
                         // marks the mail on screen and the arrows carry on
                         // from there (panel-internal: the inbox listens).
@@ -2445,6 +2502,14 @@ impl Stage {
                         } else {
                             self.resolve_click(cx, Act::Preview(pid, id), false);
                         }
+                    }
+                    WidgetOp::Suggest(i) => {
+                        // The pick splices into the field and keeps its
+                        // focus; the shell's share is a redraw.
+                        if let Some(w) = self.hosted.get(&pid) {
+                            w.as_inbox_panel().pick(cx, i);
+                        }
+                        self.kick(cx);
                     }
                 }
                 return;
@@ -2658,7 +2723,7 @@ impl Stage {
     /// same story every time.
     fn triage(&mut self, cx: &mut Cx, id: core::MailId, delete: bool) {
         // Decided first, while the row is still in the list to have one.
-        let next = self.successor_of(cx, id);
+        let next = self.successor_of(id);
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
@@ -2742,7 +2807,7 @@ impl Stage {
     /// away: the next row down, or the one above if it was the last. `None`
     /// when no inbox is pointing at this mail — a header button pressed on a
     /// message nobody is walking towards moves no cursor.
-    fn successor_of(&mut self, cx: &mut Cx, id: core::MailId) -> Option<(PanelId, core::MailId)> {
+    fn successor_of(&mut self, id: core::MailId) -> Option<(PanelId, core::MailId)> {
         let inboxes: Vec<PanelId> = self
             .state
             .as_deref()?
@@ -2758,16 +2823,13 @@ impl Stage {
                 .and_then(|w| w.as_inbox_panel().selected())
                 == Some(id)
         })?;
-        // The rows as that panel has them — its own filter included, exactly
-        // the way `draw_hosted` reads them back for hit registration.
+        // The rows as that panel has them — its own filter included: the
+        // panel's table answers, exactly as it does for hit registration.
         let w = self.hosted.get(&pid)?.clone();
-        let filter = w.widget(cx, ids!(filter_input)).as_text_input().text();
         let store = self.state.as_deref()?.store.clone();
-        let rows = mail::inbox_filtered(&store, &filter);
-        let i = rows.iter().position(|m| m.id == id)?;
-        rows.get(i + 1)
-            .or_else(|| i.checked_sub(1).and_then(|j| rows.get(j)))
-            .map(|m| (pid, m.id))
+        w.as_inbox_panel()
+            .neighbour_of(&store, id)
+            .map(|next| (pid, next))
     }
 
     // -- touch ---------------------------------------------------------------
@@ -4830,17 +4892,13 @@ impl Stage {
                 // anywhere on either line opens it. Splitting it (a select
                 // band beside an open band) made the from name and the date
                 // look dead — a row means its mail, whichever line you hit.
-                let filter = w
-                    .widget(cx, ids!(filter_input))
-                    .as_text_input()
-                    .text();
-                let rows = mail::inbox_filtered(&state.store, &filter);
+                let panel = w.as_inbox_panel();
                 let swiping = self.row_swipe.as_ref().filter(|rs| rs.pid == pid).map(|rs| rs.id);
                 if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
                     for (idx, item) in list.items().iter() {
                         let r = item.widget.area().rect(cx);
                         if r.size.x > 0.0 {
-                            if let Some(m) = rows.get(*idx) {
+                            if let Some(m) = panel.row_at(&state.store, *idx) {
                                 // A row with a curtain over it answers to
                                 // nothing: it is on its way out, and a tap
                                 // landing on it would open the mail being
@@ -4860,6 +4918,12 @@ impl Stage {
                             }
                         }
                     }
+                }
+                // The autocomplete's rows, registered after the mail rows
+                // they cover: `hit_at` searches back to front, so the box
+                // wins where they overlap.
+                for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
             }
             Some(Kind::Message { id }) => {

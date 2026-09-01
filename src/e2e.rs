@@ -13,6 +13,9 @@
 //! wait 600            — ms; let springs settle / a frame render
 //! shot inbox          — e2e/out/inbox.png
 //! click "reply"       — click the interactive element whose label matches
+//! mouse "filter"      — the same through the shell's real mouse path (a
+//!                       MouseDown/MouseUp pair into the stage), for what a
+//!                       resolved click cannot show: focus stealing, hits
 //! altclick "subject"  — the same, with alt held (fresh un-joined panel)
 //! drag "body" 200 0   — mouse press-drag-release from the element's left
 //!                       edge: selects text under the pointer
@@ -48,6 +51,13 @@ pub enum Step {
         label: String,
         /// Hold cmd: always a fresh, un-joined panel.
         fresh: bool,
+    },
+    /// A real mouse press-release at the labelled element's centre, through
+    /// the stage's own event handling rather than the resolved action —
+    /// the path a physical click takes, key-focus side effects included.
+    Mouse {
+        /// Label substring.
+        label: String,
     },
     /// A key chord: `cmd+shift+left`, `enter`, `j`, … with a repeat count
     /// (`key j 5`).
@@ -147,6 +157,7 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                 label: quoted()?,
                 fresh: true,
             },
+            "mouse" => Step::Mouse { label: quoted()? },
             "key" => {
                 let mut it = rest.split_whitespace();
                 let chord = it.next().ok_or_else(|| err("expected a key chord"))?;
