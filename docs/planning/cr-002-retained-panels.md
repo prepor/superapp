@@ -179,6 +179,26 @@ register two rects: the whole row selects, the subject band (later in the
 list, and hit_at searches back-to-front) opens — so the mouse keeps the
 open-vs-select split the widget's own hit test used to judge.
 
+And a sixth, the deepest: **everything was working invisibly.** Plain
+stock-shader quads inside PortalList items merge (per-shader draw-call
+merging) into a call that paints *under* the panel background — the
+selection wash and row rules never rendered, while text, buttons and
+fields (distinct shaders, own calls) drew fine. So selection moved,
+clicks selected, arrows walked — with no pixels to show it, which reads
+as "nothing works". The fix is a trivial custom `pixel: fn()` on such
+quads (distinct shader ⇒ own, correctly-ordered call); relatedly, a Fill
+walk inside `flow: Overlay` defers forever, so the wash is a twin line
+with its own bg, toggled like the bold pairs. The TextInput selection
+quad paints *over* its glyphs with a state mix that doesn't engage — one
+translucent ink for every selection state, plus collapse-on-blur, gives
+the frameworks' behaviour. Testing doctrine from the same episode:
+occluded windows skip presents, so background e2e screenshots are stale
+frames (byte-identical shots are the tell) — visual claims need
+`--front`; state claims stay store-level; and `e2e/cgpost.c` posts real
+HID events at a scratch instance for the platform seam that synthesis
+cannot reach (idle machine only — real events land wherever the front
+window is).
+
 Also in this pass, visual parity: the library draws at the theme's sizes
 (10.5/8.25 — it had hardcoded 8.0, which read as a different font entirely),
 subjects hold to one line (`max_lines: 1` + `Ellipsis`), unread bold is the
