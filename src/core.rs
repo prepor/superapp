@@ -442,11 +442,15 @@ impl Ws {
 
     /// Closes a panel; focus falls to its nearest surviving neighbour.
     pub fn close(&mut self, pid: PanelId) {
-        let Some((c, r)) = self.locate(pid) else {
-            return;
-        };
+        self.detach(pid);
+    }
+
+    /// Detaches a panel — layout, joins, focus fallback — and hands it back.
+    /// [`Ws::close`] is detach-and-drop; a workspace move re-homes the panel.
+    pub fn detach(&mut self, pid: PanelId) -> Option<Panel> {
+        let (c, r) = self.locate(pid)?;
         self.remove_from_layout(pid);
-        self.panels.remove(&pid);
+        let panel = self.panels.remove(&pid);
         self.joins.retain(|&a, &mut b| a != pid && b != pid);
         self.validate_joins();
         if self.focus == Some(pid) {
@@ -458,6 +462,7 @@ impl Ws {
                 self.focus = col.panels.get(r).copied();
             }
         }
+        panel
     }
 
     /// Keeps per-column invariants: `active` clamped, and following focus.
@@ -949,6 +954,124 @@ impl Ws {
     pub fn pan(&mut self, dx: f64) {
         self.camera_x += dx;
     }
+
+    /// Whether the workspace holds any panels.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+}
+
+/// How many numbered workspaces exist — cmd+1 … cmd+9.
+pub const WS_N: usize = 9;
+
+/// The workspaces, niri/hyprland-style: nine numbered spaces, each a full
+/// [`Ws`] (own columns, focus and camera — switching back restores both),
+/// one active at a time. An empty workspace is just an empty slot; it costs
+/// nothing and needs no creation step.
+///
+/// `Wm` derefs to the active workspace, so everything that mutates "the
+/// workspace" (open, close, focus, drops) applies where the user is looking.
+/// Panel ids are minted per workspace in disjoint ranges, which keeps them
+/// unique across the whole set — the shell keys springs and per-panel ui
+/// state by `PanelId` alone, even mid-move between workspaces.
+#[derive(Debug, Clone)]
+pub struct Wm {
+    /// The workspaces, index = number − 1. Fixed [`WS_N`] entries.
+    pub wss: Vec<Ws>,
+    /// Index of the active workspace.
+    pub active: usize,
+}
+
+impl Default for Wm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Wm {
+    /// Nine empty workspaces, the first one active.
+    #[must_use]
+    pub fn new() -> Self {
+        let wss = (0..WS_N)
+            .map(|k| {
+                let mut w = Ws::new();
+                w.next_id = (k as u64) << 32;
+                w
+            })
+            .collect();
+        Wm { wss, active: 0 }
+    }
+
+    /// Switches to workspace `k`. Returns whether anything changed.
+    pub fn switch(&mut self, k: usize) -> bool {
+        if k >= WS_N || k == self.active {
+            return false;
+        }
+        self.active = k;
+        true
+    }
+
+    /// Moves the focused panel to workspace `k` as its own trailing column
+    /// and follows it there (niri's default for move-to-workspace). The
+    /// panel leaves its joins behind; focus in the old workspace falls to a
+    /// neighbour, exactly as on close.
+    pub fn send_focused_to(&mut self, k: usize) -> Option<PanelId> {
+        if k >= WS_N || k == self.active {
+            return None;
+        }
+        let pid = self.wss[self.active].focus?;
+        let panel = self.wss[self.active].detach(pid)?;
+        let ws = &mut self.wss[k];
+        ws.panels.insert(pid, panel);
+        ws.columns.push(Column::of(pid));
+        ws.focus = Some(pid);
+        ws.normalize();
+        self.active = k;
+        Some(pid)
+    }
+
+    /// A panel by id, wherever it lives.
+    #[must_use]
+    pub fn panel(&self, pid: PanelId) -> Option<&Panel> {
+        self.wss.iter().find_map(|w| w.panels.get(&pid))
+    }
+
+    /// The workspaces worth showing: every occupied one, the active one, and
+    /// the first empty slot (the "fresh workspace" target) — what the macOS
+    /// menubar and the touch overlay list.
+    #[must_use]
+    pub fn roster(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..WS_N)
+            .filter(|&k| k == self.active || !self.wss[k].is_empty())
+            .collect();
+        if let Some(empty) = (0..WS_N).find(|k| !v.contains(k)) {
+            v.push(empty);
+            v.sort_unstable();
+        }
+        v
+    }
+
+    /// Switches the layout grid on every workspace — a fold/unfold reshapes
+    /// them all, not just the visible one.
+    pub fn set_grid(&mut self, grid: Grid) {
+        for w in &mut self.wss {
+            w.set_grid(grid);
+        }
+    }
+}
+
+impl std::ops::Deref for Wm {
+    type Target = Ws;
+    fn deref(&self) -> &Ws {
+        &self.wss[self.active]
+    }
+}
+
+impl std::ops::DerefMut for Wm {
+    fn deref_mut(&mut self) -> &mut Ws {
+        &mut self.wss[self.active]
+    }
 }
 
 #[cfg(test)]
@@ -1278,5 +1401,62 @@ mod tests {
         ws.focus = Some(help);
         ws.focus_dir(Dir::Right, VP, opts());
         assert_eq!(ws.focus, Some(inbox));
+    }
+
+    /// Workspaces: switching remembers focus and camera per space; a move
+    /// re-homes the panel, follows it, and leaves old focus on a neighbour.
+    #[test]
+    fn workspaces_switch_and_move() {
+        let mut wm = Wm::new();
+        let help = wm.open(Kind::Help, None, false);
+        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        wm.focus = Some(inbox);
+        wm.camera_x = 120.0;
+
+        // Switch to an empty workspace and back: both are intact.
+        assert!(wm.switch(1));
+        assert!(wm.is_empty());
+        assert_eq!(wm.focus, None);
+        assert!(!wm.switch(1), "already there");
+        wm.switch(0);
+        assert_eq!(wm.focus, Some(inbox));
+        assert_eq!(wm.camera_x, 120.0);
+
+        // Move the focused panel to 3: it follows, its own trailing column.
+        assert_eq!(wm.send_focused_to(3), Some(inbox));
+        assert_eq!(wm.active, 3);
+        assert_eq!(wm.focus, Some(inbox));
+        assert_eq!(kinds(&wm.wss[3]), [vec!["inbox"]]);
+        // The old workspace keeps help, focus fell to it.
+        assert_eq!(kinds(&wm.wss[0]), [vec!["help"]]);
+        assert_eq!(wm.wss[0].focus, Some(help));
+        // A move to the active workspace is a no-op.
+        assert_eq!(wm.send_focused_to(3), None);
+
+        // Ids stay unique across workspaces (disjoint ranges per space).
+        let about = wm.open(Kind::About, None, false);
+        assert_ne!(about, help);
+        assert!(wm.panel(help).is_some(), "cross-space lookup");
+
+        // Roster: occupied 0 and 3, plus the first empty slot 1.
+        assert_eq!(wm.roster(), vec![0, 1, 3]);
+    }
+
+    /// Moving a joined child re-homes just the panel; the join dies with the
+    /// adjacency. The grid applies to every workspace at once.
+    #[test]
+    fn workspace_move_breaks_joins_and_grid_is_global() {
+        let mut wm = Wm::new();
+        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let msg = wm.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        assert_eq!(wm.joined_child(inbox), Some(msg));
+        wm.send_focused_to(1);
+        assert_eq!(wm.active, 1);
+        assert!(wm.wss[0].joins.is_empty(), "join died with the move");
+        assert_eq!(kinds(&wm.wss[1]), [vec!["msg"]]);
+
+        wm.set_grid(Grid { w: 4, h: 3 });
+        assert_eq!(wm.wss[0].grid, Grid { w: 4, h: 3 });
+        assert_eq!(wm.wss[8].grid, Grid { w: 4, h: 3 });
     }
 }

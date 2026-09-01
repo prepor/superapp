@@ -23,7 +23,13 @@ current state; everything else in this book is settled.
 7. **Small-grid content density**: panels reuse the desktop content on the
    4×3 cover grid (only the grid clamps). Whether kinds should *adapt* their
    content to tight columns (fewer inbox columns, shorter dates) is open.
+8. **Moving a panel between workspaces on touch** has no gesture yet — the
+   overlay only switches. Candidates: drag a held panel onto the overlay
+   (raise it during a drag near the top edge?), or rows as drop targets.
+   Un-answered until the phone build gets real use.
 
-Settled since the last revision: android as a second target — touch grammar,
-grids per screen, fold resize (see [Interaction
-Grammar](./interaction-grammar.md) and [Tech Stack](./tech-stack.md)).
+Settled since the last revision: workspaces — nine numbered, vertical slide,
+menu bar on macOS, two-finger-swipe-down overlay on touch (see [Panel
+Model](./panel-model.md) and [Interaction
+Grammar](./interaction-grammar.md)); makepad is now plain upstream at
+mosaic's pin (see [Tech Stack](./tech-stack.md) for the one e2e trade-off).

@@ -1,5 +1,17 @@
 # Panel Model
 
+## Workspaces
+
+Above the strip sit **nine numbered workspaces** (niri/hyprland's model):
+each is a full workspace — its own columns, focus and camera, restored
+exactly on return — and an empty one is just an empty slot, no creation or
+teardown. They stack **vertically**: a switch slides the view down or up a
+viewport (the same springs as everything else), so workspace 3 is a *place
+below workspace 2*, not a scene cut. Moving a panel to another workspace
+re-homes it as its own trailing column there and **follows it** (niri's
+default); its joins stay behind and die with the lost adjacency, and focus
+in the old workspace falls to a neighbour exactly as on close.
+
 ## Grid and columns
 
 The viewport is a **unit grid** with 8 pt gaps — **12×6 on desktop, 8×4 on the

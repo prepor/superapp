@@ -25,7 +25,7 @@ use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, PanelId, Ws};
+use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
 use crate::data::{self, MailId, MailState};
 use crate::e2e;
 use crate::spring::{Spring, SpringParams};
@@ -495,6 +495,10 @@ enum Act {
     Field(PanelId, FieldId),
     /// Activate this panel's tab in its tabbed column.
     Tab(PanelId),
+    /// A row of the workspaces overlay: switch to workspace `k`.
+    WsRow(usize),
+    /// The overlay's backdrop: tapping outside the rows dismisses it.
+    OverlayClose,
 }
 
 #[derive(Debug, Clone)]
@@ -506,8 +510,8 @@ struct HitR {
     label: String,
 }
 
-/// The panel an act belongs to.
-fn act_pid(act: &Act) -> PanelId {
+/// The panel an act belongs to (overlay acts belong to none).
+fn act_pid(act: &Act) -> Option<PanelId> {
     match act {
         Act::Focus(pid)
         | Act::Close(pid)
@@ -516,7 +520,8 @@ fn act_pid(act: &Act) -> PanelId {
         | Act::Replace(pid, _)
         | Act::Row(pid, _)
         | Act::Field(pid, _)
-        | Act::Tab(pid) => *pid,
+        | Act::Tab(pid) => Some(*pid),
+        Act::WsRow(_) | Act::OverlayClose => None,
     }
 }
 
@@ -540,8 +545,10 @@ enum TouchMode {
     Tap { uid: u64, act: Option<Act> },
     /// One finger scrolling a panel body, 1:1.
     Scroll { uid: u64, pid: PanelId },
-    /// Two fingers panning the workspace horizontally, 1:1.
-    Pan,
+    /// Two fingers down. The first move past the slop locks the axis:
+    /// horizontal pans the strip 1:1; a vertical swipe toggles the
+    /// workspaces overlay (down opens, up closes) and goes dead.
+    Pan { horizontal: Option<bool> },
     /// A long-pressed header: the panel rides the finger; the drop point
     /// picks its new place ([`Ws::place_at`]).
     Drag { uid: u64, pid: PanelId, offset: DVec2 },
@@ -570,10 +577,12 @@ struct PanelAnim {
     h: Spring,
     alpha: Spring,
     title: String,
+    /// Which workspace the panel lives on — its row in the vertical stack.
+    ws: usize,
 }
 
 impl PanelAnim {
-    fn spawn(target: core::Rect, title: String, visible: bool) -> Self {
+    fn spawn(target: core::Rect, title: String, visible: bool, ws: usize) -> Self {
         // Born slightly inset and transparent; springs carry it to place. A
         // panel born hidden (an inactive tab) just sits at its rect at rest.
         let inset = if visible { 12.0 } else { 0.0 };
@@ -585,6 +594,7 @@ impl PanelAnim {
             h: mk(target.h - 2.0 * inset),
             alpha: Spring::at_rest(0.0, SpringParams::fade()),
             title,
+            ws,
         };
         pa.retarget(target);
         if visible {
@@ -627,12 +637,17 @@ struct Ghost {
     rect: core::Rect,
     alpha: Spring,
     title: String,
+    /// The workspace row the panel died on.
+    ws: usize,
 }
 
 /// Drawn state: springs keyed by panel, plus fading ghosts of closed panels.
 #[derive(Debug, Default)]
 struct Anim {
     camera: Option<Spring>,
+    /// The camera's vertical position in the workspace stack, in workspace
+    /// rows — springs between numbers on a switch (niri's slide).
+    slide: Option<Spring>,
     panels: HashMap<PanelId, PanelAnim>,
     ghosts: Vec<Ghost>,
 }
@@ -643,23 +658,41 @@ impl Anim {
             .get_or_insert_with(|| Spring::at_rest(0.0, SpringParams::movement()))
     }
 
-    /// Applies a fresh scene: retarget the living, spawn the new, ghost the gone.
-    fn apply(&mut self, scene: &core::Scene, titles: &HashMap<PanelId, String>) {
-        self.camera().retarget(scene.camera_x);
+    fn slide(&mut self) -> &mut Spring {
+        self.slide
+            .get_or_insert_with(|| Spring::at_rest(0.0, SpringParams::movement()))
+    }
+
+    /// Applies every workspace's fresh scene: retarget the living, spawn the
+    /// new, ghost the gone. Only the union across workspaces counts as
+    /// alive — a switch must never ghost the space being left.
+    fn apply(
+        &mut self,
+        scenes: &[(usize, core::Scene)],
+        active: usize,
+        titles: &HashMap<PanelId, String>,
+    ) {
+        if let Some((_, sc)) = scenes.iter().find(|(k, _)| *k == active) {
+            self.camera().retarget(sc.camera_x);
+        }
+        self.slide().retarget(active as f64);
         let mut seen = std::collections::HashSet::new();
-        for ps in &scene.panels {
-            seen.insert(ps.id);
-            let title = titles.get(&ps.id).cloned().unwrap_or_default();
-            match self.panels.get_mut(&ps.id) {
-                Some(pa) => {
-                    pa.retarget(ps.rect);
-                    // A tab switch is a crossfade in place, never open/close.
-                    pa.alpha.retarget(if ps.visible { 1.0 } else { 0.0 });
-                    pa.title = title;
-                }
-                None => {
-                    self.panels
-                        .insert(ps.id, PanelAnim::spawn(ps.rect, title, ps.visible));
+        for (k, scene) in scenes {
+            for ps in &scene.panels {
+                seen.insert(ps.id);
+                let title = titles.get(&ps.id).cloned().unwrap_or_default();
+                match self.panels.get_mut(&ps.id) {
+                    Some(pa) => {
+                        pa.retarget(ps.rect);
+                        // A tab switch is a crossfade in place, never open/close.
+                        pa.alpha.retarget(if ps.visible { 1.0 } else { 0.0 });
+                        pa.title = title;
+                        pa.ws = *k;
+                    }
+                    None => {
+                        self.panels
+                            .insert(ps.id, PanelAnim::spawn(ps.rect, title, ps.visible, *k));
+                    }
                 }
             }
         }
@@ -677,6 +710,7 @@ impl Anim {
                 rect: pa.rect(),
                 alpha,
                 title: pa.title,
+                ws: pa.ws,
             });
         }
     }
@@ -686,6 +720,10 @@ impl Anim {
         if let Some(c) = self.camera.as_mut() {
             c.advance(dt);
             active |= !c.is_done();
+        }
+        if let Some(s) = self.slide.as_mut() {
+            s.advance(dt);
+            active |= !s.is_done();
         }
         for pa in self.panels.values_mut() {
             pa.advance(dt);
@@ -705,7 +743,7 @@ impl Anim {
 // ---------------------------------------------------------------------------
 
 struct State {
-    ws: Ws,
+    ws: Wm,
     mail: MailState,
     ui: HashMap<PanelId, PanelUi>,
     anim: Anim,
@@ -715,6 +753,8 @@ struct State {
     hover: Option<Act>,
     field: Option<(PanelId, FieldId)>,
     toast: Option<(String, bool, Instant)>,
+    /// The workspaces overlay (two-finger swipe down on touch).
+    overlay: bool,
 }
 
 /// A field's content as one string plus the caret in chars — the shape the
@@ -760,7 +800,7 @@ fn grid_for(vp: DVec2) -> core::Grid {
 
 impl State {
     fn new() -> Self {
-        let mut ws = Ws::new();
+        let mut ws = Wm::new();
         ws.open(Kind::Help, None, false);
         let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
         ws.focus = Some(inbox);
@@ -775,6 +815,7 @@ impl State {
             hover: None,
             field: None,
             toast: None,
+            overlay: false,
         }
     }
 
@@ -813,46 +854,66 @@ impl State {
         let vp = self.vp();
         let opts = self.opts();
         self.ws.ensure_focus_visible(vp, opts);
-        // Per-panel ui: create/reset entries, drop dead ones.
-        let ids: Vec<PanelId> = self.ws.panels.keys().copied().collect();
-        for pid in &ids {
-            let kind = self.ws.panels[pid].kind.clone();
+        // Per-panel ui: create/reset entries, drop dead ones — across every
+        // workspace, so panels on inactive spaces keep drafts and scrolls.
+        let ids: Vec<(PanelId, Kind)> = self
+            .ws
+            .wss
+            .iter()
+            .flat_map(|w| w.panels.values().map(|p| (p.id, p.kind.clone())))
+            .collect();
+        for (pid, kind) in &ids {
             let fresh = match self.ui.get(pid) {
-                Some(ui) => ui.kind != kind,
+                Some(ui) => ui.kind != *kind,
                 None => true,
             };
             if fresh {
-                let ui = PanelUi::for_kind(&kind, &mut self.mail);
+                let ui = PanelUi::for_kind(kind, &mut self.mail);
                 if matches!(kind, Kind::Compose { .. }) {
                     self.field = Some((*pid, FieldId::Body));
                 }
                 self.ui.insert(*pid, ui);
             }
         }
-        self.ui.retain(|pid, _| self.ws.panels.contains_key(pid));
+        self.ui.retain(|pid, _| {
+            let pid = *pid;
+            ids.iter().any(|(id, _)| *id == pid)
+        });
+        // A field only makes sense on the visible workspace: switching away
+        // (or moving the panel away) blurs it, which also parks the IME.
         if let Some((pid, _)) = self.field {
             if !self.ws.panels.contains_key(&pid) {
                 self.field = None;
             }
         }
 
-        let scene = self.ws.scene(self.vp(), self.opts());
+        // Every workspace computes its scene: the animator needs the union
+        // (a switch retargets both spaces mid-slide, and must never ghost
+        // the one being left).
+        let active = self.ws.active;
+        let scenes: Vec<(usize, core::Scene)> = self
+            .ws
+            .wss
+            .iter_mut()
+            .enumerate()
+            .map(|(k, w)| (k, w.scene(vp, opts)))
+            .collect();
         let titles: HashMap<PanelId, String> = self
             .ws
-            .panels
-            .values()
+            .wss
+            .iter()
+            .flat_map(|w| w.panels.values())
             .map(|p| (p.id, self.panel_title(&p.kind)))
             .collect();
-        self.anim.apply(&scene, &titles);
+        self.anim.apply(&scenes, active, &titles);
     }
 
     /// Trackpad pan: 1:1, no spring.
     fn pan(&mut self, dx: f64) {
         self.ws.pan(dx);
-        let cam = {
-            let scene = self.ws.scene(self.vp(), self.opts());
-            scene.camera_x
-        };
+        let vp = self.vp();
+        let opts = self.opts();
+        let cam = self.ws.scene(vp, opts).camera_x;
         self.anim.camera().jump_to(cam);
     }
 
@@ -880,7 +941,8 @@ fn kbd(s: &str) -> Seg {
 }
 
 fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
-    let Some(panel) = state.ws.panels.get(&pid) else {
+    // Cross-workspace lookup: panels on inactive spaces draw mid-slide too.
+    let Some(panel) = state.ws.panel(pid) else {
         return Vec::new();
     };
     let ui = state.ui.get(&pid);
@@ -1020,6 +1082,33 @@ fn help_lines() -> Vec<Line> {
         ..Default::default()
     });
     v.push(Line::text("trackpad: scroll the strip and the panels", Style::N));
+    v.push(Line::blank());
+    v.push(Line {
+        left: vec![Seg::T("WORKSPACES".into(), Style::Label)],
+        rule: true,
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("1"),
+            Seg::T("…".into(), Style::N),
+            kbd("9"),
+            Seg::T(" — switch workspace".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("shift"),
+            Seg::T("+№ — move the panel there".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    if cfg!(target_os = "macos") {
+        v.push(Line::text("the menu bar lists them; [n] is current", Style::N));
+    }
     if cfg!(target_os = "android") {
         v.push(Line::blank());
         v.push(Line {
@@ -1030,6 +1119,7 @@ fn help_lines() -> Vec<Line> {
         v.push(Line::text("tap — follow links, press buttons", Style::N));
         v.push(Line::text("drag — scroll a panel's content", Style::N));
         v.push(Line::text("two fingers — scroll the workspace", Style::N));
+        v.push(Line::text("two fingers down — workspaces overlay", Style::N));
         v.push(Line::text("hold a header — pick the panel up;", Style::N));
         v.push(Line::text("drop on a column to stack, between", Style::N));
         v.push(Line::text("columns for a fresh one", Style::N));
@@ -1376,6 +1466,10 @@ pub struct Stage {
     /// Safe-area insets (cutouts, rounded corners): top, right, bottom, left.
     #[rust]
     insets: (f64, f64, f64, f64),
+    /// What the macOS menu bar currently shows: `(workspace, is_current)`
+    /// per roster entry. Menus rebuild only when this changes.
+    #[rust]
+    menu_sig: Vec<(usize, bool)>,
     #[rust]
     e2e: Option<e2e::Runner>,
     #[rust]
@@ -1383,6 +1477,12 @@ pub struct Stage {
     #[rust]
     state: Option<Box<State>>,
 }
+
+/// Menu command id bases: workspace `k`'s items are `base + k`. Plain
+/// numbers (not `live_id!` hashes) — the ranges cannot collide with the one
+/// hashed command makepad special-cases, `quit`.
+const WS_MENU_SWITCH: u64 = 0x5753_0100;
+const WS_MENU_MOVE: u64 = 0x5753_0200;
 
 /// How a `key` chord executes: as a synthesized key event, or as text (plain
 /// letters reach panels the same way real typing does).
@@ -1423,6 +1523,15 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "period" | "." => Some(KeyCode::Period),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
         "bracketright" | "]" => Some(KeyCode::RBracket),
+        "1" => Some(KeyCode::Key1),
+        "2" => Some(KeyCode::Key2),
+        "3" => Some(KeyCode::Key3),
+        "4" => Some(KeyCode::Key4),
+        "5" => Some(KeyCode::Key5),
+        "6" => Some(KeyCode::Key6),
+        "7" => Some(KeyCode::Key7),
+        "8" => Some(KeyCode::Key8),
+        "9" => Some(KeyCode::Key9),
         _ => None,
     };
     let plain = !mods.logo && !mods.control && !mods.alt;
@@ -1522,7 +1631,70 @@ impl Stage {
         if let Some(state) = self.state.as_deref_mut() {
             state.sync();
         }
+        self.update_menu(cx);
         self.kick(cx);
+    }
+
+    /// The macOS menu bar mirrors the workspaces: one menu per roster entry,
+    /// the current one bracketed. The bold app menu itself is
+    /// AppKit-mandatory — it cannot be removed, so it keeps only Quit. The
+    /// items carry no key equivalents (the KeyDown path owns cmd+№; the
+    /// labels document it); rebuilds happen only when the signature changes,
+    /// never per keystroke.
+    fn update_menu(&mut self, cx: &mut Cx) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        let sig: Vec<(usize, bool)> = state
+            .ws
+            .roster()
+            .into_iter()
+            .map(|k| (k, k == state.ws.active))
+            .collect();
+        if sig == self.menu_sig {
+            return;
+        }
+        self.menu_sig = sig.clone();
+        let mut items = vec![MacosMenu::Sub {
+            name: "superapp".into(),
+            items: vec![MacosMenu::Item {
+                command: live_id!(quit),
+                key: KeyCode::KeyQ,
+                shift: false,
+                enabled: true,
+                name: "Quit superapp".into(),
+            }],
+        }];
+        for (k, current) in sig {
+            let name = if current {
+                format!("[{}]", k + 1)
+            } else {
+                format!("{}", k + 1)
+            };
+            items.push(MacosMenu::Sub {
+                name,
+                items: vec![
+                    MacosMenu::Item {
+                        command: LiveId(WS_MENU_SWITCH + k as u64),
+                        key: KeyCode::Unknown,
+                        shift: false,
+                        enabled: !current,
+                        name: format!("Switch Here — ⌘{}", k + 1),
+                    },
+                    MacosMenu::Item {
+                        command: LiveId(WS_MENU_MOVE + k as u64),
+                        key: KeyCode::Unknown,
+                        shift: true,
+                        enabled: !current,
+                        name: format!("Move Panel Here — ⇧⌘{}", k + 1),
+                    },
+                ],
+            });
+        }
+        cx.update_macos_menu(MacosMenu::Main { items });
     }
 
     fn hit_at(&self, p: DVec2) -> Option<&HitR> {
@@ -1624,8 +1796,8 @@ impl Stage {
                         }
                     }
                 }
-                e2e::Step::Pan2(dx) => {
-                    eprintln!("e2e: pan2 by {dx}");
+                e2e::Step::Pan2 { dx, dy } => {
+                    eprintln!("e2e: pan2 by ({dx}, {dy})");
                     let vp = self
                         .state
                         .as_deref()
@@ -1636,12 +1808,12 @@ impl Stage {
                     self.touch_start(1, a);
                     self.touch_start(2, b);
                     for i in 1..=8 {
-                        let f = f64::from(i) / 8.0 * dx;
-                        self.touch_move(cx, 1, dvec2(a.x + f, a.y));
-                        self.touch_move(cx, 2, dvec2(b.x + f, b.y));
+                        let f = f64::from(i) / 8.0;
+                        self.touch_move(cx, 1, dvec2(a.x + f * dx, a.y + f * dy));
+                        self.touch_move(cx, 2, dvec2(b.x + f * dx, b.y + f * dy));
                     }
-                    self.touch_stop(cx, 1, dvec2(a.x + dx, a.y));
-                    self.touch_stop(cx, 2, dvec2(b.x + dx, b.y));
+                    self.touch_stop(cx, 1, dvec2(a.x + dx, a.y + dy));
+                    self.touch_stop(cx, 2, dvec2(b.x + dx, b.y + dy));
                 }
                 e2e::Step::Drop => {
                     if let TouchMode::Drag { uid, .. } = self.touch.mode {
@@ -1720,8 +1892,34 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // The overlay dismisses on esc; cmd chords below still work through it.
+        if state.overlay && k.key_code == KeyCode::Escape {
+            state.overlay = false;
+            self.kick(cx);
+            return;
+        }
         // Cmd is the workspace modifier (niri's Mod; mosaic's choice too).
         if k.modifiers.logo {
+            let num = match k.key_code {
+                KeyCode::Key1 => Some(0),
+                KeyCode::Key2 => Some(1),
+                KeyCode::Key3 => Some(2),
+                KeyCode::Key4 => Some(3),
+                KeyCode::Key5 => Some(4),
+                KeyCode::Key6 => Some(5),
+                KeyCode::Key7 => Some(6),
+                KeyCode::Key8 => Some(7),
+                KeyCode::Key9 => Some(8),
+                _ => None,
+            };
+            if let Some(n) = num {
+                if k.modifiers.shift {
+                    self.move_focused_to_ws(cx, n);
+                } else {
+                    self.switch_ws(cx, n);
+                }
+                return;
+            }
             let dir = match k.key_code {
                 KeyCode::ArrowLeft | KeyCode::KeyH => Some(Dir::Left),
                 KeyCode::ArrowRight | KeyCode::KeyL => Some(Dir::Right),
@@ -2070,10 +2268,57 @@ impl Stage {
         }
     }
 
+    /// Switches to workspace `k`: the slide spring carries the view there;
+    /// the horizontal camera lands instantly on the target space's own
+    /// position (a glide under the slide would read as drift).
+    fn switch_ws(&mut self, cx: &mut Cx, k: usize) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        state.overlay = false;
+        if state.ws.switch(k) {
+            state.field = None;
+            state.sync();
+            let cam = state.ws.camera_x;
+            state.anim.camera().jump_to(cam);
+        }
+        self.update_menu(cx);
+        self.kick(cx);
+    }
+
+    /// Moves the focused panel to workspace `k` and follows it (niri's
+    /// default): the whole viewport slides, the panel rides along.
+    fn move_focused_to_ws(&mut self, cx: &mut Cx, k: usize) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        state.overlay = false;
+        if state.ws.send_focused_to(k).is_some() {
+            state.field = None;
+            state.sync();
+            let cam = state.ws.camera_x;
+            state.anim.camera().jump_to(cam);
+        }
+        self.update_menu(cx);
+        self.kick(cx);
+    }
+
     fn resolve_click(&mut self, cx: &mut Cx, act: Act, alt: bool) {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        match act {
+            Act::WsRow(k) => {
+                self.switch_ws(cx, k);
+                return;
+            }
+            Act::OverlayClose => {
+                state.overlay = false;
+                self.kick(cx);
+                return;
+            }
+            _ => {}
+        }
         match act {
             Act::Focus(pid) => {
                 state.ws.focus = Some(pid);
@@ -2142,6 +2387,8 @@ impl Stage {
                 }
                 self.sync(cx);
             }
+            // Handled above — they return before reaching this match.
+            Act::WsRow(_) | Act::OverlayClose => {}
         }
     }
 
@@ -2163,7 +2410,9 @@ impl Stage {
         match self.touch.mode {
             // A drag keeps the panel no matter what other fingers do.
             TouchMode::Drag { .. } => {}
-            _ if self.touch.pts.len() >= 2 => self.touch.mode = TouchMode::Pan,
+            _ if self.touch.pts.len() >= 2 => {
+                self.touch.mode = TouchMode::Pan { horizontal: None }
+            }
             _ => {
                 let act = self.hit_at(p).map(|h| h.act.clone());
                 // logcat is the only window into a device run.
@@ -2189,7 +2438,7 @@ impl Stage {
                 }
                 // Vertical wins the panel's scroll; sideways one-finger
                 // movement means nothing (the workspace pans on two).
-                self.touch.mode = match act.as_ref().map(act_pid) {
+                self.touch.mode = match act.as_ref().and_then(act_pid) {
                     Some(pid) if t.y.abs() >= t.x.abs() => TouchMode::Scroll { uid, pid },
                     _ => TouchMode::Dead,
                 };
@@ -2203,7 +2452,28 @@ impl Stage {
                 }
                 self.kick(cx);
             }
-            TouchMode::Pan => {
+            TouchMode::Pan { horizontal } => {
+                // The first move past the slop locks the axis for the whole
+                // gesture: no mode flips mid-pan.
+                if horizontal.is_none() {
+                    let t = p - start;
+                    if t.x.abs() < TOUCH_SLOP && t.y.abs() < TOUCH_SLOP {
+                        return;
+                    }
+                    if t.x.abs() >= t.y.abs() {
+                        self.touch.mode = TouchMode::Pan { horizontal: Some(true) };
+                    } else {
+                        // A vertical two-finger swipe: down summons the
+                        // workspaces overlay, up dismisses it. One shot —
+                        // the rest of the gesture is inert.
+                        if let Some(state) = self.state.as_deref_mut() {
+                            state.overlay = t.y > 0.0;
+                        }
+                        self.touch.mode = TouchMode::Dead;
+                        self.kick(cx);
+                        return;
+                    }
+                }
                 // Each finger reports its own move; splitting by the finger
                 // count makes the strip track the gesture 1:1.
                 let n = self.touch.pts.len().max(1) as f64;
@@ -2271,19 +2541,21 @@ impl Stage {
                 self.sync(cx);
             }
             TouchMode::Drag { .. } => {} // a bystander finger lifted mid-drag
-            TouchMode::Pan => {
+            TouchMode::Pan { horizontal } => {
                 // The pan ends with the first lifted finger; the camera
                 // magnetises to the nearest column alignment — a spring, so
                 // it settles rather than jumps. A leftover finger is inert.
                 if !self.touch.pts.is_empty() {
                     self.touch.mode = TouchMode::Dead;
                 }
-                if let Some(state) = self.state.as_deref_mut() {
-                    let vp = state.vp();
-                    let opts = state.opts();
-                    state.ws.snap_camera(vp, opts);
-                    let cam = state.ws.camera_x;
-                    state.anim.camera().retarget(cam);
+                if horizontal == Some(true) {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        let vp = state.vp();
+                        let opts = state.opts();
+                        state.ws.snap_camera(vp, opts);
+                        let cam = state.ws.camera_x;
+                        state.anim.camera().retarget(cam);
+                    }
                 }
                 self.kick(cx);
             }
@@ -2306,7 +2578,7 @@ impl Stage {
             TouchMode::Idle => {}
             _ => return,
         }
-        let Some(pid) = self.hit_at(p).map(|h| act_pid(&h.act)) else {
+        let Some(pid) = self.hit_at(p).and_then(|h| act_pid(&h.act)) else {
             return;
         };
         // Only the header (or a tab riding above it) grabs.
@@ -2394,6 +2666,16 @@ impl Widget for Stage {
             Event::LongPress(e) => self.long_press(cx, e.uid, e.abs),
 
             Event::KeyDown(k) => self.handle_key_down(cx, k),
+
+            // A workspace menu item (macOS menu bar).
+            Event::MacosMenuCommand(cmd) => {
+                let id = cmd.0;
+                if (WS_MENU_SWITCH..WS_MENU_SWITCH + WS_N as u64).contains(&id) {
+                    self.switch_ws(cx, (id - WS_MENU_SWITCH) as usize);
+                } else if (WS_MENU_MOVE..WS_MENU_MOVE + WS_N as u64).contains(&id) {
+                    self.move_focused_to_ws(cx, (id - WS_MENU_MOVE) as usize);
+                }
+            }
 
             Event::TextInput(e) => {
                 // android's IME sends the authoritative full field state;
@@ -2490,16 +2772,7 @@ impl Widget for Stage {
                         .iter()
                         .rev()
                         .find(|h| h.rect.contains(p))
-                        .map(|h| match &h.act {
-                            Act::Focus(pid)
-                            | Act::Close(pid)
-                            | Act::Btn(pid, _)
-                            | Act::Open(pid, _)
-                            | Act::Replace(pid, _)
-                            | Act::Row(pid, _)
-                            | Act::Field(pid, _)
-                            | Act::Tab(pid) => *pid,
-                        });
+                        .and_then(|h| act_pid(&h.act));
                     if let Some(pid) = pid {
                         if let Some(ui) = state.ui.get_mut(&pid) {
                             ui.scroll = (ui.scroll + e.scroll.y).clamp(0.0, ui.max_scroll);
@@ -2682,26 +2955,58 @@ impl Widget for Stage {
 
 impl Stage {
     fn draw_scene(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
-        let cam = state.anim.camera().value();
-        let to_screen = |r: core::Rect| -> Rect {
-            rect(r.x - cam + vp.pos.x, r.y + vp.pos.y, r.w, r.h)
+        // Workspaces stack vertically, one viewport (and a gap) apart; the
+        // slide spring carries the view between rows on a switch. Each
+        // workspace pans on its own x-camera — the active one live, the
+        // rest parked at their stored targets. Anything a full row away
+        // culls out, so a settled view draws exactly one workspace.
+        let slide = state.anim.slide().value();
+        let cam_a = state.anim.camera().value();
+        let active = state.ws.active;
+        let step = vp.size.y + theme::GAP;
+        let cams: Vec<f64> = (0..WS_N)
+            .map(|k| {
+                if k == active {
+                    cam_a
+                } else {
+                    state.ws.wss[k].camera_x
+                }
+            })
+            .collect();
+        let to_screen = move |r: core::Rect, k: usize| -> Rect {
+            rect(
+                r.x - cams[k] + vp.pos.x,
+                r.y + (k as f64 - slide) * step + vp.pos.y,
+                r.w,
+                r.h,
+            )
+        };
+        let off_screen = |r: &Rect| -> bool {
+            r.pos.x > vp.pos.x + vp.size.x
+                || r.pos.x + r.size.x < vp.pos.x
+                || r.pos.y > vp.pos.y + vp.size.y
+                || r.pos.y + r.size.y < vp.pos.y
         };
 
-        // Ghosts first: chrome-only, fading out.
+        // Ghosts first: chrome-only, fading out on their workspace row.
         let ghosts = state.anim.ghosts.clone();
         for g in &ghosts {
-            let r = to_screen(g.rect);
+            let r = to_screen(g.rect, g.ws);
+            if off_screen(&r) {
+                continue;
+            }
             let a = g.alpha.value();
             self.draw_chrome(cx, r, &g.title, false, a, None, None);
         }
 
-        // Panels in column order; the focused one last so it draws on top
-        // while overlapping mid-animation.
+        // Panels in column order per workspace; the active workspace's
+        // focused panel last so it draws on top while overlapping
+        // mid-animation.
         let mut order: Vec<PanelId> = state
             .ws
-            .columns
+            .wss
             .iter()
-            .flat_map(|c| c.panels.iter().copied())
+            .flat_map(|w| w.columns.iter().flat_map(|c| c.panels.iter().copied()))
             .collect();
         if let Some(f) = state.ws.focus {
             if let Some(i) = order.iter().position(|&p| p == f) {
@@ -2709,8 +3014,9 @@ impl Stage {
                 order.push(f);
             }
         }
-        // A panel is interactive only if its column actually shows it (the
-        // active tab, or any panel of a normal column).
+        // A panel is interactive only if it is on the active workspace and
+        // its column actually shows it (the active tab, or any panel of a
+        // normal column).
         let shown = |ws: &Ws, pid: PanelId| -> bool {
             ws.locate(pid).is_none_or(|(c, r)| {
                 let col = &ws.columns[c];
@@ -2721,19 +3027,20 @@ impl Stage {
             let Some(pa) = state.anim.panels.get(&pid) else {
                 continue;
             };
-            let r = to_screen(pa.rect());
-            if r.pos.x > vp.pos.x + vp.size.x || r.pos.x + r.size.x < vp.pos.x {
+            let k = pa.ws;
+            let r = to_screen(pa.rect(), k);
+            if off_screen(&r) {
                 continue;
             }
             let alpha = pa.alpha.value();
-            let interactive = shown(&state.ws, pid);
+            let interactive = k == active && shown(&state.ws.wss[k], pid);
             if !interactive && alpha < 0.02 {
                 continue; // a fully faded hidden tab
             }
             let hits_before = self.hits.len();
             self.draw_panel_full(cx, state, pid, r, alpha);
             if !interactive {
-                // Mid-crossfade: visible, but only the active tab is hittable.
+                // Mid-crossfade or another workspace: visible, not hittable.
                 self.hits.truncate(hits_before);
             }
         }
@@ -2741,83 +3048,98 @@ impl Stage {
         // Tab strips above tabbed columns: one title segment per panel, the
         // active one inverted. They ride the active panel's animated rect.
         let hover = state.hover.clone();
-        let columns = state.ws.columns.clone();
-        for col in &columns {
-            if !col.tabbed || col.panels.is_empty() {
-                continue;
-            }
-            let active_idx = col.active.min(col.panels.len() - 1);
-            let Some(pa) = state.anim.panels.get(&col.panels[active_idx]) else {
-                continue;
-            };
-            let r = to_screen(pa.rect());
-            // The strip belongs to the column, not to one tab: during a
-            // crossfade the outgoing+incoming alphas sum to ~1, so the strip
-            // holds steady; when a column first appears it still fades in.
-            let alpha = col
-                .panels
-                .iter()
-                .filter_map(|pid| state.anim.panels.get(pid))
-                .map(|pa| pa.alpha.value())
-                .sum::<f64>()
-                .min(1.0);
-            let strip = rect(
-                r.pos.x,
-                r.pos.y - theme::TAB_GAP - theme::TAB_H,
-                r.size.x,
-                theme::TAB_H,
-            );
-            if strip.pos.x > vp.pos.x + vp.size.x || strip.pos.x + strip.size.x < vp.pos.x {
-                continue;
-            }
-            let n = col.panels.len() as f64;
-            let seg_gap = 2.0;
-            let seg_w = ((strip.size.x - (n - 1.0) * seg_gap) / n).max(24.0);
-            for (i, pid) in col.panels.iter().enumerate() {
-                let sx = strip.pos.x + i as f64 * (seg_w + seg_gap);
-                let sr = rect(sx, strip.pos.y, seg_w, theme::TAB_H);
-                let act = Act::Tab(*pid);
-                let active = i == active_idx;
-                let hovered = hover.as_ref() == Some(&act);
-                let (bg, fg) = match (active, hovered) {
-                    (true, _) => (theme::INK, theme::BG),
-                    (false, true) => (theme::HOVER, theme::INK),
-                    (false, false) => (theme::BG, theme::INK),
+        for k in 0..WS_N {
+            let columns = state.ws.wss[k].columns.clone();
+            for col in &columns {
+                if !col.tabbed || col.panels.is_empty() {
+                    continue;
+                }
+                let active_idx = col.active.min(col.panels.len() - 1);
+                let Some(pa) = state.anim.panels.get(&col.panels[active_idx]) else {
+                    continue;
                 };
-                self.draw_panel.color = rgba_a(bg, alpha);
-                self.draw_panel.border_color = rgba_a(theme::INK, alpha);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = alpha as f32;
-                self.draw_panel.draw_abs(cx, sr);
-                let title = state
-                    .ws
+                let r = to_screen(pa.rect(), k);
+                // The strip belongs to the column, not to one tab: during a
+                // crossfade the outgoing+incoming alphas sum to ~1, so the
+                // strip holds steady; when a column first appears it still
+                // fades in.
+                let alpha = col
                     .panels
-                    .get(pid)
-                    .map(|p| state.panel_title(&p.kind))
-                    .unwrap_or_default();
-                let title_cols = (((seg_w - 12.0) / self.cell.label_step()).max(2.0)) as usize;
-                let t = trunc(&title, title_cols);
-                let tw = self.cell.label_w(t.chars().count());
-                let ty = sr.pos.y + (theme::TAB_H - self.cell.label_line()) / 2.0;
-                self.draw_label(cx, sx + ((seg_w - tw) / 2.0).max(6.0), ty, &t, fg, alpha);
-                self.hits.push(HitR {
-                    rect: sr,
-                    act,
-                    cursor: MouseCursor::Hand,
-                    label: title,
-                });
+                    .iter()
+                    .filter_map(|pid| state.anim.panels.get(pid))
+                    .map(|pa| pa.alpha.value())
+                    .sum::<f64>()
+                    .min(1.0);
+                let strip = rect(
+                    r.pos.x,
+                    r.pos.y - theme::TAB_GAP - theme::TAB_H,
+                    r.size.x,
+                    theme::TAB_H,
+                );
+                if off_screen(&strip) {
+                    continue;
+                }
+                let n = col.panels.len() as f64;
+                let seg_gap = 2.0;
+                let seg_w = ((strip.size.x - (n - 1.0) * seg_gap) / n).max(24.0);
+                for (i, pid) in col.panels.iter().enumerate() {
+                    let sx = strip.pos.x + i as f64 * (seg_w + seg_gap);
+                    let sr = rect(sx, strip.pos.y, seg_w, theme::TAB_H);
+                    let act = Act::Tab(*pid);
+                    let tab_active = i == active_idx;
+                    let hovered = hover.as_ref() == Some(&act);
+                    let (bg, fg) = match (tab_active, hovered) {
+                        (true, _) => (theme::INK, theme::BG),
+                        (false, true) => (theme::HOVER, theme::INK),
+                        (false, false) => (theme::BG, theme::INK),
+                    };
+                    self.draw_panel.color = rgba_a(bg, alpha);
+                    self.draw_panel.border_color = rgba_a(theme::INK, alpha);
+                    self.draw_panel.border_size = 1.0;
+                    self.draw_panel.alpha = alpha as f32;
+                    self.draw_panel.draw_abs(cx, sr);
+                    let title = state
+                        .ws
+                        .panel(*pid)
+                        .map(|p| state.panel_title(&p.kind))
+                        .unwrap_or_default();
+                    let title_cols =
+                        (((seg_w - 12.0) / self.cell.label_step()).max(2.0)) as usize;
+                    let t = trunc(&title, title_cols);
+                    let tw = self.cell.label_w(t.chars().count());
+                    let ty = sr.pos.y + (theme::TAB_H - self.cell.label_line()) / 2.0;
+                    self.draw_label(cx, sx + ((seg_w - tw) / 2.0).max(6.0), ty, &t, fg, alpha);
+                    if k == active {
+                        self.hits.push(HitR {
+                            rect: sr,
+                            act,
+                            cursor: MouseCursor::Hand,
+                            label: title,
+                        });
+                    }
+                }
             }
         }
 
         // Bridges above panels: the join indicator.
         self.draw_flat.new_draw_call(cx);
-        for (&a, &b) in state.ws.joins.clone().iter() {
+        let joins: Vec<(usize, PanelId, PanelId)> = state
+            .ws
+            .wss
+            .iter()
+            .enumerate()
+            .flat_map(|(k, w)| w.joins.iter().map(move |(&a, &b)| (k, a, b)))
+            .collect();
+        for (k, a, b) in joins {
             let (Some(pa), Some(pb)) = (state.anim.panels.get(&a), state.anim.panels.get(&b))
             else {
                 continue;
             };
-            let ra = to_screen(pa.rect());
-            let rb = to_screen(pb.rect());
+            let ra = to_screen(pa.rect(), k);
+            let rb = to_screen(pb.rect(), k);
+            if off_screen(&ra) && off_screen(&rb) {
+                continue;
+            }
             let mut y = rb.pos.y + theme::HEAD_H / 2.0;
             if y < ra.pos.y || y > ra.pos.y + ra.size.y {
                 y = ra.pos.y + theme::HEAD_H / 2.0;
@@ -2846,10 +3168,106 @@ impl Stage {
         // land — vertical in a gap (fresh column), horizontal across a
         // column (stack at that row).
         if let Some(h) = self.drag_hint {
-            let r = to_screen(h);
+            let r = to_screen(h, active);
             self.draw_flat.new_draw_call(cx);
             self.draw_flat.color = rgba_a(theme::INK, 0.85);
             self.draw_flat.draw_abs(cx, r);
+        }
+
+        // An empty active workspace names itself, so a switch onto a blank
+        // screen reads as a place, not a bug.
+        if state.ws.is_empty() && state.anim.ghosts.is_empty() && !state.overlay {
+            let msg = if cfg!(target_os = "android") {
+                format!("workspace {} is empty", active + 1)
+            } else {
+                format!("workspace {} — cmd+shift+№ brings a panel here", active + 1)
+            };
+            let w = msg.chars().count() as f64 * self.cell.adv;
+            self.draw_mono.new_draw_call(cx);
+            self.set_text(Style::Muted, 1.0);
+            self.draw_mono.draw_abs(
+                cx,
+                dvec2(
+                    vp.pos.x + (vp.size.x - w) / 2.0,
+                    vp.pos.y + (vp.size.y - self.cell.line_h) / 2.0,
+                ),
+                &msg,
+            );
+        }
+
+        // The workspaces overlay: an ink wash, then a column of tappable
+        // rows — the current space inverted, panel titles as the summary,
+        // the first empty slot offered as a fresh space. While it is up it
+        // owns every hit; a tap outside the rows dismisses it.
+        if state.overlay {
+            self.hits.clear();
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 0.30);
+            self.draw_flat.draw_abs(cx, vp);
+            self.hits.push(HitR {
+                rect: vp,
+                act: Act::OverlayClose,
+                cursor: MouseCursor::Default,
+                label: "workspaces".into(),
+            });
+            let roster = state.ws.roster();
+            let row_h: f64 = 54.0;
+            let row_gap: f64 = 10.0;
+            let w = (vp.size.x - 4.0 * theme::GAP).min(430.0);
+            let total = roster.len() as f64 * (row_h + row_gap) - row_gap;
+            let x = vp.pos.x + (vp.size.x - w) / 2.0;
+            let mut y = vp.pos.y + ((vp.size.y - total) / 2.0).max(2.0 * theme::GAP);
+            self.draw_panel.new_draw_call(cx);
+            self.draw_mono.new_draw_call(cx);
+            for k in roster {
+                let r = rect(x, y, w, row_h);
+                let current = k == state.ws.active;
+                let (bg, fg) = if current {
+                    (theme::INK, theme::BG)
+                } else {
+                    (theme::BG, theme::INK)
+                };
+                self.draw_panel.color = rgba_a(bg, 1.0);
+                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, r);
+                self.set_text(Style::Big, 1.0);
+                self.draw_mono.color = rgba_a(fg, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(x + 16.0, y + (row_h - self.cell.natural * 1.25) / 2.0),
+                    &format!("{}", k + 1),
+                );
+                let ws = &state.ws.wss[k];
+                let summary = if ws.is_empty() {
+                    "new".to_string()
+                } else {
+                    let names: Vec<String> = ws
+                        .columns
+                        .iter()
+                        .flat_map(|c| c.panels.iter())
+                        .filter_map(|pid| ws.panels.get(pid).map(|p| state.panel_title(&p.kind)))
+                        .collect();
+                    names.join(" · ")
+                };
+                let cols = (((w - 56.0) / self.cell.adv).max(4.0)) as usize;
+                let summary = trunc(&summary, cols);
+                self.set_text(Style::N, 1.0);
+                self.draw_mono.color = rgba_a(fg, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(x + 48.0, y + (row_h - self.cell.natural) / 2.0),
+                    &summary,
+                );
+                self.hits.push(HitR {
+                    rect: r,
+                    act: Act::WsRow(k),
+                    cursor: MouseCursor::Hand,
+                    label: format!("workspace {}", k + 1),
+                });
+                y += row_h + row_gap;
+            }
         }
 
         // The toast, above everything.
@@ -3013,7 +3431,8 @@ impl Stage {
     }
 
     fn draw_panel_full(&mut self, cx: &mut Cx2d, state: &mut State, pid: PanelId, r: Rect, alpha: f64) {
-        let Some(panel) = state.ws.panels.get(&pid) else {
+        // Cross-workspace lookup: inactive spaces draw during the slide.
+        let Some(panel) = state.ws.panel(pid) else {
             return;
         };
         let kind = panel.kind.clone();

@@ -23,6 +23,8 @@ Everything below it belongs to the focused panel's content — which is what a
 future text-editor panel needs: the whole plain keyboard, no modes.
 
 - `cmd` + `←↓↑→` / `hjkl` — focus panels; `+shift` — move the focused panel
+- `cmd+1…9` — switch workspace; `cmd+shift+1…9` — move the focused panel to
+  that workspace and follow it
 - `cmd+w` — close the focused panel
 - `cmd+[` / `cmd+]` — consume into / expel out of a column;
   `cmd+,` / `cmd+.` — pull from the right / push the bottom out
@@ -34,6 +36,23 @@ future text-editor panel needs: the whole plain keyboard, no modes.
 
 Letter keys reach panels as text input, so key repeat and IME behave like
 typing; control keys (enter, arrows, backspace) are routed as key events.
+
+## Workspaces
+
+Nine numbered spaces on a vertical stack; a switch **slides** the viewport a
+workspace-height down or up (see [Panel Model](./panel-model.md)). On macOS
+the **menu bar mirrors them**: one menu per workspace worth showing — every
+occupied one plus the first empty slot — with the current number bracketed,
+and *Switch Here / Move Panel Here* items inside. (The bold app menu itself
+is AppKit-mandatory; it holds only Quit.) An empty workspace names itself in
+muted text, so switching onto a blank screen reads as a place, not a bug.
+
+On touch, a **two-finger swipe down** raises the workspaces overlay: one row
+per workspace (number + its panel titles, the current row inverted, the
+first empty slot offered as *new*). A tap on a row switches, a tap outside —
+or a two-finger swipe up, or `esc` — dismisses. There is no touch gesture
+for *moving* a panel between workspaces yet (see
+[Open Questions](./open-questions.md)).
 
 ## Mouse and trackpad
 
@@ -54,10 +73,13 @@ The same grammar, re-based on fingers:
 - **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
   A sideways one-finger drag means nothing (deliberately: it would fight
   taps and the workspace pan).
-- **two-finger horizontal drag** — pans the workspace strip, 1:1 while the
-  fingers are down; on release the camera **magnetises** to the nearest
-  column alignment (a column's left edge one gap in from the viewport's
-  left, or its right edge one gap in from the right) and springs there.
+- **two-finger drag** — the first move past the slop locks its axis.
+  Horizontal pans the workspace strip, 1:1 while the fingers are down; on
+  release the camera **magnetises** to the nearest column alignment (a
+  column's left edge one gap in from the viewport's left, or its right edge
+  one gap in from the right) and springs there. **Vertical, downward, raises
+  the workspaces overlay** (upward dismisses it), then the gesture goes
+  inert.
 - **long-press a panel header** — picks the panel up; it rides the finger
   (spring-following, so it trails with the same physics as everything else).
   While held, an **ink insertion bar previews the drop**, judged by the

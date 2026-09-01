@@ -1,0 +1,33 @@
+# Workspaces: cmd+№ switches (a vertical slide), cmd+shift+№ moves the
+# focused panel and follows it, a two-finger swipe down lists them in an
+# overlay whose rows switch on tap.
+wait 600
+shot ws-1
+# an empty workspace names itself
+key cmd+2
+wait 500
+shot ws-2-empty
+key cmd+1
+wait 500
+# move the focused inbox to workspace 3 and follow it there
+key cmd+shift+3
+wait 600
+shot ws-3-moved
+# the old space kept help; focus fell to it
+key cmd+1
+wait 500
+shot ws-1-after-move
+# the overlay: swipe down, rows are tappable
+pan2 0 260
+wait 400
+shot ws-overlay
+click "workspace 3"
+wait 600
+shot ws-3-via-overlay
+# swipe up dismisses it again
+pan2 0 260
+wait 300
+pan2 0 -260
+wait 300
+shot ws-overlay-closed
+quit

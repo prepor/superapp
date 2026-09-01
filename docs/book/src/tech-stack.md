@@ -2,16 +2,23 @@
 
 **Rust + Makepad** (GPU-rendered immediate-mode UI), macOS first, **android
 second** (Samsung Fold — two screens, so resizes are a first-class event).
-The same stack, and the same *vendored copy*, as mosaic in `rel.systems`:
+The same makepad generation as mosaic in `rel.systems`, but sourced
+directly:
 
-- `makepad-widgets` is a **path dependency** on
-  `../rel.systems/mosaic/third_party/makepad` — makepad pinned at mosaic's
-  commit with mosaic's patches applied. Run
-  `rel.systems/mosaic/scripts/vendor-makepad.sh` once to materialise it.
-  Superapp deliberately does not carry its own makepad: one pin, one patch
-  set, owned where the expertise is.
+- `makepad-widgets` (and the apple/objc sys crates) are **git dependencies
+  on upstream `makepad/makepad`, pinned to the same commit mosaic's vendor
+  pipeline uses** — no filesystem coupling between the repos, any checkout
+  builds. This is *plain* upstream: mosaic's three local patches are not
+  applied. The one superapp used was 0003 (present-while-occluded); without
+  it a fully covered window skips presents, so **e2e screenshots are only
+  meaningful in `--front` runs** — suite logic (hits, labels, steps) is
+  unaffected. If that trade stops being worth it, the fallback is a pushed
+  branch of the patched tree and the same `{ git, rev }` shape.
 - `makepad-apple-sys` / `makepad-objc-sys` for the few macOS calls makepad
   does not expose (screen geometry, activation, window screenshots).
+- The **macOS menu bar** is makepad's own `MacosMenu` API
+  (`cx.update_macos_menu`, clicks arrive as `Event::MacosMenuCommand`); the
+  workspace menus rebuild only when the roster or the active space changes.
 - The window is **borderless over the display's visible frame** (menu bar and
   Dock stay) — mosaic's shape, deliberately not a macOS fullscreen Space.
 - Toolchain via `mise` (`rust` stable); no other runtime dependencies.

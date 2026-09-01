@@ -17,7 +17,8 @@
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! type "hello"        — text into the focused field / panel keys
 //! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre
-//! pan2 -300           — two-finger horizontal workspace pan
+//! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
+//!                       (the workspaces overlay), `pan2 0 -260` swipes up
 //! holdmove "inbox" 400 0 — long-press the element, drag the panel, drop
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
@@ -63,8 +64,15 @@ pub enum Step {
         /// Vertical travel, points.
         dy: f64,
     },
-    /// A two-finger horizontal pan of the workspace by `dx` points.
-    Pan2(f64),
+    /// A two-finger pan by `(dx, dy)` points: horizontal pans the workspace
+    /// strip; vertical toggles the workspaces overlay (down opens, up
+    /// closes).
+    Pan2 {
+        /// Horizontal travel, points.
+        dx: f64,
+        /// Vertical travel, points.
+        dy: f64,
+    },
     /// Long-press the labelled element (a header picks the panel up), drag by
     /// `(dx, dy)`, and drop — unless `hold` keeps the drag alive (screenshot
     /// the preview, then `drop`).
@@ -157,7 +165,18 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                 }
             }
             "drop" => Step::Drop,
-            "pan2" => Step::Pan2(rest.parse().map_err(|_| err("expected dx"))?),
+            "pan2" => {
+                let mut it = rest.split_whitespace();
+                let dx: f64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| err("expected dx [dy]"))?;
+                let dy: f64 = match it.next() {
+                    Some(s) => s.parse().map_err(|_| err("expected dx [dy]"))?,
+                    None => 0.0,
+                };
+                Step::Pan2 { dx, dy }
+            }
             "quit" => Step::Quit,
             _ => return Err(err("unknown command")),
         });
@@ -282,7 +301,9 @@ mod tests {
                 dy: -120.0
             }
         );
-        assert_eq!(s[1], Step::Pan2(-300.0));
+        assert_eq!(s[1], Step::Pan2 { dx: -300.0, dy: 0.0 });
+        let v = parse("pan2 0 260").unwrap();
+        assert_eq!(v[0], Step::Pan2 { dx: 0.0, dy: 260.0 });
         assert_eq!(
             s[2],
             Step::HoldMove {
