@@ -6,7 +6,9 @@
 //! - a **panel** is kind + params and requests grid units on the workspace
 //!   grid (12×6 on desktop; the android shell switches 8×4 ⇄ 4×3 with the
 //!   fold); requests clamp to the active grid, and heights are honoured
-//!   literally — unused rows stay empty;
+//!   literally — unused rows stay empty. The kind's request is a floor: the
+//!   shell measures what a panel is about to show and may ask for more
+//!   ([`Ws::wishes`] — a long letter opens tall);
 //! - solid links **open joined**, dotted links **replace in place**, buttons
 //!   are side effects (links live in panel content, i.e. the shell);
 //! - a **join** is alive only while the child sits in the column immediately
@@ -39,7 +41,7 @@ impl Default for Grid {
 }
 
 /// A panel's kind, parameters included: the whole identity of what it shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// The legend + keys panel.
     Help,
@@ -74,6 +76,10 @@ pub enum Kind {
 impl Kind {
     /// Requested grid size, width × height — a wish, clamped to the active
     /// [`Grid`] by the workspace (an inbox asking 4×6 fills a 4×3 screen).
+    ///
+    /// The constant is what a kind asks for knowing nothing about its
+    /// content; a kind whose content varies in length (a letter) asks for
+    /// more through [`Ws::wishes`], and this stays its floor.
     #[must_use]
     pub fn grid(&self) -> (u32, u32) {
         match self {
@@ -240,6 +246,14 @@ pub struct Ws {
     pub focus: Option<PanelId>,
     /// Camera x target in strip coordinates.
     pub camera_x: f64,
+    /// Size wishes measured from content, keyed by what a panel shows. A
+    /// kind's [`Kind::grid`] is a constant, but a letter's length is not —
+    /// and this module cannot read a letter, so the shell measures and
+    /// leaves the answer here.
+    ///
+    /// Ephemeral physics, like the camera and the grid: never snapshotted,
+    /// re-derived by the shell whenever it recomputes targets.
+    pub wishes: HashMap<Kind, (u32, u32)>,
 }
 
 impl Ws {
@@ -270,12 +284,32 @@ impl Ws {
         self.grid = grid;
     }
 
+    /// What a kind asks for: the wish the shell measured from its content
+    /// if there is one, else the kind's constant.
+    #[must_use]
+    pub fn wish_of(&self, kind: &Kind) -> (u32, u32) {
+        self.wishes.get(kind).copied().unwrap_or_else(|| kind.grid())
+    }
+
+    /// Records a content-derived wish. The shell calls this before opening
+    /// a panel too — placement consults the wish, and a panel about to be
+    /// born has no id to hang one on yet.
+    pub fn wish(&mut self, kind: Kind, size: (u32, u32)) {
+        self.wishes.insert(kind, size);
+    }
+
+    /// Replaces every wish at once — the shell re-measures the lot each
+    /// time it recomputes targets, so kinds nothing shows any more drop out.
+    pub fn set_wishes(&mut self, wishes: HashMap<Kind, (u32, u32)>) {
+        self.wishes = wishes;
+    }
+
     /// A panel's requested grid size, clamped to the active grid.
     fn panel_grid(&self, pid: PanelId) -> (u32, u32) {
         let (w, h) = self
             .panels
             .get(&pid)
-            .map(|p| p.kind.grid())
+            .map(|p| self.wish_of(&p.kind))
             .unwrap_or((1, 1));
         (w.min(self.grid.w), h.min(self.grid.h))
     }
@@ -1134,6 +1168,24 @@ impl Wm {
         }
     }
 
+    /// Records a content-derived wish everywhere (see [`Ws::wish`]): what a
+    /// mail asks for is a property of the mail, not of the space it happens
+    /// to be read in.
+    pub fn wish(&mut self, kind: &Kind, size: (u32, u32)) {
+        for w in &mut self.wss {
+            w.wish(kind.clone(), size);
+        }
+    }
+
+    /// Replaces every workspace's wishes (see [`Ws::set_wishes`]). Every
+    /// space lays out on every sync — the one being switched away from
+    /// included — so they all need the same measurements.
+    pub fn set_wishes(&mut self, wishes: HashMap<Kind, (u32, u32)>) {
+        for w in &mut self.wss {
+            w.set_wishes(wishes.clone());
+        }
+    }
+
     /// The logical state worth keeping: what the store persists and boot
     /// restores. Ephemeral physics — cameras, grids — deliberately absent;
     /// the shell re-derives both.
@@ -1376,6 +1428,52 @@ mod tests {
         let msg_r = scene.panels.iter().find(|p| p.id == msg).unwrap().rect;
         // Inbox requests 6 rows, message 3: the message is about half as tall.
         assert!((msg_r.h / inbox_r.h - 0.5).abs() < 0.02);
+    }
+
+    /// A wish measured from content overrides the kind's constant — a long
+    /// letter takes the rows a short one leaves empty — and clamps to the
+    /// grid like any other request.
+    #[test]
+    fn a_measured_wish_overrides_the_kinds_constant() {
+        let mut ws = Ws::new();
+        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        ws.wish(Kind::Message { id: 1 }, (4, 6));
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
+        let tall = |ws: &mut Ws, pid| {
+            let scene = ws.scene(VP, opts());
+            scene.panels.iter().find(|p| p.id == pid).unwrap().rect.h
+        };
+        assert!(
+            (tall(&mut ws, msg) - tall(&mut ws, inbox)).abs() < 0.01,
+            "six rows asked, six rows given"
+        );
+        // The wish is a wish: a folded screen clamps it like the inbox's.
+        ws.set_grid(Grid { w: 4, h: 3 });
+        assert!((tall(&mut ws, msg) - tall(&mut ws, inbox)).abs() < 0.01);
+        assert!(tall(&mut ws, msg) < 900.0);
+        // And the mail it was measured from is what carries the wish:
+        // another letter in the same panel is back on the constant.
+        ws.set_grid(Grid::default());
+        ws.replace(msg, Kind::Message { id: 2 });
+        assert!((tall(&mut ws, msg) / tall(&mut ws, inbox) - 0.5).abs() < 0.02);
+    }
+
+    /// Placement consults the wish: a letter that wants the whole column
+    /// stops fitting under its neighbour and earns a column of its own.
+    #[test]
+    fn a_tall_letter_earns_its_own_column() {
+        let mut ws = Ws::new();
+        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let contact = ws.open(Kind::Contact { email: "vera@kovac.io".into() }, Some(inbox), false);
+        // Short (3 rows) under the contact (2): 5 of 6 rows, it fits.
+        let short = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
+        assert_eq!(ws.locate(short).unwrap().0, ws.locate(contact).unwrap().0);
+        ws.close(short);
+        // Long (6 rows): it cannot share, so a column is inserted for it.
+        ws.wish(Kind::Message { id: 2 }, (4, 6));
+        let long = ws.follow_open(inbox, Kind::Message { id: 2 }, false);
+        assert_ne!(ws.locate(long).unwrap().0, ws.locate(contact).unwrap().0);
+        assert_eq!(kinds(&ws), [vec!["inbox"], vec!["msg"], vec!["contact"]]);
     }
 
     #[test]

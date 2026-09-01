@@ -257,6 +257,27 @@ pub fn neighbours(store: &Store, id: MailId) -> (Option<MailId>, Option<MailId>)
     )
 }
 
+/// How many lines the letter reads as when wrapped at `cols` columns — how
+/// *long* a mail is, which is what the message panel's height wish is made
+/// of (the shell turns lines into grid rows).
+///
+/// The reading measured is the one the panel draws: the HTML when the
+/// sender sent one, the plain text otherwise. Wrapping is counted by
+/// character, so a real word wrap breaks a line or two earlier than this
+/// says; the wish rounds up to whole rows and swallows the difference.
+#[must_use]
+pub fn reading_lines(m: &MailFull, cols: usize) -> usize {
+    let text = match &m.html {
+        Some(h) => crate::html::plain(h),
+        None => m.body.clone(),
+    };
+    let cols = cols.max(1);
+    text.lines()
+        .map(|l| l.chars().count().div_ceil(cols).max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
 /// The panel's display title for a kind — what headers, tab strips, the
 /// overlay and the launcher all show. Data-carrying kinds resolve through
 /// the store (cached like everything else).
@@ -1177,6 +1198,23 @@ fn base_mails() -> Vec<SeedMail> {
             html: None,
             status: None,
         },
+        // The one long letter in the demo world: it does not fit a message
+        // panel's three rows, so the panel asks for more and opens tall.
+        SeedMail {
+            from_name: "Max Ivanov",
+            from_email: "max@ivanov.dev",
+            subject: "long version: what panels owe their content",
+            date: ts(2026, 8, 28, 9, 12),
+            unread: false,
+            body: "You asked for the long version, so here it is — the argument I could not fit into two lines yesterday.\n\n\
+                   What bothers me about every mail client I have used is that the reading pane is a fixed hole in the layout. A two-line \"ok, see you Thursday\" and a four-page release note are poured into the same box: one leaves most of it empty, the other is cut off a third of the way down. The box was sized for neither.\n\n\
+                   Your panels already know better. A panel asks for grid units — a request, rather than a rectangle handed down. But the request is a constant per kind, which makes it a guess about the average letter, and the average letter does not exist.\n\n\
+                   So let the kind's request be a floor rather than a promise. A short mail keeps its three rows — no reason to make a one-liner tall. A long one asks for as many rows as it needs, up to the whole column, and the grid clamps it there like it clamps everything else. Nothing new in the layout, just a better number going in.\n\n\
+                   The nice consequence is that the layout tells you something before you read a word: a column where one panel is visibly taller is a column where one letter is long. That is real information, and you got it for free.\n\n\
+                   Anyway — this letter is its own test case. If it opens in three rows you have proven my point; if it opens tall, yours.",
+            html: None,
+            status: None,
+        },
     ]
 }
 
@@ -1275,13 +1313,13 @@ mod tests {
         s
     }
 
-    /// The seed reproduces the demo world: 68 mails, m1/m2 unread, ids in
+    /// The seed reproduces the demo world: 69 mails, m1/m2 unread, ids in
     /// insert order (m1 = 1), newest first.
     #[test]
     fn seed_reproduces_the_demo_world() {
         let s = store();
         let rows = inbox(&s);
-        assert_eq!(rows.len(), 68);
+        assert_eq!(rows.len(), 69);
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].subject, "Q3 infra budget draft");
         assert!(rows[0].unread && rows[1].unread && !rows[2].unread);
@@ -1289,7 +1327,7 @@ mod tests {
         assert_eq!(me(&s), "me@prepor.dev");
         // Seeding an already-seeded store is a no-op.
         seed_if_empty(&s).unwrap();
-        assert_eq!(inbox(&s).len(), 68);
+        assert_eq!(inbox(&s).len(), 69);
     }
 
     /// The demo world carries one HTML sender, narrowed on the way in: the
@@ -1349,9 +1387,9 @@ mod tests {
         s.write(|c| mark_read_tx(c, 1)).unwrap();
         assert!(!inbox(&s)[0].unread);
         assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "archive moved it");
-        assert_eq!(inbox(&s).len(), 67);
+        assert_eq!(inbox(&s).len(), 68);
         assert_ne!(inbox(&s)[0].id, 1);
-        assert_eq!(all(&s).len(), 68, "archived mail stays in the corpus");
+        assert_eq!(all(&s).len(), 69, "archived mail stays in the corpus");
         let (name, n) = contact(&s, "vera@kovac.io");
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
     }
@@ -1364,9 +1402,9 @@ mod tests {
         let s = store();
         assert!(can_file(&s, 2, "trash"));
         assert!(s.write(|c| delete_tx(c, 2)).unwrap(), "delete moved it");
-        assert_eq!(inbox(&s).len(), 67);
+        assert_eq!(inbox(&s).len(), 68);
         assert!(!inbox(&s).iter().any(|m| m.id == 2));
-        assert_eq!(all(&s).len(), 68, "deleted mail stays in the corpus");
+        assert_eq!(all(&s).len(), 69, "deleted mail stays in the corpus");
 
         // An account without the folder: the mail must stay exactly where it
         // is. A fresh store, because the folder can only be dropped while
@@ -1377,6 +1415,31 @@ mod tests {
         assert!(!can_file(&s, 3, "trash"));
         assert!(!s.write(|c| delete_tx(c, 3)).unwrap(), "nothing to move to");
         assert!(inbox(&s).iter().any(|m| m.id == 3), "still in the inbox");
+    }
+
+    /// How long a letter is, counted in wrapped lines — the measure behind
+    /// a message panel's height wish. Paragraph breaks count as the blank
+    /// line they draw, and the reading measured is the one the panel shows.
+    #[test]
+    fn a_letters_length_is_counted_in_wrapped_lines() {
+        let s = store();
+        let vera = mail(&s, 1).expect("vera");
+        // Two paragraphs, wide enough not to wrap: two lines and the blank
+        // one between them.
+        assert_eq!(reading_lines(&vera, 1000), 3);
+        // The narrower the column, the more lines the same letter takes.
+        assert!(reading_lines(&vera, 40) > reading_lines(&vera, 80));
+        // The HTML sender is measured on its HTML — the reading the panel
+        // draws — so its list is lines rather than one long blob.
+        let gh = mail(&s, 2).expect("github");
+        assert!(reading_lines(&gh, 1000) >= 5, "{}", reading_lines(&gh, 1000));
+        // And the demo world's one long letter dwarfs them both.
+        let long = all(&s)
+            .iter()
+            .find(|m| m.subject.starts_with("long version"))
+            .and_then(|m| mail(&s, m.id))
+            .expect("the long letter");
+        assert!(reading_lines(&long, 60) > 4 * reading_lines(&vera, 60));
     }
 
     /// A trace records exactly what was read between begin and end — the
@@ -1395,7 +1458,7 @@ mod tests {
             t.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec!["inbox", "mail"]
         );
-        assert_eq!(t[0].rows, 68);
+        assert_eq!(t[0].rows, 69);
         assert_eq!(t[1].params, "1");
         assert!(t[0].describe.contains("inbox"));
     }

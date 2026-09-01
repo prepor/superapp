@@ -29,6 +29,13 @@ pub const GAP: f64 = 8.0;
 pub const HEAD_H: f64 = 26.0;
 /// Body text size, in points (renders ≈14 px, the web prototype's 13 px).
 pub const FONT_SIZE: f64 = 10.5;
+/// One mono character's advance, as a fraction of the font size. The face
+/// is measured at first draw; this is the ratio it comes out at, and what
+/// layout arithmetic uses before (and away from) that measurement.
+pub const MONO_ADV: f64 = 0.8;
+/// One line of body text, as a fraction of the font size — the web
+/// prototype's 1.5 line-height, on this grid.
+pub const LINE_H: f64 = 2.0;
 /// Label text size: uppercase tracked labels, headers, buttons.
 pub const LABEL_SIZE: f64 = 8.25;
 /// Extra tracking between label characters, as a fraction of the advance.
