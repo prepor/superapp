@@ -65,6 +65,21 @@ A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.
 
+**Sending** is the outbox pattern with the undo window built in. A compose
+panel's draft persists in the store *as you type* (plain upkeep — typing is
+the future editor's local undo, not the system's), keyed by the panel id,
+so half-written mail survives restarts. *Send* is an action: it files an
+outbox row with `send_after = now + 10 s` and closes the panel; `cmd+z`
+inside the window cancels it — the row's deletion *is* the undo, and the
+claim (`WHERE status='pending'`) means the race between undo and the
+sender has exactly one winner. The sender thread wakes at the deadline,
+submits over SMTP (rustls, port 465; reply headers thread via
+`In-Reply-To`), appends the sent bytes to the account's Sent folder over
+IMAP, and records the outcome. A delivered send is physics: the undo guard
+marks its action **expired** and the history walk skips it transparently.
+A *failed* send stays cancellable — the error toasts and `cmd+z` reopens
+the draft. The launcher's *new mail* root opens a blank compose.
+
 ## What stays out of the file
 
 - **Ephemeral physics**: spring positions, in-flight gestures, the caret

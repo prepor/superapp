@@ -29,6 +29,7 @@ use crate::core::{self, Dir, Kind, MailId, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
+use crate::send;
 use crate::store::Store;
 use crate::sync;
 use crate::spring::{Spring, SpringParams};
@@ -54,6 +55,8 @@ struct Config {
     /// Override the store's path (`--db PATH`). E2e runs default to a fresh
     /// temp file; normal runs to the platform data dir.
     db: Option<String>,
+    /// The send-undo window in seconds (`--send-delay 1` for e2e).
+    send_delay: f64,
 }
 
 fn parse_wxh(s: &str) -> Option<(f64, f64)> {
@@ -66,6 +69,7 @@ fn config() -> &'static Config {
     CONFIG.get_or_init(|| {
         let mut c = Config {
             out: "e2e/out".into(),
+            send_delay: 10.0,
             ..Default::default()
         };
         let mut args = std::env::args().skip(1);
@@ -88,6 +92,11 @@ fn config() -> &'static Config {
                 }
                 "--window" => c.window = args.next().and_then(|s| parse_wxh(&s)),
                 "--db" => c.db = args.next(),
+                "--send-delay" => {
+                    if let Some(d) = args.next().and_then(|s| s.parse().ok()) {
+                        c.send_delay = d;
+                    }
+                }
                 other => eprintln!("superapp: ignoring unknown argument {other:?}"),
             }
         }
@@ -496,6 +505,8 @@ struct PanelUi {
     set_pass: TextField,
     set_imap: TextField,
     set_smtp: TextField,
+    /// The draft as last persisted (compose panels; skip no-op saves).
+    draft_saved: Option<mail::Draft>,
 }
 
 impl PanelUi {
@@ -515,7 +526,7 @@ impl PanelUi {
 }
 
 impl PanelUi {
-    fn for_kind(kind: &Kind, store: &Store) -> Self {
+    fn for_kind(kind: &Kind, store: &Store, pid: PanelId) -> Self {
         let mut ui = PanelUi {
             kind: kind.clone(),
             sel: None,
@@ -531,6 +542,7 @@ impl PanelUi {
             set_pass: TextField::default(),
             set_imap: TextField::default(),
             set_smtp: TextField::default(),
+            draft_saved: None,
         };
         match kind {
             Kind::Inbox { filter } => {
@@ -551,12 +563,28 @@ impl PanelUi {
             // constructor's, which also runs on boot restore.
             Kind::Message { .. } => {}
             Kind::Compose { re } => {
-                if let Some(m) = mail::mail(store, *re) {
+                // A persisted draft (boot restore, undo) wins over the
+                // reply prefill.
+                if let Some(d) = mail::draft(store, pid as i64) {
+                    ui.to.text = d.to;
+                    ui.subject.text = d.subject;
+                    ui.body = if d.body.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        d.body.split('\n').map(str::to_string).collect()
+                    };
+                    ui.caret = (ui.body.len() - 1, ui.body.last().map_or(0, |l| l.chars().count()));
+                    ui.draft_saved = Some(mail::Draft {
+                        to: ui.to.text.clone(),
+                        subject: ui.subject.text.clone(),
+                        body: ui.body.join("\n"),
+                    });
+                } else if let Some(m) = mail::mail(store, *re) {
                     ui.to.text = m.head.from_email;
-                    ui.to.caret = ui.to.text.chars().count();
                     ui.subject.text = format!("Re: {}", m.head.subject);
-                    ui.subject.caret = ui.subject.text.chars().count();
                 }
+                ui.to.caret = ui.to.text.chars().count();
+                ui.subject.caret = ui.subject.text.chars().count();
             }
             _ => {}
         }
@@ -923,6 +951,10 @@ struct State {
     db_path: Option<std::path::PathBuf>,
     /// One IMAP worker per configured account.
     workers: Vec<sync::Worker>,
+    /// The outbox sender thread.
+    sender: Option<send::Sender>,
+    /// Failed outbox rows already toasted (new ones toast on signal).
+    failed_seen: usize,
     /// The last persisted logical snapshot — [`State::sync`] only writes
     /// when the state actually changed.
     last_saved: Option<core::WmSnap>,
@@ -1006,6 +1038,8 @@ impl State {
             store,
             db_path,
             workers: Vec::new(),
+            sender: None,
+            failed_seen: 0,
             last_saved: None,
             ui: HashMap::new(),
             anim: Anim::default(),
@@ -1053,7 +1087,7 @@ impl State {
                 None => true,
             };
             if fresh {
-                let ui = PanelUi::for_kind(kind, &self.store);
+                let ui = PanelUi::for_kind(kind, &self.store, *pid);
                 if matches!(kind, Kind::Compose { .. }) {
                     self.field = Some((*pid, FieldId::Body));
                 }
@@ -1151,9 +1185,13 @@ impl State {
         }
         self.last_saved = Some(snap);
         // Push soon: whatever this action changed about mail intent, a
-        // worker makes the server agree without waiting for the poll.
+        // worker makes the server agree without waiting for the poll —
+        // and the sender re-times its next deadline.
         for w in &self.workers {
             w.kick();
+        }
+        if let Some(s) = &self.sender {
+            s.kick();
         }
     }
 
@@ -1168,6 +1206,34 @@ impl State {
         self.act(kind, label, entity, mutate, |_| Ok(()));
     }
 
+    /// Persists compose drafts that changed since their last save — typing
+    /// upkeep, not actions (see the book on what undo deliberately isn't).
+    fn persist_drafts(&mut self) {
+        let composes: Vec<(PanelId, Option<MailId>)> = self
+            .ws
+            .wss
+            .iter()
+            .flat_map(|w| w.panels.values())
+            .filter_map(|p| match p.kind {
+                Kind::Compose { re } => Some((p.id, (re != 0).then_some(re))),
+                _ => None,
+            })
+            .collect();
+        for (pid, re) in composes {
+            let Some(ui) = self.ui.get_mut(&pid) else { continue };
+            let d = mail::Draft {
+                to: ui.to.text.clone(),
+                subject: ui.subject.text.clone(),
+                body: ui.body.join("\n"),
+            };
+            if ui.draft_saved.as_ref() == Some(&d) {
+                continue;
+            }
+            mail::save_draft(&self.store, pid as i64, re, &d);
+            ui.draft_saved = Some(d);
+        }
+    }
+
     /// Spawns a sync worker for every configured account that lacks one.
     /// Idempotent — call after boot and after adding an account. Workers
     /// for removed accounts retire themselves.
@@ -1175,6 +1241,11 @@ impl State {
         let Some(db) = self.db_path.clone() else {
             return;
         };
+        if self.sender.is_none() {
+            self.sender = Some(send::spawn(db.clone(), || {
+                SignalToUI::set_ui_signal();
+            }));
+        }
         self.workers.retain(|w| {
             mail::accounts(&self.store).iter().any(|a| a.id == w.account)
         });
@@ -1969,6 +2040,11 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
 
 impl Stage {
     fn kick(&mut self, cx: &mut Cx) {
+        // Compose drafts persist as they are typed (plain upkeep, not
+        // actions): every edit path funnels through kick.
+        if let Some(state) = self.state.as_deref_mut() {
+            state.persist_drafts();
+        }
         // makepad only routes keys to the system IME — which is what emits
         // TextInput events — while the IME is shown. On macOS letter keys
         // (j/k/r, "/", field typing) all arrive that way, so the IME stays on
@@ -3206,22 +3282,57 @@ impl Stage {
                         }
                     }
                     BtnAct::Send => {
-                        let to = state
+                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                            _ => None,
+                        };
+                        let d = state
                             .ui
                             .get(&pid)
-                            .map(|u| u.to.text.clone())
+                            .map(|u| mail::Draft {
+                                to: u.to.text.trim().to_string(),
+                                subject: u.subject.text.clone(),
+                                body: u.body.join("\n"),
+                            })
                             .unwrap_or_default();
-                        state.toast(format!("sent to {to} (fake)"), false);
-                        let label = format!("close “{}”", state.title_of(pid));
-                        state.act_nav("close", label, None, move |ws| {
-                            ws.close(pid);
-                        });
+                        if d.to.is_empty() {
+                            state.toast("no recipient", true);
+                        } else {
+                            let delay = config().send_delay;
+                            let subject = if d.subject.is_empty() {
+                                "(no subject)".into()
+                            } else {
+                                d.subject.clone()
+                            };
+                            state.act(
+                                "send",
+                                format!("send “{subject}”"),
+                                Some(format!("outbox:{pid}")),
+                                move |ws| {
+                                    ws.close(pid);
+                                },
+                                move |tx| {
+                                    mail::upsert_draft_tx(tx, pid as i64, re, &d)?;
+                                    mail::file_send_tx(tx, pid as i64, delay)
+                                },
+                            );
+                            state.toast(
+                                format!("sending in {}s — ⌘z undoes", delay as u32),
+                                false,
+                            );
+                        }
                     }
                     BtnAct::Discard => {
                         let label = format!("discard “{}”", state.title_of(pid));
-                        state.act_nav("close", label, None, move |ws| {
-                            ws.close(pid);
-                        });
+                        state.act(
+                            "close",
+                            label,
+                            None,
+                            move |ws| {
+                                ws.close(pid);
+                            },
+                            move |tx| mail::discard_draft_tx(tx, pid as i64),
+                        );
                     }
                 }
                 self.sync(cx);
@@ -3473,7 +3584,11 @@ impl Widget for Stage {
                 if let Err(e) = mail::seed_if_empty(&store) {
                     eprintln!("store: seeding demo mail failed: {e}");
                 }
+                // A delivered send can no longer be undone — the walk
+                // marks it expired and steps past.
+                store.set_undo_guard(mail::send_locked);
                 let mut s = State::new(store, path);
+                s.failed_seen = mail::outbox_failures(&s.store).len();
                 s.spawn_workers();
                 s.sync();
                 self.state = Some(Box::new(s));
@@ -3529,6 +3644,15 @@ impl Widget for Stage {
                 if SignalToUI::check_and_clear_ui_signal() {
                     if let Some(state) = self.state.as_deref_mut() {
                         if state.store.poll_external() {
+                            // A fresh send failure deserves a toast; the
+                            // row itself stays cancellable via cmd+z.
+                            let failures = mail::outbox_failures(&state.store);
+                            if failures.len() > state.failed_seen {
+                                if let Some((_, err)) = failures.last() {
+                                    state.toast(format!("send failed: {err} — ⌘z reopens"), true);
+                                }
+                            }
+                            state.failed_seen = failures.len();
                             cx.redraw_all();
                         }
                     }
@@ -4525,7 +4649,7 @@ impl Stage {
         let max_scroll = (content_h - view_h).max(0.0);
         let (scroll, sel, caret_focus) = {
             let ui = state.ui.entry(pid).or_insert_with(|| {
-                PanelUi::for_kind(&kind, &state.store)
+                PanelUi::for_kind(&kind, &state.store, pid)
             });
             ui.max_scroll = max_scroll;
             ui.view_h = view_h;

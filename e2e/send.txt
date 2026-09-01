@@ -1,0 +1,24 @@
+# The send walk (run with --send-delay 1): file a send, cancel it inside
+# the window, file it again, watch the sender fail it honestly (the demo
+# account has no smtp host), and reopen the draft with cmd+z.
+wait 700
+click "Q3 infra"
+wait 500
+click "reply"
+wait 500
+type "Thanks — looks good, will check egress today."
+wait 300
+shot n1-compose
+click "send"
+wait 400
+shot n2-filed
+key cmd+z
+wait 600
+shot n3-cancelled
+click "send"
+wait 2500
+shot n4-failed
+key cmd+z
+wait 600
+shot n5-reopened
+quit

@@ -296,7 +296,14 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    restores the server. Simpler than the sketch and strictly more honest;
    COPYUID-less moves re-identify by Message-ID. Offline = intent waits.
 5. **Send.** Drafts persist; outbox with a 10 s window; SMTP worker; undo-send;
-   Sent append.
+   Sent append. — **landed 2026-09-01**: drafts keyed by panel id (typing
+   persists outside actions; survives restarts); outbox row id = panel id,
+   so the undo entity exists before the row; pending-claim makes undo vs
+   sender atomic; delivered sends expire via a store-level undo *guard*
+   (domain judgement injected by the shell); failures toast and stay
+   cancellable; lettre/rustls SMTP + IMAP APPEND to Sent; `--send-delay`
+   for e2e; a *new mail* launcher root. Real-server submission awaits a
+   real account (unit-tested via a Mailer fake).
 6. **The history overlay.** The DAG made visible and walkable; jumping =
    replaying compensations along the path. Entry point decided then.
 7. **Panel context.** The trace serialized behind a shortcut.

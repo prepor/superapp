@@ -512,6 +512,23 @@ pub mod imap_transport {
         })
     }
 
+    /// One-shot `APPEND` (the sender files sent mail into the Sent folder).
+    pub fn append(
+        host: &str,
+        user: &str,
+        pass: &str,
+        folder: &str,
+        raw: &[u8],
+    ) -> Result<(), String> {
+        let mut t = connect(host, user, pass)?;
+        t.session
+            .append(folder, raw)
+            .flag(imap::types::Flag::Seen)
+            .finish()
+            .map_err(s)?;
+        Ok(())
+    }
+
     impl Imap {
         fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
             let mb = self.session.select(name).map_err(s)?;

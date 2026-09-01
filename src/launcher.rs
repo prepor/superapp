@@ -166,6 +166,7 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
 
     for kind in [
         Kind::Inbox { filter: None },
+        Kind::Compose { re: 0 },
         Kind::Settings,
         Kind::Help,
         Kind::About,
@@ -216,15 +217,17 @@ mod tests {
         let (wm, store) = world();
         let hits = search(&wm, &store, "");
         // Open help + inbox, then the unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 4);
+        assert_eq!(hits.len(), 5);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
         assert!(matches!(hits[1].go, Go::Focus(_)));
-        assert_eq!(hits[2].label, "settings");
-        assert!(matches!(hits[2].go, Go::Open(Kind::Settings)));
-        assert_eq!(hits[3].label, "about");
-        assert!(matches!(hits[3].go, Go::Open(Kind::About)));
+        assert_eq!(hits[2].label, "new mail");
+        assert!(matches!(hits[2].go, Go::Open(Kind::Compose { re: 0 })));
+        assert_eq!(hits[3].label, "settings");
+        assert!(matches!(hits[3].go, Go::Open(Kind::Settings)));
+        assert_eq!(hits[4].label, "about");
+        assert!(matches!(hits[4].go, Go::Open(Kind::About)));
     }
 
     #[test]

@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 mail-parser = "0.11"
 # Upstream makepad, pinned to the same commit mosaic's vendor pipeline uses
 # (makepad@dev). Plain upstream — none of mosaic's patches; the one superapp

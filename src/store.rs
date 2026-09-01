@@ -84,6 +84,10 @@ pub struct Store {
     redraw: Cell<bool>,
     /// Last seen `PRAGMA data_version` (foreign-commit detector).
     data_version: Cell<i64>,
+    /// Answers "can this action no longer be undone?" (an expired send).
+    /// Domain knowledge injected by the shell; the walk marks such nodes
+    /// `expired` and skips them transparently.
+    undo_guard: RefCell<Option<Box<dyn Fn(&Connection, &str, Option<&str>) -> bool>>>,
 }
 
 /// Schema v1. UI tables are mutated only through actions (phase 2 formalizes
@@ -211,12 +215,41 @@ ALTER TABLE message DROP COLUMN uid;
 ALTER TABLE message DROP COLUMN dirty;
 ";
 
+/// Schema v5 (CR-001 phase 5): drafts and the outbox. A draft belongs to
+/// its compose **panel** (panel ids are stable and persisted), so
+/// half-written text survives restarts; an outbox row shares the panel's
+/// id — one pending send per compose, and the undo entity (`outbox:N`) is
+/// known before the row exists.
+const SCHEMA_V5: &str = "
+CREATE TABLE draft(
+  panel      INTEGER PRIMARY KEY,
+  account    INTEGER,
+  re_message INTEGER,
+  to_addr    TEXT NOT NULL DEFAULT '',
+  subject    TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL DEFAULT '',
+  updated    REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE outbox(
+  id         INTEGER PRIMARY KEY,
+  account    INTEGER NOT NULL,
+  send_after REAL NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  error      TEXT
+);
+";
+
 /// The tables sessions record — the undoable world. `action` and `meta`
 /// (the head pointer) stay outside it — undo must never rewrite history's
 /// own bookkeeping — and so does `server_msg`: what the server holds is
 /// fact, not intent, and executor writes must never collide with undo.
-const ACTION_TABLES: [&str; 7] = [
-    "account", "folder", "message", "workspace", "ws_col", "panel", "wm",
+/// `draft` and `outbox` are in — undoing a discard restores the text,
+/// undoing a send cancels the pending row. (Typing itself never records:
+/// keystrokes are plain writes outside `act`, the future editor's local
+/// undo, not the system's.)
+const ACTION_TABLES: [&str; 9] = [
+    "account", "folder", "message", "workspace", "ws_col", "panel", "wm", "draft",
+    "outbox",
 ];
 
 /// Actions of the same kind on the same entity within this window amend the
@@ -263,6 +296,10 @@ impl Store {
             conn.execute_batch(SCHEMA_V4)?;
             conn.pragma_update(None, "user_version", 4)?;
         }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5)?;
+            conn.pragma_update(None, "user_version", 5)?;
+        }
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         let d = dirty.clone();
@@ -280,6 +317,7 @@ impl Store {
             cache: RefCell::default(),
             redraw: Cell::new(false),
             data_version: Cell::new(-1),
+            undo_guard: RefCell::new(None),
         })
     }
 
@@ -684,11 +722,19 @@ impl Store {
         Ok(out)
     }
 
+    /// Injects the domain judgement for irreversibility (see `undo_guard`).
+    pub fn set_undo_guard(
+        &self,
+        guard: impl Fn(&Connection, &str, Option<&str>) -> bool + 'static,
+    ) {
+        *self.undo_guard.borrow_mut() = Some(Box::new(guard));
+    }
+
     /// Undoes the head action: applies its inverted changeset (conflicting
     /// rows — changed since by ingest — are skipped, not forced), marks it
     /// undone, moves HEAD to its parent. An `expired` head (a send past its
-    /// window, phase 5) is skipped over transparently. Returns the undone
-    /// action's label.
+    /// window) is skipped over transparently. Returns the undone action's
+    /// label.
     pub fn undo(&self) -> rusqlite::Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
         let mut head = self.head(&tx)?;
@@ -697,12 +743,37 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            let (parent, label, state, fwd): (i64, String, String, Vec<u8>) = tx.query_row(
-                "SELECT parent, label, state, fwd FROM action WHERE id=?1",
+            let (parent, label, state, kind, entity, fwd): (
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                Vec<u8>,
+            ) = tx.query_row(
+                "SELECT parent, label, state, kind, entity, fwd FROM action WHERE id=?1",
                 [head],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )?;
-            if state == "expired" {
+            let now_expired = state != "expired"
+                && self
+                    .undo_guard
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|g| g(&tx, &kind, entity.as_deref()));
+            if now_expired {
+                tx.execute("UPDATE action SET state='expired' WHERE id=?1", [head])?;
+            }
+            if state == "expired" || now_expired {
                 // Transparent: the world can't roll it back; walk past it.
                 self.set_head(&tx, parent)?;
                 head = parent;
@@ -962,8 +1033,8 @@ mod tests {
 
         let mut wm = Wm::new();
         let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
-        let msg = wm.follow_open(inbox, Kind::Message { id: 3 }, false);
-        wm.send_focused_to(4); // msg re-homes to ws 5
+        let _msg = wm.follow_open(inbox, Kind::Message { id: 3 }, false);
+        wm.send_focused_to(4); // the message re-homes to ws 5
         wm.switch(0);
         wm.toggle_tabbed(inbox); // a surviving tabbed column
         wm.follow_open(inbox, Kind::Contact { email: "v@k.io".into() }, false);

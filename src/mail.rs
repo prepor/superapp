@@ -298,6 +298,133 @@ pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> 
     Ok(())
 }
 
+// -- drafts and the send window ----------------------------------------------
+
+/// A compose panel's persisted draft.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Draft {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// Loads a panel's draft, if any (boot restore, prefill).
+pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
+    store
+        .conn()
+        .query_row(
+            "SELECT to_addr, subject, body FROM draft WHERE panel=?1",
+            [panel],
+            |r| {
+                Ok(Draft {
+                    to: r.get(0)?,
+                    subject: r.get(1)?,
+                    body: r.get(2)?,
+                })
+            },
+        )
+        .ok()
+}
+
+/// Persists a compose panel's fields — plain typing upkeep, deliberately
+/// **not** an action (text editing is the future editor's local undo).
+/// The caller skips no-op saves; this just writes.
+pub fn save_draft(store: &Store, panel: i64, re: Option<MailId>, d: &Draft) {
+    let _ = store.write(|c| {
+        upsert_draft_tx(c, panel, re, d)?;
+        Ok(())
+    });
+}
+
+/// The transaction-level draft upsert (also part of the send action, so
+/// the recorded changeset carries the final content).
+pub fn upsert_draft_tx(
+    c: &rusqlite::Connection,
+    panel: i64,
+    re: Option<MailId>,
+    d: &Draft,
+) -> rusqlite::Result<()> {
+    let account: Option<i64> = re
+        .and_then(|id| {
+            c.query_row("SELECT account FROM message WHERE id=?1", [id], |r| r.get(0))
+                .ok()
+        })
+        .or_else(|| {
+            c.query_row(
+                "SELECT id FROM account
+                 WHERE COALESCE(smtp_host,'') != '' ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        })
+        .or_else(|| c.query_row("SELECT id FROM account ORDER BY id LIMIT 1", [], |r| r.get(0)).ok());
+    c.execute(
+        "INSERT INTO draft(panel, account, re_message, to_addr, subject, body, updated)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(panel) DO UPDATE SET
+           to_addr=excluded.to_addr, subject=excluded.subject,
+           body=excluded.body, updated=excluded.updated",
+        rusqlite::params![panel, account, re, d.to, d.subject, d.body, crate::store::now()],
+    )?;
+    Ok(())
+}
+
+/// Files the outbox row for a send action — the row id is the panel id, so
+/// the undo entity (`outbox:{panel}`) exists before the row does.
+pub fn file_send_tx(
+    c: &rusqlite::Connection,
+    panel: i64,
+    delay: f64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO outbox(id, account, send_after, status, error)
+         SELECT panel, COALESCE(account, 1), ?2, 'pending', NULL FROM draft WHERE panel=?1",
+        rusqlite::params![panel, crate::store::now() + delay],
+    )?;
+    Ok(())
+}
+
+/// The undo guard: a send whose outbox row is mid-flight or delivered can
+/// no longer be undone (the walk marks it expired). Pending and failed
+/// rows stay cancellable.
+pub fn send_locked(c: &rusqlite::Connection, kind: &str, entity: Option<&str>) -> bool {
+    if kind != "send" {
+        return false;
+    }
+    let Some(id) = entity
+        .and_then(|e| e.strip_prefix("outbox:"))
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return false;
+    };
+    matches!(
+        c.query_row("SELECT status FROM outbox WHERE id=?1", [id], |r| {
+            r.get::<_, String>(0)
+        }),
+        Ok(s) if s == "sending" || s == "sent"
+    )
+}
+
+/// Discard: the draft goes with the panel (both revert on undo).
+pub fn discard_draft_tx(c: &rusqlite::Connection, panel: i64) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM draft WHERE panel=?1", [panel])?;
+    Ok(())
+}
+
+/// Outbox rows that failed — surfaced as toasts and on settings.
+pub fn outbox_failures(store: &Store) -> Vec<(i64, String)> {
+    let Ok(mut stmt) = store
+        .conn()
+        .prepare("SELECT id, COALESCE(error,'send failed') FROM outbox WHERE status='failed' ORDER BY id")
+    else {
+        return Vec::new();
+    };
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|it| it.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
 // -- dates -------------------------------------------------------------------
 
 const MONTHS: [&str; 12] = [
