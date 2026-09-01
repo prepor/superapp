@@ -33,6 +33,13 @@ current state; everything else in this book is settled.
    nothing records focus history yet. Whether the launcher (and alt-tab-like
    switching generally) wants an MRU model is open until real use hurts.
 
+10. **The semantic component library** (`src/ui.rs`) is a seed: sections,
+    field rows, action rows, the tab/enter walk. Its growth path — richer
+    field behaviour (click-to-caret, selection), denser tables, a real
+    layout pass instead of the char grid's fixed columns — is the same arc
+    as the future text editor panel. Grown by need, stelaxis-style: name
+    the meaning, never the pixels.
+
 Settled since the last revision: workspaces — nine numbered, vertical slide,
 menu bar on macOS, two-finger-swipe-down overlay on touch (see [Panel
 Model](./panel-model.md) and [Interaction

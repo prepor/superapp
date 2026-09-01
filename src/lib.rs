@@ -13,6 +13,7 @@
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
+//! | [`ui`] | the semantic content vocabulary: lines, fields, forms | no |
 //! | [`theme`] | the look: sizes and colours | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
 //!
@@ -31,3 +32,4 @@ pub mod spring;
 pub mod store;
 pub mod sync;
 pub mod theme;
+pub mod ui;

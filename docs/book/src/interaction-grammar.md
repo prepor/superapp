@@ -33,6 +33,8 @@ future text-editor panel needs: the whole plain keyboard, no modes.
 - inbox: `j`/`k` row cursor (scrolls the list to keep it visible), `enter`
   opens (`cmd+enter` un-joined), `/` filter
 - message: `j`/`k` older/newer in place, `r` reply
+- forms: `tab` / `shift+tab` walk the fields; on settings, `enter` advances
+  too and **submits past the last field**
 - `esc` leaves a text field; arrows scroll a panel that has nothing better to do
 
 Letter keys reach panels as text input, so key repeat and IME behave like

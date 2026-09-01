@@ -344,7 +344,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let out = match f(&tx) {
             Ok(v) => v,
             Err(e) => {
@@ -710,7 +710,7 @@ impl Store {
         for t in ACTION_TABLES {
             sess.attach(Some(t))?;
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let out = match f(&tx) {
             Ok(v) => v,
             Err(e) => {
@@ -788,7 +788,7 @@ impl Store {
     /// window) is skipped over transparently. Returns the undone action's
     /// label.
     pub fn undo(&self) -> rusqlite::Result<Option<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let mut head = self.head(&tx)?;
         loop {
             if head == 0 {
@@ -849,7 +849,7 @@ impl Store {
     /// Redoes the most recent undone child of HEAD (the default branch) and
     /// moves HEAD onto it. Returns its label.
     pub fn redo(&self) -> rusqlite::Result<Option<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let head = self.head(&tx)?;
         let child: Option<(i64, String, Vec<u8>)> = tx
             .query_row(
@@ -880,7 +880,7 @@ impl Store {
     /// transparent in both directions (their effects are physics). `0` is
     /// the origin — undo everything. Returns the target's label.
     pub fn travel(&self, target: i64) -> rusqlite::Result<Option<String>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let chain = |from: i64| -> rusqlite::Result<Vec<i64>> {
             let mut v = vec![from];
             let mut cur = from;

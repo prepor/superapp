@@ -34,6 +34,9 @@ use crate::store::Store;
 use crate::sync;
 use crate::spring::{Spring, SpringParams};
 use crate::theme;
+use crate::ui::{
+    self, char_byte, kbd, pad_to, trunc, wrap, BtnAct, FieldId, Line, Seg, Style, TextField,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -265,227 +268,6 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Content model: panel bodies as styled lines on a character grid
-// ---------------------------------------------------------------------------
-
-/// Text styles the content grammar needs. Everything monochrome except `Err`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Style {
-    /// Body text.
-    N,
-    /// Fake-bold body text (unread rows).
-    Bold,
-    /// A bigger fake-bold heading (the contact name).
-    Big,
-    /// Secondary.
-    T2,
-    /// Muted.
-    Muted,
-    /// Uppercase small tracked label.
-    Label,
-    /// The one colour: errors.
-    Err,
-}
-
-impl Style {
-    fn color(self) -> theme::Rgba {
-        match self {
-            Style::N | Style::Bold | Style::Big => theme::INK,
-            Style::T2 => theme::TEXT2,
-            Style::Muted => theme::MUTED,
-            Style::Label => theme::TEXT2,
-            Style::Err => theme::ERR,
-        }
-    }
-    fn size(self) -> f64 {
-        match self {
-            Style::Label => theme::LABEL_SIZE,
-            Style::Big => theme::FONT_SIZE * 1.25,
-            _ => theme::FONT_SIZE,
-        }
-    }
-}
-
-/// Side-effect buttons (never navigation).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum BtnAct {
-    Refresh,
-    Archive,
-    Send,
-    Discard,
-    TryIt,
-    /// Settings: create the account from the form fields.
-    AddAccount,
-    /// Settings: remove this account (and its mail).
-    RemoveAccount(i64),
-}
-
-/// Text fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldId {
-    Filter,
-    To,
-    Subject,
-    Body,
-    /// Settings form: address, app password, IMAP host, SMTP host.
-    SetEmail,
-    SetPass,
-    SetImap,
-    SetSmtp,
-}
-
-/// One run inside a line.
-#[derive(Debug, Clone)]
-enum Seg {
-    /// Plain text.
-    T(String, Style),
-    /// A link: solid underline opens joined, dotted replaces in place.
-    Link {
-        label: String,
-        target: Kind,
-        dotted: bool,
-    },
-    /// A bordered side-effect button.
-    Btn { label: String, act: BtnAct },
-    /// A bordered, inert key-cap chip.
-    Kbd(String),
-    /// A single-line text field, `w` chars wide.
-    Fld { id: FieldId, w: usize },
-    /// Horizontal gap, in chars.
-    Sp(usize),
-}
-
-impl Seg {
-    fn chars(&self) -> usize {
-        match self {
-            Seg::T(s, _) => s.chars().count(),
-            Seg::Link { label, .. } => label.chars().count(),
-            Seg::Btn { label, .. } => label.chars().count() + 2,
-            Seg::Kbd(s) => s.chars().count() + 2,
-            Seg::Fld { w, .. } => *w,
-            Seg::Sp(n) => *n,
-        }
-    }
-}
-
-/// One line of panel content: left-aligned runs, right-aligned runs, an
-/// optional hairline under it, and an optional full-row selection identity.
-#[derive(Debug, Clone, Default)]
-struct Line {
-    left: Vec<Seg>,
-    right: Vec<Seg>,
-    rule: bool,
-    /// Draw the rule in ink (table headers) instead of the hairline grey.
-    rule_ink: bool,
-    /// This line is a selectable inbox row for the given mail.
-    row: Option<MailId>,
-    /// Pinned above the scrolling region (the filter, table headers). Only a
-    /// leading run of pinned lines is honoured.
-    pin: bool,
-}
-
-impl Line {
-    fn text(s: impl Into<String>, st: Style) -> Self {
-        Line {
-            left: vec![Seg::T(s.into(), st)],
-            ..Default::default()
-        }
-    }
-    fn blank() -> Self {
-        Line::default()
-    }
-}
-
-fn trunc(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
-fn pad_to(s: &str, w: usize) -> String {
-    let mut out = trunc(s, w);
-    let n = out.chars().count();
-    out.extend(std::iter::repeat(' ').take(w.saturating_sub(n)));
-    out
-}
-
-fn wrap(s: &str, cols: usize) -> Vec<String> {
-    let cols = cols.max(8);
-    let mut lines = Vec::new();
-    let mut cur = String::new();
-    let mut cur_n = 0usize;
-    for word in s.split(' ') {
-        let wn = word.chars().count();
-        if cur_n > 0 && cur_n + 1 + wn > cols {
-            lines.push(std::mem::take(&mut cur));
-            cur_n = 0;
-        }
-        if cur_n > 0 {
-            cur.push(' ');
-            cur_n += 1;
-        }
-        cur.push_str(word);
-        cur_n += wn;
-    }
-    if !cur.is_empty() || lines.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
-// ---------------------------------------------------------------------------
-// Per-panel volatile UI state
-// ---------------------------------------------------------------------------
-
-/// A single-line text field.
-#[derive(Debug, Clone, Default)]
-struct TextField {
-    text: String,
-    caret: usize, // chars
-}
-
-impl TextField {
-    fn insert(&mut self, s: &str) {
-        let byte = char_byte(&self.text, self.caret);
-        self.text.insert_str(byte, s);
-        self.caret += s.chars().count();
-    }
-    fn backspace(&mut self) {
-        if self.caret == 0 {
-            return;
-        }
-        let b0 = char_byte(&self.text, self.caret - 1);
-        let b1 = char_byte(&self.text, self.caret);
-        self.text.replace_range(b0..b1, "");
-        self.caret -= 1;
-    }
-    fn delete(&mut self) {
-        if self.caret >= self.text.chars().count() {
-            return;
-        }
-        let b0 = char_byte(&self.text, self.caret);
-        let b1 = char_byte(&self.text, self.caret + 1);
-        self.text.replace_range(b0..b1, "");
-    }
-    fn left(&mut self) {
-        self.caret = self.caret.saturating_sub(1);
-    }
-    fn right(&mut self) {
-        self.caret = (self.caret + 1).min(self.text.chars().count());
-    }
-}
-
-fn char_byte(s: &str, ch: usize) -> usize {
-    s.char_indices()
-        .nth(ch)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
-}
 
 /// What a panel keeps between frames and loses on replacement.
 #[derive(Debug, Clone)]
@@ -1296,11 +1078,6 @@ impl State {
 
 // ---------------------------------------------------------------------------
 // Content builders
-// ---------------------------------------------------------------------------
-
-fn kbd(s: &str) -> Seg {
-    Seg::Kbd(s.to_string())
-}
 
 fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
     // Cross-workspace lookup: panels on inactive spaces draw mid-slide too.
@@ -1321,15 +1098,14 @@ fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
 
 /// The settings panel: every account with its sync status, and the
 /// add-account form (fastmail-style: address + app password; hosts are
-/// editable defaults; the user name is the address).
+/// editable defaults; the user name is the address). Built from the
+/// semantic form vocabulary — tab walks the fields, enter submits at the
+/// end.
 fn settings_lines(state: &State) -> Vec<Line> {
+    const LABEL_W: usize = 10;
     let mut v = Vec::new();
-    v.push(Line {
-        left: vec![Seg::T("ACCOUNTS".into(), Style::Label)],
-        rule: true,
-        rule_ink: true,
-        ..Default::default()
-    });
+    v.push(ui::section("ACCOUNTS"));
+    v.push(ui::gap());
     let accounts = mail::accounts(&state.store);
     for a in accounts.iter() {
         let host = a.imap_host.clone().unwrap_or_default();
@@ -1351,44 +1127,33 @@ fn settings_lines(state: &State) -> Vec<Line> {
         let status = a.status.clone().unwrap_or_else(|| "never synced".into());
         let err = status.starts_with("error");
         v.push(Line {
-            left: vec![Seg::T(status, if err { Style::Err } else { Style::Muted })],
-            rule: true,
+            left: vec![
+                Seg::Sp(2),
+                Seg::T(status, if err { Style::Err } else { Style::Muted }),
+            ],
             ..Default::default()
         });
+        v.push(ui::gap());
     }
     if accounts.is_empty() {
         v.push(Line::text("no accounts", Style::Muted));
+        v.push(ui::gap());
     }
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T("ADD ACCOUNT".into(), Style::Label)],
-        rule: true,
-        rule_ink: true,
-        ..Default::default()
-    });
-    let field = |name: &str, id: FieldId| Line {
-        left: vec![
-            Seg::T(pad_to(name, 10), Style::Label),
-            Seg::Fld { id, w: 28 },
-        ],
-        ..Default::default()
-    };
-    v.push(field("ADDRESS", FieldId::SetEmail));
-    v.push(field("PASSWORD", FieldId::SetPass));
-    v.push(field("IMAP", FieldId::SetImap));
-    v.push(field("SMTP", FieldId::SetSmtp));
-    v.push(Line::blank());
-    v.push(Line {
-        left: vec![Seg::T(
-            "an app password — the real one never works, by design".into(),
-            Style::Muted,
-        )],
-        right: vec![Seg::Btn {
-            label: "add account".into(),
-            act: BtnAct::AddAccount,
-        }],
-        ..Default::default()
-    });
+    v.push(ui::gap());
+    v.push(ui::section("ADD ACCOUNT"));
+    v.push(ui::gap());
+    v.push(ui::field_row("ADDRESS", LABEL_W, FieldId::SetEmail, 30));
+    v.push(ui::gap());
+    v.push(ui::field_row("PASSWORD", LABEL_W, FieldId::SetPass, 30));
+    v.push(ui::gap());
+    v.push(ui::field_row("IMAP", LABEL_W, FieldId::SetImap, 30));
+    v.push(ui::gap());
+    v.push(ui::field_row("SMTP", LABEL_W, FieldId::SetSmtp, 30));
+    v.push(ui::gap());
+    v.push(ui::actions(
+        "an app password — tab walks, enter submits",
+        &[("add account", BtnAct::AddAccount)],
+    ));
     v
 }
 
@@ -1822,7 +1587,9 @@ fn compose_lines(ui: Option<&PanelUi>, _re: &MailId) -> Vec<Line> {
         rule: true,
         ..Default::default()
     });
-    // The body: free lines; the whole region is one Field hit (built in draw).
+    // The body: free lines; the whole region is one Field hit (built in
+    // draw). Send and discard live in the header, with the other side
+    // effects — nothing floats below the text.
     for i in 0..body_rows {
         let text = ui.map(|u| u.body[i].clone()).unwrap_or_default();
         v.push(Line {
@@ -1830,21 +1597,6 @@ fn compose_lines(ui: Option<&PanelUi>, _re: &MailId) -> Vec<Line> {
             ..Default::default()
         });
     }
-    v.push(Line::blank());
-    v.push(Line {
-        right: vec![
-            Seg::Btn {
-                label: "discard".into(),
-                act: BtnAct::Discard,
-            },
-            Seg::Sp(1),
-            Seg::Btn {
-                label: "send".into(),
-                act: BtnAct::Send,
-            },
-        ],
-        ..Default::default()
-    });
     v
 }
 
@@ -2021,6 +1773,7 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "z" => Some(KeyCode::KeyZ),
         "u" => Some(KeyCode::KeyU),
         "i" => Some(KeyCode::KeyI),
+        "tab" => Some(KeyCode::Tab),
         "comma" | "," => Some(KeyCode::Comma),
         "period" | "." => Some(KeyCode::Period),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
@@ -2048,7 +1801,8 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
             | KeyCode::ReturnKey
             | KeyCode::Escape
             | KeyCode::Backspace
-            | KeyCode::Delete)),
+            | KeyCode::Delete
+            | KeyCode::Tab)),
             true,
             _,
         ) => Some(ChordExec::Ev(KeyEvent {
@@ -2648,6 +2402,34 @@ impl Stage {
 
         // A focused text field owns the keyboard (chars arrive via TextInput).
         if let Some((pid, fid)) = state.field {
+            let kind = state.ws.panels.get(&pid).map(|p| p.kind.clone());
+            // Tab walks the form; enter advances too on settings fields —
+            // and past the last one, submits.
+            if k.key_code == KeyCode::Tab {
+                if let Some(kind) = &kind {
+                    let dir = if k.modifiers.shift { -1 } else { 1 };
+                    if let Some(next) = ui::next_field(kind, fid, dir) {
+                        state.field = Some((pid, next));
+                    }
+                }
+                self.kick(cx);
+                return;
+            }
+            let settings_field = matches!(
+                fid,
+                FieldId::SetEmail | FieldId::SetPass | FieldId::SetImap | FieldId::SetSmtp
+            );
+            if settings_field && k.key_code == KeyCode::ReturnKey {
+                match kind.as_ref().and_then(|kd| ui::next_field(kd, fid, 1)) {
+                    Some(next) => state.field = Some((pid, next)),
+                    None => {
+                        self.add_account_from(cx, pid);
+                        return;
+                    }
+                }
+                self.kick(cx);
+                return;
+            }
             let Some(ui) = state.ui.get_mut(&pid) else {
                 state.field = None;
                 return;
@@ -2917,6 +2699,57 @@ impl Stage {
         }
         self.update_menu(cx);
         self.kick(cx);
+    }
+
+    /// Submits the settings form (the button, or enter past the last
+    /// field): keychain the password, add the account as an action, spawn
+    /// its worker.
+    fn add_account_from(&mut self, cx: &mut Cx, pid: PanelId) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let form = state.ui.get(&pid).map(|u| {
+            (
+                u.set_email.text.trim().to_string(),
+                u.set_pass.text.clone(),
+                u.set_imap.text.trim().to_string(),
+                u.set_smtp.text.trim().to_string(),
+            )
+        });
+        let Some((email, pass, imap, smtp)) = form else {
+            return;
+        };
+        if email.is_empty() || pass.is_empty() || imap.is_empty() {
+            state.toast("address, password and imap host are required", true);
+        } else if state.db_path.is_none() {
+            state.toast("no store file — accounts need one", true);
+        } else {
+            let dir = state
+                .db_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            if !crate::secret::set(&dir, &email, &pass) {
+                state.toast("storing the password failed", true);
+            } else {
+                state.act(
+                    "account",
+                    format!("add account {email}"),
+                    None,
+                    |_| {},
+                    move |tx| mail::add_account_tx(tx, &email, &imap, &smtp).map(|_| ()),
+                );
+                if let Some(ui) = state.ui.get_mut(&pid) {
+                    ui.set_email = TextField::default();
+                    ui.set_pass = TextField::default();
+                }
+                state.field = None;
+                state.spawn_workers();
+                state.toast("account added — syncing", false);
+            }
+        }
+        self.sync(cx);
     }
 
     /// Notices foreign commits (sync workers, the sender): re-runs stale
@@ -3368,50 +3201,8 @@ impl Stage {
                         }
                     }
                     BtnAct::AddAccount => {
-                        let form = state.ui.get(&pid).map(|u| {
-                            (
-                                u.set_email.text.trim().to_string(),
-                                u.set_pass.text.clone(),
-                                u.set_imap.text.trim().to_string(),
-                                u.set_smtp.text.trim().to_string(),
-                            )
-                        });
-                        let Some((email, pass, imap, smtp)) = form else {
-                            return;
-                        };
-                        if email.is_empty() || pass.is_empty() || imap.is_empty() {
-                            state.toast("address, password and imap host are required", true);
-                        } else if state.db_path.is_none() {
-                            state.toast("no store file — accounts need one", true);
-                        } else {
-                            let dir = state
-                                .db_path
-                                .as_ref()
-                                .and_then(|p| p.parent())
-                                .map(std::path::Path::to_path_buf)
-                                .unwrap_or_default();
-                            if !crate::secret::set(&dir, &email, &pass) {
-                                state.toast("storing the password failed", true);
-                            } else {
-                                state.act(
-                                    "account",
-                                    format!("add account {email}"),
-                                    None,
-                                    |_| {},
-                                    move |tx| {
-                                        mail::add_account_tx(tx, &email, &imap, &smtp)
-                                            .map(|_| ())
-                                    },
-                                );
-                                if let Some(ui) = state.ui.get_mut(&pid) {
-                                    ui.set_email = TextField::default();
-                                    ui.set_pass = TextField::default();
-                                }
-                                state.field = None;
-                                state.spawn_workers();
-                                state.toast("account added — syncing", false);
-                            }
-                        }
+                        self.add_account_from(cx, pid);
+                        return;
                     }
                     BtnAct::RemoveAccount(id) => {
                         let email = mail::accounts(&state.store)
@@ -4880,21 +4671,25 @@ impl Stage {
         let hover = state.hover.clone();
         self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref());
 
-        // Extra header actions.
-        let head_btn = match kind {
-            Kind::Inbox { .. } => Some(("refresh", BtnAct::Refresh)),
-            Kind::Message { .. } => Some(("archive", BtnAct::Archive)),
-            _ => None,
+        // Extra header actions, right to left from the close button —
+        // side effects live in the chrome, never floating in content.
+        let head_btns: &[(&str, BtnAct)] = match kind {
+            Kind::Inbox { .. } => &[("refresh", BtnAct::Refresh)],
+            Kind::Message { .. } => &[("archive", BtnAct::Archive)],
+            Kind::Compose { .. } => &[("send", BtnAct::Send), ("discard", BtnAct::Discard)],
+            _ => &[],
         };
-        if let Some((label, act)) = head_btn {
+        let mut bx = r.pos.x + r.size.x - 18.0 - 4.0;
+        for (label, act) in head_btns {
             let w = self.cell.label_w(label.chars().count()) + 12.0;
+            bx -= w + 4.0;
             let br = rect(
-                r.pos.x + r.size.x - 18.0 - 4.0 - w - 4.0,
+                bx,
                 r.pos.y + (theme::HEAD_H - theme::BTN_H) / 2.0,
                 w,
                 theme::BTN_H,
             );
-            self.draw_header_btn(cx, br, label, label, focused, alpha, Act::Btn(pid, act), hover.as_ref());
+            self.draw_header_btn(cx, br, label, label, focused, alpha, Act::Btn(pid, *act), hover.as_ref());
         }
 
         // The body: a clipped turtle, content on the char grid.
