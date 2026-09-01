@@ -100,24 +100,28 @@ script_mod! {
     // Sizes mirror theme.rs: FONT_SIZE 10.5 body, LABEL_SIZE 8.25 labels —
     // the same numbers the char-grid renderer draws with, so migrated and
     // unmigrated panels read as one app.
-    // The one face, bundled rather than borrowed. Menlo fronted the family
-    // until HTML mail asked for a weight it does not have: Menlo.ttc yields
-    // only its regular face, so `<b>` drew as body text. It was also macOS
-    // furniture — the Fold never had it and fell through to Liberation, so
-    // "the app's face" was already two faces depending on where you read.
+    // The one face, carried rather than borrowed. Menlo fronted the family
+    // until HTML mail asked it for a weight it does not have: Menlo.ttc
+    // yields only its regular face, so `<b>` drew as body text. It was
+    // also macOS furniture — the Fold never had it and fell through to
+    // Liberation, so "the app's face" was already two faces depending on
+    // which screen you read it from.
     //
-    // JetBrains Mono is variable on `wght` (100–800), ships inside
-    // makepad_widgets (no new asset, OFL), and is 0.600 em wide against
-    // Menlo's 0.6021 — the character grid moves by a third of a percent.
-    // Its ratio is Liberation's to four places, so this is the face the
-    // Fold has been drawing all along; macOS is the side that changes.
+    // Geist Mono replaces it on both, from `resources/` (OFL, shipped
+    // alongside in OFL.txt). It is 0.600 em wide against Menlo's 0.6021,
+    // so the character grid moves by a third of a percent — and that is
+    // Liberation's ratio to four places, so the Fold has been drawing this
+    // width all along. macOS is the side that changes.
     //
-    // What it still cannot do is italic: makepad's `FontMember` exposes
-    // only `weight`, with no slant or skew anywhere in `TextStyle`, so an
-    // oblique needs a second file on disk whatever family we pick.
+    // Two files, four styles: both faces are variable on `wght` (100–900),
+    // and the second is a true italic rather than a slant. makepad has no
+    // synthetic oblique — `FontMember` exposes only `weight`, and nothing
+    // in `TextStyle` skews — so italic could only ever come from its own
+    // file. The `[wght]` of the upstream filenames is dropped because the
+    // brackets are awkward in a resource path; the fonts are unmodified.
     mod.widgets.SMonoStyle = TextStyle{
         font_family: FontFamily{
-            latin := FontMember{res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0}
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0}
             fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
             symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
             emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
@@ -126,12 +130,38 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** The same face leaning on its weight axis — real bold, not the two
-        nudged passes `SBold` draws (which stay, for now: they are what the
-        char grid's headers and the accelerator marks are built from). */
+    /** The same face leaning on its weight axis. This is what retired the
+        char grid's fake bold: unread rows, contact headers and the
+        accelerator marks were all the same run drawn two or three times,
+        each copy nudged a fraction of a pixel, because Menlo had no weight
+        to ask for. See `SBoldLabel`. */
     mod.widgets.SMonoBoldStyle = TextStyle{
         font_family: FontFamily{
-            latin := FontMember{res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** The drawn italic, not a skewed roman: Geist Mono ships its own. */
+    mod.widgets.SMonoItalicStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** Both at once — `<b><i>`, and the `<em>` inside a heading. */
+    mod.widgets.SMonoBoldItalicStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
             fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
             symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
             emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
@@ -158,14 +188,14 @@ script_mod! {
         }
     }
 
-    /** Fake-bold text, the char grid's way: the same run twice, the twin
-        nudged 0.4 px — Menlo ships no variable weight to ask for. */
-    mod.widgets.SBold = set_type_default() do #(SBold::register_widget(vm)) {
-        ..mod.widgets.View
-        width: Fit, height: Fit
-        flow: Overlay
-        a := mod.widgets.SLabel { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
-        b := mod.widgets.SLabel { width: Fill, margin: Inset{left: 0.4}, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
+    /** Body text at the family's bold weight.
+
+        This used to be a widget that drew the same run twice with the twin
+        nudged 0.4 px, because Menlo ships no weight to ask for. Geist Mono
+        does, so the trick is gone and with it the overlays, the twin
+        labels and the pair of set_texts each one needed. */
+    mod.widgets.SBoldLabel = mod.widgets.SLabel {
+        draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
     }
 
     /** The flat monochrome text field: white well, hairline border that
@@ -287,10 +317,9 @@ script_mod! {
         underline *is* the link (CR-003's grammar), so they read correctly
         in plain #141414.
 
-        `<b>` is real weight now that the family is variable (see
-        `SMonoStyle`). `<i>` is not: makepad exposes no slant, so italic
-        would need a second file on disk, and until one is there it reads
-        as body text. */
+        Emphasis is real: `<b>` is the weight axis and `<i>` is Geist
+        Mono's drawn italic, so the four `text_style_*` slots are four
+        actual faces rather than one face repeated (see `SMonoStyle`). */
     mod.widgets.SHtml = Html {
         width: Fill, height: Fit
         padding: 0
@@ -303,9 +332,9 @@ script_mod! {
         draw_text +: { color: #141414 }
 
         text_style_normal: mod.widgets.SMonoStyle{}
-        text_style_italic: mod.widgets.SMonoStyle{}
+        text_style_italic: mod.widgets.SMonoItalicStyle{}
         text_style_bold: mod.widgets.SMonoBoldStyle{}
-        text_style_bold_italic: mod.widgets.SMonoBoldStyle{}
+        text_style_bold_italic: mod.widgets.SMonoBoldItalicStyle{}
         text_style_fixed: mod.widgets.SMonoStyle{}
 
         // `-` for the nested level: `•` comes from the symbol fallback,
@@ -380,9 +409,10 @@ script_mod! {
         flow: Down
         cursor: MouseCursor.Hand
         // The label is split so one character can carry the accelerator
-        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
-        // beats padding a twin with spaces — `←` arrives from the symbol
-        // fallback, whose advance is not the mono cell.
+        // mark (CR-003): prefix, the key, suffix. The split stays even now
+        // that the key is real bold — `←` arrives from the symbol
+        // fallback, whose advance is not the mono cell, so padding a twin
+        // with spaces would not line up.
         // Label's base padding is mspace_1 — invisible around a single run,
         // but it would open a gap between each of the three, so the split
         // parts zero it and the row carries the word's own spacing.
@@ -390,16 +420,10 @@ script_mod! {
             width: Fit, height: Fit
             flow: Right
             pre := mod.widgets.SLabel { padding: 0, text: "" }
-            // Three passes, not the usual two: one nudge is legible in a
-            // run of body text but disappears in a short label, and the
-            // mark has to read at a glance to be worth anything.
-            key := View {
-                width: Fit, height: Fit
-                flow: Overlay
-                k1 := mod.widgets.SLabel { padding: 0, text: "" }
-                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
-                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
-            }
+            // One pass. It took three nudged copies to make a single
+            // character read as bold at this size; the weight axis does it
+            // properly.
+            key := mod.widgets.SBoldLabel { padding: 0, text: "" }
             post := mod.widgets.SLabel { padding: 0, text: "" }
         }
         // The solid underline needs its own `pixel` for the same reason the
@@ -695,7 +719,10 @@ script_mod! {
                 from_lbl := mod.widgets.SLabel {
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
-                from_b := mod.widgets.SBold { visible: false, width: Fill }
+                from_b := mod.widgets.SBoldLabel {
+                    visible: false
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
             }
             View { width: 10, height: 1 }
             date_lbl := mod.widgets.SLabel {
@@ -705,7 +732,10 @@ script_mod! {
         subject_lbl := mod.widgets.SLabel {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
-        subject_b := mod.widgets.SBold { visible: false, width: Fill }
+        subject_b := mod.widgets.SBoldLabel {
+            visible: false
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
     }
 
     mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
@@ -859,14 +889,10 @@ script_mod! {
         spacing: 6
 
         View {
-            width: Fill, height: Fit, flow: Overlay
-            name_lbl := mod.widgets.SLabel {
+            width: Fill, height: Fit
+            name_lbl := mod.widgets.SBoldLabel {
                 width: Fill
-                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
-            }
-            name_lbl2 := mod.widgets.SLabel {
-                width: Fill, margin: Inset{left: 0.4}
-                draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+                draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
             }
         }
         email_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
@@ -1185,38 +1211,6 @@ script_mod! {
             flow: Down
             row := mod.widgets.OverlayRow {}
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SBold
-// ---------------------------------------------------------------------------
-
-/// The char grid's fake bold as a widget: the same text on two overlaid
-/// labels, the twin nudged 0.4 px right.
-#[derive(Script, ScriptHook, Widget)]
-pub struct SBold {
-    #[source]
-    source: ScriptObjectRef,
-    #[deref]
-    view: View,
-}
-
-impl Widget for SBold {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.view.draw_walk(cx, scope, walk)
-    }
-}
-
-impl SBoldRef {
-    pub fn set_text(&self, cx: &mut Cx, text: &str) {
-        let Some(inner) = self.borrow() else { return };
-        inner.view.label(cx, ids!(a)).set_text(cx, text);
-        inner.view.label(cx, ids!(b)).set_text(cx, text);
     }
 }
 
@@ -1673,15 +1667,15 @@ impl InboxLineRef {
         let Some(inner) = self.borrow() else { return };
         let from = &m.from_name;
         let fp = inner.view.label(cx, ids!(from_lbl));
-        let fb = inner.view.widget(cx, ids!(from_b));
+        let fb = inner.view.label(cx, ids!(from_b));
         let sp = inner.view.label(cx, ids!(subject_lbl));
-        let sb = inner.view.widget(cx, ids!(subject_b));
+        let sb = inner.view.label(cx, ids!(subject_b));
         fp.set_text(cx, if m.unread { "" } else { from });
-        fb.as_sbold().set_text(cx, if m.unread { from } else { "" });
+        fb.set_text(cx, if m.unread { from } else { "" });
         fp.set_visible(cx, !m.unread);
         fb.set_visible(cx, m.unread);
         sp.set_text(cx, if m.unread { "" } else { &m.subject });
-        sb.as_sbold().set_text(cx, if m.unread { &m.subject } else { "" });
+        sb.set_text(cx, if m.unread { &m.subject } else { "" });
         sp.set_visible(cx, !m.unread);
         sb.set_visible(cx, m.unread);
         inner
@@ -1953,10 +1947,9 @@ impl SLinkRef {
         let post_l = l.view.label(cx, ids!(row.post));
         post_l.set_text(cx, &post);
         post_l.set_visible(cx, !post.is_empty());
-        for p in [ids!(row.key.k1), ids!(row.key.k2), ids!(row.key.k3)] {
-            l.view.label(cx, p).set_text(cx, &key);
-        }
-        l.view.view(cx, ids!(row.key)).set_visible(cx, !key.is_empty());
+        let key_l = l.view.label(cx, ids!(row.key));
+        key_l.set_text(cx, &key);
+        key_l.set_visible(cx, !key.is_empty());
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
     }
@@ -2170,7 +2163,6 @@ impl Widget for ContactPanel {
                 let (name, count) = mail::contact(&p.store, email);
                 let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
                 self.view.label(cx, ids!(name_lbl)).set_text(cx, &name);
-                self.view.label(cx, ids!(name_lbl2)).set_text(cx, &name);
                 self.view.label(cx, ids!(email_lbl)).set_text(cx, email);
                 self.view
                     .label(cx, ids!(count_lbl))

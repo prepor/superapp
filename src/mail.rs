@@ -528,7 +528,8 @@ fn base_mails() -> Vec<SeedMail> {
                  <p>Run <b>main #4128</b> failed on push <code>9f3c2a1</code>.</p>\
                  <p>Failed steps:</p>\
                  <ul><li>mix test &mdash; <b>2 failures</b></li>\
-                 <li>credo --strict &mdash; 1 warning</li></ul>\
+                 <li>credo --strict &mdash; <i>1 warning</i></li></ul>\
+                 <p><i>This run was triggered by a push to </i><b><i>main</i></b>.</p>\
                  <p><a href=\"https://github.com/x/stelaxis/actions/runs/4128\">View the run</a> \
                  or <a href=\"javascript:unsub()\">unsubscribe</a>.</p>\
                  </td></tr></table>\
