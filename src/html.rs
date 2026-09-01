@@ -407,6 +407,30 @@ fn num_ref(src: &str, at: usize) -> Option<(i64, usize)> {
     n.ok().map(|n| (n, j + 1))
 }
 
+/// Whether `src` carries a numeric reference the widget's parser would die
+/// on. A pure scan with no allocation, so [`guard`] costs nothing on the
+/// letters that are fine — which is all of them but the odd one.
+fn needs_repair(src: &str) -> bool {
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let Some(rel) = b[i..].iter().position(|&c| c == b'&') else {
+            return false;
+        };
+        let at = i + rel;
+        match num_ref(src, at) {
+            Some((n, end)) => {
+                if u32::try_from(n).ok().and_then(char::from_u32).is_none() {
+                    return true;
+                }
+                i = end;
+            }
+            None => i = at + 1,
+        }
+    }
+    false
+}
+
 /// Repairs numeric character references the widget's parser cannot decode.
 ///
 /// It parses `&#N;` into a `u32` and then calls `char::from_u32(..).unwrap()`,
@@ -455,6 +479,27 @@ fn fix_numeric_entities(src: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// The last thing between stored HTML and the widget.
+///
+/// [`sanitize`] runs at **ingest**, so what the store holds was narrowed by
+/// whichever version was current when the mail arrived. Tighten the narrowing
+/// — as the surrogate repair did — and every row written before it is stale,
+/// still carrying whatever the old rules let through. A mail that crashes the
+/// parser crashes it on every frame that draws it, which means the app cannot
+/// be opened rather than that one letter looks wrong, so the guarantee has to
+/// hold at the point of use and not only at the point of writing.
+///
+/// Borrows unless there is something to repair, so a letter that is fine
+/// costs one scan and no allocation.
+#[must_use]
+pub fn guard(src: &str) -> std::borrow::Cow<'_, str> {
+    if needs_repair(src) {
+        std::borrow::Cow::Owned(fix_numeric_entities(src))
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
 }
 
 /// Narrows an HTML mail body to what the `Html` widget draws.

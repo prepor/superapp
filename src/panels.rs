@@ -2151,11 +2151,15 @@ impl Widget for MessagePanel {
                     // every time — the hidden one is emptied rather than
                     // merely hidden, so no mail can leave its text behind
                     // for the next one to show.
-                    let html = m.html.as_deref().unwrap_or("");
+                    // Guarded on the way in, not merely on the way into the
+                    // store: rows narrowed by an older build are still out
+                    // there, and one the parser cannot read takes the whole
+                    // app down every frame it is drawn.
+                    let html = crate::html::guard(m.html.as_deref().unwrap_or(""));
                     self.view
                         .text_input(cx, ids!(body_lbl))
                         .set_text(cx, if m.html.is_some() { "" } else { &m.body });
-                    self.view.html(cx, ids!(body_html)).set_text(cx, html);
+                    self.view.html(cx, ids!(body_html)).set_text(cx, &html);
                     self.view
                         .view(cx, ids!(text_wrap))
                         .set_visible(cx, m.html.is_none());
