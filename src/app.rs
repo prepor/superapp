@@ -1191,7 +1191,7 @@ fn help_lines() -> Vec<Line> {
         ..Default::default()
     });
     v.push(Line {
-        left: vec![kbd("cmd"), Seg::T("+arrows / hjkl — focus panels".into(), Style::N)],
+        left: vec![kbd("cmd"), Seg::T("+arrows — focus panels".into(), Style::N)],
         ..Default::default()
     });
     v.push(Line {
@@ -1257,22 +1257,37 @@ fn help_lines() -> Vec<Line> {
         left: vec![
             kbd("cmd"),
             kbd("t"),
-            Seg::T(" — column tabs (click a tab or cmd+j/k)".into(), Style::N),
+            Seg::T(" — column tabs (click a tab or cmd+↑/↓)".into(), Style::N),
         ],
         ..Default::default()
     });
-    v.push(Line::text("plain keys belong to the focused panel:", Style::N));
+    v.push(Line::text(
+        "a control wearing a bold letter is cmd+that letter:",
+        Style::N,
+    ));
+    v.push(Line {
+        left: vec![
+            Seg::T("  message ".into(), Style::N),
+            kbd("cmd+a"),
+            Seg::T("rchive ".into(), Style::N),
+            kbd("cmd+r"),
+            Seg::T("eply ".into(), Style::N),
+            kbd("cmd+n"),
+            Seg::T("/".into(), Style::N),
+            kbd("cmd+o"),
+            Seg::T(" walk".into(), Style::N),
+        ],
+        ..Default::default()
+    });
     v.push(Line {
         left: vec![
             Seg::T("  inbox ".into(), Style::N),
-            kbd("j"),
-            kbd("k"),
+            kbd("cmd+r"),
+            Seg::T("efresh  ".into(), Style::N),
             kbd("enter"),
+            Seg::T(" opens  ".into(), Style::N),
             kbd("/"),
-            Seg::T("  message ".into(), Style::N),
-            kbd("j"),
-            kbd("k"),
-            kbd("r"),
+            Seg::T(" filters  arrows walk the rows".into(), Style::N),
         ],
         ..Default::default()
     });
@@ -1715,6 +1730,48 @@ enum ChordExec {
     Tap(KeyCode),
 }
 
+/// The alphabet, both ways — read by the chord parser and by the
+/// accelerator resolver, so a key's name and its code cannot drift.
+const LETTERS: [(char, KeyCode); 26] = [
+    ('a', KeyCode::KeyA),
+    ('b', KeyCode::KeyB),
+    ('c', KeyCode::KeyC),
+    ('d', KeyCode::KeyD),
+    ('e', KeyCode::KeyE),
+    ('f', KeyCode::KeyF),
+    ('g', KeyCode::KeyG),
+    ('h', KeyCode::KeyH),
+    ('i', KeyCode::KeyI),
+    ('j', KeyCode::KeyJ),
+    ('k', KeyCode::KeyK),
+    ('l', KeyCode::KeyL),
+    ('m', KeyCode::KeyM),
+    ('n', KeyCode::KeyN),
+    ('o', KeyCode::KeyO),
+    ('p', KeyCode::KeyP),
+    ('q', KeyCode::KeyQ),
+    ('r', KeyCode::KeyR),
+    ('s', KeyCode::KeyS),
+    ('t', KeyCode::KeyT),
+    ('u', KeyCode::KeyU),
+    ('v', KeyCode::KeyV),
+    ('w', KeyCode::KeyW),
+    ('x', KeyCode::KeyX),
+    ('y', KeyCode::KeyY),
+    ('z', KeyCode::KeyZ),
+];
+
+/// The key code a letter presses.
+fn letter_key(c: char) -> Option<KeyCode> {
+    let lower = c.to_ascii_lowercase();
+    LETTERS.iter().find(|(l, _)| *l == lower).map(|(_, k)| *k)
+}
+
+/// The letter a key code types, if it is one.
+fn key_char(k: KeyCode) -> Option<char> {
+    LETTERS.iter().find(|(_, c)| *c == k).map(|(l, _)| *l)
+}
+
 fn parse_chord(s: &str) -> Option<ChordExec> {
     if let "cmd" | "logo" | "super" = s {
         return Some(ChordExec::Tap(KeyCode::Logo));
@@ -1740,15 +1797,6 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "esc" | "escape" => Some(KeyCode::Escape),
         "backspace" => Some(KeyCode::Backspace),
         "delete" => Some(KeyCode::Delete),
-        "h" => Some(KeyCode::KeyH),
-        "j" => Some(KeyCode::KeyJ),
-        "k" => Some(KeyCode::KeyK),
-        "l" => Some(KeyCode::KeyL),
-        "w" => Some(KeyCode::KeyW),
-        "t" => Some(KeyCode::KeyT),
-        "z" => Some(KeyCode::KeyZ),
-        "u" => Some(KeyCode::KeyU),
-        "i" => Some(KeyCode::KeyI),
         "tab" => Some(KeyCode::Tab),
         "comma" | "," => Some(KeyCode::Comma),
         "period" | "." => Some(KeyCode::Period),
@@ -1763,7 +1811,12 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "7" => Some(KeyCode::Key7),
         "8" => Some(KeyCode::Key8),
         "9" => Some(KeyCode::Key9),
-        _ => None,
+        // Every letter parses, so a script can drive any accelerator.
+        k => k
+            .chars()
+            .next()
+            .filter(|_| k.chars().count() == 1)
+            .and_then(letter_key),
     };
     let plain = !mods.logo && !mods.control && !mods.alt;
     match (code, plain, key.chars().count()) {
@@ -2294,11 +2347,13 @@ impl Stage {
                 }
                 return;
             }
+            // Arrows only — the vim walk went with CR-003, which also frees
+            // h/j/k/l for panel accelerators.
             let dir = match k.key_code {
-                KeyCode::ArrowLeft | KeyCode::KeyH => Some(Dir::Left),
-                KeyCode::ArrowRight | KeyCode::KeyL => Some(Dir::Right),
-                KeyCode::ArrowUp | KeyCode::KeyK => Some(Dir::Up),
-                KeyCode::ArrowDown | KeyCode::KeyJ => Some(Dir::Down),
+                KeyCode::ArrowLeft => Some(Dir::Left),
+                KeyCode::ArrowRight => Some(Dir::Right),
+                KeyCode::ArrowUp => Some(Dir::Up),
+                KeyCode::ArrowDown => Some(Dir::Down),
                 _ => None,
             };
             if let Some(dir) = dir {
@@ -2385,7 +2440,29 @@ impl Stage {
                     _ => {}
                 }
             }
+            // Past the reserved set the chord belongs to the focused panel
+            // (CR-003). Chrome buttons resolve here, because the chrome is
+            // the shell's; links resolve inside the panel widget, which
+            // owns them — so an unclaimed chord falls through to it rather
+            // than dying here.
+            let accel = state.ws.focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
+                let kind = state.ws.panels.get(&f).map(|p| p.kind.clone())?;
+                let act = ui::head_btns(&kind)
+                    .iter()
+                    .find(|(_, a)| ui::btn_accel(*a) == Some(c))
+                    .map(|(_, a)| *a)?;
+                Some((f, act))
+            });
+            if let Some((f, act)) = accel {
+                // The same door a click uses, so undo and toasts are shared.
+                self.resolve_click(cx, Act::Btn(f, act), false);
+                return;
+            }
             if k.key_code != KeyCode::ReturnKey {
+                if hosted && state.field.is_none() {
+                    self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
+                    self.kick(cx);
+                }
                 return;
             }
             // cmd+enter falls through: fresh un-joined open in the inbox.
@@ -2932,41 +3009,13 @@ impl Stage {
         let Some(f) = state.ws.focus else {
             return;
         };
+        // Only the char-grid kinds reach here — hosted panels took their
+        // typing above. The vim walk and `r` left with CR-003; `/` is the
+        // one plain letter the grammar keeps.
         let kind = state.ws.panels.get(&f).map(|p| p.kind.clone());
-        match (kind, input) {
-            (Some(Kind::Inbox { .. }), "j") => self.inbox_move_sel(cx, f, 1),
-            (Some(Kind::Inbox { .. }), "k") => self.inbox_move_sel(cx, f, -1),
-            (Some(Kind::Inbox { .. }), "/") => {
-                state.field = Some((f, FieldId::Filter));
-                self.kick(cx);
-            }
-            (Some(Kind::Message { id }), "j") | (Some(Kind::Message { id }), "k") => {
-                let (newer, older) = mail::neighbours(&state.store, id);
-                let t = if input == "j" { older } else { newer };
-                if let Some(t) = t {
-                    let kind = Kind::Message { id: t };
-                    let label = format!("read “{}”", state.panel_title(&kind));
-                    state.act(
-                        "read",
-                        label,
-                        Some(format!("panel:{f}")),
-                        move |ws| {
-                            ws.follow_replace(f, kind, false);
-                        },
-                        move |tx| mail::mark_read_tx(tx, t),
-                    );
-                    self.sync(cx);
-                }
-            }
-            (Some(Kind::Message { id }), "r") => {
-                let kind = Kind::Compose { re: id };
-                let label = format!("open “{}”", state.panel_title(&kind));
-                state.act_nav("open", label, None, move |ws| {
-                    ws.follow_open(f, kind, false);
-                });
-                self.sync(cx);
-            }
-            _ => {}
+        if let (Some(Kind::Inbox { .. }), "/") = (kind, input) {
+            state.field = Some((f, FieldId::Filter));
+            self.kick(cx);
         }
     }
 
@@ -4852,15 +4901,36 @@ impl Stage {
         color: theme::Rgba,
         alpha: f64,
     ) -> f64 {
+        self.draw_label_accel(cx, x, y, s, color, alpha, None)
+    }
+
+    /// As [`Self::draw_label`], but the character at `accel` is drawn twice,
+    /// nudged — the accelerator mark (CR-003). It is the grid's own fake
+    /// bold, narrowed from a run to a single glyph; the letter-tracking walk
+    /// this label already does makes the position free.
+    fn draw_label_accel(
+        &mut self,
+        cx: &mut Cx2d,
+        x: f64,
+        y: f64,
+        s: &str,
+        color: theme::Rgba,
+        alpha: f64,
+        accel: Option<usize>,
+    ) -> f64 {
         self.draw_mono.text_style.font_size = theme::LABEL_SIZE as f32;
         self.draw_mono.color = rgba_a(color, alpha);
         let step = self.cell.label_step();
         let up = s.to_uppercase();
         let mut dx = x;
-        for ch in up.chars() {
+        for (i, ch) in up.chars().enumerate() {
             if ch != ' ' {
                 let mut buf = [0u8; 4];
-                self.draw_mono.draw_abs(cx, dvec2(dx, y), ch.encode_utf8(&mut buf));
+                let g = ch.encode_utf8(&mut buf);
+                self.draw_mono.draw_abs(cx, dvec2(dx, y), g);
+                if accel == Some(i) {
+                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.4, y), g);
+                }
             }
             dx += step;
         }
@@ -4960,7 +5030,13 @@ impl Stage {
         let tw = self.cell.label_w(label.chars().count());
         let tx = r.pos.x + (r.size.x - tw) / 2.0;
         let ty = r.pos.y + (r.size.y - self.cell.label_line()) / 2.0;
-        self.draw_label(cx, tx, ty, label, fg, alpha);
+        // A side-effect button wears its key (CR-003); × is cmd+w and needs
+        // no mark of its own.
+        let accel = match &act {
+            Act::Btn(_, a) => ui::btn_accel(*a).and_then(|c| ui::accel_idx(label, c)),
+            _ => None,
+        };
+        self.draw_label_accel(cx, tx, ty, label, fg, alpha, accel);
         self.hits.push(HitR {
             rect: r,
             act,
@@ -5214,12 +5290,7 @@ impl Stage {
 
         // Extra header actions, right to left from the close button —
         // side effects live in the chrome, never floating in content.
-        let head_btns: &[(&str, BtnAct)] = match kind {
-            Kind::Inbox { .. } => &[("refresh", BtnAct::Refresh)],
-            Kind::Message { .. } => &[("archive", BtnAct::Archive)],
-            Kind::Compose { .. } => &[("send", BtnAct::Send), ("discard", BtnAct::Discard)],
-            _ => &[],
-        };
+        let head_btns = ui::head_btns(&kind);
         let mut bx = r.pos.x + r.size.x - 18.0 - 4.0;
         for (label, act) in head_btns {
             let w = self.cell.label_w(label.chars().count()) + 12.0;

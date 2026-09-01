@@ -12,6 +12,7 @@ use makepad_widgets::*;
 
 use crate::mail;
 use crate::store::Store;
+use crate::ui;
 
 /// What a panel widget may read while drawing: the store and its own
 /// panel identity. Passed through `Scope` props each draw (props ride an
@@ -445,10 +446,38 @@ script_mod! {
         width: Fit, height: Fit
         flow: Down
         cursor: MouseCursor.Hand
-        lbl := mod.widgets.SLabel { text: "" }
+        // The label is split so one character can carry the accelerator
+        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
+        // beats padding a twin with spaces — `←` arrives from the symbol
+        // fallback, whose advance is not the mono cell.
+        // Label's base padding is mspace_1 — invisible around a single run,
+        // but it would open a gap between each of the three, so the split
+        // parts zero it and the row carries the word's own spacing.
+        row := View {
+            width: Fit, height: Fit
+            flow: Right
+            pre := mod.widgets.SLabel { padding: 0, text: "" }
+            key := View {
+                width: Fit, height: Fit
+                flow: Overlay
+                k1 := mod.widgets.SLabel { padding: 0, text: "" }
+                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.4}, text: "" }
+            }
+            post := mod.widgets.SLabel { padding: 0, text: "" }
+        }
+        // The solid underline needs its own `pixel` for the same reason the
+        // row wash does (CR-002's sixth defect): a stock-shader quad merges
+        // into a draw call that paints *under* the panel background, so it
+        // never appears. A distinct shader earns a correctly-ordered call.
         ul := View {
             width: Fill, height: 1
-            show_bg: true, draw_bg +: { color: #141414 }
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
         }
         ul_dotted := View {
             visible: false
@@ -456,9 +485,12 @@ script_mod! {
             show_bg: true
             draw_bg +: {
                 color: #141414
+                // `Math` carries only rotate_2d/random_2d on this pin, so
+                // the period comes from fract, not a mod that never
+                // compiled (and so never dashed anything).
                 pixel: fn() {
                     let x = self.pos.x * self.rect_size.x
-                    if Math.mod(x, 6.0) > 3.0 {
+                    if fract(x / 6.0) > 0.5 {
                         return vec4(0.0, 0.0, 0.0, 0.0)
                     }
                     return vec4(self.color.xyz * self.color.w, self.color.w)
@@ -1077,16 +1109,12 @@ impl Widget for InboxPanel {
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
 
-        // The panel's letter grammar, only while the filter is at rest —
-        // letters arrive as TextInput events, exactly like real typing.
+        // `/` focuses the filter — the one plain letter the grammar keeps
+        // (CR-003 retired the vim walk; the arrows already mirrored it).
+        // It arrives as a TextInput event, exactly like real typing.
         if let Event::TextInput(t) = event {
-            if !filter_focused {
-                match t.input.as_str() {
-                    "j" => self.move_sel(cx, scope, 1),
-                    "k" => self.move_sel(cx, scope, -1),
-                    "/" => SettingsPanel::focus_input(cx, &filter),
-                    _ => {}
-                }
+            if !filter_focused && t.input == "/" {
+                SettingsPanel::focus_input(cx, &filter);
             }
         }
         if let Event::KeyDown(k) = event {
@@ -1106,7 +1134,8 @@ impl Widget for InboxPanel {
                             });
                         }
                     }
-                    // Arrows mirror j/k (the char grid's grammar).
+                    // The row walk, with scroll-follow (CR-003: the arrows
+                    // are the whole walk now, j/k having gone).
                     KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
                     // The inbox's one-stop tab ring: the filter.
@@ -1213,11 +1242,38 @@ impl SLinkRef {
         target: crate::core::Kind,
         dotted: bool,
     ) {
+        self.set_accel(cx, pid, text, target, dotted, None);
+    }
+
+    /// As [`Self::set`], but `accel` names the key this link carries — its
+    /// letter is drawn twice, nudged, so the link wears its own chord.
+    pub fn set_accel(
+        &self,
+        cx: &mut Cx,
+        pid: u64,
+        text: &str,
+        target: crate::core::Kind,
+        dotted: bool,
+        accel: Option<char>,
+    ) {
         let Some(mut l) = self.borrow_mut() else { return };
         l.pid = pid;
         l.target = Some(target);
         l.dotted = dotted;
-        l.view.label(cx, ids!(lbl)).set_text(cx, text);
+        let at = accel.and_then(|c| ui::accel_idx(text, c));
+        let (pre, key, post) = match at {
+            Some(i) => {
+                let mut it = text.chars();
+                let pre: String = it.by_ref().take(i).collect();
+                let key: String = it.next().into_iter().collect();
+                (pre, key, it.collect::<String>())
+            }
+            None => (text.to_string(), String::new(), String::new()),
+        };
+        l.view.label(cx, ids!(row.pre)).set_text(cx, &pre);
+        l.view.label(cx, ids!(row.key.k1)).set_text(cx, &key);
+        l.view.label(cx, ids!(row.key.k2)).set_text(cx, &key);
+        l.view.label(cx, ids!(row.post)).set_text(cx, &post);
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
     }
@@ -1266,35 +1322,44 @@ impl Widget for MessagePanel {
                 }
             }
         }
-        // The message grammar: j/k walk in place (dotted semantics),
-        // r replies — letters arrive as TextInput events.
-        if let Event::TextInput(t) = event {
+        // The message panel's link accelerators (CR-003): the walk that used
+        // to be a hidden j/k is cmd+n / cmd+o now, drawn onto the links
+        // themselves, and reply is cmd+r. The shell forwards any cmd chord
+        // it does not own itself.
+        if let Event::KeyDown(k) = event {
+            if !k.modifiers.logo {
+                return;
+            }
             let Some(p) = scope.props.get::<PanelProps>() else {
                 return;
             };
             let crate::core::Kind::Message { id } = p.kind else {
                 return;
             };
-            match t.input.as_str() {
-                "j" | "k" => {
-                    let (newer, older) = mail::neighbours(&p.store, id);
-                    let target = if t.input == "j" { older } else { newer };
-                    if let Some(nid) = target {
-                        cx.action(PanelAction::FollowLink {
-                            pid: p.pid,
-                            target: crate::core::Kind::Message { id: nid },
-                            dotted: true,
-                            fresh: false,
-                        });
-                    }
-                }
-                "r" => cx.action(PanelAction::FollowLink {
+            let c = match k.key_code {
+                KeyCode::KeyN => ui::ACCEL_NEWER,
+                KeyCode::KeyO => ui::ACCEL_OLDER,
+                KeyCode::KeyR => ui::ACCEL_REPLY,
+                _ => return,
+            };
+            if c == ui::ACCEL_REPLY {
+                cx.action(PanelAction::FollowLink {
                     pid: p.pid,
                     target: crate::core::Kind::Compose { re: id },
                     dotted: false,
                     fresh: false,
-                }),
-                _ => {}
+                });
+                return;
+            }
+            let (newer, older) = mail::neighbours(&p.store, id);
+            let target = if c == ui::ACCEL_OLDER { older } else { newer };
+            if let Some(nid) = target {
+                cx.action(PanelAction::FollowLink {
+                    pid: p.pid,
+                    target: crate::core::Kind::Message { id: nid },
+                    dotted: true,
+                    fresh: false,
+                });
             }
         }
     }
@@ -1342,23 +1407,38 @@ impl Widget for MessagePanel {
                     let nl = self.view.link(cx, ids!(newer_link));
                     let no = self.view.label(cx, ids!(newer_off));
                     if let Some(n) = newer {
-                        nl.set(cx, pid, "← newer", crate::core::Kind::Message { id: n }, true);
+                        nl.set_accel(
+                            cx,
+                            pid,
+                            "← newer",
+                            crate::core::Kind::Message { id: n },
+                            true,
+                            Some(ui::ACCEL_NEWER),
+                        );
                     }
                     nl.set_visible(cx, newer.is_some());
                     no.set_visible(cx, newer.is_none());
                     let ol = self.view.link(cx, ids!(older_link));
                     let oo = self.view.label(cx, ids!(older_off));
                     if let Some(o) = older {
-                        ol.set(cx, pid, "older →", crate::core::Kind::Message { id: o }, true);
+                        ol.set_accel(
+                            cx,
+                            pid,
+                            "older →",
+                            crate::core::Kind::Message { id: o },
+                            true,
+                            Some(ui::ACCEL_OLDER),
+                        );
                     }
                     ol.set_visible(cx, older.is_some());
                     oo.set_visible(cx, older.is_none());
-                    self.view.link(cx, ids!(reply_link)).set(
+                    self.view.link(cx, ids!(reply_link)).set_accel(
                         cx,
                         pid,
                         "reply",
                         crate::core::Kind::Compose { re: id },
                         false,
+                        Some(ui::ACCEL_REPLY),
                     );
                 }
             }

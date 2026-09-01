@@ -13,6 +13,10 @@ a nudged double-draw (unread rows, the contact name). Panel content is laid
 out on the character grid the face is measured to, which is what keeps tables,
 fields and buttons aligned by construction.
 
+Bold does exactly two jobs, and they never share a place: a bold **run** is
+emphasis, a bold **single character inside a button or a link** is that
+control's [accelerator](./interaction-grammar.md#accelerators).
+
 ## Chrome
 
 1 pt near-black borders, sharp corners, 8 pt gaps, no shadows. Panel header:

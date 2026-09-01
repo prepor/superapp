@@ -18,11 +18,13 @@ the bottom-right corner; errors are the only place colour appears.
 
 ## Keyboard
 
-**Cmd is the workspace modifier** (niri's Mod; mosaic made the same choice).
-Everything below it belongs to the focused panel's content — which is what a
-future text-editor panel needs: the whole plain keyboard, no modes.
+**Cmd carries two namespaces.** The **reserved set** below is global and
+fixed — it means the same thing on every panel, forever. Everything else
+under cmd belongs to the **focused panel**, which spends it on
+[accelerators](#accelerators). Plain letters stay free: no modes, and the
+whole keyboard is still there for a future text-editor panel.
 
-- `cmd` + `←↓↑→` / `hjkl` — focus panels; `+shift` — move the focused panel
+- `cmd` + `←↓↑→` — focus panels; `+shift` — move the focused panel
 - `cmd+1…9` — switch workspace; `cmd+shift+1…9` — move the focused panel to
   that workspace and follow it
 - `cmd+w` — close the focused panel
@@ -30,15 +32,54 @@ future text-editor panel needs: the whole plain keyboard, no modes.
 - `cmd+[` / `cmd+]` — consume into / expel out of a column;
   `cmd+,` / `cmd+.` — pull from the right / push the bottom out
 - `cmd+t` — toggle column tabs
-- inbox: `j`/`k` row cursor (scrolls the list to keep it visible), `enter`
-  opens (`cmd+enter` un-joined), `/` filter
-- message: `j`/`k` older/newer in place, `r` reply
-- forms: `tab` / `shift+tab` walk the fields; on settings, `enter` advances
-  too and **submits past the last field**
+- `cmd+u` history · `cmd+i` copy the panel's context
+
+That is the whole reserved set: `1…9`, the arrows, `w z u i t [ ] , .` and
+`enter`. A panel may claim any other letter.
+
+Per panel, below the reserved set:
+
+- inbox: `enter` opens (`cmd+enter` un-joined), `/` filter, arrows walk the
+  rows (scrolling the list to keep the cursor visible)
+- forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
+  wrapping; `enter` advances and **submits past the last field**
 - `esc` leaves a text field; arrows scroll a panel that has nothing better to do
+
+There is no vim layer: `hjkl` and the plain `j`/`k` walks are gone. A key is
+an arrow, a cmd chord, or typing — nothing in between.
 
 Letter keys reach panels as text input, so key repeat and IME behave like
 typing; control keys (enter, arrows, backspace) are routed as key events.
+
+## Accelerators
+
+**A control carries its own key, drawn into its label.** One character of a
+button or link is **bold**, and `cmd`+that letter fires it: `archive` is
+`cmd+a`, `reply` is `cmd+r`, the message walk is `cmd+n` / `cmd+o` on
+`← newer` and `older →`. Nothing to memorise and no help panel to consult —
+the shortcut is a property of the thing it fires.
+
+This is the one place bold does a second job, so the rule is sharp:
+
+> A bold **run** is emphasis (unread rows, a contact's name). A bold **single
+> character inside a bordered button or an underlined link** is that
+> control's key.
+
+The two never share a place: emphasis is never applied to a control's label,
+and controls are already marked by border or underline.
+
+Accelerators are **on cmd, not on bare letters**, so they work while a text
+field owns the keyboard — you can archive mid-sentence in a compose body, and
+the mark never has to lie about whether it is live. They are also
+**panel-scoped**: `cmd+a` archives on a message, and stays select-all in a
+compose body. Four rules keep that honest, enforced by unit test rather than
+by discipline:
+
+1. never the reserved set;
+2. unique within a panel;
+3. a panel that edits text yields `c` `v` `x` `a` to the field;
+4. only for controls a panel has exactly one of — a list of rows each with a
+   *remove* button stays on the Tab ring and the mouse.
 
 ## Workspaces
 
