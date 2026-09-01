@@ -264,6 +264,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
             .map(|m| format!("re: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
+        Kind::AddAccount => "add account".into(),
     }
 }
 

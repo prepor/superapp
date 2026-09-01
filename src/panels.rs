@@ -28,7 +28,7 @@ pub struct PanelProps {
 #[derive(Debug, Clone)]
 pub enum PanelAction {
     AddAccount {
-        /// The settings panel that submitted (its form clears on success).
+        /// The add-account panel that submitted (its form clears on success).
         pid: u64,
         email: String,
         pass: String,
@@ -245,6 +245,70 @@ script_mod! {
         }
     }
 
+    /** The link grammar as a widget: label over a 1 px underline — solid
+        opens joined, dotted replaces in place (the dashes are shader-drawn). */
+    mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Down
+        cursor: MouseCursor.Hand
+        // The label is split so one character can carry the accelerator
+        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
+        // beats padding a twin with spaces — `←` arrives from the symbol
+        // fallback, whose advance is not the mono cell.
+        // Label's base padding is mspace_1 — invisible around a single run,
+        // but it would open a gap between each of the three, so the split
+        // parts zero it and the row carries the word's own spacing.
+        row := View {
+            width: Fit, height: Fit
+            flow: Right
+            pre := mod.widgets.SLabel { padding: 0, text: "" }
+            // Three passes, not the usual two: one nudge is legible in a
+            // run of body text but disappears in a short label, and the
+            // mark has to read at a glance to be worth anything.
+            key := View {
+                width: Fit, height: Fit
+                flow: Overlay
+                k1 := mod.widgets.SLabel { padding: 0, text: "" }
+                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
+                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
+            }
+            post := mod.widgets.SLabel { padding: 0, text: "" }
+        }
+        // The solid underline needs its own `pixel` for the same reason the
+        // row wash does (CR-002's sixth defect): a stock-shader quad merges
+        // into a draw call that paints *under* the panel background, so it
+        // never appears. A distinct shader earns a correctly-ordered call.
+        ul := View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        ul_dotted := View {
+            visible: false
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                // `Math` carries only rotate_2d/random_2d on this pin, so
+                // the period comes from fract, not a mod that never
+                // compiled (and so never dashed anything).
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if fract(x / 6.0) > 0.5 {
+                        return vec4(0.0, 0.0, 0.0, 0.0)
+                    }
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
     // ---- settings ----------------------------------------------------------
 
     /** One account: address + host, status underneath, remove on the right. */
@@ -295,8 +359,8 @@ script_mod! {
         }
     }
 
-    /** The settings panel: accounts fill the middle; the add form keeps a
-        compact, fixed shape at the bottom. */
+    /** The settings panel: the accounts and their sync state. The add form
+        is its own panel, opened by the header link (solid: joined right). */
     mod.widgets.SettingsPanel = set_type_default() do #(SettingsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -304,23 +368,32 @@ script_mod! {
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
-        mod.widgets.SSection { text: "ACCOUNTS" }
+        View {
+            width: Fill, height: Fit, align: Align{y: 1.0}
+            mod.widgets.SSection { text: "ACCOUNTS" }
+            View { width: Fill, height: 1 }
+            add_link := mod.widgets.SLink {}
+        }
         View { width: Fill, height: 5 }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
 
         accounts_list := PortalList {
             // PortalList virtualizes against a fixed viewport (Fit would
-            // collapse it) — so it takes whatever the form leaves.
+            // collapse it) — so it fills the panel below the header.
             width: Fill, height: Fill
             flow: Down
             account_row := mod.widgets.AccountRow {}
         }
+    }
 
-        View { width: Fill, height: 14 }
-        mod.widgets.SSection { text: "ADD ACCOUNT" }
-        View { width: Fill, height: 5 }
-        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
-        View { width: Fill, height: 10 }
+    /** The add-account form, a panel of its own: four labelled fields and
+        the one button, top-aligned in a compact panel. */
+    mod.widgets.AddAccountPanel = set_type_default() do #(AddAccountPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -335,7 +408,12 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "PASSWORD" }
-            pass_input := mod.widgets.SField { is_password: true }
+            pass_input := mod.widgets.SField {
+                is_password: true
+                // The placeholder carries the one hint worth keeping (the
+                // masking skips empty text — it renders plain).
+                empty_text: "app password"
+            }
         }
         View { width: Fill, height: 7 }
         View {
@@ -360,11 +438,7 @@ script_mod! {
         }
         View { width: Fill, height: 12 }
         View {
-            width: Fill, height: Fit, align: Align{y: 0.5}
-            hint_lbl := mod.widgets.SLabel {
-                text: "an app password — tab walks, enter submits"
-                draw_text +: { color: #909090, text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
-            }
+            width: Fill, height: Fit
             View { width: Fill, height: 1 }
             add_btn := mod.widgets.SBtn { text: "add account" }
         }
@@ -495,71 +569,7 @@ script_mod! {
         }
     }
 
-    // ---- links and the read panels ----------------------------------------
-
-    /** The link grammar as a widget: label over a 1 px underline — solid
-        opens joined, dotted replaces in place (the dashes are shader-drawn). */
-    mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
-        ..mod.widgets.View
-        width: Fit, height: Fit
-        flow: Down
-        cursor: MouseCursor.Hand
-        // The label is split so one character can carry the accelerator
-        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
-        // beats padding a twin with spaces — `←` arrives from the symbol
-        // fallback, whose advance is not the mono cell.
-        // Label's base padding is mspace_1 — invisible around a single run,
-        // but it would open a gap between each of the three, so the split
-        // parts zero it and the row carries the word's own spacing.
-        row := View {
-            width: Fit, height: Fit
-            flow: Right
-            pre := mod.widgets.SLabel { padding: 0, text: "" }
-            // Three passes, not the usual two: one nudge is legible in a
-            // run of body text but disappears in a short label, and the
-            // mark has to read at a glance to be worth anything.
-            key := View {
-                width: Fit, height: Fit
-                flow: Overlay
-                k1 := mod.widgets.SLabel { padding: 0, text: "" }
-                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
-                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
-            }
-            post := mod.widgets.SLabel { padding: 0, text: "" }
-        }
-        // The solid underline needs its own `pixel` for the same reason the
-        // row wash does (CR-002's sixth defect): a stock-shader quad merges
-        // into a draw call that paints *under* the panel background, so it
-        // never appears. A distinct shader earns a correctly-ordered call.
-        ul := View {
-            width: Fill, height: 1
-            show_bg: true
-            draw_bg +: {
-                color: #141414
-                pixel: fn() {
-                    return vec4(self.color.xyz * self.color.w, self.color.w)
-                }
-            }
-        }
-        ul_dotted := View {
-            visible: false
-            width: Fill, height: 1
-            show_bg: true
-            draw_bg +: {
-                color: #141414
-                // `Math` carries only rotate_2d/random_2d on this pin, so
-                // the period comes from fract, not a mod that never
-                // compiled (and so never dashed anything).
-                pixel: fn() {
-                    let x = self.pos.x * self.rect_size.x
-                    if fract(x / 6.0) > 0.5 {
-                        return vec4(0.0, 0.0, 0.0, 0.0)
-                    }
-                    return vec4(self.color.xyz * self.color.w, self.color.w)
-                }
-            }
-        }
-    }
+    // ---- the read panels ---------------------------------------------------
 
     /** One mail, whole: headers with a contact link, the body, the walk. */
     mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
@@ -760,33 +770,40 @@ impl RingStop {
 
     fn focus(&self, cx: &mut Cx) {
         match self {
-            RingStop::Input(t) => SettingsPanel::focus_input(cx, t),
+            RingStop::Input(t) => focus_input(cx, t),
             RingStop::Remove(b, _) | RingStop::Add(b) => cx.set_key_focus(b.area()),
         }
     }
 }
 
+/// Advance focus the way forms expect: focus + select-all, so typing
+/// replaces and backspace clears.
+fn focus_input(cx: &mut Cx, input: &TextInputRef) {
+    input.set_key_focus(cx);
+    if let Some(mut t) = input.borrow_mut() {
+        t.select_all(cx);
+    }
+}
+
+/// Walk a tab ring one step: wrap around; when the panel itself holds
+/// focus, the first Tab lands on the first stop (last, shifted).
+fn tab_ring(cx: &mut Cx, ring: &[RingStop], shift: bool) {
+    if ring.is_empty() {
+        return;
+    }
+    let dir: isize = if shift { -1 } else { 1 };
+    let n = ring.len() as isize;
+    let j = match ring.iter().position(|s| s.is_focused(cx)) {
+        Some(i) => (i as isize + dir).rem_euclid(n),
+        None if dir > 0 => 0,
+        None => n - 1,
+    };
+    ring[j as usize].focus(cx);
+}
+
 impl SettingsPanel {
-    /// Advance focus the way forms expect: focus + select-all, so typing
-    /// replaces and backspace clears.
-    pub(crate) fn focus_input(cx: &mut Cx, input: &TextInputRef) {
-        input.set_key_focus(cx);
-        if let Some(mut t) = input.borrow_mut() {
-            t.select_all(cx);
-        }
-    }
-
-    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 4] {
-        [
-            self.view.text_input(cx, ids!(email_input)),
-            self.view.text_input(cx, ids!(pass_input)),
-            self.view.text_input(cx, ids!(imap_input)),
-            self.view.text_input(cx, ids!(smtp_input)),
-        ]
-    }
-
-    /// The tab ring in visual order: remove buttons (visible account rows),
-    /// the form fields, the add button.
+    /// The tab ring in visual order: the visible account rows' remove
+    /// buttons.
     fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
         let mut v = Vec::new();
         if let Some(list) = self
@@ -806,9 +823,87 @@ impl SettingsPanel {
                 v.push(RingStop::Remove(row.button(cx, ids!(remove_btn)), id));
             }
         }
-        for t in self.inputs(cx) {
-            v.push(RingStop::Input(t));
+        v
+    }
+}
+
+impl Widget for SettingsPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+
+        // Tab walks the remove buttons; enter/space press the focused one.
+        if let Event::KeyDown(k) = event {
+            if k.key_code == KeyCode::Tab {
+                let ring = self.ring(cx);
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
+            }
+            if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+                for stop in self.ring(cx) {
+                    if stop.is_focused(cx) {
+                        if let RingStop::Remove(_, id) = stop {
+                            cx.action(PanelAction::RemoveAccount(id));
+                        }
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let props = scope.props.get::<PanelProps>();
+        let pid = props.map_or(0, |p| p.pid);
+        let accounts = props.map(|p| mail::accounts(&p.store));
+        self.view.link(cx, ids!(add_link)).set(
+            cx,
+            pid,
+            "add account",
+            crate::core::Kind::AddAccount,
+            false,
+        );
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                let accounts = accounts.as_deref().map_or(&[][..], |a| &a[..]);
+                list.set_item_range(cx, 0, accounts.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(a) = accounts.get(idx) {
+                        let row = list.item(cx, idx, live_id!(account_row));
+                        row.as_account_row().populate(cx, a);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AddAccountPanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct AddAccountPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl AddAccountPanel {
+    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 4] {
+        [
+            self.view.text_input(cx, ids!(email_input)),
+            self.view.text_input(cx, ids!(pass_input)),
+            self.view.text_input(cx, ids!(imap_input)),
+            self.view.text_input(cx, ids!(smtp_input)),
+        ]
+    }
+
+    /// The tab ring in visual order: the fields, the add button.
+    fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
+        let mut v: Vec<RingStop> = self.inputs(cx).into_iter().map(RingStop::Input).collect();
         v.push(RingStop::Add(self.view.button(cx, ids!(add_btn))));
         v
     }
@@ -844,42 +939,22 @@ impl SettingsPanel {
     }
 }
 
-impl Widget for SettingsPanel {
+impl Widget for AddAccountPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
-        // Tab walks the whole ring — fields AND buttons — with the
-        // frameworks' rules: wrap around; when the panel itself holds
-        // focus, the first Tab lands on the first stop (last, shifted).
-        // Enter/Space press a focused button.
+        // Tab walks the fields and the button; enter/space press it.
         if let Event::KeyDown(k) = event {
             if k.key_code == KeyCode::Tab {
                 let ring = self.ring(cx);
-                if !ring.is_empty() {
-                    let dir: isize = if k.modifiers.shift { -1 } else { 1 };
-                    let n = ring.len() as isize;
-                    let j = match ring.iter().position(|s| s.is_focused(cx)) {
-                        Some(i) => (i as isize + dir).rem_euclid(n),
-                        None if dir > 0 => 0,
-                        None => n - 1,
-                    };
-                    ring[j as usize].focus(cx);
-                    self.redraw(cx);
-                }
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
             }
             if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
-                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
-                for stop in self.ring(cx) {
-                    if stop.is_focused(cx) {
-                        match stop {
-                            RingStop::Remove(_, id) => {
-                                cx.action(PanelAction::RemoveAccount(id));
-                            }
-                            RingStop::Add(_) => self.submit(cx, pid),
-                            RingStop::Input(_) => {}
-                        }
-                        break;
-                    }
+                let add = self.view.button(cx, ids!(add_btn));
+                if cx.has_key_focus(add.area()) {
+                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                    self.submit(cx, pid);
                 }
             }
         }
@@ -895,11 +970,11 @@ impl Widget for SettingsPanel {
             }
             // Enter advances; past the last field it submits.
             if email.returned(actions).is_some() {
-                Self::focus_input(cx, &pass);
+                focus_input(cx, &pass);
             } else if pass.returned(actions).is_some() {
-                Self::focus_input(cx, &imap);
+                focus_input(cx, &imap);
             } else if imap.returned(actions).is_some() {
-                Self::focus_input(cx, &smtp);
+                focus_input(cx, &smtp);
             } else if smtp.returned(actions).is_some()
                 || self.view.button(cx, ids!(add_btn)).clicked(actions)
             {
@@ -910,24 +985,7 @@ impl Widget for SettingsPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let accounts = scope
-            .props
-            .get::<PanelProps>()
-            .map(|p| mail::accounts(&p.store));
-        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
-            if let Some(mut list) = item.as_portal_list().borrow_mut() {
-                let accounts = accounts.as_deref().map_or(&[][..], |a| &a[..]);
-                list.set_item_range(cx, 0, accounts.len());
-                while let Some(idx) = list.next_visible_item(cx) {
-                    if let Some(a) = accounts.get(idx) {
-                        let row = list.item(cx, idx, live_id!(account_row));
-                        row.as_account_row().populate(cx, a);
-                        row.draw_all(cx, scope);
-                    }
-                }
-            }
-        }
-        DrawStep::done()
+        self.view.draw_walk(cx, scope, walk)
     }
 }
 
@@ -971,7 +1029,7 @@ impl Widget for ComposePanel {
                     None if dir > 0 => 0,
                     None => n - 1,
                 };
-                SettingsPanel::focus_input(cx, &inputs[j as usize]);
+                focus_input(cx, &inputs[j as usize]);
             }
         }
 
@@ -983,9 +1041,9 @@ impl Widget for ComposePanel {
                 }
             }
             if to.returned(actions).is_some() {
-                SettingsPanel::focus_input(cx, &subject);
+                focus_input(cx, &subject);
             } else if subject.returned(actions).is_some() {
-                SettingsPanel::focus_input(cx, &body);
+                focus_input(cx, &body);
             }
             if to.changed(actions).is_some()
                 || subject.changed(actions).is_some()
@@ -1184,7 +1242,7 @@ impl Widget for InboxPanel {
         // It arrives as a TextInput event, exactly like real typing.
         if let Event::TextInput(t) = event {
             if !filter_focused && t.input == "/" {
-                SettingsPanel::focus_input(cx, &filter);
+                focus_input(cx, &filter);
             }
         }
         if let Event::KeyDown(k) = event {
@@ -1209,7 +1267,7 @@ impl Widget for InboxPanel {
                     KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
                     // The inbox's one-stop tab ring: the filter.
-                    KeyCode::Tab => SettingsPanel::focus_input(cx, &filter),
+                    KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
                 }
             }
