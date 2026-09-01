@@ -235,6 +235,10 @@ script_mod! {
                         contact_tpl := mod.widgets.ContactPanel{}
                         help_tpl := mod.widgets.HelpPanel{}
                         about_tpl := mod.widgets.AboutPanel{}
+                        // The modal overlays are hosted the same way, keyed
+                        // by a reserved id rather than a panel.
+                        rows_overlay_tpl := mod.widgets.RowsOverlay{}
+                        launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                     }
                 }
             }
@@ -1734,6 +1738,12 @@ const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
 
+/// The overlays are hosted like panels, so they need keys in the same map.
+/// Panel ids are workspace-tagged (`k << 32`) and allocated upward, so the
+/// top of the range is free forever.
+const OVERLAY_PID_R: PanelId = u64::MAX;
+const OVERLAY_PID_L: PanelId = u64::MAX - 1;
+
 /// How a `key` chord executes: as a synthesized key event, as text (plain
 /// letters reach panels the same way real typing does), or as a bare
 /// modifier tap — a down/up pair (`key cmd 2` double-taps cmd).
@@ -1905,9 +1915,10 @@ impl Stage {
             self.ime_sent = None;
             self.ime_composing = false;
             if want_ime {
-                // With a hosted panel the key focus belongs to whichever
-                // TextInput holds it — only the char grid claims it here.
-                if !hosted {
+                // With a hosted panel — or the launcher's field — the key
+                // focus belongs to whichever TextInput holds it; only the
+                // char grid claims it here.
+                if !hosted && !launcher {
                     cx.set_key_focus(self.area);
                 }
                 cx.show_text_ime_with_config(
@@ -1927,14 +1938,13 @@ impl Stage {
         // android's IME owns an editable mirroring the focused field; seed it
         // on focus and after every app-side edit — except mid-composition,
         // when a push would clobber what the keyboard is composing.
-        if cfg!(target_os = "android") && self.ime_shown && !self.ime_composing {
-            if let Some((text, caret)) = self.state.as_deref().and_then(|s| {
-                if launcher {
-                    Some((s.launcher.query.clone(), s.launcher.caret))
-                } else {
-                    s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid))
-                }
-            }) {
+        // The launcher's field is a TextInput now and syncs itself.
+        if cfg!(target_os = "android") && self.ime_shown && !self.ime_composing && !launcher {
+            if let Some((text, caret)) = self
+                .state
+                .as_deref()
+                .and_then(|s| s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid)))
+            {
                 let sent = self.ime_sent.as_ref();
                 if sent.map(|(t, c)| (t.as_str(), *c)) != Some((text.as_str(), caret)) {
                     self.ime_sent = Some((text.clone(), caret));
@@ -2303,9 +2313,10 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // The launcher owns the keyboard while it is up: arrows pick, enter
-        // goes, esc closes; characters edit the query (they arrive as
-        // TextInput, backspace and caret moves are handled here).
+        // The launcher owns the keyboard while it is up: arrows pick the
+        // hit, enter goes, esc closes. Everything else — the query's own
+        // editing, caret, selection — belongs to its `SField` now, so it is
+        // forwarded rather than re-implemented (CR-002 F).
         if state.overlay == Overlay::Launcher {
             match k.key_code {
                 KeyCode::Escape => {
@@ -2326,27 +2337,10 @@ impl Stage {
                     state.launcher.sel = state.launcher.sel.saturating_sub(1);
                     self.kick(cx);
                 }
-                KeyCode::ArrowLeft => {
-                    state.launcher.caret = state.launcher.caret.saturating_sub(1);
+                _ => {
+                    self.forward_to_overlay(cx, &Event::KeyDown(k.clone()));
                     self.kick(cx);
                 }
-                KeyCode::ArrowRight => {
-                    let len = state.launcher.query.chars().count();
-                    state.launcher.caret = (state.launcher.caret + 1).min(len);
-                    self.kick(cx);
-                }
-                KeyCode::Backspace => {
-                    let c = state.launcher.caret;
-                    if c > 0 {
-                        let b0 = char_byte(&state.launcher.query, c - 1);
-                        let b1 = char_byte(&state.launcher.query, c);
-                        state.launcher.query.replace_range(b0..b1, "");
-                        state.launcher.caret = c - 1;
-                        state.launcher.sel = 0;
-                    }
-                    self.kick(cx);
-                }
-                _ => {}
             }
             return;
         }
@@ -2938,15 +2932,16 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // The launcher's query mirrors the IME editable wholesale, like any
-        // field (this is the android typing path).
+        // The launcher's query is an `SField`, and a TextInput owns the
+        // whole android full-state protocol itself — hand it the event
+        // untouched rather than mirroring it here.
         if state.overlay == Overlay::Launcher {
-            let text = fs.text.replace('\n', "");
-            state.launcher.caret = caret.min(text.chars().count());
-            if state.launcher.query != text {
-                state.launcher.query = text;
-                state.launcher.sel = 0;
-            }
+            let ev = Event::TextInput(TextInputEvent {
+                input: String::new(),
+                full_state_sync: Some(fs.clone()),
+                ..Default::default()
+            });
+            self.forward_to_overlay(cx, &ev);
             self.kick(cx);
             return;
         }
@@ -3009,11 +3004,15 @@ impl Stage {
             self.kick(cx);
             return;
         }
+        // The launcher's query is an `SField` now: hand it the character
+        // and let the widget's own editing take it (the shell hears the
+        // result back as `OverlayAction::Query`).
         if state.overlay == Overlay::Launcher {
-            let byte = char_byte(&state.launcher.query, state.launcher.caret);
-            state.launcher.query.insert_str(byte, input);
-            state.launcher.caret += input.chars().count();
-            state.launcher.sel = 0;
+            let ev = Event::TextInput(TextInputEvent {
+                input: input.to_string(),
+                ..Default::default()
+            });
+            self.forward_to_overlay(cx, &ev);
             self.kick(cx);
             return;
         }
@@ -3782,6 +3781,21 @@ impl Stage {
                 }
             }
         }
+        // The launcher's field reports its own edits; the search re-runs on
+        // the next draw from this query.
+        for a in actions {
+            if let Some(crate::panels::OverlayAction::Query(q)) =
+                a.downcast_ref::<crate::panels::OverlayAction>()
+            {
+                if let Some(state) = self.state.as_deref_mut() {
+                    if state.launcher.query != *q {
+                        state.launcher.query = q.clone();
+                        state.launcher.sel = 0;
+                        refresh = true;
+                    }
+                }
+            }
+        }
         if refresh {
             self.sync(cx);
         }
@@ -3879,6 +3893,26 @@ impl Stage {
         }
     }
 
+    /// Hands an event to whichever overlay widget is up. Its rows are
+    /// presentation, so in practice this feeds the launcher's query field.
+    fn forward_to_overlay(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        let key = match state.overlay {
+            Overlay::Launcher => OVERLAY_PID_L,
+            Overlay::Ws | Overlay::History => OVERLAY_PID_R,
+            Overlay::None => return,
+        };
+        let Some(w) = self.hosted.get(&key).cloned() else {
+            return;
+        };
+        // Rows come from the shell each draw; event handling needs none.
+        let props = crate::panels::OverlayProps::default();
+        let mut scope = Scope::with_props(&props);
+        w.handle_event(cx, event, &mut scope);
+    }
+
     /// Keys and text go to the focused panel's widget alone — pointer
     /// events are positional, but the keyboard belongs to one panel, and
     /// a "j" typed into compose must not walk some other inbox.
@@ -3916,10 +3950,23 @@ impl Widget for Stage {
             Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
         ) {
             self.forward_to_hosted(cx, event);
+            // The overlay is hosted too, but keyed outside the panel map —
+            // without this its field would never hear its own Changed
+            // action, and the query would type but never search.
+            self.forward_to_overlay(cx, event);
         }
         if let Some(pid) = self.pending_focus.take() {
-            if let Some(w) = self.hosted.get(&pid) {
-                w.as_compose_panel().focus_body(cx);
+            if let Some(w) = self.hosted.get(&pid).cloned() {
+                if pid == OVERLAY_PID_L {
+                    let q = self
+                        .state
+                        .as_deref()
+                        .map(|s| s.launcher.query.clone())
+                        .unwrap_or_default();
+                    w.as_launcher_overlay().focus_query(cx, &q);
+                } else {
+                    w.as_compose_panel().focus_body(cx);
+                }
             }
         }
         // A blurring TextInput hides the platform IME (its own lifecycle);
@@ -4651,322 +4698,11 @@ impl Stage {
             });
         }
 
-        // The workspaces overlay: a column of tappable rows — the current
-        // space inverted, panel titles as the summary, the first empty slot
-        // offered as a fresh space — under a search row, the launcher's
-        // touch entry.
-        if state.overlay == Overlay::Ws {
-            let roster = state.ws.roster();
-            let row_h: f64 = 54.0;
-            let row_gap: f64 = 10.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(430.0);
-            let total = (roster.len() + 1) as f64 * (row_h + row_gap) - row_gap;
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let mut y = vp.pos.y + ((vp.size.y - total) / 2.0).max(2.0 * theme::GAP);
-            self.draw_panel.new_draw_call(cx);
-            self.draw_mono.new_draw_call(cx);
-            let r = rect(x, y, w, row_h);
-            self.draw_panel.color = rgba_a(theme::BG, 1.0);
-            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-            self.draw_panel.border_size = 1.0;
-            self.draw_panel.alpha = 1.0;
-            self.draw_panel.draw_abs(cx, r);
-            self.set_text(Style::Muted, 1.0);
-            self.draw_mono.draw_abs(
-                cx,
-                dvec2(x + 16.0, y + (row_h - self.cell.natural) / 2.0),
-                "search",
-            );
-            self.hits.push(HitR {
-                rect: r,
-                act: Act::LauncherOpen,
-                cursor: MouseCursor::Hand,
-                label: "search".into(),
-            });
-            y += row_h + row_gap;
-            for k in roster {
-                let r = rect(x, y, w, row_h);
-                let current = k == state.ws.active;
-                let (bg, fg) = if current {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, r);
-                self.set_text(Style::Big, 1.0);
-                self.draw_mono.color = rgba_a(fg, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, y + (row_h - self.cell.natural * 1.25) / 2.0),
-                    &format!("{}", k + 1),
-                );
-                let ws = &state.ws.wss[k];
-                let summary = if ws.is_empty() {
-                    "new".to_string()
-                } else {
-                    let names: Vec<String> = ws
-                        .columns
-                        .iter()
-                        .flat_map(|c| c.panels.iter())
-                        .filter_map(|pid| ws.panels.get(pid).map(|p| state.panel_title(&p.kind)))
-                        .collect();
-                    names.join(" · ")
-                };
-                let cols = (((w - 56.0) / self.cell.adv).max(4.0)) as usize;
-                let summary = trunc(&summary, cols);
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(fg, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 48.0, y + (row_h - self.cell.natural) / 2.0),
-                    &summary,
-                );
-                self.hits.push(HitR {
-                    rect: r,
-                    act: Act::WsRow(k),
-                    cursor: MouseCursor::Hand,
-                    label: format!("workspace {}", k + 1),
-                });
-                y += row_h + row_gap;
-            }
-        }
+        // The overlays are retained widgets now (CR-002 F): the shell
+        // supplies their rows and owns their clicks, exactly as it does for
+        // a panel's in-list controls.
+        self.draw_overlay(cx, state, vp);
 
-        // The launcher: a query field over the result rows, windowed around
-        // the selection. Hits are recomputed here, on what is actually
-        // drawn, so clicks and enter resolve against the visible list.
-        // The history overlay: the action DAG as rows, newest first, indented
-        // by branch depth. The row under HEAD is inverted; undone branches
-        // are muted but clickable — travel goes anywhere, including the
-        // beginning. Expired sends are physics: marked, never re-walked.
-        if state.overlay == Overlay::History {
-            let (nodes, head) = state.store.history().unwrap_or((Vec::new(), 0));
-            let mut depth: HashMap<i64, usize> = HashMap::new();
-            for n in &nodes {
-                let d = depth.get(&n.parent).map_or(0, |d| d + 1);
-                depth.insert(n.id, d);
-            }
-            struct HRow {
-                id: i64,
-                text: String,
-                right: String,
-                state: &'static str,
-            }
-            let mut rows: Vec<HRow> = nodes
-                .iter()
-                .rev()
-                .map(|n| {
-                    let ind = "  ".repeat((*depth.get(&n.id).unwrap_or(&0)).min(6));
-                    HRow {
-                        id: n.id,
-                        text: format!("{ind}{}", n.label),
-                        right: match n.state.as_str() {
-                            "expired" => format!("{} · sent", mail::fmt_date(n.ts)),
-                            _ => mail::fmt_date(n.ts),
-                        },
-                        state: match n.state.as_str() {
-                            "applied" => "applied",
-                            "expired" => "expired",
-                            _ => "undone",
-                        },
-                    }
-                })
-                .collect();
-            rows.push(HRow {
-                id: 0,
-                text: "the beginning".into(),
-                right: String::new(),
-                state: "applied",
-            });
-
-            let row_h: f64 = 40.0;
-            let row_gap: f64 = 8.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(560.0);
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let top = vp.pos.y + 2.0 * theme::GAP;
-            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - top).max(0.0);
-            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
-            let head_idx = rows.iter().position(|r| r.id == head).unwrap_or(0);
-            let start = (head_idx + 1).saturating_sub(max_rows.max(3) - 2).min(
-                rows.len().saturating_sub(max_rows),
-            );
-            let end = (start + max_rows).min(rows.len());
-
-            self.draw_panel.new_draw_call(cx);
-            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
-            let mut y = top;
-            for r in &rows[start..end] {
-                let rr = rect(x, y, w, row_h);
-                let is_head = r.id == head;
-                let (bg, fg) = if is_head {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                let alpha = if r.state == "applied" || is_head { 1.0 } else { 0.45 };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, if is_head { 1.0 } else { alpha });
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, rr);
-                let ty = y + (row_h - self.cell.natural) / 2.0;
-                let rx = x + w - 16.0 - r.right.chars().count() as f64 * self.cell.adv;
-                if !r.right.is_empty() {
-                    texts.push((dvec2(rx, ty), r.right.clone(), fg, 0.5 * alpha + 0.05));
-                }
-                let cols = (((rx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
-                texts.push((dvec2(x + 16.0, ty), trunc(&r.text, cols), fg, alpha));
-                self.hits.push(HitR {
-                    rect: rr,
-                    act: Act::HistoryRow(r.id),
-                    cursor: MouseCursor::Hand,
-                    label: r.text.trim().to_string(),
-                });
-                y += row_h + row_gap;
-            }
-            if end < rows.len() {
-                texts.push((
-                    dvec2(x + 16.0, y + 6.0),
-                    format!("… {} earlier", rows.len() - end),
-                    theme::INK,
-                    0.45,
-                ));
-            }
-            self.draw_mono.new_draw_call(cx);
-            for (pos, s, color, alpha) in texts {
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(color, alpha);
-                self.draw_mono.draw_abs(cx, pos, &s);
-            }
-        }
-
-        if state.overlay == Overlay::Launcher {
-            state.launcher.hits =
-                launcher::search(&state.ws, &state.store, &state.launcher.query);
-            let n_hits = state.launcher.hits.len();
-            state.launcher.sel = state.launcher.sel.min(n_hits.saturating_sub(1));
-            let field_h: f64 = 54.0;
-            let row_h: f64 = 40.0;
-            let row_gap: f64 = 8.0;
-            let w = (vp.size.x - 4.0 * theme::GAP).min(520.0);
-            let x = vp.pos.x + (vp.size.x - w) / 2.0;
-            let top = vp.pos.y + 2.0 * theme::GAP;
-            self.draw_panel.new_draw_call(cx);
-            let fr = rect(x, top, w, field_h);
-            self.draw_panel.color = rgba_a(theme::BG, 1.0);
-            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-            self.draw_panel.border_size = 1.0;
-            self.draw_panel.alpha = 1.0;
-            self.draw_panel.draw_abs(cx, fr);
-            self.hits.push(HitR {
-                rect: fr,
-                act: Act::LauncherOpen,
-                cursor: MouseCursor::Text,
-                label: "search".into(),
-            });
-
-            // Result rows first (they share the panel draw call).
-            let mut y = top + field_h + 12.0;
-            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - y).max(0.0);
-            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
-            let start = (state.launcher.sel + 1).saturating_sub(max_rows);
-            let end = (start + max_rows).min(n_hits);
-            let rows: Vec<launcher::Hit> = state.launcher.hits[start..end].to_vec();
-            let sel = state.launcher.sel;
-            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
-            for (i, hit) in rows.iter().enumerate() {
-                let idx = start + i;
-                let r = rect(x, y, w, row_h);
-                let (bg, fg) = if idx == sel {
-                    (theme::INK, theme::BG)
-                } else {
-                    (theme::BG, theme::INK)
-                };
-                self.draw_panel.color = rgba_a(bg, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, r);
-                let ty = y + (row_h - self.cell.natural) / 2.0;
-                let badge = match hit.ws {
-                    Some(k) => format!("№{}", k + 1),
-                    None => "new".to_string(),
-                };
-                let bx = x + w - 16.0 - badge.chars().count() as f64 * self.cell.adv;
-                texts.push((dvec2(bx, ty), badge, fg, 0.55));
-                let cols = (((bx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
-                let label = trunc(&hit.label, cols);
-                let used = label.chars().count() + 2;
-                texts.push((dvec2(x + 16.0, ty), label, fg, 1.0));
-                if !hit.detail.is_empty() && hit.detail != hit.label && used < cols {
-                    let detail = trunc(&hit.detail, cols - used);
-                    texts.push((
-                        dvec2(x + 16.0 + used as f64 * self.cell.adv, ty),
-                        detail,
-                        fg,
-                        0.55,
-                    ));
-                }
-                self.hits.push(HitR {
-                    rect: r,
-                    act: Act::LauncherRow(idx),
-                    cursor: MouseCursor::Hand,
-                    label: hit.label.clone(),
-                });
-                y += row_h + row_gap;
-            }
-
-            // The caret, above the field's rect.
-            let q_chars = state.launcher.query.chars().count();
-            let caret = state.launcher.caret.min(q_chars);
-            self.draw_flat.new_draw_call(cx);
-            self.draw_flat.color = rgba_a(theme::INK, 1.0);
-            self.draw_flat.draw_abs(
-                cx,
-                rect(
-                    x + 16.0 + caret as f64 * self.cell.adv,
-                    top + (field_h - self.cell.line_h) / 2.0,
-                    2.0,
-                    self.cell.line_h,
-                ),
-            );
-
-            // Text above everything: the query (or its ghost), the rows.
-            self.draw_mono.new_draw_call(cx);
-            let fy = top + (field_h - self.cell.natural) / 2.0;
-            if state.launcher.query.is_empty() {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, fy),
-                    "search — panels, mail, people",
-                );
-            } else {
-                let cols = (((w - 32.0) / self.cell.adv).max(4.0)) as usize;
-                self.set_text(Style::N, 1.0);
-                self.draw_mono
-                    .draw_abs(cx, dvec2(x + 16.0, fy), &trunc(&state.launcher.query, cols));
-            }
-            for (pos, s, color, alpha) in texts {
-                self.set_text(Style::N, 1.0);
-                self.draw_mono.color = rgba_a(color, alpha);
-                self.draw_mono.draw_abs(cx, pos, &s);
-            }
-            if n_hits == 0 && !state.launcher.query.is_empty() {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(cx, dvec2(x + 16.0, y + 6.0), "nothing matches");
-            } else if end < n_hits {
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(x + 16.0, y + 2.0),
-                    &format!("… {} more", n_hits - end),
-                );
-            }
-        }
 
         // The toast, above everything.
         if let Some((msg, err, since)) = state.toast.clone() {
@@ -5157,6 +4893,215 @@ impl Stage {
             cursor: MouseCursor::Hand,
             label: hit_label.to_string(),
         });
+    }
+
+    /// Draws whichever modal overlay is up as a retained widget, and
+    /// registers its rows as hits.
+    ///
+    /// The rows live in a `PortalList`, so — like a panel's in-list
+    /// controls — the shell owns their clicks: real presses and scripted
+    /// ones resolve through the same `Act`s the char grid used, and the
+    /// widget is presentation plus (for the launcher) a real text field.
+    fn draw_overlay(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
+        use crate::panels::{OverlayProps, OverlayRowData};
+        if state.overlay == Overlay::None {
+            // Each opening starts clean: the launcher's field seeds and
+            // takes focus only on the frame its widget is created.
+            self.hosted.remove(&OVERLAY_PID_R);
+            self.hosted.remove(&OVERLAY_PID_L);
+            return;
+        }
+        let launcher = state.overlay == Overlay::Launcher;
+        // Rows, plus the Act each one resolves to.
+        let mut acts: Vec<Act> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut rows: Vec<OverlayRowData> = Vec::new();
+        match state.overlay {
+            Overlay::Ws => {
+                for k in state.ws.roster() {
+                    let ws = &state.ws.wss[k];
+                    let summary = if ws.is_empty() {
+                        "new".to_string()
+                    } else {
+                        ws.columns
+                            .iter()
+                            .flat_map(|c| c.panels.iter())
+                            .filter_map(|pid| {
+                                ws.panels.get(pid).map(|p| state.panel_title(&p.kind))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    rows.push(OverlayRowData {
+                        num: format!("{}", k + 1),
+                        main: summary,
+                        current: k == state.ws.active,
+                        ..Default::default()
+                    });
+                    acts.push(Act::WsRow(k));
+                    labels.push(format!("workspace {}", k + 1));
+                }
+            }
+            Overlay::History => {
+                let (nodes, head) = state.store.history().unwrap_or((Vec::new(), 0));
+                let mut depth: HashMap<i64, usize> = HashMap::new();
+                for n in &nodes {
+                    let d = depth.get(&n.parent).map_or(0, |d| d + 1);
+                    depth.insert(n.id, d);
+                }
+                for n in nodes.iter().rev() {
+                    let ind = "  ".repeat((*depth.get(&n.id).unwrap_or(&0)).min(6));
+                    rows.push(OverlayRowData {
+                        main: format!("{ind}{}", n.label),
+                        right: match n.state.as_str() {
+                            "expired" => format!("{} · sent", mail::fmt_date(n.ts)),
+                            _ => mail::fmt_date(n.ts),
+                        },
+                        current: n.id == head,
+                        muted: n.state != "applied" && n.state != "expired",
+                        ..Default::default()
+                    });
+                    acts.push(Act::HistoryRow(n.id));
+                    labels.push(n.label.clone());
+                }
+                rows.push(OverlayRowData {
+                    main: "the beginning".into(),
+                    current: head == 0,
+                    ..Default::default()
+                });
+                acts.push(Act::HistoryRow(0));
+                labels.push("the beginning".into());
+            }
+            Overlay::Launcher => {
+                state.launcher.hits =
+                    launcher::search(&state.ws, &state.store, &state.launcher.query);
+                let n = state.launcher.hits.len();
+                state.launcher.sel = state.launcher.sel.min(n.saturating_sub(1));
+                for (i, hit) in state.launcher.hits.iter().enumerate() {
+                    rows.push(OverlayRowData {
+                        main: hit.label.clone(),
+                        detail: if hit.detail == hit.label {
+                            String::new()
+                        } else {
+                            hit.detail.clone()
+                        },
+                        right: match hit.ws {
+                            Some(k) => format!("№{}", k + 1),
+                            None => "new".into(),
+                        },
+                        current: i == state.launcher.sel,
+                        ..Default::default()
+                    });
+                    acts.push(Act::LauncherRow(i));
+                    labels.push(hit.label.clone());
+                }
+            }
+            Overlay::None => return,
+        }
+
+        // A centred column, the width the char grid used. The workspaces
+        // overlay reserves its first band for the search row — the
+        // launcher's entry on glass, which the shell draws.
+        let w = (vp.size.x - 4.0 * theme::GAP).min(if launcher { 520.0 } else { 560.0 });
+        let x = vp.pos.x + (vp.size.x - w) / 2.0;
+        let top = vp.pos.y + 2.0 * theme::GAP;
+        let search_h = if state.overlay == Overlay::Ws { 48.0 } else { 0.0 };
+        let h = (vp.size.y - 4.0 * theme::GAP - search_h).max(80.0);
+        let r = rect(x, top + search_h, w, h);
+
+        let tpl = if launcher {
+            live_id!(launcher_overlay_tpl)
+        } else {
+            live_id!(rows_overlay_tpl)
+        };
+        let key = if launcher { OVERLAY_PID_L } else { OVERLAY_PID_R };
+        let Some((widget, created)) = self.hosted_widget(cx, key, tpl) else {
+            return;
+        };
+        if created && launcher {
+            // Typing lands in the query the moment the launcher opens —
+            // but key focus set during a draw pass does not take, so the
+            // next event tick does it (the compose panel's lesson).
+            self.pending_focus = Some(OVERLAY_PID_L);
+        }
+        if launcher {
+            widget
+                .as_launcher_overlay()
+                .scroll_to(cx, state.launcher.sel);
+        }
+        let props = OverlayProps {
+            rows,
+            query: state.launcher.query.clone(),
+        };
+        let mut scope = Scope::with_props(&props);
+        cx.begin_turtle(
+            Walk::abs_rect(r),
+            Layout {
+                clip_x: true,
+                clip_y: true,
+                ..Default::default()
+            },
+        );
+        widget.draw_all(cx, &mut scope);
+        cx.end_turtle();
+
+        // The rows that actually drew become hits, above the backdrop's
+        // close-everything rect.
+        let list_path = ids!(list);
+        if let Some(list) = widget.widget(cx, list_path).as_portal_list().borrow() {
+            for (idx, item) in list.items().iter() {
+                let ir = item.widget.area().rect(cx);
+                if ir.size.x <= 0.0 {
+                    continue;
+                }
+                if let (Some(act), Some(label)) = (acts.get(*idx), labels.get(*idx)) {
+                    self.hits.push(HitR {
+                        rect: ir,
+                        act: act.clone(),
+                        cursor: MouseCursor::Hand,
+                        label: label.clone(),
+                    });
+                }
+            }
+        }
+        if launcher {
+            // The query field: a real TextInput, so a click just needs to
+            // reach it (the widget owns focus and caret).
+            let fr = widget.widget(cx, ids!(query_input)).area().rect(cx);
+            if fr.size.x > 0.0 {
+                self.hits.push(HitR {
+                    rect: fr,
+                    act: Act::LauncherOpen,
+                    cursor: MouseCursor::Text,
+                    label: "search".into(),
+                });
+            }
+        } else if state.overlay == Overlay::Ws {
+            // The workspaces overlay's search row is the launcher's entry
+            // on glass: a card above the roster, drawn by the shell.
+            let sr = rect(x, top, w, 40.0);
+            {
+                self.draw_panel.new_draw_call(cx);
+                self.draw_panel.color = rgba_a(theme::BG, 1.0);
+                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, sr);
+                self.draw_mono.new_draw_call(cx);
+                self.set_text(Style::Muted, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
+                    "search",
+                );
+                self.hits.push(HitR {
+                    rect: sr,
+                    act: Act::LauncherOpen,
+                    cursor: MouseCursor::Hand,
+                    label: "search".into(),
+                });
+            }
+        }
     }
 
     /// Draws a panel's retained content widget inside the body rect and

@@ -23,6 +23,33 @@ pub struct PanelProps {
     pub kind: crate::core::Kind,
 }
 
+/// One row of a modal overlay, already reduced to what it draws. The shell
+/// assembles these per draw — overlays read no store of their own.
+#[derive(Clone, Default)]
+pub struct OverlayRowData {
+    /// The big left-hand number (workspaces) — empty elsewhere.
+    pub num: String,
+    /// The row's subject: a workspace summary, an action label, a hit.
+    pub main: String,
+    /// Dimmed trailing text on the same line (a launcher hit's detail).
+    pub detail: String,
+    /// Right-aligned: a date, a workspace badge.
+    pub right: String,
+    /// Inverted: the current workspace, the selected hit, the DAG's head.
+    pub current: bool,
+    /// Undone history branches draw muted but stay walkable.
+    pub muted: bool,
+}
+
+/// What an overlay widget draws. Assembled by the shell each frame from the
+/// workspace roster, the undo DAG, or the launcher's live search.
+#[derive(Clone, Default)]
+pub struct OverlayProps {
+    pub rows: Vec<OverlayRowData>,
+    /// The launcher's query, pushed into the field when the overlay opens.
+    pub query: String,
+}
+
 /// Intent bubbled from panel widgets to the shell. The shell owns turning
 /// these into undoable store actions.
 #[derive(Debug, Clone)]
@@ -946,6 +973,108 @@ script_mod! {
         mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "on one scrolling gridded workspace." } }
         View { width: Fill, height: 8 }
         mod.widgets.SRow { help_link := mod.widgets.SLink {} }
+    }
+
+    // ---- the modal overlays ------------------------------------------------
+
+    /** One overlay row: a bordered card, inverted while current. The
+        shell registers the click (rows live in a PortalList, whose item
+        areas go stale mid-gesture — CR-002's fifth defect), so this is
+        presentation only. */
+    /** The card, in the one shape both variants share. A hand-drawn 1 px
+        frame on its own shader — a stock-shader quad merges into a call
+        that paints under the wash (CR-002's sixth defect). */
+    mod.widgets.OverlayCard = View {
+        width: Fill, height: 40
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{left: 16, right: 16}
+        show_bg: true
+        draw_bg +: {
+            color: #ffffff
+            border_color: #141414
+            pixel: fn() {
+                let p = self.pos * self.rect_size
+                if p.x < 1.0 || p.y < 1.0
+                    || p.x > self.rect_size.x - 1.0
+                    || p.y > self.rect_size.y - 1.0 {
+                    return vec4(self.border_color.xyz, 1.0)
+                }
+                return vec4(self.color.xyz, 1.0)
+            }
+        }
+        num_lbl := mod.widgets.SLabel {
+            width: Fit, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
+        }
+        num_gap := View { width: 20, height: 1, visible: false }
+        main_lbl := mod.widgets.SLabel {
+            width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
+        detail_lbl := mod.widgets.SLabel {
+            width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            margin: Inset{left: 8}
+            draw_text +: { color: #5a5a5a }
+        }
+        View { width: Fill, height: 1 }
+        right_lbl := mod.widgets.SLabel {
+            width: Fit, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
+    }
+
+    mod.widgets.OverlayRow = set_type_default() do #(OverlayRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{bottom: 8}
+        // Twin cards rather than one card recoloured: a DrawQuad's shader
+        // vars are not struct fields, so a quad's colour cannot be set at
+        // draw time — and an Overlay-flow wash never resolves its walk.
+        // Exactly one of these draws; text colours stay static in the DSL.
+        // Label colours are painted per draw (a Label's draw_text.color IS
+        // reachable); only the quad needs a twin.
+        card := mod.widgets.OverlayCard {}
+        card_inv := mod.widgets.OverlayCard {
+            visible: false
+            draw_bg +: { color: #141414, border_color: #141414 }
+        }
+    }
+
+    /** The overlay chassis: a centred column of rows over the shell's wash.
+        Workspaces and history use it bare; the launcher puts a field on top. */
+    mod.widgets.RowsOverlay = set_type_default() do #(RowsOverlay::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            row := mod.widgets.OverlayRow {}
+        }
+    }
+
+    /** The launcher: one field over the hits. The field is a real `SField`,
+        so the query has a caret, selection, and the platform IME — the char
+        grid drew a rectangle and tracked an index. */
+    mod.widgets.LauncherOverlay = set_type_default() do #(LauncherOverlay::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        query_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "search panels, mail, people…"
+            return_key_type: ReturnKeyType.Go
+            autocapitalize: AutoCapitalize.None
+            autocorrect: AutoCorrect.Disabled
+            padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
+        }
+        View { width: Fill, height: 12 }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            row := mod.widgets.OverlayRow {}
+        }
     }
 }
 
@@ -2015,6 +2144,189 @@ impl Widget for AboutPanel {
         );
         self.view.draw_walk(cx, scope, walk)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The overlays
+// ---------------------------------------------------------------------------
+
+/// One overlay row. Presentation only — the shell owns the click.
+#[derive(Script, ScriptHook, Widget)]
+pub struct OverlayRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for OverlayRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.area()) {
+            cx.set_cursor(MouseCursor::Hand);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl OverlayRowRef {
+    fn populate(&self, cx: &mut Cx, d: &OverlayRowData) {
+        let Some(row) = self.borrow() else { return };
+        // Inverted while current; an undone branch stays legible but quiet.
+        let (bg, fg, dim) = if d.current {
+            (vec4(0.078, 0.078, 0.078, 1.0), vec4(1.0, 1.0, 1.0, 1.0), vec4(0.75, 0.75, 0.75, 1.0))
+        } else if d.muted {
+            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.565, 0.565, 0.565, 1.0), vec4(0.72, 0.72, 0.72, 1.0))
+        } else {
+            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.078, 0.078, 0.078, 1.0), vec4(0.353, 0.353, 0.353, 1.0))
+        };
+        // One card draws; the other stands down. A quad's shader vars are
+        // not struct fields (no runtime colour), but a Label's draw_text
+        // colour is — so the twin is only for the background.
+        row.view.view(cx, ids!(card)).set_visible(cx, !d.current);
+        row.view.view(cx, ids!(card_inv)).set_visible(cx, d.current);
+        let c = if d.current {
+            ids!(card_inv)
+        } else {
+            ids!(card)
+        };
+        let paint = |_cx: &mut Cx, lbl: &LabelRef, col: Vec4f| {
+            if let Some(mut l) = lbl.borrow_mut() {
+                l.draw_text.color = col;
+            }
+        };
+        let num = row.view.label(cx, &[c[0], live_id!(num_lbl)]);
+        num.set_text(cx, &d.num);
+        num.set_visible(cx, !d.num.is_empty());
+        paint(cx, &num, fg);
+        row.view
+            .view(cx, &[c[0], live_id!(num_gap)])
+            .set_visible(cx, !d.num.is_empty());
+        let main = row.view.label(cx, &[c[0], live_id!(main_lbl)]);
+        main.set_text(cx, &d.main);
+        paint(cx, &main, fg);
+        let detail = row.view.label(cx, &[c[0], live_id!(detail_lbl)]);
+        detail.set_text(cx, &d.detail);
+        detail.set_visible(cx, !d.detail.is_empty());
+        paint(cx, &detail, dim);
+        let right = row.view.label(cx, &[c[0], live_id!(right_lbl)]);
+        right.set_text(cx, &d.right);
+        right.set_visible(cx, !d.right.is_empty());
+        paint(cx, &right, dim);
+        let _ = bg;
+    }
+}
+
+/// A column of overlay rows — the workspaces roster, the undo DAG.
+#[derive(Script, ScriptHook, Widget)]
+pub struct RowsOverlay {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for RowsOverlay {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rows = scope
+            .props
+            .get::<OverlayProps>()
+            .map(|p| p.rows.clone())
+            .unwrap_or_default();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, rows.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(d) = rows.get(idx) {
+                        let row = list.item(cx, idx, live_id!(row));
+                        row.as_overlay_row().populate(cx, d);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+/// The launcher: a real text field over the hits.
+#[derive(Script, ScriptHook, Widget)]
+pub struct LauncherOverlay {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for LauncherOverlay {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            let q = self.view.text_input(cx, ids!(query_input));
+            if q.changed(actions).is_some() {
+                cx.action(OverlayAction::Query(q.text()));
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rows = scope
+            .props
+            .get::<OverlayProps>()
+            .map(|p| p.rows.clone())
+            .unwrap_or_default();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, rows.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(d) = rows.get(idx) {
+                        let row = list.item(cx, idx, live_id!(row));
+                        row.as_overlay_row().populate(cx, d);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+impl LauncherOverlayRef {
+    /// Seeds the field and takes the keyboard — called when the overlay
+    /// opens, so typing lands in the query without a tap.
+    pub fn focus_query(&self, cx: &mut Cx, text: &str) {
+        let Some(inner) = self.borrow() else { return };
+        let q = inner.view.text_input(cx, ids!(query_input));
+        q.set_text(cx, text);
+        q.set_key_focus(cx);
+    }
+
+    /// Keeps the selected hit on screen as arrows walk it.
+    pub fn scroll_to(&self, cx: &mut Cx, idx: usize) {
+        let Some(inner) = self.borrow() else { return };
+        let list = inner.view.widget(cx, ids!(list)).as_portal_list();
+        let visible = list
+            .borrow()
+            .is_some_and(|l| l.items().iter().any(|(i, _)| *i == idx));
+        if !visible {
+            list.smooth_scroll_to(cx, idx, 90.0, None, 0.0);
+        }
+    }
+}
+
+/// Intent from an overlay widget. Rows resolve through the shell's own hit
+/// table (they live in a PortalList), so only the query field speaks here.
+#[derive(Debug, Clone)]
+pub enum OverlayAction {
+    /// The launcher's field changed — re-run the search.
+    Query(String),
 }
 
 /// `WidgetRef → SLinkRef` convenience mirroring the generated accessors.
