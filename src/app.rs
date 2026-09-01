@@ -1694,9 +1694,11 @@ pub struct Stage {
     poll_timer: Timer,
     /// android: after a field-to-field focus move, the blurring TextInput
     /// hides the soft keyboard and the next field's one draw-time show can
-    /// lose the race against the hide animation. The guard re-issues it.
+    /// lose the race against the hide animation. The guard re-issues it —
+    /// twice if it must (areas re-issue on redraw, so it checks the live
+    /// focus, never a stored handle).
     #[rust]
-    ime_guard_area: Area,
+    ime_guard_tries: u8,
     #[rust]
     ime_guard_timer: Timer,
     #[rust]
@@ -3837,7 +3839,8 @@ impl Widget for Stage {
                 && ke.focus != Area::Empty
                 && ke.focus != self.area
             {
-                self.ime_guard_area = ke.focus;
+                log!("ime guard: armed (field-to-field focus move)");
+                self.ime_guard_tries = 2;
                 self.ime_guard_timer = cx.start_timeout(0.4);
             }
         }
@@ -3895,16 +3898,29 @@ impl Widget for Stage {
             }
             if self.ime_guard_timer.0 != 0 && te.timer_id == self.ime_guard_timer.0 {
                 self.ime_guard_timer = Timer::default();
-                let area = self.ime_guard_area;
-                self.ime_guard_area = Area::Empty;
-                // The keyboard lost the race (it is down while a field
-                // holds focus): reset the platform's config dedup so the
-                // focused field's next draw re-shows with its own config.
-                // A keyboard that made it up — or a user dismissal outside
-                // a focus move — never gets here.
-                if self.kb_h == 0.0 && area != Area::Empty && cx.has_key_focus(area) {
+                // The keyboard lost the race (it is down while a widget —
+                // in practice the next TextInput — holds key focus): reset
+                // the platform's config dedup so the focused field's next
+                // draw re-shows with its own config. Checked against the
+                // LIVE focus (stored areas go stale across redraws). A
+                // keyboard that made it up, or a user dismissal outside a
+                // focus move, never gets here.
+                let focus = cx.key_focus();
+                let field_focused = focus != Area::Empty && focus != self.area;
+                log!(
+                    "ime guard: fire kb_h={} field_focused={} tries_left={}",
+                    self.kb_h,
+                    field_focused,
+                    self.ime_guard_tries
+                );
+                if self.kb_h == 0.0 && field_focused && self.ime_guard_tries > 0 {
+                    self.ime_guard_tries -= 1;
+                    log!("ime guard: re-issuing keyboard show");
                     cx.hide_text_ime();
                     cx.redraw_all();
+                    if self.ime_guard_tries > 0 {
+                        self.ime_guard_timer = cx.start_timeout(0.5);
+                    }
                 }
             }
         }
