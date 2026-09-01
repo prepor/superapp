@@ -1,0 +1,19 @@
+# The height wish: a panel asks for the rows its letter actually needs.
+wait 900
+shot 01-boot
+
+# A short letter keeps the kind's three rows — half the inbox, as ever.
+click "Sat hike"
+wait 700
+shot 02-short-letter
+
+# A long one asks for more, and the same panel grows into it.
+click "long version"
+wait 900
+shot 03-long-letter
+
+# Back to a short one: the wish belongs to the letter, not the panel.
+click "airport book"
+wait 900
+shot 04-short-again
+quit

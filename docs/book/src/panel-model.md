@@ -22,12 +22,23 @@ contact 3×2, compose 4×4, help 4×6, about 3×2); a request larger than the
 active grid **clamps to it** — which is why a phone shows the inbox
 full-screen with no phone-specific layout code. Requests are honoured
 **literally** while a column's requests fit: a 3-row panel in an otherwise
-empty column leaves the remaining rows empty. A column asked to hold
-*more* than the grid (consume/expel deliberately over-fill) ignores the
-requests and **distributes its height evenly** instead. A column is as wide as
-its widest panel. Columns line up left to right on an infinite strip; the
-workspace scrolls horizontally when they overflow the viewport (niri's
-scrolling model).
+empty column leaves the remaining rows empty. A column asked to hold *more*
+than the grid (consume/expel deliberately over-fill) ignores the requests and
+**distributes its height evenly** instead. A column is as wide as its widest
+panel. Columns line up left to right on an infinite strip; the workspace
+scrolls horizontally when they overflow the viewport (niri's scrolling model).
+
+A kind's request is a **floor, not the whole story**. Where the length of what
+a panel shows is knowable, the shell measures it and asks for more — today the
+message panel does: a letter that does not fit its three rows asks for as many
+as it needs, up to the whole column, so a long mail *opens tall* rather than
+opening scrolled, while a one-liner stays short. The measurement is re-taken
+every time the shell recomputes targets, so a body that arrives after its
+panel opened grows the panel when it lands, and nothing about it is persisted
+— like the camera and the grid, it is re-derived. Downstream a measured wish
+is treated exactly like a constant one: the grid clamps it, placement consults
+it (a tall letter no longer fits under a neighbour, so it earns a column of
+its own), and an over-filled column still splits evenly.
 
 ## Column operations and tabs (niri's)
 

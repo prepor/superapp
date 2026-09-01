@@ -637,6 +637,60 @@ pub fn sanitize(src: &str) -> String {
     out.finish()
 }
 
+/// A narrowed letter as plain lines: tags go, the ones that stand on their
+/// own line become breaks, and an entity counts as the one character it
+/// decodes to.
+///
+/// This is a measure, not a reading — nobody sees the result. It exists so
+/// the shell can ask how long a letter is without laying it out, which is
+/// what a message panel's height wish is made of. Input is [`sanitize`]'s
+/// output: already well-formed, already narrowed.
+#[must_use]
+pub fn plain(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(at) = rest.find('<') {
+        text(&mut out, &rest[..at]);
+        let after = &rest[at + 1..];
+        let Some(end) = after.find('>') else { break };
+        let name = after[..end]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let breaks = name == "br" || name == "hr" || KEEP_BLOCK.contains(&name.as_str());
+        if breaks && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        rest = &after[end + 1..];
+    }
+    text(&mut out, rest);
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Text between two tags, entities collapsed to one character each: a line
+/// that reads `&mdash;` is one character wider there, not seven.
+fn text(out: &mut String, mut src: &str) {
+    while let Some(at) = src.find('&') {
+        out.push_str(&src[..at]);
+        match src[at..].find(';').filter(|&e| e <= 12) {
+            Some(e) => {
+                out.push('·');
+                src = &src[at + e + 1..];
+            }
+            None => {
+                out.push('&');
+                src = &src[at + 1..];
+            }
+        }
+    }
+    out.push_str(src);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +775,21 @@ mod tests {
         );
         // Nothing leading or trailing survives.
         assert_eq!(sanitize("<div></div><p>x</p><div></div>"), "<p>x</p>");
+    }
+
+    /// The measure's reading of a narrowed letter: tags out, the tags that
+    /// stand on their own line become breaks, and an entity counts as the
+    /// one character it decodes to.
+    #[test]
+    fn plain_reduces_the_letter_to_lines() {
+        assert_eq!(plain(&sanitize("<div>one</div><div>two</div>")), "one\ntwo");
+        assert_eq!(plain("<p>a</p><ul><li>x</li><li>y</li></ul>"), "a\nx\ny");
+        assert_eq!(plain("first<br>second"), "first\nsecond");
+        // Emphasis is not a line of its own; a paragraph is.
+        assert_eq!(plain("<p>plain <b>bold</b> tail</p>"), "plain bold tail");
+        // Seven characters of entity read as one.
+        assert_eq!(plain("a&mdash;b"), "a\u{b7}b");
+        assert_eq!(plain("bare & ampersand"), "bare & ampersand");
     }
 
     /// Unknown and inline-only tags vanish without touching the text.

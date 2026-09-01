@@ -12,6 +12,9 @@
 - **Grid** — the 12×6 unit grid a viewport is divided into. Every kind
   requests a width×height in grid units and gets exactly that; unused rows at
   the bottom of a column stay empty.
+- **Wish** — a request measured from the content rather than fixed by the
+  kind: a long letter asks for more rows than a short one. The kind's
+  request is its floor, the grid its ceiling.
 - **Join** — the preview-pane relation, generalized: a solid link opens its
   panel *joined* to the link's panel; the next solid link from the same parent
   replaces the joined child instead of opening another panel.

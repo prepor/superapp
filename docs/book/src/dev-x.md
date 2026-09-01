@@ -85,12 +85,17 @@ starts as a Change Request under `docs/planning/`.
 
 ```sh
 # the fast path: every suite, in parallel, no rendering
-mise exec -- cargo run -- --e2e e2e/basic.txt --no-draw
+mise exec -- cargo run -- --e2e e2e/basic.txt --no-draw --draws 4000
 
 # validation: render and write screenshots (one run at a time)
 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
-  mise exec -- cargo run -- --e2e e2e/basic.txt --e2e-out e2e/out
+  mise exec -- cargo run -- --e2e e2e/basic.txt --e2e-out e2e/out --draws 4000
 ```
+
+`--draws N` is makepad's, not ours: the headless backend runs a *bounded*
+loop, and without it the process draws a single frame and exits before the
+script's first step. N is an upper bound on draw cycles (≈ frames), so pick
+one comfortably past the script's own waits — the run ends at `quit`, not at N.
 
 An e2e run replays a line-based script against the shell's real input paths
 — hit resolution, key handling, text input. Every run opens a **fresh
@@ -167,7 +172,9 @@ honest no-smtp failure, cmd+z reopening the draft), and `e2e/history.txt`
 walks the history overlay (travel back, to the beginning, and forward).
 `e2e/keys.txt` drives every panel accelerator, asserting through label
 resolution — a walk that lands on the wrong mail fails the run, no picture
-needed — and `e2e/select.txt` covers selectable content.
+needed — `e2e/select.txt` covers selectable content, and `e2e/height.txt`
+reads a short letter, the demo world's long one and a short one again: the
+same panel three rows tall, then six, then three.
 
 `drag` is weaker than it looks: drag-selection runs on `Hit::FingerMove`,
 which fires only for the area that **captured** the finger, and that

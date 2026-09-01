@@ -875,10 +875,78 @@ impl State {
         mail::title(&self.store, kind)
     }
 
+    /// How many grid rows a letter asks for: enough that the whole of it is
+    /// on screen, so a long mail opens tall instead of opening scrolled.
+    /// The kind's three rows are the floor, the grid is the ceiling.
+    ///
+    /// The measuring belongs to the shell rather than to [`core`]: only here
+    /// are the column's width in characters and the share of the panel the
+    /// body does *not* get both known.
+    fn message_rows(&self, id: core::MailId) -> Option<u32> {
+        /// Roughly how many lines of body the message panel spends on
+        /// everything that is not the letter: its own header, the
+        /// FROM/TO/DATE block and its rule, the walk of links at the foot,
+        /// and the padding around them. An estimate on purpose — the wish
+        /// only has to land on the right row.
+        const CHROME_LINES: f64 = 7.0;
+
+        let m = mail::mail(&self.store, id)?;
+        let (vw, vh) = self.vp();
+        let grid = self.ws.grid;
+        let gap = theme::GAP;
+        let (gw, floor) = Kind::Message { id }.grid();
+
+        // How wide the letter reads, in characters: the column, less the
+        // panel's padding, over one mono advance.
+        let unit_w = (vw - gap) / f64::from(grid.w);
+        let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
+        let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
+        let need = mail::reading_lines(&m, cols) as f64;
+
+        // ...against how many lines a panel of `rows` rows has room for.
+        let line_h = theme::FONT_SIZE * theme::LINE_H;
+        let row_h = (vh - 2.0 * gap - f64::from(grid.h - 1) * gap) / f64::from(grid.h);
+        let holds = |rows: u32| {
+            let h = f64::from(rows) * row_h + f64::from(rows - 1) * gap;
+            h / line_h - CHROME_LINES
+        };
+        Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
+    }
+
+    /// Measures a kind before a panel shows it. Placement consults the wish
+    /// — a tall letter earns a column of its own instead of squeezing into
+    /// a neighbour — and a panel about to be born has no id to hang one on,
+    /// so the shell measures ahead of the mutation.
+    fn wish_ahead(&mut self, kind: &Kind) {
+        if let Kind::Message { id } = kind {
+            if let Some(h) = self.message_rows(*id) {
+                let (w, _) = kind.grid();
+                self.ws.wish(kind, (w, h));
+            }
+        }
+    }
+
     /// Recomputes targets after a mutation and feeds the animator. The camera
     /// follows focus here — and only here, so trackpad pans stay free.
     fn sync(&mut self) {
         self.ws.set_grid(grid_for(self.viewport));
+        // Wishes measured from content, re-taken from scratch: a letter that
+        // arrived, changed or left changes what its panel asks for. Ephemeral
+        // like the grid above — measured here, never snapshotted.
+        let wishes = self
+            .ws
+            .wss
+            .iter()
+            .flat_map(|w| w.panels.values())
+            .filter_map(|p| match &p.kind {
+                Kind::Message { id } => {
+                    let (w, _) = p.kind.grid();
+                    Some((p.kind.clone(), (w, self.message_rows(*id)?)))
+                }
+                _ => None,
+            })
+            .collect();
+        self.ws.set_wishes(wishes);
         let vp = self.vp();
         let opts = self.opts();
         // A preview asked to be seen: reveal it first, then focus, so focus
@@ -1038,8 +1106,8 @@ struct CellFont {
 impl Default for CellFont {
     fn default() -> Self {
         CellFont {
-            adv: theme::FONT_SIZE * 0.8,
-            line_h: theme::FONT_SIZE * 2.0,
+            adv: theme::FONT_SIZE * theme::MONO_ADV,
+            line_h: theme::FONT_SIZE * theme::LINE_H,
             natural: theme::FONT_SIZE * 1.55,
             dpi: 0.0,
         }
@@ -2182,6 +2250,7 @@ impl Stage {
             launcher::Go::Open(kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                state.wish_ahead(&kind);
                 state.act(
                     "open",
                     label,
@@ -2399,6 +2468,7 @@ impl Stage {
             Act::Open(pid, kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                state.wish_ahead(&kind);
                 state.act(
                     "open",
                     label,
@@ -2417,6 +2487,7 @@ impl Stage {
                 // Replacing with another mail (the newer/older links) is the
                 // same "read" walk as j/k — it coalesces per panel.
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                state.wish_ahead(&kind);
                 let (akind, entity, label) = match mid {
                     Some(_) => (
                         READ,
@@ -2448,6 +2519,7 @@ impl Stage {
                 let kind = Kind::Message { id };
                 let label = format!("read “{}”", state.panel_title(&kind));
                 let (vp, opts) = (state.vp(), state.opts());
+                state.wish_ahead(&kind);
                 state.act(
                     READ,
                     label,
@@ -2614,6 +2686,11 @@ impl Stage {
             .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
             .unwrap_or(0);
         let readers = state.ws.showing(&Kind::Message { id });
+        // The successor's preview is an open like any other: measured first,
+        // so it is placed by the rows its letter actually wants.
+        if let Some((_, nid)) = next {
+            state.wish_ahead(&Kind::Message { id: nid });
+        }
         state.act(
             verb,
             format!("{verb} “{subject}”"),
