@@ -28,8 +28,16 @@ current state; everything else in this book is settled.
    (raise it during a drag near the top edge?), or rows as drop targets.
    Un-answered until the phone build gets real use.
 
+9. **Launcher ranking is positional, not learned**: open panels, then roots,
+   contacts, mails, newest first — no recency or frequency boost, because
+   nothing records focus history yet. Whether the launcher (and alt-tab-like
+   switching generally) wants an MRU model is open until real use hurts.
+
 Settled since the last revision: workspaces — nine numbered, vertical slide,
 menu bar on macOS, two-finger-swipe-down overlay on touch (see [Panel
 Model](./panel-model.md) and [Interaction
 Grammar](./interaction-grammar.md)); makepad is now plain upstream at
-mosaic's pin (see [Tech Stack](./tech-stack.md) for the one e2e trade-off).
+mosaic's pin (see [Tech Stack](./tech-stack.md) for the one e2e trade-off);
+the launcher — double-cmd, one query over open panels + the mail world,
+go-to vs open decided per hit, no fresh-copy variant, the search row as its
+touch entry (see [Interaction Grammar](./interaction-grammar.md)).

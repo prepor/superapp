@@ -15,6 +15,8 @@
 //! click "reply"       — click the interactive element whose label matches
 //! altclick "subject"  — the same, with alt held (fresh un-joined panel)
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
+//! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
+//!                       the launcher trigger
 //! type "hello"        — text into the focused field / panel keys
 //! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down

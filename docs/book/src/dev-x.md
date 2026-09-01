@@ -70,6 +70,7 @@ key cmd+shift+left  # chords; plain letters flow as text, like real typing
 key j 45            # optional repeat count
 type "hello"
 key cmd+3           # digits work: workspace chords
+key cmd 2           # a bare modifier taps (down+up); ×2 = double-cmd, the launcher
 swipe "inbox" 0 -160   # one-finger touch drag from the element's centre
 pan2 -400              # two-finger workspace pan
 pan2 0 260             # …vertical: swipe down (workspaces overlay); 0 -260 up
@@ -81,8 +82,10 @@ quit
 
 The touch steps drive the same gesture state machine android uses, so
 `e2e/touch.txt` and `e2e/phone.txt` (run with `--window 380x780 --grid 4x3`)
-verify the android interactions on the desktop, and `e2e/workspaces.txt`
-walks the workspace grammar (switch, move-and-follow, overlay).
+verify the android interactions on the desktop, `e2e/workspaces.txt` walks
+the workspace grammar (switch, move-and-follow, overlay), and
+`e2e/launcher.txt` walks the launcher (double-cmd, open vs go-to, the
+overlay's search row).
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
 rows (by subject) and panel titles. Steps that mutate the workspace need a

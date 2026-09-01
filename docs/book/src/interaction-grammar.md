@@ -47,12 +47,42 @@ and *Switch Here / Move Panel Here* items inside. (The bold app menu itself
 is AppKit-mandatory; it holds only Quit.) An empty workspace names itself in
 muted text, so switching onto a blank screen reads as a place, not a bug.
 
-On touch, a **two-finger swipe down** raises the workspaces overlay: one row
-per workspace (number + its panel titles, the current row inverted, the
-first empty slot offered as *new*). A tap on a row switches, a tap outside —
-or a two-finger swipe up, or `esc` — dismisses. There is no touch gesture
-for *moving* a panel between workspaces yet (see
-[Open Questions](./open-questions.md)).
+On touch, a **two-finger swipe down** raises the workspaces overlay: a
+*search* row (the launcher's entry, below), then one row per workspace
+(number + its panel titles, the current row inverted, the first empty slot
+offered as *new*). A tap on a row switches, a tap outside — or a two-finger
+swipe up, or `esc` — dismisses. There is no touch gesture for *moving* a
+panel between workspaces yet (see [Open Questions](./open-questions.md)).
+
+## The launcher
+
+**Double-tap cmd** (the workspace key itself — no letter spent) and a modal
+query field rises over an ink wash. One query runs over *everything that can
+be a panel*: the open panels on every workspace, the root panels, and the
+mail world — contacts by name and address, mails by subject and sender, the
+same word-by-word substring semantics as the inbox filter. Every token must
+match, so `vera q3` narrows to her budget mail.
+
+Each hit carries one of two verbs, decided for you:
+
+- already open somewhere → **go to it** — switch workspace, focus it; the
+  row wears its workspace number (`№3`);
+- not open → **open it** — a fresh un-joined trailing column on the active
+  workspace; the row says *new*.
+
+There is never a second copy: an open panel absorbs its would-be duplicate
+(no "force a fresh copy" variant — deliberately). The empty query is the
+pure **switcher**: every open panel, the active workspace's first, roots
+beneath. Arrows pick, `enter` goes, `esc` (or another double-cmd, or a tap
+outside) dismisses; every row is clickable. A tap only counts as a tap:
+holding cmd for a chord, cmd+clicking, or overshooting ~350 ms between taps
+never summons it.
+
+On desktop the launcher is also in the menu bar (*Launcher — ⌘ ⌘*); on touch
+it is the search row atop the workspaces overlay — tapping it flips the
+overlay into the launcher and raises the soft keyboard. When real kinds
+arrive (telegram, rss, kb), each contributes its entries to the same query —
+this surface is where global search lives.
 
 ## Mouse and trackpad
 

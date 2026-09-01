@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::data::MailId;
+use crate::data::{self, MailId};
 
 /// Stable panel identity.
 pub type PanelId = u64;
@@ -78,6 +78,29 @@ impl Kind {
             Kind::Message { .. } => (4, 3),
             Kind::Contact { .. } => (3, 2),
             Kind::Compose { .. } => (4, 4),
+        }
+    }
+
+    /// The panel's display title — what headers, tab strips, the workspaces
+    /// overlay and the launcher all show for this kind.
+    #[must_use]
+    pub fn title(&self) -> String {
+        match self {
+            Kind::Help => "help".into(),
+            Kind::About => "about".into(),
+            Kind::Inbox { filter: Some(f) } => format!("inbox · {f}"),
+            Kind::Inbox { filter: None } => "inbox".into(),
+            Kind::Message { id } => data::mail(id)
+                .map(|m| m.subject.to_string())
+                .unwrap_or_else(|| "message".into()),
+            Kind::Contact { email } => data::mails()
+                .iter()
+                .find(|m| m.from_email == *email)
+                .map(|m| m.from_name.to_string())
+                .unwrap_or_else(|| (*email).to_string()),
+            Kind::Compose { re } => data::mail(re)
+                .map(|m| format!("re: {}", m.subject))
+                .unwrap_or_else(|| "new mail".into()),
         }
     }
 }
@@ -1035,6 +1058,21 @@ impl Wm {
     #[must_use]
     pub fn panel(&self, pid: PanelId) -> Option<&Panel> {
         self.wss.iter().find_map(|w| w.panels.get(&pid))
+    }
+
+    /// Which workspace holds a panel.
+    #[must_use]
+    pub fn ws_of(&self, pid: PanelId) -> Option<usize> {
+        self.wss.iter().position(|w| w.panels.contains_key(&pid))
+    }
+
+    /// Focuses a panel wherever it lives, switching workspaces if needed
+    /// (the launcher's "go to"). Returns the workspace it landed on.
+    pub fn focus_panel(&mut self, pid: PanelId) -> Option<usize> {
+        let k = self.ws_of(pid)?;
+        self.active = k;
+        self.wss[k].focus = Some(pid);
+        Some(k)
     }
 
     /// The workspaces worth showing: every occupied one, the active one, and

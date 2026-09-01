@@ -28,6 +28,7 @@ use makepad_widgets::makepad_platform::ime::TextInputConfig;
 use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
 use crate::data::{self, MailId, MailState};
 use crate::e2e;
+use crate::launcher;
 use crate::spring::{Spring, SpringParams};
 use crate::theme;
 
@@ -497,6 +498,11 @@ enum Act {
     Tab(PanelId),
     /// A row of the workspaces overlay: switch to workspace `k`.
     WsRow(usize),
+    /// The workspaces overlay's search row (and the menu item): raise the
+    /// launcher.
+    LauncherOpen,
+    /// The launcher's `i`-th visible hit: go to it / open it.
+    LauncherRow(usize),
     /// The overlay's backdrop: tapping outside the rows dismisses it.
     OverlayClose,
 }
@@ -521,7 +527,65 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Row(pid, _)
         | Act::Field(pid, _)
         | Act::Tab(pid) => Some(*pid),
-        Act::WsRow(_) | Act::OverlayClose => None,
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::OverlayClose => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Double-cmd
+// ---------------------------------------------------------------------------
+
+/// Max gap between the two taps, seconds.
+const CMD_TAP_GAP: f64 = 0.35;
+/// Max hold of each tap — longer means a chord was intended, not a tap.
+const CMD_TAP_HOLD: f64 = 0.5;
+
+/// The double-cmd detector (the JetBrains double-shift move, on the
+/// workspace key). Bare modifier presses arrive as real KeyDown/KeyUp with
+/// `KeyCode::Logo`. A tap only counts while *clean*: any other key, click or
+/// scroll while cmd is down means a chord (cmd+w, cmd+click…) and dirties
+/// it; a press held past [`CMD_TAP_HOLD`] is not a tap at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum CmdTap {
+    #[default]
+    Idle,
+    /// First press down, so far clean.
+    Down { t: f64, dirty: bool },
+    /// One clean tap done; a second press within the gap arms the trigger.
+    Up { t: f64 },
+    /// Second press down; a clean release fires.
+    Down2 { t: f64, dirty: bool },
+}
+
+impl CmdTap {
+    fn press(&mut self, t: f64) {
+        *self = match *self {
+            CmdTap::Up { t: t0 } if t - t0 <= CMD_TAP_GAP => CmdTap::Down2 { t, dirty: false },
+            _ => CmdTap::Down { t, dirty: false },
+        };
+    }
+
+    /// Returns whether the double-tap fired.
+    fn release(&mut self, t: f64) -> bool {
+        let (next, fire) = match *self {
+            CmdTap::Down { t: t0, dirty: false } if t - t0 <= CMD_TAP_HOLD => {
+                (CmdTap::Up { t }, false)
+            }
+            CmdTap::Down2 { t: t0, dirty: false } if t - t0 <= CMD_TAP_HOLD => (CmdTap::Idle, true),
+            _ => (CmdTap::Idle, false),
+        };
+        *self = next;
+        fire
+    }
+
+    /// Any other input: a held press turns into a chord, a pending second
+    /// tap is abandoned.
+    fn other_input(&mut self) {
+        *self = match *self {
+            CmdTap::Down { t, .. } => CmdTap::Down { t, dirty: true },
+            CmdTap::Down2 { t, .. } => CmdTap::Down2 { t, dirty: true },
+            _ => CmdTap::Idle,
+        };
     }
 }
 
@@ -742,6 +806,31 @@ impl Anim {
 // Shell state
 // ---------------------------------------------------------------------------
 
+/// Which modal surface is up. Both share the chassis (ink wash, rows, esc /
+/// tap-outside closes); while one is up it owns every hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum Overlay {
+    #[default]
+    None,
+    /// The workspaces list (two-finger swipe down on touch).
+    Ws,
+    /// The launcher: a query over everything (double-cmd on desktop, the
+    /// search row of the workspaces overlay on touch).
+    Launcher,
+}
+
+/// The launcher's editable state. Hits are recomputed on draw, and kept here
+/// so a click resolves against exactly what was on screen.
+#[derive(Debug, Default)]
+struct LauncherUi {
+    query: String,
+    /// Caret, in chars.
+    caret: usize,
+    /// Selected row (enter activates it).
+    sel: usize,
+    hits: Vec<launcher::Hit>,
+}
+
 struct State {
     ws: Wm,
     mail: MailState,
@@ -753,8 +842,8 @@ struct State {
     hover: Option<Act>,
     field: Option<(PanelId, FieldId)>,
     toast: Option<(String, bool, Instant)>,
-    /// The workspaces overlay (two-finger swipe down on touch).
-    overlay: bool,
+    overlay: Overlay,
+    launcher: LauncherUi,
 }
 
 /// A field's content as one string plus the caret in chars — the shape the
@@ -815,7 +904,8 @@ impl State {
             hover: None,
             field: None,
             toast: None,
-            overlay: false,
+            overlay: Overlay::None,
+            launcher: LauncherUi::default(),
         }
     }
 
@@ -828,23 +918,7 @@ impl State {
     }
 
     fn panel_title(&self, kind: &Kind) -> String {
-        match kind {
-            Kind::Help => "help".into(),
-            Kind::About => "about".into(),
-            Kind::Inbox { filter: Some(f) } => format!("inbox · {f}"),
-            Kind::Inbox { filter: None } => "inbox".into(),
-            Kind::Message { id } => data::mail(id)
-                .map(|m| m.subject.to_string())
-                .unwrap_or_else(|| "message".into()),
-            Kind::Contact { email } => data::mails()
-                .iter()
-                .find(|m| m.from_email == *email)
-                .map(|m| m.from_name.to_string())
-                .unwrap_or_else(|| (*email).to_string()),
-            Kind::Compose { re } => data::mail(re)
-                .map(|m| format!("re: {}", m.subject))
-                .unwrap_or_else(|| "new mail".into()),
-        }
+        kind.title()
     }
 
     /// Recomputes targets after a mutation and feeds the animator. The camera
@@ -1108,6 +1182,27 @@ fn help_lines() -> Vec<Line> {
     });
     if cfg!(target_os = "macos") {
         v.push(Line::text("the menu bar lists them; [n] is current", Style::N));
+    }
+    v.push(Line::blank());
+    v.push(Line {
+        left: vec![Seg::T("LAUNCHER".into(), Style::Label)],
+        rule: true,
+        ..Default::default()
+    });
+    if !cfg!(target_os = "android") {
+        v.push(Line {
+            left: vec![
+                kbd("cmd"),
+                kbd("cmd"),
+                Seg::T(" — the launcher: search everything".into(), Style::N),
+            ],
+            ..Default::default()
+        });
+        v.push(Line::text("type to find panels, mail, people;", Style::N));
+        v.push(Line::text("enter goes to it — or opens it fresh", Style::N));
+    } else {
+        v.push(Line::text("the overlay's search row opens it:", Style::N));
+        v.push(Line::text("find open panels, mail, people", Style::N));
     }
     if cfg!(target_os = "android") {
         v.push(Line::blank());
@@ -1470,6 +1565,9 @@ pub struct Stage {
     /// per roster entry. Menus rebuild only when this changes.
     #[rust]
     menu_sig: Vec<(usize, bool)>,
+    /// The double-cmd launcher trigger.
+    #[rust]
+    cmd_tap: CmdTap,
     #[rust]
     e2e: Option<e2e::Runner>,
     #[rust]
@@ -1483,15 +1581,21 @@ pub struct Stage {
 /// hashed command makepad special-cases, `quit`.
 const WS_MENU_SWITCH: u64 = 0x5753_0100;
 const WS_MENU_MOVE: u64 = 0x5753_0200;
+const MENU_LAUNCHER: u64 = 0x5753_0300;
 
-/// How a `key` chord executes: as a synthesized key event, or as text (plain
-/// letters reach panels the same way real typing does).
+/// How a `key` chord executes: as a synthesized key event, as text (plain
+/// letters reach panels the same way real typing does), or as a bare
+/// modifier tap — a down/up pair (`key cmd 2` double-taps cmd).
 enum ChordExec {
     Ev(KeyEvent),
     Text(String),
+    Tap(KeyCode),
 }
 
 fn parse_chord(s: &str) -> Option<ChordExec> {
+    if let "cmd" | "logo" | "super" = s {
+        return Some(ChordExec::Tap(KeyCode::Logo));
+    }
     let mut mods = KeyModifiers::default();
     let mut key: Option<&str> = None;
     for part in s.split('+') {
@@ -1571,14 +1675,25 @@ impl Stage {
         // on-screen keyboard, so it is tied to a text field instead — glass
         // has no letter keys to lose. Every focus transition passes through
         // kick().
-        let want_ime = self.state.as_deref().is_some_and(|s| {
-            if cfg!(target_os = "android") {
-                s.field.is_some()
-            } else {
-                s.ws.focus.is_some()
-            }
-        });
-        let want_field = self.state.as_deref().and_then(|s| s.field);
+        // The launcher's query field wants the IME on both targets — on
+        // android that is what raises the soft keyboard with the overlay.
+        let launcher = self
+            .state
+            .as_deref()
+            .is_some_and(|s| s.overlay == Overlay::Launcher);
+        let want_ime = launcher
+            || self.state.as_deref().is_some_and(|s| {
+                if cfg!(target_os = "android") {
+                    s.field.is_some()
+                } else {
+                    s.ws.focus.is_some()
+                }
+            });
+        let want_field = if launcher {
+            None
+        } else {
+            self.state.as_deref().and_then(|s| s.field)
+        };
         if want_ime != self.ime_shown || (want_ime && self.ime_field != want_field) {
             self.ime_shown = want_ime;
             self.ime_field = want_field;
@@ -1604,11 +1719,13 @@ impl Stage {
         // on focus and after every app-side edit — except mid-composition,
         // when a push would clobber what the keyboard is composing.
         if cfg!(target_os = "android") && self.ime_shown && !self.ime_composing {
-            if let Some((text, caret)) = self
-                .state
-                .as_deref()
-                .and_then(|s| s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid)))
-            {
+            if let Some((text, caret)) = self.state.as_deref().and_then(|s| {
+                if launcher {
+                    Some((s.launcher.query.clone(), s.launcher.caret))
+                } else {
+                    s.field.and_then(|(pid, fid)| field_text_caret(s, pid, fid))
+                }
+            }) {
                 let sent = self.ime_sent.as_ref();
                 if sent.map(|(t, c)| (t.as_str(), *c)) != Some((text.as_str(), caret)) {
                     self.ime_sent = Some((text.clone(), caret));
@@ -1660,13 +1777,22 @@ impl Stage {
         self.menu_sig = sig.clone();
         let mut items = vec![MacosMenu::Sub {
             name: "superapp".into(),
-            items: vec![MacosMenu::Item {
-                command: live_id!(quit),
-                key: KeyCode::KeyQ,
-                shift: false,
-                enabled: true,
-                name: "Quit superapp".into(),
-            }],
+            items: vec![
+                MacosMenu::Item {
+                    command: LiveId(MENU_LAUNCHER),
+                    key: KeyCode::Unknown,
+                    shift: false,
+                    enabled: true,
+                    name: "Launcher — ⌘ ⌘".into(),
+                },
+                MacosMenu::Item {
+                    command: live_id!(quit),
+                    key: KeyCode::KeyQ,
+                    shift: false,
+                    enabled: true,
+                    name: "Quit superapp".into(),
+                },
+            ],
         }];
         for (k, current) in sig {
             let name = if current {
@@ -1760,6 +1886,24 @@ impl Stage {
                             match &exec {
                                 ChordExec::Ev(ev) => self.handle_key_down(cx, ev),
                                 ChordExec::Text(s) => self.handle_text(cx, s),
+                                ChordExec::Tap(code) => {
+                                    // A bare modifier press-release, the way
+                                    // flagsChanged delivers it: the modifier
+                                    // itself is set on the down, gone on the up.
+                                    let down = KeyEvent {
+                                        key_code: *code,
+                                        modifiers: KeyModifiers {
+                                            logo: *code == KeyCode::Logo,
+                                            ..Default::default()
+                                        },
+                                        is_repeat: false,
+                                        time: 0.0,
+                                    };
+                                    let mut up = down.clone();
+                                    up.modifiers = KeyModifiers::default();
+                                    self.handle_key_down(cx, &down);
+                                    self.handle_key_up(cx, &up);
+                                }
                             }
                         }
                     }
@@ -1889,12 +2033,69 @@ impl Stage {
     }
 
     fn handle_key_down(&mut self, cx: &mut Cx, k: &KeyEvent) {
+        // A bare cmd press only feeds the double-tap detector (the launcher
+        // trigger); the firing side lives in handle_key_up.
+        if k.key_code == KeyCode::Logo {
+            if !k.is_repeat {
+                self.cmd_tap.press(k.time);
+            }
+            return;
+        }
+        self.cmd_tap.other_input();
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // The overlay dismisses on esc; cmd chords below still work through it.
-        if state.overlay && k.key_code == KeyCode::Escape {
-            state.overlay = false;
+        // The launcher owns the keyboard while it is up: arrows pick, enter
+        // goes, esc closes; characters edit the query (they arrive as
+        // TextInput, backspace and caret moves are handled here).
+        if state.overlay == Overlay::Launcher {
+            match k.key_code {
+                KeyCode::Escape => {
+                    state.overlay = Overlay::None;
+                    self.kick(cx);
+                }
+                KeyCode::ReturnKey => {
+                    let hit = state.launcher.hits.get(state.launcher.sel).cloned();
+                    if let Some(hit) = hit {
+                        self.launcher_go(cx, hit);
+                    }
+                }
+                KeyCode::ArrowDown => {
+                    state.launcher.sel += 1; // clamped against the hits on draw
+                    self.kick(cx);
+                }
+                KeyCode::ArrowUp => {
+                    state.launcher.sel = state.launcher.sel.saturating_sub(1);
+                    self.kick(cx);
+                }
+                KeyCode::ArrowLeft => {
+                    state.launcher.caret = state.launcher.caret.saturating_sub(1);
+                    self.kick(cx);
+                }
+                KeyCode::ArrowRight => {
+                    let len = state.launcher.query.chars().count();
+                    state.launcher.caret = (state.launcher.caret + 1).min(len);
+                    self.kick(cx);
+                }
+                KeyCode::Backspace => {
+                    let c = state.launcher.caret;
+                    if c > 0 {
+                        let b0 = char_byte(&state.launcher.query, c - 1);
+                        let b1 = char_byte(&state.launcher.query, c);
+                        state.launcher.query.replace_range(b0..b1, "");
+                        state.launcher.caret = c - 1;
+                        state.launcher.sel = 0;
+                    }
+                    self.kick(cx);
+                }
+                _ => {}
+            }
+            return;
+        }
+        // The workspaces overlay dismisses on esc; cmd chords below still
+        // work through it.
+        if state.overlay == Overlay::Ws && k.key_code == KeyCode::Escape {
+            state.overlay = Overlay::None;
             self.kick(cx);
             return;
         }
@@ -2162,6 +2363,71 @@ impl Stage {
     /// The android IME's authoritative field state (`full_state_sync`):
     /// replace the focused field's text and caret wholesale. Composition is
     /// tracked so app→IME syncs pause while the keyboard composes.
+    /// Only the launcher trigger cares about key releases: a clean second
+    /// cmd tap fires here.
+    fn handle_key_up(&mut self, cx: &mut Cx, k: &KeyEvent) {
+        if k.key_code == KeyCode::Logo && self.cmd_tap.release(k.time) {
+            self.toggle_launcher(cx);
+        }
+    }
+
+    /// Double-cmd: raise the launcher, or put it away if it is already up.
+    fn toggle_launcher(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if state.overlay == Overlay::Launcher {
+            state.overlay = Overlay::None;
+        } else {
+            state.launcher = LauncherUi::default();
+            state.overlay = Overlay::Launcher;
+        }
+        self.kick(cx);
+    }
+
+    /// Raise the launcher idempotently — tapping its own field (or the menu
+    /// item twice) must not reset a typed query.
+    fn open_launcher(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if state.overlay != Overlay::Launcher {
+            state.launcher = LauncherUi::default();
+            state.overlay = Overlay::Launcher;
+        }
+        self.kick(cx);
+    }
+
+    /// Activate a hit: go to the panel wherever it lives, or open a fresh
+    /// un-joined trailing column on the active workspace.
+    fn launcher_go(&mut self, cx: &mut Cx, hit: launcher::Hit) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        state.overlay = Overlay::None;
+        match hit.go {
+            launcher::Go::Focus(pid) => {
+                let was = state.ws.active;
+                if let Some(k) = state.ws.focus_panel(pid) {
+                    state.field = None;
+                    state.sync();
+                    if k != was {
+                        // The same jump-under-the-slide as a cmd+№ switch.
+                        let cam = state.ws.camera_x;
+                        state.anim.camera().jump_to(cam);
+                    }
+                }
+            }
+            launcher::Go::Open(kind) => {
+                state.ws.open(kind, None, false);
+                state.field = None;
+                state.sync();
+            }
+        }
+        self.update_menu(cx);
+        self.kick(cx);
+    }
+
     fn handle_ime_state(&mut self, cx: &mut Cx, fs: &FullTextState) {
         let caret = fs.selection.end.0;
         self.ime_composing = fs.composition.is_some();
@@ -2169,6 +2435,18 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // The launcher's query mirrors the IME editable wholesale, like any
+        // field (this is the android typing path).
+        if state.overlay == Overlay::Launcher {
+            let text = fs.text.replace('\n', "");
+            state.launcher.caret = caret.min(text.chars().count());
+            if state.launcher.query != text {
+                state.launcher.query = text;
+                state.launcher.sel = 0;
+            }
+            self.kick(cx);
+            return;
+        }
         let Some((pid, fid)) = state.field else {
             return;
         };
@@ -2219,6 +2497,14 @@ impl Stage {
             return;
         };
         if input.is_empty() || input.chars().any(|c| c.is_control()) {
+            return;
+        }
+        if state.overlay == Overlay::Launcher {
+            let byte = char_byte(&state.launcher.query, state.launcher.caret);
+            state.launcher.query.insert_str(byte, input);
+            state.launcher.caret += input.chars().count();
+            state.launcher.sel = 0;
+            self.kick(cx);
             return;
         }
         if let Some((pid, fid)) = state.field {
@@ -2275,7 +2561,7 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        state.overlay = false;
+        state.overlay = Overlay::None;
         if state.ws.switch(k) {
             state.field = None;
             state.sync();
@@ -2292,7 +2578,7 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        state.overlay = false;
+        state.overlay = Overlay::None;
         if state.ws.send_focused_to(k).is_some() {
             state.field = None;
             state.sync();
@@ -2312,8 +2598,19 @@ impl Stage {
                 self.switch_ws(cx, k);
                 return;
             }
+            Act::LauncherOpen => {
+                self.open_launcher(cx);
+                return;
+            }
+            Act::LauncherRow(i) => {
+                let hit = state.launcher.hits.get(i).cloned();
+                if let Some(hit) = hit {
+                    self.launcher_go(cx, hit);
+                }
+                return;
+            }
             Act::OverlayClose => {
-                state.overlay = false;
+                state.overlay = Overlay::None;
                 self.kick(cx);
                 return;
             }
@@ -2388,7 +2685,7 @@ impl Stage {
                 self.sync(cx);
             }
             // Handled above — they return before reaching this match.
-            Act::WsRow(_) | Act::OverlayClose => {}
+            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::OverlayClose => {}
         }
     }
 
@@ -2464,10 +2761,14 @@ impl Stage {
                         self.touch.mode = TouchMode::Pan { horizontal: Some(true) };
                     } else {
                         // A vertical two-finger swipe: down summons the
-                        // workspaces overlay, up dismisses it. One shot —
-                        // the rest of the gesture is inert.
+                        // workspaces overlay, up dismisses whichever overlay
+                        // is up. One shot — the rest of the gesture is inert.
                         if let Some(state) = self.state.as_deref_mut() {
-                            state.overlay = t.y > 0.0;
+                            state.overlay = if t.y > 0.0 {
+                                Overlay::Ws
+                            } else {
+                                Overlay::None
+                            };
                         }
                         self.touch.mode = TouchMode::Dead;
                         self.kick(cx);
@@ -2667,13 +2968,18 @@ impl Widget for Stage {
 
             Event::KeyDown(k) => self.handle_key_down(cx, k),
 
-            // A workspace menu item (macOS menu bar).
+            Event::KeyUp(k) => self.handle_key_up(cx, k),
+
+            // A menu item (macOS menu bar).
             Event::MacosMenuCommand(cmd) => {
+                self.cmd_tap.other_input();
                 let id = cmd.0;
                 if (WS_MENU_SWITCH..WS_MENU_SWITCH + WS_N as u64).contains(&id) {
                     self.switch_ws(cx, (id - WS_MENU_SWITCH) as usize);
                 } else if (WS_MENU_MOVE..WS_MENU_MOVE + WS_N as u64).contains(&id) {
                     self.move_focused_to_ws(cx, (id - WS_MENU_MOVE) as usize);
+                } else if id == MENU_LAUNCHER {
+                    self.open_launcher(cx);
                 }
             }
 
@@ -2747,6 +3053,7 @@ impl Widget for Stage {
             }
 
             Event::MouseDown(e) => {
+                self.cmd_tap.other_input();
                 cx.set_key_focus(self.area);
                 let act = self.hit_at(e.abs).map(|h| h.act.clone());
                 if let Some(act) = act {
@@ -2757,6 +3064,7 @@ impl Widget for Stage {
             }
 
             Event::Scroll(e) => {
+                self.cmd_tap.other_input();
                 let Some(state) = self.state.as_deref_mut() else {
                     return;
                 };
@@ -3176,7 +3484,7 @@ impl Stage {
 
         // An empty active workspace names itself, so a switch onto a blank
         // screen reads as a place, not a bug.
-        if state.ws.is_empty() && state.anim.ghosts.is_empty() && !state.overlay {
+        if state.ws.is_empty() && state.anim.ghosts.is_empty() && state.overlay == Overlay::None {
             let msg = if cfg!(target_os = "android") {
                 format!("workspace {} is empty", active + 1)
             } else {
@@ -3195,11 +3503,10 @@ impl Stage {
             );
         }
 
-        // The workspaces overlay: an ink wash, then a column of tappable
-        // rows — the current space inverted, panel titles as the summary,
-        // the first empty slot offered as a fresh space. While it is up it
-        // owns every hit; a tap outside the rows dismisses it.
-        if state.overlay {
+        // The modal overlays share a chassis: an ink wash that owns every
+        // hit, a tap outside the rows dismisses. On top of it, either the
+        // workspaces list or the launcher.
+        if state.overlay != Overlay::None {
             self.hits.clear();
             self.draw_flat.new_draw_call(cx);
             self.draw_flat.color = rgba_a(theme::INK, 0.30);
@@ -3208,17 +3515,47 @@ impl Stage {
                 rect: vp,
                 act: Act::OverlayClose,
                 cursor: MouseCursor::Default,
-                label: "workspaces".into(),
+                label: match state.overlay {
+                    Overlay::Ws => "workspaces",
+                    _ => "launcher",
+                }
+                .into(),
             });
+        }
+
+        // The workspaces overlay: a column of tappable rows — the current
+        // space inverted, panel titles as the summary, the first empty slot
+        // offered as a fresh space — under a search row, the launcher's
+        // touch entry.
+        if state.overlay == Overlay::Ws {
             let roster = state.ws.roster();
             let row_h: f64 = 54.0;
             let row_gap: f64 = 10.0;
             let w = (vp.size.x - 4.0 * theme::GAP).min(430.0);
-            let total = roster.len() as f64 * (row_h + row_gap) - row_gap;
+            let total = (roster.len() + 1) as f64 * (row_h + row_gap) - row_gap;
             let x = vp.pos.x + (vp.size.x - w) / 2.0;
             let mut y = vp.pos.y + ((vp.size.y - total) / 2.0).max(2.0 * theme::GAP);
             self.draw_panel.new_draw_call(cx);
             self.draw_mono.new_draw_call(cx);
+            let r = rect(x, y, w, row_h);
+            self.draw_panel.color = rgba_a(theme::BG, 1.0);
+            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+            self.draw_panel.border_size = 1.0;
+            self.draw_panel.alpha = 1.0;
+            self.draw_panel.draw_abs(cx, r);
+            self.set_text(Style::Muted, 1.0);
+            self.draw_mono.draw_abs(
+                cx,
+                dvec2(x + 16.0, y + (row_h - self.cell.natural) / 2.0),
+                "search",
+            );
+            self.hits.push(HitR {
+                rect: r,
+                act: Act::LauncherOpen,
+                cursor: MouseCursor::Hand,
+                label: "search".into(),
+            });
+            y += row_h + row_gap;
             for k in roster {
                 let r = rect(x, y, w, row_h);
                 let current = k == state.ws.active;
@@ -3267,6 +3604,133 @@ impl Stage {
                     label: format!("workspace {}", k + 1),
                 });
                 y += row_h + row_gap;
+            }
+        }
+
+        // The launcher: a query field over the result rows, windowed around
+        // the selection. Hits are recomputed here, on what is actually
+        // drawn, so clicks and enter resolve against the visible list.
+        if state.overlay == Overlay::Launcher {
+            state.launcher.hits = launcher::search(&state.ws, &state.launcher.query);
+            let n_hits = state.launcher.hits.len();
+            state.launcher.sel = state.launcher.sel.min(n_hits.saturating_sub(1));
+            let field_h: f64 = 54.0;
+            let row_h: f64 = 40.0;
+            let row_gap: f64 = 8.0;
+            let w = (vp.size.x - 4.0 * theme::GAP).min(520.0);
+            let x = vp.pos.x + (vp.size.x - w) / 2.0;
+            let top = vp.pos.y + 2.0 * theme::GAP;
+            self.draw_panel.new_draw_call(cx);
+            let fr = rect(x, top, w, field_h);
+            self.draw_panel.color = rgba_a(theme::BG, 1.0);
+            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+            self.draw_panel.border_size = 1.0;
+            self.draw_panel.alpha = 1.0;
+            self.draw_panel.draw_abs(cx, fr);
+            self.hits.push(HitR {
+                rect: fr,
+                act: Act::LauncherOpen,
+                cursor: MouseCursor::Text,
+                label: "search".into(),
+            });
+
+            // Result rows first (they share the panel draw call).
+            let mut y = top + field_h + 12.0;
+            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - y).max(0.0);
+            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
+            let start = (state.launcher.sel + 1).saturating_sub(max_rows);
+            let end = (start + max_rows).min(n_hits);
+            let rows: Vec<launcher::Hit> = state.launcher.hits[start..end].to_vec();
+            let sel = state.launcher.sel;
+            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
+            for (i, hit) in rows.iter().enumerate() {
+                let idx = start + i;
+                let r = rect(x, y, w, row_h);
+                let (bg, fg) = if idx == sel {
+                    (theme::INK, theme::BG)
+                } else {
+                    (theme::BG, theme::INK)
+                };
+                self.draw_panel.color = rgba_a(bg, 1.0);
+                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, r);
+                let ty = y + (row_h - self.cell.natural) / 2.0;
+                let badge = match hit.ws {
+                    Some(k) => format!("№{}", k + 1),
+                    None => "new".to_string(),
+                };
+                let bx = x + w - 16.0 - badge.chars().count() as f64 * self.cell.adv;
+                texts.push((dvec2(bx, ty), badge, fg, 0.55));
+                let cols = (((bx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
+                let label = trunc(&hit.label, cols);
+                let used = label.chars().count() + 2;
+                texts.push((dvec2(x + 16.0, ty), label, fg, 1.0));
+                if !hit.detail.is_empty() && hit.detail != hit.label && used < cols {
+                    let detail = trunc(&hit.detail, cols - used);
+                    texts.push((
+                        dvec2(x + 16.0 + used as f64 * self.cell.adv, ty),
+                        detail,
+                        fg,
+                        0.55,
+                    ));
+                }
+                self.hits.push(HitR {
+                    rect: r,
+                    act: Act::LauncherRow(idx),
+                    cursor: MouseCursor::Hand,
+                    label: hit.label.clone(),
+                });
+                y += row_h + row_gap;
+            }
+
+            // The caret, above the field's rect.
+            let q_chars = state.launcher.query.chars().count();
+            let caret = state.launcher.caret.min(q_chars);
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 1.0);
+            self.draw_flat.draw_abs(
+                cx,
+                rect(
+                    x + 16.0 + caret as f64 * self.cell.adv,
+                    top + (field_h - self.cell.line_h) / 2.0,
+                    2.0,
+                    self.cell.line_h,
+                ),
+            );
+
+            // Text above everything: the query (or its ghost), the rows.
+            self.draw_mono.new_draw_call(cx);
+            let fy = top + (field_h - self.cell.natural) / 2.0;
+            if state.launcher.query.is_empty() {
+                self.set_text(Style::Muted, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(x + 16.0, fy),
+                    "search — panels, mail, people",
+                );
+            } else {
+                let cols = (((w - 32.0) / self.cell.adv).max(4.0)) as usize;
+                self.set_text(Style::N, 1.0);
+                self.draw_mono
+                    .draw_abs(cx, dvec2(x + 16.0, fy), &trunc(&state.launcher.query, cols));
+            }
+            for (pos, s, color, alpha) in texts {
+                self.set_text(Style::N, 1.0);
+                self.draw_mono.color = rgba_a(color, alpha);
+                self.draw_mono.draw_abs(cx, pos, &s);
+            }
+            if n_hits == 0 && !state.launcher.query.is_empty() {
+                self.set_text(Style::Muted, 1.0);
+                self.draw_mono.draw_abs(cx, dvec2(x + 16.0, y + 6.0), "nothing matches");
+            } else if end < n_hits {
+                self.set_text(Style::Muted, 1.0);
+                self.draw_mono.draw_abs(
+                    cx,
+                    dvec2(x + 16.0, y + 2.0),
+                    &format!("… {} more", n_hits - end),
+                );
             }
         }
 
