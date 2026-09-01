@@ -26,10 +26,15 @@ lazily on next draw. Dependencies are not declared — they are **captured by
 SQLite's authorizer** at prepare time, so the dependency set is complete by
 construction.
 
-That same trace is the future **panel context**: a panel's provenance — which
-queries, which parameters, over which tables, as of which commit — exists as
-a side effect of how drawing works, ready to be serialized for an agent
-(phase 7). This is what "data centric" means mechanically.
+That same trace **is the panel context**: every panel's draw runs inside a
+trace, so its provenance — which queries, which parameters, how many rows —
+exists as a side effect of how drawing works, never by declaration.
+**`cmd+i`** serializes the focused panel's context (identity, params, the
+traced queries with their SQL) to the clipboard and to `panel-context.md`
+beside the store — ready to hand to an agent; the agent hookup itself is
+future work. The trace is honest to a fault: a message panel's context
+includes the inbox query, because the newer/older links really read it.
+This is what "data centric" means mechanically.
 
 At personal-mail scale, re-run-on-invalidate is microseconds; rel.systems'
 incremental Z-set engine remains the documented upgrade path if a view ever

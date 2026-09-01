@@ -1500,6 +1500,14 @@ fn help_lines() -> Vec<Line> {
     v.push(Line {
         left: vec![
             kbd("cmd"),
+            kbd("i"),
+            Seg::T(" — copy the panel's context (its queries)".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
             kbd("["),
             kbd("]"),
             Seg::T(" — consume into / expel out of a column".into(), Style::N),
@@ -2009,6 +2017,7 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "t" => Some(KeyCode::KeyT),
         "z" => Some(KeyCode::KeyZ),
         "u" => Some(KeyCode::KeyU),
+        "i" => Some(KeyCode::KeyI),
         "comma" | "," => Some(KeyCode::Comma),
         "period" | "." => Some(KeyCode::Period),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
@@ -2579,6 +2588,10 @@ impl Stage {
                 self.kick(cx);
                 return;
             }
+            if k.key_code == KeyCode::KeyI {
+                self.copy_panel_context(cx);
+                return;
+            }
             if k.key_code == KeyCode::KeyW {
                 if let Some(f) = state.ws.focus {
                     state.field = None;
@@ -2900,6 +2913,80 @@ impl Stage {
             Err(e) => state.toast(format!("redo failed: {e}"), true),
         }
         self.update_menu(cx);
+        self.kick(cx);
+    }
+
+    /// Serializes the focused panel's context — identity, params, and the
+    /// query trace from its last draw (provenance by construction) — to
+    /// the clipboard and a file beside the store. The agent handoff this
+    /// feeds is future work; the surface is ready.
+    fn copy_panel_context(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let Some(pid) = state.ws.focus else {
+            state.toast("no focused panel", false);
+            return;
+        };
+        let Some(panel) = state.ws.panel(pid) else {
+            return;
+        };
+        let kind = panel.kind.clone();
+        let title = state.panel_title(&kind);
+        let ws = state.ws.ws_of(pid).map_or(0, |k| k + 1);
+        let (kname, p_int, p_txt) = crate::store::kind_cols(&kind);
+        let entries = state.store.trace_of(pid);
+        let mut md = String::new();
+        md.push_str("# superapp panel context\n\n");
+        md.push_str(&format!("panel: “{title}” — workspace {ws}\n"));
+        md.push_str(&format!("kind: {kname}\n"));
+        match (p_int, &p_txt) {
+            (Some(i), _) => md.push_str(&format!("params: {i}\n")),
+            (_, Some(s)) => md.push_str(&format!("params: '{s}'\n")),
+            _ => {}
+        }
+        md.push_str(&format!(
+            "\n## queries (last draw — {} of them)\n",
+            entries.len()
+        ));
+        for e in &entries {
+            md.push_str(&format!("\n### {} — {}\n", e.id, e.describe));
+            if !e.params.is_empty() {
+                md.push_str(&format!("params: {}\n", e.params));
+            }
+            md.push_str(&format!("rows: {}\n", e.rows));
+            let sql: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            md.push_str(&format!("```sql\n{sql}\n```\n"));
+        }
+        // Deliver: a file beside the store, and the clipboard on macOS.
+        let mut where_to = String::new();
+        if let Some(dir) = state.db_path.as_ref().and_then(|p| p.parent()) {
+            let path = dir.join("panel-context.md");
+            if std::fs::write(&path, &md).is_ok() {
+                where_to = path.to_string_lossy().into_owned();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            if let Ok(mut child) = std::process::Command::new("/usr/bin/pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(md.as_bytes());
+                }
+                let _ = child.wait();
+            }
+        }
+        state.toast(
+            format!(
+                "panel context copied — {} queries{}",
+                entries.len(),
+                if where_to.is_empty() { String::new() } else { format!(" · {where_to}") }
+            ),
+            false,
+        );
         self.kick(cx);
     }
 
@@ -4102,6 +4189,7 @@ impl Stage {
             }
             let hits_before = self.hits.len();
             self.draw_panel_full(cx, state, pid, r, alpha);
+            state.store.trace_end();
             if !interactive {
                 // Mid-crossfade or another workspace: visible, not hittable.
                 self.hits.truncate(hits_before);
@@ -4763,6 +4851,9 @@ impl Stage {
         };
         let kind = panel.kind.clone();
         let focused = state.ws.focus == Some(pid);
+        // Everything this panel reads while drawing is its provenance —
+        // the trace behind the panel context (cmd+i).
+        state.store.trace_begin(pid);
         let title = state.panel_title(&kind);
 
         // Whole panel: focus on click (bottom-most hit).

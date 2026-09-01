@@ -310,7 +310,15 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    branch-depth indentation, HEAD inverted, undone branches muted,
    expired sends marked `· sent` and transparent; `Store::travel` walks
    undo-to-LCA then redo-down; the overlay stays up while you browse.
-7. **Panel context.** The trace serialized behind a shortcut.
+7. **Panel context.** The trace serialized behind a shortcut. —
+   **landed 2026-09-01**: every panel's draw runs inside a store trace;
+   `cmd+i` serializes the focused panel (kind, params, traced queries
+   with SQL and row counts) to the clipboard + `panel-context.md` beside
+   the store. Agent hookup remains future work, as scoped.
+
+**All seven phases landed 2026-09-01.** The CR is complete; the book's
+[Data Substrate](../book/src/data-substrate.md) chapter is the living
+description of what was built.
 
 ## Decisions needed
 

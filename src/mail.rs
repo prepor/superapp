@@ -710,6 +710,27 @@ mod tests {
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
     }
 
+    /// A trace records exactly what was read between begin and end — the
+    /// provenance the panel context serializes.
+    #[test]
+    fn traces_record_panel_provenance() {
+        let s = store();
+        s.trace_begin(7);
+        let _ = inbox(&s);
+        let _ = mail(&s, 1);
+        let _ = mail(&s, 1); // repeated reads dedupe
+        s.trace_end();
+        let _ = senders(&s); // outside the trace: not recorded
+        let t = s.trace_of(7);
+        assert_eq!(
+            t.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec!["inbox", "mail"]
+        );
+        assert_eq!(t[0].rows, 68);
+        assert_eq!(t[1].params, "1");
+        assert!(t[0].describe.contains("inbox"));
+    }
+
     /// The civil-date maths round-trips.
     #[test]
     fn dates_round_trip() {

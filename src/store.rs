@@ -88,6 +88,21 @@ pub struct Store {
     /// Domain knowledge injected by the shell; the walk marks such nodes
     /// `expired` and skips them transparently.
     undo_guard: RefCell<Option<Box<dyn Fn(&Connection, &str, Option<&str>) -> bool>>>,
+    /// Per-panel query traces: which queries the panel's last draw touched
+    /// — its data provenance, and the panel context an agent receives.
+    traces: RefCell<HashMap<u64, Vec<TraceEntry>>>,
+    active_trace: Cell<Option<u64>>,
+}
+
+/// One traced read: everything an agent needs to re-derive what a panel
+/// showed.
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub id: &'static str,
+    pub sql: &'static str,
+    pub describe: &'static str,
+    pub params: String,
+    pub rows: usize,
 }
 
 /// Schema v1. UI tables are mutated only through actions (phase 2 formalizes
@@ -318,6 +333,8 @@ impl Store {
             redraw: Cell::new(false),
             data_version: Cell::new(-1),
             undo_guard: RefCell::new(None),
+            traces: RefCell::default(),
+            active_trace: Cell::new(None),
         })
     }
 
@@ -407,45 +424,80 @@ impl Store {
     /// generations still match returns the cached rows; anything else
     /// re-runs and re-stamps. Errors surface as an empty result (and a
     /// stderr note) — a draw pass has nowhere better to put them yet.
+    /// While a trace is open, every read is recorded against it.
     pub fn rows<T: 'static>(
         &self,
         q: &'static Q,
         params: &[Val],
         map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
     ) -> Rc<Vec<T>> {
-        let key = (q.sql, format!("{params:?}"));
+        let pkey = fmt_params(params);
+        let key = (q.sql, pkey.clone());
         let deps = self.deps_for(q);
-        if let Some(c) = self.cache.borrow().get(&key) {
+        let cached: Option<Rc<Vec<T>>> = self.cache.borrow().get(&key).and_then(|c| {
             let fresh = c
                 .deps
                 .iter()
                 .zip(&c.gens)
                 .all(|(t, g)| self.gen_of(t) == *g);
             if fresh {
-                if let Ok(rows) = c.rows.clone().downcast::<Vec<T>>() {
-                    return rows;
+                c.rows.clone().downcast::<Vec<T>>().ok()
+            } else {
+                None
+            }
+        });
+        let rows = cached.unwrap_or_else(|| {
+            let run = || -> rusqlite::Result<Vec<T>> {
+                let mut stmt = self.conn.prepare_cached(q.sql)?;
+                let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
+                iter.collect()
+            };
+            let rows = Rc::new(run().unwrap_or_else(|e| {
+                eprintln!("store: query {} failed: {e}", q.id);
+                Vec::new()
+            }));
+            let gens = deps.iter().map(|t| self.gen_of(t)).collect();
+            self.cache.borrow_mut().insert(
+                key,
+                Cached {
+                    deps,
+                    gens,
+                    rows: rows.clone(),
+                },
+            );
+            rows
+        });
+        if let Some(k) = self.active_trace.get() {
+            let mut traces = self.traces.borrow_mut();
+            if let Some(v) = traces.get_mut(&k) {
+                if !v.iter().any(|e| e.id == q.id && e.params == pkey) {
+                    v.push(TraceEntry {
+                        id: q.id,
+                        sql: q.sql,
+                        describe: q.describe,
+                        params: pkey,
+                        rows: rows.len(),
+                    });
                 }
             }
         }
-        let run = || -> rusqlite::Result<Vec<T>> {
-            let mut stmt = self.conn.prepare_cached(q.sql)?;
-            let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
-            iter.collect()
-        };
-        let rows = Rc::new(run().unwrap_or_else(|e| {
-            eprintln!("store: query {} failed: {e}", q.id);
-            Vec::new()
-        }));
-        let gens = deps.iter().map(|t| self.gen_of(t)).collect();
-        self.cache.borrow_mut().insert(
-            key,
-            Cached {
-                deps,
-                gens,
-                rows: rows.clone(),
-            },
-        );
         rows
+    }
+
+    /// Opens a trace: reads until [`Store::trace_end`] are recorded as this
+    /// key's provenance (the shell traces each panel's draw).
+    pub fn trace_begin(&self, key: u64) {
+        self.traces.borrow_mut().insert(key, Vec::new());
+        self.active_trace.set(Some(key));
+    }
+
+    pub fn trace_end(&self) {
+        self.active_trace.set(None);
+    }
+
+    /// A key's provenance, as of its last trace.
+    pub fn trace_of(&self, key: u64) -> Vec<TraceEntry> {
+        self.traces.borrow().get(&key).cloned().unwrap_or_default()
     }
 
     /// Direct read access for one-shot, non-reactive reads (boot, tests).
@@ -942,8 +994,23 @@ impl Store {
     }
 }
 
+/// Query params rendered for humans (and cache keys).
+fn fmt_params(params: &[Val]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    params
+        .iter()
+        .map(|v| match v {
+            Val::I(i) => i.to_string(),
+            Val::S(s) => format!("'{s}'"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// [`Kind`] → its persisted row: `(kind, p_int, p_txt)`.
-fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
+pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
     match kind {
         Kind::Help => ("help", None, None),
         Kind::About => ("about", None, None),
