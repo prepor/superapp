@@ -3899,7 +3899,7 @@ impl Stage {
                             hit.detail.clone()
                         },
                         right: match hit.ws {
-                            Some(k) => format!("№{}", k + 1),
+                            Some(k) => format!("#{}", k + 1),
                             None => "new".into(),
                         },
                         current: i == state.launcher.sel,

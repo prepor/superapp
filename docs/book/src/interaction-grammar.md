@@ -114,7 +114,7 @@ match, so `vera q3` narrows to her budget mail.
 Each hit carries one of two verbs, decided for you:
 
 - already open somewhere → **go to it** — switch workspace, focus it; the
-  row wears its workspace number (`№3`);
+  row wears its workspace number (`#3`);
 - not open → **open it** — a fresh un-joined trailing column on the active
   workspace; the row says *new*.
 
