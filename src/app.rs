@@ -419,6 +419,7 @@ enum WidgetOp {
     AddAccount,
     RemoveAccount(i64),
     OpenMail(i64),
+    SelectMail(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3088,6 +3089,14 @@ impl Stage {
                     WidgetOp::OpenMail(id) => {
                         self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), alt);
                     }
+                    WidgetOp::SelectMail(id) => {
+                        // Panel-internal: the inbox widget listens for this
+                        // and moves its j/k cursor.
+                        state.ws.focus = Some(pid);
+                        state.field = None;
+                        cx.action(crate::panels::PanelAction::SelectMail { pid, id });
+                        self.sync(cx);
+                    }
                 }
                 return;
             }
@@ -3982,13 +3991,15 @@ impl Widget for Stage {
                 if let Some(act) = act {
                     // cmd+click (alt as a quiet alias): a fresh, un-joined panel.
                     let fresh = e.modifiers.logo || e.modifiers.alt;
-                    // Real clicks on hosted content act through the widgets
-                    // themselves (rows open, buttons submit — the forwarded
-                    // pointer stream). The semantic ops are the e2e bridge's
-                    // route only; resolving them here too would double-fire.
-                    // The shell's share of a content click is panel focus.
+                    // PortalList items are rebuilt every draw, so their areas
+                    // go stale the moment a mid-gesture redraw lands — a
+                    // down/up pair inside one cannot be trusted. In-list
+                    // controls (rows, remove) therefore resolve semantically
+                    // for real clicks too. Standalone widgets (the add
+                    // button) keep their native path — resolving those here
+                    // as well would double-fire.
                     let act = match act {
-                        Act::WidgetOp(pid, _) => Act::Pointer(pid),
+                        Act::WidgetOp(pid, WidgetOp::AddAccount) => Act::Pointer(pid),
                         a => a,
                     };
                     self.resolve_click(cx, act, fresh);
@@ -5043,8 +5054,13 @@ impl Stage {
                 if fr.size.x > 0.0 {
                     reg.push(("filter".to_string(), fr, Act::Pointer(pid)));
                 }
-                // Visible rows, addressed by subject — clicking one in a
-                // script means "open it", the subject-link semantics.
+                // Visible rows. These rects are the REAL click path too, not
+                // just the scripts' door: list items are rebuilt per draw,
+                // so a down/up pair inside them dies on any mid-gesture
+                // redraw. The whole row selects; the subject band (pushed
+                // later — hit_at searches back-to-front, so it wins the
+                // overlap) opens, keeping the bare-subject address the
+                // scripts use for "open it".
                 let filter = w
                     .widget(cx, ids!(filter_input))
                     .as_text_input()
@@ -5056,10 +5072,26 @@ impl Stage {
                         if r.size.x > 0.0 {
                             if let Some(m) = rows.get(*idx) {
                                 reg.push((
-                                    m.subject.clone(),
+                                    format!("row {}", m.subject),
                                     r,
-                                    Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
+                                    Act::WidgetOp(pid, WidgetOp::SelectMail(m.id)),
                                 ));
+                                let s = if m.unread {
+                                    item.widget.widget(cx, ids!(subject_b)).area().rect(cx)
+                                } else {
+                                    item.widget.label(cx, ids!(subject_lbl)).area().rect(cx)
+                                };
+                                if s.size.x > 0.0 {
+                                    let band = Rect {
+                                        pos: dvec2(s.pos.x, r.pos.y),
+                                        size: dvec2(s.size.x, r.size.y),
+                                    };
+                                    reg.push((
+                                        m.subject.clone(),
+                                        band,
+                                        Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
+                                    ));
+                                }
                             }
                         }
                     }

@@ -165,6 +165,20 @@ exercise. That layer is verified store-level now: drive letters through a
 temp db and assert the panels they produce (j·j·enter must open the second
 row, not the first), which proves the path without pixels.
 
+A fifth followed the fourth, and settled the phase-A mystery: PortalList
+items are rebuilt every draw, so **their areas go stale the moment a
+mid-gesture redraw lands** — and a panel-focus click triggers exactly such
+a redraw between down and up. A down/up pair inside a list item can never
+be trusted (this, not capture-overload exotica, is why synthetic button
+clicks died in phase A). The rule that falls out: **in-list controls
+(inbox rows, account remove buttons) resolve real clicks through the
+shell's registered rects — the same semantic door the scripts use, one
+door total; standalone widgets (the add button, links, fields) keep their
+native pointer paths, and their registered rects stay e2e-only.** Rows
+register two rects: the whole row selects, the subject band (later in the
+list, and hit_at searches back-to-front) opens — so the mouse keeps the
+open-vs-select split the widget's own hit test used to judge.
+
 Also in this pass, visual parity: the library draws at the theme's sizes
 (10.5/8.25 — it had hardcoded 8.0, which read as a different font entirely),
 subjects hold to one line (`max_lines: 1` + `Ellipsis`), unread bold is the
@@ -174,4 +188,12 @@ j/k with scroll-follow, the message body scrolls, and settings lost its
 fixed-height list (accounts fill the middle, the form holds the bottom).
 Tab between fields stays ours: neither makepad's TextInput nor Robrix
 handles Tab at all — the enter chain is Robrix's ceiling; the Tab walk is
-ours on top of it.
+ours on top of it. It grew into a proper ring (Andrey's ask): buttons are
+stops too (settings: remove rows → fields → add), the ring wraps, a panel
+holding focus starts the ring at its first stop (compose: Tab lands on
+"to"), Enter/Space press a focused button (makepad buttons take key focus
+but ship no keyboard activation), a keyboard-focused button wears the
+selection wash, and — the frameworks' norm — a field's selection paints
+only while it is focused, so tab-out lets the highlight go. Arrows also
+scroll the message body again (three lines, the char grid's behaviour),
+synthesized as Scroll events so the ScrollBars keep the clamping.

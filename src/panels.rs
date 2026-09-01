@@ -7,6 +7,7 @@
 //! as [`PanelAction`]s (global actions the shell catches and turns into
 //! store actions — so undo semantics never enter this module).
 
+use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use makepad_widgets::*;
 
 use crate::mail;
@@ -146,11 +147,13 @@ script_mod! {
             color: #141414
         }
         draw_selection +: {
-            color: #e7e7e7
-            color_hover: #e7e7e7
+            // Selection paints only while focused (the frameworks' norm:
+            // tab-in selects all, tab-out lets the highlight go).
+            color: #ffffff
+            color_hover: #ffffff
             color_focus: #e7e7e7
             color_down: #e7e7e7
-            color_empty: #e7e7e7
+            color_empty: #ffffff
         }
     }
 
@@ -165,7 +168,9 @@ script_mod! {
             color: #ffffff
             color_hover: #efefef
             color_down: #e7e7e7
-            color_focus: #ffffff
+            // Keyboard focus reads as the selection wash — enter/space
+            // will press this button.
+            color_focus: #e7e7e7
             color_disabled: #ffffff
             border_color: #141414
             border_color_hover: #141414
@@ -528,11 +533,9 @@ pub struct AccountRow {
 impl Widget for AccountRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        if let Event::Actions(actions) = event {
-            if self.view.button(cx, ids!(remove_btn)).clicked(actions) {
-                cx.action(PanelAction::RemoveAccount(self.account_id));
-            }
-        }
+        // The remove button's clicks resolve through the shell's semantic
+        // rect (list-item areas go stale mid-gesture); `account_id` stays
+        // for the settings tab ring.
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -575,6 +578,31 @@ pub struct SettingsPanel {
     view: View,
 }
 
+/// One stop on a tab ring — fields and buttons alike. (No focus-traversal
+/// system exists upstream: makepad's TextInput doesn't own Tab and Robrix
+/// stops at the enter-chain, so the ring is ours.)
+enum RingStop {
+    Input(TextInputRef),
+    Remove(ButtonRef, i64),
+    Add(ButtonRef),
+}
+
+impl RingStop {
+    fn is_focused(&self, cx: &Cx) -> bool {
+        match self {
+            RingStop::Input(t) => t.key_focus(cx),
+            RingStop::Remove(b, _) | RingStop::Add(b) => cx.has_key_focus(b.area()),
+        }
+    }
+
+    fn focus(&self, cx: &mut Cx) {
+        match self {
+            RingStop::Input(t) => SettingsPanel::focus_input(cx, t),
+            RingStop::Remove(b, _) | RingStop::Add(b) => cx.set_key_focus(b.area()),
+        }
+    }
+}
+
 impl SettingsPanel {
     /// Advance focus the way forms expect: focus + select-all, so typing
     /// replaces and backspace clears.
@@ -592,6 +620,34 @@ impl SettingsPanel {
             self.view.text_input(cx, ids!(imap_input)),
             self.view.text_input(cx, ids!(smtp_input)),
         ]
+    }
+
+    /// The tab ring in visual order: remove buttons (visible account rows),
+    /// the form fields, the add button.
+    fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
+        let mut v = Vec::new();
+        if let Some(list) = self
+            .view
+            .widget(cx, ids!(accounts_list))
+            .as_portal_list()
+            .borrow()
+        {
+            let mut rows: Vec<(usize, WidgetRef)> = list
+                .items()
+                .iter()
+                .map(|(i, item)| (*i, item.widget.clone()))
+                .collect();
+            rows.sort_by_key(|(i, _)| *i);
+            for (_, row) in rows {
+                let id = row.as_account_row().borrow().map_or(0, |r| r.account_id);
+                v.push(RingStop::Remove(row.button(cx, ids!(remove_btn)), id));
+            }
+        }
+        for t in self.inputs(cx) {
+            v.push(RingStop::Input(t));
+        }
+        v.push(RingStop::Add(self.view.button(cx, ids!(add_btn))));
+        v
     }
 
     fn submit(&mut self, cx: &mut Cx, pid: u64) {
@@ -629,15 +685,37 @@ impl Widget for SettingsPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
-        // Tab walks the form (shift reverses); TextInput doesn't own Tab.
+        // Tab walks the whole ring — fields AND buttons — with the
+        // frameworks' rules: wrap around; when the panel itself holds
+        // focus, the first Tab lands on the first stop (last, shifted).
+        // Enter/Space press a focused button.
         if let Event::KeyDown(k) = event {
             if k.key_code == KeyCode::Tab {
-                let inputs = self.inputs(cx);
-                if let Some(i) = inputs.iter().position(|t| t.key_focus(cx)) {
-                    let n = inputs.len() as isize;
-                    let j = i as isize + if k.modifiers.shift { -1 } else { 1 };
-                    if (0..n).contains(&j) {
-                        Self::focus_input(cx, &inputs[j as usize]);
+                let ring = self.ring(cx);
+                if !ring.is_empty() {
+                    let dir: isize = if k.modifiers.shift { -1 } else { 1 };
+                    let n = ring.len() as isize;
+                    let j = match ring.iter().position(|s| s.is_focused(cx)) {
+                        Some(i) => (i as isize + dir).rem_euclid(n),
+                        None if dir > 0 => 0,
+                        None => n - 1,
+                    };
+                    ring[j as usize].focus(cx);
+                    self.redraw(cx);
+                }
+            }
+            if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                for stop in self.ring(cx) {
+                    if stop.is_focused(cx) {
+                        match stop {
+                            RingStop::Remove(_, id) => {
+                                cx.action(PanelAction::RemoveAccount(id));
+                            }
+                            RingStop::Add(_) => self.submit(cx, pid),
+                            RingStop::Input(_) => {}
+                        }
+                        break;
                     }
                 }
             }
@@ -710,18 +788,20 @@ impl Widget for ComposePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
-        // Tab walks to → subject → body (shift reverses; the body's enter
-        // stays a newline — multiline TextInput owns it).
+        // Tab walks to → subject → body, wrapping; from panel focus it
+        // lands on "to" (the body's enter stays a newline — multiline
+        // TextInput owns it).
         if let Event::KeyDown(k) = event {
             if k.key_code == KeyCode::Tab {
                 let inputs = self.inputs(cx);
-                if let Some(i) = inputs.iter().position(|t| t.key_focus(cx)) {
-                    let n = inputs.len() as isize;
-                    let j = i as isize + if k.modifiers.shift { -1 } else { 1 };
-                    if (0..n).contains(&j) {
-                        SettingsPanel::focus_input(cx, &inputs[j as usize]);
-                    }
-                }
+                let dir: isize = if k.modifiers.shift { -1 } else { 1 };
+                let n = inputs.len() as isize;
+                let j = match inputs.iter().position(|t| t.key_focus(cx)) {
+                    Some(i) => (i as isize + dir).rem_euclid(n),
+                    None if dir > 0 => 0,
+                    None => n - 1,
+                };
+                SettingsPanel::focus_input(cx, &inputs[j as usize]);
             }
         }
 
@@ -797,35 +877,17 @@ pub struct InboxRow {
     source: ScriptObjectRef,
     #[deref]
     view: View,
-    #[rust]
-    pid: u64,
-    #[rust]
-    mail_id: i64,
 }
 
 impl Widget for InboxRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        match event.hits(cx, self.view.area()) {
-            Hit::FingerUp(fe) if fe.is_over && fe.was_tap() => {
-                let subj = self.view.label(cx, ids!(subject_lbl)).area().rect(cx);
-                let subj_b = self.view.widget(cx, ids!(subject_b)).area().rect(cx);
-                let over_subject = subj.contains(fe.abs) || subj_b.contains(fe.abs);
-                if over_subject {
-                    cx.action(PanelAction::OpenMail {
-                        pid: self.pid,
-                        id: self.mail_id,
-                        fresh: fe.modifiers.logo || fe.modifiers.alt,
-                    });
-                } else {
-                    cx.action(PanelAction::SelectMail {
-                        pid: self.pid,
-                        id: self.mail_id,
-                    });
-                }
-            }
-            Hit::FingerHoverIn(_) => cx.set_cursor(MouseCursor::Hand),
-            _ => {}
+        // Clicks resolve through the shell's registered rects — a list
+        // item's own area goes stale on any mid-gesture redraw, so a
+        // down/up pair here cannot be trusted. The row's share is the
+        // cursor.
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.area()) {
+            cx.set_cursor(MouseCursor::Hand);
         }
     }
 
@@ -835,10 +897,8 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    fn populate(&self, cx: &mut Cx, pid: u64, m: &mail::MailHead, selected: bool) {
+    fn populate(&self, cx: &mut Cx, m: &mail::MailHead, selected: bool) {
         let Some(mut row) = self.borrow_mut() else { return };
-        row.pid = pid;
-        row.mail_id = m.id;
         let from = &m.from_name;
         let date = mail::fmt_date(m.date);
         let fp = row.view.label(cx, ids!(from_lbl));
@@ -945,6 +1005,8 @@ impl Widget for InboxPanel {
                     // Arrows mirror j/k (the char grid's grammar).
                     KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
+                    // The inbox's one-stop tab ring: the filter.
+                    KeyCode::Tab => SettingsPanel::focus_input(cx, &filter),
                     _ => {}
                 }
             }
@@ -977,7 +1039,6 @@ impl Widget for InboxPanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let rows = self.rows(cx, scope);
-        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
         let sel = self.sel;
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
@@ -985,7 +1046,7 @@ impl Widget for InboxPanel {
                 while let Some(idx) = list.next_visible_item(cx) {
                     if let Some(m) = rows.get(idx) {
                         let row = list.item(cx, idx, live_id!(row));
-                        row.as_inbox_row().populate(cx, pid, m, sel == Some(m.id));
+                        row.as_inbox_row().populate(cx, m, sel == Some(m.id));
                         row.draw_all(cx, scope);
                     }
                 }
@@ -1070,6 +1131,34 @@ pub struct MessagePanel {
 impl Widget for MessagePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        // Arrows scroll the body three lines (the char grid's behaviour) —
+        // synthesized as a Scroll event so the ScrollBars keep clamping
+        // and position, no shadow state.
+        if let Event::KeyDown(k) = event {
+            let d = match k.key_code {
+                KeyCode::ArrowDown => 3.0,
+                KeyCode::ArrowUp => -3.0,
+                _ => 0.0,
+            };
+            if d != 0.0 {
+                let r = self.view.view(cx, ids!(body_scroll)).area().rect(cx);
+                if r.size.y > 0.0 {
+                    let ev = Event::Scroll(ScrollEvent {
+                        window_id: CxWindowPool::id_zero(),
+                        scroll: dvec2(0.0, d * 14.0),
+                        abs: r.pos + r.size * 0.5,
+                        modifiers: KeyModifiers::default(),
+                        handled_x: std::cell::Cell::new(false),
+                        handled_y: std::cell::Cell::new(false),
+                        is_mouse: false,
+                        time: 0.0,
+                        phase: ScrollPhase::None,
+                    });
+                    self.view.handle_event(cx, &ev, scope);
+                    self.redraw(cx);
+                }
+            }
+        }
         // The message grammar: j/k walk in place (dotted semantics),
         // r replies — letters arrive as TextInput events.
         if let Event::TextInput(t) = event {
