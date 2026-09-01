@@ -22,13 +22,13 @@ path = "src/main.rs"
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 mail-parser = "0.11"
-# Upstream makepad@dev, re-pinned 2026-09-01 to current HEAD (53 commits
-# past mosaic's vendor pin; fast-forward, zero source drift, full battery
-# green). Plain upstream — none of mosaic's patches; the one superapp used
-# was 0003 (present-when-occluded, for background e2e runs), dropped as an
-# experiment: if occluded e2e suites go stale, run them with --front. The
-# API reference is the ~/.cargo git checkout of this rev (mosaic's vendored
-# tree lags it).
+# makepad@dev, re-pinned 2026-09-01 to then-HEAD (53 commits past mosaic's
+# vendor pin; fast-forward, zero source drift, full battery green). None of
+# mosaic's patches; the one superapp used was 0003 (present-when-occluded,
+# for background e2e runs), dropped as an experiment: if occluded e2e
+# suites go stale, run them with --front. Two patches of our own now ride
+# on top — see the [patch] section at the bottom. The API reference is the
+# ~/.cargo git checkout of the fork rev (mosaic's vendored tree lags it).
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
 # The one store: bundled SQLite (same pin rel.systems validated) so the hook
@@ -43,15 +43,24 @@ rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# One patch on the pin (local clone of the same rev + commit bdb23508,
-# branch superapp-pin): TextInput keeps the soft keyboard up when key
-# focus moves to another widget — upstream hides it unconditionally on
-# blur, which closes and reopens the keyboard on every mobile "next".
-# Worth offering upstream; until then this override carries it.
+# Two soft-keyboard patches on top of the pin, carried on
+# prepor/makepad@superapp-pin (branched at the pin; rebase them when
+# bumping it). Both are android IME defects with no app-side workaround:
+#
+#   bdb23508  TextInput hides the IME only when key focus goes to nothing —
+#             the unconditional hide-on-blur closed and reopened the
+#             keyboard on every field-to-field move (mobile "next", tab).
+#   5bf8e78f  A dismissed keyboard is not hidden again (Samsung re-presents
+#             it to replay the animation: dismissals "closed twice"), and a
+#             tap on a field clears the dismissed latch, so a re-tap on the
+#             focused field can raise the keyboard again.
+#
+# A local clone at ../makepad-superapp is the working tree for them; the
+# git rev below is what actually builds, here and anywhere else.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { path = "../makepad-superapp/widgets" }
-makepad-objc-sys = { path = "../makepad-superapp/libs/objc-sys" }
-makepad-apple-sys = { path = "../makepad-superapp/libs/apple_sys" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe66ca4b9c890b963da733dd6dbfabdc2" }
 
 [profile.dev]
 opt-level = 1
