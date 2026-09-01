@@ -59,7 +59,7 @@ Every effect is a serializable value that knows how to describe itself and
 how to do itself.
 
 ```rust
-pub trait Effect: Serialize + DeserializeOwned + Sized {
+pub trait Effect: Sized {
     /// Stable, greppable, the table's `kind`.
     const KIND: &'static str;
     /// What this call answers.
@@ -67,12 +67,16 @@ pub trait Effect: Serialize + DeserializeOwned + Sized {
     /// One line of English — the row's `detail`, the label in a status UI,
     /// and what an assertion failure prints. Never carries a secret.
     fn describe(&self) -> String;
-    /// Do it.
-    fn perform(&self, o: &mut dyn Outside) -> Result<Self::Reply, String>;
+    /// Do it. `Ctx` is the outside plus read-only store access, so a payload
+    /// can reference a row instead of embedding its contents.
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
 }
 ```
 
-Serializability is a bound on the trait itself, so an effect that cannot be
+`Effect` is deliberately **not** `Serialize`. An in-memory effect is written
+nowhere, so requiring it would be a lie — and a dangerous one, since
+`Connect` carries a password. Serializability belongs to `Deferred`, where a
+row actually exists, and there it is a bound: an effect that cannot be
 written down is a compile error rather than a discovery.
 
 ### Persisted and in-memory
@@ -90,11 +94,19 @@ The deferred set carries two more obligations, so it gets its own trait:
 ```rust
 /// An effect worth persisting. Its reply must survive a round trip through
 /// the table, and it must say whether repeating it is safe.
-pub trait Deferred: Effect
+pub trait Deferred: Effect + Serialize + DeserializeOwned + 'static
 where
     Self::Reply: Serialize + DeserializeOwned,
 {
     fn idempotent(&self) -> bool;
+    /// What this job belongs to — `account:2`, `outbox:9`. Lets a panel
+    /// query its own effects.
+    fn entity(&self) -> Option<String> { None }
+    /// Checked after the claim, before the round trip: if undo landed while
+    /// the job waited, it goes `obsolete` rather than pushing stale work.
+    fn still_wanted(&self, _db: &Connection) -> bool { true }
+    /// What the success establishes, in the same transaction as the status.
+    fn settle(&self, _tx: &Transaction, _reply: &Self::Reply) -> rusqlite::Result<()> { Ok(()) }
 }
 ```
 
@@ -163,6 +175,7 @@ CREATE TABLE effect(
   payload    TEXT NOT NULL CHECK (json_valid(payload)),   -- json: the effect
   entity     TEXT,                             -- 'panel:7' | 'account:2'
   status     TEXT NOT NULL DEFAULT 'pending',  -- pending|processing|done|failed|obsolete
+  idempotent INTEGER NOT NULL DEFAULT 0,       -- copied at enqueue: the sweep is pure SQL
   reply      TEXT CHECK (reply IS NULL OR json_valid(reply)),
   error      TEXT,
   attempts   INTEGER NOT NULL DEFAULT 0,
