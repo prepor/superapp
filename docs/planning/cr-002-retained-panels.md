@@ -117,8 +117,16 @@ D. **Inbox** on `PortalList` — **landed 2026-09-01**: virtualized rows
    `OpenMail` → the same undoable `Act::Open` path, mark-read included);
    elsewhere selects. e2e rows register by subject, so every existing
    script keeps working unchanged.
-E. **Message / Contact / Help / About**; retire the char-grid renderer and
-   the custom field machinery.
+E. **Message / Contact** — **landed 2026-09-01**: `SLink` completes the
+   design language in widget form (label over a 1 px underline; the
+   dotted variant's dashes are shader-drawn); links carry their target
+   `Kind` and bubble `FollowLink` into the same undoable Open/Replace
+   paths, workspace modifier included. The message panel walks j/k/r
+   from forwarded letters; neighbours grey out at the ends. `PanelProps`
+   now carries the panel's `Kind`, so read panels self-derive entirely
+   from scope. **Help / About stay on the char grid deliberately** —
+   static text where the grid is harmless; they migrate with F when the
+   overlays go, and only then does the old renderer retire.
 F. **Overlays** onto the same library (launcher field becomes an `SField`,
    history rows become widgets) — optional, by pain.
 

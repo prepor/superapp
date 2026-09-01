@@ -18,6 +18,7 @@ use crate::store::Store;
 pub struct PanelProps {
     pub store: std::rc::Rc<Store>,
     pub pid: u64,
+    pub kind: crate::core::Kind,
 }
 
 /// Intent bubbled from panel widgets to the shell. The shell owns turning
@@ -46,6 +47,14 @@ pub enum PanelAction {
     OpenMail { pid: u64, id: i64, fresh: bool },
     /// Panel-internal: an inbox row was tapped outside its subject.
     SelectMail { pid: u64, id: i64 },
+    /// A link was followed: solid opens joined, dotted replaces in place,
+    /// `fresh` (the workspace modifier) always opens un-joined.
+    FollowLink {
+        pid: u64,
+        target: crate::core::Kind,
+        dotted: bool,
+        fresh: bool,
+    },
 }
 
 script_mod! {
@@ -338,6 +347,103 @@ script_mod! {
             flow: Down
             row := mod.widgets.InboxRow {}
         }
+    }
+
+    // ---- links and the read panels ----------------------------------------
+
+    /** The link grammar as a widget: label over a 1 px underline — solid
+        opens joined, dotted replaces in place (the dashes are shader-drawn). */
+    mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Down
+        cursor: MouseCursor.Hand
+        lbl := mod.widgets.SLabel { text: "" }
+        ul := View {
+            width: Fill, height: 1
+            show_bg: true, draw_bg +: { color: #141414 }
+        }
+        ul_dotted := View {
+            visible: false
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if Math.mod(x, 6.0) > 3.0 {
+                        return vec4(0.0, 0.0, 0.0, 0.0)
+                    }
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** One mail, whole: headers with a contact link, the body, the walk. */
+    mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        spacing: 5
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 52, text: "FROM" }
+            from_link := mod.widgets.SLink {}
+        }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 52, text: "TO" }
+            to_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+        }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 52, text: "DATE" }
+            date_lbl := mod.widgets.SLabel { text: "" }
+        }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
+        status_lbl := mod.widgets.SLabel {
+            visible: false, text: "", draw_text +: { color: #5a5a5a }
+        }
+        status_err_lbl := mod.widgets.SLabel {
+            visible: false, text: "", draw_text +: { color: #a01500 }
+        }
+        body_lbl := mod.widgets.SLabel { width: Fill, height: Fill, text: "" }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            newer_link := mod.widgets.SLink {}
+            newer_off := mod.widgets.SLabel {
+                visible: false, text: "← newer", draw_text +: { color: #909090 }
+            }
+            mod.widgets.SLabel { width: 16, text: "" }
+            older_link := mod.widgets.SLink {}
+            older_off := mod.widgets.SLabel {
+                visible: false, text: "older →", draw_text +: { color: #909090 }
+            }
+            View { width: Fill, height: 1 }
+            reply_link := mod.widgets.SLink {}
+        }
+    }
+
+    /** A sender's card. */
+    mod.widgets.ContactPanel = set_type_default() do #(ContactPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        spacing: 6
+
+        name_lbl := mod.widgets.SLabel {
+            text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 10.5} }
+        }
+        email_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+        View { width: Fill, height: 4 }
+        count_lbl := mod.widgets.SLabel { text: "" }
+        View { width: Fill, height: 4 }
+        from_link := mod.widgets.SLink {}
     }
 }
 
@@ -817,5 +923,233 @@ impl Widget for InboxPanel {
             }
         }
         DrawStep::done()
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// SLink
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct SLink {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    #[rust]
+    pid: u64,
+    #[rust]
+    target: Option<crate::core::Kind>,
+    #[rust]
+    dotted: bool,
+}
+
+impl Widget for SLink {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Hit::FingerUp(fe) = event.hits(cx, self.view.area()) {
+            if fe.is_over && fe.was_tap() {
+                if let Some(target) = self.target.clone() {
+                    cx.action(PanelAction::FollowLink {
+                        pid: self.pid,
+                        target,
+                        dotted: self.dotted,
+                        fresh: fe.modifiers.logo || fe.modifiers.alt,
+                    });
+                }
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl SLinkRef {
+    pub fn set(
+        &self,
+        cx: &mut Cx,
+        pid: u64,
+        text: &str,
+        target: crate::core::Kind,
+        dotted: bool,
+    ) {
+        let Some(mut l) = self.borrow_mut() else { return };
+        l.pid = pid;
+        l.target = Some(target);
+        l.dotted = dotted;
+        l.view.label(cx, ids!(lbl)).set_text(cx, text);
+        l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
+        l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MessagePanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct MessagePanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for MessagePanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        // The message grammar: j/k walk in place (dotted semantics),
+        // r replies — letters arrive as TextInput events.
+        if let Event::TextInput(t) = event {
+            let Some(p) = scope.props.get::<PanelProps>() else {
+                return;
+            };
+            let crate::core::Kind::Message { id } = p.kind else {
+                return;
+            };
+            match t.input.as_str() {
+                "j" | "k" => {
+                    let (newer, older) = mail::neighbours(&p.store, id);
+                    let target = if t.input == "j" { older } else { newer };
+                    if let Some(nid) = target {
+                        cx.action(PanelAction::FollowLink {
+                            pid: p.pid,
+                            target: crate::core::Kind::Message { id: nid },
+                            dotted: true,
+                            fresh: false,
+                        });
+                    }
+                }
+                "r" => cx.action(PanelAction::FollowLink {
+                    pid: p.pid,
+                    target: crate::core::Kind::Compose { re: id },
+                    dotted: false,
+                    fresh: false,
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if let Some(p) = scope.props.get::<PanelProps>() {
+            if let crate::core::Kind::Message { id } = p.kind {
+                let pid = p.pid;
+                if let Some(m) = mail::mail(&p.store, id) {
+                    self.view.link(cx, ids!(from_link)).set(
+                        cx,
+                        pid,
+                        &format!("{} <{}>", m.head.from_name, m.head.from_email),
+                        crate::core::Kind::Contact {
+                            email: m.head.from_email.clone(),
+                        },
+                        false,
+                    );
+                    self.view.label(cx, ids!(to_lbl)).set_text(cx, &m.to);
+                    self.view
+                        .label(cx, ids!(date_lbl))
+                        .set_text(cx, &mail::fmt_date(m.head.date));
+                    let (ok_l, err_l) = (
+                        self.view.label(cx, ids!(status_lbl)),
+                        self.view.label(cx, ids!(status_err_lbl)),
+                    );
+                    match &m.status {
+                        Some((txt, true)) => {
+                            err_l.set_text(cx, txt);
+                            err_l.set_visible(cx, true);
+                            ok_l.set_visible(cx, false);
+                        }
+                        Some((txt, false)) => {
+                            ok_l.set_text(cx, txt);
+                            ok_l.set_visible(cx, true);
+                            err_l.set_visible(cx, false);
+                        }
+                        None => {
+                            ok_l.set_visible(cx, false);
+                            err_l.set_visible(cx, false);
+                        }
+                    }
+                    self.view.label(cx, ids!(body_lbl)).set_text(cx, &m.body);
+                    let (newer, older) = mail::neighbours(&p.store, id);
+                    let nl = self.view.link(cx, ids!(newer_link));
+                    let no = self.view.label(cx, ids!(newer_off));
+                    if let Some(n) = newer {
+                        nl.set(cx, pid, "← newer", crate::core::Kind::Message { id: n }, true);
+                    }
+                    nl.set_visible(cx, newer.is_some());
+                    no.set_visible(cx, newer.is_none());
+                    let ol = self.view.link(cx, ids!(older_link));
+                    let oo = self.view.label(cx, ids!(older_off));
+                    if let Some(o) = older {
+                        ol.set(cx, pid, "older →", crate::core::Kind::Message { id: o }, true);
+                    }
+                    ol.set_visible(cx, older.is_some());
+                    oo.set_visible(cx, older.is_none());
+                    self.view.link(cx, ids!(reply_link)).set(
+                        cx,
+                        pid,
+                        "reply",
+                        crate::core::Kind::Compose { re: id },
+                        false,
+                    );
+                }
+            }
+        }
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContactPanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct ContactPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for ContactPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if let Some(p) = scope.props.get::<PanelProps>() {
+            if let crate::core::Kind::Contact { email } = &p.kind {
+                let (name, count) = mail::contact(&p.store, email);
+                let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
+                self.view.label(cx, ids!(name_lbl)).set_text(cx, &name);
+                self.view.label(cx, ids!(email_lbl)).set_text(cx, email);
+                self.view
+                    .label(cx, ids!(count_lbl))
+                    .set_text(cx, &format!("{count} message(s) in mail"));
+                self.view.link(cx, ids!(from_link)).set(
+                    cx,
+                    p.pid,
+                    &format!("messages from {first}"),
+                    crate::core::Kind::Inbox {
+                        filter: Some(email.clone()),
+                    },
+                    false,
+                );
+            }
+        }
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// `WidgetRef → SLinkRef` convenience mirroring the generated accessors.
+trait LinkViewExt {
+    fn link(&self, cx: &mut Cx, path: &[LiveId]) -> SLinkRef;
+}
+impl LinkViewExt for View {
+    fn link(&self, cx: &mut Cx, path: &[LiveId]) -> SLinkRef {
+        self.widget(cx, path).as_slink()
     }
 }

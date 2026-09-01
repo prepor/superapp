@@ -229,6 +229,8 @@ script_mod! {
                         settings_tpl := mod.widgets.SettingsPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
                         inbox_tpl := mod.widgets.InboxPanel{}
+                        message_tpl := mod.widgets.MessagePanel{}
+                        contact_tpl := mod.widgets.ContactPanel{}
                     }
                 }
             }
@@ -3526,6 +3528,8 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Settings => Some(live_id!(settings_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
+        Kind::Message { .. } => Some(live_id!(message_tpl)),
+        Kind::Contact { .. } => Some(live_id!(contact_tpl)),
         _ => None,
     }
 }
@@ -3628,6 +3632,19 @@ impl Stage {
                     self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), fresh);
                 }
                 crate::panels::PanelAction::SelectMail { .. } => {}
+                crate::panels::PanelAction::FollowLink {
+                    pid,
+                    target,
+                    dotted,
+                    fresh,
+                } => {
+                    let act = if dotted {
+                        Act::Replace(pid, target)
+                    } else {
+                        Act::Open(pid, target)
+                    };
+                    self.resolve_click(cx, act, fresh);
+                }
                 crate::panels::PanelAction::RemoveAccount(id) => {
                     let Some(state) = self.state.as_deref_mut() else {
                         continue;
@@ -3699,9 +3716,13 @@ impl Stage {
             return;
         };
         for (pid, w) in &self.hosted {
+            let Some(kind) = state.ws.panel(*pid).map(|p| p.kind.clone()) else {
+                continue;
+            };
             let props = crate::panels::PanelProps {
                 store: state.store.clone(),
                 pid: *pid,
+                kind,
             };
             let mut scope = Scope::with_props(&props);
             w.handle_event(cx, event, &mut scope);
@@ -4879,6 +4900,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             pid,
+            kind: kind.clone().unwrap_or(Kind::About),
         };
         let mut scope = Scope::with_props(&props);
         cx.begin_turtle(
@@ -4972,6 +4994,55 @@ impl Stage {
                             }
                         }
                     }
+                }
+            }
+            Some(Kind::Message { id }) => {
+                let id = *id;
+                let m = mail::mail(&state.store, id);
+                let (newer, older) = mail::neighbours(&state.store, id);
+                let mut link = |path: &[LiveId], label: String, act: Act| {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label, r, act));
+                    }
+                };
+                if let Some(m) = &m {
+                    link(
+                        ids!(from_link),
+                        format!("{} <{}>", m.head.from_name, m.head.from_email),
+                        Act::Open(pid, Kind::Contact { email: m.head.from_email.clone() }),
+                    );
+                }
+                if let Some(n) = newer {
+                    link(
+                        ids!(newer_link),
+                        "newer".into(),
+                        Act::Replace(pid, Kind::Message { id: n }),
+                    );
+                }
+                if let Some(o) = older {
+                    link(
+                        ids!(older_link),
+                        "older".into(),
+                        Act::Replace(pid, Kind::Message { id: o }),
+                    );
+                }
+                link(
+                    ids!(reply_link),
+                    "reply".into(),
+                    Act::Open(pid, Kind::Compose { re: id }),
+                );
+            }
+            Some(Kind::Contact { email }) => {
+                let r = w.widget(cx, ids!(from_link)).area().rect(cx);
+                if r.size.x > 0.0 {
+                    let (name, _) = mail::contact(&state.store, email);
+                    let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
+                    reg.push((
+                        format!("messages from {first}"),
+                        r,
+                        Act::Open(pid, Kind::Inbox { filter: Some(email.clone()) }),
+                    ));
                 }
             }
             _ => {}
