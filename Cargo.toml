@@ -43,6 +43,16 @@ rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
+# One patch on the pin (local clone of the same rev + commit bdb23508,
+# branch superapp-pin): TextInput keeps the soft keyboard up when key
+# focus moves to another widget — upstream hides it unconditionally on
+# blur, which closes and reopens the keyboard on every mobile "next".
+# Worth offering upstream; until then this override carries it.
+[patch."https://github.com/makepad/makepad"]
+makepad-widgets = { path = "../makepad-superapp/widgets" }
+makepad-objc-sys = { path = "../makepad-superapp/libs/objc-sys" }
+makepad-apple-sys = { path = "../makepad-superapp/libs/apple_sys" }
+
 [profile.dev]
 opt-level = 1
 
