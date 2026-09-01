@@ -39,15 +39,16 @@ click "discard"
 wait 600
 shot k6-discarded
 
-# cmd+a archives the message panel and closes it. The inbox is what is left,
-# so its own accelerator (cmd+r, refresh) is what must resolve next.
+# cmd+a archives the message panel and closes it. The cursor was walking
+# with it, so the inbox carries on to the next mail and previews it (CR-005)
+# — focus lands back on the list.
 key cmd+a
 wait 700
 shot k7-archived
 
-# Back on the inbox: cmd+r is refresh here, not reply — accelerators are
-# panel-scoped. It toasts rather than navigating, so the inbox stays.
-key cmd+r
+# Back on the inbox: cmd+s is its own accelerator (sync). It toasts rather
+# than navigating, so the inbox stays put.
+key cmd+s
 wait 600
 click "Sat hike"
 wait 700

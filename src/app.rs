@@ -317,6 +317,9 @@ enum Act {
     Btn(PanelId, BtnAct),
     Open(PanelId, Kind),
     Replace(PanelId, Kind),
+    /// The inbox cursor landed on a mail: open it joined **without taking
+    /// focus** (CR-005). The list keeps the keyboard, so the walk carries on.
+    Preview(PanelId, core::MailId),
     /// Activate this panel's tab in its tabbed column.
     Tab(PanelId),
     /// A row of the workspaces overlay: switch to workspace `k`.
@@ -355,7 +358,11 @@ struct HitR {
     label: String,
 }
 
-/// The panel an act belongs to (overlay acts belong to none).
+/// The panel an act belongs to (overlay acts belong to none). A hosted
+/// widget's own hits — rows, fields, selectable runs — name their panel too:
+/// they sit *above* the panel-wide `Focus` hit, so a finger that lands on a
+/// row would otherwise resolve to no panel at all and the gesture would die
+/// before it could scroll (see [`Stage::touch_move`]).
 fn act_pid(act: &Act) -> Option<PanelId> {
     match act {
         Act::Focus(pid)
@@ -363,8 +370,11 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Btn(pid, _)
         | Act::Open(pid, _)
         | Act::Replace(pid, _)
-        | Act::Tab(pid) => Some(*pid),
-        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) => None,
+        | Act::Tab(pid)
+        | Act::Preview(pid, _)
+        | Act::Pointer(pid)
+        | Act::WidgetOp(pid, _) => Some(*pid),
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => None,
     }
 }
 
@@ -430,6 +440,12 @@ impl CmdTap {
 // Touch navigation
 // ---------------------------------------------------------------------------
 
+/// The action kind a reading walk records — a preview, or the newer/older
+/// step that does the same thing from inside a message. Named because two
+/// rules key off it: these coalesce per panel into one undo node, and they
+/// are the one kind that does **not** wake the sync workers ([`State::act`]).
+const READ: &str = "read";
+
 /// How far a finger may wander and still be a tap, in points.
 const TOUCH_SLOP: f64 = 8.0;
 
@@ -453,8 +469,13 @@ enum TouchMode {
     /// A long-pressed header: the panel rides the finger; the drop point
     /// picks its new place ([`Ws::place_at`]).
     Drag { uid: u64, pid: PanelId, offset: DVec2 },
-    /// A gesture that came to nothing (sideways one-finger move, a lifted
-    /// pan finger): inert until every finger lifts.
+    /// A sideways finger on a list row: triage. Left archives, right deletes
+    /// — the curtain and its physics live in [`RowSwipe`] on the stage, since
+    /// a committed swipe keeps animating after the finger is gone.
+    RowSwipe { uid: u64 },
+    /// A gesture that came to nothing (a sideways one-finger move with
+    /// nothing to triage, a lifted pan finger): inert until every finger
+    /// lifts.
     Dead,
 }
 
@@ -464,6 +485,43 @@ struct TouchNav {
     /// uid → (start, latest) positions.
     pts: HashMap<u64, (DVec2, DVec2)>,
     mode: TouchMode,
+}
+
+/// How far across a row the curtain must be drawn for a lift to commit.
+const SWIPE_COMMIT: f64 = 0.35;
+
+/// A swiped inbox row and the curtain wiping across it (CR-005). The row
+/// itself never moves: an ink panel carrying the action's name is drawn in
+/// from the edge the finger travels away from, which is also the edge that
+/// action's button sits on in a message header. Past [`SWIPE_COMMIT`] the
+/// curtain inverts — the same "this will fire" inversion a hovered header
+/// button uses, and the same reason it needs no colour.
+///
+/// It lives on the [`Stage`] rather than in [`TouchMode`] because a committed
+/// swipe outlives its finger: the curtain finishes covering the row, and only
+/// then does the mail leave the inbox.
+#[derive(Debug)]
+struct RowSwipe {
+    /// The inbox the row belongs to.
+    pid: PanelId,
+    /// The mail under the finger.
+    id: core::MailId,
+    /// The row's rect as last drawn — kept so the curtain still has somewhere
+    /// to be after the mail leaves the query.
+    slot: Rect,
+    /// How far the curtain is drawn, signed: negative wipes in from the right
+    /// (archive), positive from the left (delete).
+    x: Spring,
+    /// Set on a committing lift: `true` deletes, `false` archives. The action
+    /// fires when the spring lands.
+    commit: Option<bool>,
+}
+
+impl RowSwipe {
+    /// Whether the curtain is far enough across to fire on lift.
+    fn armed(&self) -> bool {
+        self.slot.size.x > 0.0 && self.x.value().abs() >= self.slot.size.x * SWIPE_COMMIT
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +764,12 @@ struct State {
     toast: Option<(String, bool, f64)>,
     overlay: Overlay,
     launcher: LauncherUi,
+    /// A panel to reveal alongside focus on the next [`State::sync`], once.
+    /// A preview opens without taking focus, so nothing else would pull the
+    /// camera onto it — and this must stay one-shot: `sync` runs on every
+    /// viewport change and worker poll, and a standing rule here would fight
+    /// the user's own pans.
+    show_also: Option<PanelId>,
 }
 
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
@@ -795,6 +859,7 @@ impl State {
             toast: None,
             overlay: Overlay::None,
             launcher: LauncherUi::default(),
+            show_also: None,
         }
     }
 
@@ -816,6 +881,12 @@ impl State {
         self.ws.set_grid(grid_for(self.viewport));
         let vp = self.vp();
         let opts = self.opts();
+        // A preview asked to be seen: reveal it first, then focus, so focus
+        // still wins when both cannot fit (a phone grid, where each of them
+        // is the whole screen).
+        if let Some(pid) = self.show_also.take() {
+            self.ws.ensure_visible(pid, vp, opts);
+        }
         self.ws.ensure_focus_visible(vp, opts);
 
         // Every workspace computes its scene: the animator needs the union
@@ -991,6 +1062,21 @@ impl CellFont {
         }
         chars as f64 * self.label_step() - self.label_adv() * theme::LABEL_TRACK
     }
+    /// How much of a header the chrome buttons eat: the close box plus every
+    /// side-effect button the kind declares, gaps included. The title
+    /// truncates against this rather than against a guessed constant — a
+    /// message carrying both archive and delete needs half again what one
+    /// button did.
+    fn head_btns_w(&self, kind: &Kind) -> f64 {
+        // Mirrors the walk in `draw_panel_full`: the close box, then each
+        // button as its label plus padding, each preceded by a gap.
+        theme::BTN_H
+            + 4.0
+            + ui::head_btns(kind)
+                .iter()
+                .map(|(label, _)| self.label_w(label.chars().count()) + 12.0 + 4.0)
+                .sum::<f64>()
+    }
     /// Natural line height at label size, for vertical centering.
     fn label_line(&self) -> f64 {
         self.natural * (theme::LABEL_SIZE / theme::FONT_SIZE)
@@ -1045,6 +1131,10 @@ pub struct Stage {
     kb_h: f64,
     #[rust]
     touch: TouchNav,
+    /// A row mid-swipe, and the curtain over it (CR-005). Outlives the finger:
+    /// a committed swipe keeps animating until the curtain has covered the row.
+    #[rust]
+    row_swipe: Option<RowSwipe>,
     /// The drop-preview insertion bar while a panel is dragged, strip coords.
     #[rust]
     drag_hint: Option<core::Rect>,
@@ -1413,20 +1503,24 @@ impl Stage {
                 }
                 e2e::Step::Click { label, fresh } => {
                     let needle = label.to_lowercase();
-                    let hit = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| {
-                            !matches!(h.act, Act::Focus(_))
-                                && h.label.to_lowercase().contains(&needle)
-                        })
-                        .or_else(|| {
-                            self.hits
-                                .iter()
-                                .rev()
-                                .find(|h| h.label.to_lowercase().contains(&needle))
-                        })
+                    // Whole-label matches win over substrings. Without that,
+                    // `click "archive"` can land on a mail *subject* — the
+                    // seed has sixty "archive digest #NN" rows — and which
+                    // one it finds depends on draw order, so the script
+                    // silently tests something else. An exact name is an
+                    // exact target.
+                    let exact = |h: &&HitR| h.label.eq_ignore_ascii_case(&label);
+                    let loose = |h: &&HitR| h.label.to_lowercase().contains(&needle);
+                    let named = |h: &&HitR| !matches!(h.act, Act::Focus(_));
+                    let pick = |f: &dyn Fn(&&HitR) -> bool| {
+                        self.hits
+                            .iter()
+                            .rev()
+                            .find(|h| named(h) && f(h))
+                            .or_else(|| self.hits.iter().rev().find(f))
+                    };
+                    let hit = pick(&exact)
+                        .or_else(|| pick(&loose))
                         .map(|h| (h.act.clone(), h.rect));
                     match hit {
                         Some((act, r)) => {
@@ -1501,7 +1595,7 @@ impl Stage {
                         }
                     }
                 }
-                e2e::Step::Swipe { label, dx, dy } => {
+                e2e::Step::Swipe { label, dx, dy, hold } => {
                     let needle = label.to_lowercase();
                     let c = self
                         .hits
@@ -1517,7 +1611,12 @@ impl Stage {
                                 let f = f64::from(i) / 8.0;
                                 self.touch_move(cx, 1, dvec2(c.x + dx * f, c.y + dy * f));
                             }
-                            self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                            // A whole swipe runs inside one tick, so nothing
+                            // is ever drawn mid-gesture: `hold` leaves the
+                            // finger down long enough to photograph it.
+                            if !hold {
+                                self.touch_stop(cx, 1, dvec2(c.x + dx, c.y + dy));
+                            }
                         }
                         None => {
                             eprintln!("e2e: FAIL swipe {label:?}: no matching element");
@@ -1545,7 +1644,11 @@ impl Stage {
                     self.touch_stop(cx, 2, dvec2(b.x + dx, b.y + dy));
                 }
                 e2e::Step::Drop => {
-                    if let TouchMode::Drag { uid, .. } = self.touch.mode {
+                    let held = match self.touch.mode {
+                        TouchMode::Drag { uid, .. } | TouchMode::RowSwipe { uid } => Some(uid),
+                        _ => None,
+                    };
+                    if let Some(uid) = held {
                         let p = self
                             .touch
                             .pts
@@ -1555,7 +1658,7 @@ impl Stage {
                         eprintln!("e2e: drop");
                         self.touch_stop(cx, uid, p);
                     } else {
-                        eprintln!("e2e: FAIL drop: nothing is being dragged");
+                        eprintln!("e2e: FAIL drop: no gesture is being held");
                         runner.failures += 1;
                     }
                 }
@@ -1808,6 +1911,32 @@ impl Stage {
                 self.resolve_click(cx, Act::Btn(f, act), false);
                 return;
             }
+            // Nothing on this panel wanted it. A panel that drives a preview
+            // now **borrows** its preview's keys (CR-005): the pair reads as
+            // one thing, so archive, delete and reply work from the list
+            // without first walking focus into the mail. The borrowed mark is
+            // never drawn here — it stays on the message's own chrome, one
+            // column over and in plain sight.
+            if let Some(child) = self.lender(cx) {
+                let kind = self
+                    .state
+                    .as_deref()
+                    .and_then(|s| s.ws.panel(child).map(|p| p.kind.clone()));
+                let lent = kind.zip(key_char(k.key_code)).and_then(|(kind, c)| {
+                    ui::head_btns(&kind)
+                        .iter()
+                        .find(|(_, a)| ui::btn_accel(*a) == Some(c))
+                        .map(|(_, a)| *a)
+                });
+                if let Some(act) = lent {
+                    self.resolve_click(cx, Act::Btn(child, act), false);
+                    return;
+                }
+                // Its *links* answer inside the widget, so the chord has to
+                // reach it. Only chords: the message scrolls its body on bare
+                // arrows, which are the cursor walk out here.
+                self.forward_to_panel(cx, child, &Event::KeyDown(k.clone()));
+            }
             // An unclaimed chord — cmd+enter included, which the inbox reads
             // as "open un-joined" — falls through to the panel below.
         }
@@ -1818,6 +1947,32 @@ impl Stage {
             self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
             self.kick(cx);
         }
+    }
+
+    /// The panel the focused one may borrow accelerators from: its live
+    /// preview child, if it drives one.
+    ///
+    /// The fifth letter rule's guard lives here — a borrowed chord stands
+    /// down while the driver's own text field holds the keyboard, so `cmd+a`
+    /// stays select-all in a live filter rather than silently archiving. The
+    /// widget is asked directly: focus parks on `Area::Empty` after `esc` and
+    /// on the stage's own area otherwise, and comparing against both here
+    /// would re-encode two rules that already live elsewhere.
+    fn lender(&mut self, cx: &mut Cx) -> Option<PanelId> {
+        let state = self.state.as_deref()?;
+        let f = state.ws.focus?;
+        let kind = state.ws.panel(f).map(|p| p.kind.clone())?;
+        ui::preview_kind(&kind)?;
+        let child = state.ws.joined_child(f)?;
+        if !state.ws.panels.contains_key(&child) {
+            return None;
+        }
+        let editing = self
+            .hosted
+            .get(&f)
+            .cloned()
+            .is_some_and(|w| w.as_inbox_panel().filter_focused(cx));
+        (!editing).then_some(child)
     }
 
     /// Only the launcher trigger cares about key releases: a clean second
@@ -2208,11 +2363,19 @@ impl Stage {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
                     WidgetOp::OpenMail(id) => {
-                        // The cursor follows what you opened, so the wash
-                        // marks the mail on screen and j/k carries on from
-                        // there (panel-internal: the inbox widget listens).
+                        // The cursor follows what you clicked, so the wash
+                        // marks the mail on screen and the arrows carry on
+                        // from there (panel-internal: the inbox listens).
                         cx.action(crate::panels::PanelAction::SelectMail { pid, id });
-                        self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), alt);
+                        // Clicking a row is the same move as walking onto it:
+                        // it previews, and the list keeps the keyboard.
+                        // `enter` is what *goes*. Cmd+click still means what
+                        // it means everywhere — a fresh, un-joined panel.
+                        if alt {
+                            self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), true);
+                        } else {
+                            self.resolve_click(cx, Act::Preview(pid, id), false);
+                        }
                     }
                 }
                 return;
@@ -2256,7 +2419,7 @@ impl Stage {
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
                 let (akind, entity, label) = match mid {
                     Some(_) => (
-                        "read",
+                        READ,
                         Some(format!("panel:{pid}")),
                         format!("read “{}”", state.panel_title(&kind)),
                     ),
@@ -2276,6 +2439,48 @@ impl Stage {
                 );
                 self.sync(cx);
             }
+            Act::Preview(pid, id) => {
+                // The cursor walk's own open (CR-005). Same door as a solid
+                // link — join semantics, mark read, undoable — minus the one
+                // thing that would end the walk: it never takes focus. So it
+                // is a "read", coalescing per driver panel exactly like the
+                // newer/older walk does.
+                let kind = Kind::Message { id };
+                let label = format!("read “{}”", state.panel_title(&kind));
+                let (vp, opts) = (state.vp(), state.opts());
+                state.act(
+                    READ,
+                    label,
+                    Some(format!("panel:{pid}")),
+                    move |ws| {
+                        // Whoever holds focus keeps it — the driver normally,
+                        // but not necessarily: this must leave focus exactly
+                        // as it found it, or a walk that ends in cmd+→ would
+                        // be snapped back to the list.
+                        let held = ws.focus;
+                        let child = ws.follow_open(pid, kind, false);
+                        // follow_open focused the child; the child still has
+                        // to be its column's shown tab either way, which
+                        // normalize only does for the focused panel.
+                        ws.activate(child);
+                        // The exception: where the pair cannot share the
+                        // screen — a phone grid, each panel the whole of it —
+                        // a preview nobody can see would read as nothing
+                        // having happened, so there the open simply goes.
+                        if ws.fit_together(pid, child, vp, opts) {
+                            ws.focus = held;
+                        }
+                    },
+                    move |tx| mail::mark_read_tx(tx, id),
+                    // Same claim on the world an ordinary open makes: the
+                    // mail is read now, and undo un-reads it.
+                    vec![Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>],
+                );
+                // The preview opened off to the right of a driver that never
+                // moved, so nothing has pulled the camera onto it.
+                state.show_also = state.ws.joined_child(pid);
+                self.sync(cx);
+            }
             Act::Tab(pid) => {
                 state.ws.focus = Some(pid);
                 self.sync(cx);
@@ -2293,36 +2498,16 @@ impl Stage {
                             state.toast("syncing…", false);
                         }
                     }
-                    BtnAct::Archive => {
+                    BtnAct::Archive | BtnAct::Delete => {
+                        // The button acts on the mail its panel is showing;
+                        // triage then closes every reader of it, this one
+                        // included.
                         if let Some(Kind::Message { id }) =
                             state.ws.panels.get(&pid).map(|p| p.kind.clone())
                         {
-                            let subject = mail::mail(&state.store, id)
-                                .map(|m| m.head.subject)
-                                .unwrap_or_default();
-                            // Where it lives now, so undo puts it back exactly
-                            // there rather than guessing "the inbox".
-                            let from_folder: i64 = state
-                                .store
-                                .conn()
-                                .query_row(
-                                    "SELECT folder FROM message WHERE id = ?1",
-                                    [id],
-                                    |r| r.get(0),
-                                )
-                                .unwrap_or(0);
-                            state.act(
-                                "archive",
-                                format!("archive “{subject}”"),
-                                None,
-                                move |ws| {
-                                    ws.close(pid);
-                                },
-                                move |tx| mail::archive_tx(tx, id),
-                                vec![Box::new(mail::Archived { mail: id, from_folder }) as Box<dyn crate::history::Intent>],
-                            );
-                            state.toast(format!("archived “{subject}” — ⌘z undoes"), false);
+                            self.triage(cx, id, b == BtnAct::Delete);
                         }
+                        return;
                     }
                     BtnAct::Send => {
                         let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
@@ -2394,6 +2579,120 @@ impl Stage {
         }
     }
 
+    /// Files one mail out of the inbox — archive or delete — from wherever
+    /// the intent came: a message panel's header button, the chord an inbox
+    /// borrowed from its preview, or an android row swipe. One door, so the
+    /// undo node, the toast and the closing of the mail's readers are the
+    /// same story every time.
+    fn triage(&mut self, cx: &mut Cx, id: core::MailId, delete: bool) {
+        // Decided first, while the row is still in the list to have one.
+        let next = self.successor_of(cx, id);
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let (verb, done, role) = if delete {
+            ("delete", "deleted", "trash")
+        } else {
+            ("archive", "archived", "archive")
+        };
+        // Ask before acting: without the folder the move is a no-op, and an
+        // action that changes nothing records no node — so the user would
+        // get silence rather than an answer.
+        if !mail::can_file(&state.store, id, role) {
+            state.toast(format!("this account has no {role} folder"), true);
+            self.kick(cx);
+            return;
+        }
+        let subject = mail::mail(&state.store, id)
+            .map(|m| m.head.subject)
+            .unwrap_or_default();
+        // Where it lives now, so undo puts it back exactly there rather than
+        // guessing "the inbox".
+        let from_folder: i64 = state
+            .store
+            .conn()
+            .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap_or(0);
+        let readers = state.ws.showing(&Kind::Message { id });
+        state.act(
+            verb,
+            format!("{verb} “{subject}”"),
+            None,
+            move |ws| {
+                // The mail left the inbox, so its readers have nothing left
+                // to read — on whichever workspace they were opened.
+                for r in readers {
+                    ws.close_anywhere(r);
+                }
+                // The walk survives triaging the row it stood on: the cursor
+                // moves up one and its preview opens in the same breath. Same
+                // action, so one ⌘z takes the whole thing back.
+                if let Some((pid, nid)) = next {
+                    let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
+                    ws.activate(child);
+                    ws.focus = Some(pid);
+                }
+            },
+            move |tx| {
+                if delete {
+                    mail::delete_tx(tx, id)?;
+                } else {
+                    mail::archive_tx(tx, id)?;
+                }
+                next.map_or(Ok(()), |(_, nid)| mail::mark_read_tx(tx, nid))
+            },
+            // Both halves of the action claim something back: the filing, and
+            // the read of whatever the cursor moved onto. One node, so one
+            // ⌘z reverses the pair in step.
+            next.into_iter()
+                .map(|(_, nid)| Box::new(mail::MarkRead { mail: nid }) as Box<dyn crate::history::Intent>)
+                .chain(std::iter::once(Box::new(mail::Filed {
+                    mail: id,
+                    from_folder,
+                    role,
+                }) as Box<dyn crate::history::Intent>))
+                .collect(),
+        );
+        state.toast(format!("{done} “{subject}” — ⌘z undoes"), false);
+        if let Some((pid, nid)) = next {
+            state.show_also = state.ws.joined_child(pid);
+            cx.action(crate::panels::PanelAction::SelectMail { pid, id: nid });
+        }
+        self.sync(cx);
+    }
+
+    /// Where an inbox cursor standing on `id` should land once it is filed
+    /// away: the next row down, or the one above if it was the last. `None`
+    /// when no inbox is pointing at this mail — a header button pressed on a
+    /// message nobody is walking towards moves no cursor.
+    fn successor_of(&mut self, cx: &mut Cx, id: core::MailId) -> Option<(PanelId, core::MailId)> {
+        let inboxes: Vec<PanelId> = self
+            .state
+            .as_deref()?
+            .ws
+            .panels
+            .iter()
+            .filter(|(_, p)| matches!(p.kind, Kind::Inbox { .. }))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let pid = inboxes.into_iter().find(|pid| {
+            self.hosted
+                .get(pid)
+                .and_then(|w| w.as_inbox_panel().selected())
+                == Some(id)
+        })?;
+        // The rows as that panel has them — its own filter included, exactly
+        // the way `draw_hosted` reads them back for hit registration.
+        let w = self.hosted.get(&pid)?.clone();
+        let filter = w.widget(cx, ids!(filter_input)).as_text_input().text();
+        let store = self.state.as_deref()?.store.clone();
+        let rows = mail::inbox_filtered(&store, &filter);
+        let i = rows.iter().position(|m| m.id == id)?;
+        rows.get(i + 1)
+            .or_else(|| i.checked_sub(1).and_then(|j| rows.get(j)))
+            .map(|m| (pid, m.id))
+    }
+
     // -- touch ---------------------------------------------------------------
 
     fn touch_update(&mut self, cx: &mut Cx, e: &TouchUpdateEvent) {
@@ -2410,8 +2709,10 @@ impl Stage {
     fn touch_start(&mut self, uid: u64, p: DVec2) {
         self.touch.pts.insert(uid, (p, p));
         match self.touch.mode {
-            // A drag keeps the panel no matter what other fingers do.
-            TouchMode::Drag { .. } => {}
+            // A drag keeps the panel no matter what other fingers do, and a
+            // row keeps its curtain: a second finger must not strand one
+            // half-drawn with nothing left to settle it.
+            TouchMode::Drag { .. } | TouchMode::RowSwipe { .. } => {}
             _ if self.touch.pts.len() >= 2 => {
                 self.touch.mode = TouchMode::Pan { horizontal: None }
             }
@@ -2438,12 +2739,36 @@ impl Stage {
                 if t.x.abs() < TOUCH_SLOP && t.y.abs() < TOUCH_SLOP {
                     return;
                 }
-                // Vertical wins the panel's scroll; sideways one-finger
-                // movement means nothing (the workspace pans on two).
-                self.touch.mode = match act.as_ref().and_then(act_pid) {
-                    Some(pid) if t.y.abs() >= t.x.abs() => TouchMode::Scroll { uid, pid },
+                // Sideways on a mail row is triage (CR-005); sideways
+                // anywhere else still means nothing (the workspace pans on
+                // two fingers). Vertical is the panel's scroll, and keeps
+                // ties — a diagonal is a scroll, never a half-swipe.
+                let row = match act {
+                    Some(Act::WidgetOp(pid, WidgetOp::OpenMail(id))) => Some((*pid, *id)),
+                    _ => None,
+                };
+                self.touch.mode = match (row, act.as_ref().and_then(act_pid)) {
+                    (Some((pid, id)), _) if t.x.abs() > t.y.abs() => {
+                        self.row_swipe = Some(RowSwipe {
+                            pid,
+                            id,
+                            slot: self.row_rect(pid, id).unwrap_or_default(),
+                            x: Spring::at_rest(0.0, SpringParams::movement()),
+                            commit: None,
+                        });
+                        TouchMode::RowSwipe { uid }
+                    }
+                    (_, Some(pid)) if t.y.abs() >= t.x.abs() => TouchMode::Scroll { uid, pid },
                     _ => TouchMode::Dead,
                 };
+            }
+            TouchMode::RowSwipe { uid: u } if *u == uid => {
+                // The curtain tracks the finger 1:1 — no spring while it is
+                // down, or the ink would lag the thumb.
+                if let Some(rs) = self.row_swipe.as_mut() {
+                    rs.x.jump_to(p.x - start.x);
+                }
+                self.kick(cx);
             }
             TouchMode::Scroll { uid: u, pid: _ } if *u == uid => {
                 // Retained content scrolls itself: the drag becomes a
@@ -2549,6 +2874,22 @@ impl Stage {
             TouchMode::Scroll { uid: u, .. } if u == uid => {
                 self.touch.mode = TouchMode::Idle;
             }
+            TouchMode::RowSwipe { uid: u } if u == uid => {
+                self.touch.mode = TouchMode::Idle;
+                if let Some(rs) = self.row_swipe.as_mut() {
+                    if rs.armed() {
+                        // Committed: the curtain runs on to cover the row,
+                        // and the mail is filed when it lands — so the row is
+                        // gone from view before it is gone from the inbox.
+                        let w = rs.slot.size.x;
+                        rs.commit = Some(rs.x.value() > 0.0);
+                        rs.x.retarget(if rs.x.value() > 0.0 { w } else { -w });
+                    } else {
+                        rs.x.retarget(0.0);
+                    }
+                }
+                self.kick(cx);
+            }
             TouchMode::Drag { uid: u, pid, .. } if u == uid => {
                 self.touch.mode = TouchMode::Idle;
                 self.drag_hint = None;
@@ -2594,6 +2935,38 @@ impl Stage {
         if self.touch.pts.is_empty() {
             self.touch.mode = TouchMode::Idle;
         }
+    }
+
+    /// Runs a settled curtain: a committed one files its mail, a cancelled
+    /// one just clears. Called once the spring has landed, so the row is
+    /// covered before it leaves the inbox rather than blinking out from
+    /// under the finger.
+    fn settle_row_swipe(&mut self, cx: &mut Cx) {
+        let done = self
+            .row_swipe
+            .as_ref()
+            .is_some_and(|rs| rs.x.is_done() && !matches!(self.touch.mode, TouchMode::RowSwipe { .. }));
+        if !done {
+            return;
+        }
+        let Some(rs) = self.row_swipe.take() else {
+            return;
+        };
+        if let Some(delete) = rs.commit {
+            self.triage(cx, rs.id, delete);
+        } else {
+            self.kick(cx);
+        }
+    }
+
+    /// The rect an inbox row was last drawn at, from the hits registered for
+    /// that draw. The curtain needs somewhere to be, and this is the same
+    /// geometry a tap on the row would resolve against.
+    fn row_rect(&self, pid: PanelId, id: core::MailId) -> Option<Rect> {
+        self.hits
+            .iter()
+            .find(|h| h.act == Act::WidgetOp(pid, WidgetOp::OpenMail(id)))
+            .map(|h| h.rect)
     }
 
     /// The platform's long-press (android's GestureDetector; e2e on desktop):
@@ -2819,6 +3192,17 @@ impl Stage {
                 crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
                     self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), fresh);
                 }
+                crate::panels::PanelAction::PreviewMail { pid, id } => {
+                    // Straight through, no pacing. A preview costs ~0.2 ms —
+                    // one small transaction over a handful of UI rows, on a
+                    // WAL store with `synchronous=NORMAL`, coalescing into the
+                    // head node rather than appending — so even a held arrow
+                    // spends well under a frame on them. Anything that queued
+                    // them would only put a delay between the cursor and what
+                    // it is pointing at, and could land a stale focus restore
+                    // on top of a cmd+arrow the user has since pressed.
+                    self.resolve_click(cx, Act::Preview(pid, id), false);
+                }
                 crate::panels::PanelAction::SelectMail { .. } => {}
                 crate::panels::PanelAction::FollowLink {
                     pid,
@@ -2826,6 +3210,19 @@ impl Stage {
                     dotted,
                     fresh,
                 } => {
+                    // A dotted walk inside a preview re-aims the pair: the
+                    // driver's cursor follows, so master and detail never
+                    // disagree about which mail is open — whoever moved it.
+                    if let (true, false, Kind::Message { id }) = (dotted, fresh, &target) {
+                        let driver = self.state.as_deref().and_then(|s| {
+                            let p = s.ws.join_parent_of(pid)?;
+                            let k = s.ws.panel(p).map(|q| q.kind.clone())?;
+                            ui::preview_kind(&k).map(|_| p)
+                        });
+                        if let Some(p) = driver {
+                            cx.action(crate::panels::PanelAction::SelectMail { pid: p, id: *id });
+                        }
+                    }
                     let act = if dotted {
                         Act::Replace(pid, target)
                     } else {
@@ -3001,21 +3398,28 @@ impl Stage {
     /// events are positional, but the keyboard belongs to one panel, and
     /// a "j" typed into compose must not walk some other inbox.
     fn forward_to_focused(&mut self, cx: &mut Cx, event: &Event) {
+        let Some(f) = self.state.as_deref().and_then(|s| s.ws.focus) else {
+            return;
+        };
+        self.forward_to_panel(cx, f, event);
+    }
+
+    /// As [`Stage::forward_to_focused`], to a named panel: a borrowed chord
+    /// has to reach the preview that owns it, and that panel needs *its own*
+    /// props on the scope to know which mail it is looking at.
+    fn forward_to_panel(&mut self, cx: &mut Cx, pid: PanelId, event: &Event) {
         let Some(state) = self.state.as_deref() else {
             return;
         };
-        let Some(f) = state.ws.focus else {
+        let Some(w) = self.hosted.get(&pid) else {
             return;
         };
-        let Some(w) = self.hosted.get(&f) else {
-            return;
-        };
-        let Some(kind) = state.ws.panel(f).map(|p| p.kind.clone()) else {
+        let Some(kind) = state.ws.panel(pid).map(|p| p.kind.clone()) else {
             return;
         };
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
-            pid: f,
+            pid,
             kind,
         };
         let mut scope = Scope::with_props(&props);
@@ -3409,10 +3813,25 @@ impl Widget for Stage {
                     None => false,
                 };
                 state.animating = springs_active;
-                if springs_active || toast_active || dragging {
+                // The curtain's spring lives outside `Anim`, so it has to ask
+                // for its own frames or it would freeze after one.
+                let swiping = match self.touch.mode {
+                    TouchMode::RowSwipe { .. } => true,
+                    _ => match self.row_swipe.as_mut() {
+                        Some(rs) => {
+                            rs.x.advance(dt);
+                            !rs.x.is_done()
+                        }
+                        None => false,
+                    },
+                };
+                if springs_active || toast_active || dragging || swiping {
                     self.next_frame = cx.new_next_frame();
                 }
                 cx.redraw_all();
+                // Mutates the world, so it runs after the frame's own
+                // bookkeeping rather than in the middle of it.
+                self.settle_row_swipe(cx);
             }
 
             _ => {}
@@ -3567,7 +3986,8 @@ impl Stage {
                 continue;
             }
             let a = g.alpha.value();
-            self.draw_chrome(cx, r, &g.title, false, a, None, None);
+            // A ghost has no kind left to ask, and no buttons to clear.
+            self.draw_chrome(cx, r, &g.title, false, a, None, None, 0.0);
         }
 
         // Panels in column order per workspace; the active workspace's
@@ -3889,6 +4309,9 @@ impl Stage {
         alpha: f64,
         close: Option<PanelId>,
         hover: Option<&Act>,
+        // Width the header buttons will occupy on the right — the title
+        // truncates to clear them. Ghosts carry no kind, so they pass 0.
+        btns_w: f64,
     ) {
         self.draw_panel.color = rgba_a(theme::BG, alpha);
         self.draw_panel.border_color = rgba_a(theme::INK, alpha);
@@ -3908,7 +4331,7 @@ impl Stage {
 
         // Title: tracked uppercase, vertically centred, truncated to leave
         // room for the header buttons.
-        let title_cols = (((r.size.x - 16.0 - 110.0) / self.cell.label_step()).max(4.0)) as usize;
+        let title_cols = (((r.size.x - 16.0 - btns_w) / self.cell.label_step()).max(4.0)) as usize;
         let t = trunc(title, title_cols);
         let ty = r.pos.y + (theme::HEAD_H - self.cell.label_line()) / 2.0;
         let color = if focused { theme::BG } else { theme::INK };
@@ -4226,6 +4649,11 @@ impl Stage {
             },
         );
         w.draw_all(cx, &mut scope);
+        // Inside the panel's own clipped turtle, so a curtain over a row at
+        // the edge of the list is cut off with everything else.
+        if matches!(kind, Some(Kind::Inbox { .. })) {
+            self.draw_row_swipe(cx, &w, pid);
+        }
         cx.end_turtle();
 
         // The e2e bridge: known interactive children become labelled hits;
@@ -4330,11 +4758,23 @@ impl Stage {
                     .as_text_input()
                     .text();
                 let rows = mail::inbox_filtered(&state.store, &filter);
+                let swiping = self.row_swipe.as_ref().filter(|rs| rs.pid == pid).map(|rs| rs.id);
                 if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
                     for (idx, item) in list.items().iter() {
                         let r = item.widget.area().rect(cx);
                         if r.size.x > 0.0 {
                             if let Some(m) = rows.get(*idx) {
+                                // A row with a curtain over it answers to
+                                // nothing: it is on its way out, and a tap
+                                // landing on it would open the mail being
+                                // filed. Its rect still counts — that is
+                                // where the curtain is drawn.
+                                if swiping == Some(m.id) {
+                                    if let Some(rs) = self.row_swipe.as_mut() {
+                                        rs.slot = r;
+                                    }
+                                    continue;
+                                }
                                 reg.push((
                                     m.subject.clone(),
                                     r,
@@ -4430,6 +4870,81 @@ impl Stage {
         }
     }
 
+    /// The swipe curtain (CR-005): an ink panel wiping across the row under
+    /// the finger, carrying the name of what a lift would do.
+    ///
+    /// It enters from the edge the finger travels *away* from, which is the
+    /// edge that action's button occupies in a message header — swipe left
+    /// and `archive` comes in from the right, exactly where the header draws
+    /// it. Below the commit threshold it is a grey wash with ink lettering;
+    /// past it the whole thing inverts, the same way a header button inverts
+    /// under the pointer. No colour, and nothing to read but the word.
+    fn draw_row_swipe(&mut self, cx: &mut Cx2d, w: &WidgetRef, pid: PanelId) {
+        let Some(rs) = self.row_swipe.as_ref().filter(|rs| rs.pid == pid) else {
+            return;
+        };
+        let (dx, armed, slot) = (rs.x.value(), rs.armed(), rs.slot);
+        if slot.size.x <= 0.0 || dx.abs() < 0.5 {
+            return;
+        }
+        // Clip to the list: a row scrolled half under the pinned header has a
+        // rect that reaches above it, and the curtain must not.
+        let list = w.widget(cx, ids!(list)).area().rect(cx);
+        let (top, bot) = (
+            slot.pos.y.max(list.pos.y),
+            (slot.pos.y + slot.size.y).min(list.pos.y + list.size.y),
+        );
+        if bot <= top {
+            return;
+        }
+        let width = dx.abs().min(slot.size.x);
+        // Negative dx means the finger went left: archive, entering right.
+        let (x, label) = if dx < 0.0 {
+            (slot.pos.x + slot.size.x - width, "archive")
+        } else {
+            (slot.pos.x, "delete")
+        };
+        let (bg, fg) = if armed {
+            (theme::INK, theme::BG)
+        } else {
+            (theme::SEL, theme::INK)
+        };
+        // A distinct draw call, or these quads merge into the chrome's and
+        // paint under the panel they belong to (see `panels.rs`' portal-item
+        // note — the same shader-merge trap).
+        self.draw_flat.new_draw_call(cx);
+        self.draw_flat.color = rgba_a(bg, 1.0);
+        self.draw_flat.draw_abs(cx, rect(x, top, width, bot - top));
+        // The leading edge, as a hairline. Without it a curtain that has not
+        // armed yet is the *same* grey as the selection wash, so swiping the
+        // row the cursor is standing on would show nothing at all until it
+        // inverted. An ink edge being pulled across reads on any backing.
+        if !armed {
+            let ex = if dx < 0.0 { x } else { x + width - 1.0 };
+            self.draw_flat.color = rgba_a(theme::INK, 1.0);
+            self.draw_flat.draw_abs(cx, rect(ex, top, 1.0, bot - top));
+        }
+        // The word is pinned to the entering edge, so it holds still while
+        // the curtain grows past it — and stands down until there is room:
+        // half a word reads as a glitch, not as a hint.
+        //
+        // Measured by the step `draw_label` actually walks, not by
+        // `label_w`, which trims the trailing tracking: aligning to a width
+        // the drawing does not use pushes the run off its own edge.
+        const SWIPE_PAD: f64 = 10.0;
+        let tw = self.cell.label_step() * label.chars().count() as f64;
+        if width >= tw + 2.0 * SWIPE_PAD {
+            let tx = if dx < 0.0 {
+                x + width - tw - SWIPE_PAD
+            } else {
+                x + SWIPE_PAD
+            };
+            let ty = slot.pos.y + (slot.size.y - self.cell.label_line()) / 2.0;
+            self.draw_mono.new_draw_call(cx);
+            self.draw_label(cx, tx, ty, label, fg, 1.0);
+        }
+    }
+
     fn draw_panel_full(&mut self, cx: &mut Cx2d, state: &mut State, pid: PanelId, r: Rect, alpha: f64) {
         // Cross-workspace lookup: inactive spaces draw during the slide.
         let Some(panel) = state.ws.panel(pid) else {
@@ -4451,7 +4966,8 @@ impl Stage {
         });
 
         let hover = state.hover.clone();
-        self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref());
+        let btns_w = self.cell.head_btns_w(&kind);
+        self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref(), btns_w);
 
         // Extra header actions, right to left from the close button —
         // side effects live in the chrome, never floating in content.

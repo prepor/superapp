@@ -108,6 +108,15 @@ A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.
 
+What "perform outside any transaction" is worth, measured: a UI action costs
+0.10 ms uncontended and **468 ms** behind a 400 ms fetch that holds
+`BEGIN IMMEDIATE` across the wire. SQLite has one writer and the UI shares
+the file, so a pass that keeps a transaction open over a round-trip stalls
+everything behind it for as long as the server takes — and it reads as the
+app hanging, not as sync being slow. The rule above is what keeps a reading
+walk down the inbox, which writes on every keystroke, from queueing behind
+the network.
+
 **Sending** is the outbox pattern with the undo window built in. A compose
 panel's draft persists in the store *as you type* (plain upkeep — typing is
 the future editor's local undo, not the system's), keyed by the panel id,

@@ -20,7 +20,9 @@
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
 //! type "hello"        — text into the focused field / panel keys
-//! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre
+//! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre;
+//!                       sideways on a mail row triages it. `… hold` keeps
+//!                       the finger down (shoot the gesture, then `drop`)
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
 //!                       (the workspaces overlay), `pan2 0 -260` swipes up
 //! holdmove "inbox" 400 0 — long-press the element, drag the panel, drop
@@ -68,7 +70,8 @@ pub enum Step {
         dy: f64,
     },
     /// A one-finger touch drag from the labelled element's centre, by
-    /// `(dx, dy)` points: vertical scrolls that panel.
+    /// `(dx, dy)` points: vertical scrolls that panel, sideways on a mail row
+    /// triages it.
     Swipe {
         /// Label substring picking the start element.
         label: String,
@@ -76,6 +79,10 @@ pub enum Step {
         dx: f64,
         /// Vertical travel, points.
         dy: f64,
+        /// Keep the finger down after the move — the only way to photograph a
+        /// gesture mid-flight, since a whole swipe otherwise runs inside one
+        /// tick and never draws. Release with [`Step::Drop`].
+        hold: bool,
     },
     /// A two-finger pan by `(dx, dy)` points: horizontal pans the workspace
     /// strip; vertical toggles the workspaces overlay (down opens, up
@@ -99,7 +106,7 @@ pub enum Step {
         /// Keep holding after the move; release with [`Step::Drop`].
         hold: bool,
     },
-    /// Release a drag left alive by `holdmove … hold`.
+    /// Release a gesture left alive by `holdmove … hold` or `swipe … hold`.
     Drop,
     /// End the run.
     Quit,
@@ -165,12 +172,17 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                     .next()
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| err("expected dx dy"))?;
+                let hold = it.next() == Some("hold");
                 if cmd == "drag" {
                     Step::Drag { label, dx, dy }
                 } else if cmd == "swipe" {
-                    Step::Swipe { label, dx, dy }
+                    Step::Swipe {
+                        label,
+                        dx,
+                        dy,
+                        hold,
+                    }
                 } else {
-                    let hold = it.next() == Some("hold");
                     Step::HoldMove {
                         label,
                         dx,
@@ -320,7 +332,8 @@ mod tests {
             Step::Swipe {
                 label: "inbox".into(),
                 dx: 0.0,
-                dy: -120.0
+                dy: -120.0,
+                hold: false
             }
         );
         assert_eq!(s[1], Step::Pan2 { dx: -300.0, dy: 0.0 });
@@ -338,6 +351,10 @@ mod tests {
         let s = parse("holdmove \"help\" 10 0 hold\ndrop").unwrap();
         assert!(matches!(s[0], Step::HoldMove { hold: true, .. }));
         assert_eq!(s[1], Step::Drop);
+        // A swipe holds the same way — the only way to photograph a curtain
+        // mid-wipe, since a whole gesture otherwise runs inside one tick.
+        let s = parse("swipe \"q3\" -120 0 hold\ndrop").unwrap();
+        assert!(matches!(s[0], Step::Swipe { hold: true, .. }));
     }
 
     #[test]

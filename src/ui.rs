@@ -56,6 +56,7 @@ impl Style {
 pub enum BtnAct {
     Refresh,
     Archive,
+    Delete,
     Send,
     Discard,
     TryIt,
@@ -79,8 +80,14 @@ pub const TEXT_CHORDS: &[char] = &['c', 'v', 'x', 'a'];
 /// two can never disagree.
 pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
     match kind {
-        Kind::Inbox { .. } => &[("refresh", BtnAct::Refresh)],
-        Kind::Message { .. } => &[("archive", BtnAct::Archive)],
+        // "sync" rather than "refresh": the button kicks the IMAP workers, it
+        // does not reload a view. The truer word also frees `r` for the mail
+        // the inbox is previewing to lend back its `reply` (CR-005).
+        Kind::Inbox { .. } => &[("sync", BtnAct::Refresh)],
+        // Drawn right to left from the close button, so this reads
+        // "delete archive ×" — the destructive one furthest from the corner,
+        // the same order compose puts discard and send in.
+        Kind::Message { .. } => &[("archive", BtnAct::Archive), ("delete", BtnAct::Delete)],
         Kind::Compose { .. } => &[("send", BtnAct::Send), ("discard", BtnAct::Discard)],
         _ => &[],
     }
@@ -89,8 +96,9 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
 /// The key a side-effect button carries.
 pub fn btn_accel(act: BtnAct) -> Option<char> {
     match act {
-        BtnAct::Refresh => Some('r'),
+        BtnAct::Refresh => Some('s'),
         BtnAct::Archive => Some('a'),
+        BtnAct::Delete => Some('d'),
         BtnAct::Send => Some('s'),
         BtnAct::Discard => Some('d'),
         // The help panel's demo button fires nothing worth a chord.
@@ -108,6 +116,22 @@ pub const ACCEL_REPLY: char = 'r';
 /// `a`: the account rows are selectable text, so `cmd+a` belongs to them —
 /// the same courtesy an editable field gets, for the same reason.
 pub const ACCEL_ADD_ACCOUNT: char = 'd';
+
+/// The kind a panel **previews** into its joined child: a master/detail list
+/// whose cursor walk re-targets the child instead of opening a new panel, and
+/// which keeps focus while doing it (CR-005).
+///
+/// Such a panel also **borrows** its preview's accelerators — the fifth
+/// letter rule. The borrowed mark is never drawn on the borrower: it stays on
+/// the previewed panel's own chrome, one column over and in plain sight. The
+/// id here is a placeholder; only the variant is ever read.
+#[must_use]
+pub fn preview_kind(kind: &Kind) -> Option<Kind> {
+    match kind {
+        Kind::Inbox { .. } => Some(Kind::Message { id: 0 }),
+        _ => None,
+    }
+}
 
 /// Every accelerator a kind declares — chrome buttons *and* links — as
 /// `(key, what it fires)`. One table, so [`tests`] can hold the whole
@@ -244,6 +268,31 @@ mod tests {
                     !TEXT_CHORDS.contains(&c),
                     "{k:?} edits text, so cmd+{c} ({what}) must stay copy/cut/paste/select-all"
                 );
+            }
+        }
+    }
+
+    /// The fifth rule (CR-005): a panel that previews **borrows** its
+    /// preview's accelerators, so while a preview is up the user faces the
+    /// union of the two sets. That union has to obey the same rules a single
+    /// panel does — otherwise a borrowed chord could shadow a reserved one,
+    /// or two visible controls could answer to the same key.
+    #[test]
+    fn a_preview_lends_without_colliding_with_its_driver() {
+        for k in every_kind() {
+            let Some(child) = preview_kind(&k) else {
+                continue;
+            };
+            let mut seen: Vec<(char, &'static str)> = accels(&k);
+            for (c, what) in accels(&child) {
+                assert!(
+                    !RESERVED.contains(&c),
+                    "{k:?} would borrow cmd+{c} for {what}, but the workspace owns it"
+                );
+                if let Some((_, mine)) = seen.iter().find(|(s, _)| *s == c) {
+                    panic!("{k:?} claims cmd+{c} for {mine}, so its preview cannot lend {what}");
+                }
+                seen.push((c, what));
             }
         }
     }

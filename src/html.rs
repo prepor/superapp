@@ -12,8 +12,11 @@
 //! tracking pixel has no `alt` text, so it leaves without a trace. Links
 //! keep only the schemes a reader could have meant.
 //!
-//! Entities pass through untouched — makepad's own parser decodes them,
-//! and decoding here would mean escaping them again on the way out.
+//! Entities pass through untouched — makepad's own parser decodes them, and
+//! decoding here would mean escaping them again on the way out. With one
+//! exception it cannot survive: a numeric reference whose value is not a
+//! Unicode scalar is unwrapped straight into a panic there, so those are
+//! repaired on the way in (see [`fix_numeric_entities`]).
 
 /// Elements the widget draws, emitted as they came (attributes dropped;
 /// `<a>` is the one exception, handled separately).
@@ -378,12 +381,136 @@ fn collapse(t: &str) -> (String, bool, bool) {
     (s, lead, trail)
 }
 
+/// One numeric character reference at `at`: its value and the index past
+/// the `;`. `None` when this is not one — including digits the widget's own
+/// parser would also reject, which it does cleanly.
+fn num_ref(src: &str, at: usize) -> Option<(i64, usize)> {
+    let b = src.as_bytes();
+    if at + 3 >= b.len() || b[at] != b'&' || b[at + 1] != b'#' {
+        return None;
+    }
+    let hex = b[at + 2] | 0x20 == b'x';
+    let start = if hex { at + 3 } else { at + 2 };
+    let mut j = start;
+    while j < b.len() && b[j] != b';' {
+        j += 1;
+    }
+    if j >= b.len() || j == start {
+        return None;
+    }
+    let digits = &src[start..j];
+    let n = if hex {
+        i64::from_str_radix(digits, 16)
+    } else {
+        digits.parse::<i64>()
+    };
+    n.ok().map(|n| (n, j + 1))
+}
+
+/// Whether `src` carries a numeric reference the widget's parser would die
+/// on. A pure scan with no allocation, so [`guard`] costs nothing on the
+/// letters that are fine — which is all of them but the odd one.
+fn needs_repair(src: &str) -> bool {
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let Some(rel) = b[i..].iter().position(|&c| c == b'&') else {
+            return false;
+        };
+        let at = i + rel;
+        match num_ref(src, at) {
+            Some((n, end)) => {
+                if u32::try_from(n).ok().and_then(char::from_u32).is_none() {
+                    return true;
+                }
+                i = end;
+            }
+            None => i = at + 1,
+        }
+    }
+    false
+}
+
+/// Repairs numeric character references the widget's parser cannot decode.
+///
+/// It parses `&#N;` into a `u32` and then calls `char::from_u32(..).unwrap()`,
+/// so a value that is not a Unicode scalar takes the process down. Real mail
+/// is full of them: composers routinely emit an emoji as the two halves of
+/// its UTF-16 surrogate pair, and `&#55357;&#56538;` is an ordinary 📚.
+///
+/// A pair is put back together into the character it meant; anything else out
+/// of range becomes U+FFFD. References the parser *can* read are copied
+/// through byte for byte, so the module's pass-them-through rule still holds
+/// everywhere it was ever true.
+fn fix_numeric_entities(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        if let Some((n, end)) = num_ref(src, i) {
+            // Readable as it stands: leave it exactly alone.
+            if u32::try_from(n).ok().and_then(char::from_u32).is_some() {
+                out.push_str(&src[i..end]);
+                i = end;
+                continue;
+            }
+            // A high surrogate whose low half follows it is half of a real
+            // character, not a broken one.
+            if (0xD800..=0xDBFF).contains(&n) {
+                if let Some((lo, end2)) = num_ref(src, end) {
+                    if (0xDC00..=0xDFFF).contains(&lo) {
+                        let c = 0x1_0000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
+                        out.push(
+                            u32::try_from(c)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\u{FFFD}'),
+                        );
+                        i = end2;
+                        continue;
+                    }
+                }
+            }
+            out.push('\u{FFFD}');
+            i = end;
+            continue;
+        }
+        let ch = src[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The last thing between stored HTML and the widget.
+///
+/// [`sanitize`] runs at **ingest**, so what the store holds was narrowed by
+/// whichever version was current when the mail arrived. Tighten the narrowing
+/// — as the surrogate repair did — and every row written before it is stale,
+/// still carrying whatever the old rules let through. A mail that crashes the
+/// parser crashes it on every frame that draws it, which means the app cannot
+/// be opened rather than that one letter looks wrong, so the guarantee has to
+/// hold at the point of use and not only at the point of writing.
+///
+/// Borrows unless there is something to repair, so a letter that is fine
+/// costs one scan and no allocation.
+#[must_use]
+pub fn guard(src: &str) -> std::borrow::Cow<'_, str> {
+    if needs_repair(src) {
+        std::borrow::Cow::Owned(fix_numeric_entities(src))
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
 /// Narrows an HTML mail body to what the `Html` widget draws.
 ///
 /// The result is safe to hand straight to the widget: no network-fetching
-/// element survives, and link hrefs carry only [`SCHEMES`].
+/// element survives, link hrefs carry only [`SCHEMES`], and no numeric
+/// character reference is left that the widget would panic decoding.
 #[must_use]
 pub fn sanitize(src: &str) -> String {
+    let fixed = fix_numeric_entities(src);
+    let src = fixed.as_str();
     let mut out = Out::default();
     let mut i = 0usize;
     // `<pre>` keeps its whitespace; everything else collapses.
@@ -513,6 +640,44 @@ pub fn sanitize(src: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A numeric reference the widget's parser cannot decode is a crash, not
+    /// a rendering bug: it unwraps `char::from_u32`. The commonest source is
+    /// an emoji written as its UTF-16 surrogate pair, which is what a real
+    /// mail in the wild turned out to contain.
+    #[test]
+    fn surrogate_pairs_are_put_back_together() {
+        // &#55357;&#56538; is 📚, &#55357;&#56960; is 🚀 — as sent.
+        assert_eq!(sanitize("&#55357;&#56538;"), "📚");
+        assert_eq!(sanitize("<p>&#55357;&#56960; go</p>"), "<p>🚀 go</p>");
+        // Hex spelling of the same thing.
+        assert_eq!(sanitize("&#xD83D;&#xDE80;"), "🚀");
+    }
+
+    /// Anything else out of range is replaced rather than dropped, so the
+    /// text keeps its shape and nothing downstream sees a bare surrogate.
+    #[test]
+    fn unpaired_or_out_of_range_references_become_replacement() {
+        assert_eq!(sanitize("a&#55357;b"), "a\u{FFFD}b");
+        assert_eq!(sanitize("a&#56538;b"), "a\u{FFFD}b", "lone low half");
+        assert_eq!(sanitize("a&#1114112;b"), "a\u{FFFD}b", "past the last plane");
+        assert_eq!(sanitize("a&#99999999999;b"), "a\u{FFFD}b", "past u32 too");
+        assert_eq!(sanitize("a&#-1;b"), "a\u{FFFD}b", "negative");
+        // A high surrogate followed by something that is not its low half.
+        assert_eq!(sanitize("&#55357;&#65;"), "\u{FFFD}&#65;");
+    }
+
+    /// Everything the parser can read is still handed over byte for byte —
+    /// decoding here would mean re-escaping on the way out.
+    #[test]
+    fn readable_references_pass_through_untouched() {
+        assert_eq!(sanitize("<p>a &amp; b</p>"), "<p>a &amp; b</p>");
+        assert_eq!(sanitize("<p>&#60;tag&#62;</p>"), "<p>&#60;tag&#62;</p>");
+        assert_eq!(sanitize("<p>&#x1F4DA;</p>"), "<p>&#x1F4DA;</p>");
+        assert_eq!(sanitize("<p>caf&#233;</p>"), "<p>caf&#233;</p>");
+        // Not a numeric reference at all: left for the parser to reject.
+        assert_eq!(sanitize("<p>a &# b &#; c</p>"), "<p>a &# b &#; c</p>");
+    }
 
     /// The vocabulary the widget draws survives intact.
     #[test]
@@ -654,3 +819,4 @@ mod tests {
         assert_eq!(sanitize("<br><br><p>x</p>"), "<p>x</p>");
     }
 }
+

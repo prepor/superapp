@@ -46,7 +46,10 @@ scrolling model).
 The camera follows focus — the minimal scroll that keeps the focused panel
 fully visible with one gap of margin — and pans 1:1 under a horizontal
 trackpad scroll. A touch pan is free while the fingers are down and
-magnetises on release to the nearest column alignment.
+magnetises on release to the nearest column alignment. A panel opened
+*without* taking focus (a
+[preview](./interaction-grammar.md#preview-the-one-open-that-does-not-go))
+asks to be revealed as well, once, and loses to focus when both cannot fit.
 
 ## Placement
 
@@ -68,6 +71,11 @@ joined pair and inserts after it rather than splitting it.
   join, visibly: the ═ bridge between the pair is the only indicator, always
   drawn for a live join.
 - Alt (click or enter) always opens a fresh, un-joined panel.
+- A **preview** is the same joined open with focus left behind, so a list's
+  cursor can drive the panel beside it. It is raised to its column's shown
+  tab explicitly — the usual rule promotes whatever holds focus, and a
+  preview holds none. Where the pair cannot share the screen it keeps focus
+  after all, and is an ordinary open.
 
 ## Focus, movement, closing
 

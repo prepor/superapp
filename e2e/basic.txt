@@ -2,12 +2,13 @@
 wait 900
 shot 01-boot
 
-# Solid link: a message opens to the right, joined (bridge).
+# A mail row: the message opens to the right, joined (bridge). It is a
+# preview, so the inbox keeps focus — its header stays inverted (CR-005).
 click "Q3 infra"
 wait 700
 shot 02-message-joined
 
-# Next solid link in the parent replaces the joined panel.
+# The next row replaces the joined panel, same as any solid link would.
 click "Sat hike"
 wait 700
 shot 03-joined-replaced
