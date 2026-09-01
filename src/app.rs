@@ -3065,10 +3065,14 @@ impl Stage {
             }
             Act::Pointer(pid) => {
                 // The widget under it got the real event via forwarding;
-                // the shell's share is panel focus.
-                state.ws.focus = Some(pid);
-                state.field = None;
-                self.sync(cx);
+                // the shell's share is panel focus. A no-op focus must not
+                // redraw the world: a mid-gesture rebuild reissues areas
+                // and breaks the widget's own down/up pairing.
+                if state.ws.focus != Some(pid) || state.field.is_some() {
+                    state.ws.focus = Some(pid);
+                    state.field = None;
+                    self.sync(cx);
+                }
                 return;
             }
             Act::WidgetOp(pid, op) => {
@@ -3091,11 +3095,16 @@ impl Stage {
                     }
                     WidgetOp::SelectMail(id) => {
                         // Panel-internal: the inbox widget listens for this
-                        // and moves its j/k cursor.
-                        state.ws.focus = Some(pid);
-                        state.field = None;
+                        // and moves its j/k cursor. Focus syncs only when
+                        // it actually moves (no mid-gesture world redraws).
                         cx.action(crate::panels::PanelAction::SelectMail { pid, id });
-                        self.sync(cx);
+                        if state.ws.focus != Some(pid) || state.field.is_some() {
+                            state.ws.focus = Some(pid);
+                            state.field = None;
+                            self.sync(cx);
+                        } else {
+                            self.kick(cx);
+                        }
                     }
                 }
                 return;
@@ -3104,9 +3113,11 @@ impl Stage {
         }
         match act {
             Act::Focus(pid) => {
-                state.ws.focus = Some(pid);
-                state.field = None;
-                self.sync(cx);
+                if state.ws.focus != Some(pid) || state.field.is_some() {
+                    state.ws.focus = Some(pid);
+                    state.field = None;
+                    self.sync(cx);
+                }
             }
             Act::Close(pid) => {
                 let label = format!("close “{}”", state.title_of(pid));
@@ -3400,6 +3411,19 @@ impl Stage {
                 }
                 if let (true, Some(act)) = (within, act) {
                     // No modifiers on glass: never the fresh-panel variant.
+                    let act = match act {
+                        // Tap = click on glass: a row tap opens — the
+                        // select cursor is keyboard grammar, and there is
+                        // no keyboard here.
+                        Act::WidgetOp(pid, WidgetOp::SelectMail(id)) => {
+                            Act::WidgetOp(pid, WidgetOp::OpenMail(id))
+                        }
+                        // Standalone widgets own their taps (the mouse
+                        // rule): resolving the semantic op here too would
+                        // double-fire.
+                        Act::WidgetOp(pid, WidgetOp::AddAccount) => Act::Pointer(pid),
+                        a => a,
+                    };
                     self.resolve_click(cx, act, false);
                 }
             }
@@ -3899,22 +3923,22 @@ impl Widget for Stage {
             }
 
             Event::TextInput(e) => {
-                // android's IME sends the authoritative full field state;
-                // plain characters (macOS, hardware keys) come as `input`.
-                if let Some(fs) = e.full_state_sync.clone() {
-                    self.handle_ime_state(cx, &fs);
-                } else if self.hosted_focus()
+                // A hosted panel's TextInputs own the whole IME protocol —
+                // android's authoritative full-state syncs and plain chars
+                // alike — so they get the original event first, untouched.
+                // The e2e text path stays on handle_text, which synthesizes
+                // the same event: one route, two doors. Everything else
+                // splits as before: full state to the char-grid mirror,
+                // chars to handle_text.
+                if self.hosted_focus()
                     && self.state.as_deref().is_some_and(|s| {
                         s.overlay == Overlay::None && s.field.is_none()
                     })
                 {
-                    // The focused panel is a widget tree: hand the original
-                    // event over whole, composition flags intact (its
-                    // TextInputs strip control chars themselves). The e2e
-                    // text path stays on handle_text, which synthesizes the
-                    // same event — one route, two doors.
                     self.forward_to_focused(cx, event);
                     self.kick(cx);
+                } else if let Some(fs) = e.full_state_sync.clone() {
+                    self.handle_ime_state(cx, &fs);
                 } else {
                     let input = e.input.clone();
                     self.handle_text(cx, &input);

@@ -116,6 +116,10 @@ script_mod! {
         padding: Inset{left: 7, right: 7, top: 5, bottom: 5}
         margin: 0
         empty_text: " "
+        // Forms advance: the soft keyboard's action key reads "next" and
+        // lands as the same Returned action the enter-chain walks. Fields
+        // that end a chain override with Done/Search.
+        return_key_type: ReturnKeyType.Next
         draw_bg +: {
             border_radius: 1.0
             border_size: 1.0
@@ -262,7 +266,11 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "ADDRESS" }
-            email_input := mod.widgets.SField {}
+            email_input := mod.widgets.SField {
+                content_type: TextInputContentType.EmailAddress
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
         }
         View { width: Fill, height: 7 }
         View {
@@ -274,13 +282,22 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "IMAP" }
-            imap_input := mod.widgets.SField { text: "imap.fastmail.com" }
+            imap_input := mod.widgets.SField {
+                text: "imap.fastmail.com"
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
         }
         View { width: Fill, height: 7 }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "SMTP" }
-            smtp_input := mod.widgets.SField { text: "smtp.fastmail.com" }
+            smtp_input := mod.widgets.SField {
+                text: "smtp.fastmail.com"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
         }
         View { width: Fill, height: 12 }
         View {
@@ -308,7 +325,11 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "TO" }
-            to_input := mod.widgets.SField {}
+            to_input := mod.widgets.SField {
+                content_type: TextInputContentType.EmailAddress
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -320,6 +341,8 @@ script_mod! {
             width: Fill, height: Fill
             is_multiline: true
             empty_text: ""
+            // Multiline: the keyboard's return stays a newline.
+            return_key_type: ReturnKeyType.Default
         }
     }
 
@@ -394,6 +417,9 @@ script_mod! {
         filter_input := mod.widgets.SField {
             width: Fill
             empty_text: "filter…  ( / )"
+            return_key_type: ReturnKeyType.Search
+            autocapitalize: AutoCapitalize.None
+            autocorrect: AutoCorrect.Disabled
         }
         View {
             width: Fill, height: Fit
