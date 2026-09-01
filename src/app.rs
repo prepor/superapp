@@ -4248,10 +4248,18 @@ impl Stage {
             _ => {}
         }
         for (label, r, act) in reg {
+            // The hand promises a click does something. Text keeps that
+            // promise honest: the fields and the read-only selectable runs
+            // (CR-003) answer to the drag, not the click, so they take the
+            // beam — which is also the only hint that they can be copied.
+            let cursor = match act {
+                Act::Pointer(_) => MouseCursor::Text,
+                _ => MouseCursor::Hand,
+            };
             self.hits.push(HitR {
                 rect: r,
                 act,
-                cursor: MouseCursor::Hand,
+                cursor,
                 label,
             });
         }
