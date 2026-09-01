@@ -472,6 +472,16 @@ impl Ws {
         panel
     }
 
+    /// Raises `pid` to be its column's shown tab. [`Ws::normalize`] does this
+    /// for the *focused* panel only, so a panel opened without focus — a
+    /// preview (CR-005) — would otherwise land as a hidden tab and draw at
+    /// alpha 0.
+    pub fn activate(&mut self, pid: PanelId) {
+        if let Some((c, r)) = self.locate(pid) {
+            self.columns[c].active = r;
+        }
+    }
+
     /// Keeps per-column invariants: `active` clamped, and following focus.
     fn normalize(&mut self) {
         for col in &mut self.columns {
@@ -918,17 +928,38 @@ impl Ws {
         (panels, x)
     }
 
-    /// Scrolls the camera the minimal amount that makes the focused panel
-    /// fully visible, with one gap of margin. Called after mutations — never
-    /// while the user pans, which must stay free.
-    pub fn ensure_focus_visible(&mut self, viewport: (f64, f64), opts: LayoutOpts) {
+    /// Scrolls the camera the minimal amount that makes `pid` fully visible,
+    /// with one gap of margin. Called after mutations — never while the user
+    /// pans, which must stay free.
+    pub fn ensure_visible(&mut self, pid: PanelId, viewport: (f64, f64), opts: LayoutOpts) {
         let (panels, _) = self.layout_panels(viewport, opts);
+        if let Some(ps) = panels.iter().find(|p| p.id == pid) {
+            let lo = ps.rect.x - opts.gap;
+            let hi = ps.rect.right() + opts.gap - viewport.0;
+            self.camera_x = self.camera_x.clamp(hi.min(lo), lo);
+        }
+    }
+
+    /// As [`Ws::ensure_visible`], for whatever holds focus.
+    pub fn ensure_focus_visible(&mut self, viewport: (f64, f64), opts: LayoutOpts) {
         if let Some(f) = self.focus {
-            if let Some(ps) = panels.iter().find(|p| p.id == f) {
-                let lo = ps.rect.x - opts.gap;
-                let hi = ps.rect.right() + opts.gap - viewport.0;
-                self.camera_x = self.camera_x.clamp(hi.min(lo), lo);
+            self.ensure_visible(f, viewport, opts);
+        }
+    }
+
+    /// Whether two panels can be on screen at the same time. A preview only
+    /// makes sense where the pair fits — on a phone grid each of them is the
+    /// whole screen, so an open that kept focus behind would just look like
+    /// nothing happened.
+    #[must_use]
+    pub fn fit_together(&self, a: PanelId, b: PanelId, viewport: (f64, f64), opts: LayoutOpts) -> bool {
+        let (panels, _) = self.layout_panels(viewport, opts);
+        let find = |id| panels.iter().find(|p| p.id == id).map(|p| p.rect);
+        match (find(a), find(b)) {
+            (Some(ra), Some(rb)) => {
+                ra.right().max(rb.right()) - ra.x.min(rb.x) <= viewport.0
             }
+            _ => false,
         }
     }
 
@@ -1048,6 +1079,27 @@ impl Wm {
     #[must_use]
     pub fn ws_of(&self, pid: PanelId) -> Option<usize> {
         self.wss.iter().position(|w| w.panels.contains_key(&pid))
+    }
+
+    /// Every panel showing exactly this kind, on any workspace. A mail that
+    /// leaves the inbox closes its readers wherever they were opened, so this
+    /// deliberately looks past the active workspace `Wm` derefs to.
+    #[must_use]
+    pub fn showing(&self, kind: &Kind) -> Vec<PanelId> {
+        self.wss
+            .iter()
+            .flat_map(|w| w.panels.values())
+            .filter(|p| p.kind == *kind)
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// Closes a panel on whichever workspace holds it — the plain [`Ws::close`]
+    /// reached through the deref only ever sees the active one.
+    pub fn close_anywhere(&mut self, pid: PanelId) {
+        if let Some(k) = self.ws_of(pid) {
+            self.wss[k].close(pid);
+        }
     }
 
     /// Focuses a panel wherever it lives, switching workspaces if needed

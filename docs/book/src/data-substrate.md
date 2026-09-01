@@ -71,6 +71,24 @@ A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.
 
+**A worker never holds the write lock across the network.** SQLite has one
+writer and the UI shares the file, so a transaction left open over an IMAP
+round-trip stalls every UI action behind it for as long as the server takes
+to answer — an action that costs 0.1 ms becomes 468 ms behind a 400 ms
+fetch, which reads as the app hanging rather than as sync being slow. Each
+pass therefore reads what it knows, does *all* its protocol work with no
+transaction open, and takes the lock once for the local writes. A unit test
+pins the property by trying to acquire the lock from a second connection on
+every transport call, because it is the kind of invariant that reads as a
+tidying preference right up until someone moves a `BEGIN` for clarity.
+
+The same reasoning bounds who may *wake* a worker: a reading walk does not.
+Arrowing down the inbox is a burst of keystrokes each recording a `\Seen`
+intent nobody is waiting on, and kicking a worker per keystroke means a sync
+pass per keystroke, each competing for the lock the next keystroke needs.
+Everything else — archive, delete, send — still kicks; the minute poll
+carries the rest.
+
 **Sending** is the outbox pattern with the undo window built in. A compose
 panel's draft persists in the store *as you type* (plain upkeep — typing is
 the future editor's local undo, not the system's), keyed by the panel id,

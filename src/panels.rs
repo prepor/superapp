@@ -74,6 +74,11 @@ pub enum PanelAction {
     /// Open a mail from the inbox (the solid-link semantics; `fresh` is
     /// the workspace modifier).
     OpenMail { pid: u64, id: i64, fresh: bool },
+    /// The inbox cursor landed on a mail (CR-005): open it joined but leave
+    /// focus in the list, so the walk carries on. Deliberately not a flag on
+    /// [`PanelAction::OpenMail`] — a preview is never the `fresh` variant,
+    /// and two bools would let that nonsense be spelled.
+    PreviewMail { pid: u64, id: i64 },
     /// Panel-internal: an inbox row was tapped outside its subject.
     SelectMail { pid: u64, id: i64 },
     /// A link was followed: solid opens joined, dotted replaces in place,
@@ -869,25 +874,38 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "a control wearing a bold letter is cmd+that letter:" }
         }
+        // Two lines per kind: a panel wide enough for one row of these was
+        // already a squeeze before delete joined the message's chrome.
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "  message " }
             mod.widgets.SKbd { text: "cmd+a" }
             mod.widgets.SLabel { text: "rchive " }
+            mod.widgets.SKbd { text: "cmd+d" }
+            mod.widgets.SLabel { text: "elete " }
             mod.widgets.SKbd { text: "cmd+r" }
-            mod.widgets.SLabel { text: "eply " }
+            mod.widgets.SLabel { text: "eply" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "          " }
             mod.widgets.SKbd { text: "cmd+n" }
             mod.widgets.SLabel { text: "/" }
             mod.widgets.SKbd { text: "cmd+o" }
-            mod.widgets.SLabel { text: " walk" }
+            mod.widgets.SLabel { text: " walk newer / older" }
         }
         mod.widgets.SRow {
-            mod.widgets.SLabel { text: "  inbox " }
-            mod.widgets.SKbd { text: "cmd+r" }
-            mod.widgets.SLabel { text: "efresh  " }
+            mod.widgets.SLabel { text: "  inbox   " }
+            mod.widgets.SKbd { text: "cmd+s" }
+            mod.widgets.SLabel { text: "ync  " }
             mod.widgets.SKbd { text: "enter" }
-            mod.widgets.SLabel { text: " opens  " }
+            mod.widgets.SLabel { text: " goes  " }
             mod.widgets.SKbd { text: "/" }
-            mod.widgets.SLabel { text: " filters  arrows walk the rows" }
+            mod.widgets.SLabel { text: " filters" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "          arrows walk the rows" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "clicking a row, or walking onto it, opens the mail beside the list without leaving it — and that preview lends the list its own keys" }
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "esc" }
@@ -945,7 +963,8 @@ script_mod! {
             mod.widgets.SSection { text: "TOUCH" }
             mod.widgets.SRule {}
             mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "tap — follow links, press buttons" } }
-            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "drag — scroll a panel's content" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "drag up/down — scroll a panel's content" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "drag a mail sideways — left archives, right deletes; let go before the ink fills and nothing happens" } }
             mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers — scroll the workspace" } }
             mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers down — workspaces overlay" } }
             mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "hold a header — pick the panel up; drop on a column to stack, between columns for a fresh one" } }
@@ -1628,8 +1647,12 @@ pub struct InboxPanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    /// The cursor: which mail, and the row it sat on. The index is the
+    /// fallback — a mail archived out from under the cursor is no longer in
+    /// `rows`, and without it the walk would resolve to nothing and snap back
+    /// to the top of the inbox instead of carrying on where it stood.
     #[rust]
-    sel: Option<i64>,
+    sel: Option<(i64, usize)>,
 }
 
 impl InboxPanel {
@@ -1642,18 +1665,11 @@ impl InboxPanel {
             .unwrap_or_default()
     }
 
-    fn move_sel(&mut self, cx: &mut Cx, scope: &Scope, d: isize) {
-        let rows = self.rows(cx, scope);
-        if rows.is_empty() {
-            return;
-        }
-        let i = self
-            .sel
-            .and_then(|s| rows.iter().position(|m| m.id == s))
-            .map_or(0, |i| {
-                (i as isize + d).clamp(0, rows.len() as isize - 1) as usize
-            });
-        self.sel = Some(rows[i].id);
+    /// Puts the cursor on `i` and previews what it lands on — every cursor
+    /// move goes through here, so walking and previewing can never disagree.
+    fn set_sel(&mut self, cx: &mut Cx, pid: u64, rows: &[mail::MailHead], i: usize) {
+        let Some(m) = rows.get(i) else { return };
+        self.sel = Some((m.id, i));
         // Keep the cursor on screen: a row without a live item is off-view.
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
         let visible = list
@@ -1662,7 +1678,43 @@ impl InboxPanel {
         if !visible {
             list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
         }
+        cx.action(PanelAction::PreviewMail { pid, id: m.id });
         self.redraw(cx);
+    }
+
+    fn move_sel(&mut self, cx: &mut Cx, scope: &Scope, pid: u64, d: isize) {
+        let rows = self.rows(cx, scope);
+        if rows.is_empty() {
+            return;
+        }
+        // Resolve by id, fall back to the remembered row: the mail the cursor
+        // was on may have just been archived away.
+        let at = self.sel.and_then(|(s, i)| {
+            rows.iter()
+                .position(|m| m.id == s)
+                .or(Some(i.min(rows.len() - 1)))
+        });
+        let i = match at {
+            Some(i) => (i as isize + d).clamp(0, rows.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.set_sel(cx, pid, &rows, i);
+    }
+}
+
+impl InboxPanelRef {
+    /// The mail under the cursor, if any — the shell asks so it can carry the
+    /// cursor forward when that mail is filed away.
+    pub fn selected(&self) -> Option<i64> {
+        self.borrow().and_then(|p| p.sel).map(|(id, _)| id)
+    }
+
+    /// Whether the filter owns the keyboard. The fifth accelerator rule
+    /// (CR-005) stands the borrowed chords down while it does, so `cmd+a`
+    /// stays select-all in a live field.
+    pub fn filter_focused(&self, cx: &mut Cx) -> bool {
+        self.borrow()
+            .is_some_and(|p| p.view.text_input(cx, ids!(filter_input)).key_focus(cx))
     }
 }
 
@@ -1688,9 +1740,12 @@ impl Widget for InboxPanel {
                         let rows = self.rows(cx, scope);
                         let target = self
                             .sel
+                            .map(|(s, _)| s)
                             .filter(|s| rows.iter().any(|m| m.id == *s))
                             .or_else(|| rows.first().map(|m| m.id));
                         if let Some(id) = target {
+                            // Enter *goes*: unlike the walk's preview, it
+                            // hands focus to the mail (the solid-link rule).
                             cx.action(PanelAction::OpenMail {
                                 pid,
                                 id,
@@ -1699,9 +1754,10 @@ impl Widget for InboxPanel {
                         }
                     }
                     // The row walk, with scroll-follow (CR-003: the arrows
-                    // are the whole walk now, j/k having gone).
-                    KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
-                    KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
+                    // are the whole walk now, j/k having gone). Each step
+                    // previews what it lands on and keeps the keyboard.
+                    KeyCode::ArrowDown => self.move_sel(cx, scope, pid, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, scope, pid, -1),
                     // The inbox's one-stop tab ring: the filter.
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
@@ -1716,7 +1772,8 @@ impl Widget for InboxPanel {
             if filter.returned(actions).is_some() || filter.escaped(actions) {
                 cx.set_key_focus(Area::Empty);
                 if filter.returned(actions).is_some() {
-                    self.sel = self.rows(cx, scope).first().map(|m| m.id);
+                    let rows = self.rows(cx, scope);
+                    self.set_sel(cx, pid, &rows, 0);
                 }
                 self.redraw(cx);
             }
@@ -1729,7 +1786,16 @@ impl Widget for InboxPanel {
                     a.downcast_ref::<PanelAction>()
                 {
                     if *p == pid {
-                        self.sel = Some(*id);
+                        // The shell moved the cursor for us (a mail opened by
+                        // click, or the walk carried past one just filed
+                        // away). Take the row from the live list so the index
+                        // fallback stays honest.
+                        let i = self
+                            .rows(cx, scope)
+                            .iter()
+                            .position(|m| m.id == *id)
+                            .unwrap_or(0);
+                        self.sel = Some((*id, i));
                         self.redraw(cx);
                     }
                 }
@@ -1739,7 +1805,7 @@ impl Widget for InboxPanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let rows = self.rows(cx, scope);
-        let sel = self.sel;
+        let sel = self.sel.map(|(id, _)| id);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
                 list.set_item_range(cx, 0, rows.len());

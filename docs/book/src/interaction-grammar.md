@@ -16,6 +16,32 @@ panel — the workspace modifier means "workspace-level" with the mouse too
 (alt is kept as a quiet alias). Side-effect feedback is a transient toast in
 the bottom-right corner; errors are the only place colour appears.
 
+### Preview: the one open that does not go
+
+A **list panel's cursor opens what it lands on, without leaving the list.**
+Walking the inbox with the arrows — or clicking a row — re-targets a joined
+message beside it; focus stays on the rows, so the next arrow keeps walking
+rather than scrolling a message body, and reading a list never costs a trip
+back.
+
+So the split is: **touching a row previews, `enter` goes.** Enter is the one
+that hands focus over, which is the solid-link rule above, unchanged; `cmd+→`
+is the other way there. Cmd+click still means what it means everywhere — a
+fresh, un-joined panel.
+
+A preview is a real open — joined, marks the mail read, undoable — minus the
+one thing that would end the walk. It opens **immediately**, on every step,
+with nothing queued between the cursor and what it points at; a whole run of
+them coalesces into a single history node, so one `cmd+z` takes it all back.
+
+Only a panel that *has* a cursor over a list can preview, and it previews into
+exactly one kind (the inbox into a message). The pair reads as one thing,
+which is also why it borrows keys — see [Accelerators](#accelerators).
+
+A preview needs somewhere to *be*. Where the pair cannot share the screen —
+a phone grid, where each panel is the whole of it — the open simply goes, as
+any other open would; a preview nobody can see is worse than no preview.
+
 ## Keyboard
 
 **Cmd carries two namespaces.** The **reserved set** below is global and
@@ -39,8 +65,9 @@ That is the whole reserved set: `1…9`, the arrows, `w z u i t [ ] , .` and
 
 Per panel, below the reserved set:
 
-- inbox: `enter` opens (`cmd+enter` un-joined), `/` filter, arrows walk the
-  rows (scrolling the list to keep the cursor visible)
+- inbox: `enter` opens *and goes* (`cmd+enter` un-joined), `/` filter, arrows
+  walk the rows (scrolling the list to keep the cursor visible, and
+  **previewing** each one beside it)
 - forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
   wrapping; `enter` advances and **submits past the last field**. Read
   panels have no ring: their controls wear chords instead.
@@ -56,10 +83,10 @@ typing; control keys (enter, arrows, backspace) are routed as key events.
 
 **A control carries its own key, drawn into its label.** One character of a
 button or link is **bold**, and `cmd`+that letter fires it: `archive` is
-`cmd+a`, `reply` is `cmd+r`, the message walk is `cmd+n` / `cmd+o` on
-`← newer` and `older →`, settings' `add account` is `cmd+d`. Nothing to
-memorise and no help panel to consult — the shortcut is a property of the
-thing it fires.
+`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, the message walk is
+`cmd+n` / `cmd+o` on `← newer` and `older →`, the inbox's `sync` is `cmd+s`,
+settings' `add account` is `cmd+d`. Nothing to memorise and no help panel to
+consult — the shortcut is a property of the thing it fires.
 
 This is the one place bold does a second job, so the rule is sharp:
 
@@ -74,7 +101,7 @@ Accelerators are **on cmd, not on bare letters**, so they work while a text
 field owns the keyboard — you can archive mid-sentence in a compose body, and
 the mark never has to lie about whether it is live. They are also
 **panel-scoped**: `cmd+a` archives on a message, and stays select-all in a
-compose body. Four rules keep that honest, enforced by unit test rather than
+compose body. Five rules keep that honest, enforced by unit test rather than
 by discipline:
 
 1. never the reserved set;
@@ -83,7 +110,28 @@ by discipline:
    it — which is why settings' one link is `cmd+d`, not `cmd+a`: the account
    rows are selectable, so select-all stays theirs;
 4. only for controls a panel has exactly one of — a list of rows each with a
-   *remove* button stays on the Tab ring and the mouse.
+   *remove* button stays on the Tab ring and the mouse;
+5. **a panel that previews borrows its preview's keys** — see below.
+
+### Borrowed keys
+
+A [preview](#preview-the-one-open-that-does-not-go) and the list driving it
+are one working surface, so they pool their accelerators: with a mail
+previewed, `cmd+a` archives it, `cmd+d` deletes it, `cmd+r` replies and
+`cmd+n` / `cmd+o` walk — all without leaving the list. The driver's own keys
+win first (`cmd+s` still syncs the inbox), and the preview lends what is left.
+
+The mark stays honest because it never moves: it is drawn on the message
+panel's own chrome, one column over and in plain sight. Nothing is ever bold
+on the borrower — a borrowed key is a property of the panel you can see, not a
+hidden binding on the panel you are in. That is also why refresh became
+`sync`: two visible controls may not answer to one letter, and `reply`'s `r`
+was already spoken for.
+
+Borrowed keys **stand down while the driver's own text field holds the
+keyboard**, so `cmd+a` in a live filter is still select-all. Rule 3 survives:
+the list yields the text chords to its field exactly as before, and only
+lends them when the field is not listening.
 
 ## Workspaces
 
@@ -135,8 +183,10 @@ this surface is where global search lives.
 ## Undo
 
 **Every action is undoable** — open, close, replace, move, column ops,
-workspace moves, archive — and `cmd+z` walks them back with their whole
-delta: undoing an archive restores the panel *and* the mail's folder;
+workspace moves, archive, delete — and `cmd+z` walks them back with their
+whole delta: undoing an archive restores the panel *and* the mail's folder;
+filing a mail carries the list's cursor to the next one in the same node, so
+one `cmd+z` takes back the filing and the move together;
 undoing an open makes the mail unread again exactly if the open unread it.
 Undo also puts you back where the action happened (its workspace and focus
 revert with it). `cmd+shift+z` re-applies.
@@ -175,11 +225,23 @@ scrolling region.
 
 The same grammar, re-based on fingers:
 
-- **tap** — exactly a click: follow a link, press a button, focus a panel.
-  There is **no touch equivalent of cmd+click**; a solid link always follows
-  join semantics on glass.
+- **tap** — exactly a click: follow a link, press a button, focus a panel,
+  preview a mail row. There is **no touch equivalent of cmd+click**; a solid
+  link always follows join semantics on glass. (On a phone grid a previewed
+  panel is the whole screen, so there the tap goes — see
+  [Preview](#preview-the-one-open-that-does-not-go).)
 - **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
-  A sideways one-finger drag means nothing (deliberately: it would fight
+  Vertical keeps ties, so a diagonal is a scroll and never half a swipe.
+- **one-finger sideways drag on a mail row** — triage: **left archives,
+  right deletes**. An ink **curtain** wipes across the row carrying the name
+  of what will happen, entering from the edge that action's button occupies
+  in a message header — so the two surfaces agree about which side means
+  which verb. Under a third of the way it is a grey wash with the word in
+  ink; past that it **inverts**, the same way a header button inverts under
+  the pointer, and letting go there fires it. The curtain finishes covering
+  the row before the mail leaves the inbox, and a toast offers the undo.
+  Let go short of the threshold and it wipes back out.
+  Sideways anywhere *else* still means nothing (deliberately: it would fight
   taps and the workspace pan).
 - **two-finger drag** — the first move past the slop locks its axis.
   Horizontal pans the workspace strip, 1:1 while the fingers are down; on

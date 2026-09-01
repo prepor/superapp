@@ -286,17 +286,54 @@ pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()
     Ok(())
 }
 
-/// Archives a mail: it moves to its account's archive folder. Intent only —
-/// the push pass makes the server agree (see [`mark_read_tx`]).
-pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
-    c.execute(
+/// Moves a mail out of the inbox into one of its account's role folders.
+/// Intent only — the push pass makes the server agree (see [`mark_read_tx`]),
+/// and it is generic over the move, so trash rides the same path archive
+/// already proved.
+///
+/// The `EXISTS` guard is load-bearing: an account whose server advertises no
+/// such folder (see [`crate::sync`]'s role detection) would otherwise get a
+/// `NULL` from the subquery, and a mail with a null folder falls out of the
+/// inbox query *and* out of the push set's join — vanishing silently, with
+/// nothing to sync it back. Returns whether the mail actually moved, so the
+/// caller can say so.
+fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
         "UPDATE message SET folder =
            (SELECT f.id FROM folder f
-            WHERE f.account = message.account AND f.role = 'archive')
-         WHERE id = ?1",
-        [id],
+            WHERE f.account = message.account AND f.role = ?2)
+         WHERE id = ?1
+           AND EXISTS (SELECT 1 FROM folder f
+                       WHERE f.account = message.account AND f.role = ?2)",
+        rusqlite::params![id, role],
     )?;
-    Ok(())
+    Ok(n > 0)
+}
+
+/// Archives a mail: it moves to its account's archive folder.
+pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<bool> {
+    file_tx(c, id, "archive")
+}
+
+/// Deletes a mail: it moves to its account's trash folder. Recoverable by
+/// undo like any other action, and by the server's own trash after that.
+pub fn delete_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<bool> {
+    file_tx(c, id, "trash")
+}
+
+/// Whether this mail's account has the folder a triage would move it to.
+/// The pre-flight for [`archive_tx`] / [`delete_tx`]: the shell asks first so
+/// it can say *why* nothing happened rather than record an empty action.
+pub fn can_file(store: &Store, id: MailId, role: &str) -> bool {
+    store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM message m JOIN folder f ON f.account = m.account
+             WHERE m.id = ?1 AND f.role = ?2",
+            rusqlite::params![id, role],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
 }
 
 // -- drafts and the send window ----------------------------------------------
@@ -703,12 +740,35 @@ mod tests {
 
         s.write(|c| mark_read_tx(c, 1)).unwrap();
         assert!(!inbox(&s)[0].unread);
-        s.write(|c| archive_tx(c, 1)).unwrap();
+        assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "archive moved it");
         assert_eq!(inbox(&s).len(), 67);
         assert_ne!(inbox(&s)[0].id, 1);
         assert_eq!(all(&s).len(), 68, "archived mail stays in the corpus");
         let (name, n) = contact(&s, "vera@kovac.io");
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
+    }
+
+    /// Delete is archive's twin on the trash folder, and both refuse to move
+    /// a mail whose account has no such folder rather than stranding it with
+    /// a null one (which would drop it from the inbox *and* from the push).
+    #[test]
+    fn delete_files_to_trash_and_needs_the_folder() {
+        let s = store();
+        assert!(can_file(&s, 2, "trash"));
+        assert!(s.write(|c| delete_tx(c, 2)).unwrap(), "delete moved it");
+        assert_eq!(inbox(&s).len(), 67);
+        assert!(!inbox(&s).iter().any(|m| m.id == 2));
+        assert_eq!(all(&s).len(), 68, "deleted mail stays in the corpus");
+
+        // An account without the folder: the mail must stay exactly where it
+        // is. A fresh store, because the folder can only be dropped while
+        // nothing references it.
+        let s = store();
+        s.write(|c| c.execute("DELETE FROM folder WHERE role = 'trash'", []))
+            .unwrap();
+        assert!(!can_file(&s, 3, "trash"));
+        assert!(!s.write(|c| delete_tx(c, 3)).unwrap(), "nothing to move to");
+        assert!(inbox(&s).iter().any(|m| m.id == 3), "still in the inbox");
     }
 
     /// A trace records exactly what was read between begin and end — the

@@ -1,14 +1,17 @@
 # The history walk: cmd+u shows the tree; clicking a node travels there —
 # backward, to the very beginning, and forward again.
+#
+# Clicking a row previews it (CR-005), so the first node is a `read`; the
+# archive then rides the chord the preview lends the list.
 wait 700
 click "Q3 infra"
 wait 400
-click "archive"
+key cmd+a
 wait 500
 key cmd+u
 wait 500
 shot y1-history
-click "open “Q3"
+click "read “Q3"
 wait 600
 shot y2-back
 click "the beginning"

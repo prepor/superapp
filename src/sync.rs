@@ -167,6 +167,14 @@ pub fn push_account(
 }
 
 /// The fetch/reconcile pass.
+///
+/// Per folder: read what we know (autocommit), do **all** the network work
+/// with no transaction open, then take the write lock once for the local
+/// writes. The order is load-bearing rather than tidy — SQLite has one
+/// writer, and the UI shares this file. A `BEGIN IMMEDIATE` held across an
+/// IMAP round-trip blocks every UI action behind it for as long as the
+/// server takes to answer (measured: a 400 ms fetch turns a 0.1 ms action
+/// into a 468 ms one), which reads as the whole app hanging.
 fn fetch_account(
     conn: &Connection,
     t: &mut dyn Transport,
@@ -177,7 +185,9 @@ fn fetch_account(
         let Some(role) = rf.role else { continue };
         let meta = t.folder_meta(&rf.name)?;
 
-        conn.execute("BEGIN IMMEDIATE", []).map_err(err)?;
+        // Resolving the folder row is one statement in autocommit, not the
+        // opening of a transaction: nothing below may hold the write lock
+        // while the network is in the loop (see the pass's doc comment).
         let fid: i64 = conn
             .query_row(
                 "SELECT id FROM folder WHERE account=?1 AND name=?2",
@@ -201,93 +211,117 @@ fn fetch_account(
             .map_err(err)?;
 
         let floor = u32::max(1, meta.uidnext.saturating_sub(FETCH_CAP));
-        let from = if known.0 != Some(i64::from(meta.uidvalidity)) {
-            // The server renumbered (or first contact): local copies of
-            // this folder are meaningless. Start over inside the window.
-            conn.execute(
-                "DELETE FROM message WHERE id IN
-                   (SELECT message FROM server_msg WHERE folder=?1)",
-                [fid],
-            )
-            .map_err(err)?;
-            conn.execute("DELETE FROM server_msg WHERE folder=?1", [fid])
-                .map_err(err)?;
+        // The server renumbered (or first contact): local copies of this
+        // folder are meaningless, and the window starts over. The deletion
+        // that follows from it happens below, with the rest of the writes.
+        let renumbered = known.0 != Some(i64::from(meta.uidvalidity));
+        let from = if renumbered {
             floor
         } else {
             known.1.map_or(floor, |n| n as u32)
         };
 
-        if meta.uidnext > from {
-            for m in t.fetch_from(&rf.name, from)? {
+        // ---- the network, with no transaction open -------------------------
+        let fetched = if meta.uidnext > from {
+            t.fetch_from(&rf.name, from)?
+        } else {
+            Vec::new()
+        };
+        // Facts to reconcile against — the *server's* view of this folder.
+        let server = t.uids(&rf.name)?;
+        let unseen = t.unread_uids(&rf.name)?;
+
+        // ---- one transaction, local work only ------------------------------
+        conn.execute("BEGIN IMMEDIATE", []).map_err(err)?;
+        let out = (|| -> Result<(), String> {
+            if renumbered {
+                conn.execute(
+                    "DELETE FROM message WHERE id IN
+                       (SELECT message FROM server_msg WHERE folder=?1)",
+                    [fid],
+                )
+                .map_err(err)?;
+                conn.execute("DELETE FROM server_msg WHERE folder=?1", [fid])
+                    .map_err(err)?;
+            }
+            for m in &fetched {
                 if m.uid < from {
                     continue; // `from:*` quirk: a lone highest message
                 }
-                ingest_message(conn, account, fid, &m).map_err(err)?;
+                ingest_message(conn, account, fid, m).map_err(err)?;
             }
-        }
-        conn.execute(
-            "UPDATE folder SET uidvalidity=?1, uidnext=?2 WHERE id=?3",
-            rusqlite::params![meta.uidvalidity, meta.uidnext, fid],
-        )
-        .map_err(err)?;
+            conn.execute(
+                "UPDATE folder SET uidvalidity=?1, uidnext=?2 WHERE id=?3",
+                rusqlite::params![meta.uidvalidity, meta.uidnext, fid],
+            )
+            .map_err(err)?;
 
-        // Reconcile facts over the retained window — by the *server's* view
-        // of this folder. Divergent intent stays local truth: an unpushed
-        // read/archive is never clobbered, only recorded.
-        let server = t.uids(&rf.name)?;
-        let unseen = t.unread_uids(&rf.name)?;
-        let local: Vec<(i64, u32, bool, bool)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT m.id, s.uid, s.seen, m.unread
-                     FROM server_msg s JOIN message m ON m.id = s.message
-                     WHERE s.folder=?1 AND s.uid IS NOT NULL",
-                )
-                .map_err(err)?;
-            let rows = stmt
-                .query_map([fid], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)? as u32,
-                        r.get(2)?,
-                        r.get(3)?,
-                    ))
-                })
-                .map_err(err)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(err)?;
-            rows
-        };
-        for (id, uid, seen, unread) in local {
-            if !server.contains(&uid) {
-                // Gone upstream (deleted, or moved beyond our mirror):
-                // deletion wins, divergent intent included.
-                conn.execute("DELETE FROM message WHERE id=?1", [id])
-                    .map_err(err)?;
-                conn.execute("DELETE FROM server_msg WHERE message=?1", [id])
-                    .map_err(err)?;
-                continue;
-            }
-            let now_seen = !unseen.contains(&uid);
-            if now_seen != seen {
-                conn.execute(
-                    "UPDATE server_msg SET seen=?1 WHERE message=?2",
-                    rusqlite::params![now_seen, id],
-                )
-                .map_err(err)?;
-                // Clean rows (intent agrees with the old server state)
-                // follow the server; divergent intent will be pushed over
-                // it next pass instead.
-                if unread != seen {
-                    conn.execute(
-                        "UPDATE message SET unread=?1 WHERE id=?2",
-                        rusqlite::params![!now_seen, id],
+            // Divergent intent stays local truth: an unpushed read/archive is
+            // never clobbered, only recorded.
+            let local: Vec<(i64, u32, bool, bool)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT m.id, s.uid, s.seen, m.unread
+                         FROM server_msg s JOIN message m ON m.id = s.message
+                         WHERE s.folder=?1 AND s.uid IS NOT NULL",
                     )
                     .map_err(err)?;
+                let rows = stmt
+                    .query_map([fid], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)? as u32,
+                            r.get(2)?,
+                            r.get(3)?,
+                        ))
+                    })
+                    .map_err(err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(err)?;
+                rows
+            };
+            for (id, uid, seen, unread) in local {
+                if !server.contains(&uid) {
+                    // Gone upstream (deleted, or moved beyond our mirror):
+                    // deletion wins, divergent intent included.
+                    conn.execute("DELETE FROM message WHERE id=?1", [id])
+                        .map_err(err)?;
+                    conn.execute("DELETE FROM server_msg WHERE message=?1", [id])
+                        .map_err(err)?;
+                    continue;
+                }
+                let now_seen = !unseen.contains(&uid);
+                if now_seen != seen {
+                    conn.execute(
+                        "UPDATE server_msg SET seen=?1 WHERE message=?2",
+                        rusqlite::params![now_seen, id],
+                    )
+                    .map_err(err)?;
+                    // Clean rows (intent agrees with the old server state)
+                    // follow the server; divergent intent will be pushed over
+                    // it next pass instead.
+                    if unread != seen {
+                        conn.execute(
+                            "UPDATE message SET unread=?1 WHERE id=?2",
+                            rusqlite::params![!now_seen, id],
+                        )
+                        .map_err(err)?;
+                    }
                 }
             }
-        }
-        conn.execute("COMMIT", []).map_err(err)?;
+            Ok(())
+        })();
+        // A `?` straight out of the block above would leave the transaction
+        // open — and an open write transaction on this connection holds the
+        // lock for the life of the worker, which is the very thing this pass
+        // is arranged to avoid.
+        match out {
+            Ok(()) => conn.execute("COMMIT", []).map_err(err)?,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        };
     }
     Ok(())
 }
@@ -922,5 +956,106 @@ First paragraph.\r\n\r\nSecond paragraph.\r\n";
         }
         sync_account(s.conn(), &mut t, acct).unwrap();
         assert_eq!(inbox_rows(&s).len(), FETCH_CAP as usize);
+    }
+
+    /// A transport that checks, on every network verb, whether this process
+    /// could take the write lock right then — i.e. whether the pass is
+    /// holding it across the wire.
+    struct LockProbe {
+        inner: FakeTransport,
+        probe: Connection,
+        /// Verbs that found the write lock already taken.
+        blocked: Vec<&'static str>,
+    }
+
+    impl LockProbe {
+        fn check(&mut self, verb: &'static str) {
+            // No timeout: the question is whether the lock is free *now*.
+            if self.probe.execute("BEGIN IMMEDIATE", []).is_err() {
+                self.blocked.push(verb);
+            } else {
+                let _ = self.probe.execute("ROLLBACK", []);
+            }
+        }
+    }
+
+    impl Transport for LockProbe {
+        fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
+            self.check("folders");
+            self.inner.folders()
+        }
+        fn folder_meta(&mut self, n: &str) -> Result<FolderMeta, String> {
+            self.check("folder_meta");
+            self.inner.folder_meta(n)
+        }
+        fn fetch_from(&mut self, n: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+            self.check("fetch_from");
+            self.inner.fetch_from(n, from)
+        }
+        fn uids(&mut self, n: &str) -> Result<HashSet<u32>, String> {
+            self.check("uids");
+            self.inner.uids(n)
+        }
+        fn unread_uids(&mut self, n: &str) -> Result<HashSet<u32>, String> {
+            self.check("unread_uids");
+            self.inner.unread_uids(n)
+        }
+        fn move_uid(&mut self, f: &str, t: &str, uid: u32) -> Result<Option<u32>, String> {
+            self.check("move_uid");
+            self.inner.move_uid(f, t, uid)
+        }
+        fn store_seen(&mut self, f: &str, uid: u32, seen: bool) -> Result<(), String> {
+            self.check("store_seen");
+            self.inner.store_seen(f, uid, seen)
+        }
+    }
+
+    /// **A sync pass never holds the write lock across the network.** SQLite
+    /// has one writer and the UI shares this file, so a `BEGIN IMMEDIATE`
+    /// held over an IMAP round-trip stalls every UI action behind it for as
+    /// long as the server takes — which reads as the app hanging. This is a
+    /// property of the pass's shape, so it is pinned here rather than left to
+    /// whoever next edits the transaction boundaries.
+    #[test]
+    fn a_sync_pass_never_holds_the_write_lock_across_the_network() {
+        let dir = std::env::temp_dir().join(format!("superapp-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock.db");
+        let s = Store::open(Some(&path)).expect("store");
+        s.write(|c| {
+            c.execute(
+                "INSERT INTO account(label, email, imap_host) VALUES('t','t@t','imap.t')",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let mut t = FakeTransport::default();
+        t.folders.insert("INBOX".into(), (7, 1, Vec::new()));
+        t.folders.insert("Archive".into(), (3, 1, Vec::new()));
+        t.deliver("INBOX", true, RAW);
+
+        let probe = Connection::open(&path).unwrap();
+        probe.busy_timeout(Duration::from_millis(0)).unwrap();
+        let mut lp = LockProbe {
+            inner: t,
+            probe,
+            blocked: Vec::new(),
+        };
+
+        // First contact: creates folders, ingests, reconciles.
+        sync_account(s.conn(), &mut lp, 1).unwrap();
+        // And a pass with local intent to push, so the push side is covered.
+        s.write(|c| crate::mail::archive_tx(c, 1)).unwrap();
+        sync_account(s.conn(), &mut lp, 1).unwrap();
+
+        assert!(
+            lp.blocked.is_empty(),
+            "the write lock was held during: {:?}",
+            lp.blocked
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
