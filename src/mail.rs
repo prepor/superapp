@@ -1105,7 +1105,7 @@ fn base_mails() -> Vec<SeedMail> {
                  <a href=\"https://github.com/x/stelaxis\">stelaxis</a></div>\
                  </td></tr><tr><td>\
                  <p>Run <b>main #4128</b> failed on push <code>9f3c2a1</code>.</p>\
-                 <p>Failed steps:</p>\
+                 <p>Failed steps: &#55357;&#56960;</p>\
                  <ul><li>mix test &mdash; <b>2 failures</b></li>\
                  <li>credo --strict &mdash; <i>1 warning</i></li></ul>\
                  <p><i>This run was triggered by a push to </i><b><i>main</i></b>.</p>\
@@ -1302,6 +1302,12 @@ mod tests {
         assert!(h.contains("<ul><li>mix test"), "the list survives: {h}");
         assert!(h.contains(r#"<a href="https://github.com/x/stelaxis">"#));
         assert!(h.contains("&mdash;"), "entities are makepad's to decode");
+        // …except the ones it decodes by unwrapping `char::from_u32`. The
+        // seed carries an emoji spelled as its UTF-16 surrogate pair, the way
+        // real composers send them, so every run that draws this mail is a
+        // check that the pair was put back together before the widget saw it.
+        assert!(h.contains('🚀'), "the surrogate pair is repaired: {h}");
+        assert!(!h.contains("&#55357;"), "no bare surrogate reaches the widget");
         assert!(!h.contains("background:#24292f"), "the stylesheet is gone");
         assert!(!h.contains("<table") && !h.contains("<td"), "layout is gone");
         assert!(!h.contains("pixel.gif"), "the tracking pixel is gone");
