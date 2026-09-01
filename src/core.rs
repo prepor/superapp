@@ -65,6 +65,8 @@ pub enum Kind {
         /// The mail being replied to.
         re: MailId,
     },
+    /// Accounts and their sync state; the add-account form.
+    Settings,
 }
 
 impl Kind {
@@ -79,6 +81,7 @@ impl Kind {
             Kind::Message { .. } => (4, 3),
             Kind::Contact { .. } => (3, 2),
             Kind::Compose { .. } => (4, 4),
+            Kind::Settings => (4, 5),
         }
     }
 }
@@ -1216,6 +1219,7 @@ mod tests {
                         Kind::Message { .. } => "msg",
                         Kind::Contact { .. } => "contact",
                         Kind::Compose { .. } => "compose",
+                        Kind::Settings => "settings",
                     })
                     .collect()
             })

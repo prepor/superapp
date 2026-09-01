@@ -1,0 +1,620 @@
+//! The IMAP sync engine: one worker thread per account, each with its own
+//! connection to the one store (WAL; the UI notices foreign commits via
+//! `data_version` — see [`crate::store::Store::poll_external`]).
+//!
+//! Sync is **ingest**, not action: nothing here is undoable, and nothing
+//! here fights the user — rows flagged `dirty` (locally read/archived,
+//! server not yet told) are left alone by reconciliation until the op
+//! queue pushes them (CR-001 phase 4).
+//!
+//! The protocol work hides behind [`Transport`], so the whole engine runs
+//! headless in tests against [`FakeTransport`]; [`imap_transport`] is the
+//! real thing (rustls, port 993, app passwords — fastmail-style).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use rusqlite::Connection;
+
+/// How many most-recent messages a folder retains on first contact (and
+/// after a UIDVALIDITY reset). Bounded coverage, stated honestly — the
+/// panels say nothing below this window exists locally.
+pub const FETCH_CAP: u32 = 200;
+
+/// Poll cadence between kicks.
+const POLL: Duration = Duration::from_secs(60);
+
+/// A folder as the server lists it.
+#[derive(Debug, Clone)]
+pub struct RemoteFolder {
+    pub name: String,
+    /// inbox | archive | sent | trash — `None` folders are not mirrored.
+    pub role: Option<&'static str>,
+}
+
+/// SELECT results.
+#[derive(Debug, Clone, Copy)]
+pub struct FolderMeta {
+    pub uidvalidity: u32,
+    pub uidnext: u32,
+}
+
+/// One fetched message.
+#[derive(Debug, Clone)]
+pub struct RemoteMail {
+    pub uid: u32,
+    pub unread: bool,
+    pub raw: Vec<u8>,
+}
+
+/// The five IMAP verbs the engine needs. Errors are strings — they land on
+/// the account's status line, for a human.
+pub trait Transport {
+    fn folders(&mut self) -> Result<Vec<RemoteFolder>, String>;
+    fn folder_meta(&mut self, name: &str) -> Result<FolderMeta, String>;
+    /// Messages with `uid >= from`, ascending.
+    fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String>;
+    /// Every uid currently in the folder (deletion reconcile).
+    fn uids(&mut self, name: &str) -> Result<HashSet<u32>, String>;
+    /// Every unseen uid (flag reconcile).
+    fn unread_uids(&mut self, name: &str) -> Result<HashSet<u32>, String>;
+}
+
+/// One full sync pass for one account: mirror folders, fetch what is new,
+/// reconcile flags and deletions over the retained window. Each folder is
+/// one transaction.
+pub fn sync_account(
+    conn: &Connection,
+    t: &mut dyn Transport,
+    account: i64,
+) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    for rf in t.folders()? {
+        let Some(role) = rf.role else { continue };
+        let meta = t.folder_meta(&rf.name)?;
+
+        conn.execute("BEGIN IMMEDIATE", []).map_err(err)?;
+        let fid: i64 = conn
+            .query_row(
+                "SELECT id FROM folder WHERE account=?1 AND name=?2",
+                rusqlite::params![account, rf.name],
+                |r| r.get(0),
+            )
+            .or_else(|_| {
+                conn.execute(
+                    "INSERT INTO folder(account, name, role) VALUES(?1,?2,?3)",
+                    rusqlite::params![account, rf.name, role],
+                )
+                .map(|_| conn.last_insert_rowid())
+            })
+            .map_err(err)?;
+        let known: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT uidvalidity, uidnext FROM folder WHERE id=?1",
+                [fid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(err)?;
+
+        let floor = u32::max(1, meta.uidnext.saturating_sub(FETCH_CAP));
+        let from = if known.0 != Some(i64::from(meta.uidvalidity)) {
+            // The server renumbered (or first contact): local copies of
+            // this folder are meaningless. Start over inside the window.
+            conn.execute("DELETE FROM message WHERE folder=?1", [fid])
+                .map_err(err)?;
+            floor
+        } else {
+            known.1.map_or(floor, |n| n as u32)
+        };
+
+        if meta.uidnext > from {
+            for m in t.fetch_from(&rf.name, from)? {
+                if m.uid < from {
+                    continue; // `from:*` quirk: a lone highest message
+                }
+                ingest_message(conn, account, fid, &m).map_err(err)?;
+            }
+        }
+        conn.execute(
+            "UPDATE folder SET uidvalidity=?1, uidnext=?2 WHERE id=?3",
+            rusqlite::params![meta.uidvalidity, meta.uidnext, fid],
+        )
+        .map_err(err)?;
+
+        // Reconcile the retained window. Dirty rows are local truth.
+        let server = t.uids(&rf.name)?;
+        let unseen = t.unread_uids(&rf.name)?;
+        let local: Vec<(i64, u32, bool)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, uid, unread FROM message WHERE folder=?1 AND uid IS NOT NULL AND dirty=0")
+                .map_err(err)?;
+            let rows = stmt
+                .query_map([fid], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))
+                })
+                .map_err(err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(err)?;
+            rows
+        };
+        for (id, uid, local_unread) in local {
+            if !server.contains(&uid) {
+                conn.execute("DELETE FROM message WHERE id=?1", [id])
+                    .map_err(err)?;
+            } else if unseen.contains(&uid) != local_unread {
+                conn.execute(
+                    "UPDATE message SET unread=?1 WHERE id=?2",
+                    rusqlite::params![unseen.contains(&uid), id],
+                )
+                .map_err(err)?;
+            }
+        }
+        conn.execute("COMMIT", []).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Parses and stores one fetched message (idempotent per `(folder, uid)`).
+fn ingest_message(
+    conn: &Connection,
+    account: i64,
+    folder: i64,
+    m: &RemoteMail,
+) -> rusqlite::Result<()> {
+    let p = parse_mail(&m.raw);
+    conn.execute(
+        "INSERT INTO message(account, folder, uid, from_name, from_email,
+                             subject, date, unread, body, raw)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(folder, uid) WHERE uid IS NOT NULL DO NOTHING",
+        rusqlite::params![
+            account,
+            folder,
+            m.uid,
+            p.from_name,
+            p.from_email,
+            p.subject,
+            p.date,
+            m.unread,
+            p.body,
+            m.raw,
+        ],
+    )?;
+    Ok(())
+}
+
+/// What panels need out of an RFC 822 blob.
+pub struct ParsedMail {
+    pub from_name: String,
+    pub from_email: String,
+    pub subject: String,
+    pub date: f64,
+    pub body: String,
+}
+
+/// MIME → panel text via `mail-parser`. Paragraph structure survives as
+/// the `\n\n` convention the message panel already renders.
+pub fn parse_mail(raw: &[u8]) -> ParsedMail {
+    let msg = mail_parser::MessageParser::default().parse(raw);
+    let Some(msg) = msg else {
+        return ParsedMail {
+            from_name: String::new(),
+            from_email: String::new(),
+            subject: "(unparseable message)".into(),
+            date: 0.0,
+            body: String::new(),
+        };
+    };
+    let (from_name, from_email) = msg
+        .from()
+        .and_then(|a| a.first())
+        .map(|a| {
+            (
+                a.name().unwrap_or_default().to_string(),
+                a.address().unwrap_or_default().to_string(),
+            )
+        })
+        .unwrap_or_default();
+    let from_name = if from_name.is_empty() {
+        from_email.clone()
+    } else {
+        from_name
+    };
+    ParsedMail {
+        from_name,
+        from_email,
+        subject: msg.subject().unwrap_or("(no subject)").to_string(),
+        date: msg.date().map(|d| d.to_timestamp() as f64).unwrap_or(0.0),
+        body: msg
+            .body_text(0)
+            .map(|t| t.replace("\r\n", "\n").trim().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+// -- the worker ---------------------------------------------------------------
+
+/// A handle to kick a worker out of its poll sleep (the Refresh button).
+pub struct Worker {
+    pub account: i64,
+    kick: mpsc::Sender<()>,
+}
+
+impl Worker {
+    pub fn kick(&self) {
+        let _ = self.kick.send(());
+    }
+}
+
+/// Spawns the sync loop for one account: connect → sync → status → sleep
+/// (or kick) → again. The thread exits when its account row disappears.
+/// `notify` wakes the UI thread after every pass (`SignalToUI` upstairs —
+/// this module stays makepad-free).
+pub fn spawn(
+    db: PathBuf,
+    account: i64,
+    notify: impl Fn() + Send + 'static,
+) -> Worker {
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name(format!("sync-{account}"))
+        .spawn(move || {
+            let Ok(conn) = Connection::open(&db) else {
+                return;
+            };
+            let _ = conn.busy_timeout(Duration::from_millis(5000));
+            loop {
+                let cfg: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT email, imap_host FROM account WHERE id=?1",
+                        [account],
+                        |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+                    )
+                    .ok();
+                let Some((email, host)) = cfg else {
+                    return; // account removed: the worker retires
+                };
+                if host.is_empty() {
+                    return; // demo account: nothing to sync
+                }
+                let pass = crate::secret::get(db.parent().unwrap_or(&db), &email);
+                let outcome = match pass {
+                    Some(pass) => imap_transport::connect(&host, &email, &pass)
+                        .and_then(|mut t| sync_account(&conn, &mut t, account)),
+                    None => Err("no password in the keychain".into()),
+                };
+                let status = match &outcome {
+                    Ok(()) => format!("ok · {}", crate::mail::fmt_date(crate::store::now())),
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = conn.execute(
+                    "UPDATE account SET status=?1, synced=?2 WHERE id=?3",
+                    rusqlite::params![
+                        status,
+                        outcome.is_ok().then(crate::store::now),
+                        account
+                    ],
+                );
+                notify();
+                // Sleep until the next poll or a kick; a closed channel
+                // (app shutdown) just means one last timeout then exit
+                // with the account check above.
+                match rx.recv_timeout(POLL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        })
+        .expect("spawn sync worker");
+    Worker { account, kick: tx }
+}
+
+// -- the real transport -------------------------------------------------------
+
+/// The `imap` crate behind [`Transport`]: rustls, port 993, LOGIN with an
+/// app password (fastmail-style; OAuth is deliberately later).
+pub mod imap_transport {
+    use super::*;
+
+    type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
+
+    pub struct Imap {
+        session: ImapSession,
+        selected: Option<String>,
+    }
+
+    fn s<E: std::fmt::Display>(e: E) -> String {
+        format!("{e}")
+    }
+
+    pub fn connect(host: &str, user: &str, pass: &str) -> Result<Imap, String> {
+        let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
+        let session = client.login(user, pass).map_err(|e| s(e.0))?;
+        Ok(Imap {
+            session,
+            selected: None,
+        })
+    }
+
+    impl Imap {
+        fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
+            let mb = self.session.select(name).map_err(s)?;
+            self.selected = Some(name.to_string());
+            Ok(FolderMeta {
+                uidvalidity: mb.uid_validity.unwrap_or(0),
+                uidnext: mb.uid_next.unwrap_or(1),
+            })
+        }
+
+        fn ensure(&mut self, name: &str) -> Result<(), String> {
+            if self.selected.as_deref() != Some(name) {
+                self.select(name)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Transport for Imap {
+        fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
+            let names = self.session.list(Some(""), Some("*")).map_err(s)?;
+            let mut out = Vec::new();
+            for n in names.iter() {
+                let attrs = format!("{:?}", n.attributes()).to_lowercase();
+                let role = if n.name().eq_ignore_ascii_case("inbox") {
+                    Some("inbox")
+                } else if attrs.contains("archive") {
+                    Some("archive")
+                } else if attrs.contains("sent") {
+                    Some("sent")
+                } else if attrs.contains("trash") {
+                    Some("trash")
+                } else {
+                    None
+                };
+                out.push(RemoteFolder {
+                    name: n.name().to_string(),
+                    role,
+                });
+            }
+            Ok(out)
+        }
+
+        fn folder_meta(&mut self, name: &str) -> Result<FolderMeta, String> {
+            self.select(name)
+        }
+
+        fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+            self.ensure(name)?;
+            let fetches = self
+                .session
+                .uid_fetch(format!("{from}:*"), "(UID FLAGS RFC822)")
+                .map_err(s)?;
+            let mut out: Vec<RemoteMail> = fetches
+                .iter()
+                .filter_map(|f| {
+                    let uid = f.uid?;
+                    let raw = f.body().or_else(|| f.text())?;
+                    let unread = !f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
+                    Some(RemoteMail {
+                        uid,
+                        unread,
+                        raw: raw.to_vec(),
+                    })
+                })
+                .collect();
+            out.sort_by_key(|m| m.uid);
+            Ok(out)
+        }
+
+        fn uids(&mut self, name: &str) -> Result<HashSet<u32>, String> {
+            self.ensure(name)?;
+            self.session.uid_search("ALL").map_err(s)
+        }
+
+        fn unread_uids(&mut self, name: &str) -> Result<HashSet<u32>, String> {
+            self.ensure(name)?;
+            self.session.uid_search("UNSEEN").map_err(s)
+        }
+    }
+}
+
+// -- the fake transport (tests + --fake-mail) ---------------------------------
+
+/// An in-memory mail server: the whole engine runs against it headless.
+#[derive(Default, Clone)]
+pub struct FakeTransport {
+    /// folder → (uidvalidity, next_uid, mails)
+    pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
+}
+
+impl FakeTransport {
+    pub fn deliver(&mut self, folder: &str, unread: bool, raw: &str) -> u32 {
+        let f = self
+            .folders
+            .entry(folder.to_string())
+            .or_insert((1, 1, Vec::new()));
+        let uid = f.1;
+        f.1 += 1;
+        f.2.push(RemoteMail {
+            uid,
+            unread,
+            raw: raw.as_bytes().to_vec(),
+        });
+        uid
+    }
+
+    pub fn remove(&mut self, folder: &str, uid: u32) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            f.2.retain(|m| m.uid != uid);
+        }
+    }
+
+    pub fn mark_seen(&mut self, folder: &str, uid: u32) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            for m in &mut f.2 {
+                if m.uid == uid {
+                    m.unread = false;
+                }
+            }
+        }
+    }
+
+    fn role_of(name: &str) -> Option<&'static str> {
+        match name {
+            "INBOX" => Some("inbox"),
+            "Archive" => Some("archive"),
+            "Sent" => Some("sent"),
+            "Trash" => Some("trash"),
+            _ => None,
+        }
+    }
+}
+
+impl Transport for FakeTransport {
+    fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
+        let mut names: Vec<&String> = self.folders.keys().collect();
+        names.sort();
+        Ok(names
+            .into_iter()
+            .map(|n| RemoteFolder {
+                name: n.clone(),
+                role: Self::role_of(n),
+            })
+            .collect())
+    }
+
+    fn folder_meta(&mut self, name: &str) -> Result<FolderMeta, String> {
+        let f = self.folders.get(name).ok_or("no such folder")?;
+        Ok(FolderMeta {
+            uidvalidity: f.0,
+            uidnext: f.1,
+        })
+    }
+
+    fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+        let f = self.folders.get(name).ok_or("no such folder")?;
+        Ok(f.2.iter().filter(|m| m.uid >= from).cloned().collect())
+    }
+
+    fn uids(&mut self, name: &str) -> Result<HashSet<u32>, String> {
+        let f = self.folders.get(name).ok_or("no such folder")?;
+        Ok(f.2.iter().map(|m| m.uid).collect())
+    }
+
+    fn unread_uids(&mut self, name: &str) -> Result<HashSet<u32>, String> {
+        let f = self.folders.get(name).ok_or("no such folder")?;
+        Ok(f.2.iter().filter(|m| m.unread).map(|m| m.uid).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    const RAW: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
+Subject: Budget v2\r\n\
+Date: Mon, 31 Aug 2026 09:14:00 +0000\r\n\
+\r\n\
+First paragraph.\r\n\r\nSecond paragraph.\r\n";
+
+    fn world() -> (Store, FakeTransport, i64) {
+        let s = Store::open(None).expect("store");
+        s.write(|c| {
+            c.execute(
+                "INSERT INTO account(label, email, imap_host) VALUES('t','t@t','imap.t')",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+        let mut t = FakeTransport::default();
+        t.folders.insert("INBOX".into(), (7, 1, Vec::new()));
+        (s, t, 1)
+    }
+
+    fn inbox_rows(s: &Store) -> Vec<(String, bool)> {
+        let mut stmt = s
+            .conn()
+            .prepare(
+                "SELECT m.subject, m.unread FROM message m
+                 JOIN folder f ON m.folder=f.id WHERE f.role='inbox' ORDER BY m.uid",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Initial sync ingests and parses; a second pass fetches only what is
+    /// new; flags flip; remote deletions disappear locally.
+    #[test]
+    fn sync_ingests_incrementally_and_reconciles() {
+        let (s, mut t, acct) = world();
+        let u1 = t.deliver("INBOX", true, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s), vec![("Budget v2".to_string(), true)]);
+        let body: String = s
+            .conn()
+            .query_row("SELECT body FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert!(body.contains("First paragraph.\n\nSecond"), "{body:?}");
+
+        // Second pass: nothing new, nothing duplicated.
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s).len(), 1);
+
+        // A new delivery, a seen flag, then a remote deletion.
+        let u2 = t.deliver("INBOX", true, "Subject: Two\r\n\r\nx");
+        t.mark_seen("INBOX", u1);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(
+            inbox_rows(&s),
+            vec![("Budget v2".into(), false), ("Two".into(), true)]
+        );
+        t.remove("INBOX", u2);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s).len(), 1);
+    }
+
+    /// Dirty rows — locally read or archived, server not yet told — are
+    /// immune to reconciliation.
+    #[test]
+    fn dirty_rows_win_over_the_server() {
+        let (s, mut t, acct) = world();
+        t.deliver("INBOX", true, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        // The user reads it locally (dirty=1); the server still says UNSEEN.
+        s.write(|c| crate::mail::mark_read_tx(c, 1)).unwrap();
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s), vec![("Budget v2".to_string(), false)]);
+    }
+
+    /// A UIDVALIDITY change wipes the folder and refetches inside the cap.
+    #[test]
+    fn uidvalidity_reset_refetches() {
+        let (s, mut t, acct) = world();
+        t.deliver("INBOX", false, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s).len(), 1);
+        // The server renumbers: same mail, new world.
+        let f = t.folders.get_mut("INBOX").unwrap();
+        f.0 = 8;
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s).len(), 1, "refetched, not duplicated");
+    }
+
+    /// First contact with a big folder fetches only the newest [`FETCH_CAP`].
+    #[test]
+    fn first_contact_respects_the_cap() {
+        let (s, mut t, acct) = world();
+        for i in 0..(FETCH_CAP + 50) {
+            t.deliver("INBOX", false, &format!("Subject: m{i}\r\n\r\nx"));
+        }
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(inbox_rows(&s).len(), FETCH_CAP as usize);
+    }
+}

@@ -279,7 +279,14 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    conflicts (rows changed since) OMIT-skipped; `wm.active` moved out of
    `meta` into a recorded `wm` table (schema v2); menu bar Undo/Redo.
 3. **IMAP read.** Accounts + keychain; sync workers; real unified inbox;
-   bodies via mail-parser.
+   bodies via mail-parser. — **landed 2026-09-01**: settings panel (add
+   form with masked password, per-account status lines, undoable
+   add/remove); one worker thread per account, own connection, 60 s poll +
+   kickable Refresh; folders by special-use; 200-message window per
+   folder; `dirty` rows immune to reconciliation until phase 4 pushes
+   them; foreign commits reach the UI via SignalToUI + `data_version`.
+   Engine unit-tested against a fake transport; the `.invalid`-host e2e
+   exercises the real signal path.
 4. **Ops for real.** Executor to the server (archive/delete/flags),
    offline-safe, undo enqueues compensations.
 5. **Send.** Drafts persist; outbox with a 10 s window; SMTP worker; undo-send;

@@ -1,0 +1,27 @@
+# The settings walk: reach it via the launcher, add an account (an .invalid
+# host, so the worker fails fast and locally), watch the status land via the
+# worker's signal, remove it again.
+wait 700
+key cmd 2
+wait 400
+type "settings"
+wait 300
+key enter
+wait 600
+shot s1-settings
+click "address"
+type "andrey@fastmail.test"
+click "password"
+type "app-pass-123"
+click "imap"
+key backspace 30
+type "imap.invalid"
+wait 200
+shot s2-filled
+click "add account"
+wait 2500
+shot s3-account-error
+click "remove"
+wait 500
+shot s4-removed
+quit

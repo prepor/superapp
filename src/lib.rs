@@ -8,6 +8,8 @@
 //! | [`core`] | pure panel/column/join state machine | no |
 //! | [`store`] | the one SQLite file + the reactive query layer | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
+//! | [`sync`] | the IMAP engine: workers, ingest, reconciliation | no |
+//! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
 //! | [`theme`] | the look: sizes and colours | no |
@@ -22,6 +24,8 @@ pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod mail;
+pub mod secret;
 pub mod spring;
 pub mod store;
+pub mod sync;
 pub mod theme;

@@ -82,6 +82,8 @@ pub struct Store {
     /// Result cache per `(sql, params)`.
     cache: RefCell<HashMap<(&'static str, String), Cached>>,
     redraw: Cell<bool>,
+    /// Last seen `PRAGMA data_version` (foreign-commit detector).
+    data_version: Cell<i64>,
 }
 
 /// Schema v1. UI tables are mutated only through actions (phase 2 formalizes
@@ -166,6 +168,25 @@ INSERT INTO wm(id, active)
 DELETE FROM meta WHERE key='wm_active';
 ";
 
+/// Schema v3 (CR-001 phase 3): real accounts. IMAP identity on folders and
+/// messages, connection config and sync status on accounts, and the `dirty`
+/// flag — a local change (read, archive) the server has not been told about
+/// yet; reconciliation leaves dirty rows alone (phase 4's op executor
+/// clears them).
+const SCHEMA_V3: &str = "
+ALTER TABLE account ADD COLUMN imap_host TEXT;
+ALTER TABLE account ADD COLUMN smtp_host TEXT;
+ALTER TABLE account ADD COLUMN status TEXT;
+ALTER TABLE account ADD COLUMN synced REAL;
+ALTER TABLE folder ADD COLUMN uidvalidity INTEGER;
+ALTER TABLE folder ADD COLUMN uidnext INTEGER;
+ALTER TABLE message ADD COLUMN uid INTEGER;
+ALTER TABLE message ADD COLUMN raw BLOB;
+ALTER TABLE message ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX idx_message_folder_uid ON message(folder, uid)
+  WHERE uid IS NOT NULL;
+";
+
 /// The tables sessions record — the undoable world. `action` and `meta`
 /// (the head pointer) stay outside it: undo must never rewrite history's
 /// own bookkeeping.
@@ -209,6 +230,10 @@ impl Store {
             conn.execute_batch(SCHEMA_V2)?;
             conn.pragma_update(None, "user_version", 2)?;
         }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
+            conn.pragma_update(None, "user_version", 3)?;
+        }
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         let d = dirty.clone();
@@ -225,6 +250,7 @@ impl Store {
             deps: RefCell::default(),
             cache: RefCell::default(),
             redraw: Cell::new(false),
+            data_version: Cell::new(-1),
         })
     }
 
@@ -252,6 +278,31 @@ impl Store {
     /// redraw (its own writes redraw anyway; this catches future ingest).
     pub fn take_redraw(&self) -> bool {
         self.redraw.replace(false)
+    }
+
+    /// Detects commits from *other* connections (the sync workers):
+    /// `data_version` moves only for foreign commits. Coarse on purpose —
+    /// every table's generation bumps, every cached query re-runs; at this
+    /// scale that costs microseconds. Returns whether anything changed.
+    pub fn poll_external(&self) -> bool {
+        let v: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if v == self.data_version.replace(v) {
+            return false;
+        }
+        let mut gens = self.generations.borrow_mut();
+        for g in gens.values_mut() {
+            *g += 1;
+        }
+        // Tables no query has touched yet have no entry — a fresh read
+        // records the current (bumped) state, so nothing is missed.
+        drop(gens);
+        // Invalidate even never-bumped deps: wipe the cache wholesale.
+        self.cache.borrow_mut().clear();
+        self.redraw.set(true);
+        true
     }
 
     /// The tables a query reads, captured by the authorizer at first
@@ -703,6 +754,7 @@ fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Message { id } => ("message", Some(*id), None),
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
         Kind::Compose { re } => ("compose", Some(*re), None),
+        Kind::Settings => ("settings", None, None),
     }
 }
 
@@ -715,6 +767,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "message" => Kind::Message { id: p_int? },
         "contact" => Kind::Contact { email: p_txt? },
         "compose" => Kind::Compose { re: p_int? },
+        "settings" => Kind::Settings,
         _ => return None,
     })
 }

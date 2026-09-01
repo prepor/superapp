@@ -30,6 +30,7 @@ use crate::e2e;
 use crate::launcher;
 use crate::mail;
 use crate::store::Store;
+use crate::sync;
 use crate::spring::{Spring, SpringParams};
 use crate::theme;
 
@@ -305,6 +306,10 @@ enum BtnAct {
     Send,
     Discard,
     TryIt,
+    /// Settings: create the account from the form fields.
+    AddAccount,
+    /// Settings: remove this account (and its mail).
+    RemoveAccount(i64),
 }
 
 /// Text fields.
@@ -314,6 +319,11 @@ enum FieldId {
     To,
     Subject,
     Body,
+    /// Settings form: address, app password, IMAP host, SMTP host.
+    SetEmail,
+    SetPass,
+    SetImap,
+    SetSmtp,
 }
 
 /// One run inside a line.
@@ -482,6 +492,26 @@ struct PanelUi {
     subject: TextField,
     body: Vec<String>,
     caret: (usize, usize), // row, col in chars
+    set_email: TextField,
+    set_pass: TextField,
+    set_imap: TextField,
+    set_smtp: TextField,
+}
+
+impl PanelUi {
+    /// Every single-line field by id (`Body` is the multi-line exception).
+    fn field_mut(&mut self, fid: FieldId) -> Option<&mut TextField> {
+        Some(match fid {
+            FieldId::Filter => &mut self.filter,
+            FieldId::To => &mut self.to,
+            FieldId::Subject => &mut self.subject,
+            FieldId::SetEmail => &mut self.set_email,
+            FieldId::SetPass => &mut self.set_pass,
+            FieldId::SetImap => &mut self.set_imap,
+            FieldId::SetSmtp => &mut self.set_smtp,
+            FieldId::Body => return None,
+        })
+    }
 }
 
 impl PanelUi {
@@ -497,6 +527,10 @@ impl PanelUi {
             subject: TextField::default(),
             body: vec![String::new()],
             caret: (0, 0),
+            set_email: TextField::default(),
+            set_pass: TextField::default(),
+            set_imap: TextField::default(),
+            set_smtp: TextField::default(),
         };
         match kind {
             Kind::Inbox { filter } => {
@@ -504,6 +538,13 @@ impl PanelUi {
                     ui.filter.text = f.clone();
                     ui.filter.caret = ui.filter.text.chars().count();
                 }
+            }
+            Kind::Settings => {
+                // Editable fastmail-style defaults, not placeholders.
+                ui.set_imap.text = "imap.fastmail.com".into();
+                ui.set_imap.caret = ui.set_imap.text.chars().count();
+                ui.set_smtp.text = "smtp.fastmail.com".into();
+                ui.set_smtp.caret = ui.set_smtp.text.chars().count();
             }
             // Read flags are the *opening action's* business (its changeset
             // carries the flag flip, so undo restores unread) — not this
@@ -877,6 +918,11 @@ struct LauncherUi {
 struct State {
     ws: Wm,
     store: Store,
+    /// The store's file path — sync workers open their own connections to
+    /// it (`None` = in-memory: no workers).
+    db_path: Option<std::path::PathBuf>,
+    /// One IMAP worker per configured account.
+    workers: Vec<sync::Worker>,
     /// The last persisted logical snapshot — [`State::sync`] only writes
     /// when the state actually changed.
     last_saved: Option<core::WmSnap>,
@@ -900,6 +946,10 @@ fn field_text_caret(state: &State, pid: PanelId, fid: FieldId) -> Option<(String
         FieldId::Filter => (ui.filter.text.clone(), ui.filter.caret),
         FieldId::To => (ui.to.text.clone(), ui.to.caret),
         FieldId::Subject => (ui.subject.text.clone(), ui.subject.caret),
+        FieldId::SetEmail => (ui.set_email.text.clone(), ui.set_email.caret),
+        FieldId::SetPass => (ui.set_pass.text.clone(), ui.set_pass.caret),
+        FieldId::SetImap => (ui.set_imap.text.clone(), ui.set_imap.caret),
+        FieldId::SetSmtp => (ui.set_smtp.text.clone(), ui.set_smtp.caret),
         FieldId::Body => {
             let (r, c) = ui.caret;
             let caret = ui
@@ -934,7 +984,7 @@ fn grid_for(vp: DVec2) -> core::Grid {
 }
 
 impl State {
-    fn new(store: Store) -> Self {
+    fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
         // Boot restores the last session from the store; a store that never
         // booted gets the default layout (and persists it on first sync).
         let ws = match store.load_wm() {
@@ -954,6 +1004,8 @@ impl State {
         State {
             ws,
             store,
+            db_path,
+            workers: Vec::new(),
             last_saved: None,
             ui: HashMap::new(),
             anim: Anim::default(),
@@ -1111,6 +1163,29 @@ impl State {
         self.act(kind, label, entity, mutate, |_| Ok(()));
     }
 
+    /// Spawns a sync worker for every configured account that lacks one.
+    /// Idempotent — call after boot and after adding an account. Workers
+    /// for removed accounts retire themselves.
+    fn spawn_workers(&mut self) {
+        let Some(db) = self.db_path.clone() else {
+            return;
+        };
+        self.workers.retain(|w| {
+            mail::accounts(&self.store).iter().any(|a| a.id == w.account)
+        });
+        for a in mail::accounts(&self.store).iter() {
+            if a.imap_host.as_deref().unwrap_or("").is_empty() {
+                continue; // the local demo account
+            }
+            if self.workers.iter().any(|w| w.account == a.id) {
+                continue;
+            }
+            self.workers.push(sync::spawn(db.clone(), a.id, || {
+                SignalToUI::set_ui_signal();
+            }));
+        }
+    }
+
     /// Rebuilds the in-memory `Wm` from the store — the tail of every
     /// undo/redo, whose changesets rewrote the UI tables underneath us.
     fn reload_wm(&mut self) {
@@ -1160,7 +1235,81 @@ fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
         Kind::Message { id } => message_lines(state, id, cols),
         Kind::Contact { email } => contact_lines(state, email),
         Kind::Compose { re } => compose_lines(ui, re),
+        Kind::Settings => settings_lines(state),
     }
+}
+
+/// The settings panel: every account with its sync status, and the
+/// add-account form (fastmail-style: address + app password; hosts are
+/// editable defaults; the user name is the address).
+fn settings_lines(state: &State) -> Vec<Line> {
+    let mut v = Vec::new();
+    v.push(Line {
+        left: vec![Seg::T("ACCOUNTS".into(), Style::Label)],
+        rule: true,
+        rule_ink: true,
+        ..Default::default()
+    });
+    let accounts = mail::accounts(&state.store);
+    for a in accounts.iter() {
+        let host = a.imap_host.clone().unwrap_or_default();
+        v.push(Line {
+            left: vec![
+                Seg::T(a.email.clone(), Style::Bold),
+                Seg::Sp(2),
+                Seg::T(
+                    if host.is_empty() { "local demo".into() } else { host },
+                    Style::Muted,
+                ),
+            ],
+            right: vec![Seg::Btn {
+                label: "remove".into(),
+                act: BtnAct::RemoveAccount(a.id),
+            }],
+            ..Default::default()
+        });
+        let status = a.status.clone().unwrap_or_else(|| "never synced".into());
+        let err = status.starts_with("error");
+        v.push(Line {
+            left: vec![Seg::T(status, if err { Style::Err } else { Style::Muted })],
+            rule: true,
+            ..Default::default()
+        });
+    }
+    if accounts.is_empty() {
+        v.push(Line::text("no accounts", Style::Muted));
+    }
+    v.push(Line::blank());
+    v.push(Line {
+        left: vec![Seg::T("ADD ACCOUNT".into(), Style::Label)],
+        rule: true,
+        rule_ink: true,
+        ..Default::default()
+    });
+    let field = |name: &str, id: FieldId| Line {
+        left: vec![
+            Seg::T(pad_to(name, 10), Style::Label),
+            Seg::Fld { id, w: 28 },
+        ],
+        ..Default::default()
+    };
+    v.push(field("ADDRESS", FieldId::SetEmail));
+    v.push(field("PASSWORD", FieldId::SetPass));
+    v.push(field("IMAP", FieldId::SetImap));
+    v.push(field("SMTP", FieldId::SetSmtp));
+    v.push(Line::blank());
+    v.push(Line {
+        left: vec![Seg::T(
+            "an app password — the real one never works, by design".into(),
+            Style::Muted,
+        )],
+        right: vec![Seg::Btn {
+            label: "add account".into(),
+            act: BtnAct::AddAccount,
+        }],
+        ..Default::default()
+    });
+    v
 }
 
 fn help_lines() -> Vec<Line> {
@@ -1475,7 +1624,7 @@ fn message_lines(state: &State, id: &MailId, cols: usize) -> Vec<Line> {
     v.push(Line {
         left: vec![
             Seg::T(pad_to("TO", 6), Style::Label),
-            Seg::T(mail::me(&state.store), Style::Muted),
+            Seg::T(m.to.clone(), Style::Muted),
         ],
         ..Default::default()
     });
@@ -2435,12 +2584,7 @@ impl Stage {
                     _ => return,
                 },
                 _ => {
-                    let f = match fid {
-                        FieldId::Filter => &mut ui.filter,
-                        FieldId::To => &mut ui.to,
-                        FieldId::Subject => &mut ui.subject,
-                        FieldId::Body => unreachable!(),
-                    };
+                    let f = ui.field_mut(fid).expect("single-line field");
                     match k.key_code {
                         KeyCode::Escape => state.field = None,
                         KeyCode::ReturnKey => {
@@ -2726,12 +2870,7 @@ impl Stage {
                 ui.caret = rc;
             }
             _ => {
-                let f = match fid {
-                    FieldId::Filter => &mut ui.filter,
-                    FieldId::To => &mut ui.to,
-                    FieldId::Subject => &mut ui.subject,
-                    FieldId::Body => unreachable!(),
-                };
+                let f = ui.field_mut(fid).expect("single-line field");
                 f.text = fs.text.clone();
                 f.caret = caret.min(f.text.chars().count());
                 if fid == FieldId::Filter {
@@ -2765,13 +2904,16 @@ impl Stage {
                         ui.filter.insert(input);
                         ui.sel = None;
                     }
-                    FieldId::To => ui.to.insert(input),
-                    FieldId::Subject => ui.subject.insert(input),
                     FieldId::Body => {
                         let (r, c) = ui.caret;
                         let byte = char_byte(&ui.body[r], c);
                         ui.body[r].insert_str(byte, input);
                         ui.caret = (r, c + input.chars().count());
+                    }
+                    _ => {
+                        if let Some(f) = ui.field_mut(fid) {
+                            f.insert(input);
+                        }
                     }
                 }
                 self.kick(cx);
@@ -2961,7 +3103,78 @@ impl Stage {
                     BtnAct::TryIt => {
                         state.toast("side effect: nothing was opened or replaced", false);
                     }
-                    BtnAct::Refresh => state.toast("inbox refreshed (fake)", false),
+                    BtnAct::Refresh => {
+                        if state.workers.is_empty() {
+                            state.toast("no accounts to sync — add one in settings", false);
+                        } else {
+                            for w in &state.workers {
+                                w.kick();
+                            }
+                            state.toast("syncing…", false);
+                        }
+                    }
+                    BtnAct::AddAccount => {
+                        let form = state.ui.get(&pid).map(|u| {
+                            (
+                                u.set_email.text.trim().to_string(),
+                                u.set_pass.text.clone(),
+                                u.set_imap.text.trim().to_string(),
+                                u.set_smtp.text.trim().to_string(),
+                            )
+                        });
+                        let Some((email, pass, imap, smtp)) = form else {
+                            return;
+                        };
+                        if email.is_empty() || pass.is_empty() || imap.is_empty() {
+                            state.toast("address, password and imap host are required", true);
+                        } else if state.db_path.is_none() {
+                            state.toast("no store file — accounts need one", true);
+                        } else {
+                            let dir = state
+                                .db_path
+                                .as_ref()
+                                .and_then(|p| p.parent())
+                                .map(std::path::Path::to_path_buf)
+                                .unwrap_or_default();
+                            if !crate::secret::set(&dir, &email, &pass) {
+                                state.toast("storing the password failed", true);
+                            } else {
+                                state.act(
+                                    "account",
+                                    format!("add account {email}"),
+                                    None,
+                                    |_| {},
+                                    move |tx| {
+                                        mail::add_account_tx(tx, &email, &imap, &smtp)
+                                            .map(|_| ())
+                                    },
+                                );
+                                if let Some(ui) = state.ui.get_mut(&pid) {
+                                    ui.set_email = TextField::default();
+                                    ui.set_pass = TextField::default();
+                                }
+                                state.field = None;
+                                state.spawn_workers();
+                                state.toast("account added — syncing", false);
+                            }
+                        }
+                    }
+                    BtnAct::RemoveAccount(id) => {
+                        let email = mail::accounts(&state.store)
+                            .iter()
+                            .find(|a| a.id == id)
+                            .map(|a| a.email.clone())
+                            .unwrap_or_default();
+                        state.act(
+                            "account",
+                            format!("remove account {email}"),
+                            None,
+                            |_| {},
+                            move |tx| mail::remove_account_tx(tx, id),
+                        );
+                        state.spawn_workers();
+                        state.toast(format!("removed {email} — ⌘z undoes"), false);
+                    }
                     BtnAct::Archive => {
                         if let Some(Kind::Message { id }) =
                             state.ws.panels.get(&pid).map(|p| p.kind.clone())
@@ -3249,7 +3462,8 @@ impl Widget for Stage {
                 if let Err(e) = mail::seed_if_empty(&store) {
                     eprintln!("store: seeding demo mail failed: {e}");
                 }
-                let mut s = State::new(store);
+                let mut s = State::new(store, path);
+                s.spawn_workers();
                 s.sync();
                 self.state = Some(Box::new(s));
             }
@@ -3297,6 +3511,18 @@ impl Widget for Stage {
             Event::KeyDown(k) => self.handle_key_down(cx, k),
 
             Event::KeyUp(k) => self.handle_key_up(cx, k),
+
+            // A sync worker committed: foreign generations bump, stale
+            // queries re-run on the next draw.
+            Event::Signal => {
+                if SignalToUI::check_and_clear_ui_signal() {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        if state.store.poll_external() {
+                            cx.redraw_all();
+                        }
+                    }
+                }
+            }
 
             // A menu item (macOS menu bar).
             Event::MacosMenuCommand(cmd) => {
@@ -4572,7 +4798,17 @@ impl Stage {
                     (FieldId::Filter, Some(u)) => (u.filter.text.clone(), u.filter.caret),
                     (FieldId::To, Some(u)) => (u.to.text.clone(), u.to.caret),
                     (FieldId::Subject, Some(u)) => (u.subject.text.clone(), u.subject.caret),
+                    (FieldId::SetEmail, Some(u)) => (u.set_email.text.clone(), u.set_email.caret),
+                    (FieldId::SetPass, Some(u)) => (u.set_pass.text.clone(), u.set_pass.caret),
+                    (FieldId::SetImap, Some(u)) => (u.set_imap.text.clone(), u.set_imap.caret),
+                    (FieldId::SetSmtp, Some(u)) => (u.set_smtp.text.clone(), u.set_smtp.caret),
                     _ => (String::new(), 0),
+                };
+                // A password draws as dots — same length, same caret.
+                let text = if *id == FieldId::SetPass {
+                    "•".repeat(text.chars().count())
+                } else {
+                    text
                 };
                 if text.is_empty() && *id == FieldId::Filter {
                     self.draw_text_at(cx, x + 4.0, y, "filter…  ( / )", Style::Muted, alpha);
@@ -4595,6 +4831,10 @@ impl Stage {
                         FieldId::To => "to",
                         FieldId::Subject => "subject",
                         FieldId::Body => "body",
+                        FieldId::SetEmail => "address",
+                        FieldId::SetPass => "password",
+                        FieldId::SetImap => "imap",
+                        FieldId::SetSmtp => "smtp",
                     }
                     .to_string(),
                 });

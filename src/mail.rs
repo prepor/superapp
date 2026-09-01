@@ -31,6 +31,8 @@ pub struct MailFull {
     pub body: String,
     /// An optional status line; `true` marks it as an error.
     pub status: Option<(String, bool)>,
+    /// The receiving account's address (the TO line).
+    pub to: String,
 }
 
 /// A distinct sender: the launcher's contact entries.
@@ -58,10 +60,11 @@ static Q_ALL: Q = Q {
 
 static Q_MAIL: Q = Q {
     id: "mail",
-    sql: "SELECT id, from_name, from_email, subject, date, unread,
-                 body, status, status_err
-          FROM message WHERE id = ?1",
-    describe: "one mail, body included",
+    sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
+                 m.body, m.status, m.status_err, a.email
+          FROM message m JOIN account a ON a.id = m.account
+          WHERE m.id = ?1",
+    describe: "one mail, body included, with its account's address",
 };
 
 static Q_SENDERS: Q = Q {
@@ -83,6 +86,13 @@ static Q_ME: Q = Q {
     describe: "the local account's address",
 };
 
+static Q_ACCOUNTS: Q = Q {
+    id: "accounts",
+    sql: "SELECT id, label, email, imap_host, smtp_host, status, synced
+          FROM account ORDER BY id",
+    describe: "every account with its connection config and sync status",
+};
+
 fn head_row(r: &rusqlite::Row) -> rusqlite::Result<MailHead> {
     Ok(MailHead {
         id: r.get(0)?,
@@ -101,6 +111,7 @@ fn full_row(r: &rusqlite::Row) -> rusqlite::Result<MailFull> {
         head: head_row(r)?,
         body: r.get(6)?,
         status: status.map(|s| (s, err)),
+        to: r.get(9)?,
     })
 }
 
@@ -163,6 +174,58 @@ pub fn contact(store: &Store, email: &str) -> (String, i64) {
         .unwrap_or_else(|| (email.to_string(), 0))
 }
 
+/// One account row, as settings shows it.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub id: i64,
+    pub label: String,
+    pub email: String,
+    pub imap_host: Option<String>,
+    pub smtp_host: Option<String>,
+    pub status: Option<String>,
+    pub synced: Option<f64>,
+}
+
+fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
+    Ok(Account {
+        id: r.get(0)?,
+        label: r.get(1)?,
+        email: r.get(2)?,
+        imap_host: r.get(3)?,
+        smtp_host: r.get(4)?,
+        status: r.get(5)?,
+        synced: r.get(6)?,
+    })
+}
+
+/// Every account.
+pub fn accounts(store: &Store) -> Rc<Vec<Account>> {
+    store.rows(&Q_ACCOUNTS, &[], account_row)
+}
+
+/// Creates an account (the settings form's action). Folders arrive with the
+/// first sync; the password goes to the keychain, never here.
+pub fn add_account_tx(
+    c: &rusqlite::Connection,
+    email: &str,
+    imap_host: &str,
+    smtp_host: &str,
+) -> rusqlite::Result<i64> {
+    c.execute(
+        "INSERT INTO account(label, email, imap_host, smtp_host) VALUES(?1,?1,?2,?3)",
+        rusqlite::params![email, imap_host, smtp_host],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
+/// Removes an account and everything it brought.
+pub fn remove_account_tx(c: &rusqlite::Connection, id: i64) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM message WHERE account=?1", [id])?;
+    c.execute("DELETE FROM folder WHERE account=?1", [id])?;
+    c.execute("DELETE FROM account WHERE id=?1", [id])?;
+    Ok(())
+}
+
 /// The local account's address.
 pub fn me(store: &Store) -> String {
     store
@@ -200,6 +263,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Compose { re } => mail(store, *re)
             .map(|m| format!("re: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
+        Kind::Settings => "settings".into(),
     }
 }
 
@@ -211,19 +275,21 @@ pub fn title(store: &Store, kind: &Kind) -> String {
 
 /// Marks a mail read (opening it does this). A no-change update touches no
 /// row — so it records nothing, and undoing the open of an already-read
-/// mail correctly leaves it read.
+/// mail correctly leaves it read. `dirty` marks the row as locally ahead of
+/// the server: reconciliation leaves it alone until the op queue pushes it.
 pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE message SET unread = 0 WHERE id = ?1 AND unread = 1",
+        "UPDATE message SET unread = 0, dirty = 1 WHERE id = ?1 AND unread = 1",
         [id],
     )?;
     Ok(())
 }
 
-/// Archives a mail: it moves to its account's archive folder.
+/// Archives a mail: it moves to its account's archive folder (locally ahead
+/// of the server — see [`mark_read_tx`] on `dirty`).
 pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE message SET folder =
+        "UPDATE message SET dirty = 1, folder =
            (SELECT f.id FROM folder f
             WHERE f.account = message.account AND f.role = 'archive')
          WHERE id = ?1",

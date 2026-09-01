@@ -55,6 +55,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Message { .. } => "mail",
         Kind::Contact { .. } => "contact",
         Kind::Compose { .. } => "draft",
+        Kind::Settings => "settings",
     }
 }
 
@@ -163,7 +164,12 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
         );
     };
 
-    for kind in [Kind::Inbox { filter: None }, Kind::Help, Kind::About] {
+    for kind in [
+        Kind::Inbox { filter: None },
+        Kind::Settings,
+        Kind::Help,
+        Kind::About,
+    ] {
         let extra = format!("{} panel", kind_word(&kind));
         candidate(&mut hits, &mut seen, kind, &extra);
     }
@@ -209,14 +215,16 @@ mod tests {
     fn empty_query_is_the_switcher() {
         let (wm, store) = world();
         let hits = search(&wm, &store, "");
-        // Open help + inbox, then the two unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 3);
+        // Open help + inbox, then the unopened roots; no mails, no people.
+        assert_eq!(hits.len(), 4);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
         assert!(matches!(hits[1].go, Go::Focus(_)));
-        assert_eq!(hits[2].label, "about");
-        assert!(matches!(hits[2].go, Go::Open(Kind::About)));
+        assert_eq!(hits[2].label, "settings");
+        assert!(matches!(hits[2].go, Go::Open(Kind::Settings)));
+        assert_eq!(hits[3].label, "about");
+        assert!(matches!(hits[3].go, Go::Open(Kind::About)));
     }
 
     #[test]

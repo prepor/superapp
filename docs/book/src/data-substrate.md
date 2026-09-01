@@ -37,14 +37,32 @@ outgrows it (its SPJ class deliberately excludes the `ORDER BY`/aggregate
 queries panels actually use — in the daemon model that compute is the
 client's job, and superapp *is* the client).
 
+## The mail engine
+
+Real accounts are **fastmail-style**: IMAP over rustls (port 993) with an
+app password; the *settings* panel (a launcher root) lists accounts with
+their live sync status and holds the add-account form. One **worker thread
+per account** — its own connection to the same file — polls every minute
+(and on *refresh*): mirror the special-use folders, fetch what is new
+(each folder retains the newest **200** messages; below that window the
+panels honestly know nothing), reconcile flags and deletions.
+
+Reconciliation never fights the user: a row flagged **`dirty`** — read or
+archived locally, server not yet told — is local truth until the op queue
+(phase 4) pushes it. A worker's commit reaches the UI as a signal; the
+store notices foreign commits by `data_version` and re-runs stale queries
+on the next draw. Account add/remove are undoable actions like everything
+else.
+
 ## What stays out of the file
 
 - **Ephemeral physics**: spring positions, in-flight gestures, the caret
   blink, where the camera is mid-slide. The line: *if losing it in a crash
   would annoy you, it belongs in the store.* Layout, focus, filters — in.
   Motion — out, re-derived at boot.
-- **Secrets** (phase 3): the keychain, never this file — it is meant to be
-  handed to agents someday.
+- **Secrets**: the macOS keychain (android: an app-private file until a
+  Keystore binding exists), never this file — it is meant to be handed to
+  agents someday.
 
 ## Session persistence
 

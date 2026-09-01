@@ -19,6 +19,8 @@ name = "superapp"
 path = "src/main.rs"
 
 [dependencies]
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+mail-parser = "0.11"
 # Upstream makepad, pinned to the same commit mosaic's vendor pipeline uses
 # (makepad@dev). Plain upstream — none of mosaic's patches; the one superapp
 # used was 0003 (present-when-occluded, for background e2e runs), dropped as
