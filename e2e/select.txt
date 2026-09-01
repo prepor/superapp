@@ -45,8 +45,8 @@ shot s4-account-selected
 
 # Selection by keyboard needs no finger capture, so it is the part the
 # harness can actually prove: focus a run, select all, look for the wash.
-# (Settings claims no cmd+a — it edits text — so the chord reaches the
-# field, which is rule 3 doing its job.)
+# (Settings claims no cmd+a: its one accelerator is the add-account link,
+# and that took the `d` of "add" precisely so these rows keep select-all.)
 click "local demo"
 wait 300
 key cmd+a

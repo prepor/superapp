@@ -227,6 +227,7 @@ script_mod! {
                         // they are collected as templates and instantiated
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
+                        add_account_tpl := mod.widgets.AddAccountPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
                         inbox_tpl := mod.widgets.InboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
@@ -1116,7 +1117,8 @@ fn build_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
         Kind::Message { id } => message_lines(state, id, cols),
         Kind::Contact { email } => contact_lines(state, email),
         Kind::Compose { re } => compose_lines(ui, re),
-        Kind::Settings => Vec::new(), // retained content (CR-002)
+        // Retained content (CR-002).
+        Kind::Settings | Kind::AddAccount => Vec::new(),
     }
 }
 
@@ -3157,8 +3159,8 @@ impl Stage {
                 match op {
                     WidgetOp::AddAccount => {
                         if let Some(w) = self.hosted.get(&pid) {
-                            if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
-                                let (email, pass, imap, smtp) = sp.form_values(cx);
+                            if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
+                                let (email, pass, imap, smtp) = ap.form_values(cx);
                                 cx.action(crate::panels::PanelAction::AddAccount {
                                     pid, email, pass, imap, smtp,
                                 });
@@ -3628,6 +3630,7 @@ impl ScriptHook for Stage {
 fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
+        Kind::AddAccount => Some(live_id!(add_account_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
@@ -3702,8 +3705,8 @@ impl Stage {
                             state.spawn_workers();
                             state.toast("account added — syncing", false);
                             if let Some(w) = self.hosted.get(&pid) {
-                                if let Some(mut sp) = w.as_settings_panel().borrow_mut() {
-                                    sp.clear_form(cx);
+                                if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
+                                    ap.clear_form(cx);
                                 }
                             }
                         }
@@ -5201,23 +5204,12 @@ impl Stage {
         let mut reg: Vec<(String, Rect, Act)> = Vec::new();
         match &kind {
             Some(Kind::Settings) => {
-                for (label, path) in [
-                    ("address", ids!(email_input)),
-                    ("password", ids!(pass_input)),
-                    ("imap", ids!(imap_input)),
-                    ("smtp", ids!(smtp_input)),
-                ] {
-                    let r = w.widget(cx, path).area().rect(cx);
-                    if r.size.x > 0.0 {
-                        reg.push((label.to_string(), r, Act::Pointer(pid)));
-                    }
-                }
-                let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
-                if add_r.size.x > 0.0 {
+                let lr = w.widget(cx, ids!(add_link)).area().rect(cx);
+                if lr.size.x > 0.0 {
                     reg.push((
                         "add account".to_string(),
-                        add_r,
-                        Act::WidgetOp(pid, WidgetOp::AddAccount),
+                        lr,
+                        Act::Open(pid, Kind::AddAccount),
                     ));
                 }
                 let accounts = mail::accounts(&state.store);
@@ -5256,6 +5248,27 @@ impl Stage {
                             }
                         }
                     }
+                }
+            }
+            Some(Kind::AddAccount) => {
+                for (label, path) in [
+                    ("address", ids!(email_input)),
+                    ("password", ids!(pass_input)),
+                    ("imap", ids!(imap_input)),
+                    ("smtp", ids!(smtp_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
+                if add_r.size.x > 0.0 {
+                    reg.push((
+                        "add account".to_string(),
+                        add_r,
+                        Act::WidgetOp(pid, WidgetOp::AddAccount),
+                    ));
                 }
             }
             Some(Kind::Compose { .. }) => {

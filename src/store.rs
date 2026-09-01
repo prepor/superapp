@@ -1019,6 +1019,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
         Kind::Compose { re } => ("compose", Some(*re), None),
         Kind::Settings => ("settings", None, None),
+        Kind::AddAccount => ("add_account", None, None),
     }
 }
 
@@ -1032,6 +1033,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "contact" => Kind::Contact { email: p_txt? },
         "compose" => Kind::Compose { re: p_int? },
         "settings" => Kind::Settings,
+        "add_account" => Kind::AddAccount,
         _ => return None,
     })
 }

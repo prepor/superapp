@@ -1,7 +1,12 @@
-# The settings walk: reach it via the launcher, fill the form with the
-# tab/enter walk (an .invalid host so the worker fails fast and locally),
-# submit with enter past the last field, watch the status land via the
-# worker's signal, remove the account again.
+# The settings walk: reach it via the launcher, open the add-account panel
+# from the link under the accounts (solid: it joins to the right) — by
+# mouse, then again by its own chord — fill the form with the tab/enter
+# walk (an .invalid host so the worker fails fast and locally), submit with
+# enter past the last field, watch the status land via the worker's signal,
+# remove the account again.
+#
+# The clicks are the assertions: "address" only resolves if the form panel
+# is really open, so the chord is proven without reading a screenshot.
 wait 700
 key cmd 2
 wait 400
@@ -10,6 +15,14 @@ wait 300
 key enter
 wait 600
 shot s1-settings
+click "add account"
+wait 600
+shot s2-add-panel
+# Close it and open it again with cmd+d, the key the link wears.
+key cmd+w
+wait 500
+key cmd+d
+wait 600
 click "address"
 type "andrey@fastmail.test"
 key tab
@@ -19,11 +32,11 @@ key backspace 30
 type "imap.invalid"
 key enter
 wait 200
-shot s2-filled
+shot s3-filled
 key enter
 wait 2500
-shot s3-account-error
+shot s4-account-error
 click "remove"
 wait 500
-shot s4-removed
+shot s5-removed
 quit

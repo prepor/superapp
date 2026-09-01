@@ -46,7 +46,8 @@ client's job, and superapp *is* the client).
 
 Real accounts are **fastmail-style**: IMAP over rustls (port 993) with an
 app password; the *settings* panel (a launcher root) lists accounts with
-their live sync status and holds the add-account form. One **worker thread
+their live sync status and links to the *add account* panel, which holds the
+form. One **worker thread
 per account** — its own connection to the same file — polls every minute
 (and on *refresh*): mirror the special-use folders, fetch what is new
 (each folder retains the newest **200** messages; below that window the

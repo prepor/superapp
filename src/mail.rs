@@ -203,7 +203,7 @@ pub fn accounts(store: &Store) -> Rc<Vec<Account>> {
     store.rows(&Q_ACCOUNTS, &[], account_row)
 }
 
-/// Creates an account (the settings form's action). Folders arrive with the
+/// Creates an account (the add-account form's action). Folders arrive with the
 /// first sync; the password goes to the keychain, never here.
 pub fn add_account_tx(
     c: &rusqlite::Connection,
@@ -264,6 +264,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
             .map(|m| format!("re: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
+        Kind::AddAccount => "add account".into(),
     }
 }
 
