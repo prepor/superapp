@@ -147,13 +147,16 @@ script_mod! {
             color: #141414
         }
         draw_selection +: {
-            // Selection paints only while focused (the frameworks' norm:
-            // tab-in selects all, tab-out lets the highlight go).
-            color: #ffffff
-            color_hover: #ffffff
-            color_focus: #e7e7e7
-            color_down: #e7e7e7
-            color_empty: #ffffff
+            // The selection quad paints OVER the glyphs and the state-mix
+            // does not engage reliably — so one translucent ink on every
+            // state: text reads through, and "no selection when blurred"
+            // is enforced by collapsing the selection on focus-lost
+            // instead of by colour.
+            color: #00000020
+            color_hover: #00000020
+            color_focus: #00000020
+            color_down: #00000020
+            color_empty: #00000000
         }
     }
 
@@ -215,7 +218,18 @@ script_mod! {
             text: "", draw_text +: { color: #a01500 }
         }
         View { width: Fill, height: 8 }
-        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                // Distinct shader ⇒ distinct draw call: portal-item quads
+                // on the stock shader paint under the panel background.
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
     }
 
     /** The settings panel: accounts fill the middle; the add form keeps a
@@ -314,37 +328,58 @@ script_mod! {
     /** One mail row: from · subject · date, bold while unread, an inverted
         wash while selected. Subjects hold to one line, ellipsized. Tap the
         subject to open; tap elsewhere to select (the j/k cursor). */
+    // No Overlay anywhere in a row, deliberately: quads under an Overlay
+    // ancestor inside a PortalList item never paint (Fill defers, and a
+    // deferred overlay walk never resolves) — so the selection wash is a
+    // twin line with its own bg, toggled like the bold pairs.
+    mod.widgets.InboxLine = set_type_default() do #(InboxLine::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: 26
+        padding: Inset{left: 4, right: 4, top: 5, bottom: 5}
+        align: Align{y: 0.5}
+        from_lbl := mod.widgets.SLabel {
+            width: 130, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
+        from_b := mod.widgets.SBold { visible: false, width: 130 }
+        View { width: 10, height: 1 }
+        subject_lbl := mod.widgets.SLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
+        subject_b := mod.widgets.SBold { visible: false, width: Fill }
+        View { width: 10, height: 1 }
+        date_lbl := mod.widgets.SLabel {
+            width: Fit, text: "", draw_text +: { color: #909090 }
+        }
+    }
+
     mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
-        flow: Overlay
-        sel_bg := View {
+        flow: Down
+        line := mod.widgets.InboxLine {}
+        line_sel := mod.widgets.InboxLine {
             visible: false
-            width: Fill, height: Fill
-            show_bg: true, draw_bg +: { color: #e7e7e7 }
-        }
-        View {
-            width: Fill, height: Fit
-            flow: Down
-            View {
-                width: Fill, height: Fit
-                padding: Inset{left: 4, right: 4, top: 5, bottom: 5}
-                align: Align{y: 0.5}
-                from_lbl := mod.widgets.SLabel {
-                    width: 130, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
-                }
-                from_b := mod.widgets.SBold { visible: false, width: 130 }
-                View { width: 10, height: 1 }
-                subject_lbl := mod.widgets.SLabel {
-                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
-                }
-                subject_b := mod.widgets.SBold { visible: false, width: Fill }
-                View { width: 10, height: 1 }
-                date_lbl := mod.widgets.SLabel {
-                    width: Fit, text: "", draw_text +: { color: #909090 }
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                // A custom pixel fn forces a distinct shader and so a
+                // distinct draw call: portal-item quads on the stock
+                // shader merge into a call that paints under the panel
+                // background — invisible.
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
                 }
             }
-            View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
+        }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
         }
     }
 
@@ -723,6 +758,13 @@ impl Widget for SettingsPanel {
 
         if let Event::Actions(actions) = event {
             let [email, pass, imap, smtp] = self.inputs(cx);
+            // A blurred field keeps no selection (the frameworks' norm —
+            // tab-in selects all, tab-out lets go).
+            for t in [&email, &pass, &imap, &smtp] {
+                if t.key_focus_lost(actions) {
+                    t.set_cursor(cx, t.cursor(), false);
+                }
+            }
             // Enter advances; past the last field it submits.
             if email.returned(actions).is_some() {
                 Self::focus_input(cx, &pass);
@@ -807,6 +849,11 @@ impl Widget for ComposePanel {
 
         if let Event::Actions(actions) = event {
             let [to, subject, body] = self.inputs(cx);
+            for t in [&to, &subject, &body] {
+                if t.key_focus_lost(actions) {
+                    t.set_cursor(cx, t.cursor(), false);
+                }
+            }
             if to.returned(actions).is_some() {
                 SettingsPanel::focus_input(cx, &subject);
             } else if subject.returned(actions).is_some() {
@@ -872,6 +919,47 @@ impl ComposePanelRef {
 // ---------------------------------------------------------------------------
 
 #[derive(Script, ScriptHook, Widget)]
+pub struct InboxLine {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for InboxLine {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl InboxLineRef {
+    fn populate(&self, cx: &mut Cx, m: &mail::MailHead) {
+        let Some(inner) = self.borrow() else { return };
+        let from = &m.from_name;
+        let fp = inner.view.label(cx, ids!(from_lbl));
+        let fb = inner.view.widget(cx, ids!(from_b));
+        let sp = inner.view.label(cx, ids!(subject_lbl));
+        let sb = inner.view.widget(cx, ids!(subject_b));
+        fp.set_text(cx, if m.unread { "" } else { from });
+        fb.as_sbold().set_text(cx, if m.unread { from } else { "" });
+        fp.set_visible(cx, !m.unread);
+        fb.set_visible(cx, m.unread);
+        sp.set_text(cx, if m.unread { "" } else { &m.subject });
+        sb.as_sbold().set_text(cx, if m.unread { &m.subject } else { "" });
+        sp.set_visible(cx, !m.unread);
+        sb.set_visible(cx, m.unread);
+        inner
+            .view
+            .label(cx, ids!(date_lbl))
+            .set_text(cx, &mail::fmt_date(m.date));
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
 pub struct InboxRow {
     #[source]
     source: ScriptObjectRef,
@@ -898,23 +986,13 @@ impl Widget for InboxRow {
 
 impl InboxRowRef {
     fn populate(&self, cx: &mut Cx, m: &mail::MailHead, selected: bool) {
-        let Some(mut row) = self.borrow_mut() else { return };
-        let from = &m.from_name;
-        let date = mail::fmt_date(m.date);
-        let fp = row.view.label(cx, ids!(from_lbl));
-        let fb = row.view.widget(cx, ids!(from_b));
-        let sp = row.view.label(cx, ids!(subject_lbl));
-        let sb = row.view.widget(cx, ids!(subject_b));
-        fp.set_text(cx, if m.unread { "" } else { from });
-        fb.as_sbold().set_text(cx, if m.unread { from } else { "" });
-        fp.set_visible(cx, !m.unread);
-        fb.set_visible(cx, m.unread);
-        sp.set_text(cx, if m.unread { "" } else { &m.subject });
-        sb.as_sbold().set_text(cx, if m.unread { &m.subject } else { "" });
-        sp.set_visible(cx, !m.unread);
-        sb.set_visible(cx, m.unread);
-        row.view.label(cx, ids!(date_lbl)).set_text(cx, &date);
-        row.view.view(cx, ids!(sel_bg)).set_visible(cx, selected);
+        let Some(row) = self.borrow() else { return };
+        let line = row.view.widget(cx, ids!(line));
+        let line_sel = row.view.widget(cx, ids!(line_sel));
+        line.as_inbox_line().populate(cx, m);
+        line_sel.as_inbox_line().populate(cx, m);
+        line.set_visible(cx, !selected);
+        line_sel.set_visible(cx, selected);
     }
 }
 
@@ -1012,6 +1090,9 @@ impl Widget for InboxPanel {
             }
         }
         if let Event::Actions(actions) = event {
+            if filter.key_focus_lost(actions) {
+                filter.set_cursor(cx, filter.cursor(), false);
+            }
             // Enter in the filter: select the first visible row and rest.
             if filter.returned(actions).is_some() || filter.escaped(actions) {
                 cx.set_key_focus(Area::Empty);

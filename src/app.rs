@@ -5076,12 +5076,19 @@ impl Stage {
                                     r,
                                     Act::WidgetOp(pid, WidgetOp::SelectMail(m.id)),
                                 ));
-                                let s = if m.unread {
-                                    item.widget.widget(cx, ids!(subject_b)).area().rect(cx)
-                                } else {
-                                    item.widget.label(cx, ids!(subject_lbl)).area().rect(cx)
-                                };
-                                if s.size.x > 0.0 {
+                                // The subject span, from whichever twin line
+                                // is live (hidden twins report stale rects —
+                                // only trust one lying inside the row).
+                                let cands = [
+                                    item.widget.label(cx, ids!(line.subject_lbl)).area().rect(cx),
+                                    item.widget.widget(cx, ids!(line.subject_b)).area().rect(cx),
+                                    item.widget.label(cx, ids!(line_sel.subject_lbl)).area().rect(cx),
+                                    item.widget.widget(cx, ids!(line_sel.subject_b)).area().rect(cx),
+                                ];
+                                let s = cands.into_iter().find(|s| {
+                                    s.size.x > 0.0 && r.contains(s.pos + s.size * 0.5)
+                                });
+                                if let Some(s) = s {
                                     let band = Rect {
                                         pos: dvec2(s.pos.x, r.pos.y),
                                         size: dvec2(s.size.x, r.size.y),
