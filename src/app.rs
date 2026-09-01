@@ -2407,6 +2407,9 @@ impl Widget for Stage {
             }
 
             Event::VirtualKeyboard(e) => {
+                if cfg!(target_os = "android") {
+                    log!("virtual keyboard: {e:?}");
+                }
                 // adjustNothing manifest: the app makes room itself. The
                 // occlusion shrinks the viewport bottom; panels spring up.
                 match e {
@@ -2589,6 +2592,11 @@ impl Widget for Stage {
         // additionally swallows touches in the notification-shade pull zone
         // at the very top of the window (~22 dp observed on gesture nav), so
         // panel headers — the drag grip, close, archive — stay below it.
+        //
+        // When the soft keyboard shows, makepad slides the whole pass up by
+        // its height (the turtle's origin goes negative — android's
+        // content-shift). Shifting back down by kb_h and shortening by it
+        // makes the viewport exactly the visible region above the keyboard.
         let vp = {
             let r = cx.turtle().rect();
             let (t, rt, b, l) = self.insets;
@@ -2597,13 +2605,11 @@ impl Widget for Stage {
             } else {
                 t
             };
-            // The soft keyboard occludes the bottom: panels make room.
-            let b = b.max(self.kb_h);
             rect(
                 r.pos.x + l,
-                r.pos.y + t,
+                r.pos.y + self.kb_h + t,
                 (r.size.x - l - rt).max(40.0),
-                (r.size.y - t - b).max(40.0),
+                (r.size.y - self.kb_h - t - b).max(40.0),
             )
         };
         self.origin = vp.pos;
@@ -2611,6 +2617,15 @@ impl Widget for Stage {
 
         if let Some(state) = self.state.as_deref_mut() {
             if (state.viewport - vp.size).length() > 1.0 {
+                if cfg!(target_os = "android") {
+                    log!(
+                        "viewport: turtle {:?} insets {:?} kb {} -> vp {:?}",
+                        cx.turtle().rect(),
+                        self.insets,
+                        self.kb_h,
+                        vp
+                    );
+                }
                 state.viewport = vp.size;
                 state.sync();
             }

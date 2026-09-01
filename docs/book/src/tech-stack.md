@@ -29,9 +29,12 @@ width breakpoint swaps the grid 8×4 ⇄ 4×3 and the springs carry the panels t
 their new places. Touch is handled from raw `TouchUpdate` events; the
 long-press comes from android's own `GestureDetector` via `Event::LongPress`.
 
-The soft keyboard uses makepad's full-state IME protocol: the manifest is
-`adjustNothing`, so the app makes room itself from
-`Event::VirtualKeyboard(DidShow { height })` (a bottom viewport inset).
+The soft keyboard uses makepad's full-state IME protocol: when it shows,
+makepad slides the whole render pass up by the keyboard height (the
+turtle's origin goes negative), and the shell cancels that shift and
+shortens the viewport by the same `Event::VirtualKeyboard(DidShow {
+height })` — so the workspace relayouts into exactly the visible region
+above the keyboard.
 Typed text arrives as `TextInput { full_state_sync }` — the IME-side
 editable is authoritative and the app mirrors it wholesale — while the app
 seeds and re-syncs that editable with `sync_ime_state` on focus and after
