@@ -23,9 +23,11 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/ui.rs` | the semantic content vocabulary: lines, fields, forms | no |
 | `src/theme.rs` | the look: sizes and colours | no |
 | `src/e2e.rs` | e2e script grammar + runner state | no |
+| `src/story.rs` | e2e scripts read as flows, and the library canvas's layout (CR-006) | no |
 | `src/mac.rs` | screen geometry, activation, window screenshots | no (apple-sys) |
 | `src/panels.rs` | retained panel widgets | yes |
 | `src/app.rs` | the makepad shell: drawing, events, animation | yes |
+| `src/library.rs` | the panels library: a canvas of live stages (CR-006) | yes |
 
 Everything above `panels` is std-only and unit-tested without opening a
 window.
@@ -38,6 +40,19 @@ you construct, never a global — the UI thread owns one, and each
 worker thread builds its own. That is what lets a whole app instance exist
 in memory, which is what makes tests isolated and parallel. See [The Data
 Substrate](./data-substrate.md).
+
+## Stages and mounts
+
+The shell's widget is the `Stage`: the workspace, its springs, its hits,
+its script runner. It comes up on a `Boot` — a store path or memory, a
+grid, the send window, whether time is virtual, which outside — and the
+window's own stage builds its boot from argv. The panels library (CR-006)
+builds one per story node instead and **mounts** the stage on the canvas:
+each mount renders into its own pass at the canvas's zoom, replays its
+story prefix on virtual time, and owns nothing outside that pass — no menu
+bar, the IME only while entered, redraws scoped to its own draw list, and
+the actions its widgets raise captured and handed back to it alone. See
+[Developer Experience](./dev-x.md#panels-library).
 
 ## Frame loop
 

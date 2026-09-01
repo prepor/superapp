@@ -122,16 +122,44 @@ pub enum Step {
     Quit,
 }
 
+impl Step {
+    /// Whether the step resolves against the drawn hit list — a click, a
+    /// drag, a swipe, a long press. Keys and text resolve semantically, a
+    /// wait or a shot resolves nothing; a replaying mount runs those
+    /// without drawing in between.
+    #[must_use]
+    pub fn needs_hits(&self) -> bool {
+        matches!(
+            self,
+            Step::Click { .. } | Step::Drag { .. } | Step::Swipe { .. } | Step::HoldMove { .. }
+        )
+    }
+}
+
 /// Parses a script. Errors carry the line number.
 pub fn parse(src: &str) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for (i, raw) in src.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+        if let Some(step) = parse_line(raw, i + 1)? {
+            steps.push(step);
         }
-        let err = |m: &str| format!("line {}: {m}: {raw}", i + 1);
-        let (cmd, rest) = match line.split_once(char::is_whitespace) {
+    }
+    if steps.last() != Some(&Step::Quit) {
+        steps.push(Step::Quit);
+    }
+    Ok(steps)
+}
+
+/// Parses one line: a step, or nothing for a blank line or a comment.
+/// `lineno` is 1-based and rides on the error. The stories of the panels
+/// library read scripts line by line through this, keeping the comments.
+pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
+    let line = raw.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    let err = |m: &str| format!("line {lineno}: {m}: {raw}");
+    let (cmd, rest) = match line.split_once(char::is_whitespace) {
             Some((c, r)) => (c, r.trim()),
             None => (line, ""),
         };
@@ -140,7 +168,7 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
             let b = rest.rfind('"').filter(|&b| b > a).ok_or_else(|| err("unclosed quote"))?;
             Ok(rest[a + 1..b].to_string())
         };
-        steps.push(match cmd {
+        Ok(Some(match cmd {
             "wait" => Step::Wait(rest.parse().map_err(|_| err("expected milliseconds"))?),
             "shot" => {
                 if rest.is_empty() {
@@ -217,12 +245,7 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
             }
             "quit" => Step::Quit,
             _ => return Err(err("unknown command")),
-        });
-    }
-    if steps.last() != Some(&Step::Quit) {
-        steps.push(Step::Quit);
-    }
-    Ok(steps)
+        }))
 }
 
 /// A run in progress.
@@ -274,6 +297,13 @@ impl Runner {
             self.wait_ms = ms as f64;
         }
         Some(step)
+    }
+
+    /// Virtual milliseconds still owed to the pending `wait` — what a
+    /// fast-forwarding library mount consumes in a single frame.
+    #[must_use]
+    pub fn pending_wait(&self) -> f64 {
+        self.wait_ms.max(0.0)
     }
 }
 

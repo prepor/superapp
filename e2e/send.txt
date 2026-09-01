@@ -1,3 +1,4 @@
+#! send-delay 1
 # The send walk (run with --send-delay 1): file a send, cancel it inside
 # the window, file it again, watch the sender fail it honestly (the demo
 # account has no smtp host), and reopen the draft with cmd+z.

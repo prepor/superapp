@@ -1,0 +1,22 @@
+#! canvas
+# The panels library (CR-006): every script it is given is a story on the
+# canvas, every shot a live node. Run with
+#   --library e2e/basic.txt e2e/phone.txt --e2e e2e/library.txt --draws 600
+# under MAKEPAD=headless (and MAKEPAD_HEADLESS_DPI=1: the canvas is a big
+# frame). The first wait lets the mounts replay their stories — a node
+# needs one frame per step that resolves against the hit list.
+wait 2500
+shot lib-01-overview
+
+# A node's caption enters it: the camera flies to 1:1 and the keyboard and
+# pointer go to that stage.
+click "02-message-joined"
+wait 900
+shot lib-02-entered
+
+# cmd+esc leaves; cmd+0 fits everything again.
+key cmd+esc
+key cmd+0
+wait 900
+shot lib-03-fit
+quit

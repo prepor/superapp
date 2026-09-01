@@ -216,3 +216,60 @@ rows (by subject) and panel titles. Steps that mutate the workspace need a
 `wait` after them — hits refresh on the next drawn frame. `e2e/basic.txt`
 walks the whole join/replace grammar; the first frame also logs panel count
 and measured cell metrics to stderr.
+
+A script may open with a `#!` header naming the flags it needs — the
+panels library reads it (below); the harness treats it as a comment, so
+the flags still have to be passed on the command line:
+
+```text
+#! window 380x780 grid 4x3      # e2e/phone.txt: --window 380x780 --grid 4x3
+#! send-delay 1                 # e2e/send.txt:  --send-delay 1
+```
+
+## Panels library
+
+```sh
+# every script under e2e/ as a story, live, on one canvas
+mise exec -- cargo run -- --library
+
+# a few stories
+mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt
+
+# the canvas's own suite, headless (a small story set; the canvas is a big frame)
+MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
+  mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
+  --e2e e2e/library.txt --e2e-out e2e/out --draws 600
+```
+
+`--library` opens the window on an **infinite canvas** instead of the
+workspace (CR-006). Every e2e script is a **story** row on it; every
+`shot` in the script is a **node** — a whole stage on a world of its own
+(an in-memory store with the demo seed, a sealed `Deny` outside with a
+clock, virtual time, the story's grid and send window) that replayed the
+story up to that shot and stopped there. The steps between two shots label
+the arrow between their nodes; the script's comments are the annotations,
+the opening block the story's description. So the canvas is a second
+reading of the suites, and a change to the UI is reviewed across every
+state the suites already walk — at 12×6 and on the phone grid in the same
+view.
+
+Replays are fast-forwarded — a `wait` is consumed in one frame, and a
+frame runs steps until the next one needs fresh hits (a click, a swipe) —
+so a node arrives in as many frames as it has clicks on the way. A node
+still on its way draws washed out and counts down in the legend.
+
+- **Pan**: drag the canvas, or scroll. **Zoom**: ⌘scroll around the
+  pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
+- **Enter** a node with a click (on it, or its name): the camera flies to
+  1:1 and the keyboard and pointer go to that stage, remapped into its own
+  coordinates, so a flow can be continued by hand from any of its states.
+  Click outside it, or ⌘esc, to leave. A story's name fits its row.
+- The legend along the bottom spells all of it out.
+
+Mounts render into their own passes at the canvas's zoom, so text is
+crisp at every level rather than scaled. A `#! outside fake` or `#!
+outside real` header gives a story's mounts the in-memory mail world or
+the network instead of `Deny` (whose refusals read "this world has no
+outside"). `e2e/library.txt` is a `#! canvas` script: it drives the canvas
+itself — `wait`, `shot`, `click` on a node's or a story's name, and the
+canvas chords — and is never mounted.
