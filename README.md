@@ -33,6 +33,8 @@ mise exec -- cargo run -- --e2e e2e/basic.txt  # scripted run + screenshots to e
 
 - `src/` — `core` (pure state machine) · `app` (makepad shell) · `data` ·
   `spring` · `theme` · `e2e` · `mac`
+- `resources/` — fonts, and the app icon (`make_icons.py` regenerates every
+  size and platform from one drawing)
 - `docs/book/` — the book
 - `e2e/` — e2e scripts (`out/` is generated)
 - `web/` — the first, throwaway web prototype that validated the model (not

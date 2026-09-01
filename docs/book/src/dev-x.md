@@ -50,6 +50,28 @@ mise exec -- cargo run -- --window 380x780 --grid 4x3   # cover display
 mise exec -- cargo run -- --grid 8x4                     # unfolded, full frame
 ```
 
+## App icons
+
+`resources/make_icons.py` draws the icon — three panels on a workspace, the
+focused header inverted, the left column two cells joined — and writes every
+target from that one drawing (Pillow, plus `iconutil` for the icns):
+
+- `resources/icon_{32..1024}.png` — the dock icon. makepad's
+  `platform/build.rs` bakes them into the binary, so a plain `cargo run`
+  shows them; `.cargo/config.toml` names the files (`MAKEPAD_APP_ICON_*`)
+  so a custom target dir cannot lose them.
+- `resources/icon.icns` / `icon.ico` — what `cargo-makepad desktop build`
+  puts in a bundle, and the windows executable icon.
+- `resources/android/res/` — the launcher icon, which `cargo-makepad
+  android` copies into the APK: an adaptive icon (one vector drawable on a
+  white background, doubling as the monochrome layer for themed icons) and
+  legacy `mipmap-*/ic_launcher.png`.
+
+Sizes at and below 64 px are laid out on the pixel grid rather than
+downsampled, so the 16 px icon is three crisp boxes. `--preview DIR` writes
+a contact sheet of every size on a light and a dark dock, with the android
+vector rasterized the way a launcher masks it.
+
 ## The book
 
 ```sh
