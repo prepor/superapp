@@ -217,3 +217,34 @@ selection wash, and — the frameworks' norm — a field's selection paints
 only while it is focused, so tab-out lets the highlight go. Arrows also
 scroll the message body again (three lines, the char grid's behaviour),
 synthesized as Scroll events so the ScrollBars keep the clamping.
+
+## The makepad patch (2026-09-01)
+
+The Fold's soft keyboard forced the one thing this project had avoided:
+carrying patches. Three app-side attempts failed against the same wall —
+`TextInput::handle_focus_lost` hides the IME **unconditionally** on blur,
+so every field-to-field move (the keyboard's "next", our Tab ring) closed
+the keyboard and reopened it. Re-showing in the same op flush only turned
+a 1.1 s close-wait-reopen into a visible dip: Samsung's insets controller
+honours the hide first no matter how tightly the show follows. The hide
+has to not happen, and only upstream can decide that.
+
+`~/code/makepad-superapp` (branch `superapp-pin`) is a clone of the exact
+pin carrying two commits, wired in via `[patch]` path overrides:
+
+- `bdb23508` — hide the IME only when `KeyFocusLost` says focus went to
+  `Area::Empty`. A widget-to-widget move leaves the keyboard to the next
+  field, whose draw-time show dedups to nothing when the config matches:
+  the keyboard never moves. Verified on device — a next-key press now logs
+  the guard arming and *nothing else*.
+- `5bf8e78f` — `text_ime_was_dismissed` no longer re-issues `HideTextIME`
+  for a keyboard Java has already reported down (Samsung re-presents it
+  just to replay the hide animation: dismissals "closed twice"), and a
+  primary tap on a `TextInput` clears the dismissed latch, so re-tapping
+  an already-focused field can raise the keyboard again.
+
+Both are small, general, and worth offering upstream; the path override
+keeps them local until then (publishing the fork branch is Andrey's call).
+Bumping the pin later means rebasing two commits — the mosaic precedent,
+without the vendoring. The app-side timer guard (`ime_guard_*` in
+`app.rs`) stays as a dormant safety net for IMEs that behave differently.
