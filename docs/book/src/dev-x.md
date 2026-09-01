@@ -8,9 +8,16 @@ mise exec -- cargo run   # makepad comes from upstream git, pinned in Cargo.toml
 ```
 
 `cargo test` runs the pure suite with no window: the panel mechanics (the
-web prototype's whole smoke scenario is a test), the spring maths, and the
-store — schema, seed, query invalidation, session round-trip — against
-in-memory SQLite.
+web prototype's whole smoke scenario is a test), the spring maths, the store
+(schema, seed, query invalidation), the effect queue, the history tree, and
+the whole mail engine — against a `World::fake()`.
+
+A fake world is an **in-memory store, an in-memory outside, and a clock that
+only moves when a test moves it**. It touches no file, no keychain, no
+network and no thread, so the suite is isolated per test and parallel by
+construction — nothing is shared to contend over. The mail engine's passes
+run inline (`Pump::Manual`), so ingest, push and send happen in a knowable
+order rather than whenever a worker thread wakes.
 
 The store lives at `~/Library/Application Support/superapp/superapp.db`
 (android: the app files dir); `--db PATH` points a run anywhere else —

@@ -6,14 +6,33 @@ the layout is, and a shell that owns *how it gets there*.
 | module | role | depends on makepad |
 |---|---|---|
 | `src/core.rs` | panel/column/join state machine + scene targets | no |
-| `src/data.rs` | the fake mail behind the demo panels | no |
+| `src/store.rs` | the one SQLite file + the reactive query layer | no |
+| `src/effect.rs` | the boundary: what leaves the process, and the job queue | no |
+| `src/history.rs` | the in-memory tree of actions and their claims | no |
+| `src/mail.rs` | the mail domain: queries, titles, seed, effects, intents | no |
+| `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |
+| `src/send.rs` | drafts → outbox → SMTP, with the undo window | no |
+| `src/secret.rs` | passwords: keychain (macOS) / private file | no |
+| `src/launcher.rs` | the launcher's search over panels + mail world | no |
 | `src/spring.rs` | niri's closed-form spring (via mosaic) | no |
+| `src/ui.rs` | the semantic content vocabulary: lines, fields, forms | no |
 | `src/theme.rs` | the look: sizes and colours | no |
 | `src/e2e.rs` | e2e script grammar + runner state | no |
 | `src/mac.rs` | screen geometry, activation, window screenshots | no (apple-sys) |
+| `src/panels.rs` | retained panel widgets (CR-002) | yes |
 | `src/app.rs` | the makepad shell: drawing, events, animation | yes |
 
-Everything above `app` is std-only and unit-tested without opening a window.
+Everything above `panels` is std-only and unit-tested without opening a
+window. `src/data.rs` retired into the store's seed in CR-001.
+
+## The world
+
+`World` (CR-004) is the one handle to everything outside the pure core: the
+store, the outside (`Real` / `Fake` / `Deny`), the effect registry. It is a
+value you construct, never a global — the UI thread owns one, and each
+worker thread builds its own. That is what lets a whole app instance exist
+in memory, which is what makes tests isolated and parallel. See [The Data
+Substrate](./data-substrate.md).
 
 ## Frame loop
 

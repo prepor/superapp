@@ -138,6 +138,13 @@ undoing an open makes the mail unread again exactly if the open unread it.
 Undo also puts you back where the action happened (its workspace and focus
 revert with it). `cmd+shift+z` re-applies.
 
+History lives **in memory** and dies with the process: quit and your undo
+tree is gone, though nothing you did is. The distinction matters and is
+worth stating plainly — a send you fired seconds before a crash still goes
+out on the next launch, you simply cannot call it back; yesterday's archive
+cannot be undone today. The rows every action wrote are durable, and the
+background passes read only those, never the tree.
+
 What is deliberately *not* an action: focus walks, workspace switches,
 camera pans, row selection — context, not intent. They persist, but they
 never become history nodes; undo restores them only as part of a real
@@ -151,13 +158,22 @@ history overlay** — the whole tree as rows, newest first, indented by
 branch depth, the current position inverted, abandoned branches muted but
 alive. Clicking any node **travels** there: undo up to the common
 ancestor, re-apply down the other side — including *the beginning*, and
-back out again; the overlay stays up, because browsing is the point. A
-delivered send shows as `· sent` and is transparent to the walk — physics,
-not data. Under the hood every action's transaction is recorded as an
-invertible SQLite changeset; undoing applies the inverse, and rows the
-world changed since (a sync, another device someday) are skipped rather
-than forced. The menu bar carries *Undo / Redo / History* items; toasts
-name what happened.
+back out again; the overlay stays up, because browsing is the point.
+
+Under the hood a node is a **layout snapshot plus zero or more claims on
+the world**. The snapshot is what makes navigation free — open, move,
+column and close undo by restoring a small typed value — and only genuine
+data mutations owe a claim, of which there are six. Each claim decides its
+own reversibility: archiving flips intent back and the next sync pass
+re-converges, while a send asks its outbox row and refuses once the sender
+has taken it. A node whose claims cannot all be given back goes **expired**
+and the walk steps transparently past it — a delivered send shows as
+`· sent`, because blocking all history behind one sent mail would be wrong
+and pretending to undo it would be a lie. Removing an account is expired
+from the start: no snapshot brings its mail back, and saying so beats
+half-restoring. The menu bar carries *Undo / Redo / History* items; toasts
+name what happened. The tree is bounded (200 actions); past that floor
+older ones are simply gone.
 
 ## Mouse and trackpad
 

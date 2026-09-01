@@ -18,14 +18,21 @@ directly:
   does not expose (screen geometry, activation, window screenshots).
 - **`rusqlite` with bundled SQLite** — the one store (see [The Data
   Substrate](./data-substrate.md)). Bundling pins one SQLite version with
-  the full hook surface (`update_hook` drives query invalidation; the
-  session extension records the undo changesets) on macOS and android
-  alike — the same choice rel.systems' research validated.
+  the full hook surface — `update_hook` drives query invalidation, the
+  authorizer captures each query's dependencies — on macOS and android
+  alike, the same choice rel.systems' research validated. The **session
+  extension is no longer used**: CR-004 moved history into memory, so
+  undo is typed values rather than invertible changesets, and the
+  `buildtime_bindgen` that `session` forced on the android cross-build
+  goes with it. SQLite's **JSON1** functions carry the effect queue's
+  payloads (TEXT, not JSONB — a shell must be able to read them).
+- **`serde` + `serde_json`** — effects are serializable values, and the
+  deferred ones are JSON payloads in the `effect` table.
 - **`imap` (rustls) + `mail-parser`** — the sync engine's protocol and
   MIME layers; the TLS stack is rustls-on-ring, which cross-compiles for
-  android without ceremony. All engine logic hides behind a `Transport`
-  trait, so the whole sync/reconcile machinery is unit-tested against an
-  in-memory fake server.
+  android without ceremony. All engine logic runs against an `Outside`
+  backend, so the whole sync/reconcile machinery is unit-tested against an
+  in-memory fake server, keychain and clock.
 - The **macOS menu bar** is makepad's own `MacosMenu` API
   (`cx.update_macos_menu`, clicks arrive as `Event::MacosMenuCommand`); the
   workspace menus rebuild only when the roster or the active space changes.
