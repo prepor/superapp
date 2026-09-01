@@ -37,7 +37,7 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65ea
 # every action's transaction as an invertible changeset — the undo system
 # (CR-001 phase 2). session ⇒ buildtime_bindgen: bindgen runs on the host
 # for both targets (verified on the android cross-build).
-rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 
 # CR-004: effects are serializable values, and the deferred ones are JSON
 # payloads in the `effect` table. serde is already in the graph transitively;

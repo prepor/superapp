@@ -753,6 +753,10 @@ struct State {
     /// the same `Rc<Store>` as the field below, so the two cannot diverge —
     /// `store` stays for the hundred read sites that only want the store.
     world: std::rc::Rc<crate::effect::World>,
+    /// The action tree (CR-004). In memory, so it dies with the process:
+    /// a restart loses undo, but never loses work — the rows every action
+    /// wrote are durable, and the passes read those, never this.
+    history: crate::history::History,
     store: std::rc::Rc<Store>,
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
@@ -855,6 +859,7 @@ impl State {
         State {
             ws,
             world,
+            history: crate::history::History::new(),
             store,
             db_path,
             workers: Vec::new(),
@@ -981,11 +986,11 @@ impl State {
             .unwrap_or_else(|| "panel".into())
     }
 
-    /// Runs one **undoable action**: mutates the in-memory `Wm`, then
-    /// records the whole delta — the UI-table rewrite plus any data
-    /// mutation — as one changeset node in the history DAG. The session
-    /// consolidates per row, so an identical rewrite contributes nothing;
-    /// an action that nets no change creates no node.
+    /// Runs one **undoable action**: mutates the in-memory `Wm`, writes the
+    /// whole thing through in one transaction, and records a node — the
+    /// layout before and after, plus whatever the action claimed of the
+    /// world. Nav-only actions carry no claims and undo for free off the
+    /// snapshot.
     fn act(
         &mut self,
         kind: &str,
@@ -993,18 +998,28 @@ impl State {
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
         data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()>,
+        intents: Vec<Box<dyn crate::history::Intent>>,
     ) {
+        let before = self.ws.snapshot();
         mutate(&mut self.ws);
         let snap = self.ws.snapshot();
-        let r = self
-            .store
-            .act(kind, &label, entity.as_deref(), self.world.now(), |tx| {
-                crate::store::save_wm_tx(tx, &snap)?;
-                data(tx)
-            });
+        let r = self.store.write(|tx| {
+            crate::store::save_wm_tx(tx, &snap)?;
+            data(tx)
+        });
         if let Err(e) = r {
             eprintln!("store: action “{label}” failed: {e}");
         }
+        let now = self.world.now();
+        self.history.apply(crate::history::Action {
+            kind,
+            label,
+            entity,
+            before,
+            after: snap.clone(),
+            intents,
+            ts: now,
+        });
         self.last_saved = Some(snap);
         // Push soon: whatever this action changed about mail intent, a
         // worker makes the server agree without waiting for the poll —
@@ -1025,7 +1040,18 @@ impl State {
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
     ) {
-        self.act(kind, label, entity, mutate, |_| Ok(()));
+        self.act(kind, label, entity, mutate, |_| Ok(()), Vec::new());
+    }
+
+    /// Restores the layout a history walk landed on, writing it through.
+    fn land(&mut self, step: crate::history::Step) -> String {
+        if let Err(e) = self.store.save_wm(&step.snap) {
+            eprintln!("store: persisting the walk failed: {e}");
+        }
+        self.last_saved = Some(step.snap.clone());
+        self.ws = Wm::restore(step.snap);
+        self.field = None;
+        step.label
     }
 
     /// Persists compose drafts that changed since their last save — typing
@@ -1085,23 +1111,6 @@ impl State {
                 SignalToUI::set_ui_signal();
             }));
         }
-    }
-
-    /// Rebuilds the in-memory `Wm` from the store — the tail of every
-    /// undo/redo, whose changesets rewrote the UI tables underneath us.
-    fn reload_wm(&mut self) {
-        match self.store.load_wm() {
-            Ok(Some(snap)) => {
-                self.last_saved = Some(snap.clone());
-                self.ws = Wm::restore(snap);
-            }
-            Ok(None) => {
-                self.last_saved = None;
-                self.ws = Wm::new();
-            }
-            Err(e) => eprintln!("store: reloading the session failed: {e}"),
-        }
-        self.field = None;
     }
 
     /// Rows the inbox panel currently shows.
@@ -2654,6 +2663,7 @@ impl Stage {
                                 ws.follow_open(f, kind, fresh);
                             },
                             move |tx| mail::mark_read_tx(tx, id),
+                            vec![Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>],
                         );
                         self.sync(cx);
                     }
@@ -2766,9 +2776,10 @@ impl Stage {
             return;
         };
         let was = state.ws.active;
-        match state.store.undo() {
-            Ok(Some(label)) => {
-                state.reload_wm();
+        let step = state.history.undo(&state.world);
+        match step {
+            Some(step) => {
+                let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
                     let cam = state.ws.camera_x;
@@ -2779,8 +2790,7 @@ impl Stage {
                 }
                 state.toast(format!("undid — {label}"), false);
             }
-            Ok(None) => state.toast("nothing to undo", false),
-            Err(e) => state.toast(format!("undo failed: {e}"), true),
+            None => state.toast("nothing to undo", false),
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -2792,9 +2802,10 @@ impl Stage {
             return;
         };
         let was = state.ws.active;
-        match state.store.redo() {
-            Ok(Some(label)) => {
-                state.reload_wm();
+        let step = state.history.redo(&state.world);
+        match step {
+            Some(step) => {
+                let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
                     let cam = state.ws.camera_x;
@@ -2805,8 +2816,7 @@ impl Stage {
                 }
                 state.toast(format!("redid — {label}"), false);
             }
-            Ok(None) => state.toast("nothing to redo", false),
-            Err(e) => state.toast(format!("redo failed: {e}"), true),
+            None => state.toast("nothing to redo", false),
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -2937,6 +2947,9 @@ impl Stage {
                         ws.open(kind, None, false);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 state.field = None;
                 state.sync();
@@ -3132,24 +3145,21 @@ impl Stage {
             }
             Act::HistoryRow(id) => {
                 let was = state.ws.active;
-                match state.store.travel(id) {
-                    Ok(Some(label)) => {
-                        state.reload_wm();
-                        state.sync();
-                        if state.ws.active != was {
-                            let cam = state.ws.camera_x;
-                            state.anim.camera().jump_to(cam);
-                        }
-                        for w in &state.workers {
-                            w.kick();
-                        }
-                        if let Some(s) = &state.sender {
-                            s.kick();
-                        }
-                        state.toast(format!("history — {label}"), false);
+                let step = state.history.travel(&state.world, id);
+                if let Some(step) = step {
+                    let label = state.land(step);
+                    state.sync();
+                    if state.ws.active != was {
+                        let cam = state.ws.camera_x;
+                        state.anim.camera().jump_to(cam);
                     }
-                    Ok(None) => {}
-                    Err(e) => state.toast(format!("travel failed: {e}"), true),
+                    for w in &state.workers {
+                        w.kick();
+                    }
+                    if let Some(s) = &state.sender {
+                        s.kick();
+                    }
+                    state.toast(format!("history — {label}"), false);
                 }
                 // The overlay stays up: browsing history is the point.
                 self.update_menu(cx);
@@ -3226,6 +3236,9 @@ impl Stage {
                         ws.follow_open(pid, kind, alt);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 self.sync(cx);
             }
@@ -3249,6 +3262,9 @@ impl Stage {
                         ws.follow_replace(pid, kind, alt);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 self.sync(cx);
             }
@@ -3292,6 +3308,17 @@ impl Stage {
                             let subject = mail::mail(&state.store, id)
                                 .map(|m| m.head.subject)
                                 .unwrap_or_default();
+                            // Where it lives now, so undo puts it back exactly
+                            // there rather than guessing "the inbox".
+                            let from_folder: i64 = state
+                                .store
+                                .conn()
+                                .query_row(
+                                    "SELECT folder FROM message WHERE id = ?1",
+                                    [id],
+                                    |r| r.get(0),
+                                )
+                                .unwrap_or(0);
                             state.act(
                                 "archive",
                                 format!("archive “{subject}”"),
@@ -3300,6 +3327,7 @@ impl Stage {
                                     ws.close(pid);
                                 },
                                 move |tx| mail::archive_tx(tx, id),
+                                vec![Box::new(mail::Archived { mail: id, from_folder }) as Box<dyn crate::history::Intent>],
                             );
                             state.toast(format!("archived “{subject}” — ⌘z undoes"), false);
                         }
@@ -3342,6 +3370,7 @@ impl Stage {
                                     mail::upsert_draft_tx(tx, pid as i64, re, &d, now)?;
                                     mail::file_send_tx(tx, pid as i64, now + delay)
                                 },
+                                vec![Box::new(mail::Sent { panel: pid as i64, delay }) as Box<dyn crate::history::Intent>],
                             );
                             state.toast(
                                 format!("sending in {}s — ⌘z undoes", delay as u32),
@@ -3351,6 +3380,12 @@ impl Stage {
                     }
                     BtnAct::Discard => {
                         let label = format!("discard “{}”", state.title_of(pid));
+                        // The text goes with the panel, so undo has to carry it.
+                        let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
+                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                            _ => None,
+                        };
                         state.act(
                             "close",
                             label,
@@ -3359,6 +3394,11 @@ impl Stage {
                                 ws.close(pid);
                             },
                             move |tx| mail::discard_draft_tx(tx, pid as i64),
+                            vec![Box::new(mail::Discarded {
+                                panel: pid as i64,
+                                draft,
+                                re,
+                            }) as Box<dyn crate::history::Intent>],
                         );
                     }
                 }
@@ -3712,15 +3752,26 @@ impl Stage {
                         if !stored {
                             state.toast("storing the password failed", true);
                         } else {
+                            let added = std::cell::Cell::new(0i64);
                             state.act(
                                 "account",
                                 format!("add account {email}"),
                                 None,
                                 |_| {},
-                                move |tx| {
-                                    mail::add_account_tx(tx, &email, &imap, &smtp).map(|_| ())
+                                |tx| {
+                                    added.set(mail::add_account_tx(
+                                        tx, &email, &imap, &smtp,
+                                    )?);
+                                    Ok(())
                                 },
+                                Vec::new(),
                             );
+                            state.history.claim(Box::new(mail::AccountAdded {
+                                id: added.get(),
+                                email: email.clone(),
+                                imap: imap.clone(),
+                                smtp: smtp.clone(),
+                            }));
                             state.spawn_workers();
                             state.toast("account added — syncing", false);
                             if let Some(w) = self.hosted.get(&pid) {
@@ -3785,6 +3836,9 @@ impl Stage {
                         None,
                         |_| {},
                         move |tx| mail::remove_account_tx(tx, id),
+                        vec![Box::new(mail::AccountRemoved {
+                            email: email.clone(),
+                        }) as Box<dyn crate::history::Intent>],
                     );
                     state.spawn_workers();
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
@@ -3974,7 +4028,6 @@ impl Widget for Stage {
                 }
                 // A delivered send can no longer be undone — the walk
                 // marks it expired and steps past.
-                store.set_undo_guard(mail::send_locked);
                 let mut s = State::new(store, path);
                 s.failed_seen = mail::outbox_failures(&s.store).len();
                 s.spawn_workers();
@@ -4753,7 +4806,7 @@ impl Stage {
         // are muted but clickable — travel goes anywhere, including the
         // beginning. Expired sends are physics: marked, never re-walked.
         if state.overlay == Overlay::History {
-            let (nodes, head) = state.store.history().unwrap_or((Vec::new(), 0));
+            let (nodes, head) = state.history.rows();
             let mut depth: HashMap<i64, usize> = HashMap::new();
             for n in &nodes {
                 let d = depth.get(&n.parent).map_or(0, |d| d + 1);

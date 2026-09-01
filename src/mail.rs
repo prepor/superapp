@@ -13,7 +13,8 @@ use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{Kind, MailId};
-use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry};
+use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
+use crate::history::Intent;
 use crate::store::{Q, Store, Val};
 
 /// One list row: what the inbox and the launcher show.
@@ -390,27 +391,6 @@ pub fn file_send_tx(
     Ok(())
 }
 
-/// The undo guard: a send whose outbox row is mid-flight or delivered can
-/// no longer be undone (the walk marks it expired). Pending and failed
-/// rows stay cancellable.
-pub fn send_locked(c: &rusqlite::Connection, kind: &str, entity: Option<&str>) -> bool {
-    if kind != "send" {
-        return false;
-    }
-    let Some(id) = entity
-        .and_then(|e| e.strip_prefix("outbox:"))
-        .and_then(|s| s.parse::<i64>().ok())
-    else {
-        return false;
-    };
-    matches!(
-        c.query_row("SELECT status FROM outbox WHERE id=?1", [id], |r| {
-            r.get::<_, String>(0)
-        }),
-        Ok(s) if s == "sending" || s == "sent"
-    )
-}
-
 /// Discard: the draft goes with the panel (both revert on undo).
 pub fn discard_draft_tx(c: &rusqlite::Connection, panel: i64) -> rusqlite::Result<()> {
     c.execute("DELETE FROM draft WHERE panel=?1", [panel])?;
@@ -676,6 +656,191 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
             Ok(d)
         }
     })
+}
+
+// -- the mail domain's intents ------------------------------------------------
+//
+// What an action claimed of the world, and how to give it back. In memory,
+// on a history node, never serialized — what survives a restart is the row
+// each one wrote.
+
+/// Opening a mail marks it read.
+pub struct MarkRead {
+    pub mail: MailId,
+}
+
+impl Intent for MarkRead {
+    fn describe(&self) -> String {
+        format!("mail:{} read", self.mail)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE message SET unread = 1 WHERE id = ?1", [self.mail])
+                    .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| mark_read_tx(c, self.mail))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Archiving moves a mail out of the folder it was in. Reversing is a plain
+/// intent flip — the push pass re-converges, so nothing compensates.
+pub struct Archived {
+    pub mail: MailId,
+    /// Where it was, so undo can put it back exactly there.
+    pub from_folder: i64,
+}
+
+impl Intent for Archived {
+    fn describe(&self) -> String {
+        format!("mail:{} archived", self.mail)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE message SET folder = ?1 WHERE id = ?2",
+                    rusqlite::params![self.from_folder, self.mail],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| archive_tx(c, self.mail))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A send, claimable back only until the sender takes it.
+pub struct Sent {
+    pub panel: i64,
+    /// How long the window is, so redo files a fresh one.
+    pub delay: f64,
+}
+
+impl Intent for Sent {
+    fn describe(&self) -> String {
+        format!("outbox:{} filed", self.panel)
+    }
+
+    /// The status guard is the whole race: `pending` means the executor has
+    /// not taken it, and undo wins. Anything else means the mail is gone.
+    fn blocked(&self, w: &World) -> Option<String> {
+        match w.store().conn().query_row(
+            "SELECT status FROM outbox WHERE id = ?1",
+            [self.panel],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) if s == "pending" => None,
+            Ok(s) if s == "failed" => None, // never left; still cancellable
+            Ok(_) => Some("already sent".into()),
+            Err(_) => None, // no row: nothing to give back, nothing to block
+        }
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "DELETE FROM outbox WHERE id = ?1 AND status IN ('pending','failed')",
+                    [self.panel],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let after = w.now() + self.delay;
+        w.store()
+            .write(|c| file_send_tx(c, self.panel, after))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Discarding a compose takes its text with it.
+pub struct Discarded {
+    pub panel: i64,
+    pub draft: Draft,
+    pub re: Option<MailId>,
+}
+
+impl Intent for Discarded {
+    fn describe(&self) -> String {
+        format!("panel:{} draft discarded", self.panel)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let now = w.now();
+        w.store()
+            .write(|c| upsert_draft_tx(c, self.panel, self.re, &self.draft, now))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| discard_draft_tx(c, self.panel))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Adding an account. Reversible while it is still empty, which it is at
+/// the moment it is added.
+pub struct AccountAdded {
+    pub id: i64,
+    pub email: String,
+    pub imap: String,
+    pub smtp: String,
+}
+
+impl Intent for AccountAdded {
+    fn describe(&self) -> String {
+        format!("account:{} added", self.id)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| remove_account_tx(c, self.id))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO account(id, label, email, imap_host, smtp_host)
+                     VALUES(?1, ?2, ?2, ?3, ?4)",
+                    rusqlite::params![self.id, self.email, self.imap, self.smtp],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Removing an account takes its mail with it, and no snapshot brings that
+/// back. Stated honestly rather than half-restored: the node goes expired
+/// and the walk steps past it.
+pub struct AccountRemoved {
+    pub email: String,
+}
+
+impl Intent for AccountRemoved {
+    fn describe(&self) -> String {
+        format!("account {} removed", self.email)
+    }
+    fn blocked(&self, _w: &World) -> Option<String> {
+        Some("an account's mail cannot be restored".into())
+    }
+    fn reverse(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
+    fn reapply(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // -- the in-memory half -------------------------------------------------------
