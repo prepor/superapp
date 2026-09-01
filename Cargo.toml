@@ -26,7 +26,7 @@ mail-parser = "0.11"
 # (makepad@dev). Plain upstream — none of mosaic's patches; the one superapp
 # used was 0003 (present-when-occluded, for background e2e runs), dropped as
 # an experiment: if occluded e2e suites go stale, run them with --front.
-makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }
+makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
 # The one store: bundled SQLite (same pin rel.systems validated) so the hook
 # surface and version are identical on macOS and android. `hooks` powers the
@@ -37,8 +37,8 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "9daab06dc
 rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }
-makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }
+makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
 [profile.dev]
 opt-level = 1
