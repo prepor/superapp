@@ -47,12 +47,23 @@ per account** — its own connection to the same file — polls every minute
 (each folder retains the newest **200** messages; below that window the
 panels honestly know nothing), reconcile flags and deletions.
 
-Reconciliation never fights the user: a row flagged **`dirty`** — read or
-archived locally, server not yet told — is local truth until the op queue
-(phase 4) pushes it. A worker's commit reaches the UI as a signal; the
-store notices foreign commits by `data_version` and re-runs stale queries
-on the next draw. Account add/remove are undoable actions like everything
-else.
+Server effects run on a **desired/actual split**: a `message` row is the
+user's *intent* (which folder, read or not); `server_msg` is what the
+server actually holds, written only by the workers. A row whose two sides
+disagree **is** the push queue — each pass starts by making the server
+agree (`UID MOVE`, `\Seen`), then fetches and reconciles facts.
+Reconciliation never fights the user: divergent intent is pushed over the
+server, never clobbered by it (deletion is the one place the server wins).
+And because `server_msg` lives outside the undo world, undoing an
+already-pushed archive needs no compensation machinery at all — intent
+flips back, the next pass moves the mail back. A moved mail whose new uid
+the server never reported (no COPYUID) is re-identified by Message-ID
+instead of duplicated; per-message push failures land on that message's
+status line.
+
+A worker's commit reaches the UI as a signal; the store notices foreign
+commits by `data_version` and re-runs stale queries on the next draw.
+Account add/remove are undoable actions like everything else.
 
 ## What stays out of the file
 

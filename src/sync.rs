@@ -49,7 +49,7 @@ pub struct RemoteMail {
     pub raw: Vec<u8>,
 }
 
-/// The five IMAP verbs the engine needs. Errors are strings — they land on
+/// The IMAP verbs the engine needs. Errors are strings — they land on
 /// the account's status line, for a human.
 pub trait Transport {
     fn folders(&mut self) -> Result<Vec<RemoteFolder>, String>;
@@ -60,12 +60,114 @@ pub trait Transport {
     fn uids(&mut self, name: &str) -> Result<HashSet<u32>, String>;
     /// Every unseen uid (flag reconcile).
     fn unread_uids(&mut self, name: &str) -> Result<HashSet<u32>, String>;
+    /// `UID MOVE`; the new uid in `to` when the server says (UIDPLUS'
+    /// COPYUID), `None` otherwise — adoption by Message-ID covers that.
+    fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String>;
+    /// `UID STORE` the `\Seen` flag.
+    fn store_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String>;
 }
 
-/// One full sync pass for one account: mirror folders, fetch what is new,
-/// reconcile flags and deletions over the retained window. Each folder is
-/// one transaction.
+/// One full sync pass for one account: **push first** (make the server
+/// agree with local intent), then mirror folders, fetch what is new, and
+/// reconcile facts. Each folder is one transaction.
 pub fn sync_account(
+    conn: &Connection,
+    t: &mut dyn Transport,
+    account: i64,
+) -> Result<(), String> {
+    push_account(conn, t, account)?;
+    fetch_account(conn, t, account)
+}
+
+/// The push pass: every message whose intent differs from the server —
+/// folder or read state — is the queue. Per-message failures land on that
+/// message's status line and do not stop the pass.
+pub fn push_account(
+    conn: &Connection,
+    t: &mut dyn Transport,
+    account: i64,
+) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    struct PushRow {
+        id: i64,
+        uid: u32,
+        want_folder: i64,
+        want_name: String,
+        have_folder: i64,
+        have_name: String,
+        unread: bool,
+        seen: bool,
+    }
+    let rows: Vec<PushRow> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, s.uid, m.folder, fw.name, s.folder, fh.name, m.unread, s.seen
+                 FROM message m
+                 JOIN server_msg s ON s.message = m.id
+                 JOIN folder fw ON fw.id = m.folder
+                 JOIN folder fh ON fh.id = s.folder
+                 WHERE m.account = ?1 AND s.uid IS NOT NULL
+                   AND (m.folder != s.folder OR m.unread = s.seen)",
+            )
+            .map_err(err)?;
+        let it = stmt
+            .query_map([account], |r| {
+                Ok(PushRow {
+                    id: r.get(0)?,
+                    uid: r.get::<_, i64>(1)? as u32,
+                    want_folder: r.get(2)?,
+                    want_name: r.get(3)?,
+                    have_folder: r.get(4)?,
+                    have_name: r.get(5)?,
+                    unread: r.get(6)?,
+                    seen: r.get(7)?,
+                })
+            })
+            .map_err(err)?;
+        it.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?
+    };
+    for p in rows {
+        let mut uid = p.uid;
+        let mut folder_name = p.have_name.clone();
+        let outcome: Result<(), String> = (|| {
+            if p.want_folder != p.have_folder {
+                let new_uid = t.move_uid(&p.have_name, &p.want_name, uid)?;
+                conn.execute(
+                    "UPDATE server_msg SET folder=?1, uid=?2 WHERE message=?3",
+                    rusqlite::params![p.want_folder, new_uid, p.id],
+                )
+                .map_err(err)?;
+                folder_name = p.want_name.clone();
+                match new_uid {
+                    Some(u) => uid = u,
+                    // No COPYUID: identity is lost until adoption by
+                    // Message-ID on the next fetch; the flag push waits.
+                    None => return Ok(()),
+                }
+            }
+            if p.unread == p.seen {
+                t.store_seen(&folder_name, uid, !p.unread)?;
+                conn.execute(
+                    "UPDATE server_msg SET seen=?1 WHERE message=?2",
+                    rusqlite::params![!p.unread, p.id],
+                )
+                .map_err(err)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            conn.execute(
+                "UPDATE message SET status=?1, status_err=1 WHERE id=?2",
+                rusqlite::params![format!("sync: {e}"), p.id],
+            )
+            .map_err(err)?;
+        }
+    }
+    Ok(())
+}
+
+/// The fetch/reconcile pass.
+fn fetch_account(
     conn: &Connection,
     t: &mut dyn Transport,
     account: i64,
@@ -102,7 +204,13 @@ pub fn sync_account(
         let from = if known.0 != Some(i64::from(meta.uidvalidity)) {
             // The server renumbered (or first contact): local copies of
             // this folder are meaningless. Start over inside the window.
-            conn.execute("DELETE FROM message WHERE folder=?1", [fid])
+            conn.execute(
+                "DELETE FROM message WHERE id IN
+                   (SELECT message FROM server_msg WHERE folder=?1)",
+                [fid],
+            )
+            .map_err(err)?;
+            conn.execute("DELETE FROM server_msg WHERE folder=?1", [fid])
                 .map_err(err)?;
             floor
         } else {
@@ -123,32 +231,60 @@ pub fn sync_account(
         )
         .map_err(err)?;
 
-        // Reconcile the retained window. Dirty rows are local truth.
+        // Reconcile facts over the retained window — by the *server's* view
+        // of this folder. Divergent intent stays local truth: an unpushed
+        // read/archive is never clobbered, only recorded.
         let server = t.uids(&rf.name)?;
         let unseen = t.unread_uids(&rf.name)?;
-        let local: Vec<(i64, u32, bool)> = {
+        let local: Vec<(i64, u32, bool, bool)> = {
             let mut stmt = conn
-                .prepare("SELECT id, uid, unread FROM message WHERE folder=?1 AND uid IS NOT NULL AND dirty=0")
+                .prepare(
+                    "SELECT m.id, s.uid, s.seen, m.unread
+                     FROM server_msg s JOIN message m ON m.id = s.message
+                     WHERE s.folder=?1 AND s.uid IS NOT NULL",
+                )
                 .map_err(err)?;
             let rows = stmt
                 .query_map([fid], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)? as u32,
+                        r.get(2)?,
+                        r.get(3)?,
+                    ))
                 })
                 .map_err(err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(err)?;
             rows
         };
-        for (id, uid, local_unread) in local {
+        for (id, uid, seen, unread) in local {
             if !server.contains(&uid) {
+                // Gone upstream (deleted, or moved beyond our mirror):
+                // deletion wins, divergent intent included.
                 conn.execute("DELETE FROM message WHERE id=?1", [id])
                     .map_err(err)?;
-            } else if unseen.contains(&uid) != local_unread {
+                conn.execute("DELETE FROM server_msg WHERE message=?1", [id])
+                    .map_err(err)?;
+                continue;
+            }
+            let now_seen = !unseen.contains(&uid);
+            if now_seen != seen {
                 conn.execute(
-                    "UPDATE message SET unread=?1 WHERE id=?2",
-                    rusqlite::params![unseen.contains(&uid), id],
+                    "UPDATE server_msg SET seen=?1 WHERE message=?2",
+                    rusqlite::params![now_seen, id],
                 )
                 .map_err(err)?;
+                // Clean rows (intent agrees with the old server state)
+                // follow the server; divergent intent will be pushed over
+                // it next pass instead.
+                if unread != seen {
+                    conn.execute(
+                        "UPDATE message SET unread=?1 WHERE id=?2",
+                        rusqlite::params![!now_seen, id],
+                    )
+                    .map_err(err)?;
+                }
             }
         }
         conn.execute("COMMIT", []).map_err(err)?;
@@ -156,23 +292,51 @@ pub fn sync_account(
     Ok(())
 }
 
-/// Parses and stores one fetched message (idempotent per `(folder, uid)`).
+/// Parses and stores one fetched message. A moved mail whose new uid the
+/// server never told us (no COPYUID) is **adopted** by Message-ID instead
+/// of duplicated.
 fn ingest_message(
     conn: &Connection,
     account: i64,
     folder: i64,
     m: &RemoteMail,
 ) -> rusqlite::Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM server_msg WHERE folder=?1 AND uid=?2",
+            rusqlite::params![folder, m.uid],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if exists {
+        return Ok(());
+    }
     let p = parse_mail(&m.raw);
+    if !p.message_id.is_empty() {
+        // A uid-less twin in this folder is the same mail, post-move.
+        let orphan: Option<i64> = conn
+            .query_row(
+                "SELECT m.id FROM message m JOIN server_msg s ON s.message=m.id
+                 WHERE m.account=?1 AND m.message_id=?2 AND s.uid IS NULL",
+                rusqlite::params![account, p.message_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = orphan {
+            conn.execute(
+                "UPDATE server_msg SET folder=?1, uid=?2, seen=?3 WHERE message=?4",
+                rusqlite::params![folder, m.uid, !m.unread, id],
+            )?;
+            return Ok(());
+        }
+    }
     conn.execute(
-        "INSERT INTO message(account, folder, uid, from_name, from_email,
-                             subject, date, unread, body, raw)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-         ON CONFLICT(folder, uid) WHERE uid IS NOT NULL DO NOTHING",
+        "INSERT INTO message(account, folder, from_name, from_email,
+                             subject, date, unread, body, raw, message_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         rusqlite::params![
             account,
             folder,
-            m.uid,
             p.from_name,
             p.from_email,
             p.subject,
@@ -180,7 +344,13 @@ fn ingest_message(
             m.unread,
             p.body,
             m.raw,
+            p.message_id,
         ],
+    )?;
+    conn.execute(
+        "INSERT INTO server_msg(message, folder, uid, seen)
+         VALUES(?1, ?2, ?3, ?4)",
+        rusqlite::params![conn.last_insert_rowid(), folder, m.uid, !m.unread],
     )?;
     Ok(())
 }
@@ -192,6 +362,8 @@ pub struct ParsedMail {
     pub subject: String,
     pub date: f64,
     pub body: String,
+    /// The Message-ID header — move adoption (and threading, someday).
+    pub message_id: String,
 }
 
 /// MIME → panel text via `mail-parser`. Paragraph structure survives as
@@ -205,6 +377,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             subject: "(unparseable message)".into(),
             date: 0.0,
             body: String::new(),
+            message_id: String::new(),
         };
     };
     let (from_name, from_email) = msg
@@ -231,6 +404,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             .body_text(0)
             .map(|t| t.replace("\r\n", "\n").trim().to_string())
             .unwrap_or_default(),
+        message_id: msg.message_id().unwrap_or_default().to_string(),
     }
 }
 
@@ -417,6 +591,23 @@ pub mod imap_transport {
             self.ensure(name)?;
             self.session.uid_search("UNSEEN").map_err(s)
         }
+
+        fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String> {
+            self.ensure(from)?;
+            self.session.uid_mv(uid.to_string(), to).map_err(s)?;
+            // The crate acks the MOVE but does not surface COPYUID; the
+            // new uid arrives via Message-ID adoption on the next fetch.
+            Ok(None)
+        }
+
+        fn store_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String> {
+            self.ensure(folder)?;
+            let flags = if seen { "+FLAGS (\\Seen)" } else { "-FLAGS (\\Seen)" };
+            self.session
+                .uid_store(uid.to_string(), flags)
+                .map_err(s)?;
+            Ok(())
+        }
     }
 }
 
@@ -427,6 +618,9 @@ pub mod imap_transport {
 pub struct FakeTransport {
     /// folder → (uidvalidity, next_uid, mails)
     pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
+    /// Whether MOVE reports the new uid (UIDPLUS' COPYUID) — both server
+    /// behaviours exist in the wild, so both are testable.
+    pub copyuid: bool,
 }
 
 impl FakeTransport {
@@ -507,6 +701,35 @@ impl Transport for FakeTransport {
         let f = self.folders.get(name).ok_or("no such folder")?;
         Ok(f.2.iter().filter(|m| m.unread).map(|m| m.uid).collect())
     }
+
+    fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String> {
+        let src = self.folders.get_mut(from).ok_or("no such folder")?;
+        let i = src
+            .2
+            .iter()
+            .position(|m| m.uid == uid)
+            .ok_or("no such uid")?;
+        let mut m = src.2.remove(i);
+        let dst = self
+            .folders
+            .entry(to.to_string())
+            .or_insert((1, 1, Vec::new()));
+        m.uid = dst.1;
+        dst.1 += 1;
+        let new = m.uid;
+        dst.2.push(m);
+        Ok(self.copyuid.then_some(new))
+    }
+
+    fn store_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String> {
+        let f = self.folders.get_mut(folder).ok_or("no such folder")?;
+        for m in &mut f.2 {
+            if m.uid == uid {
+                m.unread = !seen;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +739,7 @@ mod tests {
 
     const RAW: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
 Subject: Budget v2\r\n\
+Message-ID: <budget-v2@kovac.io>\r\n\
 Date: Mon, 31 Aug 2026 09:14:00 +0000\r\n\
 \r\n\
 First paragraph.\r\n\r\nSecond paragraph.\r\n";
@@ -540,7 +764,7 @@ First paragraph.\r\n\r\nSecond paragraph.\r\n";
             .conn()
             .prepare(
                 "SELECT m.subject, m.unread FROM message m
-                 JOIN folder f ON m.folder=f.id WHERE f.role='inbox' ORDER BY m.uid",
+                 JOIN folder f ON m.folder=f.id WHERE f.role='inbox' ORDER BY m.id",
             )
             .unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -580,15 +804,80 @@ First paragraph.\r\n\r\nSecond paragraph.\r\n";
         assert_eq!(inbox_rows(&s).len(), 1);
     }
 
-    /// Dirty rows — locally read or archived, server not yet told — are
-    /// immune to reconciliation.
+    /// Local intent is pushed, not clobbered: a locally-read mail makes the
+    /// server seen; a locally-archived mail moves on the server (COPYUID
+    /// path) — and undoing the archive moves it back, with no compensation
+    /// machinery, because undo just flips intent.
     #[test]
-    fn dirty_rows_win_over_the_server() {
+    fn push_makes_the_server_agree_and_undo_pushes_back() {
         let (s, mut t, acct) = world();
+        t.copyuid = true;
+        t.folders.insert("Archive".into(), (3, 1, Vec::new()));
         t.deliver("INBOX", true, RAW);
         sync_account(s.conn(), &mut t, acct).unwrap();
-        // The user reads it locally (dirty=1); the server still says UNSEEN.
+
+        // Read + archive locally (intent only), then push.
+        s.write(|c| {
+            crate::mail::mark_read_tx(c, 1)?;
+            crate::mail::archive_tx(c, 1)
+        })
+        .unwrap();
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert!(t.folders["INBOX"].2.is_empty(), "moved off the inbox");
+        assert_eq!(t.folders["Archive"].2.len(), 1);
+        assert!(!t.folders["Archive"].2[0].unread, "seen pushed too");
+
+        // Undo-shaped change: intent flips back; the next pass restores.
+        s.write(|c| {
+            c.execute(
+                "UPDATE message SET folder=(SELECT id FROM folder WHERE role='inbox') WHERE id=1",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(t.folders["INBOX"].2.len(), 1, "moved back");
+        assert!(t.folders["Archive"].2.is_empty());
+        assert_eq!(inbox_rows(&s).len(), 1, "still exactly one local row");
+    }
+
+    /// Without COPYUID the moved mail loses its uid until the next fetch
+    /// adopts it by Message-ID — one row throughout, never a duplicate.
+    #[test]
+    fn move_without_copyuid_adopts_by_message_id() {
+        let (s, mut t, acct) = world();
+        t.copyuid = false;
+        t.folders.insert("Archive".into(), (3, 1, Vec::new()));
+        t.deliver("INBOX", true, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        s.write(|c| crate::mail::archive_tx(c, 1)).unwrap();
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        let (n, uid): (i64, Option<i64>) = s
+            .conn()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM message), uid FROM server_msg",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "adopted, not duplicated");
+        assert!(uid.is_some(), "identity re-established by Message-ID");
+        // And the flag intent left waiting now pushes cleanly.
         s.write(|c| crate::mail::mark_read_tx(c, 1)).unwrap();
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert!(!t.folders["Archive"].2[0].unread);
+    }
+
+    /// A remote flag change lands locally when intent is clean, but
+    /// divergent local intent wins (it will be pushed over the server).
+    #[test]
+    fn remote_flags_yield_to_divergent_intent() {
+        let (s, mut t, acct) = world();
+        let u = t.deliver("INBOX", true, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        // Clean row: the server marking it seen flows in.
+        t.mark_seen("INBOX", u);
         sync_account(s.conn(), &mut t, acct).unwrap();
         assert_eq!(inbox_rows(&s), vec![("Budget v2".to_string(), false)]);
     }

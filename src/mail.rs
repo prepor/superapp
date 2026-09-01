@@ -275,21 +275,21 @@ pub fn title(store: &Store, kind: &Kind) -> String {
 
 /// Marks a mail read (opening it does this). A no-change update touches no
 /// row — so it records nothing, and undoing the open of an already-read
-/// mail correctly leaves it read. `dirty` marks the row as locally ahead of
-/// the server: reconciliation leaves it alone until the op queue pushes it.
+/// mail correctly leaves it read. This writes **intent** only; the sync
+/// worker pushes wherever intent and `server_msg` disagree.
 pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE message SET unread = 0, dirty = 1 WHERE id = ?1 AND unread = 1",
+        "UPDATE message SET unread = 0 WHERE id = ?1 AND unread = 1",
         [id],
     )?;
     Ok(())
 }
 
-/// Archives a mail: it moves to its account's archive folder (locally ahead
-/// of the server — see [`mark_read_tx`] on `dirty`).
+/// Archives a mail: it moves to its account's archive folder. Intent only —
+/// the push pass makes the server agree (see [`mark_read_tx`]).
 pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE message SET dirty = 1, folder =
+        "UPDATE message SET folder =
            (SELECT f.id FROM folder f
             WHERE f.account = message.account AND f.role = 'archive')
          WHERE id = ?1",

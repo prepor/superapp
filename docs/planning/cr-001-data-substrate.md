@@ -288,7 +288,13 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    Engine unit-tested against a fake transport; the `.invalid`-host e2e
    exercises the real signal path.
 4. **Ops for real.** Executor to the server (archive/delete/flags),
-   offline-safe, undo enqueues compensations.
+   offline-safe, undo enqueues compensations. — **landed 2026-09-01**, with
+   a deliberate deviation: no op table. The queue is *derived* from a
+   desired/actual split (`message` = intent, `server_msg` = fact, workers
+   only write the latter, sessions never record it) — so undo needs **no
+   compensation code**: reverted intent re-diverges and the push pass
+   restores the server. Simpler than the sketch and strictly more honest;
+   COPYUID-less moves re-identify by Message-ID. Offline = intent waits.
 5. **Send.** Drafts persist; outbox with a 10 s window; SMTP worker; undo-send;
    Sent append.
 6. **The history overlay.** The DAG made visible and walkable; jumping =

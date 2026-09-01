@@ -1150,6 +1150,11 @@ impl State {
             eprintln!("store: action “{label}” failed: {e}");
         }
         self.last_saved = Some(snap);
+        // Push soon: whatever this action changed about mail intent, a
+        // worker makes the server agree without waiting for the poll.
+        for w in &self.workers {
+            w.kick();
+        }
     }
 
     /// An undoable action that only moves panels around.
@@ -2753,6 +2758,9 @@ impl Stage {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
                 }
+                for w in &state.workers {
+                    w.kick(); // reverted intent pushes to the server too
+                }
                 state.toast(format!("undid — {label}"), false);
             }
             Ok(None) => state.toast("nothing to undo", false),
@@ -2775,6 +2783,9 @@ impl Stage {
                 if state.ws.active != was {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
+                }
+                for w in &state.workers {
+                    w.kick();
                 }
                 state.toast(format!("redid — {label}"), false);
             }

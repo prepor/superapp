@@ -187,9 +187,34 @@ CREATE UNIQUE INDEX idx_message_folder_uid ON message(folder, uid)
   WHERE uid IS NOT NULL;
 ";
 
+/// Schema v4 (CR-001 phase 4): the desired/actual split. `message` rows are
+/// the user's **intent** (which folder, read or not); `server_msg` is what
+/// the server actually holds. A row whose two sides disagree *is* the push
+/// queue — no op table. Only the sync workers write `server_msg`, and it
+/// stays outside the undo world, so undoing an already-pushed archive is
+/// just intent flipping back: the next push pass moves it back on the
+/// server. Compensation without compensation code.
+const SCHEMA_V4: &str = "
+CREATE TABLE server_msg(
+  message INTEGER PRIMARY KEY,
+  folder  INTEGER NOT NULL,
+  uid     INTEGER,
+  seen    INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX idx_server_msg_uid ON server_msg(folder, uid)
+  WHERE uid IS NOT NULL;
+ALTER TABLE message ADD COLUMN message_id TEXT;
+INSERT INTO server_msg(message, folder, uid, seen)
+  SELECT id, folder, uid, NOT unread FROM message WHERE uid IS NOT NULL;
+DROP INDEX idx_message_folder_uid;
+ALTER TABLE message DROP COLUMN uid;
+ALTER TABLE message DROP COLUMN dirty;
+";
+
 /// The tables sessions record — the undoable world. `action` and `meta`
-/// (the head pointer) stay outside it: undo must never rewrite history's
-/// own bookkeeping.
+/// (the head pointer) stay outside it — undo must never rewrite history's
+/// own bookkeeping — and so does `server_msg`: what the server holds is
+/// fact, not intent, and executor writes must never collide with undo.
 const ACTION_TABLES: [&str; 7] = [
     "account", "folder", "message", "workspace", "ws_col", "panel", "wm",
 ];
@@ -233,6 +258,10 @@ impl Store {
         if version < 3 {
             conn.execute_batch(SCHEMA_V3)?;
             conn.pragma_update(None, "user_version", 3)?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+            conn.pragma_update(None, "user_version", 4)?;
         }
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
