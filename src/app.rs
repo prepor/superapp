@@ -42,6 +42,24 @@ use crate::ui::{
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Under a headless build the shell runs on a **fixed frame clock**: one
+/// draw cycle is one frame of exactly this long, for both the springs and
+/// the e2e runner. Nothing reads the wall clock, so a run is reproducible
+/// whether the machine is idle or running a dozen other suites.
+#[cfg(headless)]
+const FRAME_MS: f64 = 1000.0 / 60.0;
+
+/// How often the manual pump runs a sync/send round, in frames. Half a
+/// second of frame time — often enough that a script's `wait` sees the
+/// result, rare enough that a dead host is not dialled sixty times a second.
+#[cfg(headless)]
+const PUMP_EVERY: u64 = 30;
+
+/// The windowed e2e runner is paced by a real timer at this interval; the
+/// runner counts the same milliseconds either way.
+#[cfg(not(headless))]
+const E2E_TICK_MS: f64 = 30.0;
+
 /// Command-line configuration.
 #[derive(Debug, Default)]
 struct Config {
@@ -766,6 +784,9 @@ struct State {
     /// Where passwords live. An e2e run keeps them in memory, so a suite
     /// never writes to a human's keychain and two runs never collide.
     secrets: crate::effect::Secrets,
+    /// What time the app thinks it is. Virtual under a headless build, so
+    /// a send deadline moves with the script rather than with the machine.
+    clock: crate::effect::Clock,
     /// Failed outbox rows already toasted (new ones toast on signal).
     failed_seen: usize,
     /// The last persisted logical snapshot — [`State::sync`] only writes
@@ -778,7 +799,9 @@ struct State {
     animating: bool,
     hover: Option<Act>,
     field: Option<(PanelId, FieldId)>,
-    toast: Option<(String, bool, Instant)>,
+    /// `(message, is_error, when)` — `when` on the world's clock, not the
+    /// wall's, so a toast fades by the same amount on every run.
+    toast: Option<(String, bool, f64)>,
     overlay: Overlay,
     launcher: LauncherUi,
 }
@@ -842,9 +865,16 @@ impl State {
                     .unwrap_or_default(),
             )
         };
+        // Headless: one fixed frame clock for the springs, the e2e runner
+        // and the app's own deadlines alike. It starts at a fixed instant
+        // so even the dates in a screenshot are reproducible.
+        #[cfg(headless)]
+        let clock = crate::effect::Clock::virtual_from(mail::ts(2026, 9, 1, 12, 0));
+        #[cfg(not(headless))]
+        let clock = crate::effect::Clock::System;
         let world = std::rc::Rc::new(crate::effect::World::new(
             store.clone(),
-            Box::new(crate::effect::Real::new(secrets.clone())),
+            Box::new(crate::effect::Real::new(secrets.clone(), clock.clone())),
             mail::registry(),
         ));
         // Boot restores the last session from the store; a store that never
@@ -867,9 +897,17 @@ impl State {
             ws,
             world,
             secrets,
+            clock,
             history: crate::history::History::new(),
             store,
             db_path,
+            // Headless: no threads at all. The passes run inline from the
+            // frame loop, so ingest, push and send land at frame
+            // boundaries instead of whenever a worker happens to wake —
+            // the last thing standing between a run and reproducibility.
+            #[cfg(headless)]
+            pump: sync::Pump::Manual,
+            #[cfg(not(headless))]
             pump: sync::Pump::threads(),
             failed_seen: 0,
             last_saved: None,
@@ -982,7 +1020,8 @@ impl State {
     }
 
     fn toast(&mut self, msg: impl Into<String>, err: bool) {
-        self.toast = Some((msg.into(), err, Instant::now()));
+        let now = self.world.now();
+        self.toast = Some((msg.into(), err, now));
     }
 
     /// A panel's title, wherever it lives — for action labels.
@@ -1096,7 +1135,8 @@ impl State {
         };
         let world = self.world.clone();
         let secrets = self.secrets.clone();
-        self.pump.ensure(&world, &db, &secrets, || {
+        let clock = self.clock.clone();
+        self.pump.ensure(&world, &db, &secrets, &clock, || {
             SignalToUI::set_ui_signal();
         });
     }
@@ -1718,6 +1758,10 @@ pub struct Stage {
     /// The fallback store poll (see [`Stage::poll_store`]).
     #[rust]
     poll_timer: Timer,
+    /// Frames drawn — the headless manual pump's cadence counter.
+    #[rust]
+    #[allow(dead_code)]
+    frame: u64,
     /// android: after a field-to-field focus move, the blurring TextInput
     /// hides the soft keyboard and the next field's one draw-time show can
     /// lose the race against the hide animation. The guard re-issues it —
@@ -2067,13 +2111,13 @@ impl Stage {
     }
 
     /// Executes at most one e2e step per timer tick; waits pace the script.
-    fn e2e_tick(&mut self, cx: &mut Cx) {
+    fn e2e_tick(&mut self, cx: &mut Cx, dt_ms: f64) {
         let Some(mut runner) = self.e2e.take() else {
             return;
         };
         // Screenshots are effects; a run needs the world to take them.
         let world = self.state.as_ref().map(|s| s.world.clone());
-        if let Some(step) = runner.next_step() {
+        if let Some(step) = runner.next_step(dt_ms) {
             match step {
                 e2e::Step::Wait(_) => {}
                 e2e::Step::Shot(name) => {
@@ -2295,6 +2339,12 @@ impl Stage {
                         std::process::exit(1);
                     }
                     cx.quit();
+                    // Drop the runner rather than restoring it. Under a
+                    // headless build the frame pump keeps asking for
+                    // frames while a run is live, and a finished run that
+                    // stays live spins the software rasterizer flat out
+                    // until the whole --draws budget is gone.
+                    return;
                 }
             }
         }
@@ -4012,7 +4062,13 @@ impl Widget for Stage {
                 self.state = Some(Box::new(s));
                 // Belt and braces under the worker signal: a coarse poll so
                 // a lost wake can never strand the UI on cached rows.
-                self.poll_timer = cx.start_interval(2.0);
+                // Headless: no worker threads, so no foreign commits to
+                // poll for — and a wall-clock interval would be the last
+                // thing reading a clock the script does not control.
+                #[cfg(not(headless))]
+                {
+                    self.poll_timer = cx.start_interval(2.0);
+                }
             }
             if let Some(path) = &config().e2e {
                 match std::fs::read_to_string(path)
@@ -4024,7 +4080,17 @@ impl Widget for Stage {
                         let _ = std::fs::create_dir_all(&out);
                         eprintln!("e2e: {} step(s) from {path}", steps.len());
                         self.e2e = Some(e2e::Runner::new(steps, out));
-                        self.e2e_timer = cx.start_interval(0.03);
+                        // Windowed: a real timer paces the run. Headless:
+                        // the draw cycle does, so ask for the first frame
+                        // and keep asking.
+                        #[cfg(not(headless))]
+                        {
+                            self.e2e_timer = cx.start_interval(0.03);
+                        }
+                        #[cfg(headless)]
+                        {
+                            self.next_frame = cx.new_next_frame();
+                        }
                     }
                     Err(e) => {
                         eprintln!("e2e: {path}: {e}");
@@ -4037,7 +4103,8 @@ impl Widget for Stage {
         }
         if let Event::Timer(te) = event {
             if self.e2e_timer.0 != 0 && te.timer_id == self.e2e_timer.0 {
-                self.e2e_tick(cx);
+                #[cfg(not(headless))]
+                self.e2e_tick(cx, E2E_TICK_MS);
             }
             if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
                 self.poll_store(cx);
@@ -4255,16 +4322,43 @@ impl Widget for Stage {
                 if !ne.set.contains(&self.next_frame) {
                     return;
                 }
+                // Headless: one draw cycle is one e2e tick of exactly
+                // FRAME_MS, and the run keeps the loop turning by asking
+                // for the next frame every time. No wall clock anywhere.
+                #[cfg(headless)]
+                if self.e2e.is_some() {
+                    if let Some(state) = self.state.as_deref() {
+                        state.clock.advance(FRAME_MS / 1000.0);
+                        self.frame += 1;
+                        // The manual pump, on a fixed cadence: a sync and
+                        // send round every PUMP_EVERY frames, so the engine
+                        // advances with the script rather than beside it.
+                        if self.frame % PUMP_EVERY == 0 {
+                            let w = state.world.clone();
+                            sync::tick(&w);
+                            crate::send::outbox_pass(&w);
+                            w.run_effects();
+                        }
+                    }
+                    self.e2e_tick(cx, FRAME_MS);
+                    self.next_frame = cx.new_next_frame();
+                }
                 let Some(state) = self.state.as_deref_mut() else {
                     return;
                 };
-                let now = Instant::now();
-                let dt = state
-                    .last_frame
-                    .map(|t| (now - t).as_secs_f64())
-                    .unwrap_or(1.0 / 60.0)
-                    .clamp(0.0, 1.0 / 20.0);
-                state.last_frame = Some(now);
+                #[cfg(headless)]
+                let dt = FRAME_MS / 1000.0;
+                #[cfg(not(headless))]
+                let dt = {
+                    let now = Instant::now();
+                    let dt = state
+                        .last_frame
+                        .map(|t| (now - t).as_secs_f64())
+                        .unwrap_or(1.0 / 60.0)
+                        .clamp(0.0, 1.0 / 20.0);
+                    state.last_frame = Some(now);
+                    dt
+                };
                 let springs_active = state.anim.advance(dt);
                 // A held panel near a screen edge pans the camera — that is
                 // how a drag reaches columns beyond the viewport. The grabbed
@@ -4299,9 +4393,10 @@ impl Widget for Stage {
                 } else {
                     false
                 };
+                let toast_now = state.world.now();
                 let toast_active = match state.toast {
                     Some((_, _, since)) => {
-                        if since.elapsed().as_secs_f64() > 3.0 {
+                        if toast_now - since > 3.0 {
                             state.toast = None;
                             false
                         } else {
@@ -5010,7 +5105,7 @@ impl Stage {
 
         // The toast, above everything.
         if let Some((msg, err, since)) = state.toast.clone() {
-            let age = since.elapsed().as_secs_f64();
+            let age = state.world.now() - since;
             let a = (3.0 - age).clamp(0.0, 0.25) / 0.25;
             let wchars = msg.chars().count();
             let w = wchars as f64 * self.cell.adv + 20.0;
@@ -5920,11 +6015,6 @@ impl AppMain for App {
 #[cfg(not(target_os = "android"))]
 pub fn run() {
     let _ = config();
-    if background_run() {
-        // makepad skips presents for occluded windows; patch 0003 adds this
-        // bypass so a background e2e run still draws what it screenshots.
-        std::env::set_var("MAKEPAD_PRESENT_WHEN_OCCLUDED", "1");
-    }
     main();
 }
 

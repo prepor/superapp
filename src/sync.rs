@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use rusqlite::Transaction;
 
-use crate::effect::{Creds, RemoteMail, Secrets, World};
+use crate::effect::{Clock, Creds, RemoteMail, Secrets, World};
 use crate::mail;
 
 /// How many most-recent messages a folder retains on first contact (and
@@ -503,6 +503,7 @@ pub fn spawn(
     db: PathBuf,
     account: i64,
     secrets: Secrets,
+    clock: Clock,
     notify: impl Fn() + Send + 'static,
 ) -> Worker {
     let (tx, rx) = mpsc::channel::<()>();
@@ -514,7 +515,7 @@ pub fn spawn(
             };
             let w = World::new(
                 std::rc::Rc::new(store),
-                Box::new(crate::effect::Real::new(secrets)),
+                Box::new(crate::effect::Real::new(secrets, clock)),
                 mail::registry(),
             );
             loop {
@@ -680,6 +681,7 @@ impl Pump {
         w: &World,
         db: &std::path::Path,
         secrets: &Secrets,
+        clock: &Clock,
         notify: impl Fn() + Send + Clone + 'static,
     ) {
         let Pump::Threads { workers, sender } = self else {
@@ -689,6 +691,7 @@ impl Pump {
             *sender = Some(crate::send::spawn(
                 db.to_path_buf(),
                 secrets.clone(),
+                clock.clone(),
                 notify.clone(),
             ));
         }
@@ -705,6 +708,7 @@ impl Pump {
                 db.to_path_buf(),
                 a.id,
                 secrets.clone(),
+                clock.clone(),
                 notify.clone(),
             ));
         }

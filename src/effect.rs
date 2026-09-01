@@ -1104,6 +1104,50 @@ impl MemSecrets {
     }
 }
 
+/// Where [`Real`] gets the time.
+///
+/// Shared for the same reason [`MemSecrets`] is: each worker thread builds
+/// its own [`Real`], and a deadline written on the UI thread is read on a
+/// sender thread. If the two disagreed about what time it is, the sender
+/// would claim a send the script still thinks is cancellable.
+#[derive(Clone)]
+pub enum Clock {
+    /// The wall clock.
+    System,
+    /// Virtual, advanced by whoever owns the frame loop. A headless run
+    /// steps it one frame at a time, so the app's deadlines move with the
+    /// script rather than with the machine — which is what makes a run
+    /// reproducible under load.
+    Virtual(Arc<Mutex<f64>>),
+}
+
+impl Clock {
+    /// A virtual clock starting at `start` (unix seconds).
+    #[must_use]
+    pub fn virtual_from(start: f64) -> Clock {
+        Clock::Virtual(Arc::new(Mutex::new(start)))
+    }
+
+    /// Moves a virtual clock on; the system clock ignores this.
+    pub fn advance(&self, secs: f64) {
+        if let Clock::Virtual(t) = self {
+            if let Ok(mut g) = t.lock() {
+                *g += secs;
+            }
+        }
+    }
+
+    fn read(&self) -> f64 {
+        match self {
+            Clock::System => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            Clock::Virtual(t) => t.lock().map(|g| *g).unwrap_or(0.0),
+        }
+    }
+}
+
 /// Where [`Real`] keeps passwords.
 #[derive(Clone)]
 pub enum Secrets {
@@ -1147,14 +1191,16 @@ fn headless_shot(path: &Path) -> Result<(), String> {
 pub struct Real {
     sessions: HashMap<i64, imap_session::Imap>,
     secrets: Secrets,
+    clock: Clock,
 }
 
 impl Real {
     #[must_use]
-    pub fn new(secrets: Secrets) -> Real {
+    pub fn new(secrets: Secrets, clock: Clock) -> Real {
         Real {
             sessions: HashMap::new(),
             secrets,
+            clock,
         }
     }
 
@@ -1167,10 +1213,7 @@ impl Real {
 
 impl Outside for Real {
     fn now(&mut self) -> f64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
+        self.clock.read()
     }
 
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {

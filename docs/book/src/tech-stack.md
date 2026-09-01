@@ -6,14 +6,16 @@ The same makepad generation as mosaic in `rel.systems`, but sourced
 directly:
 
 - `makepad-widgets` (and the apple/objc sys crates) are **git dependencies
-  on upstream `makepad/makepad`, pinned to the same commit mosaic's vendor
-  pipeline uses** — no filesystem coupling between the repos, any checkout
-  builds. This is *plain* upstream: mosaic's three local patches are not
-  applied. The one superapp used was 0003 (present-while-occluded); without
-  it a fully covered window skips presents, so **e2e screenshots are only
-  meaningful in `--front` runs** — suite logic (hits, labels, steps) is
-  unaffected. If that trade stops being worth it, the fallback is a pushed
-  branch of the patched tree and the same `{ git, rev }` shape.
+  pinned to `prepor/makepad@superapp-pin`** — upstream's pin plus two IME
+  patches (see `Cargo.toml` for what each one fixes and why). No filesystem
+  coupling between repos; any checkout builds.
+- **`MAKEPAD=headless`** swaps makepad's whole apple backend for a software
+  rasterizer — a virtual GPU and a shader JIT — that renders frames to PNG
+  itself. That is what the e2e suite runs on: no window, no window server,
+  no display, so a run works over ssh and under load. It also retired the
+  third patch this pin used to carry (`MAKEPAD_PRESENT_WHEN_OCCLUDED`,
+  mosaic's 0003), which only existed to make an occluded window
+  photographable. See [Developer Experience](./dev-x.md).
 - `makepad-apple-sys` / `makepad-objc-sys` for the few macOS calls makepad
   does not expose (screen geometry, activation, window screenshots).
 - **`rusqlite` with bundled SQLite** — the one store (see [The Data

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::effect::{Secrets, World};
+use crate::effect::{Clock, Secrets, World};
 use crate::mail;
 
 /// One pass over the outbox: claim everything due and queue it. Answers how
@@ -96,6 +96,7 @@ impl Sender {
 pub fn spawn(
     db: PathBuf,
     secrets: Secrets,
+    clock: Clock,
     notify: impl Fn() + Send + 'static,
 ) -> Sender {
     let (tx, rx) = mpsc::channel::<()>();
@@ -107,7 +108,7 @@ pub fn spawn(
             };
             let w = World::new(
                 std::rc::Rc::new(store),
-                Box::new(crate::effect::Real::new(secrets)),
+                Box::new(crate::effect::Real::new(secrets, clock)),
                 mail::registry(),
             );
             loop {
