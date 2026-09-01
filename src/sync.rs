@@ -619,6 +619,87 @@ pub fn settle(w: &World) {
     panic!("world did not settle: {:?}", w.jobs());
 }
 
+// -- the pump -----------------------------------------------------------------
+
+/// Who runs the passes. The passes themselves — [`sync_account`],
+/// [`crate::send::outbox_pass`], [`World::run_effects`] — are the same
+/// either way; only the scheduler differs.
+#[derive(Default)]
+pub enum Pump {
+    /// Production: one thread per account, plus the sender. Each builds its
+    /// own [`World`] over its own store connection.
+    Threads {
+        workers: Vec<Worker>,
+        sender: Option<crate::send::Sender>,
+    },
+    /// Tests and the components library: passes run inline, on the calling
+    /// thread, when [`settle`] says so. An in-memory store finally has a
+    /// mail engine, and every invalidation happens in a knowable order.
+    #[default]
+    Manual,
+}
+
+impl Pump {
+    /// A threaded pump with nothing spawned yet.
+    #[must_use]
+    pub fn threads() -> Pump {
+        Pump::Threads {
+            workers: Vec::new(),
+            sender: None,
+        }
+    }
+
+    /// Wakes everything out of its poll sleep — an action just changed
+    /// intent, and the server should hear about it without waiting.
+    pub fn kick(&self) {
+        if let Pump::Threads { workers, sender } = self {
+            for w in workers {
+                w.kick();
+            }
+            if let Some(s) = sender {
+                s.kick();
+            }
+        }
+    }
+
+    /// Whether any account currently has a worker.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self {
+            Pump::Threads { workers, .. } => workers.is_empty(),
+            Pump::Manual => true,
+        }
+    }
+
+    /// Spawns a worker for every configured account that lacks one, and
+    /// retires those whose account is gone. Idempotent — call after boot and
+    /// after the accounts change. A `Manual` pump does nothing.
+    pub fn ensure(
+        &mut self,
+        w: &World,
+        db: &std::path::Path,
+        notify: impl Fn() + Send + Clone + 'static,
+    ) {
+        let Pump::Threads { workers, sender } = self else {
+            return;
+        };
+        if sender.is_none() {
+            *sender = Some(crate::send::spawn(db.to_path_buf(), notify.clone()));
+        }
+        let accounts = crate::mail::accounts(w.store());
+        workers.retain(|k| accounts.iter().any(|a| a.id == k.account));
+        for a in accounts.iter() {
+            if a.imap_host.as_deref().unwrap_or("").is_empty() {
+                continue; // the local demo account
+            }
+            if workers.iter().any(|k| k.account == a.id) {
+                continue;
+            }
+            workers.push(spawn(db.to_path_buf(), a.id, notify.clone()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,3 +982,4 @@ First paragraph.\r\n\r\nSecond paragraph.\r\n";
         assert!(status.unwrap().contains("network is down"));
     }
 }
+

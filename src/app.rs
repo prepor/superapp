@@ -29,7 +29,6 @@ use crate::core::{self, Dir, Kind, MailId, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
-use crate::send;
 use crate::panels::*;
 use crate::store::Store;
 use crate::sync;
@@ -761,10 +760,9 @@ struct State {
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
     db_path: Option<std::path::PathBuf>,
-    /// One IMAP worker per configured account.
-    workers: Vec<sync::Worker>,
-    /// The outbox sender thread.
-    sender: Option<send::Sender>,
+    /// Who runs the passes (CR-004): threads in production, inline in a
+    /// headless world.
+    pump: sync::Pump,
     /// Failed outbox rows already toasted (new ones toast on signal).
     failed_seen: usize,
     /// The last persisted logical snapshot — [`State::sync`] only writes
@@ -862,8 +860,7 @@ impl State {
             history: crate::history::History::new(),
             store,
             db_path,
-            workers: Vec::new(),
-            sender: None,
+            pump: sync::Pump::threads(),
             failed_seen: 0,
             last_saved: None,
             ui: HashMap::new(),
@@ -1024,12 +1021,7 @@ impl State {
         // Push soon: whatever this action changed about mail intent, a
         // worker makes the server agree without waiting for the poll —
         // and the sender re-times its next deadline.
-        for w in &self.workers {
-            w.kick();
-        }
-        if let Some(s) = &self.sender {
-            s.kick();
-        }
+        self.pump.kick();
     }
 
     /// An undoable action that only moves panels around.
@@ -1090,27 +1082,12 @@ impl State {
     /// for removed accounts retire themselves.
     fn spawn_workers(&mut self) {
         let Some(db) = self.db_path.clone() else {
-            return;
+            return; // in memory: no file for a worker to open
         };
-        if self.sender.is_none() {
-            self.sender = Some(send::spawn(db.clone(), || {
-                SignalToUI::set_ui_signal();
-            }));
-        }
-        self.workers.retain(|w| {
-            mail::accounts(&self.store).iter().any(|a| a.id == w.account)
+        let world = self.world.clone();
+        self.pump.ensure(&world, &db, || {
+            SignalToUI::set_ui_signal();
         });
-        for a in mail::accounts(&self.store).iter() {
-            if a.imap_host.as_deref().unwrap_or("").is_empty() {
-                continue; // the local demo account
-            }
-            if self.workers.iter().any(|w| w.account == a.id) {
-                continue;
-            }
-            self.workers.push(sync::spawn(db.clone(), a.id, || {
-                SignalToUI::set_ui_signal();
-            }));
-        }
     }
 
     /// Rows the inbox panel currently shows.
@@ -2785,9 +2762,7 @@ impl Stage {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
                 }
-                for w in &state.workers {
-                    w.kick(); // reverted intent pushes to the server too
-                }
+                state.pump.kick(); // reverted intent pushes to the server too
                 state.toast(format!("undid — {label}"), false);
             }
             None => state.toast("nothing to undo", false),
@@ -2811,9 +2786,7 @@ impl Stage {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
                 }
-                for w in &state.workers {
-                    w.kick();
-                }
+                state.pump.kick();
                 state.toast(format!("redid — {label}"), false);
             }
             None => state.toast("nothing to redo", false),
@@ -3153,12 +3126,7 @@ impl Stage {
                         let cam = state.ws.camera_x;
                         state.anim.camera().jump_to(cam);
                     }
-                    for w in &state.workers {
-                        w.kick();
-                    }
-                    if let Some(s) = &state.sender {
-                        s.kick();
-                    }
+                    state.pump.kick();
                     state.toast(format!("history — {label}"), false);
                 }
                 // The overlay stays up: browsing history is the point.
@@ -3292,12 +3260,10 @@ impl Stage {
                         state.toast("side effect: nothing was opened or replaced", false);
                     }
                     BtnAct::Refresh => {
-                        if state.workers.is_empty() {
+                        if state.pump.idle() {
                             state.toast("no accounts to sync — add one in settings", false);
                         } else {
-                            for w in &state.workers {
-                                w.kick();
-                            }
+                            state.pump.kick();
                             state.toast("syncing…", false);
                         }
                     }

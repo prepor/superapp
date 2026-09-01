@@ -1,6 +1,7 @@
 # CR-004 · The world: isolation, effects, history
 
-Status: **draft** 2026-09-01. One design covering three things that turn out
+Status: **landed** 2026-09-01 (phases 1–3; the components library remains
+the follow-up). One design covering three things that turn out
 to be the same thing: an app instance you can construct, a strict boundary
 around what leaves the process, and a history that operates on that
 boundary. Replaces the session-changeset undo landed in CR-001 phases 2 and
@@ -545,6 +546,30 @@ Each lands green (unit + all e2e suites), book updated, committed.
    the world; a gallery mounting one panel widget per state against `Deny`
    plus a hand-written store. This CR's job is to leave it a one-evening
    task.
+
+## What was built, where it differs
+
+- **`Intent::blocked` + `reverse`**, not `reverse -> Reversal` (above).
+- **`History::apply` takes an `Action` struct.** Seven positional arguments
+  was one too many, and the struct reads better at the one call site.
+- **`idempotent` is a column**, so the sweep is SQL (above).
+- **`Pump` lives in `sync.rs`**, next to the passes it schedules, rather than
+  in its own module.
+- **`config()` stayed.** The phase-4 argument was that a process-global
+  config stops two tests disagreeing about `--send-delay` — but no test
+  reaches it. Tests construct a `World` directly; `config()` is read only by
+  the makepad shell, which a test never instantiates. Moving it would have
+  been indirection with no consumer, so it stays the shell's argv parser and
+  moves when the components library actually needs per-mount config.
+- **Send keeps its `outbox` row.** The row holds the schedule and the claim
+  guard; the pass enqueues `Submit` when one is due. Collapsing `outbox`
+  into `draft` was considered and left alone — the win is one join, and the
+  split keeps per-keystroke draft writes off the row a background thread
+  claims.
+- **Removing an account is irreversible**, and says so. The changeset undo
+  restored its rows; an `Intent` cannot restore its mail, so
+  `AccountRemoved::blocked` refuses and the walk steps past. More honest
+  than half-restoring.
 
 ## Decisions taken
 
