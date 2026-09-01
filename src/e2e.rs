@@ -32,7 +32,6 @@
 //! `wait` after them: hits refresh on the next drawn frame.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
 /// One script step.
 #[derive(Debug, Clone, PartialEq)]
@@ -204,14 +203,20 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
 }
 
 /// A run in progress.
+///
+/// The clock is **virtual**: the runner is handed a `dt` per tick and counts
+/// milliseconds down itself, never reading the wall clock. That is what
+/// makes a run reproducible — under a headless build one draw cycle is one
+/// tick of a fixed `dt`, so `wait 600` is exactly 36 frames whether the
+/// machine is idle or running twelve other suites.
 #[derive(Debug)]
 pub struct Runner {
     /// The script.
     pub steps: Vec<Step>,
     /// Next step to execute.
     pub idx: usize,
-    /// Set while a `wait` is pending.
-    pub resume_at: Option<Instant>,
+    /// Virtual milliseconds still owed to a pending `wait`.
+    pub wait_ms: f64,
     /// Where screenshots go.
     pub out: PathBuf,
     /// Failed steps so far (missing labels, failed captures).
@@ -225,24 +230,25 @@ impl Runner {
         Runner {
             steps,
             idx: 0,
-            resume_at: None,
+            wait_ms: 0.0,
             out,
             failures: 0,
         }
     }
 
-    /// The next step to run, honouring a pending wait. Advances the cursor.
-    pub fn next_step(&mut self) -> Option<Step> {
-        if let Some(t) = self.resume_at {
-            if Instant::now() < t {
+    /// Advances the virtual clock by `dt_ms` and answers the next step, if
+    /// the pending wait has run out. Advances the cursor.
+    pub fn next_step(&mut self, dt_ms: f64) -> Option<Step> {
+        if self.wait_ms > 0.0 {
+            self.wait_ms -= dt_ms;
+            if self.wait_ms > 0.0 {
                 return None;
             }
-            self.resume_at = None;
         }
         let step = self.steps.get(self.idx).cloned()?;
         self.idx += 1;
         if let Step::Wait(ms) = step {
-            self.resume_at = Some(Instant::now() + std::time::Duration::from_millis(ms));
+            self.wait_ms = ms as f64;
         }
         Some(step)
     }
@@ -344,5 +350,25 @@ mod tests {
     fn bad_lines_carry_the_line_number() {
         let e = parse("wait ten").unwrap_err();
         assert!(e.starts_with("line 1:"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// A wait costs exactly its milliseconds of virtual time, and not one
+    /// tick more — the property that makes a run reproducible under load.
+    #[test]
+    fn waits_are_counted_not_timed() {
+        let mut r = Runner::new(parse("wait 100\nshot a\nquit").unwrap(), PathBuf::new());
+        assert_eq!(r.next_step(16.0), Some(Step::Wait(100)));
+        for _ in 0..6 {
+            assert_eq!(r.next_step(16.0), None, "still waiting");
+        }
+        // 7 × 16 = 112 ms — the first tick past 100.
+        assert_eq!(r.next_step(16.0), Some(Step::Shot("a".into())));
+        assert_eq!(r.next_step(16.0), Some(Step::Quit));
+        assert_eq!(r.next_step(16.0), None, "script exhausted");
     }
 }

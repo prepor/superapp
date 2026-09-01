@@ -9,7 +9,12 @@
 
 use std::rc::Rc;
 
+use rusqlite::{Connection, Transaction};
+use serde::{Deserialize, Serialize};
+
 use crate::core::{Kind, MailId};
+use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
+use crate::history::Intent;
 use crate::store::{Q, Store, Val};
 
 /// One list row: what the inbox and the launcher show.
@@ -335,9 +340,9 @@ pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
 /// Persists a compose panel's fields — plain typing upkeep, deliberately
 /// **not** an action (text editing is the future editor's local undo).
 /// The caller skips no-op saves; this just writes.
-pub fn save_draft(store: &Store, panel: i64, re: Option<MailId>, d: &Draft) {
+pub fn save_draft(store: &Store, panel: i64, re: Option<MailId>, d: &Draft, now: f64) {
     let _ = store.write(|c| {
-        upsert_draft_tx(c, panel, re, d)?;
+        upsert_draft_tx(c, panel, re, d, now)?;
         Ok(())
     });
 }
@@ -349,6 +354,7 @@ pub fn upsert_draft_tx(
     panel: i64,
     re: Option<MailId>,
     d: &Draft,
+    now: f64,
 ) -> rusqlite::Result<()> {
     let account: Option<i64> = re
         .and_then(|id| {
@@ -371,7 +377,7 @@ pub fn upsert_draft_tx(
          ON CONFLICT(panel) DO UPDATE SET
            to_addr=excluded.to_addr, subject=excluded.subject,
            body=excluded.body, updated=excluded.updated",
-        rusqlite::params![panel, account, re, d.to, d.subject, d.body, crate::store::now()],
+        rusqlite::params![panel, account, re, d.to, d.subject, d.body, now],
     )?;
     Ok(())
 }
@@ -381,35 +387,14 @@ pub fn upsert_draft_tx(
 pub fn file_send_tx(
     c: &rusqlite::Connection,
     panel: i64,
-    delay: f64,
+    send_after: f64,
 ) -> rusqlite::Result<()> {
     c.execute(
         "INSERT OR REPLACE INTO outbox(id, account, send_after, status, error)
          SELECT panel, COALESCE(account, 1), ?2, 'pending', NULL FROM draft WHERE panel=?1",
-        rusqlite::params![panel, crate::store::now() + delay],
+        rusqlite::params![panel, send_after],
     )?;
     Ok(())
-}
-
-/// The undo guard: a send whose outbox row is mid-flight or delivered can
-/// no longer be undone (the walk marks it expired). Pending and failed
-/// rows stay cancellable.
-pub fn send_locked(c: &rusqlite::Connection, kind: &str, entity: Option<&str>) -> bool {
-    if kind != "send" {
-        return false;
-    }
-    let Some(id) = entity
-        .and_then(|e| e.strip_prefix("outbox:"))
-        .and_then(|s| s.parse::<i64>().ok())
-    else {
-        return false;
-    };
-    matches!(
-        c.query_row("SELECT status FROM outbox WHERE id=?1", [id], |r| {
-            r.get::<_, String>(0)
-        }),
-        Ok(s) if s == "sending" || s == "sent"
-    )
 }
 
 /// Discard: the draft goes with the panel (both revert on undo).
@@ -429,6 +414,558 @@ pub fn outbox_failures(store: &Store) -> Vec<(i64, String)> {
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .map(|it| it.filter_map(Result::ok).collect())
         .unwrap_or_default()
+}
+
+// -- the mail domain's effects ------------------------------------------------
+//
+// Deferred, so each one is a row in the effect table: retryable, observable,
+// and cancellable by undo while it is still `pending`. Every one of them
+// revalidates before the round trip — if undo landed while the job waited,
+// it goes `obsolete` rather than pushing stale intent at the server. That is
+// what keeps CR-001 phase 4's property: undo costs no server traffic.
+
+/// Make the server agree about which folder a mail lives in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Move {
+    pub account: i64,
+    pub message: i64,
+    /// The folder row the mail now claims — `settle` records it as fact.
+    pub to_folder: i64,
+    pub from: String,
+    pub to: String,
+    pub uid: u32,
+}
+
+impl Effect for Move {
+    const KIND: &'static str = "move";
+    type Reply = Option<u32>;
+
+    fn describe(&self) -> String {
+        format!("move uid {} from {} to {}", self.uid, self.from, self.to)
+    }
+
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.out.move_uid(self.account, &self.from, &self.to, self.uid)
+    }
+}
+
+impl Deferred for Move {
+    /// Moving an already-moved uid fails harmlessly, and `still_wanted`
+    /// catches the common case first.
+    fn idempotent(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
+    fn still_wanted(&self, db: &Connection) -> bool {
+        db.query_row(
+            "SELECT 1 FROM message m JOIN server_msg s ON s.message = m.id
+             WHERE m.id = ?1 AND m.folder = ?2 AND s.folder != ?2 AND s.uid = ?3",
+            rusqlite::params![self.message, self.to_folder, self.uid],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn settle(&self, tx: &Transaction, reply: &Self::Reply) -> rusqlite::Result<()> {
+        // No COPYUID means identity is lost until the next fetch adopts it
+        // by Message-ID; the uid goes null rather than stale.
+        tx.execute(
+            "UPDATE server_msg SET folder = ?1, uid = ?2 WHERE message = ?3",
+            rusqlite::params![self.to_folder, reply, self.message],
+        )?;
+        Ok(())
+    }
+}
+
+/// Make the server agree about whether a mail has been read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Seen {
+    pub account: i64,
+    pub message: i64,
+    pub folder: String,
+    pub uid: u32,
+    pub seen: bool,
+}
+
+impl Effect for Seen {
+    const KIND: &'static str = "seen";
+    type Reply = ();
+
+    fn describe(&self) -> String {
+        format!(
+            "mark uid {} in {} {}",
+            self.uid,
+            self.folder,
+            if self.seen { "seen" } else { "unseen" }
+        )
+    }
+
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out
+            .store_seen(self.account, &self.folder, self.uid, self.seen)
+    }
+}
+
+impl Deferred for Seen {
+    fn idempotent(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
+    fn still_wanted(&self, db: &Connection) -> bool {
+        db.query_row(
+            "SELECT 1 FROM message m JOIN server_msg s ON s.message = m.id
+             WHERE m.id = ?1 AND m.unread = ?2 AND s.seen != ?3",
+            rusqlite::params![self.message, !self.seen, self.seen],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn settle(&self, tx: &Transaction, _reply: &()) -> rusqlite::Result<()> {
+        tx.execute(
+            "UPDATE server_msg SET seen = ?1 WHERE message = ?2",
+            rusqlite::params![self.seen, self.message],
+        )?;
+        Ok(())
+    }
+}
+
+/// Hand a mail to the SMTP server, then file it into Sent. The one
+/// genuinely irreversible effect in the app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Submit {
+    /// The outbox row, which shares its compose panel's id. Referenced, not
+    /// embedded: a payload that carried the body would go stale.
+    pub outbox: i64,
+}
+
+impl Effect for Submit {
+    const KIND: &'static str = "submit";
+    /// `None` when the mail was also filed to Sent; `Some(why)` when it was
+    /// sent but filing failed — best effort, exactly as before.
+    type Reply = Option<String>;
+
+    fn describe(&self) -> String {
+        format!("submit outbox:{}", self.outbox)
+    }
+
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        let d = load_outgoing(cx.db, self.outbox)?;
+        let pass = cx
+            .out
+            .secret_get(&d.email)
+            .ok_or("no password in the keychain")?;
+        let smtp = Creds {
+            host: d.smtp,
+            user: d.email.clone(),
+            pass: pass.clone(),
+        };
+        let raw = cx.out.submit(&smtp, &d.mail)?;
+        // The mail is gone; filing it is best effort and never fails a send.
+        if d.imap.is_empty() {
+            return Ok(Some("no imap host to file to Sent".into()));
+        }
+        let imap = Creds {
+            host: d.imap,
+            user: d.email,
+            pass,
+        };
+        let filed = cx
+            .out
+            .connect(d.account, &imap)
+            .and_then(|()| cx.out.append(d.account, &d.sent, &raw));
+        Ok(filed.err().map(|e| format!("sent; filing to Sent failed: {e}")))
+    }
+}
+
+impl Deferred for Submit {
+    /// Never. A second submission is a second mail, so a crash mid-send
+    /// must ask a human rather than guess.
+    fn idempotent(&self) -> bool {
+        false
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("outbox:{}", self.outbox))
+    }
+
+    fn still_wanted(&self, db: &Connection) -> bool {
+        matches!(
+            db.query_row(
+                "SELECT status FROM outbox WHERE id = ?1",
+                [self.outbox],
+                |r| r.get::<_, String>(0)
+            ),
+            Ok(s) if s == "sending"
+        )
+    }
+
+    fn settle(&self, tx: &Transaction, reply: &Self::Reply) -> rusqlite::Result<()> {
+        tx.execute(
+            "UPDATE outbox SET status = 'sent', error = ?2 WHERE id = ?1",
+            rusqlite::params![self.outbox, reply],
+        )?;
+        Ok(())
+    }
+}
+
+/// Everything [`Submit`] needs, read from rows at execution time.
+struct Outgo {
+    account: i64,
+    email: String,
+    smtp: String,
+    imap: String,
+    sent: String,
+    mail: Outgoing,
+}
+
+fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
+    db.query_row(
+        "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
+                COALESCE((SELECT name FROM folder WHERE account=a.id AND role='sent'), 'Sent'),
+                d.to_addr, d.subject, d.body,
+                (SELECT message_id FROM message WHERE id = d.re_message)
+         FROM outbox o
+         JOIN account a ON a.id = o.account
+         JOIN draft d ON d.panel = o.id
+         WHERE o.id = ?1",
+        [outbox],
+        |r| {
+            Ok(Outgo {
+                account: r.get(0)?,
+                email: r.get(1)?,
+                smtp: r.get(2)?,
+                imap: r.get(3)?,
+                sent: r.get(4)?,
+                mail: Outgoing {
+                    to: r.get(5)?,
+                    subject: r.get(6)?,
+                    body: r.get(7)?,
+                    in_reply_to: r.get(8)?,
+                },
+            })
+        },
+    )
+    .map_err(|e| format!("outbox:{outbox} is not sendable: {e}"))
+    .and_then(|d| {
+        if d.smtp.is_empty() {
+            Err("account has no smtp host".to_string())
+        } else {
+            Ok(d)
+        }
+    })
+}
+
+// -- the mail domain's intents ------------------------------------------------
+//
+// What an action claimed of the world, and how to give it back. In memory,
+// on a history node, never serialized — what survives a restart is the row
+// each one wrote.
+
+/// Opening a mail marks it read.
+pub struct MarkRead {
+    pub mail: MailId,
+}
+
+impl Intent for MarkRead {
+    fn describe(&self) -> String {
+        format!("mail:{} read", self.mail)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE message SET unread = 1 WHERE id = ?1", [self.mail])
+                    .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| mark_read_tx(c, self.mail))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Archiving moves a mail out of the folder it was in. Reversing is a plain
+/// intent flip — the push pass re-converges, so nothing compensates.
+pub struct Archived {
+    pub mail: MailId,
+    /// Where it was, so undo can put it back exactly there.
+    pub from_folder: i64,
+}
+
+impl Intent for Archived {
+    fn describe(&self) -> String {
+        format!("mail:{} archived", self.mail)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE message SET folder = ?1 WHERE id = ?2",
+                    rusqlite::params![self.from_folder, self.mail],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| archive_tx(c, self.mail))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A send, claimable back only until the sender takes it.
+pub struct Sent {
+    pub panel: i64,
+    /// How long the window is, so redo files a fresh one.
+    pub delay: f64,
+}
+
+impl Intent for Sent {
+    fn describe(&self) -> String {
+        format!("outbox:{} filed", self.panel)
+    }
+
+    /// The status guard is the whole race: `pending` means the executor has
+    /// not taken it, and undo wins. Anything else means the mail is gone.
+    fn blocked(&self, w: &World) -> Option<String> {
+        match w.store().conn().query_row(
+            "SELECT status FROM outbox WHERE id = ?1",
+            [self.panel],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) if s == "pending" => None,
+            Ok(s) if s == "failed" => None, // never left; still cancellable
+            Ok(_) => Some("already sent".into()),
+            Err(_) => None, // no row: nothing to give back, nothing to block
+        }
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "DELETE FROM outbox WHERE id = ?1 AND status IN ('pending','failed')",
+                    [self.panel],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let after = w.now() + self.delay;
+        w.store()
+            .write(|c| file_send_tx(c, self.panel, after))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Discarding a compose takes its text with it.
+pub struct Discarded {
+    pub panel: i64,
+    pub draft: Draft,
+    pub re: Option<MailId>,
+}
+
+impl Intent for Discarded {
+    fn describe(&self) -> String {
+        format!("panel:{} draft discarded", self.panel)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let now = w.now();
+        w.store()
+            .write(|c| upsert_draft_tx(c, self.panel, self.re, &self.draft, now))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| discard_draft_tx(c, self.panel))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Adding an account. Reversible while it is still empty, which it is at
+/// the moment it is added.
+pub struct AccountAdded {
+    pub id: i64,
+    pub email: String,
+    pub imap: String,
+    pub smtp: String,
+}
+
+impl Intent for AccountAdded {
+    fn describe(&self) -> String {
+        format!("account:{} added", self.id)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| remove_account_tx(c, self.id))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO account(id, label, email, imap_host, smtp_host)
+                     VALUES(?1, ?2, ?2, ?3, ?4)",
+                    rusqlite::params![self.id, self.email, self.imap, self.smtp],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Removing an account takes its mail with it, and no snapshot brings that
+/// back. Stated honestly rather than half-restored: the node goes expired
+/// and the walk steps past it.
+pub struct AccountRemoved {
+    pub email: String,
+}
+
+impl Intent for AccountRemoved {
+    fn describe(&self) -> String {
+        format!("account {} removed", self.email)
+    }
+    fn blocked(&self, _w: &World) -> Option<String> {
+        Some("an account's mail cannot be restored".into())
+    }
+    fn reverse(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
+    fn reapply(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// -- the in-memory half -------------------------------------------------------
+//
+// Reads and session handling: nobody retries them, nobody waits on a row for
+// them, and their answers are values the caller needs now. So they are
+// `Effect` but not `Deferred` — performed at the call, written nowhere.
+
+/// Open this account's mail session. Not `Deferred`, and therefore not
+/// serializable — which is the point: it carries a password.
+#[derive(Debug, Clone)]
+pub struct Connect {
+    pub account: i64,
+    pub creds: Creds,
+}
+
+impl Effect for Connect {
+    const KIND: &'static str = "connect";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("connect to {} as {}", self.creds.host, self.creds.user)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.connect(self.account, &self.creds)
+    }
+}
+
+/// List the account's folders.
+#[derive(Debug, Clone)]
+pub struct Folders {
+    pub account: i64,
+}
+
+impl Effect for Folders {
+    const KIND: &'static str = "folders";
+    type Reply = Vec<crate::effect::RemoteFolder>;
+    fn describe(&self) -> String {
+        "list folders".into()
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.out.folders(self.account)
+    }
+}
+
+/// SELECT a folder for its uidvalidity/uidnext.
+#[derive(Debug, Clone)]
+pub struct Meta {
+    pub account: i64,
+    pub folder: String,
+}
+
+impl Effect for Meta {
+    const KIND: &'static str = "meta";
+    type Reply = crate::effect::FolderMeta;
+    fn describe(&self) -> String {
+        format!("select {}", self.folder)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.out.folder_meta(self.account, &self.folder)
+    }
+}
+
+/// Fetch everything at or above a uid.
+#[derive(Debug, Clone)]
+pub struct Fetch {
+    pub account: i64,
+    pub folder: String,
+    pub from: u32,
+}
+
+impl Effect for Fetch {
+    const KIND: &'static str = "fetch";
+    type Reply = Vec<crate::effect::RemoteMail>;
+    fn describe(&self) -> String {
+        format!("fetch {} from uid {}", self.folder, self.from)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.out.fetch(self.account, &self.folder, self.from)
+    }
+}
+
+/// Search a folder's uids — all of them, or only the unseen.
+#[derive(Debug, Clone)]
+pub struct Uids {
+    pub account: i64,
+    pub folder: String,
+    pub unread_only: bool,
+}
+
+impl Effect for Uids {
+    const KIND: &'static str = "uids";
+    type Reply = std::collections::HashSet<u32>;
+    fn describe(&self) -> String {
+        format!(
+            "search {} in {}",
+            if self.unread_only { "unseen" } else { "all" },
+            self.folder
+        )
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.out.uids(self.account, &self.folder, self.unread_only)
+    }
+}
+
+/// The mail domain's deferred effects. Each domain registers its own, so
+/// adding one touches no central list.
+pub fn register(reg: &mut Registry) {
+    reg.register::<Move>();
+    reg.register::<Seen>();
+    reg.register::<Submit>();
+}
+
+/// A registry with every domain's effects — what a real world and a test
+/// world both start from.
+#[must_use]
+pub fn registry() -> Registry {
+    let mut reg = Registry::new();
+    register(&mut reg);
+    reg
 }
 
 // -- dates -------------------------------------------------------------------
