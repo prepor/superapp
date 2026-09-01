@@ -100,9 +100,38 @@ script_mod! {
     // Sizes mirror theme.rs: FONT_SIZE 10.5 body, LABEL_SIZE 8.25 labels —
     // the same numbers the char-grid renderer draws with, so migrated and
     // unmigrated panels read as one app.
+    // The one face, bundled rather than borrowed. Menlo fronted the family
+    // until HTML mail asked for a weight it does not have: Menlo.ttc yields
+    // only its regular face, so `<b>` drew as body text. It was also macOS
+    // furniture — the Fold never had it and fell through to Liberation, so
+    // "the app's face" was already two faces depending on where you read.
+    //
+    // JetBrains Mono is variable on `wght` (100–800), ships inside
+    // makepad_widgets (no new asset, OFL), and is 0.600 em wide against
+    // Menlo's 0.6021 — the character grid moves by a third of a percent.
+    // Its ratio is Liberation's to four places, so this is the face the
+    // Fold has been drawing all along; macOS is the side that changes.
+    //
+    // What it still cannot do is italic: makepad's `FontMember` exposes
+    // only `weight`, with no slant or skew anywhere in `TextStyle`, so an
+    // oblique needs a second file on disk whatever family we pick.
     mod.widgets.SMonoStyle = TextStyle{
         font_family: FontFamily{
-            latin := FontMember{res: file_resource("/System/Library/Fonts/Menlo.ttc") asc: 0.0 desc: 0.0}
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0}
+            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 10.5
+        line_spacing: 1.0
+    }
+
+    /** The same face leaning on its weight axis — real bold, not the two
+        nudged passes `SBold` draws (which stay, for now: they are what the
+        char grid's headers and the accelerator marks are built from). */
+    mod.widgets.SMonoBoldStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
             fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
             symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
             emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
@@ -242,6 +271,73 @@ script_mod! {
             color_focus: #00000020
             color_down: #00000020
             color_empty: #00000000
+        }
+    }
+
+    /** An HTML mail body, in the app's one face.
+
+        makepad's `Html` draws a semantic vocabulary and no CSS, which is
+        the whole reason it suits this app: a sender's brand colours never
+        arrive to fight the monochrome, because there is no mechanism by
+        which they could. What arrives is structure — lists, quotes,
+        emphasis, links — drawn in Menlo at body size like everything else.
+        [`crate::html`] narrows the letter to this vocabulary first.
+
+        Links need no colour: `HtmlLink` underlines, and in this app the
+        underline *is* the link (CR-003's grammar), so they read correctly
+        in plain #141414.
+
+        `<b>` is real weight now that the family is variable (see
+        `SMonoStyle`). `<i>` is not: makepad exposes no slant, so italic
+        would need a second file on disk, and until one is there it reads
+        as body text. */
+    mod.widgets.SHtml = Html {
+        width: Fill, height: Fit
+        padding: 0
+        margin: 0
+        // The body is prose, and CR-003 made prose selectable.
+        selectable: true
+
+        font_size: 10.5
+        font_color: #141414
+        draw_text +: { color: #141414 }
+
+        text_style_normal: mod.widgets.SMonoStyle{}
+        text_style_italic: mod.widgets.SMonoStyle{}
+        text_style_bold: mod.widgets.SMonoBoldStyle{}
+        text_style_bold_italic: mod.widgets.SMonoBoldStyle{}
+        text_style_fixed: mod.widgets.SMonoStyle{}
+
+        // `-` for the nested level: `•` comes from the symbol fallback,
+        // whose advance is not the mono cell, and two of them stacked read
+        // as a smudge rather than a hierarchy.
+        ul_markers: ["•", "-"]
+        ol_separator: "."
+
+        a := mod.widgets.HtmlLink {
+            color: #141414
+            pressed_color: #5a5a5a
+        }
+
+        // The wash SText already wears. `Html` is its own widget type, not
+        // a `TextFlow` derivation, so it inherits none of `TextFlowBase`'s
+        // theming — including `draw_call_group`, without which the quad
+        // merges into the call that paints under the panel background and
+        // the selection never appears (CR-002's sixth defect, again).
+        draw_selection +: {
+            draw_call_group: @selection
+            color: #00000020
+        }
+
+        draw_block +: {
+            line_color: #141414
+            sep_color: #dcdcdc
+            quote_bg_color: #f4f4f4
+            quote_fg_color: #141414
+            code_color: #f4f4f4
+            table_border_color: #dcdcdc
+            table_header_bg_color: #f4f4f4
+            selection_color: #00000020
         }
     }
 
@@ -719,10 +815,24 @@ script_mod! {
         status_err_lbl := mod.widgets.SLabel {
             visible: false, text: "", draw_text +: { color: #a01500 }
         }
+        // Two readings of one letter; the panel shows whichever the mail
+        // actually carries, never both. Each sits in its own View because
+        // that is the widget that honours `visible` — neither `Html` nor
+        // `TextInput` carries one, so hiding either directly is a silent
+        // no-op, and the previous mail reads on under the next.
         body_scroll := View {
             width: Fill, height: Fill
+            flow: Down
             scroll_bars: ScrollBars{ show_scroll_x: false }
-            body_lbl := mod.widgets.SText { is_multiline: true }
+            text_wrap := View {
+                width: Fill, height: Fit
+                body_lbl := mod.widgets.SText { is_multiline: true }
+            }
+            html_wrap := View {
+                width: Fill, height: Fit
+                visible: false
+                body_html := mod.widgets.SHtml {}
+            }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -1976,7 +2086,23 @@ impl Widget for MessagePanel {
                             err_l.set_visible(cx, false);
                         }
                     }
-                    self.view.text_input(cx, ids!(body_lbl)).set_text(cx, &m.body);
+                    // The HTML reading wins when the sender sent one: it
+                    // keeps the lists, the emphasis and the links that
+                    // flattening to text throws away. Both are written
+                    // every time — the hidden one is emptied rather than
+                    // merely hidden, so no mail can leave its text behind
+                    // for the next one to show.
+                    let html = m.html.as_deref().unwrap_or("");
+                    self.view
+                        .text_input(cx, ids!(body_lbl))
+                        .set_text(cx, if m.html.is_some() { "" } else { &m.body });
+                    self.view.html(cx, ids!(body_html)).set_text(cx, html);
+                    self.view
+                        .view(cx, ids!(text_wrap))
+                        .set_visible(cx, m.html.is_none());
+                    self.view
+                        .view(cx, ids!(html_wrap))
+                        .set_visible(cx, m.html.is_some());
                     let (newer, older) = mail::neighbours(&p.store, id);
                     let nl = self.view.link(cx, ids!(newer_link));
                     let no = self.view.label(cx, ids!(newer_off));

@@ -22,6 +22,7 @@
 pub mod app;
 pub mod core;
 pub mod e2e;
+pub mod html;
 pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;

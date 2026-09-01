@@ -254,6 +254,20 @@ CREATE TABLE outbox(
 );
 ";
 
+/// Schema v6: the HTML half of a mail. `body` stays the plain-text reading
+/// — it is what compose quotes, and what search will want — and `html`
+/// holds the same letter narrowed to what the panel can draw (see
+/// [`crate::html`]), or NULL when the sender sent text alone.
+///
+/// The column back-fills from `raw`, which every synced mail already
+/// keeps, so mail that arrived before this migration gains its HTML
+/// without a refetch. Narrowing at ingest rather than at draw leaves the
+/// panel a plain `set_text`; `raw` stays the source to re-derive from when
+/// the narrowing improves.
+const SCHEMA_V6: &str = "
+ALTER TABLE message ADD COLUMN html TEXT;
+";
+
 /// The tables sessions record — the undoable world. `action` and `meta`
 /// (the head pointer) stay outside it — undo must never rewrite history's
 /// own bookkeeping — and so does `server_msg`: what the server holds is
@@ -278,6 +292,26 @@ pub fn now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Fills `message.html` for mail that arrived before schema v6, reading
+/// the `raw` blob each one already keeps. Messages without `raw` — the demo
+/// seed — are left alone, and a mail whose sender wrote text only stays
+/// NULL. Runs once, inside the migration.
+pub(crate) fn backfill_html(conn: &Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, Vec<u8>)> = conn
+        .prepare("SELECT id, raw FROM message WHERE raw IS NOT NULL AND html IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, raw) in rows {
+        if let Some(html) = crate::sync::parse_mail(&raw).html {
+            conn.execute(
+                "UPDATE message SET html = ?2 WHERE id = ?1",
+                rusqlite::params![id, html],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl Store {
@@ -314,6 +348,11 @@ impl Store {
         if version < 5 {
             conn.execute_batch(SCHEMA_V5)?;
             conn.pragma_update(None, "user_version", 5)?;
+        }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6)?;
+            backfill_html(&conn)?;
+            conn.pragma_update(None, "user_version", 6)?;
         }
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();

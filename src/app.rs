@@ -2632,6 +2632,21 @@ impl Stage {
     /// the one place retained content meets the undo system.
     fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let mut refresh = false;
+        // A link in an HTML mail body leaves the app: panels are for this
+        // app's own nouns — a mail, a contact — and the web is neither, so
+        // the system browser takes it. The narrowing already vetted the
+        // scheme (see [`crate::html`]), so nothing is left to check here.
+        //
+        // It lives at the app rather than on MessagePanel because every
+        // open panel is handed the same action list: one click would
+        // otherwise open as many browser windows as there are panels.
+        for a in actions {
+            if let Some(wa) = a.as_widget_action() {
+                if let HtmlLinkAction::Clicked { url, .. } = wa.cast() {
+                    cx.open_url(&url, OpenUrlInPlace::No);
+                }
+            }
+        }
         for a in actions {
             let Some(pa) = a.downcast_ref::<crate::panels::PanelAction>() else {
                 continue;
@@ -4222,8 +4237,11 @@ impl Stage {
                 // The selectable runs (CR-003). Registered like any hosted
                 // field: scripts drag them, and a real click on one keeps
                 // the key focus the TextInput just took.
+                // `mail html` is the same run in its other reading; only
+                // one of the two is ever visible, so only one registers.
                 for (label, path) in [
                     ("mail body", ids!(body_lbl)),
+                    ("mail html", ids!(body_html)),
                     ("mail to", ids!(to_lbl)),
                     ("mail date", ids!(date_lbl)),
                 ] {

@@ -332,8 +332,8 @@ fn ingest_message(
     }
     conn.execute(
         "INSERT INTO message(account, folder, from_name, from_email,
-                             subject, date, unread, body, raw, message_id)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                             subject, date, unread, body, html, raw, message_id)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         rusqlite::params![
             account,
             folder,
@@ -343,6 +343,7 @@ fn ingest_message(
             p.date,
             m.unread,
             p.body,
+            p.html,
             m.raw,
             p.message_id,
         ],
@@ -362,12 +363,21 @@ pub struct ParsedMail {
     pub subject: String,
     pub date: f64,
     pub body: String,
+    /// The same letter as HTML, already narrowed to what the panel draws
+    /// ([`crate::html::sanitize`]). `None` when the sender sent text alone,
+    /// or when the narrowing left nothing worth showing.
+    pub html: Option<String>,
     /// The Message-ID header — move adoption (and threading, someday).
     pub message_id: String,
 }
 
 /// MIME → panel text via `mail-parser`. Paragraph structure survives as
 /// the `\n\n` convention the message panel already renders.
+///
+/// A multipart/alternative mail yields both halves: the plain text as
+/// `body`, the HTML — narrowed on the way through — as `html`. Both are
+/// kept because they answer different questions; the panel prefers the
+/// HTML, while quoting a reply wants the text.
 pub fn parse_mail(raw: &[u8]) -> ParsedMail {
     let msg = mail_parser::MessageParser::default().parse(raw);
     let Some(msg) = msg else {
@@ -377,6 +387,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             subject: "(unparseable message)".into(),
             date: 0.0,
             body: String::new(),
+            html: None,
             message_id: String::new(),
         };
     };
@@ -395,6 +406,18 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
     } else {
         from_name
     };
+    // Only a genuine text/html part counts. `body_html` would answer for a
+    // text-only mail too, by running the plain text through `text_to_html`
+    // — which would route every plain letter through the HTML panel and
+    // lose the `\n\n` paragraphs it renders.
+    let html = msg
+        .html_bodies()
+        .next()
+        .and_then(|p| match &p.body {
+            mail_parser::PartType::Html(h) => Some(crate::html::sanitize(h.as_ref())),
+            _ => None,
+        })
+        .filter(|h| !h.trim().is_empty());
     ParsedMail {
         from_name,
         from_email,
@@ -404,6 +427,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             .body_text(0)
             .map(|t| t.replace("\r\n", "\n").trim().to_string())
             .unwrap_or_default(),
+        html,
         message_id: msg.message_id().unwrap_or_default().to_string(),
     }
 }
@@ -761,6 +785,29 @@ Date: Mon, 31 Aug 2026 09:14:00 +0000\r\n\
 \r\n\
 First paragraph.\r\n\r\nSecond paragraph.\r\n";
 
+    /// The shape most mail actually arrives in: both readings of one
+    /// letter, the HTML half wrapped in layout and quoted-printable.
+    const RAW_ALT: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
+Subject: Budget v3\r\n\
+Message-ID: <budget-v3@kovac.io>\r\n\
+Date: Mon, 31 Aug 2026 09:14:00 +0000\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=\"bnd\"\r\n\
+\r\n\
+--bnd\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Plain reading.\r\n\
+--bnd\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+<html><head><style>p{color:red}</style></head><body>\r\n\
+<div style=3D\"padding:8px\"><p>Rich <b>reading</b>.</p>\r\n\
+<img src=3D\"https://t.co/px.gif\" width=3D\"1\">\r\n\
+<a href=3D\"https://x.dev\">link</a></div></body></html>\r\n\
+--bnd--\r\n";
+
     fn world() -> (Store, FakeTransport, i64) {
         let s = Store::open(None).expect("store");
         s.write(|c| {
@@ -922,5 +969,57 @@ First paragraph.\r\n\r\nSecond paragraph.\r\n";
         }
         sync_account(s.conn(), &mut t, acct).unwrap();
         assert_eq!(inbox_rows(&s).len(), FETCH_CAP as usize);
+    }
+
+    /// Both readings survive the trip: a multipart/alternative mail lands
+    /// with its text in `body` and its narrowed HTML in `html`, and the
+    /// panel's query hands back the pair.
+    #[test]
+    fn alternative_mail_keeps_both_readings() {
+        let (s, mut t, acct) = world();
+        t.deliver("INBOX", true, RAW_ALT);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+
+        let m = crate::mail::mail(&s, 1).expect("the mail");
+        assert_eq!(m.body, "Plain reading.");
+        let html = m.html.expect("the html reading");
+        // Quoted-printable decoded, layout unwrapped, style and tracking
+        // pixel gone, emphasis and link intact. The space is the newline
+        // that separated the two in the source: whitespace between inline
+        // elements is text, and a browser would keep it too.
+        assert_eq!(
+            html,
+            "<p>Rich <b>reading</b>.</p> <a href=\"https://x.dev\">link</a>"
+        );
+
+        // A text-only mail leaves `html` empty, so the panel keeps showing
+        // the plain reading.
+        t.deliver("INBOX", true, RAW);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        assert_eq!(crate::mail::mail(&s, 2).expect("plain mail").html, None);
+    }
+
+    /// Mail that arrived before schema v6 gains its HTML from the `raw`
+    /// blob it already kept — no refetch.
+    #[test]
+    fn the_migration_backfills_html_from_raw() {
+        let (s, mut t, acct) = world();
+        t.deliver("INBOX", true, RAW_ALT);
+        sync_account(s.conn(), &mut t, acct).unwrap();
+        // Rewind to the pre-v6 world: the column exists but is empty.
+        s.write(|c| c.execute("UPDATE message SET html = NULL", []).map(|_| ()))
+            .unwrap();
+
+        // Read the column, not the query layer: the real backfill runs
+        // inside `Store::open`, before any query has been cached, so it
+        // never needs to advance a generation.
+        let html_of = |s: &Store| -> Option<String> {
+            s.conn()
+                .query_row("SELECT html FROM message WHERE id=1", [], |r| r.get(0))
+                .expect("the row")
+        };
+        assert_eq!(html_of(&s), None);
+        crate::store::backfill_html(s.conn()).unwrap();
+        assert!(html_of(&s).expect("backfilled").contains("<b>reading</b>"));
     }
 }
