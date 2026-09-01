@@ -4985,7 +4985,11 @@ impl Stage {
                 let g = ch.encode_utf8(&mut buf);
                 self.draw_mono.draw_abs(cx, dvec2(dx, y), g);
                 if accel == Some(i) {
-                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.4, y), g);
+                    // Three passes: labels are 8.25 pt uppercase, where the
+                    // single nudge that reads as bold in body text does not
+                    // register at all.
+                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.35, y), g);
+                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.7, y), g);
                 }
             }
             dx += step;

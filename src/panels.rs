@@ -515,11 +515,15 @@ script_mod! {
             width: Fit, height: Fit
             flow: Right
             pre := mod.widgets.SLabel { padding: 0, text: "" }
+            // Three passes, not the usual two: one nudge is legible in a
+            // run of body text but disappears in a short label, and the
+            // mark has to read at a glance to be worth anything.
             key := View {
                 width: Fit, height: Fit
                 flow: Overlay
                 k1 := mod.widgets.SLabel { padding: 0, text: "" }
-                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.4}, text: "" }
+                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
+                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
             }
             post := mod.widgets.SLabel { padding: 0, text: "" }
         }
@@ -1336,10 +1340,19 @@ impl SLinkRef {
             }
             None => (text.to_string(), String::new(), String::new()),
         };
-        l.view.label(cx, ids!(row.pre)).set_text(cx, &pre);
-        l.view.label(cx, ids!(row.key.k1)).set_text(cx, &key);
-        l.view.label(cx, ids!(row.key.k2)).set_text(cx, &key);
-        l.view.label(cx, ids!(row.post)).set_text(cx, &post);
+        // An empty label still reserves width, which would push the text
+        // right of an underline that spans the whole row — so the unused
+        // parts stand down entirely rather than render nothing.
+        let pre_l = l.view.label(cx, ids!(row.pre));
+        pre_l.set_text(cx, &pre);
+        pre_l.set_visible(cx, !pre.is_empty());
+        let post_l = l.view.label(cx, ids!(row.post));
+        post_l.set_text(cx, &post);
+        post_l.set_visible(cx, !post.is_empty());
+        for p in [ids!(row.key.k1), ids!(row.key.k2), ids!(row.key.k3)] {
+            l.view.label(cx, p).set_text(cx, &key);
+        }
+        l.view.view(cx, ids!(row.key)).set_visible(cx, !key.is_empty());
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
     }
