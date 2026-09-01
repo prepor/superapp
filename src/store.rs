@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::session::{self, Changegroup, ConflictAction, Session};
 use rusqlite::{Connection, Transaction};
 
 use crate::core::{self, Kind, PanelId};
@@ -139,6 +140,52 @@ CREATE TABLE panel(
 );
 ";
 
+/// Schema v2 (CR-001 phase 2): the action log — the undo DAG — and the
+/// `wm` row. `wm.active` moves out of `meta` because sessions must record
+/// it (undo teleports you back to where the action happened) while `meta`
+/// (the head pointer) must stay outside the recorded world.
+const SCHEMA_V2: &str = "
+CREATE TABLE action(
+  id     INTEGER PRIMARY KEY,
+  parent INTEGER NOT NULL DEFAULT 0,          -- 0 = root
+  ts     REAL NOT NULL,
+  kind   TEXT NOT NULL,
+  label  TEXT NOT NULL,
+  entity TEXT,
+  fwd    BLOB NOT NULL,                       -- forward changeset
+  state  TEXT NOT NULL DEFAULT 'applied'      -- applied | undone | expired
+);
+CREATE INDEX idx_action_parent ON action(parent);
+CREATE TABLE wm(
+  id     INTEGER PRIMARY KEY CHECK(id = 1),
+  active INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO wm(id, active)
+  SELECT 1, COALESCE((SELECT value FROM meta WHERE key='wm_active'), 0)
+  WHERE EXISTS(SELECT 1 FROM meta WHERE key='wm_active');
+DELETE FROM meta WHERE key='wm_active';
+";
+
+/// The tables sessions record — the undoable world. `action` and `meta`
+/// (the head pointer) stay outside it: undo must never rewrite history's
+/// own bookkeeping.
+const ACTION_TABLES: [&str; 7] = [
+    "account", "folder", "message", "workspace", "ws_col", "panel", "wm",
+];
+
+/// Actions of the same kind on the same entity within this window amend the
+/// head node instead of growing the tree (a burst of moves is one action).
+const COALESCE_S: f64 = 2.5;
+
+/// Unix seconds — the action log's clock.
+#[must_use]
+pub fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 impl Store {
     /// Opens (and migrates) the store; `None` is in-memory, for tests.
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Store> {
@@ -157,6 +204,10 @@ impl Store {
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2)?;
+            conn.pragma_update(None, "user_version", 2)?;
         }
 
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
@@ -193,14 +244,7 @@ impl Store {
             }
         };
         tx.commit()?;
-        let mut dirty = self.dirty.lock().expect("dirty set");
-        if !dirty.is_empty() {
-            let mut gens = self.generations.borrow_mut();
-            for t in dirty.drain() {
-                *gens.entry(t).or_insert(0) += 1;
-            }
-            self.redraw.set(true);
-        }
+        self.bump_dirty();
         Ok(out)
     }
 
@@ -296,55 +340,11 @@ impl Store {
 
     /// Persists the whole logical workspace state — a wholesale rewrite of
     /// the (tiny) UI tables in one transaction. The caller diffs snapshots
-    /// and only calls this when something actually changed.
+    /// and only calls this when something actually changed. Un-undoable
+    /// upkeep (workspace switches, boot); undoable mutations run
+    /// [`save_wm_tx`] inside [`Store::act`] instead.
     pub fn save_wm(&self, snap: &core::WmSnap) -> rusqlite::Result<()> {
-        self.write(|c| {
-            c.execute("DELETE FROM panel", [])?;
-            c.execute("DELETE FROM ws_col", [])?;
-            c.execute("DELETE FROM workspace", [])?;
-            for (k, ws) in snap.wss.iter().enumerate() {
-                c.execute(
-                    "INSERT INTO workspace(k, focus) VALUES(?1, ?2)",
-                    rusqlite::params![k as i64, ws.focus.map(|f| f as i64)],
-                )?;
-                let parent_of: HashMap<PanelId, PanelId> =
-                    ws.joins.iter().map(|&(a, b)| (b, a)).collect();
-                let kind_of: HashMap<PanelId, &Kind> =
-                    ws.panels.iter().map(|(id, k)| (*id, k)).collect();
-                for (ci, (panels, tabbed, active)) in ws.columns.iter().enumerate() {
-                    c.execute(
-                        "INSERT INTO ws_col(ws, idx, tabbed, active) VALUES(?1,?2,?3,?4)",
-                        rusqlite::params![k as i64, ci as i64, tabbed, *active as i64],
-                    )?;
-                    for (ri, pid) in panels.iter().enumerate() {
-                        let Some(kind) = kind_of.get(pid) else {
-                            continue;
-                        };
-                        let (name, p_int, p_txt) = kind_cols(kind);
-                        c.execute(
-                            "INSERT INTO panel(id, ws, col, row, kind, p_int, p_txt, joined_to)
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                            rusqlite::params![
-                                *pid as i64,
-                                k as i64,
-                                ci as i64,
-                                ri as i64,
-                                name,
-                                p_int,
-                                p_txt,
-                                parent_of.get(pid).map(|p| *p as i64),
-                            ],
-                        )?;
-                    }
-                }
-            }
-            c.execute(
-                "INSERT INTO meta(key, value) VALUES('wm_active', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [snap.active as i64],
-            )?;
-            Ok(())
-        })
+        self.write(|c| save_wm_tx(c, snap))
     }
 
     /// Restores the logical workspace state; `None` means this store never
@@ -354,9 +354,7 @@ impl Store {
     pub fn load_wm(&self) -> rusqlite::Result<Option<core::WmSnap>> {
         let active: Option<i64> = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key='wm_active'", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT active FROM wm WHERE id=1", [], |r| r.get(0))
             .ok();
         let Some(active) = active else {
             return Ok(None);
@@ -431,6 +429,268 @@ impl Store {
             active: (active as usize).min(core::WS_N - 1),
             wss,
         }))
+    }
+}
+
+/// The wholesale UI-table rewrite behind [`Store::save_wm`] — also what an
+/// undoable navigation action runs inside its recorded transaction (the
+/// session consolidates per row, so an identical rewrite records nothing
+/// and only real deltas reach the changeset).
+pub fn save_wm_tx(c: &Connection, snap: &core::WmSnap) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM panel", [])?;
+    c.execute("DELETE FROM ws_col", [])?;
+    c.execute("DELETE FROM workspace", [])?;
+    for (k, ws) in snap.wss.iter().enumerate() {
+        c.execute(
+            "INSERT INTO workspace(k, focus) VALUES(?1, ?2)",
+            rusqlite::params![k as i64, ws.focus.map(|f| f as i64)],
+        )?;
+        let parent_of: HashMap<PanelId, PanelId> =
+            ws.joins.iter().map(|&(a, b)| (b, a)).collect();
+        let kind_of: HashMap<PanelId, &Kind> =
+            ws.panels.iter().map(|(id, k)| (*id, k)).collect();
+        for (ci, (panels, tabbed, active)) in ws.columns.iter().enumerate() {
+            c.execute(
+                "INSERT INTO ws_col(ws, idx, tabbed, active) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![k as i64, ci as i64, tabbed, *active as i64],
+            )?;
+            for (ri, pid) in panels.iter().enumerate() {
+                let Some(kind) = kind_of.get(pid) else {
+                    continue;
+                };
+                let (name, p_int, p_txt) = kind_cols(kind);
+                c.execute(
+                    "INSERT INTO panel(id, ws, col, row, kind, p_int, p_txt, joined_to)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    rusqlite::params![
+                        *pid as i64,
+                        k as i64,
+                        ci as i64,
+                        ri as i64,
+                        name,
+                        p_int,
+                        p_txt,
+                        parent_of.get(pid).map(|p| *p as i64),
+                    ],
+                )?;
+            }
+        }
+    }
+    c.execute(
+        "INSERT INTO wm(id, active) VALUES(1, ?1)
+         ON CONFLICT(id) DO UPDATE SET active=excluded.active",
+        [snap.active as i64],
+    )?;
+    Ok(())
+}
+
+// -- the action log -----------------------------------------------------------
+
+/// One node of the history DAG, as the overlay reads it.
+#[derive(Debug, Clone)]
+pub struct ActionNode {
+    pub id: i64,
+    pub parent: i64,
+    pub ts: f64,
+    pub kind: String,
+    pub label: String,
+    pub state: String,
+}
+
+impl Store {
+    fn head(&self, c: &Connection) -> rusqlite::Result<i64> {
+        Ok(c.query_row("SELECT value FROM meta WHERE key='head'", [], |r| r.get(0))
+            .unwrap_or(0))
+    }
+
+    fn set_head(&self, c: &Connection, id: i64) -> rusqlite::Result<()> {
+        c.execute(
+            "INSERT INTO meta(key, value) VALUES('head', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    fn bump_dirty(&self) {
+        let mut dirty = self.dirty.lock().expect("dirty set");
+        if !dirty.is_empty() {
+            let mut gens = self.generations.borrow_mut();
+            for t in dirty.drain() {
+                *gens.entry(t).or_insert(0) += 1;
+            }
+            self.redraw.set(true);
+        }
+    }
+
+    /// Runs one **undoable action**: `f`'s transaction is recorded by a
+    /// session over the undoable tables, and the resulting changeset becomes
+    /// a node of the history DAG (child of HEAD; acting mid-tree branches).
+    /// A same-kind, same-entity action within [`COALESCE_S`] amends the head
+    /// node instead. A transaction that nets no change creates no node.
+    pub fn act<T>(
+        &self,
+        kind: &str,
+        label: &str,
+        entity: Option<&str>,
+        now: f64,
+        f: impl FnOnce(&Transaction) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let mut sess = Session::new(&self.conn)?;
+        for t in ACTION_TABLES {
+            sess.attach(Some(t))?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let out = match f(&tx) {
+            Ok(v) => v,
+            Err(e) => {
+                drop(tx);
+                drop(sess);
+                self.dirty.lock().expect("dirty set").clear();
+                return Err(e);
+            }
+        };
+        let mut fwd: Vec<u8> = Vec::new();
+        sess.changeset_strm(&mut fwd)?;
+        drop(sess);
+        if fwd.is_empty() {
+            // Nothing actually changed: no node, nothing to undo.
+            tx.commit()?;
+            self.bump_dirty();
+            return Ok(out);
+        }
+        let head = self.head(&tx)?;
+        let mut coalesced = false;
+        if let Some(ent) = entity {
+            let head_row: Option<(String, Option<String>, f64, String, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT kind, entity, ts, state, fwd FROM action WHERE id=?1",
+                    [head],
+                    |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    },
+                )
+                .ok();
+            if let Some((hkind, hent, hts, hstate, hfwd)) = head_row {
+                if hkind == kind
+                    && hent.as_deref() == Some(ent)
+                    && hstate == "applied"
+                    && (now - hts) < COALESCE_S
+                {
+                    let mut grp = Changegroup::new()?;
+                    grp.add_stream(&mut hfwd.as_slice())?;
+                    grp.add_stream(&mut fwd.as_slice())?;
+                    let mut merged: Vec<u8> = Vec::new();
+                    grp.output_strm(&mut merged)?;
+                    tx.execute(
+                        "UPDATE action SET fwd=?1, ts=?2 WHERE id=?3",
+                        rusqlite::params![merged, now, head],
+                    )?;
+                    coalesced = true;
+                }
+            }
+        }
+        if !coalesced {
+            tx.execute(
+                "INSERT INTO action(parent, ts, kind, label, entity, fwd)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![head, now, kind, label, entity, fwd],
+            )?;
+            let id = tx.last_insert_rowid();
+            self.set_head(&tx, id)?;
+        }
+        tx.commit()?;
+        self.bump_dirty();
+        Ok(out)
+    }
+
+    /// Undoes the head action: applies its inverted changeset (conflicting
+    /// rows — changed since by ingest — are skipped, not forced), marks it
+    /// undone, moves HEAD to its parent. An `expired` head (a send past its
+    /// window, phase 5) is skipped over transparently. Returns the undone
+    /// action's label.
+    pub fn undo(&self) -> rusqlite::Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut head = self.head(&tx)?;
+        loop {
+            if head == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let (parent, label, state, fwd): (i64, String, String, Vec<u8>) = tx.query_row(
+                "SELECT parent, label, state, fwd FROM action WHERE id=?1",
+                [head],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            if state == "expired" {
+                // Transparent: the world can't roll it back; walk past it.
+                self.set_head(&tx, parent)?;
+                head = parent;
+                continue;
+            }
+            let mut inv: Vec<u8> = Vec::new();
+            session::invert_strm(&mut fwd.as_slice(), &mut inv)?;
+            self.conn.apply_strm(
+                &mut inv.as_slice(),
+                None::<fn(&str) -> bool>,
+                |_t, _item| ConflictAction::SQLITE_CHANGESET_OMIT,
+            )?;
+            tx.execute("UPDATE action SET state='undone' WHERE id=?1", [head])?;
+            self.set_head(&tx, parent)?;
+            tx.commit()?;
+            self.bump_dirty();
+            return Ok(Some(label));
+        }
+    }
+
+    /// Redoes the most recent undone child of HEAD (the default branch) and
+    /// moves HEAD onto it. Returns its label.
+    pub fn redo(&self) -> rusqlite::Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let head = self.head(&tx)?;
+        let child: Option<(i64, String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT id, label, fwd FROM action
+                 WHERE parent=?1 AND state='undone' ORDER BY id DESC LIMIT 1",
+                [head],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        let Some((id, label, fwd)) = child else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        self.conn.apply_strm(
+            &mut fwd.as_slice(),
+            None::<fn(&str) -> bool>,
+            |_t, _item| ConflictAction::SQLITE_CHANGESET_OMIT,
+        )?;
+        tx.execute("UPDATE action SET state='applied' WHERE id=?1", [id])?;
+        self.set_head(&tx, id)?;
+        tx.commit()?;
+        self.bump_dirty();
+        Ok(Some(label))
+    }
+
+    /// The whole history DAG plus HEAD — what the overlay draws.
+    pub fn history(&self) -> rusqlite::Result<(Vec<ActionNode>, i64)> {
+        let head = self.head(&self.conn)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent, ts, kind, label, state FROM action ORDER BY id")?;
+        let nodes = stmt
+            .query_map([], |r| {
+                Ok(ActionNode {
+                    id: r.get(0)?,
+                    parent: r.get(1)?,
+                    ts: r.get(2)?,
+                    kind: r.get(3)?,
+                    label: r.get(4)?,
+                    state: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((nodes, head))
     }
 }
 
@@ -510,6 +770,105 @@ mod tests {
             Err(rusqlite::Error::QueryReturnedNoRows)
         });
         assert_eq!(*s.rows(&Q_META, &[], probe), vec![7], "rollback kept 7");
+    }
+
+    fn snap_open(kinds: &[Kind]) -> core::WmSnap {
+        let mut wm = Wm::new();
+        for k in kinds {
+            wm.open(k.clone(), None, false);
+        }
+        wm.snapshot()
+    }
+
+    /// The undo DAG end to end: act records changesets, undo inverts them
+    /// (back to a never-booted store at the root), redo re-applies, and
+    /// acting mid-tree branches — redo then follows the newest branch.
+    #[test]
+    fn actions_undo_redo_and_branch() {
+        let s = store();
+        let one = snap_open(&[Kind::Help]);
+        let two = snap_open(&[Kind::Help, Kind::About]);
+        s.act("open", "open help", None, 1.0, |c| save_wm_tx(c, &one))
+            .unwrap();
+        s.act("open", "open about", None, 2.0, |c| save_wm_tx(c, &two))
+            .unwrap();
+        assert_eq!(s.load_wm().unwrap(), Some(two.clone()));
+
+        assert_eq!(s.undo().unwrap().as_deref(), Some("open about"));
+        assert_eq!(s.load_wm().unwrap(), Some(one.clone()));
+        assert_eq!(s.undo().unwrap().as_deref(), Some("open help"));
+        assert_eq!(s.load_wm().unwrap(), None, "root = never booted");
+        assert_eq!(s.undo().unwrap(), None, "nothing left");
+
+        assert_eq!(s.redo().unwrap().as_deref(), Some("open help"));
+        assert_eq!(s.load_wm().unwrap(), Some(one.clone()));
+
+        // A new action mid-tree branches; redo now prefers the new branch.
+        let fork = snap_open(&[Kind::Help, Kind::Inbox { filter: None }]);
+        s.act("open", "open inbox", None, 3.0, |c| save_wm_tx(c, &fork))
+            .unwrap();
+        s.undo().unwrap();
+        assert_eq!(s.redo().unwrap().as_deref(), Some("open inbox"));
+        assert_eq!(s.load_wm().unwrap(), Some(fork));
+
+        let (nodes, head) = s.history().unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(head, 3);
+        assert_eq!(nodes[1].parent, 1, "about and inbox share a parent");
+        assert_eq!(nodes[2].parent, 1);
+        assert_eq!(nodes[1].state, "undone", "the abandoned branch stays");
+    }
+
+    /// Same kind + entity within the window amends the head node instead of
+    /// growing the tree; one undo reverts the whole burst.
+    #[test]
+    fn rapid_actions_coalesce() {
+        let s = store();
+        let a = snap_open(&[Kind::Help]);
+        let b = snap_open(&[Kind::Help, Kind::About]);
+        let c_ = snap_open(&[Kind::Help, Kind::About, Kind::Inbox { filter: None }]);
+        s.act("move", "move", Some("panel:1"), 10.0, |c| save_wm_tx(c, &a))
+            .unwrap();
+        s.act("move", "move", Some("panel:1"), 11.0, |c| save_wm_tx(c, &b))
+            .unwrap();
+        assert_eq!(s.history().unwrap().0.len(), 1, "burst = one node");
+        s.act("move", "move", Some("panel:1"), 99.0, |c| save_wm_tx(c, &c_))
+            .unwrap();
+        assert_eq!(s.history().unwrap().0.len(), 2, "window passed = new node");
+        s.undo().unwrap();
+        assert_eq!(s.load_wm().unwrap(), Some(b), "back to the burst's end");
+        s.undo().unwrap();
+        assert_eq!(s.load_wm().unwrap(), None, "one undo for the burst");
+    }
+
+    /// Rows the world changed since (ingest) are skipped on undo, not
+    /// forced — the rest of the action still reverts.
+    #[test]
+    fn undo_skips_rows_changed_since() {
+        let s = store();
+        let mut wm = Wm::new();
+        wm.open(Kind::Help, None, false);
+        wm.focus = Some(1);
+        let snap = wm.snapshot();
+        s.act("open", "open help", None, 1.0, |c| save_wm_tx(c, &snap))
+            .unwrap();
+        // The world moves on outside the action log (ingest-style write).
+        s.write(|c| {
+            c.execute("UPDATE workspace SET focus=777 WHERE k=0", [])
+                .map(|_| ())
+        })
+        .unwrap();
+        s.undo().unwrap();
+        let n: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM panel", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "the panel insert reverted");
+        let focus: i64 = s
+            .conn()
+            .query_row("SELECT focus FROM workspace WHERE k=0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(focus, 777, "the conflicting row was left alone");
     }
 
     /// Wm state survives the store: save → load → restore is the same

@@ -205,30 +205,31 @@ pub fn title(store: &Store, kind: &Kind) -> String {
 
 // -- local mutations ---------------------------------------------------------
 //
-// Phase 2 wraps these in actions (undo); phase 4 makes the server agree.
+// Transaction-level pieces, composed into undoable actions by the shell
+// (the session records them; undo inverts them). Phase 4 makes the server
+// agree via the op queue.
 
 /// Marks a mail read (opening it does this). A no-change update touches no
-/// row, so the caches of an already-read mail stay warm.
-pub fn mark_read(store: &Store, id: MailId) {
-    let _ = store.write(|c| {
-        c.execute(
-            "UPDATE message SET unread = 0 WHERE id = ?1 AND unread = 1",
-            [id],
-        )
-    });
+/// row — so it records nothing, and undoing the open of an already-read
+/// mail correctly leaves it read.
+pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE message SET unread = 0 WHERE id = ?1 AND unread = 1",
+        [id],
+    )?;
+    Ok(())
 }
 
 /// Archives a mail: it moves to its account's archive folder.
-pub fn archive(store: &Store, id: MailId) {
-    let _ = store.write(|c| {
-        c.execute(
-            "UPDATE message SET folder =
-               (SELECT f.id FROM folder f
-                WHERE f.account = message.account AND f.role = 'archive')
-             WHERE id = ?1",
-            [id],
-        )
-    });
+pub fn archive_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE message SET folder =
+           (SELECT f.id FROM folder f
+            WHERE f.account = message.account AND f.role = 'archive')
+         WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
 }
 
 // -- dates -------------------------------------------------------------------
@@ -506,9 +507,9 @@ mod tests {
         assert_eq!(title(&s, &Kind::Compose { re: 1 }), "re: Q3 infra budget draft");
         assert_eq!(title(&s, &Kind::Inbox { filter: Some("x".into()) }), "inbox · x");
 
-        mark_read(&s, 1);
+        s.write(|c| mark_read_tx(c, 1)).unwrap();
         assert!(!inbox(&s)[0].unread);
-        archive(&s, 1);
+        s.write(|c| archive_tx(c, 1)).unwrap();
         assert_eq!(inbox(&s).len(), 67);
         assert_ne!(inbox(&s)[0].id, 1);
         assert_eq!(all(&s).len(), 68, "archived mail stays in the corpus");

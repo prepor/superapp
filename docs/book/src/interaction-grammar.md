@@ -26,6 +26,7 @@ future text-editor panel needs: the whole plain keyboard, no modes.
 - `cmd+1…9` — switch workspace; `cmd+shift+1…9` — move the focused panel to
   that workspace and follow it
 - `cmd+w` — close the focused panel
+- `cmd+z` / `cmd+shift+z` — undo / redo (see below)
 - `cmd+[` / `cmd+]` — consume into / expel out of a column;
   `cmd+,` / `cmd+.` — pull from the right / push the bottom out
 - `cmd+t` — toggle column tabs
@@ -83,6 +84,31 @@ it is the search row atop the workspaces overlay — tapping it flips the
 overlay into the launcher and raises the soft keyboard. When real kinds
 arrive (telegram, rss, kb), each contributes its entries to the same query —
 this surface is where global search lives.
+
+## Undo
+
+**Every action is undoable** — open, close, replace, move, column ops,
+workspace moves, archive — and `cmd+z` walks them back with their whole
+delta: undoing an archive restores the panel *and* the mail's folder;
+undoing an open makes the mail unread again exactly if the open unread it.
+Undo also puts you back where the action happened (its workspace and focus
+revert with it). `cmd+shift+z` re-applies.
+
+What is deliberately *not* an action: focus walks, workspace switches,
+camera pans, row selection — context, not intent. They persist, but they
+never become history nodes; undo restores them only as part of a real
+action's delta. Rapid bursts of the same gesture on the same panel (arrow
+moves, j/k reading walks) **coalesce** into one node — one `cmd+z` takes
+back the whole burst.
+
+History is a **tree, not a line**: acting after an undo starts a branch and
+destroys nothing; redo follows the newest branch. (The overlay that makes
+the tree visible and walkable is planned — the data has been tree-shaped
+from the first action.) Under the hood every action's transaction is
+recorded as an invertible SQLite changeset; undoing applies the inverse,
+and rows the world changed since (a sync, another device someday) are
+skipped rather than forced. The menu bar carries *Undo / Redo* items;
+toasts name what was undone.
 
 ## Mouse and trackpad
 

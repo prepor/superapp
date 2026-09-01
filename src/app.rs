@@ -505,7 +505,10 @@ impl PanelUi {
                     ui.filter.caret = ui.filter.text.chars().count();
                 }
             }
-            Kind::Message { id } => mail::mark_read(store, *id),
+            // Read flags are the *opening action's* business (its changeset
+            // carries the flag flip, so undo restores unread) — not this
+            // constructor's, which also runs on boot restore.
+            Kind::Message { .. } => {}
             Kind::Compose { re } => {
                 if let Some(m) = mail::mail(store, *re) {
                     ui.to.text = m.head.from_email;
@@ -1062,6 +1065,69 @@ impl State {
         self.toast = Some((msg.into(), err, Instant::now()));
     }
 
+    /// A panel's title, wherever it lives — for action labels.
+    fn title_of(&self, pid: PanelId) -> String {
+        self.ws
+            .panel(pid)
+            .map(|p| self.panel_title(&p.kind))
+            .unwrap_or_else(|| "panel".into())
+    }
+
+    /// Runs one **undoable action**: mutates the in-memory `Wm`, then
+    /// records the whole delta — the UI-table rewrite plus any data
+    /// mutation — as one changeset node in the history DAG. The session
+    /// consolidates per row, so an identical rewrite contributes nothing;
+    /// an action that nets no change creates no node.
+    fn act(
+        &mut self,
+        kind: &str,
+        label: String,
+        entity: Option<String>,
+        mutate: impl FnOnce(&mut Wm),
+        data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()>,
+    ) {
+        mutate(&mut self.ws);
+        let snap = self.ws.snapshot();
+        let r = self
+            .store
+            .act(kind, &label, entity.as_deref(), crate::store::now(), |tx| {
+                crate::store::save_wm_tx(tx, &snap)?;
+                data(tx)
+            });
+        if let Err(e) = r {
+            eprintln!("store: action “{label}” failed: {e}");
+        }
+        self.last_saved = Some(snap);
+    }
+
+    /// An undoable action that only moves panels around.
+    fn act_nav(
+        &mut self,
+        kind: &str,
+        label: String,
+        entity: Option<String>,
+        mutate: impl FnOnce(&mut Wm),
+    ) {
+        self.act(kind, label, entity, mutate, |_| Ok(()));
+    }
+
+    /// Rebuilds the in-memory `Wm` from the store — the tail of every
+    /// undo/redo, whose changesets rewrote the UI tables underneath us.
+    fn reload_wm(&mut self) {
+        match self.store.load_wm() {
+            Ok(Some(snap)) => {
+                self.last_saved = Some(snap.clone());
+                self.ws = Wm::restore(snap);
+            }
+            Ok(None) => {
+                self.last_saved = None;
+                self.ws = Wm::new();
+            }
+            Err(e) => eprintln!("store: reloading the session failed: {e}"),
+        }
+        self.field = None;
+    }
+
     /// Rows the inbox panel currently shows.
     fn inbox_rows(&self, pid: PanelId) -> Vec<mail::MailHead> {
         let filter = self
@@ -1175,6 +1241,23 @@ fn help_lines() -> Vec<Line> {
     });
     v.push(Line {
         left: vec![kbd("cmd"), kbd("w"), Seg::T(" — close the focused panel".into(), Style::N)],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("z"),
+            Seg::T(" — undo (open, close, move, archive…)".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
+            kbd("shift"),
+            kbd("z"),
+            Seg::T(" — redo".into(), Style::N),
+        ],
         ..Default::default()
     });
     v.push(Line {
@@ -1643,6 +1726,8 @@ pub struct Stage {
 const WS_MENU_SWITCH: u64 = 0x5753_0100;
 const WS_MENU_MOVE: u64 = 0x5753_0200;
 const MENU_LAUNCHER: u64 = 0x5753_0300;
+const MENU_UNDO: u64 = 0x5753_0400;
+const MENU_REDO: u64 = 0x5753_0401;
 
 /// How a `key` chord executes: as a synthesized key event, as text (plain
 /// letters reach panels the same way real typing does), or as a bare
@@ -1684,6 +1769,8 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
         "l" => Some(KeyCode::KeyL),
         "w" => Some(KeyCode::KeyW),
         "t" => Some(KeyCode::KeyT),
+        "z" => Some(KeyCode::KeyZ),
+        "u" => Some(KeyCode::KeyU),
         "comma" | "," => Some(KeyCode::Comma),
         "period" | "." => Some(KeyCode::Period),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
@@ -1845,6 +1932,22 @@ impl Stage {
                     shift: false,
                     enabled: true,
                     name: "Launcher — ⌘ ⌘".into(),
+                },
+                // Chords live in the KeyDown path (the shifted-digit menu-key
+                // table is off by one upstream); labels carry the hint.
+                MacosMenu::Item {
+                    command: LiveId(MENU_UNDO),
+                    key: KeyCode::Unknown,
+                    shift: false,
+                    enabled: true,
+                    name: "Undo — ⌘Z".into(),
+                },
+                MacosMenu::Item {
+                    command: LiveId(MENU_REDO),
+                    key: KeyCode::Unknown,
+                    shift: false,
+                    enabled: true,
+                    name: "Redo — ⇧⌘Z".into(),
                 },
                 MacosMenu::Item {
                     command: live_id!(quit),
@@ -2193,9 +2296,13 @@ impl Stage {
                 state.field = None;
                 if k.modifiers.shift {
                     if let Some(f) = state.ws.focus {
-                        state.ws.move_panel(f, dir);
+                        let label = format!("move “{}”", state.title_of(f));
+                        state.act_nav("move", label, Some(format!("panel:{f}")), move |ws| {
+                            ws.move_panel(f, dir);
+                        });
                     }
                 } else {
+                    // Focus walks are context, not actions — never undo nodes.
                     let vp = state.vp();
                     let opts = state.opts();
                     state.ws.focus_dir(dir, vp, opts);
@@ -2203,39 +2310,53 @@ impl Stage {
                 self.sync(cx);
                 return;
             }
+            if k.key_code == KeyCode::KeyZ {
+                if k.modifiers.shift {
+                    self.do_redo(cx);
+                } else {
+                    self.do_undo(cx);
+                }
+                return;
+            }
             if k.key_code == KeyCode::KeyW {
                 if let Some(f) = state.ws.focus {
                     state.field = None;
-                    state.ws.close(f);
+                    let label = format!("close “{}”", state.title_of(f));
+                    state.act_nav("close", label, None, move |ws| {
+                        ws.close(f);
+                    });
                     self.sync(cx);
                 }
                 return;
             }
             // niri's column operations.
             if let Some(f) = state.ws.focus {
+                let col = |s: &mut State, label: &str, m: Box<dyn FnOnce(&mut Wm)>| {
+                    s.act_nav("column", label.to_string(), Some(format!("panel:{f}")), m);
+                };
                 match k.key_code {
                     KeyCode::LBracket => {
-                        state.ws.consume_or_expel(f, Dir::Left);
+                        col(state, "consume left", Box::new(move |ws| ws.consume_or_expel(f, Dir::Left)));
                         self.sync(cx);
                         return;
                     }
                     KeyCode::RBracket => {
-                        state.ws.consume_or_expel(f, Dir::Right);
+                        col(state, "expel right", Box::new(move |ws| ws.consume_or_expel(f, Dir::Right)));
                         self.sync(cx);
                         return;
                     }
                     KeyCode::Comma => {
-                        state.ws.consume_from_right(f);
+                        col(state, "pull from the right", Box::new(move |ws| ws.consume_from_right(f)));
                         self.sync(cx);
                         return;
                     }
                     KeyCode::Period => {
-                        state.ws.expel_bottom(f);
+                        col(state, "push the bottom out", Box::new(move |ws| ws.expel_bottom(f)));
                         self.sync(cx);
                         return;
                     }
                     KeyCode::KeyT => {
-                        state.ws.toggle_tabbed(f);
+                        col(state, "toggle tabs", Box::new(move |ws| ws.toggle_tabbed(f)));
                         self.sync(cx);
                         return;
                     }
@@ -2361,7 +2482,17 @@ impl Stage {
                         .or_else(|| rows.first().map(|m| m.id));
                     if let Some(id) = target {
                         let fresh = k.modifiers.logo || k.modifiers.alt;
-                        state.ws.follow_open(f, Kind::Message { id }, fresh);
+                        let kind = Kind::Message { id };
+                        let label = format!("open “{}”", state.panel_title(&kind));
+                        state.act(
+                            "open",
+                            label,
+                            None,
+                            move |ws| {
+                                ws.follow_open(f, kind, fresh);
+                            },
+                            move |tx| mail::mark_read_tx(tx, id),
+                        );
                         self.sync(cx);
                     }
                 }
@@ -2461,6 +2592,55 @@ impl Stage {
 
     /// Activate a hit: go to the panel wherever it lives, or open a fresh
     /// un-joined trailing column on the active workspace.
+    /// Undoes the head action: the store applies the inverted changeset,
+    /// then the in-memory world reloads from the rewritten tables. The
+    /// action's own workspace/focus rows revert with it, so undo also puts
+    /// you back where the action happened.
+    fn do_undo(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let was = state.ws.active;
+        match state.store.undo() {
+            Ok(Some(label)) => {
+                state.reload_wm();
+                state.sync();
+                if state.ws.active != was {
+                    let cam = state.ws.camera_x;
+                    state.anim.camera().jump_to(cam);
+                }
+                state.toast(format!("undid — {label}"), false);
+            }
+            Ok(None) => state.toast("nothing to undo", false),
+            Err(e) => state.toast(format!("undo failed: {e}"), true),
+        }
+        self.update_menu(cx);
+        self.kick(cx);
+    }
+
+    /// Redoes the newest undone child of HEAD (the default branch).
+    fn do_redo(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let was = state.ws.active;
+        match state.store.redo() {
+            Ok(Some(label)) => {
+                state.reload_wm();
+                state.sync();
+                if state.ws.active != was {
+                    let cam = state.ws.camera_x;
+                    state.anim.camera().jump_to(cam);
+                }
+                state.toast(format!("redid — {label}"), false);
+            }
+            Ok(None) => state.toast("nothing to redo", false),
+            Err(e) => state.toast(format!("redo failed: {e}"), true),
+        }
+        self.update_menu(cx);
+        self.kick(cx);
+    }
+
     fn launcher_go(&mut self, cx: &mut Cx, hit: launcher::Hit) {
         let Some(state) = self.state.as_deref_mut() else {
             return;
@@ -2480,7 +2660,17 @@ impl Stage {
                 }
             }
             launcher::Go::Open(kind) => {
-                state.ws.open(kind, None, false);
+                let label = format!("open “{}”", state.panel_title(&kind));
+                let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                state.act(
+                    "open",
+                    label,
+                    None,
+                    move |ws| {
+                        ws.open(kind, None, false);
+                    },
+                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                );
                 state.field = None;
                 state.sync();
             }
@@ -2603,12 +2793,26 @@ impl Stage {
                 let (newer, older) = mail::neighbours(&state.store, id);
                 let t = if input == "j" { older } else { newer };
                 if let Some(t) = t {
-                    state.ws.follow_replace(f, Kind::Message { id: t }, false);
+                    let kind = Kind::Message { id: t };
+                    let label = format!("read “{}”", state.panel_title(&kind));
+                    state.act(
+                        "read",
+                        label,
+                        Some(format!("panel:{f}")),
+                        move |ws| {
+                            ws.follow_replace(f, kind, false);
+                        },
+                        move |tx| mail::mark_read_tx(tx, t),
+                    );
                     self.sync(cx);
                 }
             }
             (Some(Kind::Message { id }), "r") => {
-                state.ws.follow_open(f, Kind::Compose { re: id }, false);
+                let kind = Kind::Compose { re: id };
+                let label = format!("open “{}”", state.panel_title(&kind));
+                state.act_nav("open", label, None, move |ws| {
+                    ws.follow_open(f, kind, false);
+                });
                 self.sync(cx);
             }
             _ => {}
@@ -2640,11 +2844,18 @@ impl Stage {
             return;
         };
         state.overlay = Overlay::None;
-        if state.ws.send_focused_to(k).is_some() {
-            state.field = None;
-            state.sync();
-            let cam = state.ws.camera_x;
-            state.anim.camera().jump_to(cam);
+        if let Some(f) = state.ws.focus {
+            let label = format!("move “{}” to workspace {}", state.title_of(f), k + 1);
+            let mut moved = false;
+            state.act_nav("movews", label, None, |ws| {
+                moved = ws.send_focused_to(k).is_some();
+            });
+            if moved {
+                state.field = None;
+                state.sync();
+                let cam = state.ws.camera_x;
+                state.anim.camera().jump_to(cam);
+            }
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -2684,15 +2895,47 @@ impl Stage {
                 self.sync(cx);
             }
             Act::Close(pid) => {
-                state.ws.close(pid);
+                let label = format!("close “{}”", state.title_of(pid));
+                state.act_nav("close", label, None, move |ws| {
+                    ws.close(pid);
+                });
                 self.sync(cx);
             }
             Act::Open(pid, kind) => {
-                state.ws.follow_open(pid, kind, alt);
+                let label = format!("open “{}”", state.panel_title(&kind));
+                let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                state.act(
+                    "open",
+                    label,
+                    None,
+                    move |ws| {
+                        ws.follow_open(pid, kind, alt);
+                    },
+                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                );
                 self.sync(cx);
             }
             Act::Replace(pid, kind) => {
-                state.ws.follow_replace(pid, kind, alt);
+                // Replacing with another mail (the newer/older links) is the
+                // same "read" walk as j/k — it coalesces per panel.
+                let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                let (akind, entity, label) = match mid {
+                    Some(_) => (
+                        "read",
+                        Some(format!("panel:{pid}")),
+                        format!("read “{}”", state.panel_title(&kind)),
+                    ),
+                    None => ("open", None, format!("open “{}”", state.panel_title(&kind))),
+                };
+                state.act(
+                    akind,
+                    label,
+                    entity,
+                    move |ws| {
+                        ws.follow_replace(pid, kind, alt);
+                    },
+                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                );
                 self.sync(cx);
             }
             Act::Row(pid, id) => {
@@ -2723,13 +2966,19 @@ impl Stage {
                         if let Some(Kind::Message { id }) =
                             state.ws.panels.get(&pid).map(|p| p.kind.clone())
                         {
-                            let subject =
-                                mail::mail(&state.store, id).map(|m| m.head.subject);
-                            mail::archive(&state.store, id);
-                            if let Some(s) = subject {
-                                state.toast(format!("archived “{s}”"), false);
-                            }
-                            state.ws.close(pid);
+                            let subject = mail::mail(&state.store, id)
+                                .map(|m| m.head.subject)
+                                .unwrap_or_default();
+                            state.act(
+                                "archive",
+                                format!("archive “{subject}”"),
+                                None,
+                                move |ws| {
+                                    ws.close(pid);
+                                },
+                                move |tx| mail::archive_tx(tx, id),
+                            );
+                            state.toast(format!("archived “{subject}” — ⌘z undoes"), false);
                         }
                     }
                     BtnAct::Send => {
@@ -2739,10 +2988,16 @@ impl Stage {
                             .map(|u| u.to.text.clone())
                             .unwrap_or_default();
                         state.toast(format!("sent to {to} (fake)"), false);
-                        state.ws.close(pid);
+                        let label = format!("close “{}”", state.title_of(pid));
+                        state.act_nav("close", label, None, move |ws| {
+                            ws.close(pid);
+                        });
                     }
                     BtnAct::Discard => {
-                        state.ws.close(pid);
+                        let label = format!("discard “{}”", state.title_of(pid));
+                        state.act_nav("close", label, None, move |ws| {
+                            ws.close(pid);
+                        });
                     }
                 }
                 self.sync(cx);
@@ -2900,7 +3155,10 @@ impl Stage {
                     let opts = state.opts();
                     // The drop lands where the finger points — same judgement
                     // as the preview bar.
-                    state.ws.place_at(pid, local.x + cam, local.y, vp, opts);
+                    let label = format!("move “{}”", state.title_of(pid));
+                    state.act_nav("move", label, Some(format!("panel:{pid}")), move |ws| {
+                        ws.place_at(pid, local.x + cam, local.y, vp, opts);
+                    });
                 }
                 self.sync(cx);
             }
@@ -3050,6 +3308,10 @@ impl Widget for Stage {
                     self.move_focused_to_ws(cx, (id - WS_MENU_MOVE) as usize);
                 } else if id == MENU_LAUNCHER {
                     self.open_launcher(cx);
+                } else if id == MENU_UNDO {
+                    self.do_undo(cx);
+                } else if id == MENU_REDO {
+                    self.do_redo(cx);
                 }
             }
 

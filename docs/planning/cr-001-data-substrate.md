@@ -272,7 +272,12 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    restart restores your session; the DB opens in `sqlite3`.*
 2. **Actions and undo.** Session-changeset action wrapper; navigation +
    archive/read as actions; `cmd+z` / `cmd+shift+z`; coalescing; toasts name
-   what they did. Linear UX, DAG data.
+   what they did. Linear UX, DAG data. — **landed 2026-09-01**: session
+   feature verified on the android cross-build (bindgen on the host); every
+   mutation site routes through `State::act`; focus/switch/camera stay
+   non-actions; undo teleports back via the action's own workspace rows;
+   conflicts (rows changed since) OMIT-skipped; `wm.active` moved out of
+   `meta` into a recorded `wm` table (schema v2); menu bar Undo/Redo.
 3. **IMAP read.** Accounts + keychain; sync workers; real unified inbox;
    bodies via mail-parser.
 4. **Ops for real.** Executor to the server (archive/delete/flags),

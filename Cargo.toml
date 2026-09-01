@@ -27,8 +27,11 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "9daab06dc
 
 # The one store: bundled SQLite (same pin rel.systems validated) so the hook
 # surface and version are identical on macOS and android. `hooks` powers the
-# query layer's table-level invalidation (update_hook).
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+# query layer's table-level invalidation (update_hook); `session` records
+# every action's transaction as an invertible changeset — the undo system
+# (CR-001 phase 2). session ⇒ buildtime_bindgen: bindgen runs on the host
+# for both targets (verified on the android cross-build).
+rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }

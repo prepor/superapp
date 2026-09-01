@@ -94,9 +94,11 @@ quit
 The touch steps drive the same gesture state machine android uses, so
 `e2e/touch.txt` and `e2e/phone.txt` (run with `--window 380x780 --grid 4x3`)
 verify the android interactions on the desktop, `e2e/workspaces.txt` walks
-the workspace grammar (switch, move-and-follow, overlay), and
+the workspace grammar (switch, move-and-follow, overlay),
 `e2e/launcher.txt` walks the launcher (double-cmd, open vs go-to, the
-overlay's search row).
+overlay's search row), and `e2e/undo.txt` walks the undo DAG (archive →
+undo → redo, close, workspace-move; run it with `--db` and the end state —
+branches, head, folders — is inspectable with `sqlite3`).
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
 rows (by subject) and panel titles. Steps that mutate the workspace need a
