@@ -1,0 +1,55 @@
+# CR-003 — the accelerators, driven by their chords alone.
+#
+# Assertions here are the clicks: every `click` names something that must
+# exist by then, and a label that does not resolve is a failure. So a walk
+# that lands on the wrong mail, or a reply that never opened, fails the run
+# without needing a human to read a screenshot.
+wait 900
+
+# Open the newest mail (id 1) so the walk has somewhere to go.
+click "Q3 infra"
+wait 700
+shot k1-message
+
+# cmd+o walks older, in place (dotted semantics) — the binding that used to
+# be a hidden `j`. Two steps lands on "Re: superapp panel model" (id 3).
+key cmd+o
+wait 600
+key cmd+o
+wait 600
+shot k2-older-twice
+
+# cmd+n walks back toward newer; one step is "[stelaxis] CI failed" (id 2).
+key cmd+n
+wait 600
+shot k3-newer-once
+
+# The panel really is that mail: its own from-link resolves.
+click "GitHub"
+wait 700
+shot k4-contact
+key cmd+w
+wait 600
+
+# cmd+r replies. The compose must exist — `discard` only resolves if it did.
+key cmd+r
+wait 700
+shot k5-reply
+click "discard"
+wait 600
+shot k6-discarded
+
+# cmd+a archives the message panel and closes it. The inbox is what is left,
+# so its own accelerator (cmd+r, refresh) is what must resolve next.
+key cmd+a
+wait 700
+shot k7-archived
+
+# Back on the inbox: cmd+r is refresh here, not reply — accelerators are
+# panel-scoped. It toasts rather than navigating, so the inbox stays.
+key cmd+r
+wait 600
+click "Sat hike"
+wait 700
+shot k8-inbox-alive
+quit

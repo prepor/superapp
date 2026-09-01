@@ -12,6 +12,7 @@ use makepad_widgets::*;
 
 use crate::mail;
 use crate::store::Store;
+use crate::ui;
 
 /// What a panel widget may read while drawing: the store and its own
 /// panel identity. Passed through `Scope` props each draw (props ride an
@@ -164,6 +165,55 @@ script_mod! {
         }
     }
 
+    /** Selectable body text (CR-003): makepad's TextInput held read-only and
+        stripped of every field affordance — no well, no border, no caret —
+        so it reads exactly as an `SLabel` but can be dragged over,
+        double-clicked and copied. Editing is impossible, and a read-only
+        input gates off `Hit::TextInput`, so it cannot swallow a panel's
+        letters; copy still arrives as a platform TextCopy hit. */
+    mod.widgets.SText = TextInputFlat {
+        width: Fill, height: Fit
+        padding: 0
+        margin: 0
+        empty_text: ""
+        is_read_only: true
+        draw_bg +: {
+            border_size: 0.0
+            color: #00000000
+            color_hover: #00000000
+            color_focus: #00000000
+            color_down: #00000000
+            color_empty: #00000000
+            color_disabled: #00000000
+            border_color: #00000000
+            border_color_hover: #00000000
+            border_color_focus: #00000000
+            border_color_down: #00000000
+            border_color_empty: #00000000
+            border_color_disabled: #00000000
+        }
+        draw_text +: {
+            color: #141414
+            color_hover: #141414
+            color_focus: #141414
+            color_down: #141414
+            color_empty: #141414
+            color_empty_hover: #141414
+            color_empty_focus: #141414
+            color_disabled: #141414
+            text_style: mod.widgets.SMonoStyle{}
+        }
+        // Nothing is being typed, so the caret never shows.
+        draw_cursor +: { color: #00000000 }
+        draw_selection +: {
+            color: #00000020
+            color_hover: #00000020
+            color_focus: #00000020
+            color_down: #00000020
+            color_empty: #00000000
+        }
+    }
+
     /** The bordered side-effect button (the design language's one button). */
     mod.widgets.SBtn = ButtonFlat {
         width: Fit, height: Fit
@@ -206,9 +256,18 @@ script_mod! {
         View {
             width: Fill, height: Fit
             align: Align{y: 0.5}
-            email_lbl := mod.widgets.SLabel { text: "" }
+            email_lbl := mod.widgets.SText { width: Fit, is_multiline: false }
             View { width: 12, height: 1 }
-            host_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+            host_lbl := mod.widgets.SText {
+                width: Fit
+                is_multiline: false
+                draw_text +: {
+                    color: #909090
+                    color_hover: #909090
+                    color_focus: #909090
+                    color_down: #909090
+                }
+            }
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
@@ -445,10 +504,42 @@ script_mod! {
         width: Fit, height: Fit
         flow: Down
         cursor: MouseCursor.Hand
-        lbl := mod.widgets.SLabel { text: "" }
+        // The label is split so one character can carry the accelerator
+        // mark (CR-003): prefix, the key drawn twice, suffix. Splitting
+        // beats padding a twin with spaces — `←` arrives from the symbol
+        // fallback, whose advance is not the mono cell.
+        // Label's base padding is mspace_1 — invisible around a single run,
+        // but it would open a gap between each of the three, so the split
+        // parts zero it and the row carries the word's own spacing.
+        row := View {
+            width: Fit, height: Fit
+            flow: Right
+            pre := mod.widgets.SLabel { padding: 0, text: "" }
+            // Three passes, not the usual two: one nudge is legible in a
+            // run of body text but disappears in a short label, and the
+            // mark has to read at a glance to be worth anything.
+            key := View {
+                width: Fit, height: Fit
+                flow: Overlay
+                k1 := mod.widgets.SLabel { padding: 0, text: "" }
+                k2 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.35}, text: "" }
+                k3 := mod.widgets.SLabel { padding: 0, margin: Inset{left: 0.7}, text: "" }
+            }
+            post := mod.widgets.SLabel { padding: 0, text: "" }
+        }
+        // The solid underline needs its own `pixel` for the same reason the
+        // row wash does (CR-002's sixth defect): a stock-shader quad merges
+        // into a draw call that paints *under* the panel background, so it
+        // never appears. A distinct shader earns a correctly-ordered call.
         ul := View {
             width: Fill, height: 1
-            show_bg: true, draw_bg +: { color: #141414 }
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
         }
         ul_dotted := View {
             visible: false
@@ -456,9 +547,12 @@ script_mod! {
             show_bg: true
             draw_bg +: {
                 color: #141414
+                // `Math` carries only rotate_2d/random_2d on this pin, so
+                // the period comes from fract, not a mod that never
+                // compiled (and so never dashed anything).
                 pixel: fn() {
                     let x = self.pos.x * self.rect_size.x
-                    if Math.mod(x, 6.0) > 3.0 {
+                    if fract(x / 6.0) > 0.5 {
                         return vec4(0.0, 0.0, 0.0, 0.0)
                     }
                     return vec4(self.color.xyz * self.color.w, self.color.w)
@@ -483,12 +577,20 @@ script_mod! {
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 60, text: "TO" }
-            to_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+            to_lbl := mod.widgets.SText {
+                is_multiline: false
+                draw_text +: {
+                    color: #909090
+                    color_hover: #909090
+                    color_focus: #909090
+                    color_down: #909090
+                }
+            }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 60, text: "DATE" }
-            date_lbl := mod.widgets.SLabel { text: "" }
+            date_lbl := mod.widgets.SText { is_multiline: false }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
         status_lbl := mod.widgets.SLabel {
@@ -500,7 +602,7 @@ script_mod! {
         body_scroll := View {
             width: Fill, height: Fill
             scroll_bars: ScrollBars{ show_scroll_x: false }
-            body_lbl := mod.widgets.SLabel { width: Fill, height: Fit, text: "" }
+            body_lbl := mod.widgets.SText { is_multiline: true }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -611,8 +713,8 @@ impl AccountRowRef {
         };
         row.account_id = a.id;
         let host = a.imap_host.clone().unwrap_or_default();
-        row.view.label(cx, ids!(email_lbl)).set_text(cx, &a.email);
-        row.view.label(cx, ids!(host_lbl)).set_text(
+        row.view.text_input(cx, ids!(email_lbl)).set_text(cx, &a.email);
+        row.view.text_input(cx, ids!(host_lbl)).set_text(
             cx,
             if host.is_empty() { "local demo" } else { &host },
         );
@@ -1077,16 +1179,12 @@ impl Widget for InboxPanel {
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
 
-        // The panel's letter grammar, only while the filter is at rest —
-        // letters arrive as TextInput events, exactly like real typing.
+        // `/` focuses the filter — the one plain letter the grammar keeps
+        // (CR-003 retired the vim walk; the arrows already mirrored it).
+        // It arrives as a TextInput event, exactly like real typing.
         if let Event::TextInput(t) = event {
-            if !filter_focused {
-                match t.input.as_str() {
-                    "j" => self.move_sel(cx, scope, 1),
-                    "k" => self.move_sel(cx, scope, -1),
-                    "/" => SettingsPanel::focus_input(cx, &filter),
-                    _ => {}
-                }
+            if !filter_focused && t.input == "/" {
+                SettingsPanel::focus_input(cx, &filter);
             }
         }
         if let Event::KeyDown(k) = event {
@@ -1106,7 +1204,8 @@ impl Widget for InboxPanel {
                             });
                         }
                     }
-                    // Arrows mirror j/k (the char grid's grammar).
+                    // The row walk, with scroll-follow (CR-003: the arrows
+                    // are the whole walk now, j/k having gone).
                     KeyCode::ArrowDown => self.move_sel(cx, scope, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, scope, -1),
                     // The inbox's one-stop tab ring: the filter.
@@ -1213,11 +1312,47 @@ impl SLinkRef {
         target: crate::core::Kind,
         dotted: bool,
     ) {
+        self.set_accel(cx, pid, text, target, dotted, None);
+    }
+
+    /// As [`Self::set`], but `accel` names the key this link carries — its
+    /// letter is drawn twice, nudged, so the link wears its own chord.
+    pub fn set_accel(
+        &self,
+        cx: &mut Cx,
+        pid: u64,
+        text: &str,
+        target: crate::core::Kind,
+        dotted: bool,
+        accel: Option<char>,
+    ) {
         let Some(mut l) = self.borrow_mut() else { return };
         l.pid = pid;
         l.target = Some(target);
         l.dotted = dotted;
-        l.view.label(cx, ids!(lbl)).set_text(cx, text);
+        let at = accel.and_then(|c| ui::accel_idx(text, c));
+        let (pre, key, post) = match at {
+            Some(i) => {
+                let mut it = text.chars();
+                let pre: String = it.by_ref().take(i).collect();
+                let key: String = it.next().into_iter().collect();
+                (pre, key, it.collect::<String>())
+            }
+            None => (text.to_string(), String::new(), String::new()),
+        };
+        // An empty label still reserves width, which would push the text
+        // right of an underline that spans the whole row — so the unused
+        // parts stand down entirely rather than render nothing.
+        let pre_l = l.view.label(cx, ids!(row.pre));
+        pre_l.set_text(cx, &pre);
+        pre_l.set_visible(cx, !pre.is_empty());
+        let post_l = l.view.label(cx, ids!(row.post));
+        post_l.set_text(cx, &post);
+        post_l.set_visible(cx, !post.is_empty());
+        for p in [ids!(row.key.k1), ids!(row.key.k2), ids!(row.key.k3)] {
+            l.view.label(cx, p).set_text(cx, &key);
+        }
+        l.view.view(cx, ids!(row.key)).set_visible(cx, !key.is_empty());
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
     }
@@ -1266,35 +1401,44 @@ impl Widget for MessagePanel {
                 }
             }
         }
-        // The message grammar: j/k walk in place (dotted semantics),
-        // r replies — letters arrive as TextInput events.
-        if let Event::TextInput(t) = event {
+        // The message panel's link accelerators (CR-003): the walk that used
+        // to be a hidden j/k is cmd+n / cmd+o now, drawn onto the links
+        // themselves, and reply is cmd+r. The shell forwards any cmd chord
+        // it does not own itself.
+        if let Event::KeyDown(k) = event {
+            if !k.modifiers.logo {
+                return;
+            }
             let Some(p) = scope.props.get::<PanelProps>() else {
                 return;
             };
             let crate::core::Kind::Message { id } = p.kind else {
                 return;
             };
-            match t.input.as_str() {
-                "j" | "k" => {
-                    let (newer, older) = mail::neighbours(&p.store, id);
-                    let target = if t.input == "j" { older } else { newer };
-                    if let Some(nid) = target {
-                        cx.action(PanelAction::FollowLink {
-                            pid: p.pid,
-                            target: crate::core::Kind::Message { id: nid },
-                            dotted: true,
-                            fresh: false,
-                        });
-                    }
-                }
-                "r" => cx.action(PanelAction::FollowLink {
+            let c = match k.key_code {
+                KeyCode::KeyN => ui::ACCEL_NEWER,
+                KeyCode::KeyO => ui::ACCEL_OLDER,
+                KeyCode::KeyR => ui::ACCEL_REPLY,
+                _ => return,
+            };
+            if c == ui::ACCEL_REPLY {
+                cx.action(PanelAction::FollowLink {
                     pid: p.pid,
                     target: crate::core::Kind::Compose { re: id },
                     dotted: false,
                     fresh: false,
-                }),
-                _ => {}
+                });
+                return;
+            }
+            let (newer, older) = mail::neighbours(&p.store, id);
+            let target = if c == ui::ACCEL_OLDER { older } else { newer };
+            if let Some(nid) = target {
+                cx.action(PanelAction::FollowLink {
+                    pid: p.pid,
+                    target: crate::core::Kind::Message { id: nid },
+                    dotted: true,
+                    fresh: false,
+                });
             }
         }
     }
@@ -1313,9 +1457,10 @@ impl Widget for MessagePanel {
                         },
                         false,
                     );
-                    self.view.label(cx, ids!(to_lbl)).set_text(cx, &m.to);
+                    // Selectable now, so they are TextInputs, not labels.
+                    self.view.text_input(cx, ids!(to_lbl)).set_text(cx, &m.to);
                     self.view
-                        .label(cx, ids!(date_lbl))
+                        .text_input(cx, ids!(date_lbl))
                         .set_text(cx, &mail::fmt_date(m.head.date));
                     let (ok_l, err_l) = (
                         self.view.label(cx, ids!(status_lbl)),
@@ -1337,28 +1482,43 @@ impl Widget for MessagePanel {
                             err_l.set_visible(cx, false);
                         }
                     }
-                    self.view.label(cx, ids!(body_lbl)).set_text(cx, &m.body);
+                    self.view.text_input(cx, ids!(body_lbl)).set_text(cx, &m.body);
                     let (newer, older) = mail::neighbours(&p.store, id);
                     let nl = self.view.link(cx, ids!(newer_link));
                     let no = self.view.label(cx, ids!(newer_off));
                     if let Some(n) = newer {
-                        nl.set(cx, pid, "← newer", crate::core::Kind::Message { id: n }, true);
+                        nl.set_accel(
+                            cx,
+                            pid,
+                            "← newer",
+                            crate::core::Kind::Message { id: n },
+                            true,
+                            Some(ui::ACCEL_NEWER),
+                        );
                     }
                     nl.set_visible(cx, newer.is_some());
                     no.set_visible(cx, newer.is_none());
                     let ol = self.view.link(cx, ids!(older_link));
                     let oo = self.view.label(cx, ids!(older_off));
                     if let Some(o) = older {
-                        ol.set(cx, pid, "older →", crate::core::Kind::Message { id: o }, true);
+                        ol.set_accel(
+                            cx,
+                            pid,
+                            "older →",
+                            crate::core::Kind::Message { id: o },
+                            true,
+                            Some(ui::ACCEL_OLDER),
+                        );
                     }
                     ol.set_visible(cx, older.is_some());
                     oo.set_visible(cx, older.is_none());
-                    self.view.link(cx, ids!(reply_link)).set(
+                    self.view.link(cx, ids!(reply_link)).set_accel(
                         cx,
                         pid,
                         "reply",
                         crate::core::Kind::Compose { re: id },
                         false,
+                        Some(ui::ACCEL_REPLY),
                     );
                 }
             }

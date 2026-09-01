@@ -1,0 +1,55 @@
+# CR-003 — read-only content is selectable. A --front suite: the claim is a
+# grey wash, and occluded windows present stale frames. (The display must
+# also be awake — a slept one cannot create the window at all, which reads
+# as every shot failing.)
+#
+# What each half proves, stated honestly:
+#
+#   `drag` is a SMOKE TEST ONLY. Drag-selection runs on Hit::FingerMove,
+#   which needs the finger capture the platform maintains — and the harness
+#   enters below that seam (CR-002's lesson, in a new place). The drags here
+#   confirm the runs are hit-addressable and that dragging them breaks
+#   nothing; they do NOT prove a selection appears. Only a real mouse, or
+#   e2e/cgpost.c, can.
+#
+#   `cmd+a` is the REAL ASSERTION. Keyboard selection needs no capture, so
+#   the wash it leaves is the proof that SText selects, renders its wash,
+#   and does so inside a PortalList item.
+wait 900
+
+click "Q3 infra"
+wait 700
+shot s1-message
+
+# Drag across the body: the first line should end up washed.
+drag "mail body" 420 0
+wait 400
+shot s2-body-selected
+
+# The headers are selectable too — addresses are the thing people copy.
+drag "mail to" 200 0
+wait 400
+shot s3-to-selected
+
+# Settings account rows: the same, inside a PortalList (whose item areas go
+# stale mid-gesture — CR-002's fifth defect — so this is the risky one).
+key cmd 2
+wait 400
+type "settings"
+wait 300
+key enter
+wait 700
+drag "local demo" 160 0
+wait 400
+shot s4-account-selected
+
+# Selection by keyboard needs no finger capture, so it is the part the
+# harness can actually prove: focus a run, select all, look for the wash.
+# (Settings claims no cmd+a — it edits text — so the chord reaches the
+# field, which is rule 3 doing its job.)
+click "local demo"
+wait 300
+key cmd+a
+wait 400
+shot s5-account-select-all
+quit

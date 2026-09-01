@@ -14,6 +14,8 @@
 //! shot inbox          — e2e/out/inbox.png
 //! click "reply"       — click the interactive element whose label matches
 //! altclick "subject"  — the same, with alt held (fresh un-joined panel)
+//! drag "body" 200 0   — mouse press-drag-release from the element's left
+//!                       edge: selects text under the pointer
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
@@ -56,6 +58,16 @@ pub enum Step {
     },
     /// Text input into whatever owns the keyboard.
     Type(String),
+    /// A mouse press-drag-release from the labelled element's left edge by
+    /// `(dx, dy)` points — how text gets selected.
+    Drag {
+        /// Label substring picking the start element.
+        label: String,
+        /// Horizontal travel, points.
+        dx: f64,
+        /// Vertical travel, points.
+        dy: f64,
+    },
     /// A one-finger touch drag from the labelled element's centre, by
     /// `(dx, dy)` points: vertical scrolls that panel.
     Swipe {
@@ -142,7 +154,7 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                 }
             }
             "type" => Step::Type(quoted()?),
-            "swipe" | "holdmove" => {
+            "drag" | "swipe" | "holdmove" => {
                 let label = quoted()?;
                 let after = &rest[rest.rfind('"').unwrap() + 1..];
                 let mut it = after.split_whitespace();
@@ -154,7 +166,9 @@ pub fn parse(src: &str) -> Result<Vec<Step>, String> {
                     .next()
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| err("expected dx dy"))?;
-                if cmd == "swipe" {
+                if cmd == "drag" {
+                    Step::Drag { label, dx, dy }
+                } else if cmd == "swipe" {
                     Step::Swipe { label, dx, dy }
                 } else {
                     let hold = it.next() == Some("hold");

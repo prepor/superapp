@@ -24,10 +24,10 @@ shot p3-cmdclick-fresh
 # filter and header stay put; the thumb moves.
 click "inbox"
 wait 300
-key j 45
+key down 45
 wait 500
 shot p4-scrolled
-key k 45
+key up 45
 wait 400
 
 # Filter: / focuses it, typing narrows, enter selects the first row and
@@ -43,8 +43,9 @@ key enter
 wait 700
 shot p6-opened-from-filter
 
-# Message keys: r replies; esc leaves the draft body; discard closes it.
-key r
+# Message keys: cmd+r replies (the accelerator the reply link wears); esc
+# leaves the draft body; discard closes it.
+key cmd+r
 wait 600
 key esc
 wait 200
