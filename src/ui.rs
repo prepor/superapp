@@ -105,6 +105,11 @@ pub const ACCEL_NEWER: char = 'n';
 pub const ACCEL_OLDER: char = 'o';
 pub const ACCEL_REPLY: char = 'r';
 
+/// Settings' link to the add-account form. The `d` of "add" rather than the
+/// `a`: the account rows are selectable text, so `cmd+a` belongs to them —
+/// the same courtesy an editable field gets, for the same reason.
+pub const ACCEL_ADD_ACCOUNT: char = 'd';
+
 /// Every accelerator a kind declares — chrome buttons *and* links — as
 /// `(key, what it fires)`. One table, so [`tests`] can hold the whole
 /// design to its rules rather than trusting discipline.
@@ -117,6 +122,9 @@ pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
         v.push((ACCEL_NEWER, "newer"));
         v.push((ACCEL_OLDER, "older"));
         v.push((ACCEL_REPLY, "reply"));
+    }
+    if matches!(kind, Kind::Settings) {
+        v.push((ACCEL_ADD_ACCOUNT, "add account"));
     }
     v
 }
@@ -349,7 +357,7 @@ pub fn actions(hint: &str, buttons: &[(&str, BtnAct)]) -> Line {
 #[must_use]
 pub fn field_order(kind: &Kind) -> &'static [FieldId] {
     match kind {
-        Kind::Settings => &[
+        Kind::AddAccount => &[
             FieldId::SetEmail,
             FieldId::SetPass,
             FieldId::SetImap,
@@ -378,10 +386,14 @@ mod tests {
 
     #[test]
     fn the_field_walk_matches_the_forms() {
-        let s = Kind::Settings;
+        let s = Kind::AddAccount;
         assert_eq!(next_field(&s, FieldId::SetEmail, 1), Some(FieldId::SetPass));
         assert_eq!(next_field(&s, FieldId::SetSmtp, 1), None, "past the end: submit");
         assert_eq!(next_field(&s, FieldId::SetEmail, -1), None);
+        assert!(
+            field_order(&Kind::Settings).is_empty(),
+            "the form left settings; only the accounts stayed"
+        );
         let c = Kind::Compose { re: 0 };
         assert_eq!(next_field(&c, FieldId::Subject, 1), Some(FieldId::Body));
         assert_eq!(next_field(&c, FieldId::Body, -1), Some(FieldId::Subject));
@@ -391,6 +403,7 @@ mod tests {
     fn every_kind() -> Vec<Kind> {
         vec![
             Kind::Settings,
+            Kind::AddAccount,
             Kind::Help,
             Kind::About,
             Kind::Inbox { filter: None },
@@ -462,6 +475,7 @@ mod tests {
             ("newer", ACCEL_NEWER),
             ("older", ACCEL_OLDER),
             ("reply", ACCEL_REPLY),
+            ("add account", ACCEL_ADD_ACCOUNT),
         ] {
             assert!(accel_idx(label, c).is_some(), "“{label}” cannot show {c}");
         }

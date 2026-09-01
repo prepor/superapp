@@ -57,8 +57,9 @@ typing; control keys (enter, arrows, backspace) are routed as key events.
 **A control carries its own key, drawn into its label.** One character of a
 button or link is **bold**, and `cmd`+that letter fires it: `archive` is
 `cmd+a`, `reply` is `cmd+r`, the message walk is `cmd+n` / `cmd+o` on
-`← newer` and `older →`. Nothing to memorise and no help panel to consult —
-the shortcut is a property of the thing it fires.
+`← newer` and `older →`, settings' `add account` is `cmd+d`. Nothing to
+memorise and no help panel to consult — the shortcut is a property of the
+thing it fires.
 
 This is the one place bold does a second job, so the rule is sharp:
 
@@ -78,7 +79,9 @@ by discipline:
 
 1. never the reserved set;
 2. unique within a panel;
-3. a panel that edits text yields `c` `v` `x` `a` to the field;
+3. a panel whose text can be edited *or selected* yields `c` `v` `x` `a` to
+   it — which is why settings' one link is `cmd+d`, not `cmd+a`: the account
+   rows are selectable, so select-all stays theirs;
 4. only for controls a panel has exactly one of — a list of rows each with a
    *remove* button stays on the Tab ring and the mouse.
 

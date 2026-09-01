@@ -359,8 +359,8 @@ script_mod! {
         }
     }
 
-    /** The settings panel: the accounts and their sync state. The add form
-        is its own panel, opened by the header link (solid: joined right). */
+    /** The settings panel: the accounts and their sync state, then the link
+        to the form (solid: the add-account panel opens joined to the right). */
     mod.widgets.SettingsPanel = set_type_default() do #(SettingsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -368,22 +368,22 @@ script_mod! {
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
-        View {
-            width: Fill, height: Fit, align: Align{y: 1.0}
-            mod.widgets.SSection { text: "ACCOUNTS" }
-            View { width: Fill, height: 1 }
-            add_link := mod.widgets.SLink {}
-        }
+        mod.widgets.SSection { text: "ACCOUNTS" }
         View { width: Fill, height: 5 }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
 
         accounts_list := PortalList {
             // PortalList virtualizes against a fixed viewport (Fit would
-            // collapse it) — so it fills the panel below the header.
+            // collapse it) — so it fills the panel above the link.
             width: Fill, height: Fill
             flow: Down
             account_row := mod.widgets.AccountRow {}
         }
+
+        // The link belongs to the content, not to the section label: a
+        // heading row is not where this language puts navigation.
+        View { width: Fill, height: 8 }
+        add_link := mod.widgets.SLink {}
     }
 
     /** The add-account form, a panel of its own: four labelled fields and
@@ -832,7 +832,21 @@ impl Widget for SettingsPanel {
         self.view.handle_event(cx, event, scope);
 
         // Tab walks the remove buttons; enter/space press the focused one.
+        // The add-account link wears its own chord instead (CR-003): it is
+        // the one control this panel has exactly one of.
         if let Event::KeyDown(k) = event {
+            if k.modifiers.logo {
+                if k.key_code == KeyCode::KeyD {
+                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                    cx.action(PanelAction::FollowLink {
+                        pid,
+                        target: crate::core::Kind::AddAccount,
+                        dotted: false,
+                        fresh: false,
+                    });
+                }
+                return;
+            }
             if k.key_code == KeyCode::Tab {
                 let ring = self.ring(cx);
                 tab_ring(cx, &ring, k.modifiers.shift);
@@ -855,12 +869,13 @@ impl Widget for SettingsPanel {
         let props = scope.props.get::<PanelProps>();
         let pid = props.map_or(0, |p| p.pid);
         let accounts = props.map(|p| mail::accounts(&p.store));
-        self.view.link(cx, ids!(add_link)).set(
+        self.view.link(cx, ids!(add_link)).set_accel(
             cx,
             pid,
             "add account",
             crate::core::Kind::AddAccount,
             false,
+            Some(ui::ACCEL_ADD_ACCOUNT),
         );
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
