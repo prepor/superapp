@@ -233,6 +233,8 @@ script_mod! {
                         inbox_tpl := mod.widgets.InboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
                         contact_tpl := mod.widgets.ContactPanel{}
+                        help_tpl := mod.widgets.HelpPanel{}
+                        about_tpl := mod.widgets.AboutPanel{}
                     }
                 }
             }
@@ -3636,7 +3638,8 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
         Kind::Contact { .. } => Some(live_id!(contact_tpl)),
-        _ => None,
+        Kind::Help => Some(live_id!(help_tpl)),
+        Kind::About => Some(live_id!(about_tpl)),
     }
 }
 
@@ -3769,6 +3772,12 @@ impl Stage {
                     );
                     state.spawn_workers();
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
+                    refresh = true;
+                }
+                crate::panels::PanelAction::TryIt { pid: _ } => {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        state.toast("side effect: nothing was opened or replaced", false);
+                    }
                     refresh = true;
                 }
             }

@@ -57,6 +57,9 @@ pub enum PanelAction {
         dotted: bool,
         fresh: bool,
     },
+    /// Help's demo button: the one side effect that does nothing, so the
+    /// legend can show what a button is without moving anything.
+    TryIt { pid: u64 },
 }
 
 script_mod! {
@@ -306,6 +309,62 @@ script_mod! {
                     }
                     return vec4(self.color.xyz * self.color.w, self.color.w)
                 }
+            }
+        }
+    }
+
+    /** A key cap: the char grid's `Seg::Kbd` as a widget — a hairline box
+        around the key's name, sized to it. Built on ButtonFlat because it
+        carries `text` on the instance (a named child's properties cannot be
+        overridden per instance at this makepad generation: the override
+        parses and is silently dropped). It is inert by construction — no
+        action reads it, and it never takes key focus. */
+    mod.widgets.SKbd = ButtonFlat {
+        width: Fit, height: Fit
+        margin: Inset{left: 1, right: 1}
+        padding: Inset{left: 4, right: 4, top: 1, bottom: 1}
+        grab_key_focus: false
+        draw_bg +: {
+            border_radius: 1.0
+            border_size: 1.0
+            color: #ffffff
+            color_hover: #ffffff
+            color_down: #ffffff
+            color_focus: #ffffff
+            color_disabled: #ffffff
+            border_color: #5a5a5a
+            border_color_hover: #5a5a5a
+            border_color_down: #5a5a5a
+            border_color_focus: #5a5a5a
+            border_color_disabled: #5a5a5a
+        }
+        draw_text +: {
+            color: #5a5a5a
+            color_hover: #5a5a5a
+            color_down: #5a5a5a
+            color_focus: #5a5a5a
+            color_disabled: #5a5a5a
+            text_style: mod.widgets.SMonoStyle{font_size: 8.25}
+        }
+    }
+
+    /** One line of prose: children laid out left to right, shared baseline. */
+    mod.widgets.SRow = View {
+        width: Fill, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{top: 1, bottom: 1}
+    }
+
+    /** The hairline under a section label. */
+    mod.widgets.SRule = View {
+        width: Fill, height: 1
+        margin: Inset{top: 3, bottom: 5}
+        show_bg: true
+        draw_bg +: {
+            color: #141414
+            pixel: fn() {
+                return vec4(self.color.xyz * self.color.w, self.color.w)
             }
         }
     }
@@ -678,6 +737,215 @@ script_mod! {
         count_lbl := mod.widgets.SLabel { text: "" }
         View { width: Fill, height: 6 }
         from_link := mod.widgets.SLink {}
+    }
+
+    // ---- help and about ----------------------------------------------------
+
+    /** The manual, and the design language's own showcase: every grammar it
+        describes is drawn with the widget that implements it — the links
+        really open and replace, the button really fires a side effect, the
+        key caps are the same `SKbd` the rest of the app would use.
+
+        Platform-specific rows are all here and hidden per target in
+        `HelpPanel::draw_walk` (the DSL cannot see `cfg!`). */
+    mod.widgets.HelpPanel = set_type_default() do #(HelpPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        scroll_bars: ScrollBars{ show_scroll_x: false }
+
+        mod.widgets.SSection { text: "LEGEND" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            solid_link := mod.widgets.SLink {}
+            mod.widgets.SLabel { text: " — opens a panel to the right, joined" }
+        }
+        mod.widgets.SRow {
+            dotted_link := mod.widgets.SLink {}
+            mod.widgets.SLabel { text: " — replaces this panel in place" }
+        }
+        mod.widgets.SRow {
+            try_btn := mod.widgets.SBtn { text: "button" }
+            mod.widgets.SLabel { text: " — side effect only, never navigation" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SLabel { text: "+click / " }
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "enter" }
+            mod.widgets.SLabel { text: " — always a fresh, un-joined panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "a ═ bridge marks a joined pair: the next solid link in the parent replaces the joined panel; replacing a panel closes its joined chain" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "color is reserved for errors: " }
+            mod.widgets.SLabel { text: "like this", draw_text +: { color: #a01500 } }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "KEYS" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SLabel { text: "+arrows — focus panels" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+same — move the panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "w" }
+            mod.widgets.SLabel { text: " — close the focused panel" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "z" }
+            mod.widgets.SLabel { text: " — undo (open, close, move, archive…)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SKbd { text: "z" }
+            mod.widgets.SLabel { text: " — redo" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "u" }
+            mod.widgets.SLabel { text: " — history: the whole tree, walkable" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "i" }
+            mod.widgets.SLabel { text: " — copy the panel's context (its queries)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "[" }
+            mod.widgets.SKbd { text: "]" }
+            mod.widgets.SLabel { text: " — consume into / expel out of a column" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "," }
+            mod.widgets.SKbd { text: "." }
+            mod.widgets.SLabel { text: " — pull from the right / push bottom out" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "t" }
+            mod.widgets.SLabel { text: " — column tabs (click a tab or cmd+↑/↓)" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "a control wearing a bold letter is cmd+that letter:" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  message " }
+            mod.widgets.SKbd { text: "cmd+a" }
+            mod.widgets.SLabel { text: "rchive " }
+            mod.widgets.SKbd { text: "cmd+r" }
+            mod.widgets.SLabel { text: "eply " }
+            mod.widgets.SKbd { text: "cmd+n" }
+            mod.widgets.SLabel { text: "/" }
+            mod.widgets.SKbd { text: "cmd+o" }
+            mod.widgets.SLabel { text: " walk" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  inbox " }
+            mod.widgets.SKbd { text: "cmd+r" }
+            mod.widgets.SLabel { text: "efresh  " }
+            mod.widgets.SKbd { text: "enter" }
+            mod.widgets.SLabel { text: " opens  " }
+            mod.widgets.SKbd { text: "/" }
+            mod.widgets.SLabel { text: " filters  arrows walk the rows" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "esc" }
+            mod.widgets.SLabel { text: " leaves a text field" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "trackpad: scroll the strip and the panels" }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "WORKSPACES" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "1" }
+            mod.widgets.SLabel { text: "…" }
+            mod.widgets.SKbd { text: "9" }
+            mod.widgets.SLabel { text: " — switch workspace" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+№ — move the panel there" }
+        }
+        menu_row := mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "the menu bar lists them; [n] is current" }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "LAUNCHER" }
+        mod.widgets.SRule {}
+        desk_launch := View {
+            width: Fill, height: Fit, flow: Down
+            mod.widgets.SRow {
+                mod.widgets.SKbd { text: "cmd" }
+                mod.widgets.SKbd { text: "cmd" }
+                mod.widgets.SLabel { text: " — the launcher: search everything" }
+            }
+            mod.widgets.SRow {
+                mod.widgets.SLabel { width: Fill, text: "type to find panels, mail, people; enter goes to it — or opens it fresh" }
+            }
+        }
+        touch_launch := View {
+            visible: false
+            width: Fill, height: Fit, flow: Down
+            mod.widgets.SRow {
+                mod.widgets.SLabel { width: Fill, text: "the overlay's search row opens it: find open panels, mail, people" }
+            }
+        }
+
+        touch_help := View {
+            visible: false
+            width: Fill, height: Fit, flow: Down
+            View { width: Fill, height: 10 }
+            mod.widgets.SSection { text: "TOUCH" }
+            mod.widgets.SRule {}
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "tap — follow links, press buttons" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "drag — scroll a panel's content" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers — scroll the workspace" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "two fingers down — workspaces overlay" } }
+            mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "hold a header — pick the panel up; drop on a column to stack, between columns for a fresh one" } }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "TRY" }
+        mod.widgets.SRule {}
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "1. click a subject — a message opens, joined (bridge)" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "2. click another subject — it replaces the joined message" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "3. from → contact joins the chain; the next subject click closes the chain" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "4. cmd+shift+← the message — moved away, it un-joins" } }
+    }
+
+    /** The colophon. */
+    mod.widgets.AboutPanel = set_type_default() do #(AboutPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 2
+
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "superapp — rust + makepad prototype." } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "no apps, no windows: specialized panels" } }
+        mod.widgets.SRow { mod.widgets.SLabel { width: Fill, text: "on one scrolling gridded workspace." } }
+        View { width: Fill, height: 8 }
+        mod.widgets.SRow { help_link := mod.widgets.SLink {} }
     }
 }
 
@@ -1663,6 +1931,88 @@ impl Widget for ContactPanel {
                 );
             }
         }
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HelpPanel / AboutPanel
+// ---------------------------------------------------------------------------
+
+/// The manual. Static prose in the DSL; the live parts — the two demo links,
+/// the demo button, and which platform's rows are visible — are settled here.
+#[derive(Script, ScriptHook, Widget)]
+pub struct HelpPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for HelpPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            if self.view.button(cx, ids!(try_btn)).clicked(actions) {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                cx.action(PanelAction::TryIt { pid });
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        // The legend demonstrates the grammar with the real thing: these
+        // links open and replace exactly like any other.
+        self.view.link(cx, ids!(solid_link)).set(
+            cx,
+            pid,
+            "solid underline",
+            crate::core::Kind::About,
+            false,
+        );
+        self.view.link(cx, ids!(dotted_link)).set(
+            cx,
+            pid,
+            "dotted underline",
+            crate::core::Kind::About,
+            true,
+        );
+        // Platform rows: the DSL holds every variant, `cfg!` picks.
+        let android = cfg!(target_os = "android");
+        self.view
+            .view(cx, ids!(menu_row))
+            .set_visible(cx, cfg!(target_os = "macos"));
+        self.view.view(cx, ids!(desk_launch)).set_visible(cx, !android);
+        self.view.view(cx, ids!(touch_launch)).set_visible(cx, android);
+        self.view.view(cx, ids!(touch_help)).set_visible(cx, android);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// The colophon: three lines and the way back.
+#[derive(Script, ScriptHook, Widget)]
+pub struct AboutPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for AboutPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        self.view.link(cx, ids!(help_link)).set(
+            cx,
+            pid,
+            "back to help",
+            crate::core::Kind::Help,
+            true,
+        );
         self.view.draw_walk(cx, scope, walk)
     }
 }
