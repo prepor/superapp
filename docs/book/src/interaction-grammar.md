@@ -42,7 +42,8 @@ Per panel, below the reserved set:
 - inbox: `enter` opens (`cmd+enter` un-joined), `/` filter, arrows walk the
   rows (scrolling the list to keep the cursor visible)
 - forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
-  wrapping; `enter` advances and **submits past the last field**
+  wrapping; `enter` advances and **submits past the last field**. Read
+  panels have no ring: their controls wear chords instead.
 - `esc` leaves a text field; arrows scroll a panel that has nothing better to do
 
 There is no vim layer: `hjkl` and the plain `j`/`k` walks are gone. A key is

@@ -168,6 +168,11 @@ A. **Vim removal + the accelerator core.** The declaration table and its
 B. **Link accelerators.** `SLink` carries an accel char and draws the twin;
    the message panel's reply/newer/older resolve from forwarded chords.
 C. **Selection.** `SText` and its three applications.
-D. **Complete the reach.** Tab rings for message/inbox/contact, links as
-   focusable stops, enter activates a focused link — so every control is
-   reachable by walk *and* by key, not one or the other.
+D. ~~**Complete the reach.** Tab rings for message/inbox/contact, links as
+   focusable stops.~~ **Dropped** (Andrey, 2026-09-01), and worth recording
+   why: once A–C landed, every control on those panels wore a chord, so a
+   ring would have been a *second* way to reach the same few things — plus
+   a focus-outline state to maintain and a second grammar to explain. Rings
+   stay where a form actually needs them (settings, compose, from CR-002).
+   The general rule this settles: **read panels get accelerators, form
+   panels get both.**
