@@ -1212,6 +1212,18 @@ pub struct WmSnap {
     pub wss: Vec<WsSnap>,
 }
 
+impl Default for WmSnap {
+    /// An empty session: every workspace present and empty, active 0 — the
+    /// shape `Wm::new().snapshot()` gives, without needing a [`Wm`].
+    /// History's floor uses it once the tree has been trimmed away.
+    fn default() -> Self {
+        WmSnap {
+            active: 0,
+            wss: vec![WsSnap::default(); WS_N],
+        }
+    }
+}
+
 impl Ws {
     /// This workspace's logical state (see [`Wm::snapshot`]).
     #[must_use]

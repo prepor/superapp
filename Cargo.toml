@@ -37,13 +37,19 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65ea
 # every action's transaction as an invertible changeset — the undo system
 # (CR-001 phase 2). session ⇒ buildtime_bindgen: bindgen runs on the host
 # for both targets (verified on the android cross-build).
-rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+
+# CR-004: effects are serializable values, and the deferred ones are JSON
+# payloads in the `effect` table. serde is already in the graph transitively;
+# serde_json is the one new crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# Three patches on top of the pin, carried on prepor/makepad@superapp-pin
+# Two patches on top of the pin, carried on prepor/makepad@superapp-pin
 # (branched at the pin; rebase them when bumping it):
 #
 #   bdb23508  TextInput hides the IME only when key focus goes to nothing —
@@ -53,18 +59,19 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 #             it to replay the animation: dismissals "closed twice"), and a
 #             tap on a field clears the dismissed latch, so a re-tap on the
 #             focused field can raise the keyboard again.
-#   99b2a58f  MAKEPAD_PRESENT_WHEN_OCCLUDED=1 keeps an occluded window
-#             presenting — mosaic's patch 0003, rebased. Headless e2e runs
-#             stay behind the user's windows on purpose and must still
-#             photograph what they draw; without it, captures are stale
-#             frames. background_run() sets the variable itself.
+#
+# A third — MAKEPAD_PRESENT_WHEN_OCCLUDED, mosaic's patch 0003 — was
+# dropped once e2e moved to `MAKEPAD=headless`. It existed so a run that
+# deliberately sat behind the user's windows could still be photographed;
+# a headless run has no window to occlude, and makepad's own software
+# rasterizer writes the frames.
 #
 # A local clone at ../makepad-superapp is the working tree for them; the
 # git rev below is what actually builds, here and anywhere else.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "99b2a58f923cc0ebf5f562b084d9e3eb1006522f" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
 
 [profile.dev]
 opt-level = 1

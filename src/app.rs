@@ -31,7 +31,6 @@ use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
-use crate::send;
 use crate::panels::*;
 use crate::store::Store;
 use crate::sync;
@@ -42,6 +41,24 @@ use crate::ui::{self, trunc, BtnAct, Style};
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Under a headless build the shell runs on a **fixed frame clock**: one
+/// draw cycle is one frame of exactly this long, for both the springs and
+/// the e2e runner. Nothing reads the wall clock, so a run is reproducible
+/// whether the machine is idle or running a dozen other suites.
+#[cfg(headless)]
+const FRAME_MS: f64 = 1000.0 / 60.0;
+
+/// How often the manual pump runs a sync/send round, in frames. Half a
+/// second of frame time — often enough that a script's `wait` sees the
+/// result, rare enough that a dead host is not dialled sixty times a second.
+#[cfg(headless)]
+const PUMP_EVERY: u64 = 30;
+
+/// The windowed e2e runner is paced by a real timer at this interval; the
+/// runner counts the same milliseconds either way.
+#[cfg(not(headless))]
+const E2E_TICK_MS: f64 = 30.0;
 
 /// Command-line configuration.
 #[derive(Debug, Default)]
@@ -711,14 +728,27 @@ struct LauncherUi {
 
 struct State {
     ws: Wm,
+    /// Everything that leaves the process, plus the clock (CR-004). Holds
+    /// the same `Rc<Store>` as the field below, so the two cannot diverge —
+    /// `store` stays for the hundred read sites that only want the store.
+    world: std::rc::Rc<crate::effect::World>,
+    /// The action tree (CR-004). In memory, so it dies with the process:
+    /// a restart loses undo, but never loses work — the rows every action
+    /// wrote are durable, and the passes read those, never this.
+    history: crate::history::History,
     store: std::rc::Rc<Store>,
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
     db_path: Option<std::path::PathBuf>,
-    /// One IMAP worker per configured account.
-    workers: Vec<sync::Worker>,
-    /// The outbox sender thread.
-    sender: Option<send::Sender>,
+    /// Who runs the passes (CR-004): threads in production, inline in a
+    /// headless world.
+    pump: sync::Pump,
+    /// Where passwords live. An e2e run keeps them in memory, so a suite
+    /// never writes to a human's keychain and two runs never collide.
+    secrets: crate::effect::Secrets,
+    /// What time the app thinks it is. Virtual under a headless build, so
+    /// a send deadline moves with the script rather than with the machine.
+    clock: crate::effect::Clock,
     /// Failed outbox rows already toasted (new ones toast on signal).
     failed_seen: usize,
     /// The last persisted logical snapshot — [`State::sync`] only writes
@@ -729,7 +759,9 @@ struct State {
     last_frame: Option<Instant>,
     animating: bool,
     hover: Option<Act>,
-    toast: Option<(String, bool, Instant)>,
+    /// `(message, is_error, when)` — `when` on the world's clock, not the
+    /// wall's, so a toast fades by the same amount on every run.
+    toast: Option<(String, bool, f64)>,
     overlay: Overlay,
     launcher: LauncherUi,
     /// A panel to reveal alongside focus on the next [`State::sync`], once.
@@ -762,6 +794,29 @@ fn grid_for(vp: DVec2) -> core::Grid {
 impl State {
     fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
         let store = std::rc::Rc::new(store);
+        let secrets = if config().e2e.is_some() {
+            crate::effect::Secrets::Memory(crate::effect::MemSecrets::new())
+        } else {
+            crate::effect::Secrets::Keychain(
+                db_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_default(),
+            )
+        };
+        // Headless: one fixed frame clock for the springs, the e2e runner
+        // and the app's own deadlines alike. It starts at a fixed instant
+        // so even the dates in a screenshot are reproducible.
+        #[cfg(headless)]
+        let clock = crate::effect::Clock::virtual_from(mail::ts(2026, 9, 1, 12, 0));
+        #[cfg(not(headless))]
+        let clock = crate::effect::Clock::System;
+        let world = std::rc::Rc::new(crate::effect::World::new(
+            store.clone(),
+            Box::new(crate::effect::Real::new(secrets.clone(), clock.clone())),
+            mail::registry(),
+        ));
         // Boot restores the last session from the store; a store that never
         // booted gets the default layout (and persists it on first sync).
         let ws = match store.load_wm() {
@@ -780,10 +835,20 @@ impl State {
         };
         State {
             ws,
+            world,
+            secrets,
+            clock,
+            history: crate::history::History::new(),
             store,
             db_path,
-            workers: Vec::new(),
-            sender: None,
+            // Headless: no threads at all. The passes run inline from the
+            // frame loop, so ingest, push and send land at frame
+            // boundaries instead of whenever a worker happens to wake —
+            // the last thing standing between a run and reproducibility.
+            #[cfg(headless)]
+            pump: sync::Pump::Manual,
+            #[cfg(not(headless))]
+            pump: sync::Pump::threads(),
             failed_seen: 0,
             last_saved: None,
             anim: Anim::default(),
@@ -866,7 +931,8 @@ impl State {
     }
 
     fn toast(&mut self, msg: impl Into<String>, err: bool) {
-        self.toast = Some((msg.into(), err, Instant::now()));
+        let now = self.world.now();
+        self.toast = Some((msg.into(), err, now));
     }
 
     /// A panel's title, wherever it lives — for action labels.
@@ -877,11 +943,11 @@ impl State {
             .unwrap_or_else(|| "panel".into())
     }
 
-    /// Runs one **undoable action**: mutates the in-memory `Wm`, then
-    /// records the whole delta — the UI-table rewrite plus any data
-    /// mutation — as one changeset node in the history DAG. The session
-    /// consolidates per row, so an identical rewrite contributes nothing;
-    /// an action that nets no change creates no node.
+    /// Runs one **undoable action**: mutates the in-memory `Wm`, writes the
+    /// whole thing through in one transaction, and records a node — the
+    /// layout before and after, plus whatever the action claimed of the
+    /// world. Nav-only actions carry no claims and undo for free off the
+    /// snapshot.
     fn act(
         &mut self,
         kind: &str,
@@ -889,36 +955,33 @@ impl State {
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
         data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()>,
+        intents: Vec<Box<dyn crate::history::Intent>>,
     ) {
+        let before = self.ws.snapshot();
         mutate(&mut self.ws);
         let snap = self.ws.snapshot();
-        let r = self
-            .store
-            .act(kind, &label, entity.as_deref(), crate::store::now(), |tx| {
-                crate::store::save_wm_tx(tx, &snap)?;
-                data(tx)
-            });
+        let r = self.store.write(|tx| {
+            crate::store::save_wm_tx(tx, &snap)?;
+            data(tx)
+        });
         if let Err(e) = r {
             eprintln!("store: action “{label}” failed: {e}");
         }
+        let now = self.world.now();
+        self.history.apply(crate::history::Action {
+            kind,
+            label,
+            entity,
+            before,
+            after: snap.clone(),
+            intents,
+            ts: now,
+        });
         self.last_saved = Some(snap);
         // Push soon: whatever this action changed about mail intent, a
         // worker makes the server agree without waiting for the poll —
         // and the sender re-times its next deadline.
-        //
-        // Except a reading walk. That is a burst of keystrokes, each one a
-        // `\Seen` intent nobody is waiting on, and waking a worker per
-        // keystroke means a sync pass per keystroke — each one competing for
-        // the same write lock this action needs. The next real action kicks,
-        // and the poll carries the rest.
-        if kind != READ {
-            for w in &self.workers {
-                w.kick();
-            }
-            if let Some(s) = &self.sender {
-                s.kick();
-            }
-        }
+        self.pump.kick();
     }
 
     /// An undoable action that only moves panels around.
@@ -929,7 +992,17 @@ impl State {
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
     ) {
-        self.act(kind, label, entity, mutate, |_| Ok(()));
+        self.act(kind, label, entity, mutate, |_| Ok(()), Vec::new());
+    }
+
+    /// Restores the layout a history walk landed on, writing it through.
+    fn land(&mut self, step: crate::history::Step) -> String {
+        if let Err(e) = self.store.save_wm(&step.snap) {
+            eprintln!("store: persisting the walk failed: {e}");
+        }
+        self.last_saved = Some(step.snap.clone());
+        self.ws = Wm::restore(step.snap);
+        step.label
     }
 
     /// Spawns a sync worker for every configured account that lacks one.
@@ -937,43 +1010,14 @@ impl State {
     /// for removed accounts retire themselves.
     fn spawn_workers(&mut self) {
         let Some(db) = self.db_path.clone() else {
-            return;
+            return; // in memory: no file for a worker to open
         };
-        if self.sender.is_none() {
-            self.sender = Some(send::spawn(db.clone(), || {
-                SignalToUI::set_ui_signal();
-            }));
-        }
-        self.workers.retain(|w| {
-            mail::accounts(&self.store).iter().any(|a| a.id == w.account)
+        let world = self.world.clone();
+        let secrets = self.secrets.clone();
+        let clock = self.clock.clone();
+        self.pump.ensure(&world, &db, &secrets, &clock, || {
+            SignalToUI::set_ui_signal();
         });
-        for a in mail::accounts(&self.store).iter() {
-            if a.imap_host.as_deref().unwrap_or("").is_empty() {
-                continue; // the local demo account
-            }
-            if self.workers.iter().any(|w| w.account == a.id) {
-                continue;
-            }
-            self.workers.push(sync::spawn(db.clone(), a.id, || {
-                SignalToUI::set_ui_signal();
-            }));
-        }
-    }
-
-    /// Rebuilds the in-memory `Wm` from the store — the tail of every
-    /// undo/redo, whose changesets rewrote the UI tables underneath us.
-    fn reload_wm(&mut self) {
-        match self.store.load_wm() {
-            Ok(Some(snap)) => {
-                self.last_saved = Some(snap.clone());
-                self.ws = Wm::restore(snap);
-            }
-            Ok(None) => {
-                self.last_saved = None;
-                self.ws = Wm::new();
-            }
-            Err(e) => eprintln!("store: reloading the session failed: {e}"),
-        }
     }
 }
 
@@ -1111,6 +1155,10 @@ pub struct Stage {
     /// The fallback store poll (see [`Stage::poll_store`]).
     #[rust]
     poll_timer: Timer,
+    /// Frames drawn — the headless manual pump's cadence counter.
+    #[rust]
+    #[allow(dead_code)]
+    frame: u64,
     /// android: after a field-to-field focus move, the blurring TextInput
     /// hides the soft keyboard and the next field's one draw-time show can
     /// lose the race against the hide animation. The guard re-issues it —
@@ -1425,24 +1473,29 @@ impl Stage {
     }
 
     /// Executes at most one e2e step per timer tick; waits pace the script.
-    fn e2e_tick(&mut self, cx: &mut Cx) {
+    fn e2e_tick(&mut self, cx: &mut Cx, dt_ms: f64) {
         let Some(mut runner) = self.e2e.take() else {
             return;
         };
-        if let Some(step) = runner.next_step() {
+        // Screenshots are effects; a run needs the world to take them.
+        let world = self.state.as_ref().map(|s| s.world.clone());
+        if let Some(step) = runner.next_step(dt_ms) {
             match step {
                 e2e::Step::Wait(_) => {}
                 e2e::Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
-                    #[cfg(target_os = "macos")]
-                    match crate::mac::screenshot(&path) {
+                    match world
+                        .as_ref()
+                        .ok_or_else(|| "no world yet".to_string())
+                        .and_then(|w| w.run(&crate::effect::Shot(&path)))
+                    {
                         Ok(()) => eprintln!("e2e: shot {}", path.display()),
                         Err(e) => {
                             eprintln!("e2e: FAIL shot {name}: {e}");
                             runner.failures += 1;
                         }
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(any())]
                     {
                         eprintln!("e2e: FAIL shot {}: screenshots need macos", path.display());
                         runner.failures += 1;
@@ -1661,6 +1714,12 @@ impl Stage {
                         std::process::exit(1);
                     }
                     cx.quit();
+                    // Drop the runner rather than restoring it. Under a
+                    // headless build the frame pump keeps asking for
+                    // frames while a run is live, and a finished run that
+                    // stays live spins the software rasterizer flat out
+                    // until the whole --draws budget is gone.
+                    return;
                 }
             }
         }
@@ -1965,21 +2024,19 @@ impl Stage {
             return;
         };
         let was = state.ws.active;
-        match state.store.undo() {
-            Ok(Some(label)) => {
-                state.reload_wm();
+        let step = state.history.undo(&state.world);
+        match step {
+            Some(step) => {
+                let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
                 }
-                for w in &state.workers {
-                    w.kick(); // reverted intent pushes to the server too
-                }
+                state.pump.kick(); // reverted intent pushes to the server too
                 state.toast(format!("undid — {label}"), false);
             }
-            Ok(None) => state.toast("nothing to undo", false),
-            Err(e) => state.toast(format!("undo failed: {e}"), true),
+            None => state.toast("nothing to undo", false),
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -1991,21 +2048,19 @@ impl Stage {
             return;
         };
         let was = state.ws.active;
-        match state.store.redo() {
-            Ok(Some(label)) => {
-                state.reload_wm();
+        let step = state.history.redo(&state.world);
+        match step {
+            Some(step) => {
+                let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
                     let cam = state.ws.camera_x;
                     state.anim.camera().jump_to(cam);
                 }
-                for w in &state.workers {
-                    w.kick();
-                }
+                state.pump.kick();
                 state.toast(format!("redid — {label}"), false);
             }
-            Ok(None) => state.toast("nothing to redo", false),
-            Err(e) => state.toast(format!("redo failed: {e}"), true),
+            None => state.toast("nothing to redo", false),
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -2075,27 +2130,27 @@ impl Stage {
             let sql: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
             md.push_str(&format!("```sql\n{sql}\n```\n"));
         }
-        // Deliver: a file beside the store, and the clipboard on macOS.
+        // Deliver: a file beside the store, and the clipboard. Both are
+        // effects, so a denied world refuses them loudly instead of
+        // silently writing to a developer's machine.
         let mut where_to = String::new();
         if let Some(dir) = state.db_path.as_ref().and_then(|p| p.parent()) {
             let path = dir.join("panel-context.md");
-            if std::fs::write(&path, &md).is_ok() {
+            if state
+                .world
+                .run(&crate::effect::WriteFile {
+                    path: &path,
+                    bytes: md.as_bytes(),
+                })
+                .is_ok()
+            {
                 where_to = path.to_string_lossy().into_owned();
             }
         }
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            if let Ok(mut child) = std::process::Command::new("/usr/bin/pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(md.as_bytes());
-                }
-                let _ = child.wait();
-            }
-        }
+        state.world.try_run(&crate::effect::Clip {
+            text: &md,
+            what: "panel context",
+        });
         state.toast(
             format!(
                 "panel context copied — {} queries{}",
@@ -2135,6 +2190,9 @@ impl Stage {
                         ws.open(kind, None, false);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 state.sync();
             }
@@ -2257,24 +2315,16 @@ impl Stage {
             }
             Act::HistoryRow(id) => {
                 let was = state.ws.active;
-                match state.store.travel(id) {
-                    Ok(Some(label)) => {
-                        state.reload_wm();
-                        state.sync();
-                        if state.ws.active != was {
-                            let cam = state.ws.camera_x;
-                            state.anim.camera().jump_to(cam);
-                        }
-                        for w in &state.workers {
-                            w.kick();
-                        }
-                        if let Some(s) = &state.sender {
-                            s.kick();
-                        }
-                        state.toast(format!("history — {label}"), false);
+                let step = state.history.travel(&state.world, id);
+                if let Some(step) = step {
+                    let label = state.land(step);
+                    state.sync();
+                    if state.ws.active != was {
+                        let cam = state.ws.camera_x;
+                        state.anim.camera().jump_to(cam);
                     }
-                    Ok(None) => {}
-                    Err(e) => state.toast(format!("travel failed: {e}"), true),
+                    state.pump.kick();
+                    state.toast(format!("history — {label}"), false);
                 }
                 // The overlay stays up: browsing history is the point.
                 self.update_menu(cx);
@@ -2357,6 +2407,9 @@ impl Stage {
                         ws.follow_open(pid, kind, alt);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 self.sync(cx);
             }
@@ -2380,6 +2433,9 @@ impl Stage {
                         ws.follow_replace(pid, kind, alt);
                     },
                     move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
+                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
+                        .into_iter()
+                        .collect(),
                 );
                 self.sync(cx);
             }
@@ -2416,6 +2472,9 @@ impl Stage {
                         }
                     },
                     move |tx| mail::mark_read_tx(tx, id),
+                    // Same claim on the world an ordinary open makes: the
+                    // mail is read now, and undo un-reads it.
+                    vec![Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>],
                 );
                 // The preview opened off to the right of a driver that never
                 // moved, so nothing has pulled the camera onto it.
@@ -2432,12 +2491,10 @@ impl Stage {
                         state.toast("side effect: nothing was opened or replaced", false);
                     }
                     BtnAct::Refresh => {
-                        if state.workers.is_empty() {
+                        if state.pump.idle() {
                             state.toast("no accounts to sync — add one in settings", false);
                         } else {
-                            for w in &state.workers {
-                                w.kick();
-                            }
+                            state.pump.kick();
                             state.toast("syncing…", false);
                         }
                     }
@@ -2466,6 +2523,7 @@ impl Stage {
                             state.toast("no recipient", true);
                         } else {
                             let delay = config().send_delay;
+                            let now = state.world.now();
                             let subject = if d.subject.is_empty() {
                                 "(no subject)".into()
                             } else {
@@ -2479,9 +2537,10 @@ impl Stage {
                                     ws.close(pid);
                                 },
                                 move |tx| {
-                                    mail::upsert_draft_tx(tx, pid as i64, re, &d)?;
-                                    mail::file_send_tx(tx, pid as i64, delay)
+                                    mail::upsert_draft_tx(tx, pid as i64, re, &d, now)?;
+                                    mail::file_send_tx(tx, pid as i64, now + delay)
                                 },
+                                vec![Box::new(mail::Sent { panel: pid as i64, delay }) as Box<dyn crate::history::Intent>],
                             );
                             state.toast(
                                 format!("sending in {}s — ⌘z undoes", delay as u32),
@@ -2491,6 +2550,12 @@ impl Stage {
                     }
                     BtnAct::Discard => {
                         let label = format!("discard “{}”", state.title_of(pid));
+                        // The text goes with the panel, so undo has to carry it.
+                        let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
+                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                            _ => None,
+                        };
                         state.act(
                             "close",
                             label,
@@ -2499,6 +2564,11 @@ impl Stage {
                                 ws.close(pid);
                             },
                             move |tx| mail::discard_draft_tx(tx, pid as i64),
+                            vec![Box::new(mail::Discarded {
+                                panel: pid as i64,
+                                draft,
+                                re,
+                            }) as Box<dyn crate::history::Intent>],
                         );
                     }
                 }
@@ -2536,6 +2606,13 @@ impl Stage {
         let subject = mail::mail(&state.store, id)
             .map(|m| m.head.subject)
             .unwrap_or_default();
+        // Where it lives now, so undo puts it back exactly there rather than
+        // guessing "the inbox".
+        let from_folder: i64 = state
+            .store
+            .conn()
+            .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap_or(0);
         let readers = state.ws.showing(&Kind::Message { id });
         state.act(
             verb,
@@ -2564,6 +2641,17 @@ impl Stage {
                 }
                 next.map_or(Ok(()), |(_, nid)| mail::mark_read_tx(tx, nid))
             },
+            // Both halves of the action claim something back: the filing, and
+            // the read of whatever the cursor moved onto. One node, so one
+            // ⌘z reverses the pair in step.
+            next.into_iter()
+                .map(|(_, nid)| Box::new(mail::MarkRead { mail: nid }) as Box<dyn crate::history::Intent>)
+                .chain(std::iter::once(Box::new(mail::Filed {
+                    mail: id,
+                    from_folder,
+                    role,
+                }) as Box<dyn crate::history::Intent>))
+                .collect(),
         );
         state.toast(format!("{done} “{subject}” — ⌘z undoes"), false);
         if let Some((pid, nid)) = next {
@@ -3004,6 +3092,21 @@ impl Stage {
     /// the one place retained content meets the undo system.
     fn handle_panel_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let mut refresh = false;
+        // A link in an HTML mail body leaves the app: panels are for this
+        // app's own nouns — a mail, a contact — and the web is neither, so
+        // the system browser takes it. The narrowing already vetted the
+        // scheme (see [`crate::html`]), so nothing is left to check here.
+        //
+        // It lives at the app rather than on MessagePanel because every
+        // open panel is handed the same action list: one click would
+        // otherwise open as many browser windows as there are panels.
+        for a in actions {
+            if let Some(wa) = a.as_widget_action() {
+                if let HtmlLinkAction::Clicked { url, .. } = wa.cast() {
+                    cx.open_url(&url, OpenUrlInPlace::No);
+                }
+            }
+        }
         for a in actions {
             let Some(pa) = a.downcast_ref::<crate::panels::PanelAction>() else {
                 continue;
@@ -3024,24 +3127,36 @@ impl Stage {
                     } else if state.db_path.is_none() {
                         state.toast("no store file — accounts need one", true);
                     } else {
-                        let dir = state
-                            .db_path
-                            .as_ref()
-                            .and_then(|p| p.parent())
-                            .map(std::path::Path::to_path_buf)
-                            .unwrap_or_default();
-                        if !crate::secret::set(&dir, &email, &pass) {
+                        let stored = state
+                            .world
+                            .run(&crate::effect::SecretSet {
+                                email: &email,
+                                pass: &pass,
+                            })
+                            .is_ok();
+                        if !stored {
                             state.toast("storing the password failed", true);
                         } else {
+                            let added = std::cell::Cell::new(0i64);
                             state.act(
                                 "account",
                                 format!("add account {email}"),
                                 None,
                                 |_| {},
-                                move |tx| {
-                                    mail::add_account_tx(tx, &email, &imap, &smtp).map(|_| ())
+                                |tx| {
+                                    added.set(mail::add_account_tx(
+                                        tx, &email, &imap, &smtp,
+                                    )?);
+                                    Ok(())
                                 },
+                                Vec::new(),
                             );
+                            state.history.claim(Box::new(mail::AccountAdded {
+                                id: added.get(),
+                                email: email.clone(),
+                                imap: imap.clone(),
+                                smtp: smtp.clone(),
+                            }));
                             state.spawn_workers();
                             state.toast("account added — syncing", false);
                             if let Some(w) = self.hosted.get(&pid) {
@@ -3071,6 +3186,7 @@ impl Stage {
                         pid as i64,
                         re,
                         &mail::Draft { to, subject, body },
+                        state.world.now(),
                     );
                 }
                 crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
@@ -3129,6 +3245,9 @@ impl Stage {
                         None,
                         |_| {},
                         move |tx| mail::remove_account_tx(tx, id),
+                        vec![Box::new(mail::AccountRemoved {
+                            email: email.clone(),
+                        }) as Box<dyn crate::history::Intent>],
                     );
                     state.spawn_workers();
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
@@ -3380,7 +3499,6 @@ impl Widget for Stage {
                 }
                 // A delivered send can no longer be undone — the walk
                 // marks it expired and steps past.
-                store.set_undo_guard(mail::send_locked);
                 let mut s = State::new(store, path);
                 s.failed_seen = mail::outbox_failures(&s.store).len();
                 s.spawn_workers();
@@ -3388,7 +3506,13 @@ impl Widget for Stage {
                 self.state = Some(Box::new(s));
                 // Belt and braces under the worker signal: a coarse poll so
                 // a lost wake can never strand the UI on cached rows.
-                self.poll_timer = cx.start_interval(2.0);
+                // Headless: no worker threads, so no foreign commits to
+                // poll for — and a wall-clock interval would be the last
+                // thing reading a clock the script does not control.
+                #[cfg(not(headless))]
+                {
+                    self.poll_timer = cx.start_interval(2.0);
+                }
             }
             if let Some(path) = &config().e2e {
                 match std::fs::read_to_string(path)
@@ -3400,7 +3524,17 @@ impl Widget for Stage {
                         let _ = std::fs::create_dir_all(&out);
                         eprintln!("e2e: {} step(s) from {path}", steps.len());
                         self.e2e = Some(e2e::Runner::new(steps, out));
-                        self.e2e_timer = cx.start_interval(0.03);
+                        // Windowed: a real timer paces the run. Headless:
+                        // the draw cycle does, so ask for the first frame
+                        // and keep asking.
+                        #[cfg(not(headless))]
+                        {
+                            self.e2e_timer = cx.start_interval(0.03);
+                        }
+                        #[cfg(headless)]
+                        {
+                            self.next_frame = cx.new_next_frame();
+                        }
                     }
                     Err(e) => {
                         eprintln!("e2e: {path}: {e}");
@@ -3413,7 +3547,8 @@ impl Widget for Stage {
         }
         if let Event::Timer(te) = event {
             if self.e2e_timer.0 != 0 && te.timer_id == self.e2e_timer.0 {
-                self.e2e_tick(cx);
+                #[cfg(not(headless))]
+                self.e2e_tick(cx, E2E_TICK_MS);
             }
             if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
                 self.poll_store(cx);
@@ -3594,16 +3729,43 @@ impl Widget for Stage {
                 if !ne.set.contains(&self.next_frame) {
                     return;
                 }
+                // Headless: one draw cycle is one e2e tick of exactly
+                // FRAME_MS, and the run keeps the loop turning by asking
+                // for the next frame every time. No wall clock anywhere.
+                #[cfg(headless)]
+                if self.e2e.is_some() {
+                    if let Some(state) = self.state.as_deref() {
+                        state.clock.advance(FRAME_MS / 1000.0);
+                        self.frame += 1;
+                        // The manual pump, on a fixed cadence: a sync and
+                        // send round every PUMP_EVERY frames, so the engine
+                        // advances with the script rather than beside it.
+                        if self.frame % PUMP_EVERY == 0 {
+                            let w = state.world.clone();
+                            sync::tick(&w);
+                            crate::send::outbox_pass(&w);
+                            w.run_effects();
+                        }
+                    }
+                    self.e2e_tick(cx, FRAME_MS);
+                    self.next_frame = cx.new_next_frame();
+                }
                 let Some(state) = self.state.as_deref_mut() else {
                     return;
                 };
-                let now = Instant::now();
-                let dt = state
-                    .last_frame
-                    .map(|t| (now - t).as_secs_f64())
-                    .unwrap_or(1.0 / 60.0)
-                    .clamp(0.0, 1.0 / 20.0);
-                state.last_frame = Some(now);
+                #[cfg(headless)]
+                let dt = FRAME_MS / 1000.0;
+                #[cfg(not(headless))]
+                let dt = {
+                    let now = Instant::now();
+                    let dt = state
+                        .last_frame
+                        .map(|t| (now - t).as_secs_f64())
+                        .unwrap_or(1.0 / 60.0)
+                        .clamp(0.0, 1.0 / 20.0);
+                    state.last_frame = Some(now);
+                    dt
+                };
                 let springs_active = state.anim.advance(dt);
                 // A held panel near a screen edge pans the camera — that is
                 // how a drag reaches columns beyond the viewport. The grabbed
@@ -3638,9 +3800,10 @@ impl Widget for Stage {
                 } else {
                     false
                 };
+                let toast_now = state.world.now();
                 let toast_active = match state.toast {
                     Some((_, _, since)) => {
-                        if since.elapsed().as_secs_f64() > 3.0 {
+                        if toast_now - since > 3.0 {
                             state.toast = None;
                             false
                         } else {
@@ -4053,7 +4216,7 @@ impl Stage {
 
         // The toast, above everything.
         if let Some((msg, err, since)) = state.toast.clone() {
-            let age = since.elapsed().as_secs_f64();
+            let age = state.world.now() - since;
             let a = (3.0 - age).clamp(0.0, 0.25) / 0.25;
             let wchars = msg.chars().count();
             let w = wchars as f64 * self.cell.adv + 20.0;
@@ -4278,7 +4441,7 @@ impl Stage {
                 }
             }
             Overlay::History => {
-                let (nodes, head) = state.store.history().unwrap_or((Vec::new(), 0));
+                let (nodes, head) = state.history.rows();
                 let mut depth: HashMap<i64, usize> = HashMap::new();
                 for n in &nodes {
                     let d = depth.get(&n.parent).map_or(0, |d| d + 1);
@@ -4661,8 +4824,11 @@ impl Stage {
                 // The selectable runs (CR-003). Registered like any hosted
                 // field: scripts drag them, and a real click on one keeps
                 // the key focus the TextInput just took.
+                // `mail html` is the same run in its other reading; only
+                // one of the two is ever visible, so only one registers.
                 for (label, path) in [
                     ("mail body", ids!(body_lbl)),
+                    ("mail html", ids!(body_html)),
                     ("mail to", ids!(to_lbl)),
                     ("mail date", ids!(date_lbl)),
                 ] {
@@ -4930,11 +5096,6 @@ impl AppMain for App {
 #[cfg(not(target_os = "android"))]
 pub fn run() {
     let _ = config();
-    if background_run() {
-        // makepad skips presents for occluded windows; patch 0003 adds this
-        // bypass so a background e2e run still draws what it screenshots.
-        std::env::set_var("MAKEPAD_PRESENT_WHEN_OCCLUDED", "1");
-    }
     main();
 }
 

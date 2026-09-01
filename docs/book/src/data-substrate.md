@@ -4,17 +4,33 @@ One SQLite file holds **all** durable data — the mail *and* the UI: which
 panels are open, where, joined to what, focused on which workspace. `sqlite3
 "~/Library/Application Support/superapp/superapp.db"` shows your session as
 rows; that inspectability is a feature, not a debugging aid. The design is
-CR-001 (`docs/planning/`), rel.systems' idioms brought in-process: single
-writer, WAL, hook-driven change capture, and side effects as rows (phases 2+).
+CR-001 and CR-004 (`docs/planning/`), rel.systems' idioms brought
+in-process: single writer, WAL, hook-driven change capture, and side effects
+as rows.
 
-## Two write paths
+## Three write paths
 
-1. **Actions** — user intent. The only path UI code mutates through
-   (phase 2 wraps them in the undo log).
-2. **Ingest** — sync results, once IMAP lands (phase 3): not undoable, same
-   store, same invalidation.
+1. **Actions** — user intent. The only path UI code mutates through.
+2. **Ingest** — sync results: not undoable, same store, same invalidation.
+3. **Effects** — what reaches the outside world, as rows in one queue
+   (below).
 
-Both go through one `write(tx)` seam: one mutation, one transaction.
+All go through one `write(tx)` seam: one mutation, one transaction.
+
+## The line: what is an effect
+
+> **An effect is anything whose result the store cannot reproduce.**
+
+The store is the app's memory — replaying its transactions replays the app —
+so SQLite is emphatically *not* an effect. A socket, the keychain, the
+clipboard, a file beside the store, the screen and the clock are. The
+corollary is the one that shapes everything below: **archiving a mail is not
+an effect; pushing the archive is.**
+
+Effects are values that describe themselves in one line and know how to do
+themselves, behind one swappable backend — the real one, an in-memory fake,
+or one that refuses everything. That last is what lets a panel be drawn in
+isolation without it quietly sending mail.
 
 ## The reactive layer
 
@@ -56,8 +72,8 @@ panels honestly know nothing), reconcile flags and deletions.
 Server effects run on a **desired/actual split**: a `message` row is the
 user's *intent* (which folder, read or not); `server_msg` is what the
 server actually holds, written only by the workers. A row whose two sides
-disagree **is** the push queue — each pass starts by making the server
-agree (`UID MOVE`, `\Seen`), then fetches and reconciles facts.
+disagree **is** the push queue — each pass turns every disagreement into a
+job, then fetches and reconciles facts.
 Reconciliation never fights the user: divergent intent is pushed over the
 server, never clobbered by it (deletion is the one place the server wins).
 And because `server_msg` lives outside the undo world, undoing an
@@ -67,27 +83,39 @@ the server never reported (no COPYUID) is re-identified by Message-ID
 instead of duplicated; per-message push failures land on that message's
 status line.
 
+The push pass itself **never talks to the server**. It materializes each
+disagreement as a row in the `effect` table, and one executor performs it:
+claim (`WHERE status='pending'`, so undo and the executor have exactly one
+winner), revalidate, perform outside any transaction, then record the
+outcome *in the same transaction as the fact it establishes*. Every job
+re-checks the diff before its round trip, so intent reverted while the job
+waited goes `obsolete` rather than pushing stale work — and intent reverted
+*before* the pass ran was never queued at all. Undoing an archive costs the
+server nothing and works offline.
+
+A job that fails backs off and retries; after six attempts it stops and
+waits for a human. A job carries whether repeating it is **idempotent**,
+because that is the one judgement a crash cannot guess: on the next launch
+idempotent work returns to the queue, and everything else fails with
+*"interrupted; outcome unknown"* rather than risking a second send. Payloads
+and replies are JSON text and reference rows rather than embedding their
+contents, so `sqlite3` shows every attempt the app has made on the world,
+with its status, its answer and its failures. A panel can ask for its own
+(`WHERE entity = 'panel:7'`); a reply is read back through the same reactive
+query layer as anything else, so watching a job is invalidation, not polling.
+
 A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.
 
-**A worker never holds the write lock across the network.** SQLite has one
-writer and the UI shares the file, so a transaction left open over an IMAP
-round-trip stalls every UI action behind it for as long as the server takes
-to answer — an action that costs 0.1 ms becomes 468 ms behind a 400 ms
-fetch, which reads as the app hanging rather than as sync being slow. Each
-pass therefore reads what it knows, does *all* its protocol work with no
-transaction open, and takes the lock once for the local writes. A unit test
-pins the property by trying to acquire the lock from a second connection on
-every transport call, because it is the kind of invariant that reads as a
-tidying preference right up until someone moves a `BEGIN` for clarity.
-
-The same reasoning bounds who may *wake* a worker: a reading walk does not.
-Arrowing down the inbox is a burst of keystrokes each recording a `\Seen`
-intent nobody is waiting on, and kicking a worker per keystroke means a sync
-pass per keystroke, each competing for the lock the next keystroke needs.
-Everything else — archive, delete, send — still kicks; the minute poll
-carries the rest.
+What "perform outside any transaction" is worth, measured: a UI action costs
+0.10 ms uncontended and **468 ms** behind a 400 ms fetch that holds
+`BEGIN IMMEDIATE` across the wire. SQLite has one writer and the UI shares
+the file, so a pass that keeps a transaction open over a round-trip stalls
+everything behind it for as long as the server takes — and it reads as the
+app hanging, not as sync being slow. The rule above is what keeps a reading
+walk down the inbox, which writes on every keystroke, from queueing behind
+the network.
 
 **Sending** is the outbox pattern with the undo window built in. A compose
 panel's draft persists in the store *as you type* (plain upkeep — typing is
@@ -96,11 +124,13 @@ so half-written mail survives restarts. *Send* is an action: it files an
 outbox row with `send_after = now + 10 s` and closes the panel; `cmd+z`
 inside the window cancels it — the row's deletion *is* the undo, and the
 claim (`WHERE status='pending'`) means the race between undo and the
-sender has exactly one winner. The sender thread wakes at the deadline,
-submits over SMTP (rustls, port 465; reply headers thread via
-`In-Reply-To`), appends the sent bytes to the account's Sent folder over
-IMAP, and records the outcome. A delivered send is physics: the undo guard
-marks its action **expired** and the history walk skips it transparently.
+sender has exactly one winner. The sender wakes at the deadline and queues
+a `submit` job; the executor submits over SMTP (rustls, port 465; reply
+headers thread via `In-Reply-To`), appends the sent bytes to the account's
+Sent folder over IMAP, and records the outcome. Because both the outbox row
+and the job are durable, a mail that hit *send* and never left goes out late
+rather than never. A delivered send is physics: its claim refuses, the
+history node goes **expired**, and the walk skips it transparently.
 A *failed* send stays cancellable — the error toasts and `cmd+z` reopens
 the draft. The launcher's *new mail* root opens a blank compose.
 
@@ -110,6 +140,12 @@ the draft. The launcher's *new mail* root opens a blank compose.
   blink, where the camera is mid-slide. The line: *if losing it in a crash
   would annoy you, it belongs in the store.* Layout, focus, filters — in.
   Motion — out, re-derived at boot.
+- **History.** The undo tree is in memory (CR-004), so it dies with the
+  process. A node is a layout snapshot plus its claims on the world; the
+  claims are in memory too, and never serialized. What survives is the row
+  each one wrote — which is all the background passes ever read, and why a
+  restart loses undo but never loses work. See [Interaction
+  Grammar](./interaction-grammar.md).
 - **Secrets**: the macOS keychain (android: an app-private file until a
   Keystore binding exists), never this file — it is meant to be handed to
   agents someday.

@@ -7,6 +7,9 @@
 //! |---|---|---|
 //! | [`core`] | pure panel/column/join state machine | no |
 //! | [`store`] | the one SQLite file + the reactive query layer | no |
+//! | [`effect`] | the boundary: what leaves the process, and the job queue | no |
+//! | [`history`] | the in-memory tree of actions and their claims | no |
+//! | [`html`] | narrowing a mail's HTML to what a panel can draw | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
@@ -22,6 +25,9 @@
 pub mod app;
 pub mod core;
 pub mod e2e;
+pub mod effect;
+pub mod history;
+pub mod html;
 pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;

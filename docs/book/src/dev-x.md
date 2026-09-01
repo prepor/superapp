@@ -8,9 +8,16 @@ mise exec -- cargo run   # makepad comes from upstream git, pinned in Cargo.toml
 ```
 
 `cargo test` runs the pure suite with no window: the panel mechanics (the
-web prototype's whole smoke scenario is a test), the spring maths, and the
-store — schema, seed, query invalidation, session round-trip — against
-in-memory SQLite.
+web prototype's whole smoke scenario is a test), the spring maths, the store
+(schema, seed, query invalidation), the effect queue, the history tree, and
+the whole mail engine — against a `World::fake()`.
+
+A fake world is an **in-memory store, an in-memory outside, and a clock that
+only moves when a test moves it**. It touches no file, no keychain, no
+network and no thread, so the suite is isolated per test and parallel by
+construction — nothing is shared to contend over. The mail engine's passes
+run inline (`Pump::Manual`), so ingest, push and send happen in a knowable
+order rather than whenever a worker thread wakes.
 
 The store lives at `~/Library/Application Support/superapp/superapp.db`
 (android: the app files dir); `--db PATH` points a run anywhere else —
@@ -55,25 +62,49 @@ starts as a Change Request under `docs/planning/`.
 ## E2E harness
 
 ```sh
-mise exec -- cargo run -- --e2e e2e/basic.txt   # add --front to watch it
+# the fast path: every suite, in parallel, no rendering
+mise exec -- cargo run -- --e2e e2e/basic.txt --no-draw
+
+# validation: render and write screenshots (one run at a time)
+MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
+  mise exec -- cargo run -- --e2e e2e/basic.txt --e2e-out e2e/out
 ```
 
-An e2e run replays a line-based script against the shell's real input paths —
-hit resolution, key handling, text input — and captures window-layer
-screenshots to `e2e/out/`. Every run opens a **fresh seeded temp store**
-(unless `--db` overrides it), so suites are deterministic and never touch
-your session. The window sits behind everything, click-through, so a run
-never takes the screen — and its screenshots are honest there: makepad
-skips presents for an occluded window (correct, free power saving), so the
-pin carries mosaic's patch 0003, and `background_run()` sets the
-`MAKEPAD_PRESENT_WHEN_OCCLUDED=1` it reads. Without that patch a background
-run photographs stale frames — byte-identical shots across steps are the
-tell — and `--front` is the only way to trust the pictures. `--front` is
-still there to *watch* a run. Two more capture gotchas: with the display asleep,
-window-layer captures *fail* (`could not create image`), and at the lock
-screen they *succeed but come out black* — `caffeinate -du` around a run
-fixes the first, only a human fixes the second. Failed steps (no element
-matching a label, failed capture) make the run exit non-zero.
+An e2e run replays a line-based script against the shell's real input paths
+— hit resolution, key handling, text input. Every run opens a **fresh
+seeded temp store** (unless `--db` overrides it), so suites never touch your
+session.
+
+Runs go through makepad's **headless backend** (`MAKEPAD=headless`), a
+software rasterizer with a virtual GPU and a shader JIT. There is no window,
+no window server and no display: makepad renders the frames itself and
+writes them to `MAKEPAD_HEADLESS_OUT_DIR`, and a `shot` step names the
+newest one. That retires a pile of environmental failure modes — a slept
+display no longer breaks captures, a lock screen no longer blackens them,
+and `caffeinate -du` is no longer needed. It also retired mosaic's patch
+0003 (`MAKEPAD_PRESENT_WHEN_OCCLUDED`), which existed so a deliberately
+backgrounded window could still be photographed: a headless run has no
+window to occlude.
+
+**Time is virtual.** Under a headless build one draw cycle is one frame of
+exactly `FRAME_MS`, and that single clock drives the springs, the script's
+`wait` steps *and* the app's own deadlines — the send window included, via
+`Clock::Virtual` shared with the pump. Nothing reads the wall clock, so a
+run is reproducible: the same script produces byte-identical screenshots
+whether the machine is idle or running a dozen other suites. The pump is
+`Manual` too, so ingest, push and send land on frame boundaries instead of
+whenever a worker thread wakes.
+
+**Two modes of the same suites.** Screenshots are for a human to look at,
+not assertions — nothing diffs them against goldens. So `--no-draw` skips
+rasterization while still running the full widget draw pass, which means
+hit resolution and label matching work exactly as before at roughly **80×
+less cost** (a suite in ~1 s rather than ~30 s). That is the mode to run
+constantly, and it parallelises freely because it writes no frames. Turn
+rendering on when you want to *see* something, and run those one at a time.
+
+Failed steps (no element matching a label, a failed capture) make the run
+exit non-zero.
 
 ```text
 wait 600            # ms
@@ -101,9 +132,11 @@ The touch steps drive the same gesture state machine android uses, so
 verify the android interactions on the desktop, `e2e/workspaces.txt` walks
 the workspace grammar (switch, move-and-follow, overlay),
 `e2e/launcher.txt` walks the launcher (double-cmd, open vs go-to, the
-overlay's search row), `e2e/undo.txt` walks the undo DAG (archive → undo →
-redo, close, workspace-move; run it with `--db` and the end state —
-branches, head, folders — is inspectable with `sqlite3`), and
+overlay's search row), `e2e/undo.txt` walks the undo tree (archive → undo →
+redo, close, workspace-move). The tree itself is in memory since CR-004, so
+`sqlite3` shows what the actions *wrote* — folders, flags, the effect queue
+— rather than the history; the tree is the running process's, and dies with
+it. And
 `e2e/settings.txt` walks the accounts flow (add against an `.invalid` host
 — the worker fails fast and locally, and its error lands on the status
 line through the real signal path — then remove), `e2e/send.txt` walks the

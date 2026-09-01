@@ -148,20 +148,20 @@ worker, so each arrow press started a sync pass that took the lock across
 its next fetch, which blocked the next arrow press. Walking the inbox was a
 keystroke-driven denial of your own write lock.
 
-Two fixes: the pass now does all its protocol work with no transaction open
-and takes the lock once for the local writes (an action landing inside a
-400 ms fetch now costs 0.2 ms), and a `read` action no longer kicks the
-workers. A third thing fell out of the first: the old shape returned through
-`?` from inside the transaction, so an error mid-fetch **leaked an open write
-transaction** for the life of the worker — the lock never coming back at all.
-It rolls back now.
+This branch fixed it by restructuring the pass, and **CR-004 fixed the same
+thing independently and better** while this work was in flight: *no effect
+runs inside a transaction* is now a rule of the world rather than a property
+of one function, and the push pass does not talk to the server at all. That
+fix is the one that landed; this branch's was dropped in the merge, along
+with the unit test that probed for the lock on every transport call — worth
+porting to the new shape, but not here (see the PR's follow-ups).
 
-Both were pre-existing: the `cmd+n`/`cmd+o` reading walk had the same shape
-before any of this. Preview only made it something you do continuously.
-Neither could be caught by the suite, because every e2e run uses a fresh
-seeded store and the demo account has no `imap_host` — **no worker has ever
-existed in a test**. The invariant is now a unit test that probes for the
-lock on every transport call.
+The pre-existing part is worth keeping on the record: the `cmd+n`/`cmd+o`
+reading walk had the same shape before any of this, so the hazard predates
+preview — preview only made it something you do continuously. And nothing in
+the suite could have caught it, because every e2e run uses a fresh seeded
+store whose demo account has no `imap_host`: **no sync worker has ever
+existed in a test.**
 
 ## A bug this uncovered
 
