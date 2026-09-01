@@ -1961,6 +1961,9 @@ pub struct Stage {
     e2e: Option<e2e::Runner>,
     #[rust]
     e2e_timer: Timer,
+    /// The fallback store poll (see [`Stage::poll_store`]).
+    #[rust]
+    poll_timer: Timer,
     #[rust]
     state: Option<Box<State>>,
 }
@@ -2916,6 +2919,26 @@ impl Stage {
         self.kick(cx);
     }
 
+    /// Notices foreign commits (sync workers, the sender): re-runs stale
+    /// queries, surfaces fresh send failures, redraws. Ridden by the
+    /// worker signal and by a coarse fallback timer — a lost wake must
+    /// never strand the UI on cached rows.
+    fn poll_store(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if state.store.poll_external() {
+            let failures = mail::outbox_failures(&state.store);
+            if failures.len() > state.failed_seen {
+                if let Some((_, err)) = failures.last() {
+                    state.toast(format!("send failed: {err} — ⌘z reopens"), true);
+                }
+            }
+            state.failed_seen = failures.len();
+            cx.redraw_all();
+        }
+    }
+
     /// Serializes the focused panel's context — identity, params, and the
     /// query trace from its last draw (provenance by construction) — to
     /// the clipboard and a file beside the store. The agent handoff this
@@ -3736,6 +3759,9 @@ impl Widget for Stage {
                 s.spawn_workers();
                 s.sync();
                 self.state = Some(Box::new(s));
+                // Belt and braces under the worker signal: a coarse poll so
+                // a lost wake can never strand the UI on cached rows.
+                self.poll_timer = cx.start_interval(2.0);
             }
             if let Some(path) = &config().e2e {
                 match std::fs::read_to_string(path)
@@ -3762,6 +3788,9 @@ impl Widget for Stage {
             if self.e2e_timer.0 != 0 && te.timer_id == self.e2e_timer.0 {
                 self.e2e_tick(cx);
             }
+            if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
+                self.poll_store(cx);
+            }
         }
 
         match event {
@@ -3782,26 +3811,10 @@ impl Widget for Stage {
 
             Event::KeyUp(k) => self.handle_key_up(cx, k),
 
-            // A sync worker committed: foreign generations bump, stale
-            // queries re-run on the next draw.
-            Event::Signal => {
-                if SignalToUI::check_and_clear_ui_signal() {
-                    if let Some(state) = self.state.as_deref_mut() {
-                        if state.store.poll_external() {
-                            // A fresh send failure deserves a toast; the
-                            // row itself stays cancellable via cmd+z.
-                            let failures = mail::outbox_failures(&state.store);
-                            if failures.len() > state.failed_seen {
-                                if let Some((_, err)) = failures.last() {
-                                    state.toast(format!("send failed: {err} — ⌘z reopens"), true);
-                                }
-                            }
-                            state.failed_seen = failures.len();
-                            cx.redraw_all();
-                        }
-                    }
-                }
-            }
+            // A sync worker committed. The platform already consumed the
+            // ui-signal flag before delivering this event (macos.rs checks
+            // and clears it itself) — so never re-check it here, just poll.
+            Event::Signal => self.poll_store(cx),
 
             // A menu item (macOS menu bar).
             Event::MacosMenuCommand(cmd) => {
