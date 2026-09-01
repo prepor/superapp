@@ -23,7 +23,9 @@ use std::time::Instant;
 use makepad_widgets::*;
 // Touch types are not in the curated platform re-export list.
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
-use makepad_widgets::makepad_platform::ime::TextInputConfig;
+use makepad_widgets::makepad_platform::ime::{
+    ReturnKeyType, SoftKeyboardConfig, TextInputConfig,
+};
 
 use crate::core::{self, Dir, Kind, MailId, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
@@ -3831,7 +3833,13 @@ impl Widget for Stage {
                 self.ime_shown = false;
                 self.kick(cx);
             }
-            // android, field to field ("next"): arm the keyboard guard.
+            // android, field to field ("next"): the blurring TextInput just
+            // queued a keyboard hide (its blur handler, unconditional).
+            // Queue a show in the SAME op flush so Java sees hide+show
+            // back-to-back and the IME coalesces them — no bounce. The new
+            // field's own draw re-issues with its exact config right after
+            // (a differing config re-configures, so the action-key label
+            // lands correctly). The timer guard stays as the safety net.
             if cfg!(target_os = "android")
                 && self.hosted_focus()
                 && ke.prev != Area::Empty
@@ -3839,7 +3847,19 @@ impl Widget for Stage {
                 && ke.focus != Area::Empty
                 && ke.focus != self.area
             {
-                log!("ime guard: armed (field-to-field focus move)");
+                log!("ime guard: armed (field-to-field focus move), pinning keyboard");
+                let r = ke.focus.rect(cx);
+                cx.show_text_ime_with_config(
+                    ke.focus,
+                    r,
+                    TextInputConfig {
+                        soft_keyboard: SoftKeyboardConfig {
+                            return_key_type: ReturnKeyType::Next,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
                 self.ime_guard_tries = 2;
                 self.ime_guard_timer = cx.start_timeout(0.4);
             }
