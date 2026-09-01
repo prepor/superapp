@@ -2600,8 +2600,10 @@ impl Widget for Stage {
         let vp = {
             let r = cx.turtle().rect();
             let (t, rt, b, l) = self.insets;
+            // 40 dp clears both the shade-pull zone and the punch-hole
+            // camera (the Fold reports no cutout inset), with margin.
             let t = if cfg!(target_os = "android") {
-                t.max(28.0)
+                t.max(40.0)
             } else {
                 t
             };
