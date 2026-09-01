@@ -1692,6 +1692,13 @@ pub struct Stage {
     /// The fallback store poll (see [`Stage::poll_store`]).
     #[rust]
     poll_timer: Timer,
+    /// android: after a field-to-field focus move, the blurring TextInput
+    /// hides the soft keyboard and the next field's one draw-time show can
+    /// lose the race against the hide animation. The guard re-issues it.
+    #[rust]
+    ime_guard_area: Area,
+    #[rust]
+    ime_guard_timer: Timer,
     #[rust]
     state: Option<Box<State>>,
 }
@@ -3822,6 +3829,17 @@ impl Widget for Stage {
                 self.ime_shown = false;
                 self.kick(cx);
             }
+            // android, field to field ("next"): arm the keyboard guard.
+            if cfg!(target_os = "android")
+                && self.hosted_focus()
+                && ke.prev != Area::Empty
+                && ke.prev != self.area
+                && ke.focus != Area::Empty
+                && ke.focus != self.area
+            {
+                self.ime_guard_area = ke.focus;
+                self.ime_guard_timer = cx.start_timeout(0.4);
+            }
         }
         if let Event::Actions(actions) = event {
             self.handle_panel_actions(cx, actions);
@@ -3874,6 +3892,20 @@ impl Widget for Stage {
             }
             if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
                 self.poll_store(cx);
+            }
+            if self.ime_guard_timer.0 != 0 && te.timer_id == self.ime_guard_timer.0 {
+                self.ime_guard_timer = Timer::default();
+                let area = self.ime_guard_area;
+                self.ime_guard_area = Area::Empty;
+                // The keyboard lost the race (it is down while a field
+                // holds focus): reset the platform's config dedup so the
+                // focused field's next draw re-shows with its own config.
+                // A keyboard that made it up — or a user dismissal outside
+                // a focus move — never gets here.
+                if self.kb_h == 0.0 && area != Area::Empty && cx.has_key_focus(area) {
+                    cx.hide_text_ime();
+                    cx.redraw_all();
+                }
             }
         }
 
@@ -4141,12 +4173,17 @@ impl Widget for Stage {
         // at the very top of the window (~22 dp observed on gesture nav), so
         // panel headers — the drag grip, close, archive — stay below it.
         //
-        // When the soft keyboard shows, makepad slides the whole pass up by
-        // its height (the turtle's origin goes negative — android's
-        // content-shift). Shifting back down by kb_h and shortening by it
-        // makes the viewport exactly the visible region above the keyboard.
+        // When the soft keyboard shows, makepad may slide the whole pass up
+        // (the turtle's origin goes negative — android's content-shift) by
+        // however much the focused field's caret rect needs: the full
+        // keyboard height for the old stage-level IME's zero rect, but as
+        // little as nothing for a hosted TextInput already visible near the
+        // top. Compensate by the ACTUAL shift — assuming kb_h shoved the
+        // whole workspace down a keyboard-height when the shift was zero —
+        // and shorten by the keyboard, which occludes that much regardless.
         let vp = {
             let r = cx.turtle().rect();
+            let shift = (-r.pos.y).max(0.0);
             let (t, rt, b, l) = self.insets;
             // 40 dp clears both the shade-pull zone and the punch-hole
             // camera (the Fold reports no cutout inset), with margin.
@@ -4157,7 +4194,7 @@ impl Widget for Stage {
             };
             rect(
                 r.pos.x + l,
-                r.pos.y + self.kb_h + t,
+                r.pos.y + shift + t,
                 (r.size.x - l - rt).max(40.0),
                 (r.size.y - self.kb_h - t - b).max(40.0),
             )
