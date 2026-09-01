@@ -108,8 +108,15 @@ C. **Compose** — **landed 2026-09-01**: to/subject `SField`s over a
    take); typing bubbles `DraftEdited` actions the shell persists; send
    and discard (chrome buttons) read the widget's values; the char-grid
    auto-field stands down for hosted kinds.
-D. **Inbox** on `PortalList`: virtualized (821+ real messages already),
-   row templates, selection/enter/j-k preserved.
+D. **Inbox** on `PortalList` — **landed 2026-09-01**: virtualized rows
+   (from/subject/date, bold-unread via label pairs, selection wash),
+   filter as an `SField` (enter selects first and rests, `/` focuses,
+   change clears selection), the whole letter grammar (`j`/`k`, enter,
+   modifiers for fresh opens) handled by the widget from forwarded
+   TextInput/KeyDown events. Tapping a subject opens (bubbled
+   `OpenMail` → the same undoable `Act::Open` path, mark-read included);
+   elsewhere selects. e2e rows register by subject, so every existing
+   script keeps working unchanged.
 E. **Message / Contact / Help / About**; retire the char-grid renderer and
    the custom field machinery.
 F. **Overlays** onto the same library (launcher field becomes an `SField`,

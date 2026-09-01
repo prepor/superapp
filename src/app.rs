@@ -228,6 +228,7 @@ script_mod! {
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
+                        inbox_tpl := mod.widgets.InboxPanel{}
                     }
                 }
             }
@@ -415,6 +416,7 @@ enum Act {
 enum WidgetOp {
     AddAccount,
     RemoveAccount(i64),
+    OpenMail(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3075,6 +3077,9 @@ impl Stage {
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
+                    WidgetOp::OpenMail(id) => {
+                        self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), alt);
+                    }
                 }
                 return;
             }
@@ -3520,6 +3525,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
+        Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         _ => None,
     }
 }
@@ -3618,6 +3624,10 @@ impl Stage {
                         &mail::Draft { to, subject, body },
                     );
                 }
+                crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
+                    self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), fresh);
+                }
+                crate::panels::PanelAction::SelectMail { .. } => {}
                 crate::panels::PanelAction::RemoveAccount(id) => {
                     let Some(state) = self.state.as_deref_mut() else {
                         continue;
@@ -4859,6 +4869,12 @@ impl Stage {
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);
             }
+            // An inbox with a baked filter param seeds its field.
+            if let Some(Kind::Inbox { filter: Some(f) }) = &kind {
+                w.widget(cx, ids!(filter_input))
+                    .as_text_input()
+                    .set_text(cx, f);
+            }
         }
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
@@ -4928,6 +4944,33 @@ impl Stage {
                     let r = w.widget(cx, path).area().rect(cx);
                     if r.size.x > 0.0 {
                         reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+            }
+            Some(Kind::Inbox { .. }) => {
+                let fr = w.widget(cx, ids!(filter_input)).area().rect(cx);
+                if fr.size.x > 0.0 {
+                    reg.push(("filter".to_string(), fr, Act::Pointer(pid)));
+                }
+                // Visible rows, addressed by subject — clicking one in a
+                // script means "open it", the subject-link semantics.
+                let filter = w
+                    .widget(cx, ids!(filter_input))
+                    .as_text_input()
+                    .text();
+                let rows = mail::inbox_filtered(&state.store, &filter);
+                if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
+                    for (idx, item) in list.items().iter() {
+                        let r = item.widget.area().rect(cx);
+                        if r.size.x > 0.0 {
+                            if let Some(m) = rows.get(*idx) {
+                                reg.push((
+                                    m.subject.clone(),
+                                    r,
+                                    Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
+                                ));
+                            }
+                        }
                     }
                 }
             }

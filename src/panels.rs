@@ -41,6 +41,11 @@ pub enum PanelAction {
         subject: String,
         body: String,
     },
+    /// Open a mail from the inbox (the solid-link semantics; `fresh` is
+    /// the workspace modifier).
+    OpenMail { pid: u64, id: i64, fresh: bool },
+    /// Panel-internal: an inbox row was tapped outside its subject.
+    SelectMail { pid: u64, id: i64 },
 }
 
 script_mod! {
@@ -267,6 +272,71 @@ script_mod! {
             width: Fill, height: Fill
             is_multiline: true
             empty_text: ""
+        }
+    }
+
+    // ---- inbox -------------------------------------------------------------
+
+    /** One mail row: from · subject · date, bold while unread, an inverted
+        wash while selected. Tap the subject to open; tap elsewhere to
+        select (the j/k cursor). */
+    mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Overlay
+        sel_bg := View {
+            visible: false
+            width: Fill, height: Fill
+            show_bg: true, draw_bg +: { color: #e7e7e7 }
+        }
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 4, right: 4, top: 3, bottom: 3}
+            align: Align{y: 0.5}
+            from_lbl := mod.widgets.SLabel { width: 96, text: "" }
+            from_lbl_b := mod.widgets.SLabel {
+                visible: false, width: 96, text: ""
+                draw_text +: { text_style: mod.widgets.SMonoStyle{} }
+            }
+            subject_lbl := mod.widgets.SLabel { width: Fill, text: "" }
+            subject_lbl_b := mod.widgets.SLabel {
+                visible: false, width: Fill, text: ""
+            }
+            date_lbl := mod.widgets.SLabel {
+                width: Fit, text: "", draw_text +: { color: #909090 }
+            }
+        }
+        rule := View {
+            width: Fill, height: Fit, flow: Down
+            View { width: Fill, height: 21 }
+            View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
+        }
+    }
+
+    /** The inbox: the filter over the header over the virtualized list. */
+    mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        spacing: 4
+
+        filter_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "filter…  ( / )"
+        }
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 4, right: 4}
+            mod.widgets.SSection { width: 96, text: "FROM" }
+            mod.widgets.SSection { width: Fill, text: "SUBJECT" }
+            mod.widgets.SSection { width: Fit, text: "DATE" }
+        }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            row := mod.widgets.InboxRow {}
         }
     }
 }
@@ -543,5 +613,209 @@ impl ComposePanelRef {
             subject: inner.view.text_input(cx, ids!(subject_input)).text(),
             body: inner.view.text_input(cx, ids!(body_input)).text(),
         }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// InboxRow
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct InboxRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    #[rust]
+    pid: u64,
+    #[rust]
+    mail_id: i64,
+}
+
+impl Widget for InboxRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        match event.hits(cx, self.view.area()) {
+            Hit::FingerUp(fe) if fe.is_over && fe.was_tap() => {
+                let subj = self.view.label(cx, ids!(subject_lbl)).area().rect(cx);
+                let subj_b = self.view.label(cx, ids!(subject_lbl_b)).area().rect(cx);
+                let over_subject = subj.contains(fe.abs) || subj_b.contains(fe.abs);
+                if over_subject {
+                    cx.action(PanelAction::OpenMail {
+                        pid: self.pid,
+                        id: self.mail_id,
+                        fresh: fe.modifiers.logo || fe.modifiers.alt,
+                    });
+                } else {
+                    cx.action(PanelAction::SelectMail {
+                        pid: self.pid,
+                        id: self.mail_id,
+                    });
+                }
+            }
+            Hit::FingerHoverIn(_) => cx.set_cursor(MouseCursor::Hand),
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl InboxRowRef {
+    #[allow(clippy::too_many_arguments)]
+    fn populate(
+        &self,
+        cx: &mut Cx,
+        pid: u64,
+        m: &mail::MailHead,
+        selected: bool,
+    ) {
+        let Some(mut row) = self.borrow_mut() else { return };
+        row.pid = pid;
+        row.mail_id = m.id;
+        let from = &m.from_name;
+        let date = mail::fmt_date(m.date);
+        let (fp, fb) = (
+            row.view.label(cx, ids!(from_lbl)),
+            row.view.label(cx, ids!(from_lbl_b)),
+        );
+        let (sp, sb) = (
+            row.view.label(cx, ids!(subject_lbl)),
+            row.view.label(cx, ids!(subject_lbl_b)),
+        );
+        fp.set_text(cx, if m.unread { "" } else { from });
+        fb.set_text(cx, if m.unread { from } else { "" });
+        fp.set_visible(cx, !m.unread);
+        fb.set_visible(cx, m.unread);
+        sp.set_text(cx, if m.unread { "" } else { &m.subject });
+        sb.set_text(cx, if m.unread { &m.subject } else { "" });
+        sp.set_visible(cx, !m.unread);
+        sb.set_visible(cx, m.unread);
+        row.view.label(cx, ids!(date_lbl)).set_text(cx, &date);
+        row.view.view(cx, ids!(sel_bg)).set_visible(cx, selected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InboxPanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct InboxPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    #[rust]
+    sel: Option<i64>,
+}
+
+impl InboxPanel {
+    fn rows(&self, cx: &mut Cx, scope: &Scope) -> Vec<mail::MailHead> {
+        let filter = self.view.text_input(cx, ids!(filter_input)).text();
+        scope
+            .props
+            .get::<PanelProps>()
+            .map(|p| mail::inbox_filtered(&p.store, &filter))
+            .unwrap_or_default()
+    }
+
+    fn move_sel(&mut self, cx: &mut Cx, scope: &Scope, d: isize) {
+        let rows = self.rows(cx, scope);
+        if rows.is_empty() {
+            return;
+        }
+        let i = self
+            .sel
+            .and_then(|s| rows.iter().position(|m| m.id == s))
+            .map_or(0, |i| {
+                (i as isize + d).clamp(0, rows.len() as isize - 1) as usize
+            });
+        self.sel = Some(rows[i].id);
+        self.redraw(cx);
+    }
+}
+
+impl Widget for InboxPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let filter_focused = filter.key_focus(cx);
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+
+        // The panel's letter grammar, only while the filter is at rest —
+        // letters arrive as TextInput events, exactly like real typing.
+        if let Event::TextInput(t) = event {
+            if !filter_focused {
+                match t.input.as_str() {
+                    "j" => self.move_sel(cx, scope, 1),
+                    "k" => self.move_sel(cx, scope, -1),
+                    "/" => SettingsPanel::focus_input(cx, &filter),
+                    _ => {}
+                }
+            }
+        }
+        if let Event::KeyDown(k) = event {
+            if !filter_focused && k.key_code == KeyCode::ReturnKey {
+                let rows = self.rows(cx, scope);
+                let target = self
+                    .sel
+                    .filter(|s| rows.iter().any(|m| m.id == *s))
+                    .or_else(|| rows.first().map(|m| m.id));
+                if let Some(id) = target {
+                    cx.action(PanelAction::OpenMail {
+                        pid,
+                        id,
+                        fresh: k.modifiers.logo || k.modifiers.alt,
+                    });
+                }
+            }
+        }
+        if let Event::Actions(actions) = event {
+            // Enter in the filter: select the first visible row and rest.
+            if filter.returned(actions).is_some() || filter.escaped(actions) {
+                cx.set_key_focus(Area::Empty);
+                if filter.returned(actions).is_some() {
+                    self.sel = self.rows(cx, scope).first().map(|m| m.id);
+                }
+                self.redraw(cx);
+            }
+            if filter.changed(actions).is_some() {
+                self.sel = None;
+                self.redraw(cx);
+            }
+            for a in actions {
+                if let Some(PanelAction::SelectMail { pid: p, id }) =
+                    a.downcast_ref::<PanelAction>()
+                {
+                    if *p == pid {
+                        self.sel = Some(*id);
+                        self.redraw(cx);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rows = self.rows(cx, scope);
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        let sel = self.sel;
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, rows.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(m) = rows.get(idx) {
+                        let row = list.item(cx, idx, live_id!(row));
+                        row.as_inbox_row().populate(cx, pid, m, sel == Some(m.id));
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
     }
 }
