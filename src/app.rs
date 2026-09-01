@@ -763,6 +763,9 @@ struct State {
     /// Who runs the passes (CR-004): threads in production, inline in a
     /// headless world.
     pump: sync::Pump,
+    /// Where passwords live. An e2e run keeps them in memory, so a suite
+    /// never writes to a human's keychain and two runs never collide.
+    secrets: crate::effect::Secrets,
     /// Failed outbox rows already toasted (new ones toast on signal).
     failed_seen: usize,
     /// The last persisted logical snapshot — [`State::sync`] only writes
@@ -828,14 +831,20 @@ fn grid_for(vp: DVec2) -> core::Grid {
 impl State {
     fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
         let store = std::rc::Rc::new(store);
-        let secrets_dir = db_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_default();
+        let secrets = if config().e2e.is_some() {
+            crate::effect::Secrets::Memory(crate::effect::MemSecrets::new())
+        } else {
+            crate::effect::Secrets::Keychain(
+                db_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_default(),
+            )
+        };
         let world = std::rc::Rc::new(crate::effect::World::new(
             store.clone(),
-            Box::new(crate::effect::Real::new(secrets_dir)),
+            Box::new(crate::effect::Real::new(secrets.clone())),
             mail::registry(),
         ));
         // Boot restores the last session from the store; a store that never
@@ -857,6 +866,7 @@ impl State {
         State {
             ws,
             world,
+            secrets,
             history: crate::history::History::new(),
             store,
             db_path,
@@ -1085,7 +1095,8 @@ impl State {
             return; // in memory: no file for a worker to open
         };
         let world = self.world.clone();
-        self.pump.ensure(&world, &db, || {
+        let secrets = self.secrets.clone();
+        self.pump.ensure(&world, &db, &secrets, || {
             SignalToUI::set_ui_signal();
         });
     }

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use rusqlite::Transaction;
 
-use crate::effect::{Creds, RemoteMail, World};
+use crate::effect::{Creds, RemoteMail, Secrets, World};
 use crate::mail;
 
 /// How many most-recent messages a folder retains on first contact (and
@@ -499,7 +499,12 @@ impl Worker {
 /// # Panics
 ///
 /// If the thread cannot be spawned.
-pub fn spawn(db: PathBuf, account: i64, notify: impl Fn() + Send + 'static) -> Worker {
+pub fn spawn(
+    db: PathBuf,
+    account: i64,
+    secrets: Secrets,
+    notify: impl Fn() + Send + 'static,
+) -> Worker {
     let (tx, rx) = mpsc::channel::<()>();
     std::thread::Builder::new()
         .name(format!("sync-{account}"))
@@ -507,13 +512,9 @@ pub fn spawn(db: PathBuf, account: i64, notify: impl Fn() + Send + 'static) -> W
             let Ok(store) = crate::store::Store::open(Some(&db)) else {
                 return;
             };
-            let dir = db
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default();
             let w = World::new(
                 std::rc::Rc::new(store),
-                Box::new(crate::effect::Real::new(dir)),
+                Box::new(crate::effect::Real::new(secrets)),
                 mail::registry(),
             );
             loop {
@@ -678,13 +679,18 @@ impl Pump {
         &mut self,
         w: &World,
         db: &std::path::Path,
+        secrets: &Secrets,
         notify: impl Fn() + Send + Clone + 'static,
     ) {
         let Pump::Threads { workers, sender } = self else {
             return;
         };
         if sender.is_none() {
-            *sender = Some(crate::send::spawn(db.to_path_buf(), notify.clone()));
+            *sender = Some(crate::send::spawn(
+                db.to_path_buf(),
+                secrets.clone(),
+                notify.clone(),
+            ));
         }
         let accounts = crate::mail::accounts(w.store());
         workers.retain(|k| accounts.iter().any(|a| a.id == k.account));
@@ -695,7 +701,12 @@ impl Pump {
             if workers.iter().any(|k| k.account == a.id) {
                 continue;
             }
-            workers.push(spawn(db.to_path_buf(), a.id, notify.clone()));
+            workers.push(spawn(
+                db.to_path_buf(),
+                a.id,
+                secrets.clone(),
+                notify.clone(),
+            ));
         }
     }
 }

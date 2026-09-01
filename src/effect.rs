@@ -29,6 +29,7 @@
 //! controls everything else.
 
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1086,22 +1087,74 @@ impl Outside for Fake {
 
 // -- Real ----------------------------------------------------------------------
 
+/// Passwords held in memory and shared across threads.
+///
+/// It has to be *shared*, not merely in-memory: each worker thread builds
+/// its own [`Real`], so a password written by the UI thread is read by a
+/// sync thread. A `HashMap` on the instance would be empty on the reader's
+/// side — which is the real reason [`crate::secret`] reaches for something
+/// process-external at all.
+#[derive(Clone, Default)]
+pub struct MemSecrets(Arc<Mutex<HashMap<String, String>>>);
+
+impl MemSecrets {
+    #[must_use]
+    pub fn new() -> MemSecrets {
+        MemSecrets::default()
+    }
+}
+
+/// Where [`Real`] keeps passwords.
+#[derive(Clone)]
+pub enum Secrets {
+    /// The macOS keychain, or an app-private file elsewhere.
+    Keychain(PathBuf),
+    /// In memory, dying with the process — what an e2e run uses, so a suite
+    /// never writes to a human's keychain and two runs never collide.
+    Memory(MemSecrets),
+}
+
+/// The newest frame the headless rasterizer wrote, copied to `path`. Under
+/// a headless build there is no window to photograph — makepad renders the
+/// frames itself, so a "screenshot" is picking the right one.
+#[cfg(headless)]
+fn headless_shot(path: &Path) -> Result<(), String> {
+    let dir = std::env::var("MAKEPAD_HEADLESS_OUT_DIR")
+        .map_err(|_| "MAKEPAD_HEADLESS_OUT_DIR is not set".to_string())?;
+    let newest = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{dir}: {e}"))?
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("window_")
+        })
+        .max_by_key(|e| e.file_name())
+        .ok_or_else(|| format!("no rendered frame in {dir}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    std::fs::copy(newest.path(), path)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+
 /// The actual outside: one IMAP session per account (rustls, port 993,
 /// LOGIN with an app password — fastmail-style; OAuth is deliberately
 /// later), lettre over rustls for submission, and the platform for
 /// everything else.
 pub struct Real {
     sessions: HashMap<i64, imap_session::Imap>,
-    /// Where the file-fallback keychain lives (android); macOS ignores it.
-    secrets_dir: PathBuf,
+    secrets: Secrets,
 }
 
 impl Real {
     #[must_use]
-    pub fn new(secrets_dir: PathBuf) -> Real {
+    pub fn new(secrets: Secrets) -> Real {
         Real {
             sessions: HashMap::new(),
-            secrets_dir,
+            secrets,
         }
     }
 
@@ -1187,11 +1240,21 @@ impl Outside for Real {
     }
 
     fn secret_get(&mut self, email: &str) -> Option<String> {
-        crate::secret::get(&self.secrets_dir, email)
+        match &self.secrets {
+            Secrets::Keychain(dir) => crate::secret::get(dir, email),
+            Secrets::Memory(m) => m.0.lock().ok()?.get(email).cloned(),
+        }
     }
 
     fn secret_set(&mut self, email: &str, pass: &str) -> bool {
-        crate::secret::set(&self.secrets_dir, email, pass)
+        match &self.secrets {
+            Secrets::Keychain(dir) => crate::secret::set(dir, email, pass),
+            Secrets::Memory(m) => m
+                .0
+                .lock()
+                .map(|mut g| g.insert(email.to_string(), pass.to_string()))
+                .is_ok(),
+        }
     }
 
     fn clip(&mut self, text: &str) -> Result<(), String> {
@@ -1225,11 +1288,15 @@ impl Outside for Real {
     }
 
     fn shot(&mut self, path: &Path) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
+        #[cfg(headless)]
+        {
+            headless_shot(path)
+        }
+        #[cfg(all(not(headless), target_os = "macos"))]
         {
             crate::mac::screenshot(path)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(headless), not(target_os = "macos")))]
         {
             let _ = path;
             Err("no window capture on this platform".into())

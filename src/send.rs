@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::effect::World;
+use crate::effect::{Secrets, World};
 use crate::mail;
 
 /// One pass over the outbox: claim everything due and queue it. Answers how
@@ -93,7 +93,11 @@ impl Sender {
 /// # Panics
 ///
 /// If the thread cannot be spawned.
-pub fn spawn(db: PathBuf, notify: impl Fn() + Send + 'static) -> Sender {
+pub fn spawn(
+    db: PathBuf,
+    secrets: Secrets,
+    notify: impl Fn() + Send + 'static,
+) -> Sender {
     let (tx, rx) = mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("sender".into())
@@ -101,13 +105,9 @@ pub fn spawn(db: PathBuf, notify: impl Fn() + Send + 'static) -> Sender {
             let Ok(store) = crate::store::Store::open(Some(&db)) else {
                 return;
             };
-            let dir = db
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default();
             let w = World::new(
                 std::rc::Rc::new(store),
-                Box::new(crate::effect::Real::new(dir)),
+                Box::new(crate::effect::Real::new(secrets)),
                 mail::registry(),
             );
             loop {
