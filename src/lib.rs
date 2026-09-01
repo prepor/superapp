@@ -13,7 +13,7 @@
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
-//! | [`ui`] | the semantic content vocabulary: lines, fields, forms | no |
+//! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
 //! | [`theme`] | the look: sizes and colours | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
 //!
