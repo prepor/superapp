@@ -702,38 +702,46 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
-        padding: Inset{left: 4, right: 4, top: 5, bottom: 5}
-        spacing: 2
+        // The row's inset is the one source of spacing: every label in it
+        // sheds the theme padding (upstream Label ships mspace_1, 3 pt a
+        // side), so the text sits 8 pt inside the row — the filter's own
+        // text inset (1 pt border + 7 pt padding) — and the two lines
+        // stack on their bare line boxes, 3 pt above and below.
+        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
+        spacing: 0
         View {
             width: Fill, height: Fit
             align: Align{y: 0.5}
-            // A Fill *Label* on a Right flow's main axis defer-walks and
-            // drops its theme padding (upstream Label ships mspace_1),
-            // landing 3 px left of every normally-walked label. So the
-            // from twins ride a Fill View whose flow is Down: there Fill
-            // width is the cross axis — no defer, padding kept, and the
-            // left edge matches the subject line (the same construction).
+            // A Fill *Label* on a Right flow's main axis defer-walks. So
+            // the from twins ride a Fill View whose flow is Down: there
+            // Fill width is the cross axis — no defer, and the left edge
+            // matches the subject line (the same construction).
             View {
                 width: Fill, height: Fit
                 flow: Down
                 from_lbl := mod.widgets.SLabel {
+                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
                 from_b := mod.widgets.SBoldLabel {
                     visible: false
+                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
             }
             View { width: 10, height: 1 }
             date_lbl := mod.widgets.SLabel {
+                padding: 0
                 width: Fit, text: "", draw_text +: { color: #909090 }
             }
         }
         subject_lbl := mod.widgets.SLabel {
+            padding: 0
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
         subject_b := mod.widgets.SBoldLabel {
             visible: false
+            padding: 0
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
     }
@@ -774,8 +782,11 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
-        padding: Inset{left: 12, right: 12, top: 10, bottom: 8}
-        spacing: 6
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        // No flow spacing: the gaps are explicit, so a rule sits the same
+        // 3 pt under the header as under every row, and the first row
+        // hangs off its rule exactly like the rest.
+        spacing: 0
 
         filter_input := mod.widgets.SField {
             width: Fill
@@ -784,18 +795,21 @@ script_mod! {
             autocapitalize: AutoCapitalize.None
             autocorrect: AutoCorrect.Disabled
         }
+        View { width: Fill, height: 6 }
         // Header cells for the columns only — the subject rides each row's
-        // extra line, owns no column, and so gets no header. FROM sits in
-        // a Fill View, not at Fill itself: a deferred Fill label drops its
-        // theme padding and drifts off the rows' shared left edge.
+        // extra line, owns no column, and so gets no header. The header
+        // wears the rows' inset and its labels shed the theme padding, so
+        // FROM shares the rows' left edge and DATE their right. FROM sits
+        // in a Fill View, not at Fill itself — the rows' construction,
+        // so it walks exactly like their from label.
         View {
             width: Fill, height: Fit
-            padding: Inset{left: 4, right: 4}
+            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
             View {
                 width: Fill, height: Fit
-                mod.widgets.SSection { text: "FROM" }
+                mod.widgets.SSection { padding: 0, text: "FROM" }
             }
-            mod.widgets.SSection { width: Fit, text: "DATE" }
+            mod.widgets.SSection { padding: 0, width: Fit, text: "DATE" }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
         list := PortalList {
