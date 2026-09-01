@@ -419,7 +419,6 @@ enum WidgetOp {
     AddAccount,
     RemoveAccount(i64),
     OpenMail(i64),
-    SelectMail(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3091,20 +3090,11 @@ impl Stage {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
                     WidgetOp::OpenMail(id) => {
-                        self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), alt);
-                    }
-                    WidgetOp::SelectMail(id) => {
-                        // Panel-internal: the inbox widget listens for this
-                        // and moves its j/k cursor. Focus syncs only when
-                        // it actually moves (no mid-gesture world redraws).
+                        // The cursor follows what you opened, so the wash
+                        // marks the mail on screen and j/k carries on from
+                        // there (panel-internal: the inbox widget listens).
                         cx.action(crate::panels::PanelAction::SelectMail { pid, id });
-                        if state.ws.focus != Some(pid) || state.field.is_some() {
-                            state.ws.focus = Some(pid);
-                            state.field = None;
-                            self.sync(cx);
-                        } else {
-                            self.kick(cx);
-                        }
+                        self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), alt);
                     }
                 }
                 return;
@@ -3412,12 +3402,6 @@ impl Stage {
                 if let (true, Some(act)) = (within, act) {
                     // No modifiers on glass: never the fresh-panel variant.
                     let act = match act {
-                        // Tap = click on glass: a row tap opens — the
-                        // select cursor is keyboard grammar, and there is
-                        // no keyboard here.
-                        Act::WidgetOp(pid, WidgetOp::SelectMail(id)) => {
-                            Act::WidgetOp(pid, WidgetOp::OpenMail(id))
-                        }
                         // Standalone widgets own their taps (the mouse
                         // rule): resolving the semantic op here too would
                         // double-fire.
@@ -5081,10 +5065,10 @@ impl Stage {
                 // Visible rows. These rects are the REAL click path too, not
                 // just the scripts' door: list items are rebuilt per draw,
                 // so a down/up pair inside them dies on any mid-gesture
-                // redraw. The whole row selects; the subject band (pushed
-                // later — hit_at searches back-to-front, so it wins the
-                // overlap) opens, keeping the bare-subject address the
-                // scripts use for "open it".
+                // redraw. A row is ONE target, addressed by its subject:
+                // anywhere on either line opens it. Splitting it (a select
+                // band beside an open band) made the from name and the date
+                // look dead — a row means its mail, whichever line you hit.
                 let filter = w
                     .widget(cx, ids!(filter_input))
                     .as_text_input()
@@ -5096,33 +5080,10 @@ impl Stage {
                         if r.size.x > 0.0 {
                             if let Some(m) = rows.get(*idx) {
                                 reg.push((
-                                    format!("row {}", m.subject),
+                                    m.subject.clone(),
                                     r,
-                                    Act::WidgetOp(pid, WidgetOp::SelectMail(m.id)),
+                                    Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
                                 ));
-                                // The subject span, from whichever twin line
-                                // is live (hidden twins report stale rects —
-                                // only trust one lying inside the row).
-                                let cands = [
-                                    item.widget.label(cx, ids!(line.subject_lbl)).area().rect(cx),
-                                    item.widget.widget(cx, ids!(line.subject_b)).area().rect(cx),
-                                    item.widget.label(cx, ids!(line_sel.subject_lbl)).area().rect(cx),
-                                    item.widget.widget(cx, ids!(line_sel.subject_b)).area().rect(cx),
-                                ];
-                                let s = cands.into_iter().find(|s| {
-                                    s.size.x > 0.0 && r.contains(s.pos + s.size * 0.5)
-                                });
-                                if let Some(s) = s {
-                                    let band = Rect {
-                                        pos: dvec2(s.pos.x, r.pos.y),
-                                        size: dvec2(s.size.x, r.size.y),
-                                    };
-                                    reg.push((
-                                        m.subject.clone(),
-                                        band,
-                                        Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
-                                    ));
-                                }
                             }
                         }
                     }
