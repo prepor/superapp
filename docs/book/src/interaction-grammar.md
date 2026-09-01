@@ -67,7 +67,9 @@ Per panel, below the reserved set:
 
 - inbox: `enter` opens *and goes* (`cmd+enter` un-joined), `/` filter, arrows
   walk the rows (scrolling the list to keep the cursor visible, and
-  **previewing** each one beside it)
+  **previewing** each one beside it). In the filter, `@` opens the tag
+  autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
+  [The Rich Table](./richtable.md) for the grammar
 - forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
   wrapping; `enter` advances and **submits past the last field**. Read
   panels have no ring: their controls wear chords instead.

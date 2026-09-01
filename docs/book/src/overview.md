@@ -11,7 +11,7 @@ single function, and every panel lives on one scrolling tiled workspace. The
 seams between "apps" disappear; a mail thread, the sender's contact card and a
 reply draft are three panels standing next to each other, joined.
 
-Because panels are small and single-purpose, they compose: the same richtable
+Because panels are small and single-purpose, they compose: the same [rich table](./richtable.md)
 that lists mail will list feed items and calendar events; the same link grammar
 navigates everything. Consistency is a hard requirement, not a style: from
 looking at any element you must know what it does.

@@ -1,0 +1,119 @@
+# CR-006 — the rich table's filter: tags, the autocomplete, values on
+# demand, and a list that pages as it scrolls.
+#
+# Assertions are the clicks: a row that does not resolve fails the run, so
+# "the filter kept Vera's mail" is checked by the run rather than by a
+# human reading a screenshot.
+wait 900
+click "inbox"
+wait 300
+
+# `/` focuses the filter; `@` opens the tag list under it.
+key /
+wait 300
+type "@"
+wait 400
+shot f1-tags
+
+# The arrows walk the offer, enter takes it: `@html ` lands in the field
+# (a boolean tag ends the token), and the box closes.
+key down
+wait 200
+key enter
+wait 500
+shot f2-html
+key esc
+wait 300
+click "[stelaxis]"
+wait 600
+
+# A tag with values: picking `@from` leaves the caret behind `@from:`, so
+# the senders list opens by itself — the dynamic kind, asked of the store
+# as you type. `kov` narrows it to Vera; enter takes her address.
+key /
+wait 200
+key cmd+a
+type "@fr"
+wait 300
+key enter
+wait 400
+shot f3-from-values
+type "kov"
+wait 400
+shot f4-from-narrowed
+key enter
+wait 500
+shot f5-from-vera
+key esc
+wait 300
+click "Q3 infra"
+wait 600
+
+# The grammar: a group is OR'ed, `@not:` negates, bare text is a substring.
+key /
+wait 200
+key cmd+a
+type "(@unread @or hike) @not:html"
+wait 400
+key esc
+wait 400
+shot f6-or-not
+click "Sat hike"
+wait 600
+
+# A date is a day, dd.mm.yyyy, and a span: from the 30th on keeps the hike
+# (aug 30) and everything newer.
+key /
+wait 200
+key cmd+a
+type "@date>=30.08.2026"
+wait 400
+key esc
+wait 400
+shot f7-date
+click "Sat hike"
+wait 600
+
+# A tag the inbox does not have reads as an error under the field, once
+# the caret has left it — not while it is still being typed.
+key /
+wait 200
+key cmd+a
+type "@bogus vera"
+wait 300
+shot f8-typing
+key esc
+wait 400
+shot f9-unknown-tag
+
+# esc puts the offer away without taking it; a second esc leaves the field.
+key /
+wait 200
+key cmd+a
+type "@"
+wait 300
+key esc
+wait 300
+shot f10-dismissed
+key esc
+wait 300
+
+# Clear the filter and walk to the bottom of the whole list: the oldest
+# row is on the second page, fetched because the viewport reached it.
+# The walk is the keyboard's (the arrows scroll-follow); a touch swipe
+# rides the list's fling physics and lands where the fling says, so it is
+# no way to address a row.
+key /
+wait 200
+key cmd+a
+key backspace
+wait 300
+key esc
+wait 300
+key down 68
+wait 1500
+shot f11-scrolled-end
+click "archive digest #01"
+wait 600
+shot f12-oldest-opened
+quit

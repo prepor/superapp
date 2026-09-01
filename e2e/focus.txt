@@ -1,0 +1,33 @@
+# A click inside a panel focuses it — through the shell's real mouse path
+# (`mouse`), which is where a physical click's key-focus rule runs.
+#
+# The assertion is a keyboard one: `key down` walks the inbox only if the
+# inbox holds focus, and the walk previews the next row, whose sender link
+# then resolves in the previewed panel.
+wait 900
+mouse "help"
+wait 500
+shot focus-1-help
+
+# A row click previews AND focuses the list it lives in.
+mouse "Sat hike"
+wait 700
+shot focus-2-row-clicked
+key down
+wait 700
+click "digest@rss.local"
+wait 700
+shot focus-3-walked-from-list
+
+# The filter: the click lands in the field (typing goes there) and the
+# panel takes focus with it.
+mouse "help"
+wait 500
+mouse "filter"
+wait 400
+type "vera"
+wait 500
+shot focus-4-filter-typed
+click "Q3 infra"
+wait 700
+quit

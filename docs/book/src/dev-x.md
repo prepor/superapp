@@ -138,6 +138,7 @@ wait 600            # ms
 shot inbox          # e2e/out/inbox.png
 click "reply"       # label substring, case-insensitive
 cmdclick "Q3"       # cmd held: fresh un-joined panel
+mouse "filter"      # the same through the shell's real mouse-down path
 key cmd+shift+left  # chords; plain letters flow as text, like real typing
 key down 45         # optional repeat count
 key cmd+a           # a panel accelerator (every letter parses)
@@ -172,9 +173,24 @@ honest no-smtp failure, cmd+z reopening the draft), and `e2e/history.txt`
 walks the history overlay (travel back, to the beginning, and forward).
 `e2e/keys.txt` drives every panel accelerator, asserting through label
 resolution — a walk that lands on the wrong mail fails the run, no picture
-needed — `e2e/select.txt` covers selectable content, and `e2e/height.txt`
+needed — `e2e/select.txt` covers selectable content, `e2e/height.txt`
 reads a short letter, the demo world's long one and a short one again: the
-same panel three rows tall, then six, then three.
+same panel three rows tall, then six, then three, and `e2e/filter.txt`
+walks the rich table (tags, the autocomplete and its dynamic values, the
+grammar, the error line, and a keyboard walk onto the second page).
+
+`click` resolves the element's action directly — it proves the action, not
+the click. `mouse` sends a real press-release pair into the stage, so the
+hit lookup, the forwarding to hosted widgets and the key-focus rule all run
+as they do for a physical click; `e2e/focus.txt` uses it to check that a
+click inside a panel focuses the panel.
+
+Two things a script cannot lean on. A `swipe` rides the list's real fling
+physics and lands where the fling says, so it is no way to *address* a
+row — walk there with `key down N`, which scroll-follows deterministically.
+And under `--no-draw` no frame is written, so every `shot` step fails and
+the run exits non-zero on those alone; read that mode for the *other*
+failures (a label that did not resolve).
 
 `drag` is weaker than it looks: drag-selection runs on `Hit::FingerMove`,
 which fires only for the area that **captured** the finger, and that
