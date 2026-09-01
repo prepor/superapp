@@ -102,13 +102,18 @@ moves, j/k reading walks) **coalesce** into one node — one `cmd+z` takes
 back the whole burst.
 
 History is a **tree, not a line**: acting after an undo starts a branch and
-destroys nothing; redo follows the newest branch. (The overlay that makes
-the tree visible and walkable is planned — the data has been tree-shaped
-from the first action.) Under the hood every action's transaction is
-recorded as an invertible SQLite changeset; undoing applies the inverse,
-and rows the world changed since (a sync, another device someday) are
-skipped rather than forced. The menu bar carries *Undo / Redo* items;
-toasts name what was undone.
+destroys nothing; redo follows the newest branch. **`cmd+u` raises the
+history overlay** — the whole tree as rows, newest first, indented by
+branch depth, the current position inverted, abandoned branches muted but
+alive. Clicking any node **travels** there: undo up to the common
+ancestor, re-apply down the other side — including *the beginning*, and
+back out again; the overlay stays up, because browsing is the point. A
+delivered send shows as `· sent` and is transparent to the walk — physics,
+not data. Under the hood every action's transaction is recorded as an
+invertible SQLite changeset; undoing applies the inverse, and rows the
+world changed since (a sync, another device someday) are skipped rather
+than forced. The menu bar carries *Undo / Redo / History* items; toasts
+name what happened.
 
 ## Mouse and trackpad
 

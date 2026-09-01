@@ -305,7 +305,11 @@ Each lands green (unit + all e2e suites) with its book pages updated.
    for e2e; a *new mail* launcher root. Real-server submission awaits a
    real account (unit-tested via a Mailer fake).
 6. **The history overlay.** The DAG made visible and walkable; jumping =
-   replaying compensations along the path. Entry point decided then.
+   replaying compensations along the path. Entry point decided then. —
+   **landed 2026-09-01**: `cmd+u` (and a menu item); rows newest-first,
+   branch-depth indentation, HEAD inverted, undone branches muted,
+   expired sends marked `· sent` and transparent; `Store::travel` walks
+   undo-to-LCA then redo-down; the overlay stays up while you browse.
 7. **Panel context.** The trace serialized behind a shortcut.
 
 ## Decisions needed

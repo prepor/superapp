@@ -101,7 +101,10 @@ redo, close, workspace-move; run it with `--db` and the end state —
 branches, head, folders — is inspectable with `sqlite3`), and
 `e2e/settings.txt` walks the accounts flow (add against an `.invalid` host
 — the worker fails fast and locally, and its error lands on the status
-line through the real signal path — then remove).
+line through the real signal path — then remove), `e2e/send.txt` walks the
+send window (run with `--send-delay 1`: cancel inside the window, an
+honest no-smtp failure, cmd+z reopening the draft), and `e2e/history.txt`
+walks the history overlay (travel back, to the beginning, and forward).
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
 rows (by subject) and panel titles. Steps that mutate the workspace need a

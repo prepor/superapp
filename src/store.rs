@@ -823,6 +823,103 @@ impl Store {
         Ok(Some(label))
     }
 
+    /// Travels to any node of the DAG: undo up to the lowest common
+    /// ancestor, then re-apply down the target's branch. Expired nodes are
+    /// transparent in both directions (their effects are physics). `0` is
+    /// the origin — undo everything. Returns the target's label.
+    pub fn travel(&self, target: i64) -> rusqlite::Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let chain = |from: i64| -> rusqlite::Result<Vec<i64>> {
+            let mut v = vec![from];
+            let mut cur = from;
+            while cur != 0 {
+                cur = tx.query_row("SELECT parent FROM action WHERE id=?1", [cur], |r| {
+                    r.get(0)
+                })?;
+                v.push(cur);
+            }
+            Ok(v)
+        };
+        let head = self.head(&tx)?;
+        if target == head {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let hc = chain(head)?;
+        let tc = chain(target)?;
+        let lca = *hc
+            .iter()
+            .find(|id| tc.contains(id))
+            .expect("the root is always common");
+
+        // Up: undo from head to the LCA.
+        let mut cur = head;
+        while cur != lca {
+            let (parent, state, kind, entity, fwd): (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Vec<u8>,
+            ) = tx.query_row(
+                "SELECT parent, state, kind, entity, fwd FROM action WHERE id=?1",
+                [cur],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+            let now_expired = state != "expired"
+                && self
+                    .undo_guard
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|g| g(&tx, &kind, entity.as_deref()));
+            if now_expired {
+                tx.execute("UPDATE action SET state='expired' WHERE id=?1", [cur])?;
+            }
+            if state != "expired" && !now_expired {
+                let mut inv: Vec<u8> = Vec::new();
+                session::invert_strm(&mut fwd.as_slice(), &mut inv)?;
+                self.conn.apply_strm(
+                    &mut inv.as_slice(),
+                    None::<fn(&str) -> bool>,
+                    |_t, _i| ConflictAction::SQLITE_CHANGESET_OMIT,
+                )?;
+                tx.execute("UPDATE action SET state='undone' WHERE id=?1", [cur])?;
+            }
+            cur = parent;
+        }
+
+        // Down: re-apply from below the LCA to the target.
+        let down: Vec<i64> = tc.iter().take_while(|&&id| id != lca).copied().collect();
+        for &id in down.iter().rev() {
+            let (state, fwd): (String, Vec<u8>) = tx.query_row(
+                "SELECT state, fwd FROM action WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if state == "expired" {
+                continue; // its effects never left
+            }
+            self.conn.apply_strm(
+                &mut fwd.as_slice(),
+                None::<fn(&str) -> bool>,
+                |_t, _i| ConflictAction::SQLITE_CHANGESET_OMIT,
+            )?;
+            tx.execute("UPDATE action SET state='applied' WHERE id=?1", [id])?;
+        }
+        self.set_head(&tx, target)?;
+        let label: Option<String> = if target == 0 {
+            Some("the beginning".into())
+        } else {
+            tx.query_row("SELECT label FROM action WHERE id=?1", [target], |r| {
+                r.get(0)
+            })
+            .ok()
+        };
+        tx.commit()?;
+        self.bump_dirty();
+        Ok(label)
+    }
+
     /// The whole history DAG plus HEAD — what the overlay draws.
     pub fn history(&self) -> rusqlite::Result<(Vec<ActionNode>, i64)> {
         let head = self.head(&self.conn)?;
@@ -1022,6 +1119,37 @@ mod tests {
             .query_row("SELECT focus FROM workspace WHERE k=0", [], |r| r.get(0))
             .unwrap();
         assert_eq!(focus, 777, "the conflicting row was left alone");
+    }
+
+    /// Travel jumps anywhere in the DAG: across branches (undo to the LCA,
+    /// redo down the other side) and to the origin.
+    #[test]
+    fn travel_walks_branches() {
+        let s = store();
+        let one = snap_open(&[Kind::Help]);
+        let two = snap_open(&[Kind::Help, Kind::About]);
+        s.act("open", "open help", None, 1.0, |c| save_wm_tx(c, &one))
+            .unwrap();
+        s.act("open", "open about", None, 2.0, |c| save_wm_tx(c, &two))
+            .unwrap();
+        // Branch: back to node 1, then a different second action.
+        s.undo().unwrap();
+        let fork = snap_open(&[Kind::Help, Kind::Inbox { filter: None }]);
+        s.act("open", "open inbox", None, 3.0, |c| save_wm_tx(c, &fork))
+            .unwrap();
+        assert_eq!(s.load_wm().unwrap(), Some(fork.clone()));
+
+        // Jump across the fork to the abandoned branch's tip.
+        assert_eq!(s.travel(2).unwrap().as_deref(), Some("open about"));
+        assert_eq!(s.load_wm().unwrap(), Some(two));
+        // Jump to the origin.
+        assert_eq!(s.travel(0).unwrap().as_deref(), Some("the beginning"));
+        assert_eq!(s.load_wm().unwrap(), None);
+        // And back out to the fork's tip again.
+        assert_eq!(s.travel(3).unwrap().as_deref(), Some("open inbox"));
+        assert_eq!(s.load_wm().unwrap(), Some(fork));
+        // No-op travel to where we already stand.
+        assert_eq!(s.travel(3).unwrap(), None);
     }
 
     /// Wm state survives the store: save → load → restore is the same

@@ -615,6 +615,8 @@ enum Act {
     LauncherOpen,
     /// The launcher's `i`-th visible hit: go to it / open it.
     LauncherRow(usize),
+    /// A node of the history overlay: travel there (0 = the beginning).
+    HistoryRow(i64),
     /// The overlay's backdrop: tapping outside the rows dismisses it.
     OverlayClose,
 }
@@ -639,7 +641,7 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Row(pid, _)
         | Act::Field(pid, _)
         | Act::Tab(pid) => Some(*pid),
-        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::OverlayClose => None,
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => None,
     }
 }
 
@@ -929,6 +931,8 @@ enum Overlay {
     /// The launcher: a query over everything (double-cmd on desktop, the
     /// search row of the workspaces overlay on touch).
     Launcher,
+    /// The history tree: every action, walkable (cmd+u).
+    History,
 }
 
 /// The launcher's editable state. Hits are recomputed on draw, and kept here
@@ -1488,6 +1492,14 @@ fn help_lines() -> Vec<Line> {
     v.push(Line {
         left: vec![
             kbd("cmd"),
+            kbd("u"),
+            Seg::T(" — history: the whole tree, walkable".into(), Style::N),
+        ],
+        ..Default::default()
+    });
+    v.push(Line {
+        left: vec![
+            kbd("cmd"),
             kbd("["),
             kbd("]"),
             Seg::T(" — consume into / expel out of a column".into(), Style::N),
@@ -1953,6 +1965,7 @@ const WS_MENU_MOVE: u64 = 0x5753_0200;
 const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
+const MENU_HISTORY: u64 = 0x5753_0500;
 
 /// How a `key` chord executes: as a synthesized key event, as text (plain
 /// letters reach panels the same way real typing does), or as a bare
@@ -2178,6 +2191,13 @@ impl Stage {
                     shift: false,
                     enabled: true,
                     name: "Redo — ⇧⌘Z".into(),
+                },
+                MacosMenu::Item {
+                    command: LiveId(MENU_HISTORY),
+                    key: KeyCode::Unknown,
+                    shift: false,
+                    enabled: true,
+                    name: "History — ⌘U".into(),
                 },
                 MacosMenu::Item {
                     command: live_id!(quit),
@@ -2488,7 +2508,9 @@ impl Stage {
         }
         // The workspaces overlay dismisses on esc; cmd chords below still
         // work through it.
-        if state.overlay == Overlay::Ws && k.key_code == KeyCode::Escape {
+        if matches!(state.overlay, Overlay::Ws | Overlay::History)
+            && k.key_code == KeyCode::Escape
+        {
             state.overlay = Overlay::None;
             self.kick(cx);
             return;
@@ -2546,6 +2568,15 @@ impl Stage {
                 } else {
                     self.do_undo(cx);
                 }
+                return;
+            }
+            if k.key_code == KeyCode::KeyU {
+                state.overlay = if state.overlay == Overlay::History {
+                    Overlay::None
+                } else {
+                    Overlay::History
+                };
+                self.kick(cx);
                 return;
             }
             if k.key_code == KeyCode::KeyW {
@@ -3110,6 +3141,32 @@ impl Stage {
                 }
                 return;
             }
+            Act::HistoryRow(id) => {
+                let was = state.ws.active;
+                match state.store.travel(id) {
+                    Ok(Some(label)) => {
+                        state.reload_wm();
+                        state.sync();
+                        if state.ws.active != was {
+                            let cam = state.ws.camera_x;
+                            state.anim.camera().jump_to(cam);
+                        }
+                        for w in &state.workers {
+                            w.kick();
+                        }
+                        if let Some(s) = &state.sender {
+                            s.kick();
+                        }
+                        state.toast(format!("history — {label}"), false);
+                    }
+                    Ok(None) => {}
+                    Err(e) => state.toast(format!("travel failed: {e}"), true),
+                }
+                // The overlay stays up: browsing history is the point.
+                self.update_menu(cx);
+                self.kick(cx);
+                return;
+            }
             Act::OverlayClose => {
                 state.overlay = Overlay::None;
                 self.kick(cx);
@@ -3338,7 +3395,7 @@ impl Stage {
                 self.sync(cx);
             }
             // Handled above — they return before reaching this match.
-            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::OverlayClose => {}
+            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => {}
         }
     }
 
@@ -3673,6 +3730,11 @@ impl Widget for Stage {
                     self.do_undo(cx);
                 } else if id == MENU_REDO {
                     self.do_redo(cx);
+                } else if id == MENU_HISTORY {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        state.overlay = Overlay::History;
+                    }
+                    self.kick(cx);
                 }
             }
 
@@ -4210,6 +4272,7 @@ impl Stage {
                 cursor: MouseCursor::Default,
                 label: match state.overlay {
                     Overlay::Ws => "workspaces",
+                    Overlay::History => "history",
                     _ => "launcher",
                 }
                 .into(),
@@ -4303,6 +4366,111 @@ impl Stage {
         // The launcher: a query field over the result rows, windowed around
         // the selection. Hits are recomputed here, on what is actually
         // drawn, so clicks and enter resolve against the visible list.
+        // The history overlay: the action DAG as rows, newest first, indented
+        // by branch depth. The row under HEAD is inverted; undone branches
+        // are muted but clickable — travel goes anywhere, including the
+        // beginning. Expired sends are physics: marked, never re-walked.
+        if state.overlay == Overlay::History {
+            let (nodes, head) = state.store.history().unwrap_or((Vec::new(), 0));
+            let mut depth: HashMap<i64, usize> = HashMap::new();
+            for n in &nodes {
+                let d = depth.get(&n.parent).map_or(0, |d| d + 1);
+                depth.insert(n.id, d);
+            }
+            struct HRow {
+                id: i64,
+                text: String,
+                right: String,
+                state: &'static str,
+            }
+            let mut rows: Vec<HRow> = nodes
+                .iter()
+                .rev()
+                .map(|n| {
+                    let ind = "  ".repeat((*depth.get(&n.id).unwrap_or(&0)).min(6));
+                    HRow {
+                        id: n.id,
+                        text: format!("{ind}{}", n.label),
+                        right: match n.state.as_str() {
+                            "expired" => format!("{} · sent", mail::fmt_date(n.ts)),
+                            _ => mail::fmt_date(n.ts),
+                        },
+                        state: match n.state.as_str() {
+                            "applied" => "applied",
+                            "expired" => "expired",
+                            _ => "undone",
+                        },
+                    }
+                })
+                .collect();
+            rows.push(HRow {
+                id: 0,
+                text: "the beginning".into(),
+                right: String::new(),
+                state: "applied",
+            });
+
+            let row_h: f64 = 40.0;
+            let row_gap: f64 = 8.0;
+            let w = (vp.size.x - 4.0 * theme::GAP).min(560.0);
+            let x = vp.pos.x + (vp.size.x - w) / 2.0;
+            let top = vp.pos.y + 2.0 * theme::GAP;
+            let avail = (vp.pos.y + vp.size.y - 2.0 * theme::GAP - top).max(0.0);
+            let max_rows = (((avail + row_gap) / (row_h + row_gap)).floor() as usize).max(1);
+            let head_idx = rows.iter().position(|r| r.id == head).unwrap_or(0);
+            let start = (head_idx + 1).saturating_sub(max_rows.max(3) - 2).min(
+                rows.len().saturating_sub(max_rows),
+            );
+            let end = (start + max_rows).min(rows.len());
+
+            self.draw_panel.new_draw_call(cx);
+            let mut texts: Vec<(DVec2, String, theme::Rgba, f64)> = Vec::new();
+            let mut y = top;
+            for r in &rows[start..end] {
+                let rr = rect(x, y, w, row_h);
+                let is_head = r.id == head;
+                let (bg, fg) = if is_head {
+                    (theme::INK, theme::BG)
+                } else {
+                    (theme::BG, theme::INK)
+                };
+                let alpha = if r.state == "applied" || is_head { 1.0 } else { 0.45 };
+                self.draw_panel.color = rgba_a(bg, 1.0);
+                self.draw_panel.border_color = rgba_a(theme::INK, if is_head { 1.0 } else { alpha });
+                self.draw_panel.border_size = 1.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, rr);
+                let ty = y + (row_h - self.cell.natural) / 2.0;
+                let rx = x + w - 16.0 - r.right.chars().count() as f64 * self.cell.adv;
+                if !r.right.is_empty() {
+                    texts.push((dvec2(rx, ty), r.right.clone(), fg, 0.5 * alpha + 0.05));
+                }
+                let cols = (((rx - 12.0 - (x + 16.0)) / self.cell.adv).max(4.0)) as usize;
+                texts.push((dvec2(x + 16.0, ty), trunc(&r.text, cols), fg, alpha));
+                self.hits.push(HitR {
+                    rect: rr,
+                    act: Act::HistoryRow(r.id),
+                    cursor: MouseCursor::Hand,
+                    label: r.text.trim().to_string(),
+                });
+                y += row_h + row_gap;
+            }
+            if end < rows.len() {
+                texts.push((
+                    dvec2(x + 16.0, y + 6.0),
+                    format!("… {} earlier", rows.len() - end),
+                    theme::INK,
+                    0.45,
+                ));
+            }
+            self.draw_mono.new_draw_call(cx);
+            for (pos, s, color, alpha) in texts {
+                self.set_text(Style::N, 1.0);
+                self.draw_mono.color = rgba_a(color, alpha);
+                self.draw_mono.draw_abs(cx, pos, &s);
+            }
+        }
+
         if state.overlay == Overlay::Launcher {
             state.launcher.hits =
                 launcher::search(&state.ws, &state.store, &state.launcher.query);
