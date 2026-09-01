@@ -4,12 +4,14 @@
 //! **go to** ([`Go::Focus`] — switch workspace, focus it); anything else is
 //! an **open** ([`Go::Open`] — a fresh un-joined column on the active
 //! workspace). The list is built from the open panels themselves, the root
-//! panels, and the mail world (senders as contacts, mails by subject); when
-//! real kinds arrive (telegram, rss, kb), each contributes its entries here
-//! and this becomes the global search.
+//! panels, and the mail world (senders as contacts, mails by subject) — all
+//! read through the store's query layer; when real kinds arrive (telegram,
+//! rss, kb), each contributes its entries here and this becomes the global
+//! search.
 
 use crate::core::{Kind, PanelId, Wm, WS_N};
-use crate::data;
+use crate::mail;
+use crate::store::Store;
 
 /// What activating a hit does.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,13 +59,25 @@ fn kind_word(kind: &Kind) -> &'static str {
 }
 
 /// The muted line under/next to a hit: what identifies it beyond the title.
-fn kind_detail(kind: &Kind) -> String {
+fn kind_detail(store: &Store, kind: &Kind) -> String {
     match kind {
-        Kind::Message { id } => data::mail(id)
-            .map(|m| m.from_name.to_string())
+        Kind::Message { id } => mail::mail(store, *id)
+            .map(|m| m.head.from_name)
             .unwrap_or_default(),
-        Kind::Contact { email } => (*email).to_string(),
+        Kind::Contact { email } => email.clone(),
         _ => kind_word(kind).to_string(),
+    }
+}
+
+/// Sender words for an open mail panel's haystack, so "vera" finds the open
+/// message the same way it finds the unopened one.
+fn mail_extra(store: &Store, kind: &Kind) -> String {
+    match kind {
+        Kind::Message { id } => mail::mail(store, *id)
+            .map(|m| format!("{} {}", m.head.from_email, mail::fmt_date(m.head.date)))
+            .unwrap_or_default(),
+        Kind::Contact { email } => email.clone(),
+        _ => String::new(),
     }
 }
 
@@ -73,7 +87,7 @@ fn kind_detail(kind: &Kind) -> String {
 /// copy; an empty query lists just the open panels and the roots — the pure
 /// switcher.
 #[must_use]
-pub fn search(wm: &Wm, query: &str) -> Vec<Hit> {
+pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
     let tokens: Vec<String> = query
         .split_whitespace()
         .map(str::to_lowercase)
@@ -111,13 +125,13 @@ pub fn search(wm: &Wm, query: &str) -> Vec<Hit> {
     };
 
     for (k, pid, kind) in &open {
-        let extra = format!("{} {}", kind_word(kind), mail_extra(kind));
+        let extra = format!("{} {}", kind_word(kind), mail_extra(store, kind));
         push(
             &mut hits,
             &mut seen,
             Hit {
-                label: kind.title(),
-                detail: kind_detail(kind),
+                label: mail::title(store, kind),
+                detail: kind_detail(store, kind),
                 ws: Some(*k),
                 go: Go::Focus(*pid),
             },
@@ -140,8 +154,8 @@ pub fn search(wm: &Wm, query: &str) -> Vec<Hit> {
             hits,
             seen,
             Hit {
-                label: kind.title(),
-                detail: kind_detail(&kind),
+                label: mail::title(store, &kind),
+                detail: kind_detail(store, &kind),
                 ws,
                 go,
             },
@@ -157,24 +171,19 @@ pub fn search(wm: &Wm, query: &str) -> Vec<Hit> {
     // Contacts and mails only when there is a query — the empty launcher is
     // the switcher, not a directory dump.
     if !tokens.is_empty() {
-        let mut seen_senders: Vec<&str> = Vec::new();
-        for m in data::mails() {
-            if seen_senders.contains(&m.from_email) {
-                continue;
-            }
-            seen_senders.push(m.from_email);
-            let extra = format!("contact {}", m.from_email);
+        for s in mail::senders(store).iter() {
+            let extra = format!("contact {}", s.email);
             candidate(
                 &mut hits,
                 &mut seen,
                 Kind::Contact {
-                    email: m.from_email,
+                    email: s.email.clone(),
                 },
                 &extra,
             );
         }
-        for m in data::mails() {
-            let extra = format!("mail {} {}", m.from_email, m.date);
+        for m in mail::all(store).iter() {
+            let extra = format!("mail {} {}", m.from_email, mail::fmt_date(m.date));
             candidate(&mut hits, &mut seen, Kind::Message { id: m.id }, &extra);
         }
     }
@@ -182,34 +191,24 @@ pub fn search(wm: &Wm, query: &str) -> Vec<Hit> {
     hits
 }
 
-/// Sender words for an open mail panel's haystack, so "vera" finds the open
-/// message the same way it finds the unopened one.
-fn mail_extra(kind: &Kind) -> String {
-    match kind {
-        Kind::Message { id } => data::mail(id)
-            .map(|m| format!("{} {}", m.from_email, m.date))
-            .unwrap_or_default(),
-        Kind::Contact { email } => (*email).to_string(),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn wm() -> Wm {
+    fn world() -> (Wm, Store) {
+        let store = Store::open(None).expect("in-memory store");
+        mail::seed_if_empty(&store).expect("seed");
         let mut wm = Wm::new();
         wm.open(Kind::Help, None, false);
         let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
         wm.focus = Some(inbox);
-        wm
+        (wm, store)
     }
 
     #[test]
     fn empty_query_is_the_switcher() {
-        let wm = wm();
-        let hits = search(&wm, "");
+        let (wm, store) = world();
+        let hits = search(&wm, &store, "");
         // Open help + inbox, then the two unopened roots; no mails, no people.
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].label, "help");
@@ -222,35 +221,35 @@ mod tests {
 
     #[test]
     fn mails_and_contacts_match_by_any_word() {
-        let wm = wm();
-        let hits = search(&wm, "vera");
+        let (wm, store) = world();
+        let hits = search(&wm, &store, "vera");
         // The contact first, then her mail — neither is open.
         assert_eq!(hits[0].label, "Vera Kovac");
         assert!(matches!(
-            hits[0].go,
-            Go::Open(Kind::Contact { email: "vera@kovac.io" })
+            &hits[0].go,
+            Go::Open(Kind::Contact { email }) if email == "vera@kovac.io"
         ));
         assert!(hits[1..]
             .iter()
-            .any(|h| matches!(h.go, Go::Open(Kind::Message { id: "m1" }))));
+            .any(|h| matches!(h.go, Go::Open(Kind::Message { id: 1 }))));
         // Every token must match: sender + a subject word.
-        let hits = search(&wm, "vera q3");
+        let hits = search(&wm, &store, "vera q3");
         assert!(hits
             .iter()
             .all(|h| !matches!(h.go, Go::Open(Kind::Contact { .. }))));
         assert!(hits
             .iter()
-            .any(|h| matches!(h.go, Go::Open(Kind::Message { id: "m1" }))));
+            .any(|h| matches!(h.go, Go::Open(Kind::Message { id: 1 }))));
     }
 
     #[test]
     fn open_panels_win_over_second_copies() {
-        let mut wm = wm();
+        let (mut wm, store) = world();
         // Open m1's message on workspace 3.
         wm.switch(2);
-        let msg = wm.open(Kind::Message { id: "m1" }, None, false);
+        let msg = wm.open(Kind::Message { id: 1 }, None, false);
         wm.switch(0);
-        let hits = search(&wm, "q3");
+        let hits = search(&wm, &store, "q3");
         // Exactly one hit for m1: a Focus at workspace 3, not an Open.
         let m1: Vec<&Hit> = hits
             .iter()
@@ -263,10 +262,10 @@ mod tests {
 
     #[test]
     fn active_workspace_panels_lead() {
-        let mut wm = wm();
+        let (mut wm, store) = world();
         wm.switch(4);
         wm.open(Kind::About, None, false);
-        let hits = search(&wm, "");
+        let hits = search(&wm, &store, "");
         // Workspace 5 is active: its panel sorts before workspace 1's.
         assert_eq!(hits[0].label, "about");
         assert_eq!(hits[0].ws, Some(4));
@@ -274,10 +273,10 @@ mod tests {
 
     #[test]
     fn focus_panel_switches_and_focuses() {
-        let mut wm = wm();
+        let (mut wm, _store) = world();
         let help = wm.columns[0].panels[0];
         wm.switch(2);
-        let msg = wm.open(Kind::Message { id: "m2" }, None, false);
+        let msg = wm.open(Kind::Message { id: 2 }, None, false);
         assert_eq!(wm.focus_panel(help), Some(0));
         assert_eq!(wm.active, 0);
         assert_eq!(wm.focus, Some(help));

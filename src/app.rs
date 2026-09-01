@@ -25,10 +25,11 @@ use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
-use crate::data::{self, MailId, MailState};
+use crate::core::{self, Dir, Kind, MailId, PanelId, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
+use crate::mail;
+use crate::store::Store;
 use crate::spring::{Spring, SpringParams};
 use crate::theme;
 
@@ -49,6 +50,9 @@ struct Config {
     grid: Option<core::Grid>,
     /// Force the window size (`--window 380x840`): preview a phone screen.
     window: Option<(f64, f64)>,
+    /// Override the store's path (`--db PATH`). E2e runs default to a fresh
+    /// temp file; normal runs to the platform data dir.
+    db: Option<String>,
 }
 
 fn parse_wxh(s: &str) -> Option<(f64, f64)> {
@@ -82,6 +86,7 @@ fn config() -> &'static Config {
                     });
                 }
                 "--window" => c.window = args.next().and_then(|s| parse_wxh(&s)),
+                "--db" => c.db = args.next(),
                 other => eprintln!("superapp: ignoring unknown argument {other:?}"),
             }
         }
@@ -92,6 +97,41 @@ fn config() -> &'static Config {
 /// An e2e run stays behind every normal window unless `--front` asks otherwise.
 fn background_run() -> bool {
     config().e2e.is_some() && !config().front
+}
+
+/// Where the store lives: `--db` wins; an e2e run gets a fresh temp file
+/// (deleted first, so every run seeds the same demo world); otherwise the
+/// platform data dir. `None` (no resolvable home) falls back to in-memory.
+fn db_path(cx: &Cx) -> Option<std::path::PathBuf> {
+    if let Some(p) = &config().db {
+        return Some(std::path::PathBuf::from(p));
+    }
+    if config().e2e.is_some() {
+        let p = std::env::temp_dir().join(format!("superapp-e2e-{}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(p.with_file_name(format!(
+                "{}{suffix}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        return Some(p);
+    }
+    #[cfg(target_os = "android")]
+    {
+        return cx
+            .os_type()
+            .get_data_dir()
+            .map(|d| std::path::Path::new(&d).join("superapp.db"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = cx;
+        let home = std::env::var_os("HOME")?;
+        let dir =
+            std::path::PathBuf::from(home).join("Library/Application Support/superapp");
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join("superapp.db"))
+    }
 }
 
 /// The desktop window frame: the display's visible frame, unless `--window`
@@ -445,7 +485,7 @@ struct PanelUi {
 }
 
 impl PanelUi {
-    fn for_kind(kind: &Kind, mail: &mut MailState) -> Self {
+    fn for_kind(kind: &Kind, store: &Store) -> Self {
         let mut ui = PanelUi {
             kind: kind.clone(),
             sel: None,
@@ -461,16 +501,16 @@ impl PanelUi {
         match kind {
             Kind::Inbox { filter } => {
                 if let Some(f) = filter {
-                    ui.filter.text = (*f).to_string();
+                    ui.filter.text = f.clone();
                     ui.filter.caret = ui.filter.text.chars().count();
                 }
             }
-            Kind::Message { id } => mail.mark_read(id),
+            Kind::Message { id } => mail::mark_read(store, *id),
             Kind::Compose { re } => {
-                if let Some(m) = data::mail(re) {
-                    ui.to.text = m.from_email.to_string();
+                if let Some(m) = mail::mail(store, *re) {
+                    ui.to.text = m.head.from_email;
                     ui.to.caret = ui.to.text.chars().count();
-                    ui.subject.text = format!("Re: {}", m.subject);
+                    ui.subject.text = format!("Re: {}", m.head.subject);
                     ui.subject.caret = ui.subject.text.chars().count();
                 }
             }
@@ -833,7 +873,10 @@ struct LauncherUi {
 
 struct State {
     ws: Wm,
-    mail: MailState,
+    store: Store,
+    /// The last persisted logical snapshot — [`State::sync`] only writes
+    /// when the state actually changed.
+    last_saved: Option<core::WmSnap>,
     ui: HashMap<PanelId, PanelUi>,
     anim: Anim,
     viewport: DVec2,
@@ -888,14 +931,27 @@ fn grid_for(vp: DVec2) -> core::Grid {
 }
 
 impl State {
-    fn new() -> Self {
-        let mut ws = Wm::new();
-        ws.open(Kind::Help, None, false);
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
-        ws.focus = Some(inbox);
+    fn new(store: Store) -> Self {
+        // Boot restores the last session from the store; a store that never
+        // booted gets the default layout (and persists it on first sync).
+        let ws = match store.load_wm() {
+            Ok(Some(snap)) => Wm::restore(snap),
+            Ok(None) => {
+                let mut ws = Wm::new();
+                ws.open(Kind::Help, None, false);
+                let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+                ws.focus = Some(inbox);
+                ws
+            }
+            Err(e) => {
+                eprintln!("store: loading the session failed: {e}");
+                Wm::new()
+            }
+        };
         State {
             ws,
-            mail: MailState::new(),
+            store,
+            last_saved: None,
             ui: HashMap::new(),
             anim: Anim::default(),
             viewport: dvec2(1440.0, 900.0),
@@ -918,7 +974,7 @@ impl State {
     }
 
     fn panel_title(&self, kind: &Kind) -> String {
-        kind.title()
+        mail::title(&self.store, kind)
     }
 
     /// Recomputes targets after a mutation and feeds the animator. The camera
@@ -942,7 +998,7 @@ impl State {
                 None => true,
             };
             if fresh {
-                let ui = PanelUi::for_kind(kind, &mut self.mail);
+                let ui = PanelUi::for_kind(kind, &self.store);
                 if matches!(kind, Kind::Compose { .. }) {
                     self.field = Some((*pid, FieldId::Body));
                 }
@@ -980,6 +1036,17 @@ impl State {
             .map(|p| (p.id, self.panel_title(&p.kind)))
             .collect();
         self.anim.apply(&scenes, active, &titles);
+
+        // Persist the logical state — every mutation path funnels through
+        // sync, so a diff here catches them all. Springs and cameras are
+        // deliberately not part of the snapshot.
+        let snap = self.ws.snapshot();
+        if self.last_saved.as_ref() != Some(&snap) {
+            if let Err(e) = self.store.save_wm(&snap) {
+                eprintln!("store: persisting the session failed: {e}");
+            }
+            self.last_saved = Some(snap);
+        }
     }
 
     /// Trackpad pan: 1:1, no spring.
@@ -996,13 +1063,13 @@ impl State {
     }
 
     /// Rows the inbox panel currently shows.
-    fn inbox_rows(&self, pid: PanelId) -> Vec<&'static data::Mail> {
+    fn inbox_rows(&self, pid: PanelId) -> Vec<mail::MailHead> {
         let filter = self
             .ui
             .get(&pid)
             .map(|u| u.filter.text.clone())
             .unwrap_or_default();
-        self.mail.inbox_filtered(&filter)
+        mail::inbox_filtered(&self.store, &filter)
     }
 }
 
@@ -1283,19 +1350,18 @@ fn inbox_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
         v.push(Line::text("no messages", Style::Muted));
     }
     for m in rows {
-        let unread = state.mail.is_unread(m.id);
-        let st = if unread { Style::Bold } else { Style::N };
+        let st = if m.unread { Style::Bold } else { Style::N };
         v.push(Line {
             left: vec![
-                Seg::T(pad_to(m.from_name, from_w), st),
+                Seg::T(pad_to(&m.from_name, from_w), st),
                 Seg::Sp(1),
                 Seg::Link {
-                    label: trunc(m.subject, subj_w),
+                    label: trunc(&m.subject, subj_w),
                     target: Kind::Message { id: m.id },
                     dotted: false,
                 },
             ],
-            right: vec![Seg::T(m.date.into(), Style::Muted)],
+            right: vec![Seg::T(mail::fmt_date(m.date), Style::Muted)],
             row: Some(m.id),
             rule: true,
             ..Default::default()
@@ -1305,18 +1371,18 @@ fn inbox_lines(state: &State, pid: PanelId, cols: usize) -> Vec<Line> {
 }
 
 fn message_lines(state: &State, id: &MailId, cols: usize) -> Vec<Line> {
-    let Some(m) = data::mail(id) else {
+    let Some(m) = mail::mail(&state.store, *id) else {
         return vec![Line::text("message not found", Style::Muted)];
     };
-    let (newer, older) = state.mail.neighbours(id);
+    let (newer, older) = mail::neighbours(&state.store, *id);
     let mut v = Vec::new();
     v.push(Line {
         left: vec![
             Seg::T(pad_to("FROM", 6), Style::Label),
             Seg::Link {
-                label: format!("{} <{}>", m.from_name, m.from_email),
+                label: format!("{} <{}>", m.head.from_name, m.head.from_email),
                 target: Kind::Contact {
-                    email: m.from_email,
+                    email: m.head.from_email.clone(),
                 },
                 dotted: false,
             },
@@ -1326,23 +1392,23 @@ fn message_lines(state: &State, id: &MailId, cols: usize) -> Vec<Line> {
     v.push(Line {
         left: vec![
             Seg::T(pad_to("TO", 6), Style::Label),
-            Seg::T(data::ME.into(), Style::Muted),
+            Seg::T(mail::me(&state.store), Style::Muted),
         ],
         ..Default::default()
     });
     v.push(Line {
         left: vec![
             Seg::T(pad_to("DATE", 6), Style::Label),
-            Seg::T(m.date.into(), Style::N),
+            Seg::T(mail::fmt_date(m.head.date), Style::N),
         ],
         rule: true,
         ..Default::default()
     });
-    if let Some((s, err)) = m.status {
-        v.push(Line::text(s, if err { Style::Err } else { Style::T2 }));
+    if let Some((s, err)) = &m.status {
+        v.push(Line::text(s.clone(), if *err { Style::Err } else { Style::T2 }));
         v.push(Line::blank());
     }
-    for para in m.body {
+    for para in m.body.split("\n\n") {
         for l in wrap(para, cols) {
             v.push(Line::text(l, Style::N));
         }
@@ -1375,24 +1441,19 @@ fn message_lines(state: &State, id: &MailId, cols: usize) -> Vec<Line> {
     ];
     nav.right = vec![Seg::Link {
         label: "reply".into(),
-        target: Kind::Compose { re: m.id },
+        target: Kind::Compose { re: m.head.id },
         dotted: false,
     }];
     v.push(nav);
     v
 }
 
-fn contact_lines(state: &State, email: &&'static str) -> Vec<Line> {
-    let name = data::mails()
-        .iter()
-        .find(|m| m.from_email == *email)
-        .map(|m| m.from_name)
-        .unwrap_or(email);
-    let count = state.mail.count_from(email);
-    let first = name.split(' ').next().unwrap_or(name).to_lowercase();
+fn contact_lines(state: &State, email: &str) -> Vec<Line> {
+    let (name, count) = mail::contact(&state.store, email);
+    let first = name.split(' ').next().unwrap_or(&name).to_lowercase();
     vec![
-        Line::text(name, Style::Big),
-        Line::text(*email, Style::Muted),
+        Line::text(name.clone(), Style::Big),
+        Line::text(email, Style::Muted),
         Line::blank(),
         Line::text(format!("{count} message(s) in mail"), Style::N),
         Line::blank(),
@@ -1400,7 +1461,7 @@ fn contact_lines(state: &State, email: &&'static str) -> Vec<Line> {
             left: vec![Seg::Link {
                 label: format!("messages from {first}"),
                 target: Kind::Inbox {
-                    filter: Some(email),
+                    filter: Some(email.to_string()),
                 },
                 dotted: false,
             }],
@@ -2539,7 +2600,7 @@ impl Stage {
                 self.kick(cx);
             }
             (Some(Kind::Message { id }), "j") | (Some(Kind::Message { id }), "k") => {
-                let (newer, older) = state.mail.neighbours(&id);
+                let (newer, older) = mail::neighbours(&state.store, id);
                 let t = if input == "j" { older } else { newer };
                 if let Some(t) = t {
                     state.ws.follow_replace(f, Kind::Message { id: t }, false);
@@ -2662,9 +2723,11 @@ impl Stage {
                         if let Some(Kind::Message { id }) =
                             state.ws.panels.get(&pid).map(|p| p.kind.clone())
                         {
-                            state.mail.archive(&id);
-                            if let Some(m) = data::mail(&id) {
-                                state.toast(format!("archived “{}” (fake)", m.subject), false);
+                            let subject =
+                                mail::mail(&state.store, id).map(|m| m.head.subject);
+                            mail::archive(&state.store, id);
+                            if let Some(s) = subject {
+                                state.toast(format!("archived “{s}”"), false);
                             }
                             state.ws.close(pid);
                         }
@@ -2921,7 +2984,14 @@ impl Widget for Stage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         if matches!(event, Event::Startup) {
             if self.state.is_none() {
-                let mut s = State::new();
+                let path = db_path(cx);
+                let store = Store::open(path.as_deref()).unwrap_or_else(|e| {
+                    panic!("store: opening {path:?} failed: {e}")
+                });
+                if let Err(e) = mail::seed_if_empty(&store) {
+                    eprintln!("store: seeding demo mail failed: {e}");
+                }
+                let mut s = State::new(store);
                 s.sync();
                 self.state = Some(Box::new(s));
             }
@@ -3611,7 +3681,8 @@ impl Stage {
         // the selection. Hits are recomputed here, on what is actually
         // drawn, so clicks and enter resolve against the visible list.
         if state.overlay == Overlay::Launcher {
-            state.launcher.hits = launcher::search(&state.ws, &state.launcher.query);
+            state.launcher.hits =
+                launcher::search(&state.ws, &state.store, &state.launcher.query);
             let n_hits = state.launcher.hits.len();
             state.launcher.sel = state.launcher.sel.min(n_hits.saturating_sub(1));
             let field_h: f64 = 54.0;
@@ -3955,7 +4026,7 @@ impl Stage {
         let max_scroll = (content_h - view_h).max(0.0);
         let (scroll, sel, caret_focus) = {
             let ui = state.ui.entry(pid).or_insert_with(|| {
-                PanelUi::for_kind(&kind, &mut state.mail)
+                PanelUi::for_kind(&kind, &state.store)
             });
             ui.max_scroll = max_scroll;
             ui.view_h = view_h;
@@ -4087,8 +4158,8 @@ impl Stage {
                 rect: row_r,
                 act: Act::Row(pid, mid),
                 cursor: MouseCursor::Default,
-                label: data::mail(&mid)
-                    .map(|m| m.subject.to_string())
+                label: mail::mail(&state.store, mid)
+                    .map(|m| m.head.subject)
                     .unwrap_or_default(),
             });
         }

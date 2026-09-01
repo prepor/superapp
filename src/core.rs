@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 
-use crate::data::{self, MailId};
+/// A mail's identity: its row id in the store.
+pub type MailId = i64;
 
 /// Stable panel identity.
 pub type PanelId = u64;
@@ -47,7 +48,7 @@ pub enum Kind {
     /// The mail list, optionally pre-filtered (a contact's address).
     Inbox {
         /// Substring filter baked into the panel's params (not the typed one).
-        filter: Option<&'static str>,
+        filter: Option<String>,
     },
     /// One mail.
     Message {
@@ -57,7 +58,7 @@ pub enum Kind {
     /// A sender's card.
     Contact {
         /// The sender's address.
-        email: &'static str,
+        email: String,
     },
     /// A reply draft.
     Compose {
@@ -78,29 +79,6 @@ impl Kind {
             Kind::Message { .. } => (4, 3),
             Kind::Contact { .. } => (3, 2),
             Kind::Compose { .. } => (4, 4),
-        }
-    }
-
-    /// The panel's display title — what headers, tab strips, the workspaces
-    /// overlay and the launcher all show for this kind.
-    #[must_use]
-    pub fn title(&self) -> String {
-        match self {
-            Kind::Help => "help".into(),
-            Kind::About => "about".into(),
-            Kind::Inbox { filter: Some(f) } => format!("inbox · {f}"),
-            Kind::Inbox { filter: None } => "inbox".into(),
-            Kind::Message { id } => data::mail(id)
-                .map(|m| m.subject.to_string())
-                .unwrap_or_else(|| "message".into()),
-            Kind::Contact { email } => data::mails()
-                .iter()
-                .find(|m| m.from_email == *email)
-                .map(|m| m.from_name.to_string())
-                .unwrap_or_else(|| (*email).to_string()),
-            Kind::Compose { re } => data::mail(re)
-                .map(|m| format!("re: {}", m.subject))
-                .unwrap_or_else(|| "new mail".into()),
         }
     }
 }
@@ -1097,6 +1075,109 @@ impl Wm {
             w.set_grid(grid);
         }
     }
+
+    /// The logical state worth keeping: what the store persists and boot
+    /// restores. Ephemeral physics — cameras, grids — deliberately absent;
+    /// the shell re-derives both.
+    #[must_use]
+    pub fn snapshot(&self) -> WmSnap {
+        WmSnap {
+            active: self.active,
+            wss: self.wss.iter().map(Ws::snapshot).collect(),
+        }
+    }
+
+    /// Rebuilds the whole set from a snapshot (boot restore). Id minting
+    /// resumes above every id already used in each workspace's range —
+    /// counted across *all* spaces, because a moved panel keeps its id but
+    /// not its home.
+    #[must_use]
+    pub fn restore(snap: WmSnap) -> Self {
+        let mut wm = Wm::new();
+        wm.active = snap.active.min(WS_N - 1);
+        let mut max_id = vec![0u64; WS_N];
+        for ws in &snap.wss {
+            for (id, _) in &ws.panels {
+                let k = (id >> 32) as usize;
+                if k < WS_N {
+                    max_id[k] = max_id[k].max(*id);
+                }
+            }
+        }
+        for (k, s) in snap.wss.into_iter().take(WS_N).enumerate() {
+            let w = &mut wm.wss[k];
+            w.columns = s
+                .columns
+                .into_iter()
+                .map(|(panels, tabbed, active)| Column {
+                    panels,
+                    tabbed,
+                    active,
+                })
+                .collect();
+            w.panels = s
+                .panels
+                .into_iter()
+                .map(|(id, kind)| (id, Panel { id, kind }))
+                .collect();
+            w.joins = s.joins.into_iter().collect();
+            w.focus = s.focus.filter(|f| w.panels.contains_key(f));
+            w.next_id = w.next_id.max(max_id[k]);
+            w.validate_joins();
+            w.normalize();
+        }
+        wm
+    }
+}
+
+/// One workspace's logical state, detached from behaviour (see
+/// [`Wm::snapshot`]). Plain data: the store serializes it, tests round-trip
+/// it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WsSnap {
+    /// Columns left to right: `(panel ids top to bottom, tabbed, active)`.
+    pub columns: Vec<(Vec<PanelId>, bool, usize)>,
+    /// Every panel, sorted by id.
+    pub panels: Vec<(PanelId, Kind)>,
+    /// Joins, `(parent, child)`, sorted.
+    pub joins: Vec<(PanelId, PanelId)>,
+    /// The focused panel.
+    pub focus: Option<PanelId>,
+}
+
+/// The whole set's logical state (see [`Wm::snapshot`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WmSnap {
+    /// Index of the active workspace.
+    pub active: usize,
+    /// All [`WS_N`] workspaces, in order.
+    pub wss: Vec<WsSnap>,
+}
+
+impl Ws {
+    /// This workspace's logical state (see [`Wm::snapshot`]).
+    #[must_use]
+    pub fn snapshot(&self) -> WsSnap {
+        let mut panels: Vec<(PanelId, Kind)> = self
+            .panels
+            .values()
+            .map(|p| (p.id, p.kind.clone()))
+            .collect();
+        panels.sort_by_key(|(id, _)| *id);
+        let mut joins: Vec<(PanelId, PanelId)> =
+            self.joins.iter().map(|(&a, &b)| (a, b)).collect();
+        joins.sort_unstable();
+        WsSnap {
+            columns: self
+                .columns
+                .iter()
+                .map(|c| (c.panels.clone(), c.tabbed, c.active))
+                .collect(),
+            panels,
+            joins,
+            focus: self.focus,
+        }
+    }
 }
 
 impl std::ops::Deref for Wm {
@@ -1156,18 +1237,18 @@ mod tests {
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"]]);
 
         // Open m1 from the inbox: new column right, joined.
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
         assert_eq!(ws.joined_child(inbox), Some(msg));
 
         // Open m2: must replace the joined panel, not open another.
-        let msg2 = ws.follow_open(inbox, Kind::Message { id: "m2" }, false);
+        let msg2 = ws.follow_open(inbox, Kind::Message { id: 2 }, false);
         assert_eq!(msg2, msg);
-        assert_eq!(ws.panels[&msg].kind, Kind::Message { id: "m2" });
+        assert_eq!(ws.panels[&msg].kind, Kind::Message { id: 2 });
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
 
         // Contact from the message: a joined chain.
-        let contact = ws.follow_open(msg, Kind::Contact { email: "e" }, false);
+        let contact = ws.follow_open(msg, Kind::Contact { email: "e".into() }, false);
         assert_eq!(ws.joined_child(msg), Some(contact));
         assert_eq!(
             kinds(&ws),
@@ -1175,13 +1256,13 @@ mod tests {
         );
 
         // Open m3 from the inbox: replaces joined AND cascade-closes contact.
-        ws.follow_open(inbox, Kind::Message { id: "m3" }, false);
+        ws.follow_open(inbox, Kind::Message { id: 3 }, false);
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
         assert!(ws.joined_child(msg).is_none());
 
         // Contact again, then a dotted replace on the message: cascade again.
-        ws.follow_open(msg, Kind::Contact { email: "e2" }, false);
-        ws.follow_replace(msg, Kind::Message { id: "m4" }, false);
+        ws.follow_open(msg, Kind::Contact { email: "e2".into() }, false);
+        ws.follow_replace(msg, Kind::Message { id: 4 }, false);
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
 
         // Move the INBOX left: pair no longer adjacent → join must drop.
@@ -1191,7 +1272,7 @@ mod tests {
 
         // No join left → the next open must create a NEW joined panel right of
         // the inbox, not touch the far-away message.
-        let m5 = ws.follow_open(inbox, Kind::Message { id: "m5" }, false);
+        let m5 = ws.follow_open(inbox, Kind::Message { id: 5 }, false);
         assert_ne!(m5, msg);
         assert_eq!(
             kinds(&ws),
@@ -1201,7 +1282,7 @@ mod tests {
 
         // Alt-open m6: separate panel; it stacks into the joined child's
         // column (3+3 rows fit) and the join must survive.
-        ws.follow_open(inbox, Kind::Message { id: "m6" }, true);
+        ws.follow_open(inbox, Kind::Message { id: 6 }, true);
         assert_eq!(
             kinds(&ws),
             [vec!["inbox"], vec!["msg", "msg"], vec!["help"], vec!["msg"]]
@@ -1217,7 +1298,7 @@ mod tests {
     fn literal_heights_leave_empty_space() {
         let mut ws = Ws::new();
         let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         let scene = ws.scene(VP, opts());
         let inbox_r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
         let msg_r = scene.panels.iter().find(|p| p.id == msg).unwrap().rect;
@@ -1229,8 +1310,7 @@ mod tests {
     fn camera_follows_focus() {
         let mut ws = Ws::new();
         let mut last = ws.open(Kind::Help, None, false);
-        for i in 0..4 {
-            let id: MailId = ["m1", "m2", "m3", "m4"][i];
+        for id in 1..=4 {
             last = ws.open(Kind::Message { id }, Some(last), false);
         }
         ws.ensure_focus_visible(VP, opts());
@@ -1268,7 +1348,7 @@ mod tests {
     #[test]
     fn consume_or_expel_round_trip() {
         let (mut ws, _help, inbox) = boot();
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         // msg is alone right of the inbox: cmd+[ consumes it into the inbox
         // column, at the bottom.
         ws.consume_or_expel(msg, Dir::Left);
@@ -1283,7 +1363,7 @@ mod tests {
     #[test]
     fn consume_from_right_and_expel_bottom() {
         let (mut ws, _help, inbox) = boot();
-        ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         // cmd+, pulls the message into the inbox column.
         ws.consume_from_right(inbox);
         assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox", "msg"]]);
@@ -1297,7 +1377,7 @@ mod tests {
     #[test]
     fn overfull_column_distributes_evenly() {
         let (mut ws, _help, inbox) = boot();
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         ws.consume_or_expel(msg, Dir::Left); // inbox(6) + msg(3) = 9 > 6
         let scene = ws.scene(VP, opts());
         let inbox_r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
@@ -1321,7 +1401,7 @@ mod tests {
         assert!((r.w - (vp.0 - 2.0 * 8.0)).abs() < 0.5, "full width, got {}", r.w);
         assert!((r.h - (vp.1 - 2.0 * 8.0)).abs() < 0.5, "full height, got {}", r.h);
         // A message (4×3 clamped) doesn't fit under it → its own column.
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         assert_ne!(ws.locate(inbox).unwrap().0, ws.locate(msg).unwrap().0);
     }
 
@@ -1395,7 +1475,7 @@ mod tests {
     fn snap_camera_aligns_to_columns() {
         let mut ws = Ws::new();
         let mut last = ws.open(Kind::Help, None, false);
-        for id in ["m1", "m2", "m3"] {
+        for id in 1..=3 {
             last = ws.open(Kind::Message { id }, Some(last), false);
         }
         // Four 4-unit columns on a 12-unit grid: one column of overflow.
@@ -1418,7 +1498,7 @@ mod tests {
     #[test]
     fn tabbed_column_shows_active_only() {
         let (mut ws, help, inbox) = boot();
-        let msg = ws.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         ws.consume_or_expel(msg, Dir::Left); // [help][inbox+msg], focus msg
         ws.toggle_tabbed(msg);
         let scene = ws.scene(VP, opts());
@@ -1480,13 +1560,47 @@ mod tests {
         assert_eq!(wm.roster(), vec![0, 1, 3]);
     }
 
+    /// Snapshot → restore is lossless for the logical state, and id minting
+    /// resumes above every restored id — even for a panel that moved into a
+    /// foreign workspace's range.
+    #[test]
+    fn snapshot_restore_round_trips() {
+        let mut wm = Wm::new();
+        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
+        wm.toggle_tabbed(msg);
+        wm.send_focused_to(2); // msg (a ws-1 id) now lives on ws 3
+        wm.switch(0);
+        wm.focus = Some(inbox);
+
+        let snap = wm.snapshot();
+        let back = Wm::restore(snap.clone());
+        assert_eq!(back.snapshot(), snap, "lossless round trip");
+        assert_eq!(back.active, 0);
+        assert_eq!(back.focus, Some(inbox));
+        assert_eq!(back.wss[2].focus, Some(msg));
+
+        // Fresh ids never collide with restored ones, in either space.
+        let mut back = back;
+        let a = back.open(Kind::About, None, false);
+        assert!(a > inbox && a != msg);
+        back.switch(2);
+        let b = back.open(Kind::About, None, false);
+        assert!(b != msg && b != a);
+
+        // A stale focus (corrupt store) is dropped instead of trusted.
+        let mut bad = snap;
+        bad.wss[0].focus = Some(0xdead);
+        assert_eq!(Wm::restore(bad).wss[0].focus, None);
+    }
+
     /// Moving a joined child re-homes just the panel; the join dies with the
     /// adjacency. The grid applies to every workspace at once.
     #[test]
     fn workspace_move_breaks_joins_and_grid_is_global() {
         let mut wm = Wm::new();
         let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
-        let msg = wm.follow_open(inbox, Kind::Message { id: "m1" }, false);
+        let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
         assert_eq!(wm.joined_child(inbox), Some(msg));
         wm.send_focused_to(1);
         assert_eq!(wm.active, 1);

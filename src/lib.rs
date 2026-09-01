@@ -6,8 +6,9 @@
 //! | module | role | depends on makepad |
 //! |---|---|---|
 //! | [`core`] | pure panel/column/join state machine | no |
+//! | [`store`] | the one SQLite file + the reactive query layer | no |
+//! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
-//! | [`data`] | fake mail data behind the demo panels | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
 //! | [`theme`] | the look: sizes and colours | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
@@ -16,10 +17,11 @@
 
 pub mod app;
 pub mod core;
-pub mod data;
 pub mod e2e;
 pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;
+pub mod mail;
 pub mod spring;
+pub mod store;
 pub mod theme;

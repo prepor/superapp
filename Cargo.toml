@@ -25,6 +25,11 @@ path = "src/main.rs"
 # an experiment: if occluded e2e suites go stale, run them with --front.
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }
 
+# The one store: bundled SQLite (same pin rel.systems validated) so the hook
+# surface and version are identical on macOS and android. `hooks` powers the
+# query layer's table-level invalidation (update_hook).
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "9daab06dcf2dd8d0f6259e146db21a21d0515f17" }

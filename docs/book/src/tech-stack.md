@@ -16,6 +16,11 @@ directly:
   branch of the patched tree and the same `{ git, rev }` shape.
 - `makepad-apple-sys` / `makepad-objc-sys` for the few macOS calls makepad
   does not expose (screen geometry, activation, window screenshots).
+- **`rusqlite` with bundled SQLite** — the one store (see [The Data
+  Substrate](./data-substrate.md)). Bundling pins one SQLite version with
+  the full hook surface (`update_hook` drives query invalidation; the
+  session extension is phase 2's undo changesets) on macOS and android
+  alike — the same choice rel.systems' research validated.
 - The **macOS menu bar** is makepad's own `MacosMenu` API
   (`cx.update_macos_menu`, clicks arrive as `Event::MacosMenuCommand`); the
   workspace menus rebuild only when the roster or the active space changes.
