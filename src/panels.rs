@@ -33,6 +33,14 @@ pub enum PanelAction {
         smtp: String,
     },
     RemoveAccount(i64),
+    /// A compose panel's fields changed — the shell persists the draft
+    /// (plain upkeep, not an action).
+    DraftEdited {
+        pid: u64,
+        to: String,
+        subject: String,
+        body: String,
+    },
 }
 
 script_mod! {
@@ -232,6 +240,35 @@ script_mod! {
             add_btn := mod.widgets.SBtn { text: "add account" }
         }
     }
+
+    // ---- compose -----------------------------------------------------------
+
+    /** The compose panel: to/subject fields over a multiline body. Send
+        and discard live in the panel chrome, with the other side effects. */
+    mod.widgets.ComposePanel = set_type_default() do #(ComposePanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        spacing: 6
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 74, text: "TO" }
+            to_input := mod.widgets.SField {}
+        }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 74, text: "SUBJECT" }
+            subject_input := mod.widgets.SField {}
+        }
+        View { width: Fill, height: 4 }
+        body_input := mod.widgets.SField {
+            width: Fill, height: Fill
+            is_multiline: true
+            empty_text: ""
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +338,7 @@ pub struct SettingsPanel {
 impl SettingsPanel {
     /// Advance focus the way forms expect: focus + select-all, so typing
     /// replaces and backspace clears.
-    fn focus_input(cx: &mut Cx, input: &TextInputRef) {
+    pub(crate) fn focus_input(cx: &mut Cx, input: &TextInputRef) {
         input.set_key_focus(cx);
         if let Some(mut t) = input.borrow_mut() {
             t.select_all(cx);
@@ -403,5 +440,108 @@ impl Widget for SettingsPanel {
             }
         }
         DrawStep::done()
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// ComposePanel
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct ComposePanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl ComposePanel {
+    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 3] {
+        [
+            self.view.text_input(cx, ids!(to_input)),
+            self.view.text_input(cx, ids!(subject_input)),
+            self.view.text_input(cx, ids!(body_input)),
+        ]
+    }
+}
+
+impl Widget for ComposePanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+
+        // Tab walks to → subject → body (shift reverses; the body's enter
+        // stays a newline — multiline TextInput owns it).
+        if let Event::KeyDown(k) = event {
+            if k.key_code == KeyCode::Tab {
+                let inputs = self.inputs(cx);
+                if let Some(i) = inputs.iter().position(|t| t.key_focus(cx)) {
+                    let n = inputs.len() as isize;
+                    let j = i as isize + if k.modifiers.shift { -1 } else { 1 };
+                    if (0..n).contains(&j) {
+                        SettingsPanel::focus_input(cx, &inputs[j as usize]);
+                    }
+                }
+            }
+        }
+
+        if let Event::Actions(actions) = event {
+            let [to, subject, body] = self.inputs(cx);
+            if to.returned(actions).is_some() {
+                SettingsPanel::focus_input(cx, &subject);
+            } else if subject.returned(actions).is_some() {
+                SettingsPanel::focus_input(cx, &body);
+            }
+            if to.changed(actions).is_some()
+                || subject.changed(actions).is_some()
+                || body.changed(actions).is_some()
+            {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                cx.action(PanelAction::DraftEdited {
+                    pid,
+                    to: to.text(),
+                    subject: subject.text(),
+                    body: body.text(),
+                });
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl ComposePanelRef {
+    /// Seeds the fields (once, at instantiation) and focuses the body.
+    pub fn prefill(&self, cx: &mut Cx, to: &str, subject: &str, body: &str) {
+        let Some(inner) = self.borrow() else { return };
+        let [to_i, subject_i, body_i] = [
+            inner.view.text_input(cx, ids!(to_input)),
+            inner.view.text_input(cx, ids!(subject_input)),
+            inner.view.text_input(cx, ids!(body_input)),
+        ];
+        to_i.set_text(cx, to);
+        subject_i.set_text(cx, subject);
+        body_i.set_text(cx, body);
+    }
+
+    /// Focuses the body — deferred to an event tick, because key focus set
+    /// during a draw pass does not take.
+    pub fn focus_body(&self, cx: &mut Cx) {
+        let Some(inner) = self.borrow() else { return };
+        inner.view.text_input(cx, ids!(body_input)).set_key_focus(cx);
+    }
+
+    /// The current fields as a draft (send reads through this).
+    pub fn values(&self, cx: &mut Cx) -> mail::Draft {
+        let Some(inner) = self.borrow() else {
+            return mail::Draft::default();
+        };
+        mail::Draft {
+            to: inner.view.text_input(cx, ids!(to_input)).text().trim().to_string(),
+            subject: inner.view.text_input(cx, ids!(subject_input)).text(),
+            body: inner.view.text_input(cx, ids!(body_input)).text(),
+        }
     }
 }

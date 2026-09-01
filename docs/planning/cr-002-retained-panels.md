@@ -102,7 +102,12 @@ B. **Settings pilot** — **landed 2026-09-01**: the panel is a widget tree
    PortalList needs a fixed height (Fit collapses it). The char-grid
    settings path is retired. Chrome fades over popping content — reads
    fine in practice.
-C. **Compose**: multiline `TextInput`, drafts/send unchanged underneath.
+C. **Compose** — **landed 2026-09-01**: to/subject `SField`s over a
+   multiline body; prefill (draft-or-reply) at instantiation with focus
+   deferred to the next event tick (key focus set during a draw does not
+   take); typing bubbles `DraftEdited` actions the shell persists; send
+   and discard (chrome buttons) read the widget's values; the char-grid
+   auto-field stands down for hosted kinds.
 D. **Inbox** on `PortalList`: virtualized (821+ real messages already),
    row templates, selection/enter/j-k preserved.
 E. **Message / Contact / Help / About**; retire the char-grid renderer and

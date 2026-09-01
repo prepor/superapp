@@ -227,6 +227,7 @@ script_mod! {
                         // they are collected as templates and instantiated
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
+                        compose_tpl := mod.widgets.ComposePanel{}
                     }
                 }
             }
@@ -888,7 +889,9 @@ impl State {
             };
             if fresh {
                 let ui = PanelUi::for_kind(kind, &self.store, *pid);
-                if matches!(kind, Kind::Compose { .. }) {
+                // Hosted kinds own their focus (the widget's TextInputs);
+                // the char-grid field must stay out of their way.
+                if matches!(kind, Kind::Compose { .. }) && hosted_tpl(kind).is_none() {
                     self.field = Some((*pid, FieldId::Body));
                 }
                 self.ui.insert(*pid, ui);
@@ -1015,7 +1018,10 @@ impl State {
             .iter()
             .flat_map(|w| w.panels.values())
             .filter_map(|p| match p.kind {
-                Kind::Compose { re } => Some((p.id, (re != 0).then_some(re))),
+                // Hosted composes persist through DraftEdited actions.
+                Kind::Compose { re } if hosted_tpl(&p.kind).is_none() => {
+                    Some((p.id, (re != 0).then_some(re)))
+                }
                 _ => None,
             })
             .collect();
@@ -1620,6 +1626,10 @@ pub struct Stage {
     tpl: HashMap<LiveId, ScriptObjectRef>,
     #[rust]
     hosted: HashMap<PanelId, WidgetRef>,
+    /// A freshly created compose wants its body focused — on the next
+    /// event tick, not during the draw that created it.
+    #[rust]
+    pending_focus: Option<PanelId>,
 
     #[redraw]
     #[live]
@@ -3177,13 +3187,16 @@ impl Stage {
                             Some(Kind::Compose { re }) => (re != 0).then_some(re),
                             _ => None,
                         };
-                        let d = state
-                            .ui
+                        let d = self
+                            .hosted
                             .get(&pid)
-                            .map(|u| mail::Draft {
-                                to: u.to.text.trim().to_string(),
-                                subject: u.subject.text.clone(),
-                                body: u.body.join("\n"),
+                            .map(|w| w.as_compose_panel().values(cx))
+                            .or_else(|| {
+                                state.ui.get(&pid).map(|u| mail::Draft {
+                                    to: u.to.text.trim().to_string(),
+                                    subject: u.subject.text.clone(),
+                                    body: u.body.join("\n"),
+                                })
                             })
                             .unwrap_or_default();
                         if d.to.is_empty() {
@@ -3506,6 +3519,7 @@ impl ScriptHook for Stage {
 fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
+        Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         _ => None,
     }
 }
@@ -3513,9 +3527,14 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
 impl Stage {
     /// The live content widget for a panel, instantiated from its kind's
     /// template on first use (mirrors PortalList::item).
-    fn hosted_widget(&mut self, cx: &mut Cx, pid: PanelId, tpl: LiveId) -> Option<WidgetRef> {
+    fn hosted_widget(
+        &mut self,
+        cx: &mut Cx,
+        pid: PanelId,
+        tpl: LiveId,
+    ) -> Option<(WidgetRef, bool)> {
         if let Some(w) = self.hosted.get(&pid) {
-            return Some(w.clone());
+            return Some((w.clone(), false));
         }
         let template_ref = self.tpl.get(&tpl)?;
         let template_value: ScriptValue = template_ref.as_object().into();
@@ -3523,7 +3542,7 @@ impl Stage {
         let widget =
             cx.with_script_vm_id(vm_id, |vm| WidgetRef::script_from_value(vm, template_value));
         self.hosted.insert(pid, widget.clone());
-        Some(widget)
+        Some((widget, true))
     }
 
     /// Turns bubbled widget intent ([`PanelAction`]) into store actions —
@@ -3578,6 +3597,26 @@ impl Stage {
                         }
                     }
                     refresh = true;
+                }
+                crate::panels::PanelAction::DraftEdited {
+                    pid,
+                    to,
+                    subject,
+                    body,
+                } => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    let re = match state.ws.panel(pid).map(|p| p.kind.clone()) {
+                        Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                        _ => None,
+                    };
+                    mail::save_draft(
+                        &state.store,
+                        pid as i64,
+                        re,
+                        &mail::Draft { to, subject, body },
+                    );
                 }
                 crate::panels::PanelAction::RemoveAccount(id) => {
                     let Some(state) = self.state.as_deref_mut() else {
@@ -3671,6 +3710,11 @@ impl Widget for Stage {
             Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
         ) {
             self.forward_to_hosted(cx, event);
+        }
+        if let Some(pid) = self.pending_focus.take() {
+            if let Some(w) = self.hosted.get(&pid) {
+                w.as_compose_panel().focus_body(cx);
+            }
         }
         if let Event::Actions(actions) = event {
             self.handle_panel_actions(cx, actions);
@@ -4793,9 +4837,29 @@ impl Stage {
     /// Draws a panel's retained content widget inside the body rect and
     /// registers its interactive children as e2e-addressable hits.
     fn draw_hosted(&mut self, cx: &mut Cx2d, state: &State, pid: PanelId, tpl: LiveId, body: Rect) {
-        let Some(w) = self.hosted_widget(cx, pid, tpl) else {
+        let Some((w, created)) = self.hosted_widget(cx, pid, tpl) else {
             return;
         };
+        let kind = state.ws.panel(pid).map(|p| p.kind.clone());
+        if created {
+            // A fresh compose instance seeds from its persisted draft, or
+            // from the reply header — and starts in the body.
+            if let Some(Kind::Compose { re }) = &kind {
+                let d = mail::draft(&state.store, pid as i64).unwrap_or_else(|| {
+                    let m = (*re != 0).then(|| mail::mail(&state.store, *re)).flatten();
+                    mail::Draft {
+                        to: m.as_ref().map(|m| m.head.from_email.clone()).unwrap_or_default(),
+                        subject: m
+                            .as_ref()
+                            .map(|m| format!("Re: {}", m.head.subject))
+                            .unwrap_or_default(),
+                        body: String::new(),
+                    }
+                });
+                w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
+                self.pending_focus = Some(pid);
+            }
+        }
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             pid,
@@ -4813,41 +4877,61 @@ impl Stage {
         cx.end_turtle();
 
         // The e2e bridge: known interactive children become labelled hits;
-        // a click on one synthesizes real pointer events at its centre.
+        // a click on one synthesizes real pointer events at its centre
+        // (fields) or resolves semantically (buttons).
         let mut reg: Vec<(String, Rect, Act)> = Vec::new();
-        for (label, path) in [
-            ("address", ids!(email_input)),
-            ("password", ids!(pass_input)),
-            ("imap", ids!(imap_input)),
-            ("smtp", ids!(smtp_input)),
-        ] {
-            let r = w.widget(cx, path).area().rect(cx);
-            if r.size.x > 0.0 {
-                reg.push((label.to_string(), r, Act::Pointer(pid)));
-            }
-        }
-        let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
-        if add_r.size.x > 0.0 {
-            reg.push((
-                "add account".to_string(),
-                add_r,
-                Act::WidgetOp(pid, WidgetOp::AddAccount),
-            ));
-        }
-        let accounts = mail::accounts(&state.store);
-        if let Some(list) = w.widget(cx, ids!(accounts_list)).as_portal_list().borrow() {
-            for (idx, item) in list.items().iter() {
-                let r = item.widget.button(cx, ids!(remove_btn)).area().rect(cx);
-                if r.size.x > 0.0 {
-                    if let Some(a) = accounts.get(*idx) {
-                        reg.push((
-                            "remove".to_string(),
-                            r,
-                            Act::WidgetOp(pid, WidgetOp::RemoveAccount(a.id)),
-                        ));
+        match &kind {
+            Some(Kind::Settings) => {
+                for (label, path) in [
+                    ("address", ids!(email_input)),
+                    ("password", ids!(pass_input)),
+                    ("imap", ids!(imap_input)),
+                    ("smtp", ids!(smtp_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let add_r = w.widget(cx, ids!(add_btn)).area().rect(cx);
+                if add_r.size.x > 0.0 {
+                    reg.push((
+                        "add account".to_string(),
+                        add_r,
+                        Act::WidgetOp(pid, WidgetOp::AddAccount),
+                    ));
+                }
+                let accounts = mail::accounts(&state.store);
+                if let Some(list) =
+                    w.widget(cx, ids!(accounts_list)).as_portal_list().borrow()
+                {
+                    for (idx, item) in list.items().iter() {
+                        let r = item.widget.button(cx, ids!(remove_btn)).area().rect(cx);
+                        if r.size.x > 0.0 {
+                            if let Some(a) = accounts.get(*idx) {
+                                reg.push((
+                                    "remove".to_string(),
+                                    r,
+                                    Act::WidgetOp(pid, WidgetOp::RemoveAccount(a.id)),
+                                ));
+                            }
+                        }
                     }
                 }
             }
+            Some(Kind::Compose { .. }) => {
+                for (label, path) in [
+                    ("to", ids!(to_input)),
+                    ("subject", ids!(subject_input)),
+                    ("body", ids!(body_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+            }
+            _ => {}
         }
         for (label, r, act) in reg {
             self.hits.push(HitR {
