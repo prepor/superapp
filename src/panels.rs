@@ -407,31 +407,48 @@ script_mod! {
 
     // ---- inbox -------------------------------------------------------------
 
-    /** One mail row: from · subject · date, bold while unread, an inverted
-        wash while selected. Subjects hold to one line, ellipsized. Tap the
-        subject to open; tap elsewhere to select (the j/k cursor). */
+    /** One mail row, two lines: the columns line (from · date), then the
+        subject alone on the richtable's *extra line* — full-width row
+        content that belongs to no column. Bold while unread, an inverted
+        wash while selected, every run one line, ellipsized. The row is one
+        target: a click anywhere on either line opens the mail and leaves
+        the j/k cursor there. */
     // No Overlay anywhere in a row, deliberately: quads under an Overlay
     // ancestor inside a PortalList item never paint (Fill defers, and a
     // deferred overlay walk never resolves) — so the selection wash is a
     // twin line with its own bg, toggled like the bold pairs.
     mod.widgets.InboxLine = set_type_default() do #(InboxLine::register_widget(vm)) {
         ..mod.widgets.View
-        width: Fill, height: 26
+        width: Fill, height: Fit
+        flow: Down
         padding: Inset{left: 4, right: 4, top: 5, bottom: 5}
-        align: Align{y: 0.5}
-        from_lbl := mod.widgets.SLabel {
-            width: 130, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        spacing: 2
+        View {
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            // A Fill *Label* on a Right flow's main axis defer-walks and
+            // drops its theme padding (upstream Label ships mspace_1),
+            // landing 3 px left of every normally-walked label. So the
+            // from twins ride a Fill View whose flow is Down: there Fill
+            // width is the cross axis — no defer, padding kept, and the
+            // left edge matches the subject line (the same construction).
+            View {
+                width: Fill, height: Fit
+                flow: Down
+                from_lbl := mod.widgets.SLabel {
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
+                from_b := mod.widgets.SBold { visible: false, width: Fill }
+            }
+            View { width: 10, height: 1 }
+            date_lbl := mod.widgets.SLabel {
+                width: Fit, text: "", draw_text +: { color: #909090 }
+            }
         }
-        from_b := mod.widgets.SBold { visible: false, width: 130 }
-        View { width: 10, height: 1 }
         subject_lbl := mod.widgets.SLabel {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
         subject_b := mod.widgets.SBold { visible: false, width: Fill }
-        View { width: 10, height: 1 }
-        date_lbl := mod.widgets.SLabel {
-            width: Fit, text: "", draw_text +: { color: #909090 }
-        }
     }
 
     mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
@@ -480,11 +497,17 @@ script_mod! {
             autocapitalize: AutoCapitalize.None
             autocorrect: AutoCorrect.Disabled
         }
+        // Header cells for the columns only — the subject rides each row's
+        // extra line, owns no column, and so gets no header. FROM sits in
+        // a Fill View, not at Fill itself: a deferred Fill label drops its
+        // theme padding and drifts off the rows' shared left edge.
         View {
             width: Fill, height: Fit
             padding: Inset{left: 4, right: 4}
-            mod.widgets.SSection { width: 140, text: "FROM" }
-            mod.widgets.SSection { width: Fill, text: "SUBJECT" }
+            View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { text: "FROM" }
+            }
             mod.widgets.SSection { width: Fit, text: "DATE" }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
