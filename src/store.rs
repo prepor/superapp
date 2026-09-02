@@ -1613,6 +1613,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::AddAccount => ("add_account", None, None),
         Kind::Problems => ("problems", None, None),
         Kind::Effects => ("effects", None, None),
+        Kind::Job { id } => ("job", Some(*id), None),
     }
 }
 
@@ -1637,6 +1638,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "add_account" => Kind::AddAccount,
         "problems" => Kind::Problems,
         "effects" => Kind::Effects,
+        "job" => Kind::Job { id: p_int? },
         _ => return None,
     })
 }

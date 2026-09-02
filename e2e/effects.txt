@@ -40,25 +40,33 @@ wait 900
 shot g3-log
 # A row is addressed by the sentence its effect describes itself with —
 # so a log that stopped naming its jobs fails the run, no picture needed.
+# Touching it previews the job beside the list, joined, the way an inbox
+# row previews its mail; the list keeps the keyboard.
 click "submit outbox:"
-wait 600
-shot g4-unfolded
-# The unfolded JSON is a selectable run like any other text in the app —
-# a payload is something one copies into a bug report. The run is
-# registered over the row it sits in, so reaching for it does not fold the
-# row back.
-click "effect payload"
+wait 700
+shot g4-previewed
+
+# The job panel is the whole row: its facts, the payload it was filed as,
+# the answer. All of it selectable — a payload is something one copies
+# into a bug report.
+click "job payload"
 wait 300
 key cmd+a
 wait 400
 shot g5-payload-selected
+
+# The walk re-aims the preview rather than opening a second panel, and the
+# list keeps the keyboard throughout.
+key down
+wait 600
+shot g6-walked
 
 # The filter is the rich table's, over the queue's own columns.
 key /
 wait 200
 type "@"
 wait 400
-shot g6-tags
+shot g7-tags
 key esc
 wait 200
 key cmd+a
@@ -68,7 +76,7 @@ type "@risky"
 wait 500
 key esc
 wait 400
-shot g7-risky
+shot g8-risky
 click "submit outbox:"
 wait 500
 
@@ -80,5 +88,5 @@ type "@kind:move"
 wait 500
 key esc
 wait 500
-shot g8-none
+shot g9-none
 quit

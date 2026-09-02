@@ -222,8 +222,9 @@ that back; an account against an `.invalid` host joins the list, *sync*
 kicks it, and removing the account clears it.
 `e2e/effects.txt` (run with `--send-delay 1`) walks the effect log — the
 same failed send, seen from the other end: the empty queue, then the job it
-files, addressed by *the sentence its effect describes itself with*, which
-is how a log that stopped naming its jobs fails the run.
+files, addressed by *the sentence its effect describes itself with* (which
+is how a log that stopped naming its jobs fails the run), and touching it
+previews the job panel the run then reads and selects from.
 
 `click` resolves the element's action directly — it proves the action, not
 the click. `mouse` sends a real press-release pair into the stage, so the
@@ -311,7 +312,9 @@ A node is one of three things:
   whole viewport. Enter it and the keys work — the walk, ⌘a, ⌘z. A subject
   the demo seed does not cover plants its own rows on the way up: the
   effect log's scene files five real jobs, in states the executor will not
-  revisit, so the queue it shows stands still while it is read.
+  revisit, so the queue it shows stands still while it is read — and its
+  job nodes end by touching the sentence they drew, so a panel that stopped
+  naming its effect fails to arrive rather than showing an empty page.
 - the **workspace** — the whole stage, kept for the shell's own subjects:
   joins, tabs, the phone grid.
 

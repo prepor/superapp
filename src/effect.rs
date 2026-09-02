@@ -561,6 +561,17 @@ pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
         .unwrap_or_default()
 }
 
+/// One job by id — what its panel reads on every draw. Through the query
+/// cache like everything else, so a job that finishes while it is open
+/// finishes on screen.
+pub fn job(store: &Store, id: i64) -> Option<Job> {
+    let sql = format!("SELECT {JOB_COLS} FROM effect e WHERE e.id = ?1");
+    store
+        .rows_sql("effect job", "one job of the effect queue, in full", &sql, &[Val::I(id)], job_row)
+        .first()
+        .cloned()
+}
+
 /// The newest job id — the mark for [`jobs_since`].
 pub fn mark(db: &Connection) -> i64 {
     db.query_row("SELECT COALESCE(MAX(id), 0) FROM effect", [], |r| r.get(0))

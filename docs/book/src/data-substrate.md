@@ -165,8 +165,19 @@ the panel: the registry decodes the payload back into the effect and calls
 the same `describe` that names it everywhere else, so a new effect kind
 arrives in the log the day it is registered and no central table of kinds
 exists to forget it. A row a build cannot decode falls back to its payload
-rather than disappearing. Enter — or a touch — unfolds the row onto the
-JSON it was filed as and the answer the world gave back, both selectable.
+rather than disappearing.
+
+The log is the **inbox's shape over another table**: it previews into a
+**job** panel exactly as the inbox previews a message — the cursor walk
+re-aims the pair and keeps the keyboard, `enter` goes. A job panel is the
+whole row as a page: the sentence, the error if there is one, then the job's
+own facts (filed, last touched, attempts, whether a crash may repeat it),
+the payload it was filed as, and the answer the world gave back — all of it
+selectable, because a payload is something one copies into a report. It
+re-reads its row every draw, so a job that finishes while it is open
+finishes on screen. A preview costs the world nothing here: looking at a
+record establishes no fact, which is the one way this pair differs from the
+inbox's.
 
 The filter is the table's own grammar over the queue's columns: `@failed`,
 `@live`, `@retried`, `@risky` (the work a crash cannot retry for you),

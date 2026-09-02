@@ -129,6 +129,7 @@ pub const ACCEL_ADD_ACCOUNT: char = 'd';
 pub fn preview_kind(kind: &Kind) -> Option<Kind> {
     match kind {
         Kind::Inbox { .. } => Some(Kind::Message { id: 0 }),
+        Kind::Effects => Some(Kind::Job { id: 0 }),
         _ => None,
     }
 }
@@ -234,6 +235,7 @@ mod tests {
                 email: "a@b.c".into(),
             },
             Kind::Effects,
+            Kind::Job { id: 1 },
         ]
     }
 

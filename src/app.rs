@@ -433,6 +433,7 @@ script_mod! {
                         about_tpl := mod.widgets.AboutPanel{}
                         problems_tpl := mod.widgets.ProblemsPanel{}
                         effects_tpl := mod.widgets.EffectsPanel{}
+                        job_tpl := mod.widgets.JobPanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
@@ -462,6 +463,8 @@ script_mod! {
                             about_tpl := mod.widgets.AboutPanel{}
                             problems_tpl := mod.widgets.ProblemsPanel{}
                             effects_tpl := mod.widgets.EffectsPanel{}
+                            job_tpl := mod.widgets.JobPanel{}
+                        job_tpl := mod.widgets.JobPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         }
@@ -544,9 +547,11 @@ enum Act {
     Btn(PanelId, BtnAct),
     Open(PanelId, Kind),
     Replace(PanelId, Kind),
-    /// The inbox cursor landed on a mail: open it joined **without taking
-    /// focus** (CR-005). The list keeps the keyboard, so the walk carries on.
-    Preview(PanelId, core::MailId),
+    /// A list panel's cursor landed on a row: open its detail joined
+    /// **without taking focus** (CR-005). The list keeps the keyboard, so
+    /// the walk carries on. Carries the kind, not an id — the inbox previews
+    /// a message and the effect log a job, through the one door.
+    Preview(PanelId, Kind),
     /// Activate this panel's tab in its tabbed column.
     Tab(PanelId),
     /// A row of the workspaces overlay: switch to workspace `k`.
@@ -594,9 +599,9 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
-    /// A row of the effect log: unfold the JSON it was filed as, or fold it
-    /// back.
-    ToggleJob(i64),
+    /// A row of the effect log: preview the job it stands for, the way a
+    /// click on an inbox row previews its mail.
+    OpenJob(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3520,7 +3525,7 @@ impl Stage {
                         if alt {
                             self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), true);
                         } else {
-                            self.resolve_click(cx, Act::Preview(pid, id), false);
+                            self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
                         }
                     }
                     WidgetOp::Suggest(i) => {
@@ -3564,21 +3569,19 @@ impl Stage {
                     }
                     WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
                     WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
-                    WidgetOp::ToggleJob(id) => {
-                        // A click inside a panel focuses it, as anywhere
-                        // else; the fold itself is the panel's own state.
-                        let store = state.store.clone();
-                        let refocus = state.ws.focus != Some(pid);
-                        if refocus {
+                    WidgetOp::OpenJob(id) => {
+                        // The inbox row's move, over the other table: the
+                        // list takes focus, the cursor follows the click,
+                        // and the job opens joined without stealing it back.
+                        if state.ws.focus != Some(pid) {
                             state.ws.focus = Some(pid);
                         }
-                        if let Some(w) = self.hosted.get(&pid).cloned() {
-                            w.as_effects_panel().toggle(cx, &store, id);
+                        cx.action(crate::panels::PanelAction::SelectJob { pid, id });
+                        if alt {
+                            self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), true);
+                        } else {
+                            self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
                         }
-                        if refocus {
-                            self.sync(cx);
-                        }
-                        self.kick(cx);
                     }
                 }
                 return;
@@ -3678,17 +3681,20 @@ impl Stage {
                 }
                 self.sync(cx);
             }
-            Act::Preview(pid, id) => {
+            Act::Preview(pid, kind) => {
                 // The cursor walk's own open (CR-005). Same door as a solid
                 // link — join semantics, mark read, undoable — minus the one
                 // thing that would end the walk: it never takes focus. So it
                 // is a "read", coalescing per driver panel.
-                let kind = Kind::Message { id };
                 let label = format!("read “{}”", state.panel_title(&kind));
                 let (vp, opts) = (state.vp(), state.opts());
-                let marks = mail::thread_unread(&state.store, id);
-                let open: BTreeSet<core::MailId> =
-                    marks.iter().copied().chain(std::iter::once(id)).collect();
+                // Reading a mail marks its thread; reading anything else
+                // establishes nothing — a job is a record, and looking at
+                // one leaves the world exactly as it was.
+                let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                let marks: Vec<core::MailId> =
+                    mid.map(|id| mail::thread_unread(&state.store, id)).unwrap_or_default();
+                let open: BTreeSet<core::MailId> = marks.iter().copied().chain(mid).collect();
                 let marks_tx = marks.clone();
                 state.wish_ahead(&kind);
                 state.act(
@@ -3727,7 +3733,9 @@ impl Stage {
                         .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
                         .collect(),
                 );
-                state.seed_expansion(id, &open);
+                if let Some(id) = mid {
+                    state.seed_expansion(id, &open);
+                }
                 // The preview opened off to the right of a driver that never
                 // moved, so nothing has pulled the camera onto it.
                 state.show_also = state.ws.joined_child(pid);
@@ -4399,6 +4407,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::About => Some(live_id!(about_tpl)),
         Kind::Problems => Some(live_id!(problems_tpl)),
         Kind::Effects => Some(live_id!(effects_tpl)),
+        Kind::Job { .. } => Some(live_id!(job_tpl)),
     }
 }
 
@@ -4737,9 +4746,16 @@ impl Stage {
                     // them would only put a delay between the cursor and what
                     // it is pointing at, and could land a stale focus restore
                     // on top of a cmd+arrow the user has since pressed.
-                    self.resolve_click(cx, Act::Preview(pid, id), false);
+                    self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
                 }
                 crate::panels::PanelAction::SelectMail { .. } => {}
+                crate::panels::PanelAction::OpenJob { pid, id, fresh } => {
+                    self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), fresh);
+                }
+                crate::panels::PanelAction::PreviewJob { pid, id } => {
+                    self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
+                }
+                crate::panels::PanelAction::SelectJob { .. } => {}
                 crate::panels::PanelAction::FollowLink {
                     pid,
                     target,
@@ -6881,18 +6897,19 @@ impl Stage {
                 }
                 // A row is ONE target, addressed by the sentence it shows —
                 // the same string the row draws, so a script and a reader
-                // name it the same way. Touching it unfolds the JSON.
+                // name it the same way. Touching it previews the job.
                 let panel = w.as_effects_panel();
                 for h in panel.row_hits(cx) {
-                    reg.push((h.label, h.rect, Act::WidgetOp(pid, WidgetOp::ToggleJob(h.id))));
-                }
-                // The unfolded JSON is selectable text, registered after the
-                // rows it sits inside so it wins where they overlap.
-                for (label, r) in panel.detail_hits(cx) {
-                    reg.push((label, r, Act::Pointer(pid)));
+                    reg.push((h.label, h.rect, Act::WidgetOp(pid, WidgetOp::OpenJob(h.id))));
                 }
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
+                }
+            }
+            Some(Kind::Job { .. }) => {
+                // The whole panel is selectable runs; nothing in it navigates.
+                for (label, r) in w.as_job_panel().runs(cx) {
+                    reg.push((label, r, Act::Pointer(pid)));
                 }
             }
             Some(Kind::Contact { email }) => {

@@ -33,14 +33,17 @@ that hands focus over, which is the solid-link rule above, unchanged; `cmd+→`
 is the other way there. Cmd+click still means what it means everywhere — a
 fresh, un-joined panel.
 
-A preview is a real open — joined, marks the mail read, undoable — minus the
-one thing that would end the walk. It opens **immediately**, on every step,
+A preview is a real open — joined, undoable, and (for a mail) marking it
+read — minus the one thing that would end the walk. It opens **immediately**, on every step,
 with nothing queued between the cursor and what it points at; a whole run of
 them coalesces into a single history node, so one `cmd+z` takes it all back.
 
 Only a panel that *has* a cursor over a list can preview, and it previews into
-exactly one kind (the inbox into a message). The pair reads as one thing,
-which is also why it borrows keys — see [Accelerators](#accelerators).
+exactly one kind: the inbox into a message, the effect log into a job. The
+pair reads as one thing, which is also why it borrows keys — see
+[Accelerators](#accelerators). What a preview *establishes* is the domain's,
+not the grammar's: opening a mail reads it, while looking at a job leaves the
+world exactly as it was.
 
 ### Threads: the row is the conversation, the panel is the whole of it
 

@@ -59,6 +59,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::AddAccount => "add account",
         Kind::Problems => "problems",
         Kind::Effects => "effects",
+        Kind::Job { .. } => "job",
     }
 }
 

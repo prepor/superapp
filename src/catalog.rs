@@ -336,32 +336,75 @@ fn plant_queue(store: &Store) {
     );
 }
 
-/// One row of the effect queue, as the log lists it. The sentence is
-/// supplied rather than decoded: a component node has no registry, and the
-/// row draws whatever line it is handed either way.
-fn job(
-    kind: &str,
-    entity: &str,
-    status: &str,
-    attempts: i64,
-    payload: &str,
-    reply: Option<&str>,
-    error: Option<&str>,
-) -> effect::Job {
-    effect::Job {
+/// One row of the effect queue as the log lists it, taken **from the effect
+/// itself**: its `KIND`, its own `Serialize` for the payload, and the
+/// sentence its own `describe` returns. Those are the three the registry
+/// hands the panel for a live job, so a component node shows what a real
+/// row shows — and an effect that changes its wording changes this scene
+/// rather than drifting from it.
+fn shown<E: effect::Effect + serde::Serialize>(e: &E, f: &Filed) -> (effect::Job, String) {
+    let job = effect::Job {
+        id: 118,
+        kind: E::KIND.to_string(),
+        entity: Some(f.entity.to_string()),
+        status: f.status.to_string(),
+        reply: f.reply.map(str::to_string),
+        error: f.error.map(str::to_string),
+        attempts: f.attempts,
+        payload: serde_json::to_string(e).expect("catalog: the fixture effect encodes"),
+        idempotent: f.idempotent,
+        created: f.at,
+        updated: f.at + 120.0,
+        not_before: f.not_before,
+    };
+    (job, e.describe())
+}
+
+/// A job whose kind this build has no handler for — a row an older version
+/// wrote, or a domain not registered here. Nothing can decode it, so the log
+/// shows the payload as it stands rather than dropping the row.
+fn stranger(kind: &str, payload: &str, f: &Filed) -> (effect::Job, String) {
+    let job = effect::Job {
         id: 118,
         kind: kind.to_string(),
-        entity: Some(entity.to_string()),
-        status: status.to_string(),
-        reply: reply.map(str::to_string),
-        error: error.map(str::to_string),
-        attempts,
+        entity: Some(f.entity.to_string()),
+        status: f.status.to_string(),
+        reply: None,
+        error: None,
+        attempts: f.attempts,
         payload: payload.to_string(),
-        idempotent: kind != "submit",
-        created: at(9, 12),
-        updated: at(9, 14),
-        not_before: 0.0,
+        idempotent: f.idempotent,
+        created: f.at,
+        updated: f.at + 120.0,
+        not_before: f.not_before,
+    };
+    (job, payload.to_string())
+}
+
+/// The three effects this app files, as the scenes show them.
+fn a_move() -> mail::Move {
+    mail::Move {
+        account: 1,
+        message: 42,
+        to_folder: 2,
+        from: "INBOX".into(),
+        to: "Archive".into(),
+        uid: 118,
     }
+}
+
+fn a_seen() -> mail::Seen {
+    mail::Seen {
+        account: 1,
+        message: 51,
+        folder: "INBOX".into(),
+        uid: 121,
+        seen: true,
+    }
+}
+
+fn a_submit() -> mail::Submit {
+    mail::Submit { outbox: 7 }
 }
 
 fn orow(num: &str, main: &str, detail: &str, right: &str) -> OverlayRowData {
@@ -372,6 +415,19 @@ fn orow(num: &str, main: &str, detail: &str, right: &str) -> OverlayRowData {
         right: right.to_string(),
         ..Default::default()
     }
+}
+
+/// The newest planted job in this state — how a job node names the row it
+/// opens on, the way [`mail_like`] names a mail.
+fn job_in(store: &Store, status: &str) -> i64 {
+    store
+        .conn()
+        .query_row(
+            "SELECT id FROM effect WHERE status = ?1 ORDER BY id DESC LIMIT 1",
+            [status],
+            |r| r.get(0),
+        )
+        .unwrap_or(1)
 }
 
 /// The newest seeded mail whose subject contains `pat`.
@@ -412,6 +468,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         link(),
         inbox(),
         effect_log(),
+        job(),
         message(),
         compose(),
         small_panels(),
@@ -608,51 +665,59 @@ fn account_row() -> Scene<Setup> {
 }
 
 fn effect_row() -> Scene<Setup> {
-    let row = |j: effect::Job, what: &'static str, selected: bool, open: bool| {
+    let row = |(j, what): (effect::Job, String), selected: bool| {
         widget(live_id!(effect_row_tpl), move |cx, w| {
-            w.as_effect_row().populate(cx, &j, what, selected, open);
+            w.as_effect_row().populate(cx, &j, &what, selected);
         })
     };
-    let mv = |status: &str, attempts: i64, error: Option<&str>| {
-        job(
-            "move",
-            "account:1",
-            status,
-            attempts,
-            r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
-            None,
-            error,
-        )
+    // Filed and waiting its turn — the state every job starts in, so the
+    // three verbs below differ by nothing but themselves.
+    let queued = || Filed {
+        status: "pending",
+        attempts: 0,
+        ..Filed::default()
     };
-    let moved = "move uid 118 from INBOX to Archive";
+    let outbox = || Filed {
+        entity: "outbox:7",
+        idempotent: false,
+        ..queued()
+    };
     Scene::new("effect row", (560.0, 60.0))
         .note("One job of the effect queue: the verb and whose it was, then the sentence the effect describes itself with.")
-        .note("Everything the app has tried on the outside world is one of these — filed before it runs, closed after.")
-        .node("queued", row(mv("pending", 0, None), moved, false, false))
-        .about("filed, waiting its turn")
+        .note("The first three are the effects this app files — everything it has tried on the outside world is one of them. The rest is what becomes of one.")
+        .node("move", row(shown(&a_move(), &queued()), false))
+        .about("make the server agree which folder a mail lives in")
+        .node("seen", row(shown(&a_seen(), &queued()), false))
+        .about("…and whether it has been read")
+        .node("submit", row(shown(&a_submit(), &outbox()), false))
+        .about("hand a mail to SMTP — the one effect a crash may not repeat, and the one that is not an account's")
         .node(
             "done",
             row(
-                job(
-                    "move",
-                    "account:1",
-                    "done",
-                    1,
-                    r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
-                    Some("119"),
-                    None,
+                shown(
+                    &a_move(),
+                    &Filed {
+                        reply: Some("119"),
+                        ..Filed::default()
+                    },
                 ),
-                moved,
-                false,
                 false,
             ),
         )
+        .about("the round trip landed; the answer is on the row")
         .node(
             "retrying",
             row(
-                mv("pending", 3, Some("connection refused")),
-                moved,
-                false,
+                shown(
+                    &a_move(),
+                    &Filed {
+                        status: "pending",
+                        attempts: 3,
+                        error: Some("connection refused"),
+                        not_before: at(9, 36),
+                        ..Filed::default()
+                    },
+                ),
                 false,
             ),
         )
@@ -661,73 +726,51 @@ fn effect_row() -> Scene<Setup> {
         .node(
             "given up",
             row(
-                job(
-                    "submit",
-                    "outbox:7",
-                    "failed",
-                    6,
-                    r#"{"outbox":7}"#,
-                    None,
-                    Some("535 authentication failed"),
+                shown(
+                    &a_submit(),
+                    &Filed {
+                        status: "failed",
+                        attempts: 6,
+                        error: Some("535 authentication failed"),
+                        ..outbox()
+                    },
                 ),
-                "submit outbox:7",
-                false,
                 false,
             ),
         )
         .sized((560.0, 76.0))
-        .about("six attempts, then it waits for a human")
-        .node("cursor", row(mv("pending", 0, None), moved, true, false))
-        .about("the cursor's wash; enter unfolds the row")
+        .about("six attempts, then it stops and waits for a human")
         .node(
             "undone",
-            row(mv("obsolete", 1, None), moved, false, false),
-        )
-        .about("undo landed while it waited: revalidated, never performed")
-        .node(
-            "unnamed",
             row(
-                job(
-                    "telegram_send",
-                    "chat:88",
-                    "pending",
-                    0,
-                    r#"{"chat":88,"text":"on my way"}"#,
-                    None,
-                    None,
+                shown(
+                    &a_move(),
+                    &Filed {
+                        status: "obsolete",
+                        ..Filed::default()
+                    },
                 ),
-                r#"{"chat":88,"text":"on my way"}"#,
                 false,
+            ),
+        )
+        .about("undo landed while it waited: revalidated, never performed, the server untouched")
+        .node("cursor", row(shown(&a_move(), &queued()), true))
+        .about("the cursor's wash — the walk previews the job beside the list")
+        .node(
+            "unreadable",
+            row(
+                stranger("telegram_send", r#"{"chat":88,"text":"on my way"}"#, &queued()),
                 false,
             ),
         )
         .about("a kind this build cannot decode keeps its payload rather than vanishing")
-        .node("narrow", row(mv("pending", 3, Some("connection refused")), moved, false, false))
-        .sized((380.0, 76.0))
+        .node("narrow", row(shown(&a_move(), &queued()), false))
+        .sized((380.0, 60.0))
         .about("the phone's width")
-        .node(
-            "unfolded",
-            row(
-                job(
-                    "move",
-                    "account:1",
-                    "done",
-                    1,
-                    r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
-                    Some("119"),
-                    None,
-                ),
-                moved,
-                false,
-                true,
-            ),
-        )
-        .sized((560.0, 190.0))
-        .about("what `sqlite3` would show: the payload it was filed as, the answer the world gave")
-        .edge("queued", "done", "the executor's round trip")
-        .edge("queued", "retrying", "the server said no")
-        .edge("retrying", "given up", "six attempts")
-        .edge("done", "unfolded", "enter / click")
+        .edge("move", "done", "the executor's round trip")
+        .edge("move", "retrying", "the server said no")
+        .edge("move", "undone", "⌘z first")
+        .edge("submit", "given up", "six attempts")
 }
 
 fn link() -> Scene<Setup> {
@@ -779,32 +822,48 @@ fn effect_log() -> Scene<Setup> {
     };
     Scene::new("effect log", (600.0, 640.0))
         .note("The effect queue read back: everything the app has tried on the outside world, newest first, one page at a time.")
-        .note("Live — enter a node and walk it; the rows are a rich table like the inbox's, and nothing here writes.")
+        .note("The inbox's shape over another table — the cursor walk previews the job beside the list, enter goes to it. Live: enter a node and walk it.")
         .node("queue", log(""))
         .about("a morning of one account: two pushes landed, one undone, one backing off, one given up")
-        .node(
-            "unfolded",
-            log("click \"submit outbox:7\"\nwait 400"),
-        )
-        .about("what `sqlite3` would show: the job, the payload it was filed as, the answer")
-        .node(
-            "failed",
-            log("click \"filter\"\nwait 200\ntype \"@failed\"\nwait 400"),
-        )
-        .about("`@failed` is the work waiting for a human")
-        .node(
-            "tags",
-            log("click \"filter\"\nwait 200\ntype \"@\"\nwait 400"),
-        )
-        .about("the filter offers the queue's own columns")
+        .node("cursor", log("click \"filter\"\nwait 200\nkey esc\nwait 200\nkey down 3\nwait 400"))
+        .about("the walk previews the job it lands on; the list keeps the keyboard")
         .node("empty", panel(|_| Kind::Effects, ""))
         .sized((600.0, 300.0))
         .about("nothing has left the process yet — said, rather than left blank")
         .node("phone", log(""))
         .sized((380.0, 720.0))
-        .edge("queue", "unfolded", "enter / click a row")
-        .edge("queue", "failed", "/ @failed")
-        .edge("queue", "tags", "/ @")
+        .edge("queue", "cursor", "↓ ×3")
+}
+
+fn job() -> Scene<Setup> {
+    // Every node ends by touching the sentence it drew: a job panel that
+    // stopped naming its effect has no such element, and the node fails to
+    // arrive instead of quietly showing an empty page.
+    const ASSERT: &str = "click \"job effect\"\nwait 200";
+    let job = |status: &'static str| {
+        panel(
+            move |s| {
+                plant_queue(s);
+                Kind::Job { id: job_in(s, status) }
+            },
+            ASSERT,
+        )
+    };
+    Scene::new("job", (520.0, 420.0))
+        .note("One job of the queue in full — what the effect log previews into, the way the inbox previews a message.")
+        .note("The sentence the effect describes itself with, then the row as `sqlite3` would show it: the job's own facts, the payload it was filed as, the answer the world gave. All of it selectable.")
+        .node("done", job("done"))
+        .about("a push that landed; the server's answer under REPLY")
+        .node("retrying", job("pending"))
+        .about("refused once, backing off — the error, the count, and when it may run again")
+        .node("given up", job("failed"))
+        .about("six attempts on the one effect a crash may not repeat")
+        .node("undone", job("obsolete"))
+        .about("undo landed first: revalidated, never performed, no REPLY to show")
+        .node("gone", panel(|_| Kind::Job { id: 4242 }, ASSERT))
+        .sized((520.0, 200.0))
+        .about("a row the queue no longer holds — the panel says so rather than inventing one")
+        .edge("retrying", "given up", "six attempts")
 }
 
 fn message() -> Scene<Setup> {

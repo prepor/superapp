@@ -7,7 +7,7 @@
 //! as [`PanelAction`]s (global actions the shell catches and turns into
 //! store actions — so undo semantics never enter this module).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
@@ -144,6 +144,13 @@ pub enum PanelAction {
     PreviewMail { pid: u64, id: i64 },
     /// Panel-internal: an inbox row was tapped outside its subject.
     SelectMail { pid: u64, id: i64 },
+    /// The same three, for the effect log and the job it previews into. The
+    /// log is the inbox's master/detail over another table, so it wants the
+    /// same verbs — separate rather than generic because the shell's reply
+    /// to each is the domain's (a mail is read by opening it; a job is not).
+    OpenJob { pid: u64, id: i64, fresh: bool },
+    PreviewJob { pid: u64, id: i64 },
+    SelectJob { pid: u64, id: i64 },
     /// A link was followed: solid opens joined, dotted replaces in place,
     /// `fresh` (the workspace modifier) always opens un-joined.
     FollowLink {
@@ -1150,8 +1157,10 @@ script_mod! {
         }
     }
 
-    /** A row of the log: the line (plain or inverted), the JSON the job was
-        filed as while it is open, and the hairline under both. */
+    /** A row of the log: the line, plain or washed, and the hairline under
+        it. The job itself is a panel — the log previews into it exactly as
+        the inbox previews a message — so a row is only ever one line's
+        worth of it. */
     mod.widgets.EffectRow = set_type_default() do #(EffectRow::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
@@ -1170,28 +1179,6 @@ script_mod! {
                     return vec4(self.color.xyz * self.color.w, self.color.w)
                 }
             }
-        }
-        // What `sqlite3` would show, unfolded in place: the payload the
-        // effect was filed as, and the answer the world gave back. Both
-        // selectable — a payload is something you copy into a bug report.
-        detail := View {
-            visible: false
-            width: Fill, height: Fit
-            flow: Down
-            padding: Inset{left: 8, right: 8, top: 2, bottom: 8}
-            // The row itself: its id, when it was filed and last touched,
-            // and whether a crash may retry it — everything about the job
-            // that is not about the effect.
-            meta_lbl := mod.widgets.SLabel {
-                padding: 0
-                margin: Inset{bottom: 6}
-                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
-                text: "", draw_text +: { color: #909090 }
-            }
-            mod.widgets.SSection { text: "PAYLOAD" }
-            payload_txt := mod.widgets.SText { margin: Inset{top: 2, bottom: 6} }
-            reply_head := mod.widgets.SSection { text: "REPLY" }
-            reply_txt := mod.widgets.SText { margin: Inset{top: 2} }
         }
         View {
             width: Fill, height: 1
@@ -1259,6 +1246,72 @@ script_mod! {
         }
         // The autocomplete, drawn last and over the rows (see `SuggestBox`).
         suggest: mod.widgets.SuggestBox {}
+    }
+
+    /** One job of the queue, in full — what the log previews into. The
+        sentence the effect describes itself with reads as the subject, then
+        what went wrong if anything did, then the row as `sqlite3` would
+        show it: the job's own facts, the payload it was filed as, and the
+        answer the world gave back. Everything below the subject is a
+        selectable run; a payload is something one copies into a report. */
+    mod.widgets.JobPanel = set_type_default() do #(JobPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+        scroll_bars: ScrollBars{ show_scroll_x: false }
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            kind_lbl := mod.widgets.SLabel { padding: 0, width: Fit, text: "" }
+            View { width: 8, height: 1 }
+            View {
+                width: Fill, height: Fit
+                flow: Down
+                entity_lbl := mod.widgets.SLabel {
+                    padding: 0
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                    draw_text +: { color: #909090 }
+                }
+            }
+            View { width: 10, height: 1 }
+            status_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fit, text: "", draw_text +: { color: #5a5a5a }
+            }
+        }
+        what_txt := mod.widgets.SText { margin: Inset{top: 2} }
+        err_txt := mod.widgets.SText {
+            visible: false
+            margin: Inset{top: 4}
+            draw_text +: {
+                color: #a01500
+                color_hover: #a01500
+                color_focus: #a01500
+                color_down: #a01500
+                color_empty: #a01500
+            }
+        }
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "JOB" }
+        mod.widgets.SRule {}
+        meta_txt := mod.widgets.SText {}
+
+        View { width: Fill, height: 10 }
+        mod.widgets.SSection { text: "PAYLOAD" }
+        mod.widgets.SRule {}
+        payload_txt := mod.widgets.SText {}
+
+        reply_head := View {
+            width: Fill, height: Fit
+            flow: Down
+            View { width: Fill, height: 10 }
+            mod.widgets.SSection { text: "REPLY" }
+            mod.widgets.SRule {}
+        }
+        reply_txt := mod.widgets.SText {}
     }
 
     // ---- the read panels ---------------------------------------------------
@@ -3212,14 +3265,7 @@ impl EffectRowRef {
         (!drawn.is_empty()).then_some((row.job, drawn))
     }
 
-    pub fn populate(
-        &self,
-        cx: &mut Cx,
-        j: &Job,
-        what: &str,
-        selected: bool,
-        open: bool,
-    ) {
+    pub fn populate(&self, cx: &mut Cx, j: &Job, what: &str, selected: bool) {
         let Some(mut row) = self.borrow_mut() else { return };
         row.job = j.id;
         row.selected = selected;
@@ -3229,33 +3275,128 @@ impl EffectRowRef {
         line_sel.as_effect_line().populate(cx, j, what);
         line.set_visible(cx, !selected);
         line_sel.set_visible(cx, selected);
+    }
+}
 
-        row.view.view(cx, ids!(detail)).set_visible(cx, open);
-        if !open {
-            return;
-        }
-        row.view.label(cx, ids!(meta_lbl)).set_text(
-            cx,
-            &format!(
-                "#{} · filed {} · touched {} · {}",
-                j.id,
-                mail::fmt_date(j.created),
-                mail::fmt_date(j.updated),
-                if j.idempotent {
-                    "safe to repeat"
-                } else {
-                    "not safe to repeat"
-                }
-            ),
-        );
-        row.view
-            .text_input(cx, ids!(payload_txt))
-            .set_text(cx, &j.payload);
+// ---------------------------------------------------------------------------
+// JobPanel
+// ---------------------------------------------------------------------------
+
+/// One job of the queue, in full: the log's detail panel. It reads its own
+/// row on every draw, so a job that finishes while it is open finishes on
+/// screen — the same reactive read every other panel does.
+#[derive(Script, ScriptHook, Widget)]
+pub struct JobPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for JobPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let Some(props) = scope.props.get::<PanelProps>() else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let crate::core::Kind::Job { id } = props.kind else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let job = effect::job(&props.store, id);
+        let what = job.as_ref().map(|j| job_line(&props.registry, j));
+        let v = &self.view;
+
+        // A job the queue no longer holds — this build cannot invent one, so
+        // the panel says what it is looking at and nothing else.
+        let Some(j) = job else {
+            v.label(cx, ids!(kind_lbl)).set_text(cx, &format!("job #{id}"));
+            v.label(cx, ids!(entity_lbl)).set_text(cx, "");
+            v.label(cx, ids!(status_lbl)).set_text(cx, "gone");
+            v.text_input(cx, ids!(what_txt))
+                .set_text(cx, "no such row in the effect queue");
+            for path in [ids!(err_txt), ids!(reply_head), ids!(reply_txt)] {
+                v.widget(cx, path).set_visible(cx, false);
+            }
+            v.text_input(cx, ids!(meta_txt)).set_text(cx, "");
+            v.text_input(cx, ids!(payload_txt)).set_text(cx, "");
+            return self.view.draw_walk(cx, scope, walk);
+        };
+
+        v.label(cx, ids!(kind_lbl)).set_text(cx, &j.kind);
+        v.label(cx, ids!(entity_lbl))
+            .set_text(cx, j.entity.as_deref().unwrap_or(""));
+        v.label(cx, ids!(status_lbl)).set_text(cx, &j.status_line());
+        v.text_input(cx, ids!(what_txt))
+            .set_text(cx, what.as_deref().unwrap_or(""));
+        let err = v.text_input(cx, ids!(err_txt));
+        err.set_text(cx, j.error.as_deref().unwrap_or(""));
+        err.set_visible(cx, j.error.is_some());
+        v.text_input(cx, ids!(meta_txt)).set_text(cx, &job_meta(&j));
+        v.text_input(cx, ids!(payload_txt)).set_text(cx, &j.payload);
         let reply = j.reply.as_deref().unwrap_or("");
-        row.view.widget(cx, ids!(reply_head)).set_visible(cx, !reply.is_empty());
-        let reply_txt = row.view.text_input(cx, ids!(reply_txt));
+        v.widget(cx, ids!(reply_head)).set_visible(cx, !reply.is_empty());
+        let reply_txt = v.text_input(cx, ids!(reply_txt));
         reply_txt.set_text(cx, reply);
         reply_txt.set_visible(cx, !reply.is_empty());
+
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// The job's own facts, as its panel lists them: what the row says about
+/// itself once the effect has had its say.
+fn job_meta(j: &Job) -> String {
+    let mut lines = vec![
+        format!("#{}", j.id),
+        format!("filed {}", mail::fmt_date(j.created)),
+        format!("last touched {}", mail::fmt_date(j.updated)),
+        format!(
+            "{} attempt{}",
+            j.attempts,
+            if j.attempts == 1 { "" } else { "s" }
+        ),
+        if j.idempotent {
+            "safe to repeat after a crash".to_string()
+        } else {
+            "not safe to repeat: a crash asks a human".to_string()
+        },
+    ];
+    // Only worth saying while it is still ahead of the job: a closed row's
+    // `not_before` is the backoff it never needed again.
+    if j.status == "pending" && j.not_before > j.created {
+        lines.push(format!("not before {}", mail::fmt_date(j.not_before)));
+    }
+    lines.join("\n")
+}
+
+impl JobPanelRef {
+    /// `(label, rect)` for every run that drew something — registered like
+    /// any other selectable text, so a payload can be dragged over and
+    /// copied. A run with nothing in it is addressable by nothing: an empty
+    /// field still reserves its box, so the text is what has to be asked,
+    /// and that is what makes a scripted click an assertion.
+    pub fn runs(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        let Some(p) = self.borrow() else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (label, path) in [
+            ("job effect", ids!(what_txt)),
+            ("job error", ids!(err_txt)),
+            ("job facts", ids!(meta_txt)),
+            ("job payload", ids!(payload_txt)),
+            ("job reply", ids!(reply_txt)),
+        ] {
+            let w = p.view.widget(cx, path);
+            let r = w.area().rect(cx);
+            if r.size.x > 0.0 && w.visible() && !w.as_text_input().text().is_empty() {
+                hits.push((label.to_string(), r));
+            }
+        }
+        hits
     }
 }
 
@@ -3291,13 +3432,9 @@ pub struct EffectsPanel {
     /// below the newest shifts the moment the executor files one.
     #[rust]
     sel: Option<(Job, usize)>,
-    /// Which rows are unfolded. Context, not history: it lives as long as
-    /// the panel does and no longer.
-    #[rust]
-    open: BTreeSet<i64>,
     /// What each live row was last populated with, by index.
     #[rust]
-    stamps: HashMap<usize, (Job, String, bool, bool)>,
+    stamps: HashMap<usize, (Job, String, bool)>,
     /// The filter's autocomplete: the table is its completion.
     #[rust]
     ac: Suggest<LogTable>,
@@ -3328,8 +3465,12 @@ impl EffectsPanel {
         (n > 0).then(|| (*idx).min(n - 1))
     }
 
-    fn set_sel(&mut self, cx: &mut Cx, store: &Store, i: usize) {
+    /// Puts the cursor on row `i` and previews what it lands on — every
+    /// cursor move goes through here, so walking and previewing can never
+    /// disagree (the inbox's rule, and for the same reason).
+    fn set_sel(&mut self, cx: &mut Cx, pid: u64, store: &Store, i: usize) {
         let Some(j) = self.table.row(store, i) else { return };
+        let id = j.id;
         self.sel = Some((j, i));
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
         let visible = list
@@ -3338,10 +3479,11 @@ impl EffectsPanel {
         if !visible {
             list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
         }
+        cx.action(PanelAction::PreviewJob { pid, id });
         self.redraw(cx);
     }
 
-    fn move_sel(&mut self, cx: &mut Cx, store: &Store, d: isize) {
+    fn move_sel(&mut self, cx: &mut Cx, store: &Store, pid: u64, d: isize) {
         let n = self.table.len(store);
         if n == 0 {
             return;
@@ -3350,7 +3492,7 @@ impl EffectsPanel {
             Some(i) => (i as isize + d).clamp(0, n as isize - 1) as usize,
             None => 0,
         };
-        self.set_sel(cx, store, i);
+        self.set_sel(cx, pid, store, i);
     }
 }
 
@@ -3384,55 +3526,6 @@ impl EffectsPanelRef {
             }
         }
         hits
-    }
-
-    /// The selectable runs a row unfolds — registered so a payload can be
-    /// dragged over and copied like any other text in the app.
-    pub fn detail_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
-        let Some(p) = self.borrow() else {
-            return Vec::new();
-        };
-        let list_ref = p.view.widget(cx, ids!(list)).as_portal_list();
-        let Some(list) = list_ref.borrow() else {
-            return Vec::new();
-        };
-        let mut hits = Vec::new();
-        for (_, item) in list.items().iter() {
-            // Gate on the fold, not on the runs inside it: a reused row
-            // (`reuse_items`) carries the area its last, open tenant drew
-            // at, so a closed row would otherwise register a payload hit
-            // over whatever now sits there.
-            let detail = item.widget.widget(cx, ids!(detail));
-            if !detail.visible() {
-                continue;
-            }
-            for (label, path) in [
-                ("effect payload", ids!(payload_txt)),
-                ("effect reply", ids!(reply_txt)),
-            ] {
-                let w = detail.widget(cx, path);
-                let r = w.area().rect(cx);
-                if r.size.x > 0.0 && w.visible() {
-                    hits.push((label.to_string(), r));
-                }
-            }
-        }
-        hits
-    }
-
-    /// Unfolds a row, or folds it back — the shell's half of a click on one.
-    pub fn toggle(&self, cx: &mut Cx, store: &Store, id: i64) {
-        let Some(mut p) = self.borrow_mut() else { return };
-        if !p.open.remove(&id) {
-            p.open.insert(id);
-        }
-        // A touched row is also where the cursor now stands.
-        if let Some(i) = p.table.index_of(store, &stub_job(id)) {
-            if let Some(j) = p.table.row(store, i) {
-                p.sel = Some((j, i));
-            }
-        }
-        p.redraw(cx);
     }
 
     /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
@@ -3474,6 +3567,7 @@ impl Widget for EffectsPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let filter = self.view.text_input(cx, ids!(filter_input));
         let filter_focused = filter.key_focus(cx);
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
 
         // The autocomplete owns the arrows, enter, tab and esc while it is
         // open; the field never sees them.
@@ -3494,9 +3588,6 @@ impl Widget for EffectsPanel {
         if let Event::KeyDown(k) = event {
             if !filter_focused {
                 match k.key_code {
-                    // Enter unfolds what the cursor stands on, and folds it
-                    // back. There is nowhere for this panel to *go*: a job
-                    // is not a place, it is a record.
                     KeyCode::ReturnKey => {
                         let id = self
                             .cursor_index(&store)
@@ -3504,14 +3595,19 @@ impl Widget for EffectsPanel {
                             .and_then(|i| self.table.row(&store, i))
                             .map(|j| j.id);
                         if let Some(id) = id {
-                            if !self.open.remove(&id) {
-                                self.open.insert(id);
-                            }
-                            self.redraw(cx);
+                            // Enter *goes*: unlike the walk's preview, it
+                            // hands focus to the job (the solid-link rule).
+                            cx.action(PanelAction::OpenJob {
+                                pid,
+                                id,
+                                fresh: k.modifiers.logo || k.modifiers.alt,
+                            });
                         }
                     }
-                    KeyCode::ArrowDown => self.move_sel(cx, &store, 1),
-                    KeyCode::ArrowUp => self.move_sel(cx, &store, -1),
+                    // The row walk, with scroll-follow. Each step previews
+                    // what it lands on and keeps the keyboard.
+                    KeyCode::ArrowDown => self.move_sel(cx, &store, pid, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, &store, pid, -1),
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
                 }
@@ -3525,7 +3621,7 @@ impl Widget for EffectsPanel {
                 cx.set_key_focus(Area::Empty);
                 if filter.returned(actions).is_some() {
                     self.sync_filter(cx);
-                    self.set_sel(cx, &store, 0);
+                    self.set_sel(cx, pid, &store, 0);
                 }
                 self.redraw(cx);
             }
@@ -3537,6 +3633,22 @@ impl Widget for EffectsPanel {
                 && self.table.extend(&store)
             {
                 self.redraw(cx);
+            }
+            for a in actions {
+                if let Some(PanelAction::SelectJob { pid: p, id }) = a.downcast_ref::<PanelAction>()
+                {
+                    if *p == pid {
+                        // The shell moved the cursor for us (a job opened by
+                        // click). Take the row from the table so the index
+                        // fallback stays honest.
+                        if let Some(i) = self.table.index_of(&store, &stub_job(*id)) {
+                            if let Some(j) = self.table.row(&store, i) {
+                                self.sel = Some((j, i));
+                                self.redraw(cx);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3579,15 +3691,9 @@ impl Widget for EffectsPanel {
                 while let Some(idx) = list.next_visible_item(cx) {
                     let Some(j) = self.table.row(&store, idx) else { continue };
                     let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
-                    let stamp = (
-                        j.clone(),
-                        job_line(&reg, &j),
-                        sel == Some(j.id),
-                        self.open.contains(&j.id),
-                    );
+                    let stamp = (j.clone(), job_line(&reg, &j), sel == Some(j.id));
                     if !existed || self.stamps.get(&idx) != Some(&stamp) {
-                        row.as_effect_row()
-                            .populate(cx, &stamp.0, &stamp.1, stamp.2, stamp.3);
+                        row.as_effect_row().populate(cx, &stamp.0, &stamp.1, stamp.2);
                         self.stamps.insert(idx, stamp);
                     }
                     live.push(idx);
