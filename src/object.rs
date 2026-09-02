@@ -6,11 +6,14 @@
 //! check that we still hold the lease. Batches and snapshots are immutable and
 //! written create-only.
 //!
-//! Two backends ship: [`MemBucket`] (in-process, for tests) and [`HttpBucket`]
-//! (a plain-HTTP client for the local `bucketd` daemon, and the shape a real
-//! R2/S3 backend would take). ETags are opaque per-key version tokens — the
-//! client never interprets them, only round-trips them — so a backend is free
-//! to use a counter (what ours do) or a content hash (what S3 does).
+//! Three backends ship: [`MemBucket`] (in-process, for tests), [`HttpBucket`]
+//! (a plain-HTTP client for the local `bucketd` daemon), and [`crate::r2`]
+//! (Cloudflare R2 over its S3 API — the same wire, with TLS and request
+//! signing). The last two share the HTTP framing here; only the stream and
+//! the headers differ. ETags are opaque per-key version tokens — the client
+//! never interprets them, only round-trips them — so a backend is free to use
+//! a counter (what `MemBucket` does), a content hash (what `bucketd` and S3
+//! do), or anything else.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -121,6 +124,15 @@ pub trait Object: Send + Sync {
     ///
     /// If the backend is unreachable.
     fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String>;
+
+    /// How often the replication worker should poll this backend when nothing
+    /// kicks it. A local daemon is free, so the default is "often enough that
+    /// a handoff feels live in a demo"; a metered endpoint across the network
+    /// says otherwise ([`crate::r2`]). A write still publishes at once — the
+    /// worker is kicked — so this is only how fast a *follower* notices.
+    fn poll_every(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(1500)
+    }
 }
 
 // -- content hash --------------------------------------------------------------
@@ -251,8 +263,7 @@ impl HttpBucket {
         key: &str,
         precond: Option<(&str, &str)>,
         body: &[u8],
-    ) -> Result<(u16, Option<String>, Vec<u8>), String> {
-        use std::io::{Read, Write};
+    ) -> Result<Reply, String> {
         use std::net::TcpStream;
         use std::time::Duration;
 
@@ -264,43 +275,148 @@ impl HttpBucket {
             .map_err(|e| e.to_string())?;
 
         let host = self.hostport.split(':').next().unwrap_or("localhost");
-        let mut req = format!(
-            "{method} /{key} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
-            body.len()
-        );
+        let mut headers = vec![("Host".to_string(), host.to_string())];
         if let Some((h, v)) = precond {
-            req.push_str(&format!("{h}: {v}\r\n"));
+            headers.push((h.to_string(), v.to_string()));
         }
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-        stream.write_all(body).map_err(|e| e.to_string())?;
-        stream.flush().map_err(|e| e.to_string())?;
-
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        parse_response(&buf)
+        round_trip(&mut stream, method, &format!("/{key}"), &headers, body)
     }
 }
 
-/// Splits an HTTP response into its status, `ETag`, and body.
-fn parse_response(buf: &[u8]) -> Result<(u16, Option<String>, Vec<u8>), String> {
+/// One response: the status, the `ETag` header, and the body.
+pub type Reply = (u16, Option<String>, Vec<u8>);
+
+/// Writes one HTTP/1.1 request and reads the whole response back.
+///
+/// Shared by the plain-socket client below and the TLS one in [`crate::r2`]:
+/// the framing is identical, only the stream and the headers differ. The
+/// caller supplies `Host` (a signed request has to sign the value it sends)
+/// and any preconditions; `Connection: close` and `Content-Length` are ours,
+/// because the connection-per-request shape is what makes reading the
+/// response a matter of reading to the end.
+///
+/// # Errors
+///
+/// If the stream fails, or the response cannot be parsed.
+pub fn round_trip<S: std::io::Read + std::io::Write>(
+    io: &mut S,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Reply, String> {
+    let mut req = format!("{method} {target} HTTP/1.1\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "Connection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    ));
+    io.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    io.write_all(body).map_err(|e| e.to_string())?;
+    io.flush().map_err(|e| e.to_string())?;
+
+    let mut buf = Vec::new();
+    read_to_close(io, &mut buf)?;
+    parse_response(&buf)
+}
+
+/// Reads until the peer closes. A server that drops the connection without a
+/// TLS `close_notify` — or resets it after the last byte — has still
+/// delivered a whole response: the framing says where the body ends, not the
+/// socket, so an unclean end is an end and not an error.
+fn read_to_close<S: std::io::Read>(io: &mut S, out: &mut Vec<u8>) -> Result<(), String> {
+    use std::io::ErrorKind;
+    let mut tmp = [0u8; 8192];
+    loop {
+        match io.read(&mut tmp) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Splits an HTTP response into its status, `ETag`, and body. `bucketd`
+/// always answers with a `Content-Length`; a real S3 endpoint may answer a
+/// `GET` chunked, so both framings are decoded here.
+///
+/// # Errors
+///
+/// If the response is not a parseable HTTP/1.1 response.
+pub fn parse_response(buf: &[u8]) -> Result<Reply, String> {
     let split = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("bucket: response has no header terminator")?;
     let head = std::str::from_utf8(&buf[..split]).map_err(|_| "bucket: non-utf8 headers")?;
-    let body = buf[split + 4..].to_vec();
+    let raw = &buf[split + 4..];
     let mut lines = head.lines();
     let status: u16 = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .ok_or("bucket: malformed status line")?;
-    let etag = lines.find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case("etag").then(|| v.trim().to_string())
-    });
+    let (mut etag, mut chunked, mut len) = (None, false, None);
+    for l in lines {
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k.eq_ignore_ascii_case("etag") {
+            etag = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = v.eq_ignore_ascii_case("chunked");
+        } else if k.eq_ignore_ascii_case("content-length") {
+            len = v.parse::<usize>().ok();
+        }
+    }
+    let body = if chunked {
+        dechunk(raw)?
+    } else if let Some(n) = len {
+        raw.get(..n.min(raw.len())).unwrap_or(raw).to_vec()
+    } else {
+        raw.to_vec()
+    };
     Ok((status, etag, body))
+}
+
+/// Joins a `Transfer-Encoding: chunked` body: `<hex len>\r\n<bytes>\r\n`
+/// repeated, ended by a zero-length chunk. Chunk extensions (`;name=v`) are
+/// ignored, trailers are whatever follows the terminator.
+fn dechunk(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    loop {
+        let eol = raw
+            .get(p..)
+            .ok_or("bucket: truncated chunk header")?
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("bucket: truncated chunk header")?;
+        let head = std::str::from_utf8(&raw[p..p + eol]).map_err(|_| "bucket: bad chunk header")?;
+        let hex = head.split(';').next().unwrap_or("").trim();
+        let n = usize::from_str_radix(hex, 16).map_err(|_| format!("bucket: bad chunk size {hex:?}"))?;
+        p += eol + 2;
+        if n == 0 {
+            return Ok(out);
+        }
+        let end = p.checked_add(n).ok_or("bucket: chunk length overflow")?;
+        out.extend_from_slice(raw.get(p..end).ok_or("bucket: truncated chunk")?);
+        p = end + 2; // the CRLF that ends the chunk
+    }
 }
 
 impl Object for HttpBucket {

@@ -1025,6 +1025,14 @@ enum ReplMode {
     },
 }
 
+/// What one sync pass moved, and so what the shell owes the screen: a role
+/// change redraws the world; a new failure only needs saying.
+#[derive(Default)]
+struct ReplChange {
+    role: bool,
+    note: bool,
+}
+
 struct State {
     ws: Wm,
     /// Everything that leaves the process, plus the clock (CR-004). Holds
@@ -1233,6 +1241,7 @@ impl State {
                 epoch: 0,
                 unpublished: 0,
                 device: String::new(),
+                note: None,
             },
             seeded: false,
             signin: None,
@@ -1718,8 +1727,10 @@ impl State {
     /// Resolves the device-sync bucket URL from the three sources that let
     /// each platform configure it: the `--bucket` flag (desktop), the
     /// `SUPERAPP_BUCKET` environment variable, and a `bucket` file beside the
-    /// store (how android is pointed at `http://10.0.2.2:PORT` — `adb push` a
-    /// one-line file into the app's files dir).
+    /// store (how android is pointed at `http://10.0.2.2:PORT`, or at a real
+    /// R2 endpoint — `adb push` the file into the app's files dir; its first
+    /// line is the URL, and for a real bucket the next two are the keys, read
+    /// by [`crate::r2`]).
     fn resolve_bucket(db_path: Option<&std::path::Path>) -> Option<String> {
         if let Some(u) = config().bucket.clone() {
             return Some(u);
@@ -1730,9 +1741,7 @@ impl State {
                 return Some(u);
             }
         }
-        let dir = db_path.and_then(std::path::Path::parent)?;
-        let u = std::fs::read_to_string(dir.join("bucket")).ok()?.trim().to_string();
-        (!u.is_empty()).then_some(u)
+        crate::r2::url_from_file(db_path.and_then(std::path::Path::parent))
     }
 
     fn start_repl(
@@ -1740,8 +1749,17 @@ impl State {
         db_path: Option<&std::path::Path>,
     ) -> Option<ReplMode> {
         let url = Self::resolve_bucket(db_path)?;
-        let bucket: std::sync::Arc<dyn crate::object::Object> =
-            std::sync::Arc::new(crate::object::HttpBucket::new(&url));
+        // `https://` is a real R2 bucket (signed, over TLS); anything else is
+        // the plain `bucketd` demo daemon. A bucket that cannot be opened at
+        // all — no credentials — is refused loudly and the app runs local:
+        // silently pretending to sync is the one outcome worth avoiding.
+        let bucket = match crate::r2::open(&url, db_path.and_then(std::path::Path::parent)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("superapp: device sync is off — {e}");
+                return None;
+            }
+        };
         // Headless: inline passes driven by the frame loop's virtual clock, so
         // a scripted run is deterministic. Production: a background thread.
         #[cfg(headless)]
@@ -1760,13 +1778,16 @@ impl State {
     // -- device sync, mode-agnostic (CR-005) --------------------------------
 
     /// Reconciles the reported status: caches it, seeds the demo world the
-    /// first time this device holds (a holder-only act), and answers whether
-    /// the role changed.
-    fn apply_repl(&mut self, status: crate::repl::Status) -> bool {
+    /// first time this device holds (a holder-only act), and answers what
+    /// moved.
+    fn apply_repl(&mut self, status: crate::repl::Status) -> ReplChange {
         if status == self.repl_status {
-            return false;
+            return ReplChange::default();
         }
-        let role_changed = status.role != self.repl_status.role;
+        let changed = ReplChange {
+            role: status.role != self.repl_status.role,
+            note: status.note != self.repl_status.note,
+        };
         self.repl_status = status;
         if matches!(self.repl_status.role, crate::repl::Role::Holder) && !self.seeded {
             self.seeded = true;
@@ -1779,19 +1800,18 @@ impl State {
                 // The seed publishes on the next pass.
             }
         }
-        role_changed
+        changed
     }
 
-    /// Runs (or reads) one sync pass and reconciles the result. Answers
-    /// whether the role changed.
-    fn repl_poll(&mut self) -> bool {
+    /// Runs (or reads) one sync pass and reconciles the result.
+    fn repl_poll(&mut self) -> ReplChange {
         let status = match &self.repl {
             Some(ReplMode::Threads(w)) => w.status(),
             Some(ReplMode::Manual { bucket }) => {
                 let b = bucket.clone();
                 crate::repl::poll(&self.store, &*b)
             }
-            None => return false,
+            None => return ReplChange::default(),
         };
         self.apply_repl(status)
     }
@@ -3437,8 +3457,10 @@ impl Stage {
         if state.repl.is_none() {
             return;
         }
-        let role_changed = state.repl_poll();
-        if role_changed {
+        let changed = state.repl_poll();
+        // Taken before the role block below hands `self` to `update_menu`.
+        let note = changed.note.then(|| state.repl_status.note.clone()).flatten();
+        if changed.role {
             let line = state.repl_status.role.line();
             let err = matches!(state.repl_status.role, crate::repl::Role::Stranded { .. });
             state.toast(line, err);
@@ -3448,6 +3470,12 @@ impl Stage {
             }
             state.sync();
             self.update_menu(cx);
+        }
+        // A new reason to be offline is worth saying even when the role does
+        // not move: a holder whose bucket refuses its key keeps holding, and
+        // would otherwise accrue unpublished frames in silence.
+        if let (Some(note), Some(state)) = (note, self.state.as_deref_mut()) {
+            state.toast(note, true);
         }
         self.reseed_composes(cx);
         cx.redraw_all();
@@ -6534,8 +6562,10 @@ impl Stage {
                 _ => ("read-only", Some("acquire")),
             };
 
+            let note = state.repl_status.note.clone();
             let cw = 460.0_f64.min(vp.size.x - 40.0);
-            let ch = 156.0;
+            // One more line when the pass had a reason to give.
+            let ch = 156.0 + if note.is_some() { self.cell.line_h + 6.0 } else { 0.0 };
             let card = rect(
                 vp.pos.x + (vp.size.x - cw) / 2.0,
                 vp.pos.y + (vp.size.y - ch) / 2.0,
@@ -6558,11 +6588,20 @@ impl Stage {
                 card.pos + dvec2(20.0, 20.0 + self.cell.line_h + 6.0),
                 &role.line(),
             );
+            let mut line = 2.0;
+            if let Some(note) = &note {
+                self.draw_mono.draw_abs(
+                    cx,
+                    card.pos + dvec2(20.0, 20.0 + line * (self.cell.line_h + 6.0)),
+                    note,
+                );
+                line += 1.0;
+            }
             let short: String = state.repl_status.device.chars().take(8).collect();
             let device = format!("this device: {short}");
             self.draw_mono.draw_abs(
                 cx,
-                card.pos + dvec2(20.0, 20.0 + 2.0 * (self.cell.line_h + 6.0)),
+                card.pos + dvec2(20.0, 20.0 + line * (self.cell.line_h + 6.0)),
                 &device,
             );
 

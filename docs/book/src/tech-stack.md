@@ -29,10 +29,15 @@ directly:
 - **`serde` + `serde_json`** — effects are serializable values, and the
   deferred ones are JSON payloads in the `effect` table; the device-sync
   `state` object and batch headers are JSON too.
-- **No new crate for device sync.** The object-store transport (CR-005) is a
-  plain-HTTP client and a tiny `bucketd` daemon over `std::net` — a demo
-  stand-in for R2/S3, kept dependency-free (a real signed backend would add
-  one). Content hashing for snapshot integrity is a dependency-free FNV-1a.
+- **No new crate for device sync**, even for the real bucket. The transport
+  (CR-005) is a plain-HTTP client and a tiny `bucketd` daemon over `std::net`
+  for the local demo; the R2 backend is the same wire plus TLS and AWS SigV4,
+  built from crates the graph already carried under imap/lettre's
+  `rustls-tls` — `rustls` (ring, never aws-lc-rs: a new C toolchain on the
+  android cross-build), `webpki-roots`, and `ring` for SHA-256 and
+  HMAC-SHA256. The signing itself is ours, some eighty lines, pinned to the
+  AWS test vector. Content hashing for snapshot integrity is a
+  dependency-free FNV-1a.
 - **`imap` (rustls) + `mail-parser`** — the sync engine's protocol and
   MIME layers; the TLS stack is rustls-on-ring, which cross-compiles for
   android without ceremony. All engine logic runs against an `Outside`

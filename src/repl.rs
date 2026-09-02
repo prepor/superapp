@@ -19,7 +19,6 @@
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +191,12 @@ pub struct Status {
     pub unpublished: i64,
     /// This install's device id.
     pub device: String,
+    /// Why the last pass failed, if it did. A bucket that refuses us —
+    /// `403 SignatureDoesNotMatch`, a bucket that does not exist — is not the
+    /// same thing as a dead network, and against a real endpoint that
+    /// difference is most of the debugging. `None` when the pass went
+    /// through.
+    pub note: Option<String>,
 }
 
 /// A batch object's header — enough to place it in the global order and walk
@@ -252,7 +257,10 @@ fn schema_of(store: &Store) -> i64 {
 pub fn poll(store: &Store, obj: &dyn Object) -> Status {
     match poll_inner(store, obj) {
         Ok(role) => status(store, role),
-        Err(_unreachable) => status(store, offline_role(store)),
+        Err(why) => Status {
+            note: Some(why),
+            ..status(store, offline_role(store))
+        },
     }
 }
 
@@ -280,6 +288,7 @@ fn status(store: &Store, role: Role) -> Status {
         unpublished: store.unpublished(),
         device: store.device(),
         role,
+        note: None,
     }
 }
 
@@ -633,10 +642,6 @@ pub fn override_lease(store: &Store, obj: &dyn Object) -> Result<Status, String>
 
 // -- the worker ---------------------------------------------------------------
 
-/// How often the worker polls the bucket when nothing kicks it — often enough
-/// that a handoff feels live in a demo, rare enough to be gentle.
-const POLL_EVERY: Duration = Duration::from_millis(1500);
-
 /// A command to the replication worker.
 enum Cmd {
     /// Poll now (an action just captured something, or the UI woke).
@@ -710,6 +715,7 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
         epoch: 0,
         unpublished: 0,
         device: String::new(),
+        note: None,
     }));
     let wstatus = status.clone();
     let wdb = db.clone();
@@ -720,14 +726,27 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
             let Ok(store) = Store::with_db(wdb) else {
                 return;
             };
-            let report = |s: Status, st: &Arc<Mutex<Status>>| {
+            // A holder that cannot reach the bucket keeps its role, so a
+            // wrong key would otherwise be invisible on the way past: say
+            // each *new* reason once, on stderr.
+            let mut said: Option<String> = None;
+            let mut report = |s: Status, st: &Arc<Mutex<Status>>| {
+                if s.note != said {
+                    if let Some(why) = &s.note {
+                        eprintln!("repl: {why}");
+                    }
+                    said = s.note.clone();
+                }
                 *st.lock().expect("repl status") = s;
                 notify();
             };
             // First pass immediately, so the UI has a role at once.
             report(poll(&store, &*wbucket), &wstatus);
+            // The transport sets the cadence: a local daemon is free to poll
+            // hard, a metered bucket across the network is not.
+            let every = wbucket.poll_every();
             loop {
-                let next = match rx.recv_timeout(POLL_EVERY) {
+                let next = match rx.recv_timeout(every) {
                     Ok(Cmd::Kick) | Err(mpsc::RecvTimeoutError::Timeout) => poll(&store, &*wbucket),
                     Ok(Cmd::Acquire) => {
                         acquire(&store, &*wbucket).unwrap_or_else(|_| poll(&store, &*wbucket))

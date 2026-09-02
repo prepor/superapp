@@ -18,6 +18,7 @@
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
 //! | [`repl`] | device sync: the changeset log, the lease, the passes | no |
 //! | [`object`] | the sync transport: object store (memory, HTTP) + `state` | no |
+//! | [`r2`] | the same transport against a real bucket: TLS + SigV4 | no |
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`oauth`] | Gmail sign-in: the browser flow, and XOAUTH2's tokens | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
@@ -50,6 +51,7 @@ pub mod oauth;
 pub mod object;
 pub mod panels;
 pub mod problems;
+pub mod r2;
 pub mod repl;
 pub mod richtable;
 pub mod scene;
