@@ -413,39 +413,58 @@ fn cmp(op: Op, have: f64, want: f64) -> bool {
     }
 }
 
-/// The filter grammar over one entry. A tag the source does not know
-/// holds — the table has already reported it, and the SQL builder drops
-/// it the same way.
-#[must_use]
-pub fn matches(e: &Entry, ast: &Ast) -> bool {
+/// The filter grammar over one entry, with the SQL builder's semantics
+/// for what does not bind: a tag the source does not know, a value a
+/// typed tag cannot read, and `@hidden` (a switch, not a predicate) are
+/// **dropped** rather than answered — `None` — so `@not:bogus` does not
+/// hide everything and `(@dir @or @bogus)` is `@dir`. A filter that is
+/// nothing but dropped clauses shows everything, and the error line says
+/// why.
+fn holds(e: &Entry, ast: &Ast) -> Option<bool> {
     match ast {
-        Ast::Text(t) => e.name.to_lowercase().contains(&t.to_lowercase()),
+        Ast::Text(t) => Some(e.name.to_lowercase().contains(&t.to_lowercase())),
         Ast::Tag(t) => match t.as_str() {
-            "dir" => e.is_dir,
-            _ => true,
+            "dir" => Some(e.is_dir),
+            _ => None,
         },
         Ast::Op { tag, op, value } => match tag.as_str() {
             "kind" => {
                 let v = value.trim().to_lowercase();
-                e.kind().tag() == v || e.kind().word() == v
+                Some(e.kind().tag() == v || e.kind().word() == v)
             }
             "size" => value
                 .trim()
                 .parse::<f64>()
-                .map_or(true, |v| cmp(*op, e.size as f64, v)),
-            "modified" => richtable::date_span(value).map_or(true, |(lo, hi)| match op {
+                .ok()
+                .map(|v| cmp(*op, e.size as f64, v)),
+            "modified" => richtable::date_span(value).map(|(lo, hi)| match op {
                 Op::Eq => e.modified >= lo && e.modified < hi,
                 Op::Gt => e.modified >= hi,
                 Op::Gte => e.modified >= lo,
                 Op::Lt => e.modified < lo,
                 Op::Lte => e.modified < hi,
             }),
-            _ => true,
+            _ => None,
         },
-        Ast::Not(inner) => !matches(e, inner),
-        Ast::And(v) => v.iter().all(|a| matches(e, a)),
-        Ast::Or(v) => v.iter().any(|a| matches(e, a)),
+        Ast::Not(inner) => holds(e, inner).map(|b| !b),
+        Ast::And(v) | Ast::Or(v) => {
+            let parts: Vec<bool> = v.iter().filter_map(|a| holds(e, a)).collect();
+            if parts.is_empty() {
+                None
+            } else if matches!(ast, Ast::And(_)) {
+                Some(parts.iter().all(|b| *b))
+            } else {
+                Some(parts.iter().any(|b| *b))
+            }
+        }
     }
+}
+
+/// Whether an entry passes the filter; a filter nothing in which binds
+/// passes everything.
+#[must_use]
+pub fn matches(e: &Entry, ast: &Ast) -> bool {
+    holds(e, ast).unwrap_or(true)
 }
 
 impl Datasource for DirSource {
@@ -527,6 +546,24 @@ mod tests {
         assert_eq!(names(&page), ["report-q3.pdf"]);
         let row = page[0].clone();
         assert_eq!(src.index_of(&store, None, &row), Some(4));
+    }
+
+    /// What does not bind is dropped, as the SQL builder drops it — under
+    /// `@not:` and inside a group too — never answered as true or false.
+    #[test]
+    fn clauses_that_do_not_bind_are_dropped_not_answered() {
+        let store = Store::open(None).unwrap();
+        let src = DirSource::new("~/Downloads");
+        let count = |q: &str| src.count(&store, filter::parse(q).ast.as_ref()).unwrap();
+        let all = count("");
+        assert_eq!(count("@bogus"), all, "an unknown tag shows everything");
+        assert_eq!(count("@not:bogus"), all, "…and so does its negation");
+        assert_eq!(count("@size>abc"), all, "an unreadable value is dropped");
+        assert_eq!(count("(@bogus @or @nope)"), all, "a group of nothing is nothing");
+        assert_eq!(count("(@dir @or @bogus)"), count("@dir"), "a dropped member leaves the rest");
+        assert_eq!(count("@not:dir"), all - count("@dir"));
+        assert_eq!(count("@bogus @not:dir"), all - count("@dir"));
+        assert_eq!(count("(@not:dir @or @bogus)"), all - count("@dir"));
     }
 
     #[test]

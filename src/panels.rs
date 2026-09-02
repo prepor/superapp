@@ -4131,13 +4131,28 @@ impl FilesPanel {
     }
 
     /// Follows the panel's params: a crumb replaced it onto an ancestor,
-    /// or a preview re-aimed it. The filter and the cursor start over.
-    fn sync_dir(&mut self, dir: &str) {
-        if self.table.source().dir != dir {
-            self.table = Table::new(files::DirSource::new(dir), files::PAGE);
-            self.sel = None;
-            self.status = None;
+    /// or a preview re-aimed it. Everything that was about the old
+    /// directory starts over: the filter (the field too, since the field
+    /// is the filter's one source), the cursor, the status line, and a
+    /// `new dir` row left open.
+    fn sync_dir(&mut self, cx: &mut Cx, dir: &str) {
+        if self.table.source().dir == dir {
+            return;
         }
+        self.table = Table::new(files::DirSource::new(dir), files::PAGE);
+        self.sel = None;
+        self.status = None;
+        self.view.text_input(cx, ids!(filter_input)).set_text(cx, "");
+        if self.newdir_open {
+            let input = self.view.text_input(cx, ids!(newdir_input));
+            if input.key_focus(cx) {
+                cx.set_key_focus(Area::Empty);
+            }
+            input.set_text(cx, "");
+            self.newdir_open = false;
+            self.view.view(cx, ids!(newdir)).set_visible(cx, false);
+        }
+        self.focus_pending = false;
     }
 
     fn sync_filter(&mut self, cx: &mut Cx) {
@@ -4398,7 +4413,7 @@ impl Widget for FilesPanel {
         };
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
         if let Some(dir) = Self::dir_of(scope) {
-            self.sync_dir(&dir);
+            self.sync_dir(cx, &dir);
         }
         let dir = self.table.source().dir.clone();
         self.sync_filter(cx);

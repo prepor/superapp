@@ -1043,6 +1043,14 @@ fn files() -> Scene<Setup> {
             dir("~/Downloads", "click \"Downloads\"\nwait 200\nkey cmd+m\nwait 500"),
         )
         .about("⌘m holds the directory shown: every files panel now offers move here")
+        .node(
+            "crumb up",
+            dir(
+                "~/Downloads",
+                "click \"filter\"\nwait 200\ntype \"q3\"\nwait 300\nclick \"~\"\nwait 500",
+            ),
+        )
+        .about("a crumb replaces the panel with ~ in place; the filter and the cursor start over")
         .node("gone", dir("~/Downloads/2027", ""))
         .about("a directory that left under the panel; the crumbs still climb")
         .node("phone", dir("~/Downloads", ""))
@@ -1050,6 +1058,7 @@ fn files() -> Scene<Setup> {
         .edge("home", "downloads", "click Downloads/")
         .edge("downloads", "cursor", "↓ ×2")
         .edge("downloads", "filtered", "/ @kind:image")
+        .edge("filtered", "crumb up", "click ~")
         .edge("downloads", "new dir", "⌘n")
         .edge("new dir", "refused", "2026, enter")
         .edge("downloads", "holding", "⌘m")
@@ -1088,6 +1097,11 @@ fn files_walk() -> Scene<Setup> {
         .about("~ as the first column")
         .node("preview", from_home(preview))
         .about("↓ ×3: Downloads previews beside ~; focus stays in the list, so the walk goes on")
+        .node(
+            "re-aimed",
+            from_home(&format!("{preview}key enter\nwait 500\nkey down 1\nwait 500\nkey down 1\nwait 700")),
+        )
+        .about("in Downloads, ↓ onto 2026/ then ↓ onto a file: the same joined panel goes from a column to a card")
         .node("chain", from_home(chain))
         .about("enter goes; ~ → Downloads → 2026 → a card, the list still driving")
         .node("replaced", from_home(&format!("{chain}key up 2\nwait 700")))
@@ -1103,6 +1117,7 @@ fn files_walk() -> Scene<Setup> {
         )
         .about("⌘h — copy here — performs into the directory shown (the draft only says so)")
         .edge("root", "preview", "↓")
+        .edge("preview", "re-aimed", "enter, ↓, ↓")
         .edge("preview", "chain", "enter, ↓, enter, ↓")
         .edge("chain", "replaced", "↑")
         .edge("chain", "holding", "enter, ⌘p, ⌘← ⌘←")
