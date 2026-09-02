@@ -106,10 +106,7 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
     }
 }
 
-/// The message panel's link keys — the walk that used to be `j`/`k`, and
-/// reply, now visible on the links themselves.
-pub const ACCEL_NEWER: char = 'n';
-pub const ACCEL_OLDER: char = 'o';
+/// The message panel's link key: reply, visible on the link itself.
 pub const ACCEL_REPLY: char = 'r';
 
 /// Settings' link to the add-account form. The `d` of "add" rather than the
@@ -142,8 +139,6 @@ pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
         .filter_map(|(label, act)| btn_accel(*act).map(|c| (c, *label)))
         .collect();
     if matches!(kind, Kind::Message { .. }) {
-        v.push((ACCEL_NEWER, "newer"));
-        v.push((ACCEL_OLDER, "older"));
         v.push((ACCEL_REPLY, "reply"));
     }
     if matches!(kind, Kind::Settings) {
@@ -310,12 +305,7 @@ mod tests {
                 );
             }
         }
-        for (label, c) in [
-            ("newer", ACCEL_NEWER),
-            ("older", ACCEL_OLDER),
-            ("reply", ACCEL_REPLY),
-            ("add account", ACCEL_ADD_ACCOUNT),
-        ] {
+        for (label, c) in [("reply", ACCEL_REPLY), ("add account", ACCEL_ADD_ACCOUNT)] {
             assert!(accel_idx(label, c).is_some(), "“{label}” cannot show {c}");
         }
     }

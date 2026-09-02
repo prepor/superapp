@@ -16,9 +16,18 @@ a one-line description and, optionally, its values — a closed set, or
 *dynamic*, asked of the source as the operator types.
 
 A SQL-backed source is declared as a `static` beside the domain's other
-queries (`mail::INBOX`): the fixed parts of its query — columns, `FROM`,
+queries (`mail::THREADS`): the fixed parts of its query — columns, `FROM`,
 a base `WHERE`, the text-search columns, tag bindings, the order — plus a
 row decoder, the row's order key, and a function for its dynamic values.
+
+A source may declare a **group key**, and then a row is a group: the
+columns are aggregates over its members, the page reads off the grouped
+subquery, and the filter becomes a membership test — a group matches when
+**any** member matches, and its aggregates always cover the whole group.
+The inbox is such a source (CR-007): its rows are threads, grouped by
+`message.thread` over the inbox messages, so `@from:vera` finds the
+conversations Vera wrote in and still shows everyone in them, and
+`@unread` finds the ones with unread mail.
 The **SQL builder** completes that with the filter's `WHERE`, the page and
 the rank. A built query goes through the store's cache, dependency capture
 and trace exactly like a `static` one (`Store::rows_sql`), so a page is
@@ -47,7 +56,8 @@ leaves. A date is written `dd.mm.yyyy` and is a **span**: `@date>D` means
 after that day, `@date:D` on it, `@date:"30.08.2026 09:14"` that minute.
 
 The inbox's tags: `@unread`, `@html`, `@from:` (senders, dynamic),
-`@subject:`, `@date`, `@account:` (dynamic).
+`@subject:`, `@date`, `@account:` (dynamic). Each reads against the inbox
+messages; a thread matches when any of them does.
 
 ## Autocomplete
 
@@ -87,9 +97,10 @@ screen.
 
 The list's cursor is kept by **rank**: a row's position is a `COUNT(*)`
 of the rows the order puts before it, built from the source's order key.
-A mail that moved under the cursor — a sync landed above it — is found
-again without walking anything; a mail that left leaves the cursor on the
-row it stood on.
+A thread that moved under the cursor — a sync landed above it — is found
+again without walking anything; a thread that left leaves the cursor on the
+row it stood on. The cursor's identity is the thread, not the mail it
+opens, because that mail changes as replies arrive.
 
 ## Drawing a long list
 

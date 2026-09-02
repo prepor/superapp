@@ -32,7 +32,9 @@ A kind's request is a **floor, not the whole story**. Where the length of what
 a panel shows is knowable, the shell measures it and asks for more — today the
 message panel does: a letter that does not fit its three rows asks for as many
 as it needs, up to the whole column, so a long mail *opens tall* rather than
-opening scrolled, while a one-liner stays short. The measurement is re-taken
+opening scrolled, while a one-liner stays short. A thread measures as its
+open messages plus a line for each closed one, so opening an old message in
+place grows the panel, and closing it shrinks it back. The measurement is re-taken
 every time the shell recomputes targets, so a body that arrives after its
 panel opened grows the panel when it lands, and nothing about it is persisted
 — like the camera and the grid, it is re-derived. Downstream a measured wish

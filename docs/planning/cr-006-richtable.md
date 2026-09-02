@@ -7,6 +7,10 @@ including the lazy kind; lazy-load on scroll instead of a *load more*
 button, and something smarter than a growing limit; and think about what
 rendering a really long list costs).
 
+Since CR-007 the inbox's rows are threads: the datasource declares a group
+key, and the filter is a membership test over the members — see the rich
+table chapter of the book.
+
 ## Why
 
 The overview promised that "the same richtable that lists mail will list

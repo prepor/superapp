@@ -15,6 +15,9 @@
 - **Wish** — a request measured from the content rather than fixed by the
   kind: a long letter asks for more rows than a short one. The kind's
   request is its floor, the grid its ceiling.
+- **Thread** — a conversation: every mail that answers, or is answered by,
+  another, joined through their `References` headers. The inbox's rows are
+  threads, and a message panel shows the whole thread its mail belongs to.
 - **Join** — the preview-pane relation, generalized: a solid link opens its
   panel *joined* to the link's panel; the next solid link from the same parent
   replaces the joined child instead of opening another panel.

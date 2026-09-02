@@ -1,0 +1,49 @@
+# CR-007 — threads: the row is the conversation, the panel is the whole of
+# it.
+#
+# Assertions are the clicks: a closed message is addressed by its sender
+# and the line it previews, an open one by its sender and date, so "this
+# message opened in place" is checked by the run rather than by a human
+# reading a screenshot.
+wait 900
+
+# The GitHub row folds six mails — five archived runs and the unread one.
+# Opening it previews the thread: the five old runs are one line each, the
+# unread one is open at the foot, and the list is scrolled to it.
+click "CI failed"
+wait 700
+shot th1-github-thread
+
+# A closed row opens in place when touched. The oldest run failed and
+# carries the red status line, which is what its row previews.
+click "GitHub: ci: FAILED"
+wait 600
+shot th2-old-run-opened
+
+# The same row, open, is addressed by sender and date; touching it closes.
+click "GitHub · aug 28 06:10"
+wait 600
+shot th3-old-run-closed
+
+# Max's thread: my note (in Sent), his reply, his second reply with a
+# quoted tail. The row reads "Max, me · 3"; the newest inbox mail opens,
+# its quote folded behind one line — which unfolds when touched.
+click "superapp panel model"
+wait 700
+shot th4-max-thread
+click "quoted"
+wait 500
+shot th5-quote-unfolded
+
+# Archiving files the conversation: both of Max's inbox mails go, the row
+# goes with them, and the cursor carries on to the next thread. One cmd+z
+# puts both mails and the row back.
+key cmd+a
+wait 700
+shot th6-archived-thread
+key cmd+z
+wait 700
+shot th7-undone
+click "superapp panel model"
+wait 600
+quit

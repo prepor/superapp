@@ -398,8 +398,8 @@ fn ingest_message(
     }
     tx.execute(
         "INSERT INTO message(account, folder, from_name, from_email,
-                             subject, date, unread, body, html, raw, message_id)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                             subject, date, unread, body, html, raw, message_id, topic)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         rusqlite::params![
             account,
             folder,
@@ -412,13 +412,18 @@ fn ingest_message(
             p.html,
             m.raw,
             p.message_id,
+            p.topic,
         ],
     )?;
+    let id = tx.last_insert_rowid();
     tx.execute(
         "INSERT INTO server_msg(message, folder, uid, seen)
          VALUES(?1, ?2, ?3, ?4)",
-        rusqlite::params![tx.last_insert_rowid(), folder, m.uid, !m.unread],
+        rusqlite::params![id, folder, m.uid, !m.unread],
     )?;
+    // Which conversation it belongs to (CR-007) — decided here, in the same
+    // transaction, so no draw ever sees an unthreaded mail.
+    mail::thread_tx(tx, account, id, &p.message_id, &p.references)?;
     Ok(())
 }
 
@@ -433,8 +438,30 @@ pub struct ParsedMail {
     /// ([`crate::html::sanitize`]). `None` when the sender sent text alone,
     /// or when the narrowing left nothing worth showing.
     pub html: Option<String>,
-    /// The Message-ID header — move adoption (and threading, someday).
+    /// The Message-ID header, angle brackets off — move adoption, and the
+    /// identity threading walks (CR-007).
     pub message_id: String,
+    /// `References` ∪ `In-Reply-To`, brackets off, header order, deduped:
+    /// every conversation this mail claims to belong to.
+    pub references: Vec<String>,
+    /// The subject with its reply/forward prefixes stripped.
+    pub topic: String,
+}
+
+/// One id out of an id header, as threading compares it: trimmed, and
+/// without the angle brackets a well-formed one wears.
+fn norm_id(s: &str) -> String {
+    s.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string()
+}
+
+/// The ids in an id-list header (`References`, `In-Reply-To`).
+fn header_ids(v: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    use mail_parser::HeaderValue;
+    match v {
+        HeaderValue::Text(t) => vec![norm_id(t)],
+        HeaderValue::TextList(l) => l.iter().map(|t| norm_id(t)).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// MIME → panel text via `mail-parser`. Paragraph structure survives as
@@ -456,6 +483,8 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             body: String::new(),
             html: None,
             message_id: String::new(),
+            references: Vec::new(),
+            topic: "(unparseable message)".into(),
         };
     };
     let (from_name, from_email) = msg
@@ -485,17 +514,29 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             _ => None,
         })
         .filter(|h| !h.trim().is_empty());
+    let subject = msg.subject().unwrap_or("(no subject)").to_string();
+    let mut references: Vec<String> = Vec::new();
+    for id in header_ids(msg.references())
+        .into_iter()
+        .chain(header_ids(msg.in_reply_to()))
+    {
+        if !id.is_empty() && !references.contains(&id) {
+            references.push(id);
+        }
+    }
     ParsedMail {
         from_name,
         from_email,
-        subject: msg.subject().unwrap_or("(no subject)").to_string(),
+        topic: crate::mail::topic_of(&subject),
+        subject,
         date: msg.date().map(|d| d.to_timestamp() as f64).unwrap_or(0.0),
         body: msg
             .body_text(0)
             .map(|t| t.replace("\r\n", "\n").trim().to_string())
             .unwrap_or_default(),
         html,
-        message_id: msg.message_id().unwrap_or_default().to_string(),
+        message_id: norm_id(msg.message_id().unwrap_or_default()),
+        references,
     }
 }
 

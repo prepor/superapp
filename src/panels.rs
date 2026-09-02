@@ -25,6 +25,44 @@ pub struct PanelProps {
     pub store: std::rc::Rc<Store>,
     pub pid: u64,
     pub kind: crate::core::Kind,
+    /// Which messages of its thread a message panel shows open (CR-007).
+    /// Panel context, owned by the shell; `None` for every other kind.
+    pub expand: Option<Expansion>,
+}
+
+/// Which messages of a conversation a panel shows open, and whose quoted
+/// tails are unfolded (CR-007). Seeded by the shell when the panel opens —
+/// the mail it opened on plus whatever was unread — and toggled by touch.
+/// Context, not history: it persists no further than the process.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Expansion {
+    /// The mail the set was seeded for. A panel re-targeted since starts
+    /// over with only its own mail open.
+    pub for_mail: i64,
+    pub open: std::collections::BTreeSet<i64>,
+    pub quotes: std::collections::BTreeSet<i64>,
+}
+
+impl Expansion {
+    /// What a panel shows when nothing seeded it: its own mail, open.
+    #[must_use]
+    pub fn just(mail: i64) -> Self {
+        Expansion {
+            for_mail: mail,
+            open: std::iter::once(mail).collect(),
+            quotes: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// The set a panel on `mail` should draw: this one if it was seeded
+    /// for that mail, the bare default otherwise.
+    #[must_use]
+    pub fn for_panel(this: Option<&Expansion>, mail: i64) -> Expansion {
+        match this {
+            Some(e) if e.for_mail == mail => e.clone(),
+            _ => Expansion::just(mail),
+        }
+    }
 }
 
 /// One row of a modal overlay, already reduced to what it draws. The shell
@@ -925,7 +963,111 @@ script_mod! {
 
     // ---- the read panels ---------------------------------------------------
 
-    /** One mail, whole: headers with a contact link, the body, the walk. */
+    /** One message of a conversation (CR-007): a header row that is the
+        same row open or closed — the sender, the date at the right edge —
+        with the letter unfolded under it while open. Closed, the row
+        previews the first line the author wrote, or the status line, red
+        when it is an error. */
+    mod.widgets.ThreadMsg = set_type_default() do #(ThreadMsg::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        head := View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            padding: Inset{top: 4, bottom: 4}
+            name_lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
+            from_link := mod.widgets.SLink { visible: false }
+            View { width: 10, height: 1 }
+            // The preview rides a Fill View whose flow is Down, for the
+            // reason the inbox row's from label does: a Fill label on a
+            // Right flow's main axis defer-walks.
+            preview_wrap := View {
+                width: Fill, height: Fit
+                flow: Down
+                preview_lbl := mod.widgets.SLabel {
+                    padding: 0
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                    draw_text +: { color: #909090 }
+                }
+                preview_err := mod.widgets.SLabel {
+                    visible: false
+                    padding: 0
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                    draw_text +: { color: #a01500 }
+                }
+            }
+            spacer := View { visible: false, width: Fill, height: 1 }
+            View { width: 10, height: 1 }
+            date_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fit, text: "", draw_text +: { color: #909090 }
+            }
+        }
+        body := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 6
+            padding: Inset{top: 2, bottom: 6}
+            status_lbl := mod.widgets.SLabel {
+                visible: false, text: "", draw_text +: { color: #5a5a5a }
+            }
+            status_err_lbl := mod.widgets.SLabel {
+                visible: false, text: "", draw_text +: { color: #a01500 }
+            }
+            // Two readings of one letter; the row shows whichever the mail
+            // actually carries, never both — each in its own View, the
+            // widget that honours `visible`.
+            text_wrap := View {
+                width: Fill, height: Fit
+                body_lbl := mod.widgets.SText { is_multiline: true }
+            }
+            html_wrap := View {
+                width: Fill, height: Fit
+                visible: false
+                body_html := mod.widgets.SHtml {}
+            }
+            // The quoted tail, folded behind one line: in a thread it is
+            // the message above. Touch unfolds it in place.
+            quote_fold := View {
+                visible: false
+                width: Fit, height: Fit
+                mod.widgets.SLabel { padding: 0, text: "› quoted", draw_text +: { color: #909090 } }
+            }
+            quote_text := View {
+                width: Fill, height: Fit
+                visible: false
+                quote_lbl := mod.widgets.SText {
+                    is_multiline: true
+                    draw_text +: {
+                        color: #5a5a5a
+                        color_hover: #5a5a5a
+                        color_focus: #5a5a5a
+                        color_down: #5a5a5a
+                    }
+                }
+            }
+            quote_html := View {
+                width: Fill, height: Fit
+                visible: false
+                quote_body := mod.widgets.SHtml {}
+            }
+        }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** One mail, in its conversation (CR-007): the account it came to,
+        once; every message of the thread, oldest first, open or closed;
+        reply at the foot. */
     mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -933,11 +1075,6 @@ script_mod! {
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 6
 
-        View {
-            width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 60, text: "FROM" }
-            from_link := mod.widgets.SLink {}
-        }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 60, text: "TO" }
@@ -951,48 +1088,15 @@ script_mod! {
                 }
             }
         }
-        View {
-            width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 60, text: "DATE" }
-            date_lbl := mod.widgets.SText { is_multiline: false }
-        }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc } }
-        status_lbl := mod.widgets.SLabel {
-            visible: false, text: "", draw_text +: { color: #5a5a5a }
-        }
-        status_err_lbl := mod.widgets.SLabel {
-            visible: false, text: "", draw_text +: { color: #a01500 }
-        }
-        // Two readings of one letter; the panel shows whichever the mail
-        // actually carries, never both. Each sits in its own View because
-        // that is the widget that honours `visible` — neither `Html` nor
-        // `TextInput` carries one, so hiding either directly is a silent
-        // no-op, and the previous mail reads on under the next.
-        body_scroll := View {
+        list := PortalList {
             width: Fill, height: Fill
             flow: Down
-            scroll_bars: ScrollBars{ show_scroll_x: false }
-            text_wrap := View {
-                width: Fill, height: Fit
-                body_lbl := mod.widgets.SText { is_multiline: true }
-            }
-            html_wrap := View {
-                width: Fill, height: Fit
-                visible: false
-                body_html := mod.widgets.SHtml {}
-            }
+            reuse_items: true
+            msg := mod.widgets.ThreadMsg {}
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            newer_link := mod.widgets.SLink {}
-            newer_off := mod.widgets.SLabel {
-                visible: false, text: "← newer", draw_text +: { color: #909090 }
-            }
-            mod.widgets.SLabel { width: 16, text: "" }
-            older_link := mod.widgets.SLink {}
-            older_off := mod.widgets.SLabel {
-                visible: false, text: "older →", draw_text +: { color: #909090 }
-            }
             View { width: Fill, height: 1 }
             reply_link := mod.widgets.SLink {}
         }
@@ -1123,7 +1227,7 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "a control wearing a bold letter is cmd+that letter:" }
         }
-        // Two lines per kind: a panel wide enough for one row of these was
+        // Short lines: a panel wide enough for one long row of these was
         // already a squeeze before delete joined the message's chrome.
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "  message " }
@@ -1133,13 +1237,6 @@ script_mod! {
             mod.widgets.SLabel { text: "elete " }
             mod.widgets.SKbd { text: "cmd+r" }
             mod.widgets.SLabel { text: "eply" }
-        }
-        mod.widgets.SRow {
-            mod.widgets.SLabel { text: "          " }
-            mod.widgets.SKbd { text: "cmd+n" }
-            mod.widgets.SLabel { text: "/" }
-            mod.widgets.SKbd { text: "cmd+o" }
-            mod.widgets.SLabel { text: " walk newer / older" }
         }
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "  inbox   " }
@@ -1154,7 +1251,10 @@ script_mod! {
             mod.widgets.SLabel { text: "          arrows walk the rows" }
         }
         mod.widgets.SRow {
-            mod.widgets.SLabel { width: Fill, text: "clicking a row, or walking onto it, opens the mail beside the list without leaving it — and that preview lends the list its own keys" }
+            mod.widgets.SLabel { width: Fill, text: "clicking a row, or walking onto it, opens the thread beside the list without leaving it — and that preview lends the list its own keys" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "in a thread, a closed message is a row: click it to open it in place, click an open one's header to close it" }
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "esc" }
@@ -2090,25 +2190,25 @@ impl Widget for InboxLine {
 }
 
 impl InboxLineRef {
-    fn populate(&self, cx: &mut Cx, m: &mail::MailHead) {
+    fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead) {
         let Some(inner) = self.borrow() else { return };
-        let from = &m.from_name;
+        let from = m.who_line();
         let fp = inner.view.label(cx, ids!(from_lbl));
         let fb = inner.view.label(cx, ids!(from_b));
         let sp = inner.view.label(cx, ids!(subject_lbl));
         let sb = inner.view.label(cx, ids!(subject_b));
-        fp.set_text(cx, if m.unread { "" } else { from });
-        fb.set_text(cx, if m.unread { from } else { "" });
+        fp.set_text(cx, if m.unread { "" } else { &from });
+        fb.set_text(cx, if m.unread { &from } else { "" });
         fp.set_visible(cx, !m.unread);
         fb.set_visible(cx, m.unread);
-        sp.set_text(cx, if m.unread { "" } else { &m.subject });
-        sb.set_text(cx, if m.unread { &m.subject } else { "" });
+        sp.set_text(cx, if m.unread { "" } else { &m.topic });
+        sb.set_text(cx, if m.unread { &m.topic } else { "" });
         sp.set_visible(cx, !m.unread);
         sb.set_visible(cx, m.unread);
         inner
             .view
             .label(cx, ids!(date_lbl))
-            .set_text(cx, &mail::fmt_date(m.date));
+            .set_text(cx, &mail::fmt_date(m.last));
     }
 }
 
@@ -2138,7 +2238,7 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    fn populate(&self, cx: &mut Cx, m: &mail::MailHead, selected: bool) {
+    fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool) {
         let Some(row) = self.borrow() else { return };
         let line = row.view.widget(cx, ids!(line));
         let line_sel = row.view.widget(cx, ids!(line_sel));
@@ -2153,8 +2253,8 @@ impl InboxRowRef {
 // InboxPanel
 // ---------------------------------------------------------------------------
 
-/// The inbox's table: the shared engine over the mail datasource.
-type InboxTable = Table<&'static SqlSource<mail::MailHead>>;
+/// The inbox's table: the shared engine over the thread datasource.
+type InboxTable = Table<&'static SqlSource<mail::ThreadHead>>;
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct InboxPanel {
@@ -2167,7 +2267,7 @@ pub struct InboxPanel {
     suggest: View,
     /// The rich table (CR-006): the filter and the paging window. It holds
     /// no rows — every row a draw needs is a page lookup in the store.
-    #[rust(Table::new(&mail::INBOX, mail::INBOX_PAGE))]
+    #[rust(Table::new(&mail::THREADS, mail::INBOX_PAGE))]
     table: InboxTable,
     /// The cursor: which mail, and the row it sat on. The index is the
     /// fallback — a mail archived out from under the cursor is no longer in
@@ -2176,10 +2276,10 @@ pub struct InboxPanel {
     #[rust]
     sel: Option<(i64, usize)>,
     /// What each live row was last populated with, by index: a draw
-    /// repopulates only the rows whose mail or selection changed, so
+    /// repopulates only the rows whose thread or selection changed, so
     /// scrolling a long list costs its new rows and nothing else.
     #[rust]
-    stamps: HashMap<usize, (mail::MailHead, bool)>,
+    stamps: HashMap<usize, (mail::ThreadHead, bool)>,
     /// The filter's autocomplete: the table is its completion — tag
     /// names, then a tag's values.
     #[rust]
@@ -2202,30 +2302,38 @@ impl InboxPanel {
     }
 
     /// Where the cursor stands now: the remembered row if it still holds
-    /// the mail, else the mail's rank (a sync landed above it), else the
-    /// row clamped into the table (the mail left; carry on from there).
+    /// the thread, else the thread's rank (a sync landed above it), else
+    /// the row clamped into the table (the thread left; carry on from
+    /// there). The cursor's identity is the thread anchor (CR-007): which
+    /// mail a row opens can change under it as replies arrive.
     fn cursor_index(&self, store: &Store) -> Option<usize> {
-        let (id, idx) = self.sel?;
-        if self.table.row(store, idx).is_some_and(|m| m.id == id) {
+        let (th, idx) = self.sel?;
+        if self.table.row(store, idx).is_some_and(|t| t.thread == th) {
             return Some(idx);
         }
-        if let Some(i) = self.index_of_id(store, id) {
+        if let Some(i) = self.index_of_thread(store, th) {
             return Some(i);
         }
         let n = self.table.len(store);
         (n > 0).then(|| idx.min(n - 1))
     }
 
-    /// A mail's row: a live row first (it is usually on screen), else its
-    /// rank in the table.
-    fn index_of_id(&self, store: &Store, id: i64) -> Option<usize> {
-        if let Some((i, _)) = self.stamps.iter().find(|(_, (m, _))| m.id == id) {
-            if self.table.row(store, *i).is_some_and(|m| m.id == id) {
+    /// A thread's row: a live row first (it is usually on screen), else its
+    /// rank in the table. The anchor is a mail id, so the row is re-derived
+    /// from it exactly as from any of its mails.
+    fn index_of_thread(&self, store: &Store, th: i64) -> Option<usize> {
+        if let Some((i, _)) = self.stamps.iter().find(|(_, (t, _))| t.thread == th) {
+            if self.table.row(store, *i).is_some_and(|t| t.thread == th) {
                 return Some(*i);
             }
         }
-        let head = mail::mail(store, id)?.head;
+        let head = mail::thread_head(store, th)?;
         self.table.index_of(store, &head)
+    }
+
+    /// A mail's row: the row of the thread it belongs to.
+    fn index_of_id(&self, store: &Store, id: i64) -> Option<usize> {
+        self.index_of_thread(store, mail::thread_of(store, id)?)
     }
 
     /// Puts the cursor on row `i` and previews what it lands on — every
@@ -2233,7 +2341,7 @@ impl InboxPanel {
     /// disagree.
     fn set_sel(&mut self, cx: &mut Cx, pid: u64, store: &Store, i: usize) {
         let Some(m) = self.table.row(store, i) else { return };
-        self.sel = Some((m.id, i));
+        self.sel = Some((m.thread, i));
         // Keep the cursor on screen: a row without a live item is off-view.
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
         let visible = list
@@ -2242,7 +2350,7 @@ impl InboxPanel {
         if !visible {
             list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
         }
-        cx.action(PanelAction::PreviewMail { pid, id: m.id });
+        cx.action(PanelAction::PreviewMail { pid, id: m.target });
         self.redraw(cx);
     }
 
@@ -2260,10 +2368,10 @@ impl InboxPanel {
 }
 
 impl InboxPanelRef {
-    /// The mail under the cursor, if any — the shell asks so it can carry the
-    /// cursor forward when that mail is filed away.
-    pub fn selected(&self) -> Option<i64> {
-        self.borrow().and_then(|p| p.sel).map(|(id, _)| id)
+    /// The thread under the cursor, if any — the shell asks so it can carry
+    /// the cursor forward when that thread is filed away.
+    pub fn selected_thread(&self) -> Option<i64> {
+        self.borrow().and_then(|p| p.sel).map(|(th, _)| th)
     }
 
     /// Whether the filter owns the keyboard. The fifth accelerator rule
@@ -2275,19 +2383,20 @@ impl InboxPanelRef {
     }
 
     /// Row `i` of the table as this panel has it — its own filter included.
-    pub fn row_at(&self, store: &Store, i: usize) -> Option<mail::MailHead> {
+    pub fn row_at(&self, store: &Store, i: usize) -> Option<mail::ThreadHead> {
         self.borrow().and_then(|p| p.table.row(store, i))
     }
 
-    /// The mail a cursor standing on `id` should land on once it is filed
-    /// away: the next row down, or the one above if it was the last.
+    /// The mail a cursor standing on `id`'s thread should land on once that
+    /// thread is filed away: the next row's, or the one above if it was the
+    /// last.
     pub fn neighbour_of(&self, store: &Store, id: i64) -> Option<i64> {
         let p = self.borrow()?;
         let i = p.index_of_id(store, id)?;
         p.table
             .row(store, i + 1)
             .or_else(|| i.checked_sub(1).and_then(|j| p.table.row(store, j)))
-            .map(|m| m.id)
+            .map(|t| t.target)
     }
 
     /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
@@ -2340,7 +2449,7 @@ impl Widget for InboxPanel {
                             .cursor_index(&store)
                             .or(Some(0))
                             .and_then(|i| self.table.row(&store, i))
-                            .map(|m| m.id);
+                            .map(|t| t.target);
                         if let Some(id) = target {
                             // Enter *goes*: unlike the walk's preview, it
                             // hands focus to the mail (the solid-link rule).
@@ -2396,9 +2505,11 @@ impl Widget for InboxPanel {
                         // click, or the walk carried past one just filed
                         // away). Take the row from the table so the index
                         // fallback stays honest.
-                        let i = self.index_of_id(&store, *id).unwrap_or(0);
-                        self.sel = Some((*id, i));
-                        self.redraw(cx);
+                        if let Some(th) = mail::thread_of(&store, *id) {
+                            let i = self.index_of_thread(&store, th).unwrap_or(0);
+                            self.sel = Some((th, i));
+                            self.redraw(cx);
+                        }
                     }
                 }
             }
@@ -2423,7 +2534,7 @@ impl Widget for InboxPanel {
         err_lbl.set_text(cx, err.as_deref().unwrap_or(""));
         err_lbl.set_visible(cx, err.is_some());
 
-        let sel = self.sel.map(|(id, _)| id);
+        let sel = self.sel.map(|(th, _)| th);
         let n = self.table.len(&store);
         let mut live: Vec<usize> = Vec::new();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
@@ -2432,7 +2543,7 @@ impl Widget for InboxPanel {
                 while let Some(idx) = list.next_visible_item(cx) {
                     let Some(m) = self.table.row(&store, idx) else { continue };
                     let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
-                    let selected = sel == Some(m.id);
+                    let selected = sel == Some(m.thread);
                     let stamp = (m, selected);
                     if !existed || self.stamps.get(&idx) != Some(&stamp) {
                         row.as_inbox_row().populate(cx, &stamp.0, selected);
@@ -2546,8 +2657,214 @@ impl SLinkRef {
 }
 
 // ---------------------------------------------------------------------------
+// ThreadMsg
+// ---------------------------------------------------------------------------
+
+/// A touchable part of a thread row, for the shell's hit table (CR-007):
+/// the header (a toggle), the contact link and the readings while open,
+/// the quote fold while it is folded.
+pub struct MsgHit {
+    pub id: i64,
+    pub open: bool,
+    /// The sender as the row names them.
+    pub name: String,
+    pub email: String,
+    pub date: String,
+    /// The line a closed row shows: the first line written, or the status.
+    pub preview: String,
+    pub head: Rect,
+    pub link: Option<Rect>,
+    pub quote: Option<Rect>,
+    pub text: Option<Rect>,
+    pub html: Option<Rect>,
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct ThreadMsg {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    #[rust]
+    id: i64,
+    #[rust]
+    open: bool,
+    #[rust]
+    has_quote: bool,
+    #[rust]
+    quoted: bool,
+    #[rust]
+    is_html: bool,
+    #[rust]
+    name: String,
+    #[rust]
+    email: String,
+    #[rust]
+    date: String,
+    #[rust]
+    preview: String,
+}
+
+impl Widget for ThreadMsg {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        // Touches resolve through the shell's registered rects, as inbox
+        // rows do — a list item's own area goes stale on any mid-gesture
+        // redraw. The row's share is the cursor.
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.view(cx, ids!(head)).area()) {
+            cx.set_cursor(MouseCursor::Hand);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl ThreadMsgRef {
+    fn populate(&self, cx: &mut Cx, pid: u64, t: &mail::ThreadMail, open: bool, quoted: bool) {
+        let Some(mut w) = self.borrow_mut() else { return };
+        let m = &t.mail;
+        let name = if m.head.from_name.is_empty() {
+            m.head.from_email.clone()
+        } else {
+            m.head.from_name.clone()
+        };
+        w.id = m.head.id;
+        w.open = open;
+        w.quoted = quoted;
+        w.is_html = m.html.is_some();
+        w.name = name.clone();
+        w.email = m.head.from_email.clone();
+        w.date = mail::fmt_date(m.head.date);
+        let (preview, err) = match &m.status {
+            Some((s, e)) => (s.clone(), *e),
+            None => (
+                mail::own_text(m)
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string(),
+                false,
+            ),
+        };
+        let (own_text, own_html, quote): (String, String, Option<String>) = if !open {
+            (String::new(), String::new(), None)
+        } else if let Some(h) = &m.html {
+            let (own, q) = mail::split_quote_html(h);
+            (String::new(), own, q)
+        } else {
+            let (own, q) = mail::split_quote(&m.body);
+            (own, String::new(), q)
+        };
+        w.preview = preview.clone();
+        w.has_quote = quote.is_some();
+        let v = &w.view;
+
+        // The header row: name, preview and date closed; the link and the
+        // date open. Same row, same height, so it toggles in place.
+        let nl = v.label(cx, ids!(name_lbl));
+        nl.set_text(cx, &name);
+        nl.set_visible(cx, !open);
+        let link = v.link(cx, ids!(from_link));
+        link.set(
+            cx,
+            pid,
+            &format!("{name} <{}>", m.head.from_email),
+            crate::core::Kind::Contact {
+                email: m.head.from_email.clone(),
+            },
+            false,
+        );
+        link.set_visible(cx, open);
+        let pl = v.label(cx, ids!(preview_lbl));
+        let pe = v.label(cx, ids!(preview_err));
+        pl.set_text(cx, if err { "" } else { &preview });
+        pl.set_visible(cx, !err);
+        pe.set_text(cx, if err { &preview } else { "" });
+        pe.set_visible(cx, err);
+        v.view(cx, ids!(preview_wrap)).set_visible(cx, !open);
+        v.view(cx, ids!(spacer)).set_visible(cx, open);
+        v.label(cx, ids!(date_lbl)).set_text(cx, &w.date);
+
+        // The letter, while open. Both readings are written every time —
+        // the hidden one emptied rather than merely hidden, so no mail
+        // can leave its text behind for the next one to show.
+        v.view(cx, ids!(body)).set_visible(cx, open);
+        let (ok_l, err_l) = (v.label(cx, ids!(status_lbl)), v.label(cx, ids!(status_err_lbl)));
+        match (&m.status, open) {
+            (Some((txt, true)), true) => {
+                err_l.set_text(cx, txt);
+                err_l.set_visible(cx, true);
+                ok_l.set_visible(cx, false);
+            }
+            (Some((txt, false)), true) => {
+                ok_l.set_text(cx, txt);
+                ok_l.set_visible(cx, true);
+                err_l.set_visible(cx, false);
+            }
+            _ => {
+                ok_l.set_visible(cx, false);
+                err_l.set_visible(cx, false);
+            }
+        }
+        let is_html = open && m.html.is_some();
+        // Guarded on the way in, not merely on the way into the store:
+        // rows narrowed by an older build are still out there, and one the
+        // parser cannot read takes the whole app down every frame.
+        v.text_input(cx, ids!(body_lbl)).set_text(cx, &own_text);
+        v.html(cx, ids!(body_html))
+            .set_text(cx, &crate::html::guard(&own_html));
+        v.view(cx, ids!(text_wrap)).set_visible(cx, open && !is_html);
+        v.view(cx, ids!(html_wrap)).set_visible(cx, is_html);
+        let show_quote = quote.is_some() && quoted;
+        v.view(cx, ids!(quote_fold)).set_visible(cx, quote.is_some() && !quoted);
+        let q = quote.unwrap_or_default();
+        v.text_input(cx, ids!(quote_lbl))
+            .set_text(cx, if show_quote && !is_html { &q } else { "" });
+        v.html(cx, ids!(quote_body)).set_text(
+            cx,
+            &crate::html::guard(if show_quote && is_html { &q } else { "" }),
+        );
+        v.view(cx, ids!(quote_text)).set_visible(cx, show_quote && !is_html);
+        v.view(cx, ids!(quote_html)).set_visible(cx, show_quote && is_html);
+    }
+
+    /// The row's touchable parts, for the shell's hit table. Rects of
+    /// hidden parts are stale, so each one is gated on the state that
+    /// drew it.
+    pub fn hits(&self, cx: &mut Cx) -> Option<MsgHit> {
+        let w = self.borrow()?;
+        let rect = |path: &[LiveId]| {
+            let r = w.view.widget(cx, path).area().rect(cx);
+            (r.size.x > 0.0 && r.size.y > 0.0).then_some(r)
+        };
+        let head = rect(ids!(head))?;
+        let open = w.open;
+        Some(MsgHit {
+            id: w.id,
+            open,
+            name: w.name.clone(),
+            email: w.email.clone(),
+            date: w.date.clone(),
+            preview: w.preview.clone(),
+            head,
+            link: if open { rect(ids!(from_link)) } else { None },
+            quote: if open && w.has_quote && !w.quoted { rect(ids!(quote_fold)) } else { None },
+            text: if open && !w.is_html { rect(ids!(body_lbl)) } else { None },
+            html: if open && w.is_html { rect(ids!(body_html)) } else { None },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MessagePanel
 // ---------------------------------------------------------------------------
+
+/// What a live thread row was last populated with: which mail, open or
+/// not, quote unfolded or not, and enough of the mail to notice it changed
+/// under the row (a body that arrived, a status that landed).
+type MsgStamp = (i64, bool, bool, usize, Option<usize>, Option<(String, bool)>, bool);
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct MessagePanel {
@@ -2555,14 +2872,20 @@ pub struct MessagePanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[rust]
+    stamps: HashMap<usize, MsgStamp>,
+    /// `(mail, seeded for)` the list was last scrolled for: a panel opens
+    /// with the mail it opened on at the top, once per seeding.
+    #[rust]
+    scrolled_for: Option<(i64, i64)>,
 }
 
 impl Widget for MessagePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        // Arrows scroll the body three lines (the char grid's behaviour) —
-        // synthesized as a Scroll event so the ScrollBars keep clamping
-        // and position, no shadow state.
+        // Arrows scroll the thread three lines — synthesized as a Scroll
+        // event over the list, so it keeps clamping and position itself,
+        // no shadow state.
         if let Event::KeyDown(k) = event {
             let d = match k.key_code {
                 KeyCode::ArrowDown => 3.0,
@@ -2570,7 +2893,7 @@ impl Widget for MessagePanel {
                 _ => 0.0,
             };
             if d != 0.0 {
-                let r = self.view.view(cx, ids!(body_scroll)).area().rect(cx);
+                let r = self.view.widget(cx, ids!(list)).area().rect(cx);
                 if r.size.y > 0.0 {
                     let ev = Event::Scroll(ScrollEvent {
                         window_id: CxWindowPool::id_zero(),
@@ -2588,12 +2911,12 @@ impl Widget for MessagePanel {
                 }
             }
         }
-        // The message panel's link accelerators (CR-003): the walk that used
-        // to be a hidden j/k is cmd+n / cmd+o now, drawn onto the links
-        // themselves, and reply is cmd+r. The shell forwards any cmd chord
-        // it does not own itself.
+        // The message panel's link accelerator (CR-003): reply is cmd+r,
+        // drawn onto the link itself. The shell forwards any cmd chord it
+        // does not own itself. Reply answers the newest mail of the
+        // thread — the conventional reply to a conversation.
         if let Event::KeyDown(k) = event {
-            if !k.modifiers.logo {
+            if !k.modifiers.logo || k.key_code != KeyCode::KeyR {
                 return;
             }
             let Some(p) = scope.props.get::<PanelProps>() else {
@@ -2602,135 +2925,101 @@ impl Widget for MessagePanel {
             let crate::core::Kind::Message { id } = p.kind else {
                 return;
             };
-            let c = match k.key_code {
-                KeyCode::KeyN => ui::ACCEL_NEWER,
-                KeyCode::KeyO => ui::ACCEL_OLDER,
-                KeyCode::KeyR => ui::ACCEL_REPLY,
-                _ => return,
-            };
-            if c == ui::ACCEL_REPLY {
-                cx.action(PanelAction::FollowLink {
-                    pid: p.pid,
-                    target: crate::core::Kind::Compose { re: id },
-                    dotted: false,
-                    fresh: false,
-                });
-                return;
-            }
-            let (newer, older) = mail::neighbours(&p.store, id);
-            let target = if c == ui::ACCEL_OLDER { older } else { newer };
-            if let Some(nid) = target {
-                cx.action(PanelAction::FollowLink {
-                    pid: p.pid,
-                    target: crate::core::Kind::Message { id: nid },
-                    dotted: true,
-                    fresh: false,
-                });
-            }
+            let re = mail::thread(&p.store, id)
+                .last()
+                .map_or(id, |t| t.mail.head.id);
+            cx.action(PanelAction::FollowLink {
+                pid: p.pid,
+                target: crate::core::Kind::Compose { re },
+                dotted: false,
+                fresh: false,
+            });
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some(p) = scope.props.get::<PanelProps>() {
-            if let crate::core::Kind::Message { id } = p.kind {
-                let pid = p.pid;
-                if let Some(m) = mail::mail(&p.store, id) {
-                    self.view.link(cx, ids!(from_link)).set(
-                        cx,
-                        pid,
-                        &format!("{} <{}>", m.head.from_name, m.head.from_email),
-                        crate::core::Kind::Contact {
-                            email: m.head.from_email.clone(),
-                        },
-                        false,
+        let Some(p) = scope.props.get::<PanelProps>() else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let crate::core::Kind::Message { id } = p.kind else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let pid = p.pid;
+        let msgs = mail::thread(&p.store, id);
+        let expand = Expansion::for_panel(p.expand.as_ref(), id);
+        if let Some(first) = msgs.first() {
+            self.view
+                .text_input(cx, ids!(to_lbl))
+                .set_text(cx, &first.mail.to);
+        }
+        let newest = msgs.last().map_or(id, |t| t.mail.head.id);
+        self.view.link(cx, ids!(reply_link)).set_accel(
+            cx,
+            pid,
+            "reply",
+            crate::core::Kind::Compose { re: newest },
+            false,
+            Some(ui::ACCEL_REPLY),
+        );
+        // Open on the mail the row pointed at: once per seeding, so a
+        // touch that opens an older message is not scrolled away from.
+        let seed = (id, expand.for_mail);
+        if self.scrolled_for != Some(seed) {
+            if let Some(i) = msgs.iter().position(|t| t.mail.head.id == id) {
+                self.view
+                    .widget(cx, ids!(list))
+                    .as_portal_list()
+                    .set_first_id(i);
+            }
+            self.scrolled_for = Some(seed);
+        }
+        let n = msgs.len();
+        let mut live: Vec<usize> = Vec::new();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, n);
+                while let Some(idx) = list.next_visible_item(cx) {
+                    let Some(t) = msgs.get(idx) else { continue };
+                    let (row, existed) = list.item_with_existed(cx, idx, live_id!(msg));
+                    let mid = t.mail.head.id;
+                    let open = expand.open.contains(&mid);
+                    let quoted = expand.quotes.contains(&mid);
+                    let stamp: MsgStamp = (
+                        mid,
+                        open,
+                        quoted,
+                        t.mail.body.len(),
+                        t.mail.html.as_ref().map(String::len),
+                        t.mail.status.clone(),
+                        t.mail.head.unread,
                     );
-                    // Selectable now, so they are TextInputs, not labels.
-                    self.view.text_input(cx, ids!(to_lbl)).set_text(cx, &m.to);
-                    self.view
-                        .text_input(cx, ids!(date_lbl))
-                        .set_text(cx, &mail::fmt_date(m.head.date));
-                    let (ok_l, err_l) = (
-                        self.view.label(cx, ids!(status_lbl)),
-                        self.view.label(cx, ids!(status_err_lbl)),
-                    );
-                    match &m.status {
-                        Some((txt, true)) => {
-                            err_l.set_text(cx, txt);
-                            err_l.set_visible(cx, true);
-                            ok_l.set_visible(cx, false);
-                        }
-                        Some((txt, false)) => {
-                            ok_l.set_text(cx, txt);
-                            ok_l.set_visible(cx, true);
-                            err_l.set_visible(cx, false);
-                        }
-                        None => {
-                            ok_l.set_visible(cx, false);
-                            err_l.set_visible(cx, false);
-                        }
+                    if !existed || self.stamps.get(&idx) != Some(&stamp) {
+                        row.as_thread_msg().populate(cx, pid, t, open, quoted);
+                        self.stamps.insert(idx, stamp);
                     }
-                    // The HTML reading wins when the sender sent one: it
-                    // keeps the lists, the emphasis and the links that
-                    // flattening to text throws away. Both are written
-                    // every time — the hidden one is emptied rather than
-                    // merely hidden, so no mail can leave its text behind
-                    // for the next one to show.
-                    // Guarded on the way in, not merely on the way into the
-                    // store: rows narrowed by an older build are still out
-                    // there, and one the parser cannot read takes the whole
-                    // app down every frame it is drawn.
-                    let html = crate::html::guard(m.html.as_deref().unwrap_or(""));
-                    self.view
-                        .text_input(cx, ids!(body_lbl))
-                        .set_text(cx, if m.html.is_some() { "" } else { &m.body });
-                    self.view.html(cx, ids!(body_html)).set_text(cx, &html);
-                    self.view
-                        .view(cx, ids!(text_wrap))
-                        .set_visible(cx, m.html.is_none());
-                    self.view
-                        .view(cx, ids!(html_wrap))
-                        .set_visible(cx, m.html.is_some());
-                    let (newer, older) = mail::neighbours(&p.store, id);
-                    let nl = self.view.link(cx, ids!(newer_link));
-                    let no = self.view.label(cx, ids!(newer_off));
-                    if let Some(n) = newer {
-                        nl.set_accel(
-                            cx,
-                            pid,
-                            "← newer",
-                            crate::core::Kind::Message { id: n },
-                            true,
-                            Some(ui::ACCEL_NEWER),
-                        );
-                    }
-                    nl.set_visible(cx, newer.is_some());
-                    no.set_visible(cx, newer.is_none());
-                    let ol = self.view.link(cx, ids!(older_link));
-                    let oo = self.view.label(cx, ids!(older_off));
-                    if let Some(o) = older {
-                        ol.set_accel(
-                            cx,
-                            pid,
-                            "older →",
-                            crate::core::Kind::Message { id: o },
-                            true,
-                            Some(ui::ACCEL_OLDER),
-                        );
-                    }
-                    ol.set_visible(cx, older.is_some());
-                    oo.set_visible(cx, older.is_none());
-                    self.view.link(cx, ids!(reply_link)).set_accel(
-                        cx,
-                        pid,
-                        "reply",
-                        crate::core::Kind::Compose { re: id },
-                        false,
-                        Some(ui::ACCEL_REPLY),
-                    );
+                    live.push(idx);
+                    row.draw_all(cx, scope);
                 }
             }
         }
-        self.view.draw_walk(cx, scope, walk)
+        self.stamps.retain(|k, _| live.contains(k));
+        DrawStep::done()
+    }
+}
+
+impl MessagePanelRef {
+    /// The live rows' touchable parts, for the shell's hit table.
+    pub fn msg_hits(&self, cx: &mut Cx) -> Vec<MsgHit> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some(list) = p.view.widget(cx, ids!(list)).as_portal_list().borrow() {
+            for (_, item) in list.items().iter() {
+                if let Some(h) = item.widget.as_thread_msg().hits(cx) {
+                    out.push(h);
+                }
+            }
+        }
+        out
     }
 }
 

@@ -310,6 +310,68 @@ CREATE INDEX idx_effect_due    ON effect(status, not_before);
 CREATE INDEX idx_effect_entity ON effect(entity);
 ";
 
+/// Schema v9 (CR-007): threads. `message.thread` is the id of the lowest
+/// member of the conversation a mail belongs to — an anchor, not a root;
+/// no row is the parent of another, and what a thread *has* (participants,
+/// last date, unread) is a `GROUP BY` at read time. `topic` is the subject
+/// with its reply prefixes stripped. `reference` holds one row per id in
+/// `References` ∪ `In-Reply-To`, indexed by the id, so the three lookups
+/// threading is made of are index walks. The back-fill re-parses `raw` for
+/// every mail that has one, oldest first, exactly as v6 did for the HTML
+/// reading; mail without raw (the seed) anchors itself.
+const SCHEMA_V9: &str = "
+ALTER TABLE message ADD COLUMN thread INTEGER;
+ALTER TABLE message ADD COLUMN topic TEXT;
+CREATE TABLE reference(
+  message INTEGER NOT NULL,
+  mid     TEXT NOT NULL
+);
+CREATE INDEX idx_reference_mid ON reference(mid);
+CREATE INDEX idx_reference_message ON reference(message);
+CREATE INDEX idx_message_thread ON message(thread);
+CREATE INDEX idx_message_mid ON message(account, message_id);
+";
+
+/// Threads every mail already in the store (schema v9), oldest id first so
+/// a reply always finds what it answers already anchored. Runs once, inside
+/// the migration.
+pub(crate) fn backfill_threads(conn: &Connection) -> rusqlite::Result<()> {
+    struct Row {
+        id: i64,
+        account: i64,
+        subject: String,
+        mid: Option<String>,
+        raw: Option<Vec<u8>>,
+    }
+    let rows: Vec<Row> = conn
+        .prepare("SELECT id, account, subject, message_id, raw FROM message ORDER BY id")?
+        .query_map([], |r| {
+            Ok(Row {
+                id: r.get(0)?,
+                account: r.get(1)?,
+                subject: r.get(2)?,
+                mid: r.get(3)?,
+                raw: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for Row { id, account, subject, mid, raw } in rows {
+        let (mid, refs, topic) = match raw {
+            Some(raw) => {
+                let p = crate::sync::parse_mail(&raw);
+                (p.message_id, p.references, p.topic)
+            }
+            None => (mid.unwrap_or_default(), Vec::new(), crate::mail::topic_of(&subject)),
+        };
+        conn.execute(
+            "UPDATE message SET topic = ?2, message_id = ?3 WHERE id = ?1",
+            rusqlite::params![id, topic, mid],
+        )?;
+        crate::mail::thread_tx(conn, account, id, &mid, &refs)?;
+    }
+    Ok(())
+}
+
 /// Fills `message.html` for mail that arrived before schema v6, reading
 /// the `raw` blob each one already keeps. Messages without `raw` — the demo
 /// seed — are left alone, and a mail whose sender wrote text only stays
@@ -377,6 +439,11 @@ impl Store {
         if version < 8 {
             conn.execute_batch(SCHEMA_V8)?;
             conn.pragma_update(None, "user_version", 8)?;
+        }
+        if version < 9 {
+            conn.execute_batch(SCHEMA_V9)?;
+            backfill_threads(&conn)?;
+            conn.pragma_update(None, "user_version", 9)?;
         }
         sweep_effects(&conn)?;
 
