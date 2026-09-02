@@ -317,11 +317,18 @@ verbs with their chords, the cursor **previewing** joined beside the list
 (the inbox's preview for any kind: `Act::PreviewKind`), the borrowed keys
 with shadowed marks, the hold and the `… here` button it raises, the
 `new dir` field and its refusals, the filter grammar over the listing, the
-crumbs as dotted links, rows opening joined, `enter` going. What is not:
-the listing is a **demo tree** in `src/files.rs`, and every verb that
-would write **toasts** what it would have done — nothing leaves the
-process. The datasource (`files::DirSource`) is the shape the
-implementation fills in with the disk and the watcher.
+crumbs as dotted links, `go to` with its completion, rows opening joined,
+`enter` going — and, since the first slice of the implementation landed,
+**the reads**: a files panel lists its directory through the outside when
+it lands on it (`Outside::list_dir`, `stat`, `read_file`), the card
+previews the real bytes, and `open` hands the real path to the OS
+(`OpenPath`; `/usr/bin/open` on macOS, no opener elsewhere yet). The
+**demo tree** in `src/files.rs` is what the *fake* outside serves — the
+library's file scenes boot on `Fake`, so they draw the same tree on every
+machine — and a `Deny` world says *this world has no outside* on the
+status line. What is not real yet: the watcher (a panel lists again only
+when its directory changes), and every verb that would **write** — new
+dir, copy here, move here, delete — still toasts what it would have done.
 
 ## Considered and not chosen
 

@@ -33,6 +33,10 @@ pub struct PanelProps {
     /// with (the log panel). Performing anything needs an
     /// [`Outside`](crate::effect::Outside), which stays behind the world.
     pub registry: std::rc::Rc<effect::Registry>,
+    /// The world, for the one kind that reads outside the store during
+    /// draw: a files panel lists its directory through the outside
+    /// (CR-008).
+    pub world: std::rc::Rc<crate::effect::World>,
     pub pid: u64,
     pub kind: crate::core::Kind,
     /// Which messages of its thread a message panel shows open (CR-007).
@@ -4131,10 +4135,18 @@ pub struct FilesPanel {
     /// The path field's box, under that field.
     #[live]
     suggest_path: View,
-    /// The rich table over the directory the panel's params name; a
-    /// replace onto another directory swaps the source.
-    #[rust(Table::new(files::DirSource::new(files::HOME), files::PAGE))]
+    /// The rich table over the directory the panel's params name — its
+    /// listing read through the outside when the panel landed on it; a
+    /// replace onto another directory lists again.
+    #[rust(Table::new(files::DirSource::new(files::HOME, Vec::new()), files::PAGE))]
     table: FilesTable,
+    /// The world the last event or draw handed in, so a pick from the
+    /// shell can complete a path through the same outside.
+    #[rust]
+    world: Option<std::rc::Rc<crate::effect::World>>,
+    /// Whether the current directory has been listed at all.
+    #[rust]
+    listed: bool,
     /// The cursor: the entry's name, and the row it sat on.
     #[rust]
     sel: Option<(String, usize)>,
@@ -4182,13 +4194,12 @@ impl FilesPanel {
     /// directory starts over: the filter (the field too, since the field
     /// is the filter's one source), the cursor, the status line, and a
     /// `new dir` row left open.
-    fn sync_dir(&mut self, cx: &mut Cx, dir: &str) {
-        if self.table.source().dir == dir {
+    fn sync_dir(&mut self, cx: &mut Cx, world: &crate::effect::World, dir: &str) {
+        if self.table.source().dir == dir && self.listed {
             return;
         }
-        self.table = Table::new(files::DirSource::new(dir), files::PAGE);
+        self.relist(world, dir);
         self.sel = None;
-        self.status = None;
         self.view.text_input(cx, ids!(filter_input)).set_text(cx, "");
         if self.newdir_open {
             let input = self.view.text_input(cx, ids!(newdir_input));
@@ -4210,6 +4221,22 @@ impl FilesPanel {
         self.focus_path_pending = false;
     }
 
+    /// Reads the directory through the outside and puts the listing under
+    /// the table — the filter as typed stays. A directory the outside
+    /// cannot list (gone, unreadable, a world with no outside) leaves an
+    /// empty table and says why on the status line.
+    fn relist(&mut self, world: &crate::effect::World, dir: &str) {
+        let (entries, err) = match files::list_in(world, dir) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let text = self.table.filter().to_string();
+        self.table = Table::new(files::DirSource::new(dir, entries), files::PAGE);
+        self.table.set_filter(&text);
+        self.status = err;
+        self.listed = true;
+    }
+
     /// Swaps the crumbs for the path field, or back.
     fn set_path_open(&mut self, cx: &mut Cx, open: bool) {
         self.path_open = open;
@@ -4227,13 +4254,14 @@ impl FilesPanel {
     /// Enter in the path field: a directory replaces the panel in place
     /// (the crumbs' own semantics), a file opens its card joined, and a
     /// path the tree does not have is refused on the status line.
-    fn go_to(&mut self, cx: &mut Cx, pid: u64, typed: &str) {
+    fn go_to(&mut self, cx: &mut Cx, pid: u64, world: &crate::effect::World, typed: &str) {
         let Some(path) = files::normalize(typed) else {
             self.status = Some(format!("not a path: {}", typed.trim()));
             self.redraw(cx);
             return;
         };
-        if files::is_dir(&path) {
+        let there = files::stat_in(world, &path);
+        if there.as_ref().is_some_and(|e| e.is_dir) {
             cx.action(PanelAction::FollowLink {
                 pid,
                 target: crate::core::Kind::Files { dir: path },
@@ -4241,7 +4269,7 @@ impl FilesPanel {
                 fresh: false,
             });
             self.close_path(cx);
-        } else if files::exists(&path) {
+        } else if there.is_some() {
             cx.action(PanelAction::FollowLink {
                 pid,
                 target: crate::core::Kind::File { path },
@@ -4432,8 +4460,9 @@ impl FilesPanelRef {
         let Some(mut p) = self.borrow_mut() else { return };
         let p = &mut *p;
         if p.pac.open() {
+            let Some(world) = p.world.clone() else { return };
             let path = p.view.text_input(cx, ids!(path_input));
-            p.pac.pick(cx, &files::PathCompletion, &path, i);
+            p.pac.pick(cx, &files::PathCompletion { world }, &path, i);
         } else {
             let filter = p.view.text_input(cx, ids!(filter_input));
             p.ac.pick(cx, &p.table, &filter, i);
@@ -4464,22 +4493,30 @@ impl Widget for FilesPanel {
         let newdir_focused = newdir_input.key_focus(cx);
         let path_focused = path_input.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        if let Some(p) = scope.props.get::<PanelProps>() {
+            self.world = Some(p.world.clone());
+        }
+        let Some(world) = self.world.clone() else { return };
         self.ac.track(cx, &filter);
         self.pac.track(cx, &path_input);
 
         if let Event::KeyDown(k) = event {
             // Enter in the path field goes to what is typed when that is
-            // a directory the tree has — even with the offer open on its
+            // a directory the disk has — even with the offer open on its
             // entries; tab takes the offer, the shell's way.
             if path_focused && k.key_code == KeyCode::ReturnKey {
                 let typed = path_input.text();
-                let is_dir = files::normalize(&typed).is_some_and(|p| files::is_dir(&p));
+                let is_dir =
+                    files::normalize(&typed).is_some_and(|p| files::is_dir_in(&world, &p));
                 if is_dir || !self.pac.open() {
-                    self.go_to(cx, pid, &typed);
+                    self.go_to(cx, pid, &world, &typed);
                     return;
                 }
             }
-            if self.pac.key(cx, &files::PathCompletion, &path_input, k) {
+            let pc = files::PathCompletion {
+                world: world.clone(),
+            };
+            if self.pac.key(cx, &pc, &path_input, k) {
                 self.redraw(cx);
                 return;
             }
@@ -4551,7 +4588,7 @@ impl Widget for FilesPanel {
                 } else if name.contains('/') {
                     self.status = Some("a name cannot hold a slash".into());
                     self.redraw(cx);
-                } else if files::exists(&files::join(&dir, &name)) {
+                } else if files::stat_in(&world, &files::join(&dir, &name)).is_some() {
                     self.status = Some(format!("{name} is already here"));
                     self.redraw(cx);
                 } else {
@@ -4566,7 +4603,7 @@ impl Widget for FilesPanel {
             // crumbs back.
             if path_input.returned(actions).is_some() {
                 let typed = path_input.text();
-                self.go_to(cx, pid, &typed);
+                self.go_to(cx, pid, &world, &typed);
             }
             if path_input.escaped(actions) {
                 self.close_path(cx);
@@ -4579,8 +4616,14 @@ impl Widget for FilesPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        if let Some(p) = scope.props.get::<PanelProps>() {
+            self.world = Some(p.world.clone());
+        }
+        let Some(world) = self.world.clone() else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
         if let Some(dir) = Self::dir_of(scope) {
-            self.sync_dir(cx, &dir);
+            self.sync_dir(cx, &world, &dir);
         }
         let dir = self.table.source().dir.clone();
         self.sync_filter(cx);
@@ -4624,13 +4667,9 @@ impl Widget for FilesPanel {
         err_lbl.set_text(cx, err.as_deref().unwrap_or(""));
         err_lbl.set_visible(cx, err.is_some());
 
-        // A directory the tree does not have is *gone*; the crumbs still
-        // climb out.
-        let status = if files::exists(&dir) {
-            self.status.clone()
-        } else {
-            Some("gone".to_string())
-        };
+        // A directory the outside could not list says why — gone,
+        // unreadable, no outside at all; the crumbs still climb out.
+        let status = self.status.clone();
         let status_lbl = self.view.label(cx, ids!(status_lbl));
         status_lbl.set_text(cx, status.as_deref().unwrap_or(""));
         status_lbl.set_visible(cx, status.is_some());
@@ -4683,14 +4722,9 @@ impl Widget for FilesPanel {
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
         // The path field's offer, under it and over the rows.
         let path_input = self.view.text_input(cx, ids!(path_input));
-        self.pac.draw(
-            cx,
-            scope,
-            &store,
-            &files::PathCompletion,
-            &path_input,
-            &mut self.suggest_path,
-        );
+        let pc = files::PathCompletion { world };
+        self.pac
+            .draw(cx, scope, &store, &pc, &path_input, &mut self.suggest_path);
         DrawStep::done()
     }
 }
@@ -4712,11 +4746,14 @@ impl Widget for FilePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let path = match scope.props.get::<PanelProps>().map(|p| &p.kind) {
-            Some(crate::core::Kind::File { path }) => Some(path.clone()),
-            _ => None,
+        let (path, world) = match scope.props.get::<PanelProps>() {
+            Some(p) => match &p.kind {
+                crate::core::Kind::File { path } => (Some(path.clone()), Some(p.world.clone())),
+                _ => (None, None),
+            },
+            None => (None, None),
         };
-        if let Some(path) = path {
+        if let (Some(path), Some(world)) = (path, world) {
             if self.shown.as_deref() != Some(path.as_str()) {
                 let v = &self.view;
                 v.label(cx, ids!(name_lbl)).set_text(cx, files::basename(&path));
@@ -4726,7 +4763,7 @@ impl Widget for FilePanel {
                 let img_prev = v.widget(cx, ids!(img_box.img_prev));
                 let img_box = v.view(cx, ids!(img_box));
                 let none_lbl = v.label(cx, ids!(none_lbl));
-                match files::entry(&path) {
+                match files::stat_in(&world, &path) {
                     Some(e) => {
                         v.label(cx, ids!(kind_lbl)).set_text(
                             cx,
@@ -4734,15 +4771,41 @@ impl Widget for FilePanel {
                         );
                         v.label(cx, ids!(when_lbl))
                             .set_text(cx, &format!("modified {}", mail::fmt_date(e.modified)));
-                        let text = files::text_of(&path);
-                        let image = files::image_of(&path);
+                        // The preview: the first 64 KB of a text file in the
+                        // app's one face; a PNG or a JPEG decoded at up to
+                        // 20 MB; anything else is the card alone.
+                        let (mut text, mut image) = (None, false);
+                        match e.kind() {
+                            files::FileKind::Text => {
+                                if let Ok(bytes) =
+                                    files::read_in(&world, &path, files::TEXT_PREVIEW_MAX)
+                                {
+                                    text = Some(String::from_utf8_lossy(&bytes).into_owned());
+                                }
+                            }
+                            files::FileKind::Image => {
+                                if let Some(fmt) = files::image_format(&e.name) {
+                                    if let Ok(bytes) =
+                                        files::read_in(&world, &path, files::IMAGE_PREVIEW_MAX)
+                                    {
+                                        let img = img_prev.as_image();
+                                        image = match fmt {
+                                            files::ImageFormat::Png => {
+                                                img.load_png_from_data(cx, &bytes).is_ok()
+                                            }
+                                            files::ImageFormat::Jpeg => {
+                                                img.load_jpg_from_data(cx, &bytes).is_ok()
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                         text_prev.set_text(cx, text.as_deref().unwrap_or(""));
                         text_box.set_visible(cx, text.is_some());
-                        if let Some(bytes) = image {
-                            let _ = img_prev.as_image().load_png_from_data(cx, bytes);
-                        }
-                        img_box.set_visible(cx, image.is_some());
-                        none_lbl.set_visible(cx, text.is_none() && image.is_none());
+                        img_box.set_visible(cx, image);
+                        none_lbl.set_visible(cx, text.is_none() && !image);
                     }
                     None => {
                         v.label(cx, ids!(kind_lbl)).set_text(cx, "gone");

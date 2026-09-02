@@ -91,6 +91,19 @@ fn panel(open: impl Fn(&Store) -> Kind + 'static, script: &str) -> Setup {
     }
 }
 
+/// A panel on a **fake** outside: what reads beyond the store — a files
+/// panel lists its directory through the outside — draws the demo tree
+/// rather than *this world has no outside*.
+fn panel_fake(open: impl Fn(&Store) -> Kind + 'static, script: &str) -> Setup {
+    Setup::Stage {
+        open: Some(Rc::new(open)),
+        solo: true,
+        steps: steps(script),
+        grid: None,
+        outside: BootOutside::Fake,
+    }
+}
+
 /// The default session — help and the inbox — for the shell's own
 /// subjects.
 fn workspace(script: &str) -> Setup {
@@ -111,7 +124,7 @@ fn workspace_on(open: impl Fn(&Store) -> Kind + 'static, script: &str) -> Setup 
         solo: false,
         steps: steps(script),
         grid: None,
-        outside: BootOutside::Deny,
+        outside: BootOutside::Fake,
     }
 }
 
@@ -1004,7 +1017,7 @@ fn files_row() -> Scene<Setup> {
 }
 
 fn files() -> Scene<Setup> {
-    let dir = |d: &'static str, script: &str| panel(move |_| Kind::Files { dir: d.into() }, script);
+    let dir = |d: &'static str, script: &str| panel_fake(move |_| Kind::Files { dir: d.into() }, script);
     Scene::new("files", (520.0, 640.0))
         .note("A directory as a column: the crumbs, the filter, the rows; every header verb acts on the directory shown.")
         .note("Live — enter a node: arrows walk, enter goes, / filters, ⌘n asks for a name, ⌘p and ⌘m hold.")
@@ -1080,7 +1093,7 @@ fn files() -> Scene<Setup> {
 }
 
 fn file_card() -> Scene<Setup> {
-    let card = |p: &'static str, script: &str| panel(move |_| Kind::File { path: p.into() }, script);
+    let card = |p: &'static str, script: &str| panel_fake(move |_| Kind::File { path: p.into() }, script);
     Scene::new("file card", (520.0, 360.0))
         .note("A file as a card: name, kind and size, when it changed, the path selectable; under the rule, the preview.")
         .node("text", card("~/Downloads/README.txt", ""))

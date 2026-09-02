@@ -4011,11 +4011,20 @@ impl Stage {
                     // `… here` are real as far as the chrome goes; the
                     // disk is untouched, and the toasts say so.
                     BtnAct::Open => {
-                        let title = state.title_of(pid);
-                        state.toast(
-                            format!("open “{title}” — draft: nothing handed to the OS"),
-                            false,
-                        );
+                        // The card's path to the OS, through the outside:
+                        // the first real verb of the browser (CR-008).
+                        let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::File { path }) => Some(path),
+                            _ => None,
+                        };
+                        if let Some(display) = path {
+                            let real = crate::files::real_path(&display);
+                            let name = crate::files::basename(&display).to_string();
+                            match state.world.run(&crate::effect::OpenPath { path: &real }) {
+                                Ok(()) => state.toast(format!("opened “{name}”"), false),
+                                Err(e) => state.toast(e, true),
+                            }
+                        }
                     }
                     BtnAct::NewDir => {
                         if let Some(w) = self.hosted.get(&pid) {
@@ -4069,7 +4078,9 @@ impl Stage {
                                 Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
                             } else if same_dir && hold.op == crate::files::HoldOp::Move {
                                 Some(format!("“{name}” is already here"))
-                            } else if !same_dir && crate::files::exists(&crate::files::join(&dir, &name)) {
+                            } else if !same_dir
+                                && crate::files::stat_in(&state.world, &crate::files::join(&dir, &name)).is_some()
+                            {
                                 Some(format!("“{name}” is already here"))
                             } else {
                                 None
@@ -5380,6 +5391,7 @@ impl Stage {
             let props = crate::panels::PanelProps {
                 store: state.store.clone(),
                 registry: state.world.registry_rc(),
+                world: state.world.clone(),
                 pid: *pid,
                 problems: state.problems_for(&kind),
                 kind,
@@ -5436,6 +5448,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             registry: state.world.registry_rc(),
+            world: state.world.clone(),
             pid,
             problems: state.problems_for(&kind),
             kind,
@@ -6985,6 +6998,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             registry: state.world.registry_rc(),
+            world: state.world.clone(),
             pid,
             kind: kind.clone().unwrap_or(Kind::About),
             expand: state.expand.get(&pid).cloned(),

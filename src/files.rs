@@ -1,16 +1,22 @@
-//! The file browser's domain (CR-008, **draft**): what a directory lists,
-//! what a file card shows, and the one held item `copy`/`move` carry to a
-//! `… here`.
+//! The file browser's domain (CR-008): what a directory lists, what a
+//! file card shows, the path field's completion, and the one held item
+//! `copy`/`move` carry to a `… here`.
 //!
-//! Over a **demo tree** for now — the panels library draws every state of
-//! the feature from it while the design settles. The disk (a listing read
-//! through the outside during draw, the watcher, the verbs as effects)
-//! arrives with the implementation; nothing here touches a filesystem.
+//! The disk is **outside** (see [`crate::effect::Outside`]): a listing is
+//! read through it during draw, and `open` hands a path to the OS
+//! through it. The [`demo`] tree is what the fake outside serves — the
+//! panels library's worlds, the tests — and what a real world never
+//! sees.
 //!
-//! Paths are the display form, `~/Downloads/2026`.
+//! Paths cross the boundary in two spellings: the **display** form the
+//! panels show and persist (`~/Downloads/2026`, `/tmp`) and the real
+//! [`Path`] the outside reads; [`real_path`] and [`display_path`] map
+//! between them.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::effect::World;
 use crate::filter::{Ast, Op};
 use crate::richtable::{
     self, Completion, Datasource, Suggestion, TagDef, TagType, Values, MAX_SUGGESTIONS,
@@ -21,6 +27,11 @@ use crate::store::Store;
 pub const HOME: &str = "~";
 /// The other root: the whole disk, for `go to /tmp`.
 pub const ROOT: &str = "/";
+
+/// How much of a text file the card reads.
+pub const TEXT_PREVIEW_MAX: usize = 64 * 1024;
+/// How much of an image the card decodes.
+pub const IMAGE_PREVIEW_MAX: usize = 20 * 1024 * 1024;
 
 /// One entry of a directory, as the files panel lists it.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +68,22 @@ impl Entry {
             format!("{}/", self.name)
         } else {
             self.name.clone()
+        }
+    }
+
+    /// An entry off the disk's own account of a file.
+    #[must_use]
+    pub fn from_metadata(name: &str, meta: &std::fs::Metadata) -> Entry {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |d| d.as_secs_f64());
+        Entry {
+            name: name.to_string(),
+            is_dir: meta.is_dir(),
+            size: if meta.is_dir() { 0 } else { meta.len() },
+            modified,
         }
     }
 }
@@ -115,6 +142,24 @@ impl FileKind {
     }
 }
 
+/// Which decoder a picture wants, off its name; `None` for what the card
+/// cannot draw.
+#[must_use]
+pub fn image_format(name: &str) -> Option<ImageFormat> {
+    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => Some(ImageFormat::Png),
+        Some("jpg" | "jpeg") => Some(ImageFormat::Jpeg),
+        _ => None,
+    }
+}
+
+/// The two picture formats the card decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+}
+
 // -- paths -------------------------------------------------------------------
 
 /// `~/Downloads` + `2026` → `~/Downloads/2026`; `/` + `tmp` → `/tmp`.
@@ -165,7 +210,7 @@ pub fn crumbs(dir: &str) -> Vec<(String, String)> {
     out
 }
 
-/// A typed path as the tree spells it: `~/`-relative or absolute, no
+/// A typed path as the panels spell it: `~/`-relative or absolute, no
 /// trailing slash except on a root, `~` alone for home. `None` for a
 /// spelling the browser does not read (relative, empty).
 ///
@@ -201,6 +246,39 @@ pub fn normalize(typed: &str) -> Option<String> {
     Some(segs.iter().fold(root.to_string(), |acc, s| join(&acc, s)))
 }
 
+/// Where home is on this machine, for the two spellings to meet.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The display spelling as the path the outside reads: `~` is home.
+#[must_use]
+pub fn real_path(display: &str) -> PathBuf {
+    match display.strip_prefix('~') {
+        Some(rest) => {
+            let mut p = home_dir();
+            for seg in rest.split('/').filter(|s| !s.is_empty()) {
+                p.push(seg);
+            }
+            p
+        }
+        None => PathBuf::from(display),
+    }
+}
+
+/// A real path as the panels spell it: home and below as `~/…`.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    let home = home_dir();
+    match path.strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => HOME.to_string(),
+        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 /// `1.2 MB`, `84 KB`, `640 B`.
 #[must_use]
 pub fn fmt_size(bytes: u64) -> String {
@@ -221,6 +299,39 @@ pub fn fmt_size(bytes: u64) -> String {
     } else {
         unit(b / (1024.0 * 1024.0 * 1024.0), "GB")
     }
+}
+
+/// Directories first, then names, case folded — the one order a listing
+/// has, whichever outside produced it.
+pub fn sort(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+// -- the disk, through the outside --------------------------------------------
+
+/// A directory's listing, or why there is none — through the world's
+/// outside, in the display spelling the panels use.
+pub fn list_in(world: &World, dir: &str) -> Result<Vec<Entry>, String> {
+    world.outside(|o| o.list_dir(&real_path(dir)))
+}
+
+/// One path's entry, if the disk has it.
+pub fn stat_in(world: &World, path: &str) -> Option<Entry> {
+    world.outside(|o| o.stat(&real_path(path))).ok().flatten()
+}
+
+/// Whether the disk has this path as a directory.
+pub fn is_dir_in(world: &World, path: &str) -> bool {
+    stat_in(world, path).is_some_and(|e| e.is_dir)
+}
+
+/// The first `max` bytes of a file, through the outside.
+pub fn read_in(world: &World, path: &str, max: usize) -> Result<Vec<u8>, String> {
+    world.outside(|o| o.read_file(&real_path(path), max))
 }
 
 // -- the held item -----------------------------------------------------------
@@ -270,133 +381,151 @@ pub struct Hold {
 
 // -- the demo tree -----------------------------------------------------------
 
-struct Fx {
-    path: &'static str,
-    dir: bool,
-    size: u64,
-    /// `(year, month, day, hour, minute)`.
-    at: (i64, u32, u32, u32, u32),
-}
+/// A home directory a design review can walk, and a little beyond it:
+/// what the fake outside serves — the panels library's worlds, the tests.
+/// Display spellings throughout.
+pub mod demo {
+    use super::{basename, parent, sort, Entry, FileKind, HOME, ROOT};
 
-const KB: u64 = 1024;
-const MB: u64 = 1024 * 1024;
-
-/// A home directory a design review can walk: two levels under Downloads,
-/// pictures, documents, dot-files, one of every kind the card previews.
-const TREE: &[Fx] = &[
-    Fx { path: "~/Desktop", dir: true, size: 0, at: (2026, 8, 31, 18, 40) },
-    Fx { path: "~/Documents", dir: true, size: 0, at: (2026, 8, 29, 11, 5) },
-    Fx { path: "~/Downloads", dir: true, size: 0, at: (2026, 9, 1, 9, 12) },
-    Fx { path: "~/Pictures", dir: true, size: 0, at: (2026, 8, 24, 20, 3) },
-    Fx { path: "~/superapp", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-    Fx { path: "~/.config", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
-    Fx { path: "~/notes.md", dir: false, size: 2 * KB + 130, at: (2026, 8, 30, 22, 47) },
-    Fx { path: "~/.zshrc", dir: false, size: 1 * KB + 90, at: (2026, 6, 2, 9, 0) },
-    Fx { path: "~/Desktop/todo.txt", dir: false, size: 300, at: (2026, 8, 31, 18, 40) },
-    Fx { path: "~/Documents/panel-model.md", dir: false, size: 9 * KB, at: (2026, 8, 29, 11, 5) },
-    Fx { path: "~/Documents/cr-008-files.md", dir: false, size: 14 * KB, at: (2026, 9, 2, 6, 55) },
-    Fx { path: "~/Documents/Lease.tla", dir: false, size: 5 * KB, at: (2026, 8, 28, 15, 20) },
-    Fx { path: "~/Downloads/2026", dir: true, size: 0, at: (2026, 8, 17, 12, 0) },
-    Fx { path: "~/Downloads/report-q3.pdf", dir: false, size: MB + 200 * KB, at: (2026, 8, 31, 9, 14) },
-    Fx { path: "~/Downloads/budget-2026.xlsx", dir: false, size: 84 * KB, at: (2026, 8, 31, 9, 14) },
-    Fx { path: "~/Downloads/screenshot-2026-08-30.png", dir: false, size: 412 * KB, at: (2026, 8, 30, 14, 2) },
-    Fx { path: "~/Downloads/superapp-0.1.0.dmg", dir: false, size: 38 * MB, at: (2026, 9, 1, 9, 12) },
-    Fx { path: "~/Downloads/logs.tar.gz", dir: false, size: 3 * MB + 400 * KB, at: (2026, 8, 30, 7, 30) },
-    Fx { path: "~/Downloads/README.txt", dir: false, size: 640, at: (2026, 8, 12, 16, 45) },
-    Fx { path: "~/Downloads/.DS_Store", dir: false, size: 6 * KB, at: (2026, 9, 1, 9, 12) },
-    Fx { path: "~/Downloads/2026/invoice-0817.pdf", dir: false, size: 96 * KB, at: (2026, 8, 17, 12, 0) },
-    Fx { path: "~/Downloads/2026/photo-lisbon.jpg", dir: false, size: 2 * MB + 800 * KB, at: (2026, 8, 3, 19, 21) },
-    Fx { path: "~/Downloads/2026/notes.txt", dir: false, size: KB + 100, at: (2026, 8, 17, 12, 0) },
-    Fx { path: "~/Pictures/lisbon", dir: true, size: 0, at: (2026, 8, 3, 19, 21) },
-    Fx { path: "~/Pictures/fold-cover.png", dir: false, size: MB + 100 * KB, at: (2026, 8, 24, 20, 3) },
-    Fx { path: "~/Pictures/lisbon/IMG_0417.jpg", dir: false, size: 3 * MB + 200 * KB, at: (2026, 8, 3, 19, 21) },
-    Fx { path: "~/Pictures/lisbon/IMG_0418.jpg", dir: false, size: 3 * MB, at: (2026, 8, 3, 19, 24) },
-    Fx { path: "~/superapp/files", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-    Fx { path: "~/superapp/superapp.db", dir: false, size: 24 * MB, at: (2026, 9, 2, 7, 30) },
-    Fx { path: "~/superapp/panel-context.md", dir: false, size: 3 * KB, at: (2026, 9, 1, 23, 8) },
-    // Beyond home: what `go to` reaches.
-    Fx { path: "/Applications", dir: true, size: 0, at: (2026, 8, 20, 10, 0) },
-    Fx { path: "/Users", dir: true, size: 0, at: (2026, 6, 1, 9, 0) },
-    Fx { path: "/Users/andrey", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-    Fx { path: "/etc", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
-    Fx { path: "/etc/hosts", dir: false, size: 213, at: (2026, 7, 14, 10, 0) },
-    Fx { path: "/tmp", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
-    Fx { path: "/tmp/superapp-e2e", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
-    Fx { path: "/tmp/superapp-e2e/frames", dir: true, size: 0, at: (2026, 9, 2, 12, 41) },
-    Fx { path: "/tmp/superapp-e2e/superapp.db", dir: false, size: 2 * MB, at: (2026, 9, 2, 12, 40) },
-    Fx { path: "/tmp/notes.txt", dir: false, size: 380, at: (2026, 9, 1, 18, 5) },
-    Fx { path: "/tmp/.keep", dir: false, size: 0, at: (2026, 9, 1, 18, 5) },
-];
-
-/// Whether the tree has this path as a directory.
-#[must_use]
-pub fn is_dir(path: &str) -> bool {
-    path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path && f.dir)
-}
-
-fn entry_of(fx: &Fx) -> Entry {
-    let (y, mo, d, h, min) = fx.at;
-    Entry {
-        name: basename(fx.path).to_string(),
-        is_dir: fx.dir,
-        size: fx.size,
-        modified: crate::mail::ts(y, mo, d, h, min),
+    struct Fx {
+        path: &'static str,
+        dir: bool,
+        size: u64,
+        /// `(year, month, day, hour, minute)`.
+        at: (i64, u32, u32, u32, u32),
     }
-}
 
-/// Whether the tree has this path — a directory or a file.
-#[must_use]
-pub fn exists(path: &str) -> bool {
-    path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path)
-}
+    pub(super) const KB: u64 = 1024;
+    pub(super) const MB: u64 = 1024 * 1024;
 
-/// The entry at a path, if the tree has it.
-#[must_use]
-pub fn entry(path: &str) -> Option<Entry> {
-    TREE.iter().find(|f| f.path == path).map(entry_of)
-}
+    const TREE: &[Fx] = &[
+        Fx { path: "~/Desktop", dir: true, size: 0, at: (2026, 8, 31, 18, 40) },
+        Fx { path: "~/Documents", dir: true, size: 0, at: (2026, 8, 29, 11, 5) },
+        Fx { path: "~/Downloads", dir: true, size: 0, at: (2026, 9, 1, 9, 12) },
+        Fx { path: "~/Pictures", dir: true, size: 0, at: (2026, 8, 24, 20, 3) },
+        Fx { path: "~/superapp", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
+        Fx { path: "~/.config", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
+        Fx { path: "~/notes.md", dir: false, size: 2 * KB + 130, at: (2026, 8, 30, 22, 47) },
+        Fx { path: "~/.zshrc", dir: false, size: KB + 90, at: (2026, 6, 2, 9, 0) },
+        Fx { path: "~/Desktop/todo.txt", dir: false, size: 300, at: (2026, 8, 31, 18, 40) },
+        Fx { path: "~/Documents/panel-model.md", dir: false, size: 9 * KB, at: (2026, 8, 29, 11, 5) },
+        Fx { path: "~/Documents/cr-008-files.md", dir: false, size: 14 * KB, at: (2026, 9, 2, 6, 55) },
+        Fx { path: "~/Documents/Lease.tla", dir: false, size: 5 * KB, at: (2026, 8, 28, 15, 20) },
+        Fx { path: "~/Downloads/2026", dir: true, size: 0, at: (2026, 8, 17, 12, 0) },
+        Fx { path: "~/Downloads/report-q3.pdf", dir: false, size: MB + 200 * KB, at: (2026, 8, 31, 9, 14) },
+        Fx { path: "~/Downloads/budget-2026.xlsx", dir: false, size: 84 * KB, at: (2026, 8, 31, 9, 14) },
+        Fx { path: "~/Downloads/screenshot-2026-08-30.png", dir: false, size: 412 * KB, at: (2026, 8, 30, 14, 2) },
+        Fx { path: "~/Downloads/superapp-0.1.0.dmg", dir: false, size: 38 * MB, at: (2026, 9, 1, 9, 12) },
+        Fx { path: "~/Downloads/logs.tar.gz", dir: false, size: 3 * MB + 400 * KB, at: (2026, 8, 30, 7, 30) },
+        Fx { path: "~/Downloads/README.txt", dir: false, size: 640, at: (2026, 8, 12, 16, 45) },
+        Fx { path: "~/Downloads/.DS_Store", dir: false, size: 6 * KB, at: (2026, 9, 1, 9, 12) },
+        Fx { path: "~/Downloads/2026/invoice-0817.pdf", dir: false, size: 96 * KB, at: (2026, 8, 17, 12, 0) },
+        Fx { path: "~/Downloads/2026/photo-lisbon.jpg", dir: false, size: 2 * MB + 800 * KB, at: (2026, 8, 3, 19, 21) },
+        Fx { path: "~/Downloads/2026/notes.txt", dir: false, size: KB + 100, at: (2026, 8, 17, 12, 0) },
+        Fx { path: "~/Pictures/lisbon", dir: true, size: 0, at: (2026, 8, 3, 19, 21) },
+        Fx { path: "~/Pictures/fold-cover.png", dir: false, size: MB + 100 * KB, at: (2026, 8, 24, 20, 3) },
+        Fx { path: "~/Pictures/lisbon/IMG_0417.jpg", dir: false, size: 3 * MB + 200 * KB, at: (2026, 8, 3, 19, 21) },
+        Fx { path: "~/Pictures/lisbon/IMG_0418.jpg", dir: false, size: 3 * MB, at: (2026, 8, 3, 19, 24) },
+        Fx { path: "~/superapp/files", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
+        Fx { path: "~/superapp/superapp.db", dir: false, size: 24 * MB, at: (2026, 9, 2, 7, 30) },
+        Fx { path: "~/superapp/panel-context.md", dir: false, size: 3 * KB, at: (2026, 9, 1, 23, 8) },
+        // Beyond home: what `go to` reaches.
+        Fx { path: "/Applications", dir: true, size: 0, at: (2026, 8, 20, 10, 0) },
+        Fx { path: "/Users", dir: true, size: 0, at: (2026, 6, 1, 9, 0) },
+        Fx { path: "/Users/andrey", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
+        Fx { path: "/etc", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
+        Fx { path: "/etc/hosts", dir: false, size: 213, at: (2026, 7, 14, 10, 0) },
+        Fx { path: "/tmp", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
+        Fx { path: "/tmp/superapp-e2e", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
+        Fx { path: "/tmp/superapp-e2e/frames", dir: true, size: 0, at: (2026, 9, 2, 12, 41) },
+        Fx { path: "/tmp/superapp-e2e/superapp.db", dir: false, size: 2 * MB, at: (2026, 9, 2, 12, 40) },
+        Fx { path: "/tmp/notes.txt", dir: false, size: 380, at: (2026, 9, 1, 18, 5) },
+        Fx { path: "/tmp/.keep", dir: false, size: 0, at: (2026, 9, 1, 18, 5) },
+    ];
 
-/// A directory's listing, unfiltered: directories first, then files, by
-/// name, case folded. Dot-files included — the filter decides.
-#[must_use]
-pub fn list(dir: &str) -> Vec<Entry> {
-    let mut v: Vec<Entry> = TREE
-        .iter()
-        .filter(|f| parent(f.path) == Some(dir))
-        .map(entry_of)
-        .collect();
-    v.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    v
-}
-
-/// A text file's reading, for the card's preview.
-#[must_use]
-pub fn text_of(path: &str) -> Option<String> {
-    let e = entry(path)?;
-    if e.kind() != FileKind::Text {
-        return None;
+    fn entry_of(fx: &Fx) -> Entry {
+        let (y, mo, d, h, min) = fx.at;
+        Entry {
+            name: basename(fx.path).to_string(),
+            is_dir: fx.dir,
+            size: fx.size,
+            modified: crate::mail::ts(y, mo, d, h, min),
+        }
     }
-    Some(match e.name.as_str() {
-        "hosts" => "127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1\tlocalhost".into(),
-        "README.txt" => "superapp 0.1.0\n\nA personal user-space OS: one workspace, specialized panels, no windows.\n\nDrag the .app to Applications. First launch asks for nothing; add a mail account in settings.".into(),
-        "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments (follow-up CR)\n- rename?".into(),
-        "notes.txt" => "Lisbon, August.\n\nInvoice 0817 is for the flat; the photos are from the last evening.".into(),
-        "notes.md" => "# notes\n\n- a directory is a list panel\n- a file is a card\n- enter goes, the cursor previews\n\nThe join is the only relation.".into(),
-        "panel-context.md" => "# panel: files ~/Downloads\n\nfilter: @kind:image\nentries: 8 (1 shown)\nlisted: 0.4 s ago".into(),
-        _ => format!("{}\n\n(the first 64 KB of the file, in the app's one face)", e.name),
-    })
-}
 
-/// An image file's bytes, for the card's preview. The demo tree has no
-/// pictures of its own, so every image is the app icon.
-#[must_use]
-pub fn image_of(path: &str) -> Option<&'static [u8]> {
-    let e = entry(path)?;
-    (e.kind() == FileKind::Image).then_some(include_bytes!("../resources/icon_256.png"))
+    /// Whether the tree has this path — a directory or a file.
+    #[must_use]
+    pub fn exists(path: &str) -> bool {
+        path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path)
+    }
+
+    /// Whether the tree has this path as a directory.
+    #[must_use]
+    pub fn is_dir(path: &str) -> bool {
+        path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path && f.dir)
+    }
+
+    /// The entry at a path, if the tree has it; a root is a directory.
+    #[must_use]
+    pub fn entry(path: &str) -> Option<Entry> {
+        if path == HOME || path == ROOT {
+            return Some(Entry {
+                name: path.to_string(),
+                is_dir: true,
+                size: 0,
+                modified: crate::mail::ts(2026, 9, 2, 7, 30),
+            });
+        }
+        TREE.iter().find(|f| f.path == path).map(entry_of)
+    }
+
+    /// A directory's listing, unfiltered: directories first, then files,
+    /// by name. Dot-files included — the filter decides. `None` for a
+    /// directory the tree does not have.
+    #[must_use]
+    pub fn list(dir: &str) -> Option<Vec<Entry>> {
+        if !is_dir(dir) {
+            return None;
+        }
+        let mut v: Vec<Entry> = TREE
+            .iter()
+            .filter(|f| parent(f.path) == Some(dir))
+            .map(entry_of)
+            .collect();
+        sort(&mut v);
+        Some(v)
+    }
+
+    /// A text file's reading, for the card's preview.
+    #[must_use]
+    pub fn text_of(path: &str) -> Option<String> {
+        let e = entry(path)?;
+        if e.kind() != FileKind::Text {
+            return None;
+        }
+        Some(match e.name.as_str() {
+            "hosts" => "127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1\tlocalhost".into(),
+            "README.txt" => "superapp 0.1.0\n\nA personal user-space OS: one workspace, specialized panels, no windows.\n\nDrag the .app to Applications. First launch asks for nothing; add a mail account in settings.".into(),
+            "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments (follow-up CR)\n- rename?".into(),
+            "notes.txt" => "Lisbon, August.\n\nInvoice 0817 is for the flat; the photos are from the last evening.".into(),
+            "notes.md" => "# notes\n\n- a directory is a list panel\n- a file is a card\n- enter goes, the cursor previews\n\nThe join is the only relation.".into(),
+            "panel-context.md" => "# panel: files ~/Downloads\n\nfilter: @kind:image\nentries: 8 (1 shown)\nlisted: 0.4 s ago".into(),
+            _ => format!("{}\n\n(the first 64 KB of the file, in the app's one face)", e.name),
+        })
+    }
+
+    /// A file's bytes, for the card's preview: a text file's reading, or
+    /// — the demo tree has no pictures of its own — the app icon as PNG
+    /// for every image. `None` for what the tree does not have.
+    #[must_use]
+    pub fn bytes_of(path: &str) -> Option<Vec<u8>> {
+        let e = entry(path)?;
+        match e.kind() {
+            FileKind::Text => text_of(path).map(String::into_bytes),
+            FileKind::Image => Some(include_bytes!("../resources/icon_256.png").to_vec()),
+            _ => Some(Vec::new()),
+        }
+    }
 }
 
 // -- the path field's completion ----------------------------------------------
@@ -405,8 +534,11 @@ pub fn image_of(path: &str) -> Option<&'static [u8]> {
 /// matched as a prefix against the entries of the directory the segments
 /// before it name — a shell's tab, in the rich table's box. A picked
 /// directory lands with its slash, so the next offer opens at once; a
-/// root is offered when nothing is typed yet.
-pub struct PathCompletion;
+/// root is offered when nothing is typed yet. The listing comes through
+/// the world's outside, like the panel's own.
+pub struct PathCompletion {
+    pub world: Rc<World>,
+}
 
 /// What the caret is in the middle of typing in a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,15 +581,16 @@ impl Completion for PathCompletion {
     fn offer(&self, _store: &Store, ctx: &PathCtx) -> Vec<Suggestion> {
         let Some(dir) = &ctx.dir else {
             // Before a slash: the two roots, as far as they match.
-            return [HOME, ROOT]
+            return [(HOME, "~/"), (ROOT, ROOT)]
                 .iter()
-                .filter(|r| r.starts_with(ctx.prefix.as_str()) || ctx.prefix.is_empty())
-                .map(|r| Suggestion::labeled(format!("{r}/").replace("//", "/"), if *r == ROOT { ROOT.to_string() } else { format!("{r}/") }))
+                .filter(|(r, _)| ctx.prefix.is_empty() || r.starts_with(ctx.prefix.as_str()))
+                .map(|(_, v)| Suggestion::value(*v))
                 .collect();
         };
         let prefix = ctx.prefix.to_lowercase();
         let hidden = prefix.starts_with('.');
-        let mut out: Vec<Suggestion> = list(dir)
+        let mut out: Vec<Suggestion> = list_in(&self.world, dir)
+            .unwrap_or_default()
             .into_iter()
             .filter(|e| hidden || !e.hidden())
             .filter(|e| e.name.to_lowercase().starts_with(&prefix))
@@ -532,28 +665,32 @@ pub static TAGS: &[TagDef] = &[
     },
 ];
 
-/// One directory as a rich-table datasource: the listing in memory, the
-/// filter evaluated over it. The draft re-lists per call; the
-/// implementation stamps the listing with the watcher's generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One directory as a rich-table datasource: the listing in memory — read
+/// through the outside when the panel opened on the directory — and the
+/// filter evaluated over it. The watcher that keeps it true is the next
+/// step; until then a panel re-lists when its directory changes.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DirSource {
     pub dir: String,
+    pub entries: Rc<Vec<Entry>>,
 }
 
 impl DirSource {
     #[must_use]
-    pub fn new(dir: &str) -> Self {
+    pub fn new(dir: &str, entries: Vec<Entry>) -> Self {
         DirSource {
             dir: dir.to_string(),
+            entries: Rc::new(entries),
         }
     }
 
     fn filtered(&self, ast: Option<&Ast>) -> Vec<Entry> {
         let hidden = ast.is_some_and(|a| a.tag_names().contains(&"hidden"));
-        list(&self.dir)
-            .into_iter()
+        self.entries
+            .iter()
             .filter(|e| hidden || !e.hidden())
             .filter(|e| ast.map_or(true, |a| matches(e, a)))
+            .cloned()
             .collect()
     }
 }
@@ -655,9 +792,13 @@ mod tests {
         v.iter().map(Entry::label).collect()
     }
 
+    fn downloads() -> DirSource {
+        DirSource::new("~/Downloads", demo::list("~/Downloads").unwrap())
+    }
+
     #[test]
     fn a_listing_puts_directories_first_then_names() {
-        let l = list("~/Downloads");
+        let l = demo::list("~/Downloads").unwrap();
         assert_eq!(
             names(&l),
             [
@@ -671,13 +812,15 @@ mod tests {
                 "superapp-0.1.0.dmg",
             ]
         );
-        assert!(list("~/nowhere").is_empty());
+        assert!(demo::list("~/nowhere").is_none());
+        assert_eq!(names(&demo::list("/").unwrap()), ["Applications/", "etc/", "tmp/", "Users/"]);
+        assert_eq!(names(&demo::list("/tmp").unwrap()), ["superapp-e2e/", ".keep", "notes.txt"]);
     }
 
     #[test]
     fn the_filter_hides_dot_files_unless_asked() {
         let store = Store::open(None).unwrap();
-        let src = DirSource::new("~/Downloads");
+        let src = downloads();
         let all = src.count(&store, None).unwrap();
         assert_eq!(all, 7, "the .DS_Store is out");
         let ast = filter::parse("@hidden").ast;
@@ -708,7 +851,7 @@ mod tests {
     #[test]
     fn clauses_that_do_not_bind_are_dropped_not_answered() {
         let store = Store::open(None).unwrap();
-        let src = DirSource::new("~/Downloads");
+        let src = downloads();
         let count = |q: &str| src.count(&store, filter::parse(q).ast.as_ref()).unwrap();
         let all = count("");
         assert_eq!(count("@bogus"), all, "an unknown tag shows everything");
@@ -749,15 +892,31 @@ mod tests {
                 ("superapp-e2e".to_string(), "/tmp/superapp-e2e".to_string()),
             ]
         );
-        assert!(exists("~/Downloads/2026"));
-        assert!(!exists("~/Downloads/2027"));
-        assert!(exists("/") && exists("/tmp") && is_dir("/tmp") && !is_dir("/tmp/notes.txt"));
-        assert_eq!(names(&list("/")), ["Applications/", "etc/", "tmp/", "Users/"]);
-        assert_eq!(names(&list("/tmp")), ["superapp-e2e/", ".keep", "notes.txt"]);
+        assert!(demo::exists("~/Downloads/2026"));
+        assert!(!demo::exists("~/Downloads/2027"));
+        assert!(demo::exists("/") && demo::exists("/tmp") && demo::is_dir("/tmp"));
+        assert!(!demo::is_dir("/tmp/notes.txt"));
+    }
+
+    /// The two spellings meet at home: `~` is `$HOME` on the way out and
+    /// `$HOME` is `~` on the way back; the rest of the disk is itself.
+    #[test]
+    fn display_and_real_paths_round_trip() {
+        let home = home_dir();
+        assert_eq!(real_path("~"), home);
+        assert_eq!(real_path("~/Downloads/2026"), home.join("Downloads").join("2026"));
+        assert_eq!(real_path("/tmp"), PathBuf::from("/tmp"));
+        assert_eq!(real_path("/"), PathBuf::from("/"));
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&home.join("Downloads")), "~/Downloads");
+        assert_eq!(display_path(Path::new("/tmp/x")), "/tmp/x");
+        for d in ["~", "~/Downloads/2026", "/tmp", "/", "/etc/hosts"] {
+            assert_eq!(display_path(&real_path(d)), d);
+        }
     }
 
     #[test]
-    fn a_typed_path_is_read_the_way_the_tree_spells_it() {
+    fn a_typed_path_is_read_the_way_the_panels_spell_it() {
         assert_eq!(normalize("~").as_deref(), Some("~"));
         assert_eq!(normalize("~/").as_deref(), Some("~"));
         assert_eq!(normalize("~/Downloads/").as_deref(), Some("~/Downloads"));
@@ -776,13 +935,67 @@ mod tests {
         assert_eq!(normalize("~/a//b/~/c").as_deref(), Some("~/c"));
     }
 
+    #[test]
+    fn sizes_and_kinds() {
+        assert_eq!(fmt_size(640), "640 B");
+        assert_eq!(fmt_size(demo::KB + 100), "1.1 KB");
+        assert_eq!(fmt_size(84 * demo::KB), "84 KB");
+        assert_eq!(fmt_size(demo::MB + 200 * demo::KB), "1.2 MB");
+        assert_eq!(fmt_size(38 * demo::MB), "38 MB");
+        assert_eq!(FileKind::of_name("photo.JPG"), FileKind::Image);
+        assert_eq!(FileKind::of_name("logs.tar.gz"), FileKind::Archive);
+        assert_eq!(FileKind::of_name(".DS_Store"), FileKind::Other);
+        assert_eq!(FileKind::of_name("Lease.tla"), FileKind::Text);
+        assert_eq!(image_format("a.jpeg"), Some(ImageFormat::Jpeg));
+        assert_eq!(image_format("a.gif"), None);
+        assert!(demo::text_of("~/Downloads/README.txt").is_some());
+        assert!(demo::text_of("~/Downloads/report-q3.pdf").is_none());
+        assert!(demo::bytes_of("~/Downloads/2026/photo-lisbon.jpg").is_some_and(|b| !b.is_empty()));
+        assert!(demo::bytes_of("~/Downloads/nope.txt").is_none());
+    }
+
+    /// The fake outside serves the demo tree through the same verbs the
+    /// real one reads the disk with, in the panels' spelling.
+    #[test]
+    fn the_fake_outside_serves_the_demo_tree() {
+        let w = World::fake(crate::effect::Registry::new());
+        assert_eq!(
+            names(&list_in(&w, "~/Downloads").unwrap()),
+            names(&demo::list("~/Downloads").unwrap())
+        );
+        assert!(list_in(&w, "~/nowhere").is_err());
+        assert!(is_dir_in(&w, "/tmp"));
+        assert!(!is_dir_in(&w, "/tmp/notes.txt"));
+        assert_eq!(stat_in(&w, "~/Downloads/README.txt").map(|e| e.size), Some(640));
+        assert_eq!(stat_in(&w, "~/Downloads/none"), None);
+        let bytes = read_in(&w, "~/Downloads/README.txt", 16).unwrap();
+        assert_eq!(bytes.len(), 16, "a read stops at the cap");
+        assert!(read_in(&w, "~/Downloads/none", 16).is_err());
+        // `open` is an effect: it hands the real path to the outside and
+        // the fake records it.
+        let real = real_path("~/Downloads/report-q3.pdf");
+        w.run(&crate::effect::OpenPath { path: &real }).unwrap();
+        assert_eq!(w.with_fake(|f| f.opened.clone()), vec![real]);
+        // A world with no outside refuses, loudly, rather than pretending.
+        let deny = World::new(
+            Rc::new(Store::open(None).unwrap()),
+            Box::new(crate::effect::Deny::with_clock(crate::effect::Clock::Virtual(
+                std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            ))),
+            crate::effect::Registry::new(),
+        );
+        assert!(list_in(&deny, "~").unwrap_err().contains("no outside"));
+    }
+
     /// The path field completes like a shell's tab: the segment under the
     /// caret against the directory before it, directories with their
     /// slash so the next offer opens at once, the roots before a slash.
     #[test]
     fn the_path_field_completes_segment_by_segment() {
         let store = Store::open(None).unwrap();
-        let c = PathCompletion;
+        let c = PathCompletion {
+            world: Rc::new(World::fake(crate::effect::Registry::new())),
+        };
         let labels = |text: &str| -> Vec<String> {
             let ctx = c.context(text, text.len()).unwrap();
             c.offer(&store, &ctx).into_iter().map(|s| s.label).collect()
@@ -811,22 +1024,5 @@ mod tests {
         let roots = c.offer(&store, &ctx);
         assert_eq!(roots[1].value, "/");
         assert_eq!(c.splice("", 0, &ctx, &roots[0]), ("~/".into(), 2));
-    }
-
-    #[test]
-    fn sizes_and_kinds() {
-        assert_eq!(fmt_size(640), "640 B");
-        assert_eq!(fmt_size(KB + 100), "1.1 KB");
-        assert_eq!(fmt_size(84 * KB), "84 KB");
-        assert_eq!(fmt_size(MB + 200 * KB), "1.2 MB");
-        assert_eq!(fmt_size(38 * MB), "38 MB");
-        assert_eq!(FileKind::of_name("photo.JPG"), FileKind::Image);
-        assert_eq!(FileKind::of_name("logs.tar.gz"), FileKind::Archive);
-        assert_eq!(FileKind::of_name(".DS_Store"), FileKind::Other);
-        assert_eq!(FileKind::of_name("Lease.tla"), FileKind::Text);
-        assert!(text_of("~/Downloads/README.txt").is_some());
-        assert!(text_of("~/Downloads/report-q3.pdf").is_none());
-        assert!(image_of("~/Downloads/2026/photo-lisbon.jpg").is_some());
-        assert!(image_of("~/Downloads/README.txt").is_none());
     }
 }
