@@ -625,6 +625,11 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
+    /// Toggle a thread's mark (CR-009). Touch only: a long press raises it,
+    /// and a tap while any mark stands.
+    Mark(i64),
+    /// A button of the marks bar.
+    MarkVerb(ui::MarkVerb),
 }
 
 #[derive(Debug, Clone)]
@@ -2142,6 +2147,10 @@ pub struct Stage {
     /// this changes.
     #[rust]
     menu_sig: (Vec<(usize, bool)>, Vec<String>),
+    /// Shift held on the click being resolved (CR-009): a gutter click
+    /// then marks the range from the cursor's row.
+    #[rust]
+    click_shift: bool,
     /// The double-cmd launcher trigger.
     #[rust]
     cmd_tap: CmdTap,
@@ -3181,6 +3190,27 @@ impl Stage {
                 self.resolve_click(cx, Act::Btn(f, act), false);
                 return;
             }
+            // The marks bar's verbs (CR-009): while the focused list has
+            // marks it wears a, d and l itself, and the keys it borrows from
+            // its preview stand down (see `lender`).
+            let focus = self.state.as_deref().and_then(|s| s.ws.focus);
+            let marked = focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
+                // The same guard the borrowed chords have: with the filter
+                // holding the keyboard, cmd+a is select-all, not archive.
+                let has = self.hosted.get(&f).is_some_and(|w| {
+                    let p = w.as_inbox_panel();
+                    p.has_marks() && !p.filter_focused(cx)
+                });
+                if has {
+                    ui::MarkVerb::from_accel(c).map(|v| (f, v))
+                } else {
+                    None
+                }
+            });
+            if let Some((f, verb)) = marked {
+                self.mark_verb(cx, f, verb);
+                return;
+            }
             // Nothing on this panel wanted it. A panel that drives a preview
             // now **borrows** its preview's keys (CR-005): the pair reads as
             // one thing, so archive, delete and reply work from the list
@@ -3235,11 +3265,15 @@ impl Stage {
         if !state.ws.panels.contains_key(&child) {
             return None;
         }
-        let editing = self.hosted.get(&f).cloned().is_some_and(|w| match kind {
+        let w = self.hosted.get(&f).cloned();
+        let editing = w.as_ref().is_some_and(|w| match kind {
             Kind::Files { .. } => w.as_files_panel().field_focused(cx),
             _ => w.as_inbox_panel().filter_focused(cx),
         });
-        (!editing).then_some(child)
+        // …and while the list has marks: its bar wears the very letters the
+        // preview would lend, on the set (CR-009).
+        let marked = w.is_some_and(|w| w.as_inbox_panel().has_marks());
+        (!editing && !marked).then_some(child)
     }
 
     /// Only the launcher trigger cares about key releases: a clean second
@@ -3315,8 +3349,10 @@ impl Stage {
         };
         let was = state.ws.active;
         let step = state.history.undo(&state.world);
+        let mut marks = None;
         match step {
             Some(step) => {
+                marks = Some((step.marks.clone(), step.undone));
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3327,6 +3363,9 @@ impl Stage {
                 state.toast(format!("undid — {label}"), false);
             }
             None => state.toast("nothing to undo", false),
+        }
+        if let Some(m) = marks {
+            self.restore_marks(cx, m);
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -3339,8 +3378,10 @@ impl Stage {
         };
         let was = state.ws.active;
         let step = state.history.redo(&state.world);
+        let mut marks = None;
         match step {
             Some(step) => {
+                marks = Some((step.marks.clone(), step.undone));
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3351,6 +3392,9 @@ impl Stage {
                 state.toast(format!("redid — {label}"), false);
             }
             None => state.toast("nothing to redo", false),
+        }
+        if let Some(m) = marks {
+            self.restore_marks(cx, m);
         }
         self.update_menu(cx);
         self.kick(cx);
@@ -3881,7 +3925,9 @@ impl Stage {
             Act::HistoryRow(id) => {
                 let was = state.ws.active;
                 let step = state.history.travel(&state.world, id);
+                let mut marks = None;
                 if let Some(step) = step {
+                    marks = Some((step.marks.clone(), step.undone));
                     let label = state.land(step);
                     state.sync();
                     if state.ws.active != was {
@@ -3890,6 +3936,9 @@ impl Stage {
                     }
                     state.pump.kick();
                     state.toast(format!("history — {label}"), false);
+                }
+                if let Some(m) = marks {
+                    self.restore_marks(cx, m);
                 }
                 // The overlay stays up: browsing history is the point.
                 self.update_menu(cx);
@@ -3969,6 +4018,23 @@ impl Stage {
                     }
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
+                    }
+                    WidgetOp::Mark(th) => {
+                        // Touch's way in (CR-009): a long press marks, and
+                        // while any mark stands a tap toggles rather than
+                        // opens. Nothing on the pointer raises this — the
+                        // bar in the row's inset is an indicator, not a
+                        // control.
+                        if state.ws.focus != Some(pid) {
+                            state.ws.focus = Some(pid);
+                        }
+                        if let Some(w) = self.hosted.get(&pid) {
+                            w.as_inbox_panel().toggle_mark(cx, th);
+                        }
+                        self.kick(cx);
+                    }
+                    WidgetOp::MarkVerb(verb) => {
+                        self.mark_verb(cx, pid, verb);
                     }
                     WidgetOp::OpenRow(target) => {
                         // A click inside a panel focuses it, as anywhere
@@ -4581,6 +4647,192 @@ impl Stage {
         self.sync(cx);
     }
 
+    /// One of the marks bar's verbs (CR-009), from its button or its chord.
+    fn mark_verb(&mut self, cx: &mut Cx, pid: PanelId, verb: ui::MarkVerb) {
+        match verb {
+            ui::MarkVerb::Archive => self.triage_marked(cx, pid, false),
+            ui::MarkVerb::Delete => self.triage_marked(cx, pid, true),
+            ui::MarkVerb::All => {
+                let store = self.state.as_deref().map(|s| s.store.clone());
+                if let (Some(store), Some(w)) = (store, self.hosted.get(&pid).cloned()) {
+                    w.as_inbox_panel().mark_all(cx, &store);
+                }
+                self.kick(cx);
+            }
+            ui::MarkVerb::Clear => {
+                if let Some(w) = self.hosted.get(&pid).cloned() {
+                    w.as_inbox_panel().clear_marks(cx);
+                }
+                self.kick(cx);
+            }
+        }
+    }
+
+    /// The batch verb (CR-009): [`Stage::triage`] over a list's marked set.
+    /// Every inbox mail of every marked thread, one `Filed` intent each,
+    /// **one node** — so one ⌘z takes the whole batch back, and puts the
+    /// marks back with it. A thread whose account has no such folder is
+    /// skipped rather than failing the batch, and stays marked: the marks
+    /// after a verb are exactly what it could not do. The cursor carries to
+    /// the nearest row that stayed, previewing as the walk does, in the same
+    /// node; readers of the filed threads close, as for one row.
+    fn triage_marked(&mut self, cx: &mut Cx, pid: PanelId, delete: bool) {
+        let Some(w) = self.hosted.get(&pid).cloned() else { return };
+        let panel = w.as_inbox_panel();
+        let threads = panel.marks();
+        if threads.is_empty() {
+            return;
+        }
+        let (verb, done, role) = if delete {
+            ("delete", "deleted", "trash")
+        } else {
+            ("archive", "archived", "archive")
+        };
+        let Some(store) = self.state.as_deref().map(|s| s.store.clone()) else {
+            return;
+        };
+        // The pre-flight, per thread: its inbox mails, and whether its
+        // account has the folder.
+        let mut filed: Vec<i64> = Vec::new();
+        let mut skipped = 0usize;
+        let mut ids: Vec<core::MailId> = Vec::new();
+        for th in &threads {
+            let head = crate::richtable::Datasource::by_key(&mail::THREADS, &store, th);
+            let Some(head) = head else {
+                skipped += 1;
+                continue;
+            };
+            let mails = mail::thread_inbox(&store, head.target);
+            if mails.is_empty() || !mail::can_file(&store, head.target, role) {
+                skipped += 1;
+                continue;
+            }
+            filed.push(*th);
+            ids.extend(mails);
+        }
+        if filed.is_empty() {
+            if let Some(state) = self.state.as_deref_mut() {
+                state.toast(format!("this account has no {role} folder"), true);
+            }
+            self.kick(cx);
+            return;
+        }
+        let gone: BTreeSet<i64> = filed.iter().copied().collect();
+        // Decided first, while the rows are still in the list to have one.
+        let next = panel.survivor(&store, &gone);
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let from: Vec<(core::MailId, i64)> = ids
+            .iter()
+            .map(|&m| {
+                let f: i64 = state
+                    .store
+                    .conn()
+                    .query_row("SELECT folder FROM message WHERE id = ?1", [m], |r| r.get(0))
+                    .unwrap_or(0);
+                (m, f)
+            })
+            .collect();
+        let mut readers: Vec<PanelId> = Vec::new();
+        for m in &ids {
+            for r in state.ws.showing(&Kind::Message { id: *m }) {
+                if !readers.contains(&r) {
+                    readers.push(r);
+                }
+            }
+        }
+        if let Some(nid) = next {
+            state.wish_ahead(&Kind::Message { id: nid });
+        }
+        let next_marks: Vec<core::MailId> = next
+            .map(|nid| mail::thread_unread(&state.store, nid))
+            .unwrap_or_default();
+        let (n_threads, n_mails) = (filed.len(), ids.len());
+        let noun = if n_threads == 1 { "conversation" } else { "conversations" };
+        let (ids_tx, marks_tx) = (ids.clone(), next_marks.clone());
+        state.act(
+            verb,
+            format!("{verb} {n_threads} {noun}"),
+            None,
+            move |ws| {
+                for r in readers {
+                    ws.close_anywhere(r);
+                }
+                if let Some(nid) = next {
+                    let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
+                    ws.activate(child);
+                    ws.focus = Some(pid);
+                }
+            },
+            move |tx| {
+                for m in &ids_tx {
+                    if delete {
+                        mail::delete_tx(tx, *m)?;
+                    } else {
+                        mail::archive_tx(tx, *m)?;
+                    }
+                }
+                for m in &marks_tx {
+                    mail::mark_read_tx(tx, *m)?;
+                }
+                Ok(())
+            },
+            next_marks
+                .iter()
+                .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
+                .chain(from.iter().map(|(m, f)| {
+                    Box::new(mail::Filed {
+                        mail: *m,
+                        from_folder: *f,
+                        role,
+                    }) as Box<dyn crate::history::Intent>
+                }))
+                .collect(),
+        );
+        // The node carries the marks it consumed: context restored with the
+        // delta, so ⌘z brings the rows back marked.
+        state.history.claim_marks(pid, filed.clone());
+        let what = if skipped > 0 {
+            format!(
+                "{done} {n_threads} of {} {noun} — {skipped} have no {role} folder — ⌘z undoes",
+                n_threads + skipped
+            )
+        } else if n_mails > n_threads {
+            format!("{done} {n_threads} {noun} ({n_mails} mails) — ⌘z undoes")
+        } else {
+            format!("{done} {n_threads} {noun} — ⌘z undoes")
+        };
+        state.toast(what, false);
+        if let Some(nid) = next {
+            let open: BTreeSet<core::MailId> =
+                next_marks.iter().copied().chain(std::iter::once(nid)).collect();
+            state.seed_expansion(nid, &open);
+            state.show_also = state.ws.joined_child(pid);
+            cx.action(crate::panels::PanelAction::Select {
+                pid,
+                target: Kind::Message { id: nid },
+            });
+        }
+        // What was filed is no longer a mark; what could not be stays one.
+        panel.remove_marks(cx, &filed);
+        self.sync(cx);
+    }
+
+    /// Puts back, or takes again, the marks a node consumed (CR-009): the
+    /// context that rides an undo or a redo.
+    fn restore_marks(&mut self, cx: &mut Cx, (marks, undone): (Vec<(PanelId, Vec<i64>)>, bool)) {
+        for (pid, keys) in marks {
+            let Some(w) = self.hosted.get(&pid).cloned() else { continue };
+            let panel = w.as_inbox_panel();
+            if undone {
+                panel.add_marks(cx, &keys);
+            } else {
+                panel.remove_marks(cx, &keys);
+            }
+        }
+    }
+
     /// Where an inbox cursor standing on `id` should land once it is filed
     /// away: the next row down, or the one above if it was the last. `None`
     /// when no inbox is pointing at this mail — a header button pressed on a
@@ -4786,6 +5038,20 @@ impl Stage {
                         Act::WidgetOp(pid, WidgetOp::AddAccount | WidgetOp::GoogleSignIn) => {
                             Act::Pointer(pid)
                         }
+                        // While a list has marks, a tap on a row toggles its
+                        // mark rather than opening it (CR-009); the last
+                        // mark cleared gives the tap back.
+                        Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))
+                            if self
+                                .hosted
+                                .get(&pid)
+                                .is_some_and(|w| w.as_inbox_panel().has_marks()) =>
+                        {
+                            match self.state.as_deref().and_then(|s| mail::thread_of(&s.store, id)) {
+                                Some(th) => Act::WidgetOp(pid, WidgetOp::Mark(th)),
+                                None => Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id })),
+                            }
+                        }
                         a => a,
                     };
                     self.resolve_click(cx, act, false);
@@ -4896,6 +5162,22 @@ impl Stage {
             TouchMode::Tap { uid: u, .. } if u == uid => {}
             TouchMode::Idle => {}
             _ => return,
+        }
+        // A long press on a row marks it (CR-009): the phone's way in. From
+        // then on taps toggle, until the last mark is cleared.
+        if let Some(Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))) =
+            self.hit_at(p).map(|h| h.act.clone())
+        {
+            let th = self
+                .state
+                .as_deref()
+                .and_then(|s| mail::thread_of(&s.store, id));
+            if let (Some(th), Some(w)) = (th, self.hosted.get(&pid).cloned()) {
+                w.as_inbox_panel().toggle_mark(cx, th);
+                self.touch.mode = TouchMode::Idle;
+                self.kick(cx);
+                return;
+            }
         }
         let Some(pid) = self.hit_at(p).and_then(|h| act_pid(&h.act)) else {
             return;
@@ -6024,7 +6306,9 @@ impl Widget for Stage {
                         }
                         a => a,
                     };
+                    self.click_shift = e.modifiers.shift;
                     self.resolve_click(cx, act, fresh);
+                    self.click_shift = false;
                 }
             }
 
@@ -7480,6 +7764,17 @@ impl Stage {
                                     r,
                                     Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id: t.target })),
                                 ));
+                                // The gutter (CR-009): the row's left edge
+                                // toggles its mark. Registered after the
+                                // row, so it wins the overlap.
+                                reg.push((
+                                    format!("mark {}", t.topic),
+                                    Rect {
+                                        pos: r.pos,
+                                        size: dvec2(ui::MARK_GUTTER, r.size.y),
+                                    },
+                                    Act::WidgetOp(pid, WidgetOp::Mark(t.thread)),
+                                ));
                             }
                         }
                     }
@@ -7489,6 +7784,10 @@ impl Stage {
                 // wins where they overlap.
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
+                }
+                // The marks bar's verbs (CR-009), while the bar is up.
+                for (label, r, verb) in panel.verb_hits(cx) {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::MarkVerb(verb))));
                 }
             }
             Some(Kind::Message { id }) => {

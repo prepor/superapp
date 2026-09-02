@@ -205,6 +205,73 @@ pub const ACCEL_ADD_ACCOUNT: char = 'd';
 /// reserved or taken.
 pub const ACCEL_DEVICE_SYNC: char = 'y';
 
+/// The verbs of the marks bar (CR-009): what a list offers on its marked
+/// set. `archive` and `delete` are the row's own verbs, on the set; `all`
+/// marks every row under the filter; `clear` empties the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkVerb {
+    Archive,
+    Delete,
+    All,
+    Clear,
+}
+
+/// The bar's order, left to right.
+pub const MARK_VERBS: &[MarkVerb] = &[
+    MarkVerb::Archive,
+    MarkVerb::Delete,
+    MarkVerb::All,
+    MarkVerb::Clear,
+];
+
+/// The row's left edge that toggles its mark, in points — the mark's own
+/// place, wider than the bar it draws.
+pub const MARK_GUTTER: f64 = 12.0;
+
+impl MarkVerb {
+    /// The button's text.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkVerb::Archive => "archive",
+            MarkVerb::Delete => "delete",
+            MarkVerb::All => "all",
+            MarkVerb::Clear => "clear",
+        }
+    }
+
+    /// The key it wears: the letter the single-row verb wears, so a batch
+    /// is nothing new to learn. `clear` wears none — `esc` is its key, and
+    /// esc cannot be drawn into a label.
+    #[must_use]
+    pub fn accel(self) -> Option<char> {
+        match self {
+            MarkVerb::Archive => Some('a'),
+            MarkVerb::Delete => Some('d'),
+            MarkVerb::All => Some('l'),
+            MarkVerb::Clear => None,
+        }
+    }
+
+    /// The verb a chord fires, while the bar is up.
+    #[must_use]
+    pub fn from_accel(c: char) -> Option<MarkVerb> {
+        MARK_VERBS.iter().copied().find(|v| v.accel() == Some(c))
+    }
+
+    /// What the harness addresses the button by — apart from the message
+    /// panel's own `archive`, one column over.
+    #[must_use]
+    pub fn hit_label(self) -> &'static str {
+        match self {
+            MarkVerb::Archive => "archive marked",
+            MarkVerb::Delete => "delete marked",
+            MarkVerb::All => "mark all",
+            MarkVerb::Clear => "clear marks",
+        }
+    }
+}
+
 /// The kind a panel **previews** into its joined child: a master/detail list
 /// whose cursor walk re-targets the child instead of opening a new panel, and
 /// which keeps focus while doing it (CR-005).
@@ -230,8 +297,10 @@ pub fn preview_kind(kind: &Kind) -> Option<Kind> {
 
 /// Every accelerator a kind declares — chrome buttons *and* links — as
 /// `(key, what it fires)`. One table, so [`tests`] can hold the whole
-/// design to its rules rather than trusting discipline.
-pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
+/// design to its rules rather than trusting discipline. `marks` is the
+/// one piece of state the table depends on: a list with marked rows wears
+/// its bar's verbs too (CR-009), and its borrowed chords stand down.
+pub fn accels(kind: &Kind, marks: bool) -> Vec<(char, &'static str)> {
     let mut v: Vec<(char, &'static str)> = head_btns(kind)
         .iter()
         .filter_map(|(label, act)| btn_accel(*act).map(|c| (c, *label)))
@@ -243,6 +312,13 @@ pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
     if matches!(kind, Kind::Settings) {
         v.push((ACCEL_ADD_ACCOUNT, "add account"));
         v.push((ACCEL_DEVICE_SYNC, "device sync"));
+    }
+    if marks && matches!(kind, Kind::Inbox { .. }) {
+        for verb in MARK_VERBS {
+            if let Some(c) = verb.accel() {
+                v.push((c, verb.label()));
+            }
+        }
     }
     v
 }
@@ -322,6 +398,15 @@ mod tests {
     use super::*;
     use crate::core::Seed;
 
+    /// Every kind in every state its accelerators depend on: with and
+    /// without marks (only a list has them, but the table has to say so).
+    fn every_state() -> Vec<(Kind, bool)> {
+        every_kind()
+            .into_iter()
+            .flat_map(|k| [(k.clone(), false), (k, true)])
+            .collect()
+    }
+
     /// Every kind an accelerator could live on.
     fn every_kind() -> Vec<Kind> {
         vec![
@@ -378,8 +463,8 @@ mod tests {
 
     #[test]
     fn accelerators_never_claim_a_reserved_chord() {
-        for k in every_kind() {
-            for (c, what) in accels(&k) {
+        for (k, marks) in every_state() {
+            for (c, what) in accels(&k, marks) {
                 assert!(
                     !RESERVED.contains(&c),
                     "{k:?} claims cmd+{c} for {what}, but the workspace owns it"
@@ -390,9 +475,9 @@ mod tests {
 
     #[test]
     fn accelerators_are_unique_within_a_panel() {
-        for k in every_kind() {
+        for (k, marks) in every_state() {
             let mut seen = Vec::new();
-            for (c, what) in accels(&k) {
+            for (c, what) in accels(&k, marks) {
                 assert!(
                     !seen.contains(&c),
                     "{k:?} claims cmd+{c} twice (second: {what})"
@@ -404,11 +489,13 @@ mod tests {
 
     #[test]
     fn kinds_that_edit_text_yield_the_text_chords() {
+        // Without marks: the bar's `a` is the one exception, held to the
+        // same guard as a borrowed chord — see the marks test below.
         for k in every_kind() {
             if field_order(&k).is_empty() {
                 continue;
             }
-            for (c, what) in accels(&k) {
+            for (c, what) in accels(&k, false) {
                 assert!(
                     !TEXT_CHORDS.contains(&c),
                     "{k:?} edits text, so cmd+{c} ({what}) must stay copy/cut/paste/select-all"
@@ -440,8 +527,8 @@ mod tests {
                 _ => vec![child],
             };
             for child in children {
-                let mut seen: Vec<(char, &'static str)> = accels(&k);
-                for (c, what) in accels(&child) {
+                let mut seen: Vec<(char, &'static str)> = accels(&k, false);
+                for (c, what) in accels(&child, false) {
                     assert!(
                         !RESERVED.contains(&c),
                         "{k:?} would borrow cmd+{c} for {what}, but the workspace owns it"
@@ -495,6 +582,54 @@ mod tests {
             ("device sync", ACCEL_DEVICE_SYNC),
         ] {
             assert!(accel_idx(label, c).is_some(), "“{label}” cannot show {c}");
+        }
+        for verb in MARK_VERBS {
+            if let Some(c) = verb.accel() {
+                assert!(
+                    accel_idx(verb.label(), c).is_some(),
+                    "“{}” cannot show its key {c}",
+                    verb.label()
+                );
+            }
+        }
+    }
+
+    /// The marks bar's verbs (CR-009): a list with marks wears `a`, `d` and
+    /// `l` — the first two the very letters its preview lends it, which is
+    /// the point (a batch is the row's verb on a set) and the reason the
+    /// borrowed chords stand down while the bar is up. Nothing else on the
+    /// list collides with them.
+    #[test]
+    fn a_marked_list_takes_its_verbs_and_the_preview_stands_down() {
+        let inbox = Kind::Inbox { filter: None };
+        let bare = accels(&inbox, false);
+        let marked = accels(&inbox, true);
+        assert!(bare.iter().all(|(c, _)| !"adl".contains(*c)));
+        for verb in MARK_VERBS {
+            let Some(c) = verb.accel() else { continue };
+            assert!(marked.contains(&(c, verb.label())), "the bar wears {c}");
+            assert!(MarkVerb::from_accel(c) == Some(*verb));
+        }
+        assert_eq!(MarkVerb::from_accel('z'), None);
+        // The bar's `a` is a text chord on a kind with a field. Like the
+        // borrowed `a` it stands down while the filter holds the keyboard
+        // (the shell's guard), so select-all in a live filter never
+        // archives; no other text chord is claimed.
+        for (c, what) in &marked {
+            assert!(!TEXT_CHORDS.contains(c) || *c == 'a', "cmd+{c} ({what}) is a text chord");
+        }
+        // The preview's own a and d are exactly the bar's: lent while the
+        // set is empty, stood down while it is not.
+        let lent = accels(&preview_kind(&inbox).unwrap(), false);
+        for (c, _) in &marked {
+            let shared = lent.iter().any(|(l, _)| l == c);
+            assert!(shared || *c == 'l' || *c == 's', "cmd+{c} is neither lent nor the bar's own");
+        }
+        // Only a list has marks: the flag changes nothing else.
+        for k in every_kind() {
+            if !matches!(k, Kind::Inbox { .. }) {
+                assert_eq!(accels(&k, true), accels(&k, false));
+            }
         }
     }
 }

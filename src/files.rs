@@ -833,9 +833,16 @@ pub fn matches(e: &Entry, ast: &Ast) -> bool {
 
 impl Datasource for DirSource {
     type Row = Entry;
+    /// A row is its name: unique within the one directory a source lists,
+    /// and what a mark would hold (CR-009).
+    type Key = String;
 
     fn tags(&self) -> &'static [TagDef] {
         TAGS
+    }
+
+    fn key(&self, row: &Entry) -> String {
+        row.name.clone()
     }
 
     fn count(&self, _store: &Store, ast: Option<&Ast>) -> Option<usize> {
