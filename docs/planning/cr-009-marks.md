@@ -1,10 +1,10 @@
 # CR-009 · Marks: batch selection and batch actions for the rich table
 
-Status: **proposed** (Andrey, 2026-09-02: stelaxis's rich table had batch
+Status: **implemented** (Andrey, 2026-09-02: stelaxis's rich table had batch
 selection and batch actions before UI v2 — the same functionality for our
-rich tables, with a UI of our own). The surface is drafted in the panels
-library — the scenes *inbox row* (its `marked` states), *marks bar* and
-*inbox, marked* — for review before anything is wired.
+rich tables, with a UI of our own). The surface was drafted in the panels
+library first — the scenes *inbox row* (its `marked` states), *marks bar*
+and *inbox, marked* — and the first two now populate the real widgets.
 
 ## Why
 
@@ -201,14 +201,46 @@ The stills are a composite widget with fixed slots (`InboxDraft`), no store
 behind it. It is scaffolding for this review and goes when the inbox panel
 draws the real thing.
 
-## To decide in review
+## Findings
 
-- The mark as an ink bar in the inset, against a glyph in a gutter column.
-- `space` as the mark key, against `x`.
-- `l` for `all`, against no letter.
-- The hidden section, against a count in the bar only (`1 hidden`) with
-  `all` clearing the filter.
-- The touch mapping — a long press to mark, then taps toggling.
+- **A `Fit` child never wraps, so the bar decides at draw.** The verbs
+  cannot be a row that falls under the count by itself: the turtle cannot
+  know a `Fit` group's width before it walks it. `MarkBar` measures what one
+  line needs when it is populated — the count and the muted hidden clause on
+  the mono cell, the buttons with their padding, the gaps and the inset —
+  and holds that against the turtle's inner width in `draw_walk`, showing
+  one of two copies of the same group. The shell registers the copy that
+  drew, so the hit table follows the layout instead of guessing it.
+- **The hidden marks ride in the one `PortalList`, as a prefix.** A second
+  list above the table would bring its own scrolling, its own widget reuse
+  and its own item ids. The caption, the hidden rows and the rule closing
+  them are items `0..prefix` of the same list instead, and every index the
+  panel hands out is offset by it (`list_index`, `row_at`, the cursor's
+  scroll-follow, the per-row stamps). The arrows walk the table's own rows
+  and never visit the prefix.
+- **The bar's chords need the filter's guard, in a second place.** The
+  borrowed keys already stood down for a live field, inside `lender`. The
+  bar's verbs are dispatched before that, so the same test (`has_marks()`
+  and not `filter_focused()`) had to be repeated there — without it a
+  `cmd+a` meant to clear the filter field would archive the marked set.
+  `e2e/marks.txt` holds the case.
+- **A mark whose row is gone is pruned at draw.** `by_key` reads under the
+  source's base `WHERE` only, so a thread that has left the inbox has no row
+  at all — neither shown nor hidden. The draw keeps what `split` still
+  accounts for and drops the rest, so the bar never counts a row nobody can
+  see or act on.
+- **A batch with nothing to file says so and writes no node.** The
+  pre-flight runs per thread — its inbox mails, and whether its account has
+  the folder — and when every marked thread is skipped there is no action:
+  the toast is the single row's error (`this account has no archive
+  folder`) and the set stays as it was. Otherwise the skipped ones stay
+  marked and the toast counts them — `archived 10 of 12 conversations —
+  2 have no archive folder — ⌘z undoes`.
+- **`mark all` on `k` was tried and reverted.** A bold `l` is one more thick
+  stroke and barely reads at label size, so the button briefly became `mark
+  all` on ⌘k (`m` is the window's, on macOS). That commit was reverted: the
+  button is `all` on its `l` again, and the letters stay the ones the
+  single-row verbs wear.
 
 ## Not done, on purpose
 

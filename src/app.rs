@@ -641,6 +641,33 @@ struct HitR {
     label: String,
 }
 
+/// How well a hit answers to what a script asked for, smaller being nearer:
+/// the whole label first, then a label that *starts* with what was asked,
+/// then one that merely contains it; within a rung a panel's own `Focus`
+/// rect yields to anything named, and the **tightest** label wins — the one
+/// that says least beyond what was asked. `None` where the label does not
+/// match at all.
+///
+/// The last two terms are what keep a row's gutter — labelled `mark
+/// <topic>` (CR-009) and registered over the row so a pointer finds it —
+/// from shadowing the row whose label it carries whole.
+fn label_rank(h: &HitR, label: &str, needle: &str) -> Option<(u8, u8, usize)> {
+    let rung = if h.label.eq_ignore_ascii_case(label) {
+        0
+    } else {
+        let l = h.label.to_lowercase();
+        if l.starts_with(needle) {
+            1
+        } else if l.contains(needle) {
+            2
+        } else {
+            return None;
+        }
+    };
+    let focus = u8::from(matches!(h.act, Act::Focus(_)));
+    Some((rung, focus, h.label.chars().count()))
+}
+
 /// The panel an act belongs to (overlay acts belong to none). A hosted
 /// widget's own hits — rows, fields, selectable runs — name their panel too:
 /// they sit *above* the panel-wide `Focus` hit, so a finger that lands on a
@@ -2622,6 +2649,19 @@ impl Stage {
         self.hits.iter().rev().find(|h| h.rect.contains(p))
     }
 
+    /// The element a script means by `label`: the nearest [`label_rank`]
+    /// offers, ties going to the last registered — a control drawn over
+    /// another takes the click, the way `hit_at` gives it the point.
+    fn hit_by_label(&self, label: &str) -> Option<&HitR> {
+        let needle = label.to_lowercase();
+        self.hits
+            .iter()
+            .rev()
+            .filter_map(|h| label_rank(h, label, &needle).map(|k| (k, h)))
+            .min_by_key(|(k, _)| *k)
+            .map(|(_, h)| h)
+    }
+
     /// Executes at most one e2e step per timer tick; waits pace the script.
     fn e2e_tick(&mut self, cx: &mut Cx, dt_ms: f64) {
         // Device sync advances with the run: `e2e_tick` is the one place every
@@ -2682,26 +2722,13 @@ impl Stage {
                     }
                 }
                 e2e::Step::Click { label, fresh } => {
-                    let needle = label.to_lowercase();
                     // Whole-label matches win over substrings. Without that,
                     // `click "archive"` can land on a mail *subject* — the
                     // seed has sixty "archive digest #NN" rows — and which
                     // one it finds depends on draw order, so the script
                     // silently tests something else. An exact name is an
-                    // exact target.
-                    let exact = |h: &&HitR| h.label.eq_ignore_ascii_case(&label);
-                    let loose = |h: &&HitR| h.label.to_lowercase().contains(&needle);
-                    let named = |h: &&HitR| !matches!(h.act, Act::Focus(_));
-                    let pick = |f: &dyn Fn(&&HitR) -> bool| {
-                        self.hits
-                            .iter()
-                            .rev()
-                            .find(|h| named(h) && f(h))
-                            .or_else(|| self.hits.iter().rev().find(f))
-                    };
-                    let hit = pick(&exact)
-                        .or_else(|| pick(&loose))
-                        .map(|h| (h.act.clone(), h.rect));
+                    // exact target; [`label_rank`] holds the whole order.
+                    let hit = self.hit_by_label(&label).map(|h| (h.act.clone(), h.rect));
                     match hit {
                         Some((act, r)) => {
                             eprintln!("e2e: click {label:?}{}", if fresh { " (cmd)" } else { "" });
@@ -2755,14 +2782,10 @@ impl Stage {
                     self.handle_text(cx, &s);
                 }
                 e2e::Step::Drag { label, dx, dy } => {
-                    let needle = label.to_lowercase();
                     // From the left edge, so a horizontal drag sweeps the
                     // run rather than starting halfway through it.
                     let c = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| h.label.to_lowercase().contains(&needle))
+                        .hit_by_label(&label)
                         .map(|h| dvec2(h.rect.pos.x + 2.0, h.rect.pos.y + h.rect.size.y / 2.0));
                     match c {
                         Some(c) => {
@@ -2776,13 +2799,7 @@ impl Stage {
                     }
                 }
                 e2e::Step::SelectAll(label) => {
-                    let needle = label.to_lowercase();
-                    let hit = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| h.label.to_lowercase().contains(&needle))
-                        .map(|h| (h.act.clone(), h.rect));
+                    let hit = self.hit_by_label(&label).map(|h| (h.act.clone(), h.rect));
                     match hit {
                         Some((Act::Pointer(pid), r)) => {
                             eprintln!("e2e: selectall {label:?}");
@@ -2822,19 +2839,7 @@ impl Stage {
                     // hit lookup and the key-focus rule all run as they do
                     // for a real click. `click` resolves the action
                     // directly and proves less.
-                    let needle = label.to_lowercase();
-                    let r = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| h.label.eq_ignore_ascii_case(&label))
-                        .or_else(|| {
-                            self.hits
-                                .iter()
-                                .rev()
-                                .find(|h| h.label.to_lowercase().contains(&needle))
-                        })
-                        .map(|h| h.rect);
+                    let r = self.hit_by_label(&label).map(|h| h.rect);
                     match r {
                         Some(r) => {
                             eprintln!("e2e: mouse {label:?}");
@@ -2865,12 +2870,8 @@ impl Stage {
                     }
                 }
                 e2e::Step::Swipe { label, dx, dy, hold } => {
-                    let needle = label.to_lowercase();
                     let c = self
-                        .hits
-                        .iter()
-                        .rev()
-                        .find(|h| h.label.to_lowercase().contains(&needle))
+                        .hit_by_label(&label)
                         .map(|h| h.rect.pos + h.rect.size / 2.0);
                     match c {
                         Some(c) => {
@@ -4697,13 +4698,18 @@ impl Stage {
         let mut skipped = 0usize;
         let mut ids: Vec<core::MailId> = Vec::new();
         for th in &threads {
+            // A thread that left the inbox under its mark — a sync filed it,
+            // another device did — is not *skipped*: there is nothing left to
+            // file, and the next draw drops its mark with it.
             let head = crate::richtable::Datasource::by_key(&mail::THREADS, &store, th);
-            let Some(head) = head else {
-                skipped += 1;
-                continue;
-            };
+            let Some(head) = head else { continue };
             let mails = mail::thread_inbox(&store, head.target);
-            if mails.is_empty() || !mail::can_file(&store, head.target, role) {
+            if mails.is_empty() {
+                continue;
+            }
+            // Ask before acting, as a row's own verb does: without the folder
+            // the move is a no-op, and this one thread stays marked.
+            if !mail::can_file(&store, head.target, role) {
                 skipped += 1;
                 continue;
             }
@@ -4712,7 +4718,16 @@ impl Stage {
         }
         if filed.is_empty() {
             if let Some(state) = self.state.as_deref_mut() {
-                state.toast(format!("this account has no {role} folder"), true);
+                // The row's own wording where the set is one; otherwise the
+                // set is what has nowhere to go, not an account.
+                let what = if skipped == 0 {
+                    format!("nothing to {verb}")
+                } else if threads.len() == 1 {
+                    format!("this account has no {role} folder")
+                } else {
+                    format!("nothing to {verb} — no {role} folder")
+                };
+                state.toast(what, true);
             }
             self.kick(cx);
             return;
@@ -4751,51 +4766,62 @@ impl Stage {
         let (n_threads, n_mails) = (filed.len(), ids.len());
         let noun = if n_threads == 1 { "conversation" } else { "conversations" };
         let (ids_tx, marks_tx) = (ids.clone(), next_marks.clone());
-        state.act(
-            verb,
-            format!("{verb} {n_threads} {noun}"),
-            None,
-            move |ws| {
-                for r in readers {
-                    ws.close_anywhere(r);
-                }
-                if let Some(nid) = next {
-                    let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
-                    ws.activate(child);
-                    ws.focus = Some(pid);
-                }
-            },
-            move |tx| {
-                for m in &ids_tx {
-                    if delete {
-                        mail::delete_tx(tx, *m)?;
-                    } else {
-                        mail::archive_tx(tx, *m)?;
+        let recorded = state
+            .act(
+                verb,
+                format!("{verb} {n_threads} {noun}"),
+                None,
+                move |ws| {
+                    for r in readers {
+                        ws.close_anywhere(r);
                     }
-                }
-                for m in &marks_tx {
-                    mail::mark_read_tx(tx, *m)?;
-                }
-                Ok(())
-            },
-            next_marks
-                .iter()
-                .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
-                .chain(from.iter().map(|(m, f)| {
-                    Box::new(mail::Filed {
-                        mail: *m,
-                        from_folder: *f,
-                        role,
-                    }) as Box<dyn crate::history::Intent>
-                }))
-                .collect(),
-        );
+                    if let Some(nid) = next {
+                        let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
+                        ws.activate(child);
+                        ws.focus = Some(pid);
+                    }
+                },
+                move |tx| {
+                    for m in &ids_tx {
+                        if delete {
+                            mail::delete_tx(tx, *m)?;
+                        } else {
+                            mail::archive_tx(tx, *m)?;
+                        }
+                    }
+                    for m in &marks_tx {
+                        mail::mark_read_tx(tx, *m)?;
+                    }
+                    Ok(())
+                },
+                next_marks
+                    .iter()
+                    .map(|m| {
+                        Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>
+                    })
+                    .chain(from.iter().map(|(m, f)| {
+                        Box::new(mail::Filed {
+                            mail: *m,
+                            from_folder: *f,
+                            role,
+                        }) as Box<dyn crate::history::Intent>
+                    }))
+                    .collect(),
+            )
+            .is_some();
+        // A read-only follower (CR-005) never got its node: the marks are
+        // still what they were, and nothing was filed to say otherwise.
+        if !recorded {
+            self.kick(cx);
+            return;
+        }
         // The node carries the marks it consumed: context restored with the
         // delta, so ⌘z brings the rows back marked.
         state.history.claim_marks(pid, filed.clone());
         let what = if skipped > 0 {
+            let have = if skipped == 1 { "has" } else { "have" };
             format!(
-                "{done} {n_threads} of {} {noun} — {skipped} have no {role} folder — ⌘z undoes",
+                "{done} {n_threads} of {} {noun} — {skipped} {have} no {role} folder — ⌘z undoes",
                 n_threads + skipped
             )
         } else if n_mails > n_threads {
@@ -5171,8 +5197,13 @@ impl Stage {
             let th = self
                 .state
                 .as_deref()
-                .and_then(|s| mail::thread_of(&s.store, id));
-            if let (Some(th), Some(w)) = (th, self.hosted.get(&pid).cloned()) {
+                .and_then(|s| mail::thread_of(&s.store, id))
+                .map(|th| (pid, th)),
+            Some(Act::WidgetOp(pid, WidgetOp::Mark(th))) => Some((pid, th)),
+            _ => None,
+        };
+        if let Some((pid, th)) = row {
+            if let Some(w) = self.hosted.get(&pid).cloned() {
                 w.as_inbox_panel().toggle_mark(cx, th);
                 self.touch.mode = TouchMode::Idle;
                 self.kick(cx);

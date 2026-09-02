@@ -86,4 +86,22 @@ wait 800
 shot m10-delete-undone
 click "clear marks"
 wait 300
+
+# The cursor carries on. With it standing on a marked row the batch takes
+# that row too, so the walk lands on the nearest row that stayed and
+# previews it — in the same node, so one ⌘z takes the pair back and the
+# marks with them.
+key down
+wait 500
+type " "
+wait 300
+key shift+down 1
+wait 500
+key cmd+a
+wait 900
+shot m11-cursor-carried
+key cmd+z
+wait 800
+click "clear marks"
+wait 300
 quit

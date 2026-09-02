@@ -4028,10 +4028,13 @@ impl InboxPanel {
         i + self.prefix()
     }
 
-    /// Space: the mark on the cursor's row, toggled.
+    /// Space: the mark on the cursor's row, toggled. With no cursor — a
+    /// fresh panel, a filter just cleared — the top row is the row, the
+    /// rule `enter` and the arrows already follow.
     fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
         let Some(m) = self
             .cursor_index(store)
+            .or(Some(0))
             .and_then(|i| self.table.row(store, i))
         else {
             return;
@@ -4168,7 +4171,8 @@ impl InboxPanelRef {
 
     /// Once the `gone` threads are filed: the mail the cursor should land
     /// on — the nearest row that stays, below first, then above. The
-    /// walk's own rule, over a set.
+    /// walk's own rule, over a set. `None` when the cursor's own row stayed
+    /// (it carries on where it stands) or when there is no cursor at all.
     pub fn survivor(
         &self,
         store: &Store,
@@ -4176,6 +4180,9 @@ impl InboxPanelRef {
     ) -> Option<i64> {
         let p = self.borrow()?;
         let i = p.cursor_index(store)?;
+        if !p.table.row(store, i).is_some_and(|t| gone.contains(&t.thread)) {
+            return None;
+        }
         let n = p.table.len(store);
         (i..n)
             .chain((0..i).rev())
