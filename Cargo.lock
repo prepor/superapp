@@ -1940,6 +1940,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "superapp"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "html5ever",
  "imap",
  "lettre",
@@ -1948,7 +1949,9 @@ dependencies = [
  "makepad-objc-sys",
  "makepad-widgets",
  "markup5ever_rcdom",
+ "ring",
  "rusqlite",
+ "rustls-connector",
  "serde",
  "serde_json",
  "simplecss",

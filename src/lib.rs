@@ -18,6 +18,7 @@
 //! | [`repl`] | device sync: the changeset log, the lease, the passes | no |
 //! | [`object`] | the sync transport: object store (memory, HTTP) + `state` | no |
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
+//! | [`oauth`] | Gmail sign-in: the browser flow, and XOAUTH2's tokens | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`problems`] | standing problems, derived from the rows that carry them | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
@@ -43,6 +44,7 @@ pub mod library;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod mail;
+pub mod oauth;
 pub mod object;
 pub mod panels;
 pub mod problems;

@@ -179,6 +179,10 @@ fn account(email: &str, host: Option<&str>, status: Option<&str>) -> mail::Accou
         smtp_host: host.map(|h| h.replace("imap", "smtp")),
         status: status.map(str::to_string),
         synced: None,
+        // The library's accounts are the password kind; a Gmail sign-in has
+        // no fixture because the scene is what settings *draws*, and that
+        // is the same row either way.
+        auth: None,
     }
 }
 

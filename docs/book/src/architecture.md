@@ -18,6 +18,7 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/repl.rs` | device sync: the log, the lease, and the sync passes | no |
 | `src/object.rs` | the sync transport: object store (memory, HTTP) + `state` | no |
 | `src/secret.rs` | passwords: keychain (macOS) / private file | no |
+| `src/oauth.rs` | Gmail sign-in: the browser flow, and XOAUTH2's tokens | no |
 | `src/launcher.rs` | the launcher's search over panels + mail world | no |
 | `src/problems.rs` | standing problems, derived from the rows that carry them | no |
 | `src/spring.rs` | niri's closed-form spring (via mosaic) | no |

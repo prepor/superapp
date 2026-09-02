@@ -110,14 +110,77 @@ pub struct Outgoing {
     pub references: Vec<String>,
 }
 
-/// How to reach a server. `Debug` redacts the password so a stray `{:?}`
+/// How a session proves who it is. Two mechanisms, and the account row's
+/// `auth` column is what picks between them.
+#[derive(Clone, PartialEq)]
+pub enum Auth {
+    /// An app password: IMAP `LOGIN`, SMTP `AUTH PLAIN`.
+    Password(String),
+    /// An OAuth 2 access token: SASL `XOAUTH2` on both (see
+    /// [`crate::oauth`]). Short-lived — the caller fetches a fresh one per
+    /// connect rather than holding it.
+    Bearer(String),
+}
+
+impl Auth {
+    /// The secret itself, for the one backend that must compare it.
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        match self {
+            Auth::Password(s) | Auth::Bearer(s) => s,
+        }
+    }
+}
+
+/// `Debug` names the mechanism and redacts the secret, so a stray `{:?}`
+/// anywhere — a test failure, a log line — cannot leak one.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Auth::Password(_) => "password …",
+            Auth::Bearer(_) => "bearer …",
+        })
+    }
+}
+
+/// How to reach a server. `Debug` redacts the secret so a stray `{:?}`
 /// cannot leak one, and no [`Effect::describe`] ever prints it — `describe`
 /// is what lands in the table.
 #[derive(Clone)]
 pub struct Creds {
     pub host: String,
     pub user: String,
-    pub pass: String,
+    pub auth: Auth,
+}
+
+impl Creds {
+    /// Credentials that log in with an app password.
+    #[must_use]
+    pub fn password(
+        host: impl Into<String>,
+        user: impl Into<String>,
+        pass: impl Into<String>,
+    ) -> Creds {
+        Creds {
+            host: host.into(),
+            user: user.into(),
+            auth: Auth::Password(pass.into()),
+        }
+    }
+
+    /// Credentials that authenticate with an OAuth access token.
+    #[must_use]
+    pub fn bearer(
+        host: impl Into<String>,
+        user: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Creds {
+        Creds {
+            host: host.into(),
+            user: user.into(),
+            auth: Auth::Bearer(token.into()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Creds {
@@ -125,7 +188,7 @@ impl std::fmt::Debug for Creds {
         f.debug_struct("Creds")
             .field("host", &self.host)
             .field("user", &self.user)
-            .field("pass", &"…")
+            .field("auth", &self.auth)
             .finish()
     }
 }
@@ -164,6 +227,14 @@ pub trait Outside {
 
     fn secret_get(&mut self, email: &str) -> Option<String>;
     fn secret_set(&mut self, email: &str, pass: &str) -> bool;
+    /// A usable OAuth access token for this address, refreshed against the
+    /// provider if the cached one has expired.
+    ///
+    /// One verb rather than "read the refresh token, then POST": the token
+    /// endpoint is a network round trip that must be fakeable, and the
+    /// cache that keeps it from happening per connect belongs to the
+    /// backend that owns the process, not to the caller.
+    fn access_token(&mut self, email: &str) -> Result<String, String>;
     fn clip(&mut self, text: &str) -> Result<(), String>;
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     fn shot(&mut self, path: &Path) -> Result<(), String>;
@@ -1179,6 +1250,9 @@ impl Outside for Deny {
     fn secret_set(&mut self, _e: &str, _p: &str) -> bool {
         false
     }
+    fn access_token(&mut self, _e: &str) -> Result<String, String> {
+        Self::no("access_token")
+    }
     fn clip(&mut self, _t: &str) -> Result<(), String> {
         Self::no("clip")
     }
@@ -1296,6 +1370,10 @@ pub struct Fake {
     pub clock: f64,
     /// When set, every network verb fails with this — the offline test.
     pub down: Option<String>,
+    /// Addresses that have signed in with OAuth, and the token the provider
+    /// hands back. A fake sign-in is one map entry — no browser, no
+    /// loopback, no token endpoint.
+    pub grants: HashMap<String, String>,
 }
 
 impl Fake {
@@ -1307,6 +1385,19 @@ impl Fake {
     /// Plants a password, as the settings form would.
     pub fn keychain(&mut self, email: &str, pass: &str) {
         self.secrets.insert(email.into(), pass.into());
+    }
+
+    /// Plants an OAuth grant, as a completed sign-in would: the provider
+    /// will hand out `token`, and the server accepts exactly it.
+    pub fn grant(&mut self, email: &str, token: &str) {
+        self.grants.insert(email.into(), token.into());
+        self.secrets.insert(email.into(), token.into());
+    }
+
+    /// Revokes a grant, as a human clicking "remove access" at the provider
+    /// would: the refresh fails, and every session with it dies.
+    pub fn revoke(&mut self, email: &str) {
+        self.grants.remove(email);
     }
 
     fn live(&mut self, account: i64) -> Result<&mut FakeServer, String> {
@@ -1329,7 +1420,7 @@ impl Outside for Fake {
         if let Some(e) = &self.down {
             return Err(e.clone());
         }
-        if self.secrets.get(&c.user).map(String::as_str) != Some(c.pass.as_str()) {
+        if self.secrets.get(&c.user).map(String::as_str) != Some(c.auth.secret()) {
             return Err("authentication failed".into());
         }
         self.connected.insert(account);
@@ -1447,7 +1538,7 @@ impl Outside for Fake {
         if let Some(e) = &self.down {
             return Err(e.clone());
         }
-        if self.secrets.get(&c.user).map(String::as_str) != Some(c.pass.as_str()) {
+        if self.secrets.get(&c.user).map(String::as_str) != Some(c.auth.secret()) {
             return Err("authentication failed".into());
         }
         // The bytes the real transport would file to Sent, headers
@@ -1478,6 +1569,16 @@ impl Outside for Fake {
 
     fn secret_get(&mut self, email: &str) -> Option<String> {
         self.secrets.get(email).cloned()
+    }
+
+    fn access_token(&mut self, email: &str) -> Result<String, String> {
+        if let Some(e) = &self.down {
+            return Err(e.clone());
+        }
+        self.grants
+            .get(email)
+            .cloned()
+            .ok_or_else(|| format!("google: no grant for {email} (invalid_grant)"))
     }
 
     fn secret_set(&mut self, email: &str, pass: &str) -> bool {
@@ -1591,7 +1692,11 @@ impl Clock {
         }
     }
 
-    fn read(&self) -> f64 {
+    /// Unix seconds. Public because a thread that has no [`World`] — a
+    /// Gmail sign-in waiting on the browser — still needs the app's clock
+    /// rather than the wall's.
+    #[must_use]
+    pub fn read(&self) -> f64 {
         match self {
             Clock::System => std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1639,22 +1744,45 @@ fn headless_shot(path: &Path) -> Result<(), String> {
 
 
 /// The actual outside: one IMAP session per account (rustls, port 993,
-/// LOGIN with an app password — fastmail-style; OAuth is deliberately
-/// later), lettre over rustls for submission, and the platform for
-/// everything else.
+/// `LOGIN` with an app password — fastmail-style — or SASL `XOAUTH2` with a
+/// bearer token, which is how Gmail is reached), lettre over rustls for
+/// submission, and the platform for everything else.
 pub struct Real {
     sessions: HashMap<i64, imap_session::Imap>,
     secrets: Secrets,
     clock: Clock,
+    /// Where the store lives: the OAuth client registration sits beside it
+    /// (see [`crate::oauth::Client::load`]). `None` for an in-memory run,
+    /// which then has no Gmail either.
+    dir: Option<PathBuf>,
+    /// Access tokens by address, with the unix second each expires at.
+    /// Per-process and never written down: a token is worth an hour, and
+    /// the refresh that mints one is a network round trip no connect
+    /// should pay twice.
+    tokens: HashMap<String, (String, f64)>,
 }
+
+/// How early a cached access token is treated as spent, so a long sync
+/// started with 3 seconds left does not die halfway through.
+const TOKEN_MARGIN: f64 = 120.0;
 
 impl Real {
     #[must_use]
     pub fn new(secrets: Secrets, clock: Clock) -> Real {
+        // The keychain variant already knows where the store lives; an
+        // in-memory one has nowhere to read a client registration from —
+        // and neither does a keychain one with no store file, whose path is
+        // the empty default.
+        let dir = match &secrets {
+            Secrets::Keychain(d) if !d.as_os_str().is_empty() => Some(d.clone()),
+            _ => None,
+        };
         Real {
             sessions: HashMap::new(),
             secrets,
             clock,
+            dir,
+            tokens: HashMap::new(),
         }
     }
 
@@ -1671,7 +1799,7 @@ impl Outside for Real {
     }
 
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
-        let s = imap_session::connect(&c.host, &c.user, &c.pass)?;
+        let s = imap_session::connect(&c.host, &c.user, &c.auth)?;
         self.sessions.insert(account, s);
         Ok(())
     }
@@ -1713,15 +1841,24 @@ impl Outside for Real {
     }
 
     fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
-        use lettre::transport::smtp::authentication::Credentials;
+        use lettre::transport::smtp::authentication::{Credentials, Mechanism};
         use lettre::{SmtpTransport, Transport};
         let s = |e: &dyn std::fmt::Display| format!("{e}");
         let msg = rfc822(&c.user, m)?;
         let raw = msg.formatted();
-        let t = SmtpTransport::relay(&c.host)
+        let mut relay = SmtpTransport::relay(&c.host)
             .map_err(|e| s(&e))?
-            .credentials(Credentials::new(c.user.clone(), c.pass.clone()))
-            .build();
+            .credentials(Credentials::new(
+                c.user.clone(),
+                c.auth.secret().to_string(),
+            ));
+        // A bearer token is not a password: offered PLAIN, Gmail's SMTP
+        // rejects it. Pin the mechanism rather than letting lettre pick by
+        // what the server advertises.
+        if matches!(c.auth, Auth::Bearer(_)) {
+            relay = relay.authentication(vec![Mechanism::Xoauth2]);
+        }
+        let t = relay.build();
         t.send(&msg).map_err(|e| s(&e))?;
         Ok(raw)
     }
@@ -1742,6 +1879,27 @@ impl Outside for Real {
                 .map(|mut g| g.insert(email.to_string(), pass.to_string()))
                 .is_ok(),
         }
+    }
+
+    fn access_token(&mut self, email: &str) -> Result<String, String> {
+        let now = self.clock.read();
+        if let Some((tok, until)) = self.tokens.get(email) {
+            if now + TOKEN_MARGIN < *until {
+                return Ok(tok.clone());
+            }
+        }
+        let dir = self
+            .dir
+            .clone()
+            .ok_or("this run has no store directory, so no google client")?;
+        let client = crate::oauth::Client::load(&dir)?;
+        let refresh = self
+            .secret_get(&crate::oauth::refresh_key(email))
+            .ok_or_else(|| format!("{email} has no google grant — sign in again"))?;
+        let (tok, until) = crate::oauth::refresh(&client, crate::oauth::GOOGLE, &refresh, now)?;
+        self.tokens
+            .insert(email.to_string(), (tok.clone(), until));
+        Ok(tok)
     }
 
     fn clip(&mut self, text: &str) -> Result<(), String> {
@@ -1798,7 +1956,7 @@ impl Outside for Real {
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod imap_session {
-    use super::{FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet};
+    use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet};
     use std::collections::HashSet;
 
     type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
@@ -1833,9 +1991,35 @@ mod imap_session {
         })
     }
 
-    pub fn connect(host: &str, user: &str, pass: &str) -> Result<Imap, String> {
+    /// The SASL exchange for `AUTHENTICATE XOAUTH2`. The server sends no
+    /// challenge worth reading, and the crate base64s what `process`
+    /// returns — so this is the envelope in the clear, once.
+    struct XOAuth2 {
+        user: String,
+        token: String,
+    }
+
+    impl imap::Authenticator for XOAuth2 {
+        type Response = String;
+        fn process(&self, _challenge: &[u8]) -> String {
+            crate::oauth::xoauth2(&self.user, &self.token)
+        }
+    }
+
+    pub fn connect(host: &str, user: &str, auth: &Auth) -> Result<Imap, String> {
         let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
-        let session = client.login(user, pass).map_err(|e| s(e.0))?;
+        let session = match auth {
+            Auth::Password(pass) => client.login(user, pass).map_err(|e| s(e.0))?,
+            Auth::Bearer(token) => client
+                .authenticate(
+                    "XOAUTH2",
+                    &XOAuth2 {
+                        user: user.to_string(),
+                        token: token.clone(),
+                    },
+                )
+                .map_err(|e| s(e.0))?,
+        };
         Ok(Imap {
             session,
             selected: None,
@@ -2229,7 +2413,7 @@ mod tests {
     /// via a stray `{:?}` on the credentials.
     #[test]
     fn secrets_never_reach_the_record() {
-        let c = Creds { host: "h".into(), user: "u".into(), pass: "s3cret".into() };
+        let c = Creds::password("h", "u", "s3cret");
         assert!(!format!("{c:?}").contains("s3cret"), "{c:?}");
     }
 
