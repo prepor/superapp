@@ -1227,9 +1227,9 @@ script_mod! {
     // ---- marks (CR-009) ----------------------------------------------------
 
     /** A bordered side-effect button that wears its key: the label split
-        the way `SLink` splits it, so one character draws bold. Presentation
-        for now — the bar's clicks will resolve through the shell's hit
-        table like every other in-list control. */
+        the way `SLink` splits it, so one character draws bold. Its clicks
+        resolve through the shell's hit table like every other in-list
+        control. */
     mod.widgets.KeyBtn = set_type_default() do #(KeyBtn::register_widget(vm)) {
         ..mod.widgets.View
         width: Fit, height: Fit
@@ -1292,8 +1292,21 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
-        padding: Inset{left: 8, right: 8, top: 4, bottom: 6}
+        padding: Inset{left: 8, right: 8, top: 0, bottom: 0}
         spacing: 6
+        // The rule the header wears, on the other side: the bar is the
+        // panel's foot, and the rows end at it.
+        foot_rule := View {
+            width: Fill, height: 1
+            margin: Inset{bottom: 6}
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
         line := View {
             width: Fill, height: Fit
             flow: Right
@@ -1309,7 +1322,6 @@ script_mod! {
         }
         verbs_below := mod.widgets.MarkVerbs { visible: false }
     }
-
     /** The inbox: the filter over the header over the virtualized list —
         a rich table (CR-006) over `mail::INBOX`. */
     mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
@@ -1335,8 +1347,6 @@ script_mod! {
             margin: Inset{left: 8, top: 4}
             text: "", draw_text +: { color: #a01500 }
         }
-        // The marks bar (CR-009): up while any row is marked, gone otherwise.
-        bar := mod.widgets.MarkBar { visible: false }
         View { width: Fill, height: 6 }
         // Header cells for the columns only — the subject rides each row's
         // extra line, owns no column, and so gets no header. The header
@@ -1383,6 +1393,11 @@ script_mod! {
                 }
             }
         }
+        // The marks bar (CR-009), at the foot: it comes with the first mark
+        // and goes with the last, and standing under the list it takes its
+        // height off the rows' own scroll rather than pushing them down —
+        // nothing being read moves when a mark lands.
+        bar := mod.widgets.MarkBar { visible: false }
         // The autocomplete, drawn last and over the rows (see `SuggestBox`).
         suggest: mod.widgets.SuggestBox {}
     }
@@ -3968,7 +3983,7 @@ impl InboxPanelRef {
         self.borrow().map_or_else(Vec::new, |p| p.marks.keys())
     }
 
-    /// Toggles one thread's mark — the gutter's click, a long press, a tap
+    /// Toggles one thread's mark — a long press, or a tap
     /// while marks exist.
     pub fn toggle_mark(&self, cx: &mut Cx, thread: i64) {
         if let Some(mut p) = self.borrow_mut() {
@@ -3977,22 +3992,6 @@ impl InboxPanelRef {
         }
     }
 
-    /// Marks the rows from the cursor's to `thread`'s, both included —
-    /// shift+click. Without a cursor, or with the thread outside the
-    /// table, just the one.
-    pub fn mark_range(&self, cx: &mut Cx, store: &Store, thread: i64) {
-        let Some(mut p) = self.borrow_mut() else { return };
-        let p = &mut *p;
-        let (Some(a), Some(b)) = (p.cursor_index(store), p.index_of_thread(store, thread)) else {
-            p.marks.add(thread);
-            p.redraw(cx);
-            return;
-        };
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let keys: Vec<i64> = p.table.rows(store, lo, hi + 1).iter().map(|t| t.thread).collect();
-        p.marks.extend(keys);
-        p.redraw(cx);
-    }
 
     /// Marks every thread under the filter — `all`, honest about the rows
     /// off screen. A source that cannot list leaves the set as it is.

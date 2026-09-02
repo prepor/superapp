@@ -235,9 +235,9 @@ Per panel, below the reserved set:
   and **previewing** each one beside it). `space` **marks** the cursor's row
   — it arrives as text the way `/` does, so in a live filter it is a space —
   `shift+↓` / `shift+↑` mark a range as they walk, and `esc` clears the
-  marks when no field is listening. A click in a row's left 12 pt gutter
-  toggles its mark, `shift+click` marks from the cursor's row to the clicked
-  one, and the row's body still previews. In a message panel the arrows
+  marks when no field is listening; the bar down a marked row's left edge is
+  an indicator, and nothing on the pointer marks — a click is the preview it
+  always was. In a message panel the arrows
   scroll; its rows open and close by pointer only. In the filter, `@` opens the tag
   autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
   [The Rich Table](./richtable.md) for the grammar

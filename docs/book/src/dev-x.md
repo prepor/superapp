@@ -221,7 +221,7 @@ walks the rich table (tags, the autocomplete and its dynamic values, the
 grammar, the error line, and a keyboard walk onto the second page), and
 `e2e/compose.txt` the compose panel's TO field completing addresses (a
 pick by enter, a pick by click, esc putting the offer away, tab walking on),
-`e2e/marks.txt` the marks (space, a shift+arrow range, `all`, the gutter, a
+`e2e/marks.txt` the marks (space, a shift+arrow range, `all`, a
 mark the filter hides, cmd+a still select-all in a live field, and a batch
 archive undone back to marked), and `e2e/problems.txt` (with `--send-delay 1
 --draws 100000` — it waits out the executor's backoff in virtual time) the
@@ -272,8 +272,8 @@ than as a plain substring: a whole-label match first, then one that
 *starts* with what was asked, then one that merely contains it — the
 tightest label winning inside a rung, and the last registered on a full
 tie, so a control drawn over another takes the click exactly as it would
-from a pointer. That is what lets a row and the gutter over it coexist:
-`click "Q3 infra"` is the row, `click "mark Q3 infra"` its mark (CR-009).
+from a pointer — `click "archive"` is the message panel's own button, not
+the marks bar's `archive marked` beside it (CR-009).
 Steps that mutate the workspace need a
 `wait` after them — hits refresh on the next drawn frame. `e2e/basic.txt`
 walks the whole join/replace grammar; the first frame also logs panel count

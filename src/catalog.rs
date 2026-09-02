@@ -577,7 +577,7 @@ fn inbox_row() -> Scene<Setup> {
         .about("the phone's width")
         .edge("read", "unread", "a reply arrives")
         .edge("read", "selected", "↓ / click")
-        .edge("read", "marked", "space / click the gutter")
+        .edge("read", "marked", "space")
         .edge("selected", "marked, cursor", "space")
 }
 

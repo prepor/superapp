@@ -34,12 +34,16 @@ shot m3-all
 key esc
 wait 400
 
-# The gutter: a click on a row's left edge toggles its mark.
-click "mark Q3 infra"
-wait 300
-click "mark [stelaxis] CI"
+# Two marks by the keys, on rows the filter below will not both keep.
+click "Q3 infra"
 wait 400
-shot m4-gutter
+type " "
+wait 300
+key down
+wait 400
+type " "
+wait 400
+shot m4-two-marks
 
 # A filter that hides a marked thread does not drop it: the bar counts it,
 # and it rides above the rows under its own caption.

@@ -625,7 +625,8 @@ enum WidgetOp {
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
     /// Toggle a thread's mark (CR-009). Touch only: a long press raises it,
-    /// and a tap while any mark stands.
+    /// and a tap while any mark stands. The bar in the row's inset is an
+    /// indicator, not a control.
     Mark(i64),
     /// A button of the marks bar.
     MarkVerb(ui::MarkVerb),
@@ -647,9 +648,9 @@ struct HitR {
 /// that says least beyond what was asked. `None` where the label does not
 /// match at all.
 ///
-/// The last two terms are what keep a row's gutter — labelled `mark
-/// <topic>` (CR-009) and registered over the row so a pointer finds it —
-/// from shadowing the row whose label it carries whole.
+/// The last two terms are what keep a control drawn over another — the
+/// marks bar's `archive marked` beside a message panel's own `archive`
+/// (CR-009) — from shadowing the label it carries whole.
 fn label_rank(h: &HitR, label: &str, needle: &str) -> Option<(u8, u8, usize)> {
     let rung = if h.label.eq_ignore_ascii_case(label) {
         0
@@ -2173,10 +2174,6 @@ pub struct Stage {
     /// this changes.
     #[rust]
     menu_sig: (Vec<(usize, bool)>, Vec<String>),
-    /// Shift held on the click being resolved (CR-009): a gutter click
-    /// then marks the range from the cursor's row.
-    #[rust]
-    click_shift: bool,
     /// The double-cmd launcher trigger.
     #[rust]
     cmd_tap: CmdTap,
@@ -6285,9 +6282,7 @@ impl Widget for Stage {
                         }
                         a => a,
                     };
-                    self.click_shift = e.modifiers.shift;
                     self.resolve_click(cx, act, fresh);
-                    self.click_shift = false;
                 }
             }
 
@@ -7742,17 +7737,6 @@ impl Stage {
                                     t.topic.clone(),
                                     r,
                                     Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id: t.target })),
-                                ));
-                                // The gutter (CR-009): the row's left edge
-                                // toggles its mark. Registered after the
-                                // row, so it wins the overlap.
-                                reg.push((
-                                    format!("mark {}", t.topic),
-                                    Rect {
-                                        pos: r.pos,
-                                        size: dvec2(ui::MARK_GUTTER, r.size.y),
-                                    },
-                                    Act::WidgetOp(pid, WidgetOp::Mark(t.thread)),
                                 ));
                             }
                         }

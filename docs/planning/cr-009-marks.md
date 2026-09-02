@@ -86,7 +86,8 @@ two more twins of the row's line rather than a flag (a quad's colour is not
 settable at draw time — `OverlayRow`'s reason).
 
 There is no checkbox and no gutter column: nothing appears on a row until
-it is marked, and nothing shifts when the first one is.
+it is marked, and nothing shifts when the first one is — nor when the bar
+arrives, which is why it stands at the foot.
 
 ### Keys and pointer
 
@@ -97,10 +98,12 @@ it is marked, and nothing shifts when the first one is.
   arrows the walk already uses. Cmd+arrows stay the workspace's.
 - **esc** clears the marks, when no field is listening (it is *leave the
   field* first, as everywhere).
-- **click the row's gutter** — its left 12 pt, the mark's own place — to
-  toggle it; the row's body still previews. **shift+click** marks the range
-  from the cursor's row to the clicked one. The gutter is one more hit in
-  the shell's table, labelled `mark <topic>` for the harness.
+- **the pointer does not mark.** The bar in the row's inset is an
+  indicator, not a control: a click on a row is the preview it always was.
+  Marking belongs to the keys and to the bar — a mouse reaches `all` and
+  `clear` there, and the cursor's row with `space` (Andrey, on review: a
+  gutter that both shows and toggles asks the row's left edge to mean two
+  things).
 - **touch**: a long press on a row marks it (a header's long press drags a
   panel; a row's is free); while any mark exists a tap toggles rather than
   opens, and the last mark cleared gives the tap back. The bar's controls
@@ -108,7 +111,12 @@ it is marked, and nothing shifts when the first one is.
 
 ### The marks bar
 
-Between the filter and the header row, while the set is not empty:
+At the panel's **foot**, while the set is not empty — under the list, not
+above it. A bar between the filter and the header would push every row down
+as the first mark lands, and the rows are what is being read (Andrey, on
+review); standing under the list it takes its height off the rows' own
+scroll instead, so nothing moves. It wears the header's rule on its other
+side, so the rows end at it:
 
 ```
 3 of 143 marked    archive  delete  all  clear
@@ -149,8 +157,8 @@ MARKED · HIDDEN BY THE FILTER
 
 The caption in the section register, the rows the same `InboxRow` with
 their bars, a strong rule closing the group. They can be unmarked from
-their gutter and opened by a click like any row; the arrows do not visit
-them — they stand outside the table's order, and the walk is the table's.
+`space` and opened by a click like any row; the arrows do not visit them
+— they stand outside the table's order, and the walk is the table's.
 
 ## The batch verbs
 
@@ -253,6 +261,6 @@ and every trace of it.
 - **Verbs beyond archive and delete.** A batch *read* / *unread* is a
   natural third and waits for the row's own.
 - **Other tables.** The inbox is the only list panel today. `Marks<K>` and
-  the datasource's three questions are generic; the bar and the gutter are
+  the datasource's three questions are generic; the bar and the mark are
   the inbox's until a second list wants them, when they lift like the
   filter field did.

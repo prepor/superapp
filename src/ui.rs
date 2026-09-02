@@ -224,10 +224,6 @@ pub const MARK_VERBS: &[MarkVerb] = &[
     MarkVerb::Clear,
 ];
 
-/// The row's left edge that toggles its mark, in points — the mark's own
-/// place, wider than the bar it draws.
-pub const MARK_GUTTER: f64 = 12.0;
-
 impl MarkVerb {
     /// The button's text.
     #[must_use]
