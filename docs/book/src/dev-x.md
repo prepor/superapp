@@ -79,7 +79,9 @@ mise exec -- mdbook serve docs/book
 ```
 
 The book is the single source of truth (see [About](./about.md)). Feature work
-starts as a Change Request under `docs/planning/`.
+starts as a Change Request under `docs/planning/` and ends with that CR
+deleted, its content folded into the chapters — the directory holds only what
+is in flight.
 
 ## E2E harness
 
@@ -106,12 +108,10 @@ Runs go through makepad's **headless backend** (`MAKEPAD=headless`), a
 software rasterizer with a virtual GPU and a shader JIT. There is no window,
 no window server and no display: makepad renders the frames itself and
 writes them to `MAKEPAD_HEADLESS_OUT_DIR`, and a `shot` step names the
-newest one. That retires a pile of environmental failure modes — a slept
-display no longer breaks captures, a lock screen no longer blackens them,
-and `caffeinate -du` is no longer needed. It also retired mosaic's patch
-0003 (`MAKEPAD_PRESENT_WHEN_OCCLUDED`), which existed so a deliberately
-backgrounded window could still be photographed: a headless run has no
-window to occlude.
+newest one. A whole class of environmental failure cannot arise: a slept
+display, a lock screen, a window occluded by another — none of them touch a
+run that has no window at all, and `caffeinate -du` has nothing to keep
+awake.
 
 **Time is virtual.** Under a headless build one draw cycle is one frame of
 exactly `FRAME_MS`, and that single clock drives the springs, the script's
@@ -161,10 +161,9 @@ verify the android interactions on the desktop, `e2e/workspaces.txt` walks
 the workspace grammar (switch, move-and-follow, overlay),
 `e2e/launcher.txt` walks the launcher (double-cmd, open vs go-to, the
 overlay's search row), `e2e/undo.txt` walks the undo tree (archive → undo →
-redo, close, workspace-move). The tree itself is in memory since CR-004, so
-`sqlite3` shows what the actions *wrote* — folders, flags, the effect queue
-— rather than the history; the tree is the running process's, and dies with
-it. And
+redo, close, workspace-move). The tree itself is in memory, so `sqlite3`
+shows what the actions *wrote* — folders, flags, the effect queue — rather
+than the history; the tree is the running process's, and dies with it. And
 `e2e/settings.txt` walks the accounts flow (add against an `.invalid` host
 — the worker fails fast and locally, and its error lands on the status
 line through the real signal path — then remove), `e2e/send.txt` walks the

@@ -33,21 +33,11 @@ current state; everything else in this book is settled.
    nothing records focus history yet. Whether the launcher (and alt-tab-like
    switching generally) wants an MRU model is open until real use hurts.
 
-10. **The semantic component library** now lives in `src/panels.rs` as
-    retained widgets (`SLabel`, `SField`, `SBtn`, `SLink`, `SKbd`, `SText`,
-    `SBold`, and the panel and overlay trees composed from them) — CR-002
-    finished the move off the char grid, so click-to-caret, selection, the
-    IME and a real layout pass come from makepad rather than from us. What
-    is open is where it grows next: denser tables, and whatever the text
-    editor panel turns out to need. Grown by need, stelaxis-style: name the
-    meaning, never the pixels. `src/ui.rs` keeps only what was never about
-    characters — the accelerator rules and the chrome's `Style`/`BtnAct`.
-
-Settled since the last revision: workspaces — nine numbered, vertical slide,
-menu bar on macOS, two-finger-swipe-down overlay on touch (see [Panel
-Model](./panel-model.md) and [Interaction
-Grammar](./interaction-grammar.md)); makepad is now plain upstream at
-mosaic's pin (see [Tech Stack](./tech-stack.md) for the one e2e trade-off);
-the launcher — double-cmd, one query over open panels + the mail world,
-go-to vs open decided per hit, no fresh-copy variant, the search row as its
-touch entry (see [Interaction Grammar](./interaction-grammar.md)).
+10. **The semantic component library** lives in `src/panels.rs` as retained
+    widgets (`SLabel`, `SField`, `SBtn`, `SLink`, `SKbd`, `SText`, `SBold`,
+    and the panel and overlay trees composed from them), so click-to-caret,
+    selection, the IME and a real layout pass come from makepad rather than
+    from us. What is open is where it grows next: denser tables, and
+    whatever the text editor panel turns out to need. Grown by need,
+    stelaxis-style: name the meaning, never the pixels. `src/ui.rs` keeps
+    the rest — the accelerator rules and the chrome's `Style`/`BtnAct`.

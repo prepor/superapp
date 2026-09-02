@@ -12,10 +12,8 @@ directly:
 - **`MAKEPAD=headless`** swaps makepad's whole apple backend for a software
   rasterizer — a virtual GPU and a shader JIT — that renders frames to PNG
   itself. That is what the e2e suite runs on: no window, no window server,
-  no display, so a run works over ssh and under load. It also retired the
-  third patch this pin used to carry (`MAKEPAD_PRESENT_WHEN_OCCLUDED`,
-  mosaic's 0003), which only existed to make an occluded window
-  photographable. See [Developer Experience](./dev-x.md).
+  no display, so a run works over ssh and under load. See [Developer
+  Experience](./dev-x.md).
 - `makepad-apple-sys` / `makepad-objc-sys` for the few macOS calls makepad
   does not expose (screen geometry, activation, window screenshots).
 - **`rusqlite` with bundled SQLite** — the one store (see [The Data
@@ -23,11 +21,11 @@ directly:
   the full hook surface — `update_hook` drives query invalidation, the
   authorizer captures each query's dependencies — on macOS and android
   alike, the same choice rel.systems' research validated. The **session
-  extension is no longer used**: CR-004 moved history into memory, so
-  undo is typed values rather than invertible changesets, and the
-  `buildtime_bindgen` that `session` forced on the android cross-build
-  goes with it. SQLite's **JSON1** functions carry the effect queue's
-  payloads (TEXT, not JSONB — a shell must be able to read them).
+  extension is not used**: undo is typed values in memory rather than
+  invertible changesets, so the build needs no `buildtime_bindgen` and the
+  android cross-build is the simpler for it. SQLite's **JSON1** functions
+  carry the effect queue's payloads (TEXT, not JSONB — a shell must be
+  able to read them).
 - **`serde` + `serde_json`** — effects are serializable values, and the
   deferred ones are JSON payloads in the `effect` table.
 - **`imap` (rustls) + `mail-parser`** — the sync engine's protocol and

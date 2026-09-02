@@ -22,5 +22,12 @@ is a bug.
 
 Changes to Superapp — new panel kinds, behavior changes, anything user-visible —
 are proposed as **Change Requests to the book**: a markdown document under
-`docs/planning/<feature-name>/book.md` describing how the book should read once
-the change is done, pushed at the *start* of the work and shrinking as it lands.
+`docs/planning/cr-<nnn>-<name>.md` describing how the book should read once the
+change is done, pushed at the *start* of the work and shrinking as it lands.
+
+A CR is scaffolding, not a record. When the work lands, everything of it that
+still matters is *in the book* — so the CR is **deleted** in the same change,
+and `docs/planning/` holds only what is in flight. Git keeps the reasoning for
+anyone who wants it; the book keeps the decision, and does not name the CR
+that carried it. A chapter that says *when* something changed, or what it
+replaced, has stopped describing the current state.
