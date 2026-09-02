@@ -4,8 +4,8 @@ Every list panel is the same engine over a different **datasource**: the
 inbox today, feeds and calendar events when they arrive. The engine
 (`src/richtable.rs`, std-only) owns a **filter** and a **paging window**
 and holds no rows; the panel widget draws what the engine hands it. The
-design is CR-006 (`docs/planning/`), a port of stelaxis's rich table with
-the paging rebuilt for an in-process store.
+design is CR-006, a port of stelaxis's rich table with the paging rebuilt
+for an in-process store.
 
 ## Datasources
 

@@ -79,7 +79,9 @@ mise exec -- mdbook serve docs/book
 ```
 
 The book is the single source of truth (see [About](./about.md)). Feature work
-starts as a Change Request under `docs/planning/`.
+starts as a Change Request under `docs/planning/` and ends with that CR
+deleted, its content folded into the chapters — the directory holds only what
+is in flight.
 
 ## E2E harness
 

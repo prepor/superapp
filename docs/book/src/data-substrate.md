@@ -4,9 +4,8 @@ One SQLite file holds **all** durable data — the mail *and* the UI: which
 panels are open, where, joined to what, focused on which workspace. `sqlite3
 "~/Library/Application Support/superapp/superapp.db"` shows your session as
 rows; that inspectability is a feature, not a debugging aid. The design is
-CR-001 and CR-004 (`docs/planning/`), rel.systems' idioms brought
-in-process: single writer, WAL, hook-driven change capture, and side effects
-as rows.
+CR-001 and CR-004, rel.systems' idioms brought in-process: single writer,
+WAL, hook-driven change capture, and side effects as rows.
 
 ## Three write paths
 
