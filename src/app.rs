@@ -1755,15 +1755,19 @@ impl State {
         let url = Self::resolve_bucket(db_path)?;
         // `https://` is a real R2 bucket (signed, over TLS); anything else is
         // the plain `bucketd` demo daemon. A bucket that cannot be opened at
-        // all — no credentials — is refused loudly and the app runs local:
-        // silently pretending to sync is the one outcome worth avoiding.
-        let bucket = match crate::r2::open(&url, db_path.and_then(std::path::Path::parent)) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("superapp: device sync is off — {e}");
-                return None;
-            }
-        };
+        // all — no credentials, a malformed endpoint — still gets a worker,
+        // over a bucket that answers every verb with the reason. Returning
+        // `None` here would leave a device that had *already joined a
+        // lineage* with no worker and no locked screen, and the store opens
+        // writable: a follower would come back as a writer outside the
+        // lease. This way the ordinary path holds — the role falls to
+        // `Offline`, the gate stays shut, and the reason is on the screen
+        // instead of only in the console.
+        let bucket = crate::r2::open(&url, db_path.and_then(std::path::Path::parent))
+            .unwrap_or_else(|e| {
+                eprintln!("superapp: device sync cannot start — {e}");
+                std::sync::Arc::new(crate::r2::Broken(e))
+            });
         // Headless: inline passes driven by the frame loop's virtual clock, so
         // a scripted run is deterministic. Production: a background thread.
         #[cfg(headless)]
@@ -1845,10 +1849,18 @@ impl State {
             if key_id.is_empty() {
                 return Err("a secret needs the key id it belongs to".into());
             }
+            // The secret goes first, because the check below has to be able
+            // to find it — and a key in the keychain that nothing points at
+            // is inert, which is not true of a written-down endpoint.
             self.world
                 .run(&crate::effect::BucketSecret { key_id, secret })
                 .map_err(|e| format!("storing the bucket secret failed: {e}"))?;
         }
+        // Check *before* anything is written down: a typo that reaches the
+        // `bucket` file is what the next launch will read, and the launch
+        // after that.
+        crate::r2::check(url, Some(&dir), key_id)?;
+
         self.world
             .run(&crate::effect::WriteFile {
                 path: &crate::r2::config_path(&dir),
@@ -1856,16 +1868,19 @@ impl State {
             })
             .map_err(|e| format!("writing the bucket file failed: {e}"))?;
 
-        // Open it before restarting anything: a missing secret should be a
-        // sentence on screen, not a worker that quietly never starts.
-        crate::r2::open(url, Some(&dir))?;
-
         // Hand the lease back before the old worker goes — the bucket it
-        // holds it in may not be the one we are moving to.
-        if let Some(ReplMode::Threads(w)) = &self.repl {
+        // holds it in may not be the one we are moving to — and then *wait*
+        // for it. A dropped handle leaves a thread that is still a device.
+        if let Some(ReplMode::Threads(w)) = self.repl.take() {
             w.release_blocking();
+            w.stop();
         }
         self.repl = None;
+        // Shut the gate for the crossing. Until the first pass answers, this
+        // device does not know whether the lineage it is joining already has
+        // a writer, and an edit made in that window is one the install is
+        // about to discard.
+        self.store.set_writable(false);
         self.repl_status = crate::repl::Status {
             role: crate::repl::Role::Detached,
             epoch: 0,

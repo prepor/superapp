@@ -87,16 +87,37 @@ fn real_bucket(url: &str) -> Result<(), String> {
     let bucket = R2::new(&prefixed, superapp::r2::creds(None)?)?;
     println!("bucket (real, signed, over TLS): {}", bucket.endpoint());
 
-    contract(&bucket)?;
-    walk(&bucket);
+    // Whatever happens in there — a refusal, a failed assertion — the objects
+    // this run made in someone's real bucket are this run's to remove. The
+    // walk asserts by panicking, so catching one is the only way to get the
+    // cleanup a chance to run.
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        contract(&bucket)?;
+        walk(&bucket);
+        Ok::<(), String>(())
+    }));
 
     step("cleaning up: the lineage this run made");
+    let swept = sweep(&bucket);
+    match &swept {
+        Ok(n) => println!("removed {n} objects under sync-demo/{stamp}/"),
+        Err(e) => eprintln!("could not clean up sync-demo/{stamp}/: {e}"),
+    }
+
+    match ran {
+        Ok(Ok(())) => swept.map(|_| ()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("the walk did not finish — see the panic above".into()),
+    }
+}
+
+/// Removes every object under this run's prefix; answers how many.
+fn sweep(bucket: &R2) -> Result<usize, String> {
     let keys = bucket.list("")?;
     for key in &keys {
         bucket.delete(key)?;
     }
-    println!("removed {} objects under sync-demo/{stamp}/", keys.len());
-    Ok(())
+    Ok(keys.len())
 }
 
 /// The three verbs the lease rests on, against whatever bucket we were given

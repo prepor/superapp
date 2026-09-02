@@ -154,6 +154,38 @@ pub fn config_bytes(url: &str, key_id: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Whether this configuration would open — the URL parses, and a secret for
+/// `key_id` can be found. Nothing is written and nothing is contacted: it is
+/// the check a form runs *before* persisting what the user typed, so a typo
+/// never becomes the thing the next launch reads.
+///
+/// # Errors
+///
+/// With the same sentence [`open`] would fail with.
+pub fn check(url: &str, dir: Option<&Path>, key_id: &str) -> Result<(), String> {
+    if !url.trim().starts_with("https://") {
+        return Ok(()); // the local daemon: no credentials to find
+    }
+    let secret = env(ENV_SECRET)
+        .or_else(|| from_file(dir).get(2).cloned())
+        .or_else(|| crate::secret::bucket_secret(dir, key_id))
+        .ok_or_else(|| {
+            format!(
+                "no secret for {key_id} — type it in, run `superapp --r2-login`, \
+                 or set {ENV_SECRET}"
+            )
+        })?;
+    R2::new(
+        url,
+        Creds {
+            key_id: key_id.to_string(),
+            secret,
+            region: env(ENV_REGION).unwrap_or_else(|| R2_REGION.to_string()),
+        },
+    )
+    .map(|_| ())
+}
+
 /// The bucket for a URL: `https://…` is R2 (signed, over TLS), anything else
 /// is the plain `bucketd` client. One door, so the app's start-up path does
 /// not branch on transports.
@@ -166,6 +198,35 @@ pub fn open(url: &str, dir: Option<&Path>) -> Result<Arc<dyn Object>, String> {
         Ok(Arc::new(R2::new(url, creds(dir)?)?))
     } else {
         Ok(Arc::new(object::HttpBucket::new(url)))
+    }
+}
+
+/// A bucket that refuses every verb with the same sentence — the reason its
+/// real counterpart could not be built.
+///
+/// A device configured for sync whose credentials have gone missing must not
+/// quietly become a *local* device: [`crate::store`] opens writable, so a
+/// follower that simply loses its worker would come back as a writer outside
+/// the lease, which is the one thing the whole design exists to prevent.
+/// Handing the worker this instead keeps the ordinary path — every pass
+/// fails, the role falls to `Offline`, a joined device stays locked, and the
+/// reason reaches the screen rather than only the console.
+pub struct Broken(pub String);
+
+impl Object for Broken {
+    fn get(&self, _key: &str) -> Result<Option<Blob>, String> {
+        Err(self.0.clone())
+    }
+    fn put_new(&self, _key: &str, _body: &[u8]) -> Result<PutNew, String> {
+        Err(self.0.clone())
+    }
+    fn cas(&self, _key: &str, _body: &[u8], _etag: &str) -> Result<Cas, String> {
+        Err(self.0.clone())
+    }
+    /// Nothing to poll for, but the role is re-derived each pass and the
+    /// worker is what keeps the gate shut: slowly, then.
+    fn poll_every(&self) -> Duration {
+        Duration::from_secs(30)
     }
 }
 
@@ -291,6 +352,41 @@ impl R2 {
             .map_err(|e| format!("bucket {}: {e}", self.host))
     }
 
+    /// One request, with the endpoint's "ask again" answers retried.
+    ///
+    /// R2 limits writes to the *same key* to roughly one a second, and the
+    /// lease lives in one key by design — a release right after a publish is
+    /// exactly the pattern that earns a `429`. S3 answers `409
+    /// ConditionalRequestConflict` for the same reason: two conditional
+    /// writes met, and the loser is meant to ask again rather than conclude
+    /// anything. Neither is an answer to the question we asked, and treating
+    /// them as one is how a lease stays held through a shutdown.
+    ///
+    /// Retrying is safe for every verb here because every write carries a
+    /// precondition: a retry either wins or comes back `412`, which is an
+    /// answer.
+    fn send_retrying(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<object::Reply, String> {
+        // Short, and bounded: `release` runs on the way out of the app, where
+        // a long wait is its own kind of failure.
+        const BACKOFF_MS: [u64; 3] = [200, 600, 1200];
+        let mut last = self.send(method, path, query, extra, body)?;
+        for wait in BACKOFF_MS {
+            if !matches!(last.0, 409 | 429 | 500 | 502 | 503 | 504) {
+                return Ok(last);
+            }
+            std::thread::sleep(Duration::from_millis(wait));
+            last = self.send(method, path, query, extra, body)?;
+        }
+        Ok(last)
+    }
+
     /// A TLS connection to the endpoint, verified against the Mozilla roots.
     fn connect(&self) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
         let sock = TcpStream::connect((self.host.as_str(), self.port))
@@ -336,7 +432,7 @@ impl R2 {
             }
             query.push_str(&format!("list-type=2&prefix={}", uri_encode(&full, true)));
             let path = uri_encode(&format!("/{}", self.bucket), false);
-            let (status, _, body) = self.send("GET", &path, &query, &[], &[])?;
+            let (status, _, body) = self.send_retrying("GET", &path, &query, &[], &[])?;
             if status != 200 {
                 return Err(self.refused("LIST", prefix, status, &body));
             }
@@ -362,7 +458,7 @@ impl R2 {
     ///
     /// If the endpoint refuses.
     pub fn delete(&self, key: &str) -> Result<(), String> {
-        let (status, _, body) = self.send("DELETE", &self.key_path(key), "", &[], &[])?;
+        let (status, _, body) = self.send_retrying("DELETE", &self.key_path(key), "", &[], &[])?;
         match status {
             200 | 204 | 404 => Ok(()),
             other => Err(self.refused("DELETE", key, other, &body)),
@@ -372,19 +468,26 @@ impl R2 {
 
 impl Object for R2 {
     fn get(&self, key: &str) -> Result<Option<Blob>, String> {
-        let (status, etag, body) = self.send("GET", &self.key_path(key), "", &[], &[])?;
+        let (status, etag, body) = self.send_retrying("GET", &self.key_path(key), "", &[], &[])?;
         match status {
             200 => Ok(Some(Blob {
                 bytes: body,
                 etag: etag.unwrap_or_default(),
             })),
+            // A missing *bucket* also answers 404, and it is not the same
+            // question: "no object yet" is what makes a device bootstrap a
+            // lineage, and a typo in the bucket name would send it around
+            // that loop forever, creating nothing each time.
+            404 if xml_tag(&body, "Code").as_deref() == Some("NoSuchBucket") => {
+                Err(self.refused("GET", key, status, &body))
+            }
             404 => Ok(None),
             other => Err(self.refused("GET", key, other, &body)),
         }
     }
 
     fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
-        let (status, etag, resp) = self.send(
+        let (status, etag, resp) = self.send_retrying(
             "PUT",
             &self.key_path(key),
             "",
@@ -393,9 +496,10 @@ impl Object for R2 {
         )?;
         match status {
             200 | 201 => Ok(PutNew::Created(etag.unwrap_or_default())),
-            // 412: it exists. 409: someone is writing it right now — which,
-            // for a create-only put, is the same answer to the same question.
-            412 | 409 => Ok(PutNew::Exists),
+            412 => Ok(PutNew::Exists),
+            // A 409 that outlived its retries is *not* "it exists": read as
+            // one, a snapshot upload would report success and `state` would
+            // come to point at an object nobody wrote.
             other => Err(self.refused("PUT", key, other, &resp)),
         }
     }
@@ -410,13 +514,19 @@ impl Object for R2 {
     }
 
     fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
-        let (status, new_etag, resp) =
-            self.send("PUT", &self.key_path(key), "", &[("if-match", etag)], body)?;
+        let (status, new_etag, resp) = self.send_retrying(
+            "PUT",
+            &self.key_path(key),
+            "",
+            &[("if-match", etag)],
+            body,
+        )?;
         match status {
             200 | 201 => Ok(Cas::Ok(new_etag.unwrap_or_default())),
-            // 412: the stored ETag moved. 409: it is moving as we ask. Either
-            // way we did not win this round, and the next pass re-reads.
-            412 | 409 => Ok(Cas::Mismatch),
+            // 412: the stored ETag moved — someone else advanced the log,
+            // and the next pass re-reads. A 409 that outlived its retries is
+            // a different thing (nobody won) and is said as one.
+            412 => Ok(Cas::Mismatch),
             other => Err(self.refused("CAS", key, other, &resp)),
         }
     }
@@ -798,6 +908,16 @@ mod tests {
             String::from_utf8(config_bytes("http://127.0.0.1:9000", "")).unwrap(),
             "http://127.0.0.1:9000\n"
         );
+    }
+
+    /// A broken bucket answers every verb with its reason — which is what
+    /// keeps a follower locked instead of quietly writable.
+    #[test]
+    fn a_broken_bucket_refuses_everything_with_its_reason() {
+        let b = Broken("no secret for AK".to_string());
+        assert_eq!(b.get("state").unwrap_err(), "no secret for AK");
+        assert_eq!(b.put_new("state", b"x").unwrap_err(), "no secret for AK");
+        assert_eq!(b.cas("state", b"x", "e").unwrap_err(), "no secret for AK");
     }
 
     /// An S3 refusal carries its reason in XML; the status line says it.

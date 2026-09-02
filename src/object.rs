@@ -386,7 +386,12 @@ pub fn parse_response(buf: &[u8]) -> Result<Reply, String> {
     let body = if chunked {
         dechunk(raw)?
     } else if let Some(n) = len {
-        raw.get(..n.min(raw.len())).unwrap_or(raw).to_vec()
+        // Short of what was promised is a *broken* response, not a small
+        // one. Returned as a body it would be a truncated snapshot or a
+        // half-read batch handed on as though it were whole.
+        raw.get(..n).ok_or_else(|| {
+            format!("bucket: body cut short — {} of {n} bytes", raw.len())
+        })?.to_vec()
     } else {
         raw.to_vec()
     };
@@ -674,6 +679,24 @@ mod tests {
         assert_ne!(batch_key(3, "dev-a", 11, 12), batch_key(4, "dev-a", 11, 12));
         assert_ne!(batch_key(3, "dev-a", 11, 12), batch_key(3, "dev-b", 11, 12));
         assert!(snap_key(0, 9, "abcd").starts_with("snap/0-9-abcd"));
+    }
+
+    /// A response that stops short of its `Content-Length` is refused, not
+    /// passed on as a shorter object.
+    #[test]
+    fn a_cut_short_body_is_an_error_not_a_small_one() {
+        let whole = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"e\"\r\n\r\nhello";
+        let (status, etag, body) = parse_response(whole).unwrap();
+        assert_eq!((status, etag.as_deref(), &body[..]), (200, Some("\"e\""), &b"hello"[..]));
+
+        let cut = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
+        assert!(parse_response(cut).unwrap_err().contains("cut short"));
+
+        // Chunked, whole and then truncated mid-chunk.
+        let ch = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert_eq!(parse_response(ch).unwrap().2, b"abcde");
+        let ch_cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabc";
+        assert!(parse_response(ch_cut).is_err());
     }
 
     #[test]
