@@ -19,6 +19,7 @@
 //! | [`object`] | the sync transport: object store (memory, HTTP) + `state` | no |
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
+//! | [`problems`] | standing problems, derived from the rows that carry them | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
 //! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
 //! | [`theme`] | the look: sizes and colours | no |
@@ -44,6 +45,7 @@ pub mod mac;
 pub mod mail;
 pub mod object;
 pub mod panels;
+pub mod problems;
 pub mod repl;
 pub mod richtable;
 pub mod scene;

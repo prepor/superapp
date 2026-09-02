@@ -152,6 +152,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::effect::World;
+    use crate::history::Intent;
 
     /// A world with one account, one draft and one queued send. No temp
     /// directory, no keychain, no PID — the fixture this replaces shared a
@@ -257,6 +258,136 @@ mod tests {
         assert_eq!(status, "failed");
         assert_eq!(error.as_deref(), Some("account has no smtp host"));
         assert!(w.with_fake(|f| f.server(1).submitted.is_empty()));
+    }
+
+    /// Exhausts the executor on a send that cannot work, so the row is
+    /// `failed` and the problems panel would offer retry and reopen.
+    fn give_up(w: &World) {
+        outbox_pass(w);
+        for _ in 0..8 {
+            w.with_fake(|f| f.clock += 3600.0);
+            w.run_effects();
+        }
+        outbox_pass(w);
+        assert_eq!(outbox(w).0, "failed");
+    }
+
+    /// A retry files the row again — and the job that failed last time
+    /// stands down, or the pass would fail the fresh filing on sight with
+    /// the old error.
+    #[test]
+    fn a_retry_is_not_failed_by_its_own_history() {
+        let w = world("");
+        w.with_fake(|f| f.clock = 200.0);
+        give_up(&w);
+
+        let now = w.now();
+        w.store()
+            .write(move |c| mail::file_send_tx(c, 9, now + 1.0))
+            .unwrap();
+        assert_eq!(outbox(&w), ("pending".into(), None));
+        assert!(
+            w.jobs().iter().all(|j| j.status == "obsolete"),
+            "the old failure is history: {:?}",
+            w.jobs()
+        );
+
+        w.with_fake(|f| f.clock += 2.0);
+        assert_eq!(outbox_pass(&w), 1, "claimed again");
+        assert_eq!(outbox(&w).0, "sending", "a fresh attempt, not the stale verdict");
+        let live: Vec<_> = w.jobs().into_iter().filter(|j| j.status != "obsolete").collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].attempts, 0);
+    }
+
+    /// Undoing a retry puts the failure back — the row and the job that
+    /// stood down — rather than deleting the row as undoing a send does:
+    /// there is no compose to reopen, so a deleted row would strand the
+    /// draft.
+    #[test]
+    fn a_retry_undone_puts_the_failure_back() {
+        let w = world("");
+        w.with_fake(|f| f.clock = 200.0);
+        give_up(&w);
+        let error = outbox(&w).1.unwrap();
+        let attempts_before = w.jobs()[0].attempts;
+
+        let intent = mail::Retried {
+            outbox: 9,
+            error: error.clone(),
+            delay: 1.0,
+        };
+        intent.reapply(&w).unwrap(); // the retry itself: the same filing
+        assert_eq!(outbox(&w), ("pending".into(), None));
+        assert!(w.jobs().iter().all(|j| j.status == "obsolete"));
+        assert!(intent.blocked(&w).is_none(), "still in the window");
+
+        intent.reverse(&w).unwrap();
+        assert_eq!(outbox(&w), ("failed".into(), Some(error)));
+        let live: Vec<_> = w.jobs().into_iter().filter(|j| j.status != "obsolete").collect();
+        assert_eq!(live.len(), 1, "the old job stands again");
+        assert_eq!((live[0].status.as_str(), live[0].attempts), ("failed", attempts_before));
+        assert!(mail::draft(w.store(), 9).is_some(), "the draft is where the row finds it");
+
+        // Once the executor has the retried row, it is a send like any other.
+        intent.reapply(&w).unwrap();
+        w.with_fake(|f| f.clock += 2.0);
+        outbox_pass(&w);
+        assert_eq!(outbox(&w).0, "sending");
+        assert_eq!(intent.blocked(&w).as_deref(), Some("already sent"));
+    }
+
+    /// Reopening a failed send moves the draft under the compose panel that
+    /// shows it and clears the row; giving it back restores both, with the
+    /// error the row carried.
+    #[test]
+    fn a_reopened_send_comes_back_on_undo() {
+        let w = world("");
+        w.with_fake(|f| f.clock = 200.0);
+        give_up(&w);
+        let error = outbox(&w).1.unwrap();
+
+        let now = w.now();
+        w.store()
+            .write(move |c| mail::reopen_send_tx(c, 9, 42, now))
+            .unwrap();
+        let draft_of = |panel: i64| mail::draft(w.store(), panel);
+        assert!(draft_of(9).is_none(), "the draft moved");
+        assert_eq!(draft_of(42).unwrap().body, "Body");
+        let rows: i64 = w
+            .store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the failed row is gone");
+
+        let minted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42));
+        let intent = mail::Reopened {
+            old: 9,
+            new: minted,
+            error: error.clone(),
+        };
+        assert!(intent.blocked(&w).is_none());
+        intent.reverse(&w).unwrap();
+        assert!(draft_of(42).is_none());
+        assert_eq!(draft_of(9).unwrap().body, "Body");
+        assert_eq!(outbox(&w), ("failed".into(), Some(error)));
+
+        intent.reapply(&w).unwrap();
+        assert!(draft_of(9).is_none());
+        assert_eq!(draft_of(42).unwrap().to, "x@y");
+
+        // Once the reopened draft has gone out, there is nothing to put back.
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO outbox(id, account, send_after, status) VALUES(42, 1, 0, 'sent')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        assert_eq!(intent.blocked(&w).as_deref(), Some("already sent"));
     }
 
     /// A send caught mid-flight by a crash is never retried on a guess —

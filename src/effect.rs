@@ -444,7 +444,7 @@ fn backoff(attempts: i64) -> f64 {
 }
 
 /// After this many attempts a job stops retrying and waits for a human.
-const MAX_ATTEMPTS: i64 = 6;
+pub const MAX_ATTEMPTS: i64 = 6;
 
 // -- reading the table ---------------------------------------------------------
 

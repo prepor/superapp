@@ -419,6 +419,7 @@ fn chord(s: &str) -> Option<KeyEvent> {
         "up" => KeyCode::ArrowUp,
         "down" => KeyCode::ArrowDown,
         "enter" | "return" => KeyCode::ReturnKey,
+        "l" => KeyCode::KeyL,
         _ => return None,
     };
     Some(KeyEvent {
@@ -952,6 +953,11 @@ impl Library {
                 self.fit_all(cx);
             }
             KeyCode::Escape if cmd => self.leave(cx),
+            // The Dev chord, from the canvas: the stage under the library
+            // is suspended and hears no keys, so the library answers for it
+            // while it has the window — and before an entered mount's own
+            // stage could, or the toggle would fire twice.
+            KeyCode::KeyL if cmd && k.modifiers.shift => cx.action(app::DevAction::ToggleLibrary),
             _ if self.entered.is_some() => self.send_entered(cx, &Event::KeyDown(*k)),
             KeyCode::ArrowLeft => self.pan_by(cx, dvec2(-PAN_STEP, 0.0)),
             KeyCode::ArrowRight => self.pan_by(cx, dvec2(PAN_STEP, 0.0)),
@@ -1576,7 +1582,7 @@ impl Library {
             String::new()
         };
         let legend = format!(
-            "{status}drag · scroll  pan   ⌘scroll · ⌘= · ⌘-  zoom   ⌘0  fit   click  enter   click outside · ⌘esc  leave"
+            "{status}drag · scroll  pan   ⌘scroll · ⌘= · ⌘-  zoom   ⌘0  fit   click  enter   click outside · ⌘esc  leave   ⇧⌘L  workspace"
         );
         let size = theme::FONT_SIZE as f32;
         let h = legend_h();

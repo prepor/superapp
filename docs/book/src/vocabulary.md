@@ -32,3 +32,6 @@
   inside the model.
 - **Ghost** — the fading afterimage of a closed panel, drawn by the shell only.
 - **Toast** — the transient bottom-right note a side-effect button leaves.
+- **Problem** — a standing background condition (a failed sync, a failed
+  send, an unreachable bucket), derived from the rows that carry it. The
+  **mark** in the toast's corner counts them; the problems panel lists them.

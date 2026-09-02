@@ -186,8 +186,9 @@ elsewhere the mark stays local, neither pushed nor read back. Because both the o
 and the job are durable, a mail that hit *send* and never left goes out late
 rather than never. A delivered send is physics: its claim refuses, the
 history node goes **expired**, and the walk skips it transparently.
-A *failed* send stays cancellable — the error toasts and `cmd+z` reopens
-the draft. The launcher's *new mail* root opens a blank compose.
+A *failed* send stays cancellable — the error toasts, `cmd+z` reopens the
+draft, and it stands in the problems panel with *retry* and *reopen* until
+it goes out or is taken back. The launcher's *new mail* root opens a blank compose.
 
 ## What stays out of the file
 

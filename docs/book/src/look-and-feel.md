@@ -1,8 +1,10 @@
 # Look & Feel
 
 Black on white, almost fully monochrome. Colour appears in exactly one role:
-errors (`#a01500`-ish ink red). There is no second accent; hover and selection
-are grey backings; focus is the inverted panel header.
+errors (`#a01500`-ish ink red) — a status line, an error toast, and the
+problems mark that stays in the toast's corner while something in the
+background is wrong. There is no second accent; hover and selection are grey
+backings; focus is the inverted panel header.
 
 ## Type
 
@@ -24,6 +26,13 @@ control's [accelerator](./interaction-grammar.md#accelerators).
 inverts; unfocused headers carry a 1 pt rule. Tables: strong rule under the
 header row, hairline rules between rows.
 
+A link that holds keyboard focus wears a doubled underline, the way a
+focused button wears the grey wash. Text carries no padding of its own: a label, a section label, a link sits
+exactly where its row puts it, so every line a panel writes shares the
+panel's inset, and the spacing between lines belongs to the rows and rules
+rather than to the words. Nothing zeroes or pads around a label at the
+site; the vocabulary is bare and the containers carry the rhythm.
+
 ## Motion
 
 niri's spring (`k=800, ζ=1`, closed-form, ~330 ms) drives every rect and the
@@ -36,4 +45,6 @@ runs the same spring back. Their widget trees render to a texture and are
 composited at the spring's alpha, which is how a real text field, caret and
 all, fades as one surface. Trackpad pans are 1:1 and deliberately not
 springed. The shell idles at zero frames — springs, not timers, request the
-next frame.
+next frame — which is also why the problems mark does not pulse: a pulse
+would keep the loop turning for as long as a server is down, and the colour
+is signal enough.
