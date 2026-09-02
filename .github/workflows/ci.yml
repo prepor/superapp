@@ -37,8 +37,13 @@ jobs:
           components: clippy
 
       # Caches the registry, the two makepad git checkouts and `target/`,
-      # keyed on the lockfile and the toolchain.
+      # keyed on the lockfile and the toolchain. `cache-on-failure` because
+      # the common failure here is a red clippy or a failed step, and the
+      # graph that got built on the way to it is just as good — without it
+      # a lint slip costs the next push a cold build of all of makepad.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # `--locked` so a Cargo.lock left behind by an edited manifest fails
       # here instead of being quietly re-resolved.
