@@ -255,11 +255,23 @@ down. A grant the human revokes at Google fails at the next refresh, and it
 fails **honestly** — the sync stops and says `invalid_grant` rather than
 falling back to a password that was never there.
 
+Two Gmail behaviours the engine has to know about, both of them the
+provider's rather than the protocol's. Gmail advertises no `\Archive`
+mailbox — archiving there *is* dropping the inbox label, leaving the message
+in All Mail — so the special-use `\All` counts as the archive role, and a
+MOVE into it is the archive. And Gmail's SMTP files its own copy into Sent
+Mail, unlike a plain relay, so the APPEND every other account gets is
+skipped: one letter in Sent, not two.
+
 One thing this cannot ship: the OAuth **client registration**. Google issues
 those per developer, so superapp reads yours — `SUPERAPP_GOOGLE_CLIENT_ID`
 and `SUPERAPP_GOOGLE_CLIENT_SECRET`, or the console's downloaded JSON
-dropped verbatim at `google-oauth.json` beside the store. Without one, the
-panel says so instead of pretending.
+dropped verbatim at `google-oauth.json` beside the store. It must be a
+**Desktop app** client: the redirect is a loopback port the OS picks per
+sign-in, and a Web client only accepts redirect URIs registered in advance,
+port and all — so one is refused by name here rather than as a
+`redirect_uri_mismatch` in the browser three steps later. Without any
+registration, the panel says so instead of pretending.
 
 The consent round trip is the one thing e2e cannot script — it wants Google
 and a human — so a run refuses it and puts that refusal on the panel's own

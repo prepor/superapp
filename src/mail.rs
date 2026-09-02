@@ -1528,6 +1528,12 @@ impl Effect for Submit {
         let d = load_outgoing(cx.db, self.outbox)?;
         let smtp = creds_for(cx.out, &d.email, &d.smtp, d.oauth)?;
         let raw = cx.out.submit(&smtp, &d.mail)?;
+        // Gmail's SMTP files its own copy into Sent Mail, so appending one
+        // would leave the human looking at the same letter twice. The
+        // account's provider is what knows; a plain relay files nothing.
+        if d.oauth && crate::oauth::GOOGLE.files_sent_itself {
+            return Ok(None);
+        }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
             return Ok(Some("no imap host to file to Sent".into()));

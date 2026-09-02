@@ -1726,12 +1726,15 @@ impl State {
         }
     }
 
-    /// Whether an address is already an account. Two rows for one mailbox
-    /// would mean two workers fetching the same mail into the same store.
-    fn has_account(&self, email: &str) -> bool {
+    /// The account already holding this address, if any. Two rows for one
+    /// mailbox would mean two workers fetching the same mail into the same
+    /// store — and for a Gmail sign-in, an existing row is not an error but
+    /// the ordinary case: signing in again is how a grant is renewed.
+    fn account_for(&self, email: &str) -> Option<mail::Account> {
         mail::accounts(&self.store)
             .iter()
-            .any(|a| a.email.eq_ignore_ascii_case(email))
+            .find(|a| a.email.eq_ignore_ascii_case(email))
+            .cloned()
     }
 
     /// Files the account row as an undoable action and claims the intent.
@@ -3251,15 +3254,36 @@ impl Stage {
                         pass: &signed.refresh,
                     })
                     .is_ok();
-                if !kept {
-                    ("storing the google grant failed".to_string(), true)
-                } else if state.has_account(&signed.email) {
-                    (format!("{} is already an account", signed.email), true)
-                } else {
-                    let g = crate::oauth::GOOGLE;
-                    state.add_account(&signed.email, g.imap, g.smtp, g.name);
-                    state.toast(format!("{} added — syncing", signed.email), false);
-                    (format!("signed in as {}", signed.email), false)
+                let g = crate::oauth::GOOGLE;
+                match (kept, state.account_for(&signed.email)) {
+                    (false, _) => ("storing the google grant failed".to_string(), true),
+                    // Signing in again is how an expired or revoked grant is
+                    // renewed, and by here the new refresh token is already
+                    // in the keychain — so this is the success it looks
+                    // like, not a duplicate. The worker picks the new token
+                    // up on its next connect.
+                    (true, Some(a)) if a.auth.as_deref() == Some(g.name) => {
+                        state.pump.kick();
+                        state.toast(format!("{} signed in again", signed.email), false);
+                        (format!("signed in again as {}", signed.email), false)
+                    }
+                    // The same address already here with a password. Its
+                    // hosts are that other provider's, so this cannot just
+                    // flip a column — and removing the row to re-add it
+                    // would take its mail with it. The human decides.
+                    (true, Some(_)) => (
+                        format!(
+                            "{} is already a password account — remove it first to \
+                             sign in with google",
+                            signed.email
+                        ),
+                        true,
+                    ),
+                    (true, None) => {
+                        state.add_account(&signed.email, g.imap, g.smtp, g.name);
+                        state.toast(format!("{} added — syncing", signed.email), false);
+                        (format!("signed in as {}", signed.email), false)
+                    }
                 }
             }
         };
@@ -4871,7 +4895,7 @@ impl Stage {
                         state.toast("address, password and imap host are required", true);
                     } else if state.db_path.is_none() {
                         state.toast("no store file — accounts need one", true);
-                    } else if state.has_account(&email) {
+                    } else if state.account_for(&email).is_some() {
                         state.toast(format!("{email} is already an account"), true);
                     } else {
                         let stored = state

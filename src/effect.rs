@@ -1799,7 +1799,20 @@ impl Outside for Real {
     }
 
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
-        let s = imap_session::connect(&c.host, &c.user, &c.auth)?;
+        let s = match imap_session::connect(&c.host, &c.user, &c.auth) {
+            Ok(s) => s,
+            Err(e) => {
+                // A bearer token the server refused is spent, whatever the
+                // cache still believes about its hour: a revoked grant kills
+                // the access token too. Drop it so the next pass mints a
+                // fresh one — otherwise signing in again would fix nothing
+                // until the cached token aged out on its own.
+                if matches!(c.auth, Auth::Bearer(_)) {
+                    self.tokens.remove(&c.user);
+                }
+                return Err(e);
+            }
+        };
         self.sessions.insert(account, s);
         Ok(())
     }
@@ -1955,6 +1968,29 @@ impl Outside for Real {
 
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
+/// Which of the four roles a mailbox plays, from its name and its RFC 6154
+/// special-use attributes (rendered — see the caller).
+///
+/// `\All` is the Gmail case, and it is why archive is not just `\Archive`:
+/// Gmail advertises no archive mailbox, because archiving there *is*
+/// dropping the inbox label, leaving the message in All Mail — which is
+/// exactly what a MOVE into it does. A real `\Archive` wins where a server
+/// has one (fastmail does), and `\All` is the fallback.
+fn role_for(name: &str, attrs: &[String]) -> Option<String> {
+    let has = |want: &str| attrs.iter().any(|a| a == want);
+    if name.eq_ignore_ascii_case("inbox") {
+        Some("inbox".to_string())
+    } else if has("Archive") || has("All") {
+        Some("archive".to_string())
+    } else if has("Sent") {
+        Some("sent".to_string())
+    } else if has("Trash") {
+        Some("trash".to_string())
+    } else {
+        None
+    }
+}
+
 mod imap_session {
     use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet};
     use std::collections::HashSet;
@@ -2048,21 +2084,16 @@ mod imap_session {
             let names = self.session.list(Some(""), Some("*")).map_err(s)?;
             let mut out = Vec::new();
             for n in names.iter() {
-                let attrs = format!("{:?}", n.attributes()).to_lowercase();
-                let role = if n.name().eq_ignore_ascii_case("inbox") {
-                    Some("inbox".to_string())
-                } else if attrs.contains("archive") {
-                    Some("archive".to_string())
-                } else if attrs.contains("sent") {
-                    Some("sent".to_string())
-                } else if attrs.contains("trash") {
-                    Some("trash".to_string())
-                } else {
-                    None
-                };
+                // The attributes as whole `Debug` renderings, one per entry:
+                // `imap` does not re-export `NameAttribute`, so the variants
+                // cannot be named here, and matching a rendering entire is
+                // what keeps an `Extension("...")` that merely spells one of
+                // these words from passing for it.
+                let attrs: Vec<String> =
+                    n.attributes().iter().map(|a| format!("{a:?}")).collect();
                 out.push(RemoteFolder {
+                    role: super::role_for(n.name(), &attrs),
                     name: n.name().to_string(),
-                    role,
                 });
             }
             Ok(out)
@@ -2510,5 +2541,40 @@ mod tests {
             "an unregistered kind names itself with nothing"
         );
         assert!(w.registry().describe("poke", "{}").is_none());
+    }
+
+    /// The special-use mapping, against what the two servers this app is
+    /// actually pointed at advertise. Gmail is the reason `\All` counts:
+    /// it names no `\Archive`, so without this an archive on a Gmail
+    /// account would find no folder to move to and quietly do nothing.
+    #[test]
+    fn gmails_all_mail_is_the_archive() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let role = |n: &str, at: &[&str]| role_for(n, &a(at));
+
+        // Gmail's LIST, as it comes.
+        assert_eq!(role("INBOX", &["HasNoChildren"]).as_deref(), Some("inbox"));
+        assert_eq!(
+            role("[Gmail]/All Mail", &["HasNoChildren", "All"]).as_deref(),
+            Some("archive")
+        );
+        assert_eq!(
+            role("[Gmail]/Sent Mail", &["HasNoChildren", "Sent"]).as_deref(),
+            Some("sent")
+        );
+        assert_eq!(
+            role("[Gmail]/Trash", &["HasNoChildren", "Trash"]).as_deref(),
+            Some("trash")
+        );
+        assert_eq!(role("[Gmail]", &["NoSelect", "HasChildren"]), None);
+
+        // A server with a real \Archive keeps it, and it wins over \All.
+        assert_eq!(role("Archive", &["Archive"]).as_deref(), Some("archive"));
+        assert_eq!(role("Everything", &["All", "Archive"]).as_deref(), Some("archive"));
+
+        // A plain folder is no role, and an extension attribute that merely
+        // spells one of the words is not that role.
+        assert_eq!(role("Receipts", &["HasNoChildren"]), None);
+        assert_eq!(role("Odd", &[r#"Extension("All")"#]), None);
     }
 }

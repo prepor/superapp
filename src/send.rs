@@ -452,6 +452,15 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].to, "x@y");
 
+        // And it is filed exactly once: Gmail's SMTP puts its own copy in
+        // Sent Mail, so the APPEND every other account gets is skipped —
+        // one letter, not two.
+        assert!(
+            w.with_fake(|f| !f.server(1).folders.contains_key("Sent")),
+            "gmail's sent copy is the server's, not ours"
+        );
+        assert_eq!(w.jobs()[0].status, "done");
+
         // Revoke the grant and the next send fails where it should: at
         // the token, before anything leaves.
         w.with_fake(|f| f.revoke("g@gmail.com"));

@@ -45,6 +45,9 @@ pub struct Provider {
     pub scope: &'static str,
     pub imap: &'static str,
     pub smtp: &'static str,
+    /// The provider's own SMTP puts a copy of everything it sends into the
+    /// Sent mailbox. A client that also APPENDs one files the mail twice.
+    pub files_sent_itself: bool,
 }
 
 /// Gmail. `https://mail.google.com/` is the only scope Google's IMAP and
@@ -56,6 +59,8 @@ pub const GOOGLE: Provider = Provider {
     scope: "https://mail.google.com/ openid email",
     imap: "imap.gmail.com",
     smtp: "smtp.gmail.com",
+    // Gmail's SMTP saves to Sent Mail on its own, unlike a plain relay.
+    files_sent_itself: true,
 };
 
 /// The `account.auth` value for a password account. `NULL` means the same —
@@ -150,26 +155,46 @@ impl Client {
                 path.display()
             ));
         };
-        Client::parse(&text)
-            .ok_or_else(|| format!("{} is not a client registration", path.display()))
+        Client::parse(&text).map_err(|why| format!("{}: {why}", path.display()))
     }
 
-    /// The console file's two shapes, and the flat one a human might type.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Client> {
-        if let Ok(f) = serde_json::from_str::<ConsoleFile>(text) {
-            if let Some(c) = f.installed.or(f.web) {
-                return (!c.client_id.is_empty()).then_some(Client {
+    /// The console's desktop-client file, and the flat pair a human might
+    /// type by hand.
+    ///
+    /// A **Web** client is refused by name rather than accepted: this flow
+    /// redirects to `http://127.0.0.1:<port>` on a port the OS picks per
+    /// sign-in, and a web client only accepts redirect URIs registered in
+    /// advance, port and all. Taking one would trade this message for a
+    /// `redirect_uri_mismatch` in the browser, three steps later.
+    ///
+    /// # Errors
+    ///
+    /// If the text is not JSON, is a web client, or names no client id.
+    pub fn parse(text: &str) -> Result<Client, String> {
+        let some = |c: ConsoleClient| {
+            if c.client_id.is_empty() {
+                Err("no client_id".to_string())
+            } else {
+                Ok(Client {
                     id: c.client_id,
                     secret: c.client_secret,
-                });
+                })
+            }
+        };
+        if let Ok(f) = serde_json::from_str::<ConsoleFile>(text) {
+            if let Some(c) = f.installed {
+                return some(c);
+            }
+            if f.web.is_some() {
+                return Err("that is a Web client — this sign-in needs an \
+                            \"Application type: Desktop app\" client, whose \
+                            loopback redirect needs no registration"
+                    .into());
             }
         }
-        let c: ConsoleClient = serde_json::from_str(text).ok()?;
-        (!c.client_id.is_empty()).then_some(Client {
-            id: c.client_id,
-            secret: c.client_secret,
-        })
+        let c: ConsoleClient =
+            serde_json::from_str(text).map_err(|_| "not a client registration".to_string())?;
+        some(c)
     }
 }
 
@@ -227,8 +252,8 @@ impl Flow {
             provider,
             listener,
             redirect: format!("http://127.0.0.1:{port}"),
-            verifier: nonce(64),
-            state: nonce(24),
+            verifier: nonce(64)?,
+            state: nonce(24)?,
         })
     }
 
@@ -409,8 +434,10 @@ fn post_token(url: &str, form: &[(&str, &str)]) -> Result<TokenReply, String> {
 ///
 /// Hand-rolled on the TLS connector `imap` already brings, because that is
 /// the honest size of the need: two endpoints, one verb, no redirects, no
-/// keep-alive. `Connection: close` makes the body's end the stream's end,
-/// so no chunked decoding is needed either.
+/// keep-alive. `Connection: close` means the body ends with the stream, so
+/// no `Content-Length` is needed — but it does **not** rule out
+/// `Transfer-Encoding: chunked`, which an HTTP/1.1 server may send anyway
+/// and which would otherwise reach serde with the chunk sizes still in it.
 fn post(url: &str, body: &str) -> Result<(u16, String), String> {
     let rest = url
         .strip_prefix("https://")
@@ -457,7 +484,39 @@ fn post(url: &str, body: &str) -> Result<(u16, String), String> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| format!("{host}: no status line"))?;
-    Ok((status, rest.to_string()))
+    let chunked = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .any(|(k, v)| {
+            k.eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        });
+    let body = if chunked {
+        dechunk(rest).ok_or_else(|| format!("{host}: malformed chunked response"))?
+    } else {
+        rest.to_string()
+    };
+    Ok((status, body))
+}
+
+/// Reassembles a `Transfer-Encoding: chunked` body: each chunk is a hex
+/// length (extensions after a `;` ignored), CRLF, that many bytes, CRLF,
+/// ending at a zero-length chunk. Trailers after it are not read — nothing
+/// here wants one.
+fn dechunk(body: &str) -> Option<String> {
+    let mut rest = body;
+    let mut out = String::new();
+    loop {
+        let (line, after) = rest.split_once("\r\n")?;
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(out);
+        }
+        let chunk = after.get(..size)?;
+        out.push_str(chunk);
+        rest = after.get(size..)?.strip_prefix("\r\n")?;
+    }
 }
 
 /// Reads one loopback request, answers the page the human is left looking
@@ -583,14 +642,23 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 
 /// `n` characters of URL-safe randomness — the PKCE verifier (RFC 7636 asks
 /// for 43..128 unreserved characters) and the state nonce.
-fn nonce(n: usize) -> String {
+///
+/// The failure is propagated rather than swallowed, and that is the whole
+/// point of the `Result`: a zeroed buffer would still hash to a *matching*
+/// challenge, so the flow would sail through with a verifier and a CSRF
+/// nonce an attacker could write down. There is no safe fallback — the only
+/// honest move is to refuse the sign-in.
+///
+/// # Errors
+///
+/// If the OS cannot supply randomness.
+fn nonce(n: usize) -> Result<String, String> {
     use ring::rand::SecureRandom;
     let mut bytes = vec![0u8; n];
-    // A sign-in that cannot get randomness must not fall back to a guessable
-    // verifier; the flow fails later on a challenge mismatch, which is the
-    // right outcome and one the OS will never actually produce.
-    let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
-    URL_SAFE_NO_PAD.encode(&bytes)[..n].to_string()
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "no randomness for the sign-in".to_string())?;
+    Ok(URL_SAFE_NO_PAD.encode(&bytes)[..n].to_string())
 }
 
 #[cfg(test)]
@@ -611,13 +679,17 @@ mod tests {
     /// its 43..128 window.
     #[test]
     fn the_verifier_is_well_formed() {
-        let v = nonce(64);
+        let v = nonce(64).expect("randomness");
         assert_eq!(v.len(), 64);
         assert!((43..=128).contains(&v.len()));
         assert!(v
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
-        assert_ne!(v, nonce(64), "two flows never share a verifier");
+        assert_ne!(
+            v,
+            nonce(64).expect("randomness"),
+            "two flows never share a verifier"
+        );
     }
 
     /// The consent URL carries what makes the flow work at all: PKCE with
@@ -656,27 +728,31 @@ mod tests {
             "project_id":"p","client_secret":"s","redirect_uris":["http://localhost"]}}"#;
         assert_eq!(
             Client::parse(installed),
-            Some(Client {
+            Ok(Client {
                 id: "a.apps.googleusercontent.com".into(),
                 secret: "s".into()
             })
         );
         assert_eq!(
-            Client::parse(r#"{"web":{"client_id":"w","client_secret":"x"}}"#),
-            Some(Client {
-                id: "w".into(),
-                secret: "x".into()
-            })
-        );
-        assert_eq!(
             Client::parse(r#"{"client_id":"flat","client_secret":"y"}"#),
-            Some(Client {
+            Ok(Client {
                 id: "flat".into(),
                 secret: "y".into()
             })
         );
-        assert_eq!(Client::parse("{}"), None);
-        assert_eq!(Client::parse("not json"), None);
+        assert!(Client::parse("{}").is_err());
+        assert!(Client::parse("not json").is_err());
+    }
+
+    /// A web client is refused where the human can still act on it, and the
+    /// message names the type to create instead. It cannot work: the
+    /// redirect port is picked per sign-in, and a web client's redirect URIs
+    /// are registered in advance.
+    #[test]
+    fn a_web_client_is_refused_by_name() {
+        let e = Client::parse(r#"{"web":{"client_id":"w","client_secret":"x"}}"#).unwrap_err();
+        assert!(e.contains("Web client"), "{e}");
+        assert!(e.contains("Desktop app"), "{e}");
     }
 
     /// A client's `Debug` never prints its secret — the same rule the
@@ -706,6 +782,24 @@ mod tests {
             id_token_email(&format!("h.{}.s", URL_SAFE_NO_PAD.encode("{}"))),
             None
         );
+    }
+
+    /// A chunked body reassembles, because `Connection: close` does not
+    /// stop a server from sending one — and the chunk sizes reaching serde
+    /// would read as "google sent something unreadable" on every sign-in.
+    #[test]
+    fn a_chunked_body_reassembles() {
+        let body = "1a\r\n{\"access_token\":\"ya29.abc\"\r\n6\r\n,\"a\":1\r\n1\r\n}\r\n0\r\n\r\n";
+        assert_eq!(
+            dechunk(body).as_deref(),
+            Some("{\"access_token\":\"ya29.abc\",\"a\":1}")
+        );
+        // One chunk, an extension on the size line, and the empty body.
+        assert_eq!(dechunk("3;x=y\r\nabc\r\n0\r\n\r\n").as_deref(), Some("abc"));
+        assert_eq!(dechunk("0\r\n\r\n").as_deref(), Some(""));
+        // Truncated mid-chunk is a failure, not a silent short read.
+        assert_eq!(dechunk("5\r\nab"), None);
+        assert_eq!(dechunk("zz\r\n"), None);
     }
 
     /// The redirect's query, as a browser sends it.
