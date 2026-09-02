@@ -459,6 +459,32 @@ pub struct ParsedMail {
     pub topic: String,
 }
 
+/// The images a letter carries inside itself — its parts with a Content-ID
+/// and an image type, the `multipart/related` a composer writes around a
+/// pasted screenshot — as `(cid, bytes)`, brackets off: the names its HTML
+/// refers to them by (`src="cid:…"`).
+#[must_use]
+pub fn inline_images(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use mail_parser::MimeHeaders;
+    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    msg.parts
+        .iter()
+        .filter_map(|p| {
+            let cid = p
+                .content_id()?
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>');
+            let image = p
+                .content_type()
+                .is_some_and(|t| t.ctype().eq_ignore_ascii_case("image"));
+            (image && !cid.is_empty()).then(|| (cid.to_string(), p.contents().to_vec()))
+        })
+        .collect()
+}
+
 /// One id out of an id header, as threading compares it: trimmed, and
 /// without the angle brackets a well-formed one wears.
 fn norm_id(s: &str) -> String {
@@ -826,6 +852,48 @@ Content-Transfer-Encoding: quoted-printable\r\n\
 <a href=3D\"https://x.dev\">link</a></div></body></html>\r\n\
 --bnd--\r\n";
 
+    /// A pasted screenshot the way a composer sends it: `multipart/related`,
+    /// the HTML referring to the image part by its Content-ID.
+    const RAW_RELATED: &str = "From: Max Ivanov <max@ivanov.dev>\r\n\
+Subject: the sketch\r\n\
+Message-ID: <sketch@ivanov.dev>\r\n\
+Date: Mon, 31 Aug 2026 10:00:00 +0000\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"rel\"\r\n\
+\r\n\
+--rel\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>Like so:</p><img src=\"cid:sketch.png@ivanov.dev\" alt=\"the sketch\" width=\"120\" height=\"80\">\r\n\
+--rel\r\n\
+Content-Type: image/png; name=\"sketch.png\"\r\n\
+Content-ID: <sketch.png@ivanov.dev>\r\n\
+Content-Disposition: inline; filename=\"sketch.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAASUVORK5CYII=\r\n\
+--rel--\r\n";
+
+    /// A pasted screenshot arrives as a `multipart/related` part: the
+    /// narrowing keeps the `<img>` under its Content-ID, and the raw gives
+    /// the bytes back under the same name.
+    #[test]
+    fn inline_images_come_out_of_the_raw() {
+        let p = parse_mail(RAW_RELATED.as_bytes());
+        assert!(
+            p.html.as_deref().unwrap_or("").contains(
+                r#"<img src="cid:sketch.png@ivanov.dev" alt="the sketch" width="120" height="80"/>"#
+            ),
+            "{:?}",
+            p.html
+        );
+        let imgs = inline_images(RAW_RELATED.as_bytes());
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].0, "sketch.png@ivanov.dev");
+        assert!(imgs[0].1.starts_with(b"\x89PNG"));
+        assert!(inline_images(RAW_ALT.as_bytes()).is_empty(), "no cid parts, no images");
+    }
+
     /// An isolated world with one real-looking account and an empty inbox.
     /// No files, no keychain, no threads — nothing outside this value.
     fn world() -> World {
@@ -1109,12 +1177,13 @@ Content-Transfer-Encoding: quoted-printable\r\n\
         assert_eq!(m.body, "Plain reading.");
         let html = m.html.expect("the html reading");
         // Quoted-printable decoded, layout unwrapped, style and tracking
-        // pixel gone, emphasis and link intact. The space is the newline
-        // that separated the two in the source: whitespace between inline
-        // elements is text, and a browser would keep it too.
+        // pixel gone, emphasis and link intact. The newline that separated
+        // the two in the source is gone with the paragraph's own close: a
+        // block separates itself, and the widget starts the link on a new
+        // line without being told.
         assert_eq!(
             html,
-            "<p>Rich <b>reading</b>.</p> <a href=\"https://x.dev\">link</a>"
+            "<p>Rich <b>reading</b>.</p><a href=\"https://x.dev\">link</a>"
         );
 
         // A text-only mail leaves `html` empty, so the panel keeps showing

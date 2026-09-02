@@ -22,10 +22,14 @@ shot 03b-back-to-html
 
 # Selection over the HTML body. cmd+a is not available to assert with here
 # the way e2e/select.txt uses it: in a message panel that chord is archive,
-# so it never reaches the widget. That leaves the drag.
+# so it never reaches the widget, and a synthesized drag never selects. So
+# the run is selected on the widget itself: the shot is the wash — every
+# line washed, and no darker band where two lines meet.
 click "CI failed"
 wait 800
 drag "mail html" 380 0
+wait 400
+selectall "mail html"
 wait 400
 shot 04-html-selected
 

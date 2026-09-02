@@ -423,22 +423,24 @@ CREATE TABLE repl(
   holding INTEGER NOT NULL DEFAULT 0
 );
 ";
-/// Fills `message.html` for mail that arrived before schema v6, reading
-/// the `raw` blob each one already keeps. Messages without `raw` — the demo
-/// seed — are left alone, and a mail whose sender wrote text only stays
-/// NULL. Runs once, inside the migration.
+/// Rewrites `message.html` from the `raw` blob each synced mail keeps. The
+/// narrowing ([`crate::html::sanitize`]) runs at ingest, so a stored reading
+/// is only as good as the build that stored it, and a better narrowing has
+/// to be run over the rows already there: schema v6 first filled the column,
+/// and since then [`crate::html::VERSION`], kept in `meta`, says which
+/// narrowing the store holds (see [`Store::open`]). Messages without `raw` — the
+/// demo seed — are left alone, and a mail whose sender wrote text only
+/// stays NULL. Runs inside the migration.
 pub(crate) fn backfill_html(conn: &Connection) -> rusqlite::Result<()> {
     let rows: Vec<(i64, Vec<u8>)> = conn
-        .prepare("SELECT id, raw FROM message WHERE raw IS NOT NULL AND html IS NULL")?
+        .prepare("SELECT id, raw FROM message WHERE raw IS NOT NULL")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, raw) in rows {
-        if let Some(html) = crate::sync::parse_mail(&raw).html {
-            conn.execute(
-                "UPDATE message SET html = ?2 WHERE id = ?1",
-                rusqlite::params![id, html],
-            )?;
-        }
+        conn.execute(
+            "UPDATE message SET html = ?2 WHERE id = ?1",
+            rusqlite::params![id, crate::sync::parse_mail(&raw).html],
+        )?;
     }
     Ok(())
 }
@@ -528,7 +530,9 @@ impl Db {
             }
         };
         let conn = open_writer(&target)?;
-        migrate(&conn)?;        sweep_effects(&conn)?;
+        migrate(&conn)?;
+        sweep_effects(&conn)?;
+
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         let d = dirty.clone();
         conn.update_hook(Some(move |_op, _db: &str, table: &str, _rowid: i64| {
@@ -718,6 +722,20 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(SCHEMA_V10)?;
         conn.execute("INSERT INTO repl(id, device) VALUES(1, ?1)", [device_id()])?;
         conn.pragma_update(None, "user_version", 10)?;
+    }
+    // The HTML narrowing runs at ingest, so a stored reading is as good as
+    // the build that wrote it. The version of the narrowing the store holds
+    // lives in `meta`; when the build's differs, every reading is redone
+    // from raw — schema versions are for the schema.
+    let narrowed: i64 = conn
+        .query_row("SELECT value FROM meta WHERE key = 'html_version'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if narrowed != i64::from(crate::html::VERSION) {
+        backfill_html(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('html_version', ?1)",
+            [i64::from(crate::html::VERSION)],
+        )?;
     }
     Ok(())
 }
@@ -1527,6 +1545,20 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
 mod tests {
     use super::*;
     use crate::core::{Kind, Wm};
+
+    /// The narrowing's version is kept with the store: a fresh store holds
+    /// the build's, so nothing is redone at its next open, and a store from
+    /// another build is redone once.
+    #[test]
+    fn the_store_records_the_narrowing_it_holds() {
+        let s = Store::open(None).unwrap();
+        let held = || -> i64 {
+            s.conn()
+                .query_row("SELECT value FROM meta WHERE key = 'html_version'", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(held(), i64::from(crate::html::VERSION));
+    }
 
     fn store() -> Store {
         Store::open(None).expect("in-memory store")

@@ -25,12 +25,21 @@ path = "src/main.rs"
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 mail-parser = "0.11"
+# HTML mail and feed articles, narrowed to the widget vocabulary in
+# src/html.rs. html5ever is the spec tree builder (implied end tags, entity
+# decoding, the adoption agency for misnested emphasis) and rcdom the plain
+# Rc tree over it; simplecss is a one-file CSS parser with selector matching
+# against our own tree, enough for the handful of properties a monochrome
+# reading honours (hidden text, weight, slant, decoration, white-space).
+html5ever = "0.39"
+markup5ever_rcdom = "0.39.0"
+simplecss = "0.2"
 # makepad@dev, re-pinned 2026-09-01 to then-HEAD (53 commits past mosaic's
 # vendor pin; fast-forward, zero source drift, full battery green). None of
 # mosaic's patches; the one superapp used was 0003 (present-when-occluded,
 # for background e2e runs), dropped as an experiment: if occluded e2e
-# suites go stale, run them with --front. Two patches of our own now ride
-# on top — see the [patch] section at the bottom. The API reference is the
+# suites go stale, run them with --front. Our own patches ride on top —
+# see the [patch] section at the bottom. The API reference is the
 # ~/.cargo git checkout of the fork rev (mosaic's vendored tree lags it).
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
@@ -54,7 +63,7 @@ serde_json = "1"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# Four patches on top of the pin, carried on prepor/makepad@superapp-pin
+# Five patches on top of the pin, carried on prepor/makepad@superapp-pin
 # (branched at the pin; rebase them when bumping it):
 #
 #   bdb23508  TextInput hides the IME only when key focus goes to nothing —
@@ -64,20 +73,23 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 #             it to replay the animation: dismissals "closed twice"), and a
 #             tap on a field clears the dismissed latch, so a re-tap on the
 #             focused field can raise the keyboard again.
-#
 #   99b2a58f  MAKEPAD_PRESENT_WHEN_OCCLUDED (mosaic's patch 0003): a run that
 #             deliberately sits behind the user's windows can still be
 #             photographed. Off by default. E2e moved to `MAKEPAD=headless`
 #             and no longer needs it; the branch carries it anyway.
 #   5d491eea  A trackpad pinch (NSEventTypeMagnify) arrives as a command-
 #             scroll at the pointer: the panels library's canvas zooms on it.
+#   d7795f23  TextFlow: a padded selection row ends at the row under it —
+#             two padded rows overlapped by 4px, and a translucent wash
+#             painted the overlap twice as dark: a band between every two
+#             lines of a selected paragraph.
 #
 # A local clone at ../makepad-superapp is the working tree for them; the
 # git rev below is what actually builds, here and anywhere else.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
 
 [profile.dev]
 opt-level = 1
