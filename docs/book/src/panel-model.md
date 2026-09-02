@@ -77,9 +77,14 @@ joined pair and inserts after it rather than splitting it.
 
 - A solid link opens its target **joined** to the panel the link lives in.
 - The next solid link in that parent **replaces** the joined child in place.
-- **Replacing a panel closes its joined chain** — the chain to its right is
-  context derived from content that just changed (open a contact for mail A,
-  click mail B: the stale contact goes with it).
+- **Replacing or closing a panel closes its joined chain** — the chain to
+  its right is context this panel pointed at, so it goes when the panel
+  does: replace, because the content it was derived from just changed
+  (open a contact for mail A, click mail B: the stale contact goes with
+  it); close, because nothing is left for it to be context *of*. A panel
+  opened for its own sake — cmd+click, a launcher hit — is nobody's
+  context and stays. Undo restores the whole chain, as it restores any
+  close.
 - A join is alive **only while the child sits in the column immediately right
   of its parent**. Any move or insert that breaks that adjacency breaks the
   join, visibly: the ═ bridge between the pair is the only indicator, always
@@ -98,8 +103,10 @@ modifier (up/down walk the column; left/right pick the nearest panel by
 vertical centre in the neighbouring column, judged on target geometry).
 Moving a panel swaps within its column, merges into a neighbour column, swaps
 whole columns when it travels alone, and expels into a fresh column at the
-edges. Closing a panel drops focus to its nearest surviving neighbour and
-removes empty columns.
+edges. Closing a panel takes its joined chain with it (above), drops focus
+to its nearest surviving neighbour and removes empty columns. A workspace
+move is not a close: the panel travels alone, and its joins stay behind to
+die with the lost adjacency.
 
 Implementation: all of the above is `src/core.rs` — std-only, no rendering,
 unit-tested (the web prototype's whole smoke scenario is transcribed as a

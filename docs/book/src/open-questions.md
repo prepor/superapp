@@ -6,8 +6,9 @@ current state; everything else in this book is settled.
 1. **Should a joined child align vertically to its parent** instead of
    appending to the bottom of an existing column?
 2. **Draft protection**: a joined compose panel is silently closed by the next
-   solid link in its parent (cascade-close). Deliberately ignored for now; a
-   "pin" concept may return.
+   solid link in its parent, and now by closing that parent too
+   (cascade-close). Deliberately ignored for now; a "pin" concept may
+   return.
 3. **In-panel selection vs panel focus**: the inbox row cursor is per-panel
    state today; whether selection should survive replacement or travel with
    joins is unexplored.
