@@ -9,6 +9,9 @@ edition = "2021"
 rust-version = "1.87"
 description = "Personal user-space OS: specialized panels on one scrolling workspace."
 publish = false
+# The helper binaries under src/bin (bucketd, sync-demo, reseed-edit) made a
+# plain `cargo run` ambiguous; the app is what every documented command means.
+default-run = "superapp"
 
 [lib]
 name = "superapp"
