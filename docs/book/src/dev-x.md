@@ -229,11 +229,12 @@ the flags still have to be passed on the command line:
 ## Panels library
 
 ```sh
-# every script under e2e/ as a story, live, on one canvas
+# the shelf: the scripts marked `#! library`, live, on one canvas
 mise exec -- cargo run -- --library
 
-# a few stories
+# the stories you name — or every script, with the directory
 mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt
+mise exec -- cargo run -- --library e2e
 
 # the canvas's own suite — the fast path: replays and labels, no rendering
 MAKEPAD=headless mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
@@ -250,8 +251,10 @@ canvas and the workspace suites alike, so a green fast-path run means what
 it says.
 
 `--library` opens the window on an **infinite canvas** instead of the
-workspace (CR-006). Every e2e script is a **story** row on it; every
-`shot` in the script is a **node** — a whole stage on a world of its own
+workspace. An e2e script is a **story** row on it — by default the few
+marked `#! library`, the *shelf*, because there will always be more
+scripts than anyone wants to review at once; name the ones you want, or
+the directory for all of them. Every `shot` in a story is a **node** — a whole stage on a world of its own
 (an in-memory store with the demo seed, a sealed `Deny` outside with a
 clock, virtual time, the story's grid and send window) that replayed the
 story up to that shot and stopped there. The steps between two shots label

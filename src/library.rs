@@ -134,9 +134,11 @@ impl Camera {
     }
 }
 
-/// One node's live stage.
+/// One node's live stage — booted the first time it is the one replaying,
+/// or entered, so opening the canvas costs no stores at all and each
+/// frame boots at most one.
 struct Mount {
-    stage: WidgetRef,
+    stage: Option<WidgetRef>,
     story: usize,
     node: usize,
     /// The viewport the story asked for, points.
@@ -266,11 +268,14 @@ pub struct Library {
     zoom_ticks: u32,
     #[rust]
     last_zoom: f64,
-    /// Frames since boot, and whether the fill-in has been reported.
+    /// Frames since boot, whether the fill-in has been reported, and what
+    /// booting the mounts cost in all.
     #[rust]
     frames: u64,
     #[rust]
     filled: bool,
+    #[rust]
+    boot_ms: f64,
     /// The last draw left renders undone — over budget, or waiting for
     /// the zoom to settle — so keep the frames coming.
     #[rust]
@@ -419,9 +424,17 @@ impl Library {
         let Some(paths) = app::library_paths() else {
             return;
         };
-        let stories = match story::load(paths) {
+        // No stories named: the shelf — what is worth reviewing now.
+        let shelf = paths.is_empty();
+        let all = ["e2e".to_string()];
+        let paths = if shelf { &all[..] } else { paths };
+        let stories = match story::load(paths, shelf) {
             Ok(s) if s.is_empty() => {
-                eprintln!("library: no stories under {paths:?}");
+                if shelf {
+                    eprintln!("library: nothing on the shelf — mark a script under e2e/ with `#! library`");
+                } else {
+                    eprintln!("library: no stories under {paths:?}");
+                }
                 std::process::exit(2);
             }
             Ok(s) => s,
@@ -431,31 +444,9 @@ impl Library {
             }
         };
         for (si, s) in stories.iter().enumerate() {
-            for (ni, n) in s.nodes.iter().enumerate() {
-                let Some(stage) = self.instantiate(cx) else {
-                    eprintln!("library: the DSL has no stage_tpl to mount");
-                    std::process::exit(2);
-                };
-                let boot = Boot {
-                    db: None,
-                    grid: s.cfg.grid,
-                    send_delay: s.cfg.send_delay,
-                    virtual_time: true,
-                    outside: match s.cfg.outside {
-                        OutsideKind::Deny => BootOutside::Deny,
-                        OutsideKind::Fake => BootOutside::Fake,
-                        OutsideKind::Real => BootOutside::Real,
-                    },
-                    secrets_in_memory: true,
-                    steps: Some(s.steps[..=n.until].to_vec()),
-                    primary: false,
-                    tag: format!("{}/{}: ", s.name, n.name),
-                };
-                if let Some(mut st) = stage.borrow_mut::<Stage>() {
-                    st.boot(cx, boot);
-                }
+            for ni in 0..s.nodes.len() {
                 self.mounts.push(Mount {
-                    stage,
+                    stage: None,
                     story: si,
                     node: ni,
                     size: dvec2(s.cfg.window.0, s.cfg.window.1),
@@ -494,6 +485,53 @@ impl Library {
         self.booted = true;
         self.next_frame = cx.new_next_frame();
         cx.redraw_all();
+    }
+
+    /// Boots a mount's stage on its story's world, if it has none yet. One
+    /// in-memory store with the demo seed, a widget tree — a few
+    /// milliseconds, paid when the mount's turn comes rather than a hundred
+    /// times at open.
+    fn ensure_booted(&mut self, cx: &mut Cx, i: usize) {
+        if self.mounts[i].stage.is_some() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (si, ni) = (self.mounts[i].story, self.mounts[i].node);
+        let Some(stage) = self.instantiate(cx) else {
+            eprintln!("library: the DSL has no stage_tpl to mount");
+            std::process::exit(2);
+        };
+        let s = &self.stories[si];
+        let n = &s.nodes[ni];
+        let boot = Boot {
+            db: None,
+            grid: s.cfg.grid,
+            send_delay: s.cfg.send_delay,
+            virtual_time: true,
+            outside: match s.cfg.outside {
+                OutsideKind::Deny => BootOutside::Deny,
+                OutsideKind::Fake => BootOutside::Fake,
+                OutsideKind::Real => BootOutside::Real,
+            },
+            secrets_in_memory: true,
+            steps: Some(s.steps[..=n.until].to_vec()),
+            primary: false,
+            tag: format!("{}/{}: ", s.name, n.name),
+        };
+        if let Some(mut st) = stage.borrow_mut::<Stage>() {
+            st.boot(cx, boot);
+        }
+        self.mounts[i].stage = Some(stage);
+        self.boot_ms += started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// A mount that has not reached its shot: waiting for its turn, or
+    /// replaying.
+    fn mount_replaying(&self, i: usize) -> bool {
+        match &self.mounts[i].stage {
+            None => true,
+            Some(w) => w.borrow::<Stage>().is_some_and(|s| s.replaying()),
+        }
     }
 
     fn instantiate(&self, cx: &mut Cx) -> Option<WidgetRef> {
@@ -653,7 +691,12 @@ impl Library {
     fn enter(&mut self, cx: &mut Cx, i: usize) {
         if self.entered != Some(i) {
             self.leave(cx);
-            if let Some(mut st) = self.mounts[i].stage.borrow_mut::<Stage>() {
+            self.ensure_booted(cx, i);
+            if let Some(mut st) = self.mounts[i]
+                .stage
+                .as_ref()
+                .and_then(|w| w.borrow_mut::<Stage>())
+            {
                 st.set_active(cx, true);
             }
             self.entered = Some(i);
@@ -665,7 +708,11 @@ impl Library {
 
     fn leave(&mut self, cx: &mut Cx) {
         if let Some(i) = self.entered.take() {
-            if let Some(mut st) = self.mounts[i].stage.borrow_mut::<Stage>() {
+            if let Some(mut st) = self.mounts[i]
+                .stage
+                .as_ref()
+                .and_then(|w| w.borrow_mut::<Stage>())
+            {
                 st.set_active(cx, false);
             }
             cx.set_key_focus(self.area);
@@ -691,7 +738,9 @@ impl Library {
     /// widgets raised, so nothing leaks to the others (a `PanelAction`
     /// carries a panel id, and every mount numbers its panels from one).
     fn send(&mut self, cx: &mut Cx, i: usize, event: &Event) {
-        let w = self.mounts[i].stage.clone();
+        let Some(w) = self.mounts[i].stage.clone() else {
+            return;
+        };
         let mut acts = cx.capture_actions(|cx| w.handle_event(cx, event, &mut Scope::empty()));
         for _ in 0..4 {
             if acts.is_empty() {
@@ -709,12 +758,7 @@ impl Library {
     /// another replaying beside it. The rest wait their turn, in canvas
     /// order.
     fn current_replayer(&self) -> Option<usize> {
-        (0..self.mounts.len()).find(|&i| {
-            self.mounts[i]
-                .stage
-                .borrow::<Stage>()
-                .is_some_and(|s| s.replaying())
-        })
+        (0..self.mounts.len()).find(|&i| self.mount_replaying(i))
     }
 
     /// Every mount that is awake — the entered one, and the one replaying.
@@ -722,6 +766,9 @@ impl Library {
     /// hears anything.
     fn broadcast(&mut self, cx: &mut Cx, event: &Event) {
         let current = self.current_replayer();
+        if let Some(i) = current {
+            self.ensure_booted(cx, i);
+        }
         for i in 0..self.mounts.len() {
             if self.entered == Some(i) || current == Some(i) {
                 self.send(cx, i, event);
@@ -749,9 +796,8 @@ impl Library {
     }
 
     fn replaying(&self) -> usize {
-        self.mounts
-            .iter()
-            .filter(|m| m.stage.borrow::<Stage>().is_some_and(|s| s.replaying()))
+        (0..self.mounts.len())
+            .filter(|&i| self.mount_replaying(i))
             .count()
     }
 
@@ -958,10 +1004,10 @@ impl Library {
         let mut deferred: Vec<(f64, usize)> = Vec::new();
         let mut more_work = false;
         for i in 0..n {
-            let replaying = self.mounts[i]
-                .stage
-                .borrow::<Stage>()
-                .is_some_and(|s| s.replaying());
+            if self.mounts[i].stage.is_none() {
+                continue;
+            }
+            let replaying = self.mount_replaying(i);
             let entered = self.entered == Some(i);
             let screen = self.mount_rect(i).map(|r| self.screen_rect(r));
             let visible = screen.is_some_and(|r| intersects(r, self.vp));
@@ -1021,14 +1067,13 @@ impl Library {
         if !render && (!visible || self.mounts[i].pass.is_none()) {
             return;
         }
+        let Some(stage) = self.mounts[i].stage.clone() else {
+            return;
+        };
         let win_dpi = cx.current_dpi_factor();
-        let replaying = self.mounts[i]
-            .stage
-            .borrow::<Stage>()
-            .is_some_and(|s| s.replaying());
+        let replaying = self.mount_replaying(i);
         let dpi = mount_dpi(win_dpi, self.zoom(), replaying);
         let size = self.mounts[i].size;
-        let stage = self.mounts[i].stage.clone();
         let mut mp = self.mounts[i]
             .pass
             .take()
@@ -1227,10 +1272,7 @@ impl Library {
                 }
                 if let Some(i) = i {
                     self.draw_mount(cx, i, screen, plan[i]);
-                    let replaying = self.mounts[i]
-                        .stage
-                        .borrow::<Stage>()
-                        .is_some_and(|s| s.replaying());
+                    let replaying = self.mount_replaying(i);
                     self.frame(
                         cx,
                         Rect {
@@ -1348,10 +1390,11 @@ impl Widget for Library {
                     if !replaying && !self.filled {
                         self.filled = true;
                         eprintln!(
-                            "library: all {} nodes arrived after {} frames ({:.1} s at 60 fps)",
+                            "library: all {} nodes arrived after {} frames ({:.1} s at 60 fps; {:.0} ms booting)",
                             self.mounts.len(),
                             self.frames,
-                            self.frames as f64 / 60.0
+                            self.frames as f64 / 60.0,
+                            self.boot_ms
                         );
                     }
                     let work = self.more_work;

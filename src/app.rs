@@ -85,7 +85,8 @@ struct Config {
     /// holds the lease, and the locked screen appears when it does not write.
     bucket: Option<String>,
     /// Open the panels library on these scripts and directories instead of
-    /// the workspace (`--library [PATH...]`, default `e2e/`). CR-006.
+    /// the workspace (`--library [PATH...]`); none means the shelf — the
+    /// scripts under `e2e/` marked `#! library`. CR-006.
     library: Option<Vec<String>>,
     /// The headless backend's `--no-draw`: the widget pass runs, nothing is
     /// rasterized. Read here so a `shot` knows there is nothing to keep.
@@ -205,9 +206,6 @@ fn config() -> &'static Config {
                     let mut paths = Vec::new();
                     while let Some(p) = args.next_if(|p| !p.starts_with("--")) {
                         paths.push(p);
-                    }
-                    if paths.is_empty() {
-                        paths.push("e2e".into());
                     }
                     c.library = Some(paths);
                 }

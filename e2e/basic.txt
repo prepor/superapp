@@ -1,3 +1,4 @@
+#! library
 # The join/replace journey — the model's whole grammar in one run.
 wait 900
 shot 01-boot

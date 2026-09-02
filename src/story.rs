@@ -14,6 +14,7 @@
 //! #! window 380x780 grid 4x3      # the mount's viewport and unit grid
 //! #! send-delay 1                 # the send-undo window, seconds
 //! #! outside real                 # deny (default) | fake | real
+//! #! library                      # on the shelf: what `--library` shows by default
 //! #! canvas                       # drives the canvas itself; never mounted
 //! ```
 //!
@@ -94,6 +95,10 @@ pub struct Story {
     /// True for a script that drives the canvas itself (`#! canvas`); the
     /// loader leaves those out.
     pub canvas: bool,
+    /// On the shelf (`#! library`): what the canvas shows when asked for no
+    /// stories in particular. There will be many more scripts than anyone
+    /// wants to review at once; the shelf is the few that matter now.
+    pub shelf: bool,
     /// Every step through the last shot. No `quit`: a mount never ends.
     pub steps: Vec<Step>,
     /// The nodes, in shot order.
@@ -106,12 +111,19 @@ fn parse_wxh(s: &str) -> Option<(f64, f64)> {
 }
 
 /// Parses a `#!` header line into the config. Errors carry the line.
-fn parse_header(line: &str, lineno: usize, cfg: &mut MountCfg, canvas: &mut bool) -> Result<(), String> {
+fn parse_header(
+    line: &str,
+    lineno: usize,
+    cfg: &mut MountCfg,
+    canvas: &mut bool,
+    shelf: &mut bool,
+) -> Result<(), String> {
     let err = |m: &str| format!("line {lineno}: {m}: {line}");
     let mut it = line.trim_start_matches("#!").split_whitespace();
     while let Some(key) = it.next() {
         match key {
             "canvas" => *canvas = true,
+            "library" => *shelf = true,
             "window" => {
                 cfg.window = it
                     .next()
@@ -155,6 +167,7 @@ pub fn parse(name: &str, src: &str) -> Result<Story, String> {
         intro: Vec::new(),
         cfg: MountCfg::default(),
         canvas: false,
+        shelf: false,
         steps: Vec::new(),
         nodes: Vec::new(),
     };
@@ -167,7 +180,7 @@ pub fn parse(name: &str, src: &str) -> Result<Story, String> {
     for (i, raw) in src.lines().enumerate() {
         let line = raw.trim();
         if line.starts_with("#!") {
-            parse_header(line, i + 1, &mut story.cfg, &mut story.canvas)?;
+            parse_header(line, i + 1, &mut story.cfg, &mut story.canvas, &mut story.shelf)?;
             continue;
         }
         if let Some(c) = line.strip_prefix('#') {
@@ -214,8 +227,9 @@ pub fn parse(name: &str, src: &str) -> Result<Story, String> {
 }
 
 /// Loads stories from files and directories (a directory contributes its
-/// `*.txt`, sorted). Canvas scripts are left out.
-pub fn load(paths: &[String]) -> Result<Vec<Story>, String> {
+/// `*.txt`, sorted). Canvas scripts are left out; with `shelf_only`, so is
+/// everything not marked `#! library`.
+pub fn load(paths: &[String], shelf_only: bool) -> Result<Vec<Story>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     for p in paths {
         let p = Path::new(p);
@@ -240,7 +254,7 @@ pub fn load(paths: &[String]) -> Result<Vec<Story>, String> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let story = parse(&name, &src).map_err(|e| format!("{}: {e}", f.display()))?;
-        if !story.canvas && !story.nodes.is_empty() {
+        if !story.canvas && !story.nodes.is_empty() && (story.shelf || !shelf_only) {
             stories.push(story);
         }
     }
@@ -456,7 +470,9 @@ quit
         assert_eq!(s.cfg.send_delay, 1.0);
         assert_eq!(s.cfg.outside, OutsideKind::Fake);
         assert!(!s.canvas);
+        assert!(!s.shelf);
         assert!(parse("x", "#! canvas\nwait 1\nshot a\n").unwrap().canvas);
+        assert!(parse("x", "#! library\nwait 1\nshot a\n").unwrap().shelf);
         assert!(parse("x", "#! outside moon\n").is_err());
         assert!(parse("x", "#! wibble\n").unwrap_err().starts_with("line 1"));
     }
