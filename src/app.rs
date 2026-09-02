@@ -1716,6 +1716,11 @@ pub struct Stage {
     tpl: HashMap<LiveId, ScriptObjectRef>,
     #[rust]
     hosted: HashMap<PanelId, WidgetRef>,
+    /// What each hosted widget was built and last seeded for — its
+    /// template and its kind. A panel replaced in place keeps its id and
+    /// so its widget; this is how the shell notices the kind under that
+    /// widget changed (a reply retargeted to a forward) and seeds it again.
+    hosted_for: HashMap<PanelId, (LiveId, Kind)>,
     /// A freshly created compose wants its body focused — on the next
     /// event tick, not during the draw that created it.
     #[rust]
@@ -2986,13 +2991,19 @@ impl Stage {
                 return;
             }
         }
+        // Only a row that is this panel's seed's: one left by a kind the
+        // panel had before says nothing about what it shows now.
         let drafts: Vec<(PanelId, mail::Draft)> = state
             .ws
             .wss
             .iter()
             .flat_map(|w| w.panels.iter())
-            .filter(|(_, p)| matches!(p.kind, Kind::Compose { .. }))
-            .map(|(id, _)| (*id, mail::draft(&state.store, *id as i64).unwrap_or_default()))
+            .filter_map(|(id, p)| match p.kind {
+                Kind::Compose { seed } => {
+                    mail::draft_for(&state.store, *id as i64, seed).map(|d| (*id, d))
+                }
+                _ => None,
+            })
             .collect();
         for (id, want) in &drafts {
             if let Some(w) = self.hosted.get(id) {
@@ -5373,6 +5384,7 @@ impl Stage {
         self.hosted.retain(|pid, _| {
             *pid == OVERLAY_PID_L || *pid == OVERLAY_PID_R || state.ws.panel(*pid).is_some()
         });
+        self.hosted_for.retain(|pid, _| state.ws.panel(*pid).is_some());
 
         // Workspaces stack vertically, one viewport (and a gap) apart; the
         // slide spring carries the view between rows on a switch. Each
@@ -6177,16 +6189,37 @@ impl Stage {
     /// Draws a panel's retained content widget inside the body rect and
     /// registers its interactive children as e2e-addressable hits.
     fn draw_hosted(&mut self, cx: &mut Cx2d, state: &State, pid: PanelId, tpl: LiveId, body: Rect) {
-        let Some((w, created)) = self.hosted_widget(cx, pid, tpl) else {
+        let Some((mut w, mut created)) = self.hosted_widget(cx, pid, tpl) else {
             return;
         };
         let kind = state.ws.panel(pid).map(|p| p.kind.clone());
-        if created {
-            // A fresh compose instance seeds from its persisted draft, or
-            // from its seed — the reply header, the forwarded letter — and
-            // starts in a field once an event tick comes (`pending_focus`).
+        // A panel replaced in place keeps its id, and with it the widget
+        // built for what it showed before. Another template means another
+        // widget; the same template under another kind — a reply
+        // retargeted to a forward by the next link — means seeding again,
+        // exactly as a fresh instance would. A preview re-targeting its
+        // message reads its props every draw and needs neither.
+        let before = self.hosted_for.get(&pid).cloned();
+        if !created && before.as_ref().is_some_and(|(t, _)| *t != tpl) {
+            self.hosted.remove(&pid);
+            let Some((fresh, _)) = self.hosted_widget(cx, pid, tpl) else {
+                return;
+            };
+            w = fresh;
+            created = true;
+        }
+        let reseed = created || before.is_none_or(|(_, k)| Some(&k) != kind.as_ref());
+        if let Some(k) = &kind {
+            self.hosted_for.insert(pid, (tpl, k.clone()));
+        }
+        if reseed {
+            // A compose seeds from its persisted draft — the row that is
+            // *this* seed's, never one left by the kind before it — or
+            // from the seed itself: the reply header, the forwarded
+            // letter. It starts in a field once an event tick comes
+            // (`pending_focus`).
             if let Some(Kind::Compose { seed }) = &kind {
-                let d = mail::draft(&state.store, pid as i64)
+                let d = mail::draft_for(&state.store, pid as i64, *seed)
                     .unwrap_or_else(|| mail::seed_draft(&state.store, *seed));
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);

@@ -55,6 +55,12 @@ pub struct RemoteFolder {
 pub struct FolderMeta {
     pub uidvalidity: u32,
     pub uidnext: u32,
+    /// Whether the folder keeps keywords such as `$Forwarded` — from
+    /// `PERMANENTFLAGS`, which may name the keyword, allow any (`\*`), or
+    /// be absent, which RFC 3501 reads as "all flags are permanent". A
+    /// server without it may accept a `STORE` and forget the flag by the
+    /// next session, so a mark is neither pushed to nor read from one.
+    pub keywords: bool,
 }
 
 /// One fetched message.
@@ -959,6 +965,9 @@ pub struct FakeServer {
     /// Whether MOVE reports the new uid (UIDPLUS' COPYUID). Both server
     /// behaviours exist in the wild, so both are testable.
     pub copyuid: bool,
+    /// A server whose `PERMANENTFLAGS` allow no keywords: it takes a
+    /// `STORE` of one and keeps nothing.
+    pub no_keywords: bool,
     /// Mail this account handed to SMTP.
     pub submitted: Vec<Outgoing>,
 }
@@ -1103,10 +1112,13 @@ impl Outside for Fake {
     }
 
     fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
-        let f = self.live(account)?.get(folder)?;
+        let s = self.live(account)?;
+        let keywords = !s.no_keywords;
+        let f = s.get(folder)?;
         Ok(FolderMeta {
             uidvalidity: f.0,
             uidnext: f.1,
+            keywords,
         })
     }
 
@@ -1158,6 +1170,7 @@ impl Outside for Fake {
         -> Result<(), String>
     {
         let s = self.live(account)?;
+        let no_keywords = s.no_keywords;
         let f = s
             .folders
             .get_mut(folder)
@@ -1166,6 +1179,8 @@ impl Outside for Fake {
             if m.uid == uid {
                 match flag {
                     MailFlag::Seen => m.unread = !on,
+                    // Accepted and forgotten, as RFC 3501 lets a server.
+                    MailFlag::Forwarded if no_keywords => {}
                     MailFlag::Forwarded => m.forwarded = on,
                 }
             }
@@ -1574,11 +1589,21 @@ mod imap_session {
 
     impl Imap {
         pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
+            use imap::types::Flag;
             let mb = self.session.select(name).map_err(s)?;
             self.selected = Some(name.to_string());
+            // No PERMANENTFLAGS at all means every flag is permanent
+            // (RFC 3501 §7.1); otherwise the keyword itself or `\*`.
+            let keywords = mb.permanent_flags.is_empty()
+                || mb.permanent_flags.iter().any(|f| match f {
+                    Flag::MayCreate => true,
+                    Flag::Custom(k) => k.eq_ignore_ascii_case(FORWARDED),
+                    _ => false,
+                });
             Ok(FolderMeta {
                 uidvalidity: mb.uid_validity.unwrap_or(0),
                 uidnext: mb.uid_next.unwrap_or(1),
+                keywords,
             })
         }
 

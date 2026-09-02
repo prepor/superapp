@@ -103,6 +103,8 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
         /// Intent, then fact, for `$Forwarded`.
         forwarded: bool,
         has_forwarded: bool,
+        /// Whether the folder it sits in keeps keywords at all.
+        keywords: bool,
     }
     let rows: Vec<Row> = {
         let db = w.store().conn();
@@ -110,7 +112,7 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
             .prepare(
                 "SELECT m.id, s.uid, m.folder, fw.name, fh.name,
                         m.folder != s.folder, m.unread, s.seen,
-                        m.forwarded, s.forwarded
+                        m.forwarded, s.forwarded, fh.keywords
                  FROM message m
                  JOIN server_msg s ON s.message = m.id
                  JOIN folder fw ON fw.id = m.folder
@@ -133,6 +135,7 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                     seen: r.get(7)?,
                     forwarded: r.get(8)?,
                     has_forwarded: r.get(9)?,
+                    keywords: r.get(10)?,
                 })
             })
             .map_err(err)?;
@@ -187,7 +190,11 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                 })
                 .map_err(err)?;
         }
-        if p.forwarded != p.has_forwarded {
+        // A server that keeps no keywords is never asked: it would take
+        // the STORE and forget it, and the mark would look pushed. The
+        // mark stays local truth there, and the next fetch never reads
+        // its absence as another client clearing it (see `land`).
+        if p.forwarded != p.has_forwarded && p.keywords {
             let job = w
                 .prepare(&mail::Forwarded {
                     account,
@@ -238,6 +245,9 @@ struct Gathered {
     server: HashSet<u32>,
     unseen: HashSet<u32>,
     forwarded: HashSet<u32>,
+    /// Whether the folder keeps keywords; `forwarded` means nothing when
+    /// it does not.
+    keywords: bool,
 }
 
 /// The fetch/reconcile pass: for each folder, gather over the network, then
@@ -313,7 +323,11 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
         };
         let server = search(UidSet::All)?;
         let unseen = search(UidSet::Unseen)?;
-        let forwarded = search(UidSet::Forwarded)?;
+        let forwarded = if meta.keywords {
+            search(UidSet::Forwarded)?
+        } else {
+            HashSet::new()
+        };
 
         // Commit. One transaction, no network.
         let g = Gathered {
@@ -325,6 +339,7 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
             server,
             unseen,
             forwarded,
+            keywords: meta.keywords,
         };
         w.store()
             .write(move |tx| land(tx, account, from, &g))
@@ -350,8 +365,8 @@ fn land(tx: &Transaction, account: i64, from: u32, g: &Gathered) -> rusqlite::Re
         ingest_message(tx, account, g.fid, m)?;
     }
     tx.execute(
-        "UPDATE folder SET uidvalidity = ?1, uidnext = ?2 WHERE id = ?3",
-        rusqlite::params![g.uidvalidity, g.uidnext, g.fid],
+        "UPDATE folder SET uidvalidity = ?1, uidnext = ?2, keywords = ?3 WHERE id = ?4",
+        rusqlite::params![g.uidvalidity, g.uidnext, g.keywords, g.fid],
     )?;
 
     // Reconcile facts over the retained window, by the *server's* view.
@@ -408,9 +423,11 @@ fn land(tx: &Transaction, account: i64, from: u32, g: &Gathered) -> rusqlite::Re
             }
         }
         // `$Forwarded`, by the same rule: another client's mark (or its
-        // clearing) is followed unless this one disagrees unpushed.
+        // clearing) is followed unless this one disagrees unpushed. On a
+        // server that keeps no keywords there is nothing to follow — its
+        // silence is not a clearing — and the local mark stands.
         let now_fwd = g.forwarded.contains(&l.uid);
-        if now_fwd != l.has_forwarded {
+        if g.keywords && now_fwd != l.has_forwarded {
             tx.execute(
                 "UPDATE server_msg SET forwarded = ?1 WHERE message = ?2",
                 rusqlite::params![now_fwd, id],
@@ -1229,6 +1246,34 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         let before = w.jobs().len();
         settle(&w);
         assert_eq!(w.jobs().len(), before, "convergence is quiet");
+    }
+
+    /// A server whose folders keep no keywords is never asked to keep
+    /// `$Forwarded`, and its silence never clears a local mark: the mark
+    /// is local truth there, pass after pass.
+    #[test]
+    fn a_server_without_keywords_keeps_the_mark_local() {
+        let w = world();
+        w.with_fake(|f| {
+            f.server(1).no_keywords = true;
+            f.server(1).deliver("INBOX", false, RAW);
+        });
+        settle(&w);
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE message SET forwarded = 1 WHERE id = 1", [])
+                    .map(|_| ())
+            })
+            .unwrap();
+        settle(&w);
+        settle(&w);
+        assert!(forwarded_of(&w, 1), "the mark stands");
+        assert!(
+            !deeds(&w).iter().any(|(k, _)| k == "forwarded"),
+            "never asked: {:?}",
+            deeds(&w)
+        );
+        assert!(!w.with_fake(|f| f.server(1).folders["INBOX"].2[0].forwarded));
     }
 
     /// A forward carries its source's chain in `References` and no

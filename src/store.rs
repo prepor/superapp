@@ -454,6 +454,13 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
         "forwarded",
         "ALTER TABLE server_msg ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0",
     ),
+    // Whether the folder's server keeps keywords (its PERMANENTFLAGS),
+    // recorded at each SELECT; assumed until the first one says.
+    (
+        "folder",
+        "keywords",
+        "ALTER TABLE folder ADD COLUMN keywords INTEGER NOT NULL DEFAULT 1",
+    ),
 ];
 
 /// Whether the store has `table` — what the table steps of the ladder go by.
@@ -1665,6 +1672,7 @@ mod tests {
             "ALTER TABLE message DROP COLUMN forwarded;
              ALTER TABLE server_msg DROP COLUMN forwarded;
              ALTER TABLE draft DROP COLUMN fwd_message;
+             ALTER TABLE folder DROP COLUMN keywords;
              DROP TABLE repl_log;
              DROP TABLE repl;",
         )

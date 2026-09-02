@@ -1091,10 +1091,14 @@ pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
 /// exactly this.
 #[must_use]
 pub fn forwarded(m: &MailFull) -> String {
-    let from = if m.head.from_name.is_empty() {
-        m.head.from_email.clone()
+    // A sender without a name is stored under their address as the name
+    // (see [`crate::sync::parse_mail`]); written out, that is the address
+    // once, not twice.
+    let (name, email) = (&m.head.from_name, &m.head.from_email);
+    let from = if name.is_empty() || name == email {
+        email.clone()
     } else {
-        format!("{} <{}>", m.head.from_name, m.head.from_email)
+        format!("{name} <{email}>")
     };
     format!(
         "\n\nBegin forwarded message:\n\nFrom: {from}\nSubject: {}\nDate: {}\nTo: {}\n\n{}",
@@ -1107,17 +1111,38 @@ pub fn forwarded(m: &MailFull) -> String {
 
 /// Loads a panel's draft, if any (boot restore, prefill).
 pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
+    draft_row(store, panel).map(|(d, _)| d)
+}
+
+/// A panel's draft, if the row is `seed`'s own: what it answers and what
+/// it passes on must match. A panel replaced in place keeps its id, so a
+/// row a reply left is not the forward's draft — that one seeds afresh.
+pub fn draft_for(store: &Store, panel: i64, seed: Seed) -> Option<Draft> {
+    draft_row(store, panel)
+        .filter(|(_, (re, fwd))| (*re, *fwd) == (seed.in_reply_to(), seed.forwards()))
+        .map(|(d, _)| d)
+}
+
+/// What a draft row answers and what it passes on — the seed it was
+/// saved under, as `(re_message, fwd_message)`.
+type DraftSeed = (Option<MailId>, Option<MailId>);
+
+/// The row: the text, and the seed it was saved under.
+fn draft_row(store: &Store, panel: i64) -> Option<(Draft, DraftSeed)> {
     store
         .conn()
         .query_row(
-            "SELECT to_addr, subject, body FROM draft WHERE panel=?1",
+            "SELECT to_addr, subject, body, re_message, fwd_message FROM draft WHERE panel=?1",
             [panel],
             |r| {
-                Ok(Draft {
-                    to: r.get(0)?,
-                    subject: r.get(1)?,
-                    body: r.get(2)?,
-                })
+                Ok((
+                    Draft {
+                        to: r.get(0)?,
+                        subject: r.get(1)?,
+                        body: r.get(2)?,
+                    },
+                    (r.get(3)?, r.get(4)?),
+                ))
             },
         )
         .ok()
@@ -1134,7 +1159,9 @@ pub fn save_draft(store: &Store, panel: i64, seed: Seed, d: &Draft, now: f64) {
 /// The transaction-level draft upsert (also part of the send action, so
 /// the recorded changeset carries the final content). The seed's mail is
 /// recorded as what the draft answers or what it passes on — the send
-/// reads its threading headers off either.
+/// reads its threading headers off either — and a row a panel already has
+/// takes the seed along with the text: a compose retargeted in place is
+/// a new draft under an old id.
 pub fn upsert_draft_tx(
     c: &rusqlite::Connection,
     panel: i64,
@@ -1163,6 +1190,8 @@ pub fn upsert_draft_tx(
                            to_addr, subject, body, updated)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(panel) DO UPDATE SET
+           account=excluded.account, re_message=excluded.re_message,
+           fwd_message=excluded.fwd_message,
            to_addr=excluded.to_addr, subject=excluded.subject,
            body=excluded.body, updated=excluded.updated",
         rusqlite::params![
@@ -2487,6 +2516,58 @@ mod tests {
         // A mail the store does not have seeds nothing.
         assert_eq!(seed_draft(&s, Seed::Forward(9999)), Draft::default());
         assert_eq!(fmt_date_long(ts(2026, 1, 5, 7, 3)), "5 Jan 2026 at 07:03");
+
+        // A sender stored under their address is written out once.
+        let mut bare = mail(&s, 1).expect("vera");
+        bare.head.from_name = bare.head.from_email.clone();
+        assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
+        bare.head.from_name.clear();
+        assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
+    }
+
+    /// A compose replaced in place keeps its panel id: the row its old
+    /// seed left is not the new seed's draft, and the next save takes the
+    /// seed along with the text — so the send threads and marks by what
+    /// the panel shows, not by what it showed.
+    #[test]
+    fn a_retargeted_draft_follows_its_seed() {
+        let s = store();
+        let now = 1.0;
+        let text = Draft {
+            to: "x@y".into(),
+            subject: "Re: Q3".into(),
+            body: "hi".into(),
+        };
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Reply(1), &text, now))
+            .unwrap();
+        assert!(draft_for(&s, 7, Seed::Reply(1)).is_some());
+        assert!(
+            draft_for(&s, 7, Seed::Forward(1)).is_none(),
+            "not the forward's"
+        );
+        assert!(draft_for(&s, 7, Seed::Blank).is_none());
+
+        let text = Draft {
+            to: String::new(),
+            subject: "Fwd: Q3".into(),
+            body: "fyi".into(),
+        };
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Forward(1), &text, now))
+            .unwrap();
+        let (re, fwd): (Option<i64>, Option<i64>) = s
+            .conn()
+            .query_row(
+                "SELECT re_message, fwd_message FROM draft WHERE panel = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((re, fwd), (None, Some(1)), "the row is the forward's now");
+        assert!(draft_for(&s, 7, Seed::Reply(1)).is_none());
+        assert_eq!(
+            draft_for(&s, 7, Seed::Forward(1)).map(|d| d.body),
+            Some("fyi".into())
+        );
     }
 
     /// Archive moves a mail out of the inbox, the
