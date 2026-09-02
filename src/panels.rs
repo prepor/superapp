@@ -21,7 +21,7 @@ use makepad_widgets::*;
 use crate::core::Seed;
 use crate::effect::{self, Job};
 use crate::mail;
-use crate::richtable::{self, Completion, SqlSource, Suggestion, Table};
+use crate::richtable::{self, Completion, Datasource, Marks, SqlSource, Suggestion, Table};
 use crate::files;
 use crate::store::Store;
 use crate::ui;
@@ -1179,6 +1179,39 @@ script_mod! {
                 }
             }
         }
+        // The mark (CR-009): an ink bar down the row's left edge, inside
+        // the row's own inset. Shader-drawn like the dotted underline, so
+        // a mark costs no layout and the text stays on the header's
+        // columns. Two more twins rather than a flag: a quad's colour is
+        // not settable at draw time (see `OverlayRow`).
+        line_mark := mod.widgets.InboxLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                    return vec4(0.0, 0.0, 0.0, 0.0)
+                }
+            }
+        }
+        line_mark_sel := mod.widgets.InboxLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(0.078, 0.078, 0.078, 1.0)
+                    }
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
         View {
             width: Fill, height: 1
             show_bg: true
@@ -1191,6 +1224,110 @@ script_mod! {
         }
     }
 
+    // ---- marks (CR-009) ----------------------------------------------------
+
+    /** A bordered side-effect button that wears its key: the label split
+        the way `SLink` splits it, so one character draws bold. Its clicks
+        resolve through the shell's hit table like every other in-list
+        control. */
+    mod.widgets.KeyBtn = set_type_default() do #(KeyBtn::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{left: 10, right: 10, top: 4, bottom: 4}
+        cursor: MouseCursor.Hand
+        show_bg: true
+        draw_bg +: {
+            color: #ffffff
+            // The 1 pt ink border, shader-drawn: a View's bg has no border
+            // of its own, and a distinct shader earns the correctly
+            // ordered draw call anyway.
+            pixel: fn() {
+                let p = self.pos * self.rect_size
+                let d = min(min(p.x, p.y), min(self.rect_size.x - p.x, self.rect_size.y - p.y))
+                if d < 1.0 {
+                    return vec4(0.078, 0.078, 0.078, 1.0)
+                }
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        pre := mod.widgets.SLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
+        }
+        key := mod.widgets.SBoldLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 8.25} }
+        }
+        post := mod.widgets.SLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
+        }
+    }
+
+    /** The verbs of the marks bar as one group: inline after the count
+        where the width allows, under it where it does not. A Fit child
+        never wraps — the turtle cannot know its width in advance — so the
+        bar decides at draw, where the width is known, and shows one of
+        two copies.
+
+        The slots are numbered rather than named: which verbs a bar wears
+        is its list's to say (`ui::mark_verbs`) — the inbox files, a files
+        panel copies and moves — and a slot past the list's verbs is
+        simply not visible. */
+    mod.widgets.MarkVerbs = View {
+        width: Fit, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        spacing: 8
+        b0 := mod.widgets.KeyBtn {}
+        b1 := mod.widgets.KeyBtn {}
+        b2 := mod.widgets.KeyBtn {}
+        b3 := mod.widgets.KeyBtn {}
+        b4 := mod.widgets.KeyBtn {}
+    }
+
+    /** The marks bar (CR-009): what a list shows while any row is marked —
+        how many of how many, how many the filter hides; then the verbs
+        that act on the marked set, `all`, `clear`. It comes with the first
+        mark and goes with the last: nothing is drawn for an empty set. The
+        verbs wear the letters their single-row twins wear (the borrowed
+        `a` and `d`, which stand down while the bar is up). */
+    mod.widgets.MarkBar = set_type_default() do #(MarkBar::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{left: 8, right: 8, top: 0, bottom: 0}
+        spacing: 6
+        // The rule the header wears, on the other side: the bar is the
+        // panel's foot, and the rows end at it.
+        foot_rule := View {
+            width: Fill, height: 1
+            margin: Inset{bottom: 6}
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        line := View {
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            spacing: 8
+            count_lbl := mod.widgets.SLabel { padding: 0, width: Fit, text: "" }
+            hidden_lbl := mod.widgets.SLabel {
+                padding: 0, width: Fit, text: ""
+                draw_text +: { color: #909090 }
+            }
+            View { width: 4, height: 1 }
+            verbs_inline := mod.widgets.MarkVerbs {}
+        }
+        verbs_below := mod.widgets.MarkVerbs { visible: false }
+    }
     /** The inbox: the filter over the header over the virtualized list —
         a rich table (CR-006) over `mail::INBOX`. */
     mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
@@ -1241,7 +1378,32 @@ script_mod! {
             // minting widgets.
             reuse_items: true
             row := mod.widgets.InboxRow {}
+            // The marks the filter hides ride above the rows (CR-009): a
+            // caption, the rows themselves, and a strong rule closing the
+            // group. The caption wears the rows' inset the way the header
+            // does; the rule has its own pixel fn, or it merges into a
+            // call under the panel and never shows.
+            caption := View {
+                width: Fill, height: Fit
+                padding: Inset{left: 8, right: 8, top: 6, bottom: 2}
+                mod.widgets.SSection { text: "MARKED · HIDDEN BY THE FILTER" }
+            }
+            rule := View {
+                width: Fill, height: 1
+                show_bg: true
+                draw_bg +: {
+                    color: #141414
+                    pixel: fn() {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                }
+            }
         }
+        // The marks bar (CR-009), at the foot: it comes with the first mark
+        // and goes with the last, and standing under the list it takes its
+        // height off the rows' own scroll rather than pushing them down —
+        // nothing being read moves when a mark lands.
+        bar := mod.widgets.MarkBar { visible: false }
         // The autocomplete, drawn last and over the rows (see `SuggestBox`).
         suggest: mod.widgets.SuggestBox {}
     }
@@ -1508,7 +1670,8 @@ script_mod! {
         }
     }
 
-    /** A files row: the line, its selected twin, a hairline. */
+    /** A files row: the line, its selected twin, its marked twins, a
+        hairline. */
     mod.widgets.FilesRow = set_type_default() do #(FilesRow::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
@@ -1520,6 +1683,37 @@ script_mod! {
             draw_bg +: {
                 color: #e7e7e7
                 pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        // The mark (CR-009): an ink bar down the row's left edge, inside
+        // the row's own inset — an inbox row's, exactly (see `InboxRow`
+        // for why it is a twin rather than a flag).
+        line_mark := mod.widgets.FilesLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                    return vec4(0.0, 0.0, 0.0, 0.0)
+                }
+            }
+        }
+        line_mark_sel := mod.widgets.FilesLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(0.078, 0.078, 0.078, 1.0)
+                    }
                     return vec4(self.color.xyz * self.color.w, self.color.w)
                 }
             }
@@ -1631,7 +1825,29 @@ script_mod! {
             flow: Down
             reuse_items: true
             row := mod.widgets.FilesRow {}
+            // The marks the filter hides ride above the rows (CR-009), in
+            // this one list: a caption, the rows themselves, a strong rule
+            // closing the group — the inbox's construction.
+            caption := View {
+                width: Fill, height: Fit
+                padding: Inset{left: 8, right: 8, top: 6, bottom: 2}
+                mod.widgets.SSection { text: "MARKED · HIDDEN BY THE FILTER" }
+            }
+            rule := View {
+                width: Fill, height: 1
+                show_bg: true
+                draw_bg +: {
+                    color: #141414
+                    pixel: fn() {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                }
+            }
         }
+        // The marks bar (CR-009), at the foot: under the list, so it takes
+        // its height off the rows' own scroll rather than pushing them
+        // down as the first mark lands.
+        bar := mod.widgets.MarkBar { visible: false }
         // A refused verb, a directory that is gone: the one colour
         // errors get.
         status_lbl := mod.widgets.SLabel {
@@ -2000,6 +2216,22 @@ script_mod! {
             mod.widgets.SLabel { text: "          arrows walk the rows" }
         }
         mod.widgets.SRow {
+            mod.widgets.SLabel { text: "          " }
+            mod.widgets.SKbd { text: "space" }
+            mod.widgets.SLabel { text: " marks  " }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+arrows a range" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  marked  " }
+            mod.widgets.SKbd { text: "cmd+a" }
+            mod.widgets.SLabel { text: "rchive " }
+            mod.widgets.SKbd { text: "cmd+d" }
+            mod.widgets.SLabel { text: "elete a" }
+            mod.widgets.SKbd { text: "cmd+l" }
+            mod.widgets.SLabel { text: "l" }
+        }
+        mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "clicking a row, or walking onto it, opens the thread beside the list without leaving it — and that preview lends the list its own keys" }
         }
         mod.widgets.SRow {
@@ -2007,7 +2239,7 @@ script_mod! {
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "esc" }
-            mod.widgets.SLabel { text: " leaves a text field" }
+            mod.widgets.SLabel { text: " leaves a text field, or clears the marks" }
         }
         mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "trackpad: scroll the strip and the panels" }
@@ -3404,14 +3636,423 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool) {
+    /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
+    /// Exactly one of the four twins draws; only it is populated.
+    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool, marked: bool) {
         let Some(row) = self.borrow() else { return };
-        let line = row.view.widget(cx, ids!(line));
-        let line_sel = row.view.widget(cx, ids!(line_sel));
-        line.as_inbox_line().populate(cx, m);
-        line_sel.as_inbox_line().populate(cx, m);
-        line.set_visible(cx, !selected);
-        line_sel.set_visible(cx, selected);
+        let twins = [
+            (ids!(line), !selected && !marked),
+            (ids!(line_sel), selected && !marked),
+            (ids!(line_mark), !selected && marked),
+            (ids!(line_mark_sel), selected && marked),
+        ];
+        for (id, on) in twins {
+            let w = row.view.widget(cx, id);
+            if on {
+                w.as_inbox_line().populate(cx, m);
+            }
+            w.set_visible(cx, on);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marks (CR-009): the draft's widgets
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct KeyBtn {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for KeyBtn {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl KeyBtnRef {
+    /// The label, its `accel` letter drawn bold where the label carries it.
+    pub fn set(&self, cx: &mut Cx, text: &str, accel: Option<char>) {
+        let Some(b) = self.borrow() else { return };
+        let (pre, key, post) = ui::split_accel(text, accel);
+        for (id, s) in [(ids!(pre), pre), (ids!(key), key), (ids!(post), post)] {
+            let l = b.view.label(cx, id);
+            l.set_text(cx, &s);
+            l.set_visible(cx, !s.is_empty());
+        }
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct MarkBar {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The width the one-line layout needs, in points: measured off the
+    /// texts at populate, held against the turtle's width at draw.
+    #[rust]
+    need: f64,
+    /// Which copy of the verbs the last draw showed: beside the count, or
+    /// under it. The shell registers that copy's buttons.
+    #[rust]
+    inline: bool,
+    /// The verbs this bar was last populated with, slot by slot — the
+    /// list's own ([`ui::mark_verbs`]). What the hits answer to.
+    #[rust]
+    verbs: Vec<ui::MarkVerb>,
+}
+
+impl Widget for MarkBar {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // The verbs beside the count where they fit, under it where they
+        // do not — decided here, the one place the width is known.
+        let fits = self.need <= cx.turtle().inner_width();
+        self.inline = fits;
+        self.view
+            .view(cx, ids!(line.verbs_inline))
+            .set_visible(cx, fits);
+        self.view.view(cx, ids!(verbs_below)).set_visible(cx, !fits);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// The bar's button slots, filled from the list's own verbs.
+const VERB_BTNS: [&[LiveId]; 5] = [ids!(b0), ids!(b1), ids!(b2), ids!(b3), ids!(b4)];
+
+impl MarkBarRef {
+    /// The bar's buttons as drawn, `(label, rect, verb)` — the copy of the
+    /// verbs the last draw showed, only the ones offered.
+    pub fn verb_hits(&self, cx: &mut Cx) -> Vec<(String, Rect, ui::MarkVerb)> {
+        let Some(b) = self.borrow() else { return Vec::new() };
+        let group: &[LiveId] = if b.inline {
+            ids!(line.verbs_inline)
+        } else {
+            ids!(verbs_below)
+        };
+        let g = b.view.widget(cx, group);
+        b.verbs
+            .iter()
+            .zip(VERB_BTNS)
+            .filter_map(|(v, id)| {
+                let btn = g.widget(cx, id);
+                let r = btn.area().rect(cx);
+                (btn.visible() && r.size.x > 0.0).then(|| (v.hit_label().to_string(), r, *v))
+            })
+            .collect()
+    }
+
+    /// The `verbs` this list offers on its set, `marked` rows in all,
+    /// `hidden` of them outside the list's filter, `total` rows under it.
+    /// With every row under the filter marked, `all` stands down.
+    pub fn populate(
+        &self,
+        cx: &mut Cx,
+        verbs: &[ui::MarkVerb],
+        marked: usize,
+        total: usize,
+        hidden: usize,
+    ) {
+        let Some(mut b) = self.borrow_mut() else { return };
+        let shown = marked.saturating_sub(hidden);
+        let all = shown >= total;
+        let count = if hidden > 0 {
+            format!("{marked} marked")
+        } else if all {
+            format!("all {total} marked")
+        } else {
+            format!("{marked} of {total} marked")
+        };
+        let hid = if hidden > 0 {
+            format!("· {hidden} hidden by the filter")
+        } else {
+            String::new()
+        };
+        b.view.label(cx, ids!(line.count_lbl)).set_text(cx, &count);
+        let h = b.view.label(cx, ids!(line.hidden_lbl));
+        h.set_text(cx, &hid);
+        h.set_visible(cx, hidden > 0);
+        // The labels and the letters come from the one table the
+        // accelerator rules are tested against — a button never advertises
+        // a key the chord dispatch does not answer to.
+        b.verbs = verbs.to_vec();
+        let verbs: Vec<(&'static str, Option<char>, bool)> = verbs
+            .iter()
+            .map(|v| (v.label(), v.accel(), *v != ui::MarkVerb::All || !all))
+            .collect();
+        let groups: [&[LiveId]; 2] = [ids!(line.verbs_inline), ids!(verbs_below)];
+        for g in groups {
+            let group = b.view.widget(cx, g);
+            for (i, id) in VERB_BTNS.iter().enumerate() {
+                let btn = group.widget(cx, *id);
+                match verbs.get(i) {
+                    Some((text, accel, on)) => {
+                        btn.as_key_btn().set(cx, text, *accel);
+                        btn.set_visible(cx, *on);
+                    }
+                    // A slot past this list's verbs: nothing to wear.
+                    None => btn.set_visible(cx, false),
+                }
+            }
+        }
+        // What one line needs: the texts on the mono cell, the buttons
+        // with their padding, the gaps and the bar's inset.
+        let body = crate::theme::FONT_SIZE * crate::theme::MONO_ADV;
+        let label = crate::theme::LABEL_SIZE * crate::theme::MONO_ADV;
+        let text = (count.chars().count() + hid.chars().count()) as f64 * body
+            + if hidden > 0 { 8.0 } else { 0.0 };
+        let btns: f64 = verbs
+            .iter()
+            .filter(|(_, _, on)| *on)
+            .map(|(t, _, _)| t.chars().count() as f64 * label + 20.0 + 8.0)
+            .sum();
+        b.need = 16.0 + text + 8.0 + 4.0 + 8.0 + btns;
+    }
+}
+
+/// What one item of a marked list is. A filter that hides marks puts them
+/// above the rows *in the same `PortalList`*: a caption, the rows, a rule
+/// closing the group — so the group scrolls with the list and the arrows,
+/// which walk the table, never visit it.
+pub enum MarkSlot<R> {
+    Caption,
+    /// A mark the filter hides, read fresh by key.
+    Hidden(R),
+    Rule,
+    /// Table row `i`, under the panel's own filter.
+    Row(usize),
+}
+
+/// The marks a list panel keeps beside its [`Table`] (CR-009): the set of
+/// keys, the rows the filter hides, the prefix they ride in above the
+/// list, and the stamp per live row that keeps a redraw proportional to
+/// what changed.
+///
+/// Everything here is the same for any list, so both list panels hold one
+/// beside their table rather than owning a copy of it. What stays the
+/// panel's own is what a mark *means*: which row the cursor is on, which
+/// verbs the bar wears, and what a batch of them does.
+pub struct PanelMarks<D: Datasource> {
+    set: Marks<D::Key>,
+    /// The marked rows the filter hides, in the marks' order: derived each
+    /// draw from the table's answer and read fresh by key.
+    hidden: Vec<D::Row>,
+    /// What each live row was last populated with, by list index.
+    stamps: HashMap<usize, (D::Row, bool, bool)>,
+}
+
+impl<D: Datasource> Default for PanelMarks<D> {
+    fn default() -> Self {
+        PanelMarks {
+            set: Marks::new(),
+            hidden: Vec::new(),
+            stamps: HashMap::new(),
+        }
+    }
+}
+
+impl<D: Datasource> PanelMarks<D> {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    #[must_use]
+    pub fn has(&self, key: &D::Key) -> bool {
+        self.set.has(key)
+    }
+
+    /// The marked keys, in key order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<D::Key> {
+        self.set.keys()
+    }
+
+    pub fn toggle(&mut self, key: D::Key) {
+        self.set.toggle(key);
+    }
+
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = D::Key>) {
+        self.set.extend(keys);
+    }
+
+    pub fn remove(&mut self, key: &D::Key) {
+        self.set.remove(key);
+    }
+
+    /// Empties the set — `esc`, `clear` — and says whether there was
+    /// anything to empty, so nothing redraws for nothing.
+    pub fn clear(&mut self) -> bool {
+        let had = !self.set.is_empty();
+        self.set.clear();
+        self.hidden.clear();
+        had
+    }
+
+    /// The list items above the table's rows: none, or the caption, the
+    /// marks the filter hides and the rule under them.
+    #[must_use]
+    pub fn prefix(&self) -> usize {
+        if self.hidden.is_empty() {
+            0
+        } else {
+            self.hidden.len() + 2
+        }
+    }
+
+    /// The list index of table row `i` — where the cursor's scroll-follow
+    /// has to look for it.
+    #[must_use]
+    pub fn list_index(&self, i: usize) -> usize {
+        i + self.prefix()
+    }
+
+    /// The marked rows the filter hides, as the last draw read them.
+    #[must_use]
+    pub fn hidden_rows(&self) -> &[D::Row] {
+        &self.hidden
+    }
+
+    /// What list item `idx` is: one of the marks the filter hides, the
+    /// caption or the rule around them, or a row of the table.
+    #[must_use]
+    pub fn slot(&self, idx: usize) -> MarkSlot<D::Row> {
+        let pre = self.prefix();
+        if pre == 0 || idx >= pre {
+            return MarkSlot::Row(idx - pre);
+        }
+        if idx == 0 {
+            return MarkSlot::Caption;
+        }
+        if idx == pre - 1 {
+            return MarkSlot::Rule;
+        }
+        MarkSlot::Hidden(self.hidden[idx - 1].clone())
+    }
+
+    /// Space: the mark on the cursor's row, toggled. With no cursor — a
+    /// fresh panel, a filter just cleared — the top row is the row, the
+    /// rule `enter` and the arrows already follow. Whether it marked.
+    pub fn toggle_cursor(
+        &mut self,
+        store: &Store,
+        table: &Table<D>,
+        cursor: Option<usize>,
+    ) -> bool {
+        let Some(row) = cursor.or(Some(0)).and_then(|i| table.row(store, i)) else {
+            return false;
+        };
+        self.set.toggle(table.key(&row));
+        true
+    }
+
+    /// One end of a shift+arrow range: the row the cursor stands on,
+    /// marked rather than toggled.
+    pub fn mark_cursor(&mut self, store: &Store, table: &Table<D>, cursor: Option<usize>) {
+        if let Some(row) = cursor.or(Some(0)).and_then(|i| table.row(store, i)) {
+            self.set.add(table.key(&row));
+        }
+    }
+
+    /// `all`: every key under the filter, the rows off screen included. A
+    /// source that cannot list them leaves the set as it is.
+    pub fn all(&mut self, store: &Store, table: &Table<D>) -> bool {
+        let Some(keys) = table.keys(store) else {
+            return false;
+        };
+        self.set.extend(keys);
+        true
+    }
+
+    /// The draw's own step: what the filter shows and what it hides, read
+    /// fresh by key — never from a snapshot taken when the row was marked
+    /// — and a mark whose row is gone altogether dropped with it.
+    pub fn sync(&mut self, store: &Store, table: &Table<D>) {
+        if self.set.is_empty() {
+            self.hidden.clear();
+            return;
+        }
+        let (shown, hidden) = table.split(store, &self.set);
+        self.hidden = hidden.iter().filter_map(|k| table.by_key(store, k)).collect();
+        let kept: std::collections::BTreeSet<D::Key> = shown
+            .into_iter()
+            .chain(self.hidden.iter().map(|r| table.key(r)))
+            .collect();
+        self.set.retain(|k| kept.contains(k));
+    }
+
+    /// The bar at the panel's foot: up with the first mark, gone with the
+    /// last. `verbs` are the list's own ([`ui::mark_verbs`]).
+    pub fn draw_bar(&self, cx: &mut Cx, view: &View, verbs: &[ui::MarkVerb], total: usize) {
+        let bar = view.widget(cx, ids!(bar));
+        if self.set.is_empty() {
+            bar.set_visible(cx, false);
+            return;
+        }
+        bar.as_mark_bar()
+            .populate(cx, verbs, self.set.len(), total, self.hidden.len());
+        bar.set_visible(cx, true);
+    }
+
+    /// The bar's buttons, `(label, rect, verb)`, for the shell's hit table
+    /// — none while the set is empty.
+    pub fn verb_hits(&self, cx: &mut Cx, view: &View) -> Vec<(String, Rect, ui::MarkVerb)> {
+        if self.set.is_empty() {
+            return Vec::new();
+        }
+        view.widget(cx, ids!(bar)).as_mark_bar().verb_hits(cx)
+    }
+
+    /// The rows a draw is still showing, by list index — how a panel finds
+    /// a row it has on screen without asking the store.
+    pub fn live(&self) -> impl Iterator<Item = (usize, &D::Row)> + '_ {
+        self.stamps.iter().map(|(i, (row, _, _))| (*i, row))
+    }
+
+    /// Only the rows the last draw kept.
+    pub fn keep_live(&mut self, live: &[usize]) {
+        self.stamps.retain(|k, _| live.contains(k));
+    }
+}
+
+impl<D: Datasource> PanelMarks<D>
+where
+    D::Row: PartialEq,
+{
+    /// Whether list item `idx` has to be populated again: a row is
+    /// repopulated only when its content, the cursor or its mark changed
+    /// (or the widget it landed on is not the one it had).
+    pub fn stamp(
+        &mut self,
+        idx: usize,
+        row: &D::Row,
+        selected: bool,
+        marked: bool,
+        existed: bool,
+    ) -> bool {
+        let stamp = (row.clone(), selected, marked);
+        if existed && self.stamps.get(&idx) == Some(&stamp) {
+            return false;
+        }
+        self.stamps.insert(idx, stamp);
+        true
     }
 }
 
@@ -3420,7 +4061,11 @@ impl InboxRowRef {
 // ---------------------------------------------------------------------------
 
 /// The inbox's table: the shared engine over the thread datasource.
-type InboxTable = Table<&'static SqlSource<mail::ThreadHead>>;
+type InboxTable = Table<&'static SqlSource<mail::ThreadHead, i64>>;
+
+/// Its marks (CR-009): thread anchors, so a mark survives the filter, the
+/// paging and a sync landing underneath.
+type InboxMarks = PanelMarks<&'static SqlSource<mail::ThreadHead, i64>>;
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct InboxPanel {
@@ -3441,11 +4086,12 @@ pub struct InboxPanel {
     /// back to the top of the inbox instead of carrying on where it stood.
     #[rust]
     sel: Option<(i64, usize)>,
-    /// What each live row was last populated with, by index: a draw
-    /// repopulates only the rows whose thread or selection changed, so
-    /// scrolling a long list costs its new rows and nothing else.
+    /// The marks (CR-009): the threads picked out for a batch verb, the
+    /// ones the filter hides, and the stamp per live row — one piece,
+    /// held beside the table by every list that has marks. Context, not
+    /// history: gone with the process.
     #[rust]
-    stamps: HashMap<usize, (mail::ThreadHead, bool)>,
+    marks: InboxMarks,
     /// The filter's autocomplete: the table is its completion — tag
     /// names, then a tag's values.
     #[rust]
@@ -3488,9 +4134,15 @@ impl InboxPanel {
     /// rank in the table. The anchor is a mail id, so the row is re-derived
     /// from it exactly as from any of its mails.
     fn index_of_thread(&self, store: &Store, th: i64) -> Option<usize> {
-        if let Some((i, _)) = self.stamps.iter().find(|(_, (t, _))| t.thread == th) {
-            if self.table.row(store, *i).is_some_and(|t| t.thread == th) {
-                return Some(*i);
+        let p = self.marks.prefix();
+        if let Some((i, _)) = self
+            .marks
+            .live()
+            .find(|(idx, t)| *idx >= p && t.thread == th)
+        {
+            let i = i - p;
+            if self.table.row(store, i).is_some_and(|t| t.thread == th) {
+                return Some(i);
             }
         }
         let head = mail::thread_head(store, th)?;
@@ -3510,11 +4162,12 @@ impl InboxPanel {
         self.sel = Some((m.thread, i));
         // Keep the cursor on screen: a row without a live item is off-view.
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let li = self.marks.list_index(i);
         let visible = list
             .borrow()
-            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == i));
+            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == li));
         if !visible {
-            list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
+            list.smooth_scroll_to(cx, li, 90.0, None, 0.0);
         }
         cx.action(PanelAction::Preview {
             pid,
@@ -3534,6 +4187,25 @@ impl InboxPanel {
         };
         self.set_sel(cx, pid, store, i);
     }
+
+    /// Space: the mark on the cursor's row, toggled (CR-009).
+    fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
+        let at = self.cursor_index(store);
+        if self.marks.toggle_cursor(store, &self.table, at) {
+            self.redraw(cx);
+        }
+    }
+
+    /// Shift+arrow: marks the cursor's row, steps, and marks the row it
+    /// lands on — a range, by the keys the walk already uses.
+    fn mark_and_step(&mut self, cx: &mut Cx, store: &Store, pid: u64, d: isize) {
+        let at = self.cursor_index(store);
+        self.marks.mark_cursor(store, &self.table, at);
+        self.move_sel(cx, store, pid, d);
+        let at = self.cursor_index(store);
+        self.marks.mark_cursor(store, &self.table, at);
+        self.redraw(cx);
+    }
 }
 
 impl InboxPanelRef {
@@ -3551,9 +4223,103 @@ impl InboxPanelRef {
             .is_some_and(|p| p.view.text_input(cx, ids!(filter_input)).key_focus(cx))
     }
 
-    /// Row `i` of the table as this panel has it — its own filter included.
-    pub fn row_at(&self, store: &Store, i: usize) -> Option<mail::ThreadHead> {
-        self.borrow().and_then(|p| p.table.row(store, i))
+    /// List item `idx` as this panel has it — a table row under its own
+    /// filter, or one of the marks the filter hides, which ride above the
+    /// rows; `None` for the caption and the rule.
+    pub fn row_at(&self, store: &Store, idx: usize) -> Option<mail::ThreadHead> {
+        let p = self.borrow()?;
+        match p.marks.slot(idx) {
+            MarkSlot::Caption | MarkSlot::Rule => None,
+            MarkSlot::Hidden(m) => Some(m),
+            MarkSlot::Row(i) => p.table.row(store, i),
+        }
+    }
+
+    /// Whether any row is marked (CR-009): the bar is up, and the chords
+    /// the list borrows from its preview stand down.
+    pub fn has_marks(&self) -> bool {
+        self.borrow().is_some_and(|p| !p.marks.is_empty())
+    }
+
+    /// The marked threads, in key order.
+    pub fn marks(&self) -> Vec<i64> {
+        self.borrow().map_or_else(Vec::new, |p| p.marks.keys())
+    }
+
+    /// Toggles one thread's mark — a long press, or a tap
+    /// while marks exist.
+    pub fn toggle_mark(&self, cx: &mut Cx, thread: i64) {
+        if let Some(mut p) = self.borrow_mut() {
+            p.marks.toggle(thread);
+            p.redraw(cx);
+        }
+    }
+
+
+    /// Marks every thread under the filter — `all`, honest about the rows
+    /// off screen. A source that cannot list leaves the set as it is.
+    pub fn mark_all(&self, cx: &mut Cx, store: &Store) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        if p.marks.all(store, &p.table) {
+            p.redraw(cx);
+        }
+    }
+
+    pub fn clear_marks(&self, cx: &mut Cx) {
+        if let Some(mut p) = self.borrow_mut() {
+            if p.marks.clear() {
+                p.redraw(cx);
+            }
+        }
+    }
+
+    /// Marks these threads again — an undo putting a batch back.
+    pub fn add_marks(&self, cx: &mut Cx, keys: &[i64]) {
+        if let Some(mut p) = self.borrow_mut() {
+            p.marks.extend(keys.iter().copied());
+            p.redraw(cx);
+        }
+    }
+
+    /// Unmarks these threads — what a batch verb filed, or a redo taking
+    /// them again.
+    pub fn remove_marks(&self, cx: &mut Cx, keys: &[i64]) {
+        if let Some(mut p) = self.borrow_mut() {
+            for k in keys {
+                p.marks.remove(k);
+            }
+            p.redraw(cx);
+        }
+    }
+
+    /// Once the `gone` threads are filed: the mail the cursor should land
+    /// on — the nearest row that stays, below first, then above. The
+    /// walk's own rule, over a set. `None` when the cursor's own row stayed
+    /// (it carries on where it stands) or when there is no cursor at all.
+    pub fn survivor(
+        &self,
+        store: &Store,
+        gone: &std::collections::BTreeSet<i64>,
+    ) -> Option<i64> {
+        let p = self.borrow()?;
+        let i = p.cursor_index(store)?;
+        if !p.table.row(store, i).is_some_and(|t| gone.contains(&t.thread)) {
+            return None;
+        }
+        let n = p.table.len(store);
+        (i..n)
+            .chain((0..i).rev())
+            .filter_map(|j| p.table.row(store, j))
+            .find(|t| !gone.contains(&t.thread))
+            .map(|t| t.target)
+    }
+
+    /// The marks bar's buttons, `(label, rect, verb)`, for the shell's hit
+    /// table — none while the set is empty.
+    pub fn verb_hits(&self, cx: &mut Cx) -> Vec<(String, Rect, ui::MarkVerb)> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        p.marks.verb_hits(cx, &p.view)
     }
 
     /// The mail a cursor standing on `id`'s thread should land on once that
@@ -3610,6 +4376,12 @@ impl Widget for InboxPanel {
             if !filter_focused && t.input == "/" {
                 focus_input(cx, &filter);
             }
+            // Space marks the cursor's row (CR-009) — the other plain key
+            // the grammar keeps, arriving as text the way `/` does. In a
+            // live filter it is a space.
+            if !filter_focused && t.input == " " {
+                self.toggle_cursor_mark(cx, &store);
+            }
         }
         if let Event::KeyDown(k) = event {
             if !filter_focused {
@@ -3633,8 +4405,23 @@ impl Widget for InboxPanel {
                     // The row walk, with scroll-follow (CR-003: the arrows
                     // are the whole walk now, j/k having gone). Each step
                     // previews what it lands on and keeps the keyboard.
+                    // Shift+arrow marks the row it leaves and the row it
+                    // lands on: a range, by the walk's own keys (CR-009).
+                    KeyCode::ArrowDown if k.modifiers.shift => {
+                        self.mark_and_step(cx, &store, pid, 1);
+                    }
+                    KeyCode::ArrowUp if k.modifiers.shift => {
+                        self.mark_and_step(cx, &store, pid, -1);
+                    }
                     KeyCode::ArrowDown => self.move_sel(cx, &store, pid, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, &store, pid, -1),
+                    // Esc empties the marks — when no field is listening; a
+                    // live field keeps its own esc.
+                    KeyCode::Escape => {
+                        if self.marks.clear() {
+                            self.redraw(cx);
+                        }
+                    }
                     // The inbox's one-stop tab ring: the filter.
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
@@ -3678,8 +4465,14 @@ impl Widget for InboxPanel {
                         // away). Take the row from the table so the index
                         // fallback stays honest.
                         if let Some(th) = mail::thread_of(&store, *id) {
-                            let i = self.index_of_thread(&store, th).unwrap_or(0);
-                            self.sel = Some((th, i));
+                            // A mark the filter hides is outside the table:
+                            // opening it moves no cursor.
+                            let hidden = self.marks.hidden_rows().iter().any(|h| h.thread == th);
+                            match self.index_of_thread(&store, th) {
+                                Some(i) => self.sel = Some((th, i)),
+                                None if hidden => {}
+                                None => self.sel = Some((th, 0)),
+                            }
                             self.redraw(cx);
                         }
                     }
@@ -3708,25 +4501,49 @@ impl Widget for InboxPanel {
 
         let sel = self.sel.map(|(th, _)| th);
         let n = self.table.len(&store);
+        // The marks (CR-009): what the filter shows and what it hides, read
+        // fresh by key each draw. A mark whose thread left the inbox
+        // altogether goes with it — the bar counts rows that exist.
+        self.marks.sync(&store, &self.table);
+        let verbs = scope
+            .props
+            .get::<PanelProps>()
+            .map_or(&[][..], |p| ui::mark_verbs(&p.kind));
+        self.marks.draw_bar(cx, &self.view, verbs, n);
+        let p = self.marks.prefix();
         let mut live: Vec<usize> = Vec::new();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
-                list.set_item_range(cx, 0, n);
+                list.set_item_range(cx, 0, n + p);
                 while let Some(idx) = list.next_visible_item(cx) {
-                    let Some(m) = self.table.row(&store, idx) else { continue };
+                    // The hidden marks ride above the table's rows: the
+                    // caption, then the rows, then the rule.
+                    let (m, marked) = match self.marks.slot(idx) {
+                        MarkSlot::Caption | MarkSlot::Rule => {
+                            let tpl = if idx == 0 { live_id!(caption) } else { live_id!(rule) };
+                            let (w, _) = list.item_with_existed(cx, idx, tpl);
+                            live.push(idx);
+                            w.draw_all(cx, scope);
+                            continue;
+                        }
+                        MarkSlot::Hidden(m) => (m, true),
+                        MarkSlot::Row(i) => {
+                            let Some(m) = self.table.row(&store, i) else { continue };
+                            let marked = self.marks.has(&m.thread);
+                            (m, marked)
+                        }
+                    };
                     let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
                     let selected = sel == Some(m.thread);
-                    let stamp = (m, selected);
-                    if !existed || self.stamps.get(&idx) != Some(&stamp) {
-                        row.as_inbox_row().populate(cx, &stamp.0, selected);
-                        self.stamps.insert(idx, stamp);
+                    if self.marks.stamp(idx, &m, selected, marked, existed) {
+                        row.as_inbox_row().populate(cx, &m, selected, marked);
                     }
                     live.push(idx);
                     row.draw_all(cx, scope);
                 }
             }
         }
-        self.stamps.retain(|k, _| live.contains(k));
+        self.marks.keep_live(&live);
         // The filter's offer, over the rows.
         self.ac
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
@@ -3980,7 +4797,7 @@ impl JobPanelRef {
 // ---------------------------------------------------------------------------
 
 /// The log's table: the shared engine over the effect queue.
-type LogTable = Table<&'static SqlSource<Job>>;
+type LogTable = Table<&'static SqlSource<Job, i64>>;
 
 /// One visible row's hit, for the shell's hit table: what a script (and a
 /// finger) addresses it by, where it is, and which job it unfolds.
@@ -4331,19 +5148,32 @@ impl Widget for FilesRow {
 }
 
 impl FilesRowRef {
-    pub fn populate(&self, cx: &mut Cx, e: &files::Entry, selected: bool) {
+    /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
+    /// Exactly one of the four twins draws; only it is populated.
+    pub fn populate(&self, cx: &mut Cx, e: &files::Entry, selected: bool, marked: bool) {
         let Some(row) = self.borrow() else { return };
-        let line = row.view.widget(cx, ids!(line));
-        let line_sel = row.view.widget(cx, ids!(line_sel));
-        line.as_files_line().populate(cx, e);
-        line_sel.as_files_line().populate(cx, e);
-        line.set_visible(cx, !selected);
-        line_sel.set_visible(cx, selected);
+        let twins = [
+            (ids!(line), !selected && !marked),
+            (ids!(line_sel), selected && !marked),
+            (ids!(line_mark), !selected && marked),
+            (ids!(line_mark_sel), selected && marked),
+        ];
+        for (id, on) in twins {
+            let w = row.view.widget(cx, id);
+            if on {
+                w.as_files_line().populate(cx, e);
+            }
+            w.set_visible(cx, on);
+        }
     }
 }
 
 /// The files panel's table: the shared engine over one directory.
 type FilesTable = Table<files::DirSource>;
+
+/// Its marks (CR-009): entry names, unique within the one directory the
+/// panel lists — so a mark survives the filter, and dies with the listing.
+type FilesMarks = PanelMarks<files::DirSource>;
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct FilesPanel {
@@ -4372,6 +5202,12 @@ pub struct FilesPanel {
     /// The cursor: the entry's name, and the row it sat on.
     #[rust]
     sel: Option<(String, usize)>,
+    /// The marks (CR-009): the entries picked out for a batch verb, the
+    /// ones the filter hides, and the stamp per live row — the same piece
+    /// the inbox holds. They are this directory's, so a panel that lands
+    /// on another one starts over.
+    #[rust]
+    marks: FilesMarks,
     #[rust]
     ac: Suggest<FilesTable>,
     /// The path field's completion: segment by segment, like a shell.
@@ -4422,6 +5258,9 @@ impl FilesPanel {
         }
         self.relist(world, dir);
         self.sel = None;
+        // The marks were that directory's entries, by name; nothing here
+        // is what they meant.
+        self.marks.clear();
         self.view.text_input(cx, ids!(filter_input)).set_text(cx, "");
         if self.newdir_open {
             let input = self.view.text_input(cx, ids!(newdir_input));
@@ -4533,11 +5372,12 @@ impl FilesPanel {
         let target = Self::target_of(&self.table.source().dir, &e);
         self.sel = Some((e.name, i));
         let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let li = self.marks.list_index(i);
         let visible = list
             .borrow()
-            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == i));
+            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == li));
         if !visible {
-            list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
+            list.smooth_scroll_to(cx, li, 90.0, None, 0.0);
         }
         cx.action(PanelAction::Preview { pid, target });
         self.redraw(cx);
@@ -4571,19 +5411,94 @@ impl FilesPanel {
         cx.set_key_focus(Area::Empty);
         self.redraw(cx);
     }
+
+    /// Space: the mark on the cursor's row, toggled (CR-009) — the
+    /// inbox's key, over this list's own keys.
+    fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
+        let at = self.cursor_index(store);
+        if self.marks.toggle_cursor(store, &self.table, at) {
+            self.redraw(cx);
+        }
+    }
+
+    /// Shift+arrow: marks the row it leaves and the row it lands on.
+    fn mark_and_step(&mut self, cx: &mut Cx, pid: u64, store: &Store, d: isize) {
+        let at = self.cursor_index(store);
+        self.marks.mark_cursor(store, &self.table, at);
+        self.move_sel(cx, pid, store, d);
+        let at = self.cursor_index(store);
+        self.marks.mark_cursor(store, &self.table, at);
+        self.redraw(cx);
+    }
 }
 
 impl FilesPanelRef {
-    /// Row `i` of the table as this panel has it — its own filter included.
+    /// List item `i` as this panel has it — a table row under its own
+    /// filter, or one of the marks the filter hides, which ride above the
+    /// rows; `None` for the caption and the rule.
     pub fn row_at(&self, store: &Store, i: usize) -> Option<files::Entry> {
-        self.borrow().and_then(|p| p.table.row(store, i))
+        let p = self.borrow()?;
+        match p.marks.slot(i) {
+            MarkSlot::Caption | MarkSlot::Rule => None,
+            MarkSlot::Hidden(e) => Some(e),
+            MarkSlot::Row(i) => p.table.row(store, i),
+        }
     }
 
-    /// What row `i` opens.
+    /// What list item `i` opens.
     pub fn target_at(&self, store: &Store, i: usize) -> Option<crate::core::Kind> {
         let p = self.borrow()?;
-        let e = p.table.row(store, i)?;
+        let e = self.row_at(store, i)?;
         Some(FilesPanel::target_of(&p.table.source().dir, &e))
+    }
+
+    /// Whether any row is marked (CR-009): the bar is up, and the panel's
+    /// own object verbs stand down.
+    pub fn has_marks(&self) -> bool {
+        self.borrow().is_some_and(|p| !p.marks.is_empty())
+    }
+
+    /// The marked entries' names, in key order.
+    pub fn marks(&self) -> Vec<String> {
+        self.borrow().map_or_else(Vec::new, |p| p.marks.keys())
+    }
+
+    /// The directory this panel lists — where its marks live.
+    pub fn dir(&self) -> Option<String> {
+        self.borrow().map(|p| p.table.source().dir.clone())
+    }
+
+    /// Toggles one entry's mark — a long press, or a tap while marks
+    /// stand.
+    pub fn toggle_mark(&self, cx: &mut Cx, name: String) {
+        if let Some(mut p) = self.borrow_mut() {
+            p.marks.toggle(name);
+            p.redraw(cx);
+        }
+    }
+
+    /// Marks every entry under the filter — `all`.
+    pub fn mark_all(&self, cx: &mut Cx, store: &Store) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        if p.marks.all(store, &p.table) {
+            p.redraw(cx);
+        }
+    }
+
+    pub fn clear_marks(&self, cx: &mut Cx) {
+        if let Some(mut p) = self.borrow_mut() {
+            if p.marks.clear() {
+                p.redraw(cx);
+            }
+        }
+    }
+
+    /// The marks bar's buttons, `(label, rect, verb)`, for the shell's hit
+    /// table — none while the set is empty.
+    pub fn verb_hits(&self, cx: &mut Cx) -> Vec<(String, Rect, ui::MarkVerb)> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        p.marks.verb_hits(cx, &p.view)
     }
 
     /// Whether one of the panel's fields owns the keyboard, so borrowed
@@ -4753,8 +5668,14 @@ impl Widget for FilesPanel {
 
         // `/` focuses the filter, as in the inbox.
         if let Event::TextInput(t) = event {
-            if !filter_focused && !newdir_focused && !path_focused && t.input == "/" {
+            let typing = filter_focused || newdir_focused || path_focused;
+            if !typing && t.input == "/" {
                 focus_input(cx, &filter);
+            }
+            // Space marks the cursor's row (CR-009), arriving as text the
+            // way `/` does. In a live field it is a space.
+            if !typing && t.input == " " {
+                self.toggle_cursor_mark(cx, &store);
             }
         }
         if let Event::KeyDown(k) = event {
@@ -4778,8 +5699,23 @@ impl Widget for FilesPanel {
                             });
                         }
                     }
+                    // Shift+arrow marks the row it leaves and the row it
+                    // lands on: a range, by the walk's own keys (CR-009).
+                    KeyCode::ArrowDown if k.modifiers.shift => {
+                        self.mark_and_step(cx, pid, &store, 1);
+                    }
+                    KeyCode::ArrowUp if k.modifiers.shift => {
+                        self.mark_and_step(cx, pid, &store, -1);
+                    }
                     KeyCode::ArrowDown => self.move_sel(cx, pid, &store, 1),
                     KeyCode::ArrowUp => self.move_sel(cx, pid, &store, -1),
+                    // Esc empties the marks — when no field is listening;
+                    // a live field keeps its own esc.
+                    KeyCode::Escape => {
+                        if self.marks.clear() {
+                            self.redraw(cx);
+                        }
+                    }
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
                 }
@@ -4928,18 +5864,49 @@ impl Widget for FilesPanel {
 
         let sel = self.sel.as_ref().map(|(name, _)| name.clone());
         let n = self.table.len(&store);
+        // The marks (CR-009): what the filter shows and what it hides,
+        // read fresh by name each draw; an entry that left the listing
+        // takes its mark with it.
+        self.marks.sync(&store, &self.table);
+        let verbs = scope
+            .props
+            .get::<PanelProps>()
+            .map_or(&[][..], |p| ui::mark_verbs(&p.kind));
+        self.marks.draw_bar(cx, &self.view, verbs, n);
+        let p = self.marks.prefix();
+        let mut live: Vec<usize> = Vec::new();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
-                list.set_item_range(cx, 0, n);
+                list.set_item_range(cx, 0, n + p);
                 while let Some(idx) = list.next_visible_item(cx) {
-                    let Some(e) = self.table.row(&store, idx) else { continue };
-                    let (row, _) = list.item_with_existed(cx, idx, live_id!(row));
-                    row.as_files_row()
-                        .populate(cx, &e, sel.as_deref() == Some(e.name.as_str()));
+                    // The hidden marks ride above the rows: the caption,
+                    // then the rows, then the rule.
+                    let (e, marked) = match self.marks.slot(idx) {
+                        MarkSlot::Caption | MarkSlot::Rule => {
+                            let tpl = if idx == 0 { live_id!(caption) } else { live_id!(rule) };
+                            let (w, _) = list.item_with_existed(cx, idx, tpl);
+                            live.push(idx);
+                            w.draw_all(cx, scope);
+                            continue;
+                        }
+                        MarkSlot::Hidden(e) => (e, true),
+                        MarkSlot::Row(i) => {
+                            let Some(e) = self.table.row(&store, i) else { continue };
+                            let marked = self.marks.has(&e.name);
+                            (e, marked)
+                        }
+                    };
+                    let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
+                    let selected = sel.as_deref() == Some(e.name.as_str());
+                    if self.marks.stamp(idx, &e, selected, marked, existed) {
+                        row.as_files_row().populate(cx, &e, selected, marked);
+                    }
+                    live.push(idx);
                     row.draw_all(cx, scope);
                 }
             }
         }
+        self.marks.keep_live(&live);
         self.ac
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
         // The path field's offer, under it and over the rows.
@@ -5124,16 +6091,7 @@ impl SLinkRef {
         l.pid = pid;
         l.target = Some(target);
         l.dotted = dotted;
-        let at = accel.and_then(|c| ui::accel_idx(text, c));
-        let (pre, key, post) = match at {
-            Some(i) => {
-                let mut it = text.chars();
-                let pre: String = it.by_ref().take(i).collect();
-                let key: String = it.next().into_iter().collect();
-                (pre, key, it.collect::<String>())
-            }
-            None => (text.to_string(), String::new(), String::new()),
-        };
+        let (pre, key, post) = ui::split_accel(text, accel);
         // An empty label still reserves width, which would push the text
         // right of an underline that spans the whole row — so the unused
         // parts stand down entirely rather than render nothing.

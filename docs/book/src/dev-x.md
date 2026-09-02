@@ -134,7 +134,11 @@ one comfortably past the script's own waits — the run ends at `quit`, not at N
 An e2e run replays a line-based script against the shell's real input paths
 — hit resolution, key handling, text input. Every run opens a **fresh
 seeded temp store** (unless `--db` overrides it), so suites never touch your
-session.
+session. The one thing a store cannot seed is the **disk**: `--demo-disk`
+gives the file browser the demo tree the [panels library](#panels-library)
+shows instead of this machine’s own, so a files suite can address a row by
+name. Nothing else changes — the network, the keychain and the screenshots
+are the ones a run always had.
 
 Runs go through makepad's **headless backend** (`MAKEPAD=headless`), a
 software rasterizer with a virtual GPU and a shader JIT. There is no window,
@@ -171,7 +175,7 @@ exit non-zero.
 ```text
 wait 600            # ms
 shot inbox          # e2e/out/inbox.png
-click "reply"       # label substring, case-insensitive
+click "reply"       # by label, case-insensitive and ranked (below)
 cmdclick "Q3"       # cmd held: fresh un-joined panel
 mouse "filter"      # the same through the shell's real mouse-down path
 key cmd+shift+left  # chords; plain letters flow as text, like real typing
@@ -221,12 +225,19 @@ walks the rich table (tags, the autocomplete and its dynamic values, the
 grammar, the error line, and a keyboard walk onto the second page), and
 `e2e/compose.txt` the compose panel's TO field completing addresses (a
 pick by enter, a pick by click, esc putting the offer away, tab walking on),
-and `e2e/problems.txt` (with `--send-delay 1 --draws 100000` — it waits out
-the executor's backoff in virtual time) the problems surface: a send
-the demo account cannot make raises the mark, the mark opens the panel,
-*retry* files it again, *reopen* brings the draft back and `cmd+z` takes
-that back; an account against an `.invalid` host joins the list, *sync*
-kicks it, and removing the account clears it.
+`e2e/marks.txt` the marks (space, a shift+arrow range, `all`, a
+mark the filter hides, cmd+a still select-all in a live field, and a batch
+archive undone back to marked), `e2e/files-marks.txt` (with `--demo-disk`)
+the same marks over a directory — the object verbs a joined files panel
+wears, then the bar taking them while rows are marked, a dot-file marked
+under `@hidden` and still drawn above the rows once the filter leaves it
+out, `⌘p` holding the whole set and `copy here` performing it, and a
+`move here` refusing it path by path — and `e2e/problems.txt` (with `--send-delay 1
+--draws 100000` — it waits out the executor's backoff in virtual time) the
+problems surface: a send the demo account cannot make raises the mark, the
+mark opens the panel, *retry* files it again, *reopen* brings the draft back
+and `cmd+z` takes that back; an account against an `.invalid` host joins the
+list, *sync* kicks it, and removing the account clears it.
 `e2e/effects.txt` (run with `--send-delay 1`) walks the effect log — the
 same failed send, seen from the other end: the empty queue, then the job it
 files, addressed by *the sentence its effect describes itself with* (which
@@ -265,7 +276,14 @@ the assertion to reach for; drag-select itself belongs to a real mouse or
 `e2e/cgpost.c`.
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
-rows (by subject) and panel titles. Steps that mutate the workspace need a
+rows (by subject) and panel titles. A label is matched **ranked** rather
+than as a plain substring: a whole-label match first, then one that
+*starts* with what was asked, then one that merely contains it — the
+tightest label winning inside a rung, and the last registered on a full
+tie, so a control drawn over another takes the click exactly as it would
+from a pointer — `click "archive"` is the message panel's own button, not
+the marks bar's `archive marked` beside it (CR-009).
+Steps that mutate the workspace need a
 `wait` after them — hits refresh on the next drawn frame. `e2e/basic.txt`
 walks the whole join/replace grammar; the first frame also logs panel count
 and measured cell metrics to stderr.

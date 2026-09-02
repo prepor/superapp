@@ -18,6 +18,11 @@
 - **Thread** — a conversation: every mail that answers, or is answered by,
   another, joined through their `References` headers. The inbox's rows are
   threads, and a message panel shows the whole thread its mail belongs to.
+- **Mark** — a row picked out for a batch verb. The **marks** are the set,
+  held as row keys beside the list's cursor, so they survive the filter, the
+  paging and a sync landing underneath; they are context, never history.
+- **Marks bar** — what a list shows while any row is marked: how many of how
+  many, how many the filter hides, and the verbs that act on the set.
 - **Join** — the preview-pane relation, generalized: a solid link opens its
   panel *joined* to the link's panel; the next solid link from the same parent
   replaces the joined child instead of opening another panel.

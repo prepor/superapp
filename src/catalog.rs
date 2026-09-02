@@ -524,6 +524,7 @@ fn sender_like(store: &Store, pat: &str) -> String {
 pub fn scenes() -> Vec<Scene<Setup>> {
     vec![
         inbox_row(),
+        marks_bar(),
         thread_message(),
         overlay_row(),
         launcher(),
@@ -531,6 +532,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         effect_row(),
         link(),
         inbox(),
+        inbox_marks(),
         effect_log(),
         job(),
         message(),
@@ -547,30 +549,36 @@ pub fn scenes() -> Vec<Scene<Setup>> {
 }
 
 fn inbox_row() -> Scene<Setup> {
-    let row = |h: mail::ThreadHead, selected: bool| {
+    let row = |h: mail::ThreadHead, selected: bool, marked: bool| {
         widget(live_id!(inbox_row_tpl), move |cx, w| {
-            w.as_inbox_row().populate(cx, &h, selected);
+            w.as_inbox_row().populate(cx, &h, selected, marked);
         })
     };
     let elena = || head(&["Elena Petrova"], "Sat hike", false, 1);
     let long = "[stelaxis] CI failed on main — workflow main #4116 failed on push 00a1b2c, the full logs attached to the run";
     Scene::new("inbox row", (520.0, 56.0))
         .note("One conversation as the inbox lists it: who wrote and when, the topic on its own line.")
-        .note("Bold while any of it is unread; the wash while the cursor is on it.")
-        .node("read", row(elena(), false))
-        .node("unread", row(head(&["Elena Petrova"], "Sat hike", true, 1), false))
+        .note("Bold while any of it is unread; the wash while the cursor is on it; the bar while it is marked (CR-009).")
+        .node("read", row(elena(), false, false))
+        .node("unread", row(head(&["Elena Petrova"], "Sat hike", true, 1), false, false))
         .about("the whole row bold, not a dot")
-        .node("selected", row(elena(), true))
+        .node("selected", row(elena(), true, false))
         .about("the cursor's wash; focus stays in the list")
-        .node("conversation", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false))
+        .node("marked", row(elena(), false, true))
+        .about("the mark: an ink bar in the row's inset, no reflow")
+        .node("marked, cursor", row(head(&["Elena Petrova"], "Sat hike", true, 1), true, true))
+        .about("the wash and the bar together; bold still means unread")
+        .node("conversation", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .about("first names once there are two, then the count")
-        .node("long topic", row(head(&["GitHub"], long, false, 1), false))
+        .node("long topic", row(head(&["GitHub"], long, false, 1), false, false))
         .about("one line each, ellipsized")
-        .node("narrow", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false))
+        .node("narrow", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .sized((320.0, 56.0))
         .about("the phone's width")
         .edge("read", "unread", "a reply arrives")
         .edge("read", "selected", "↓ / click")
+        .edge("read", "marked", "space")
+        .edge("selected", "marked, cursor", "space")
 }
 
 fn thread_message() -> Scene<Setup> {
@@ -936,6 +944,60 @@ fn job() -> Scene<Setup> {
         .edge("retrying", "given up", "six attempts")
 }
 
+fn marks_bar() -> Scene<Setup> {
+    let bar = |kind: Kind, marked: usize, total: usize, hidden: usize| {
+        widget(live_id!(mark_bar_tpl), move |cx, w| {
+            w.as_mark_bar()
+                .populate(cx, crate::ui::mark_verbs(&kind), marked, total, hidden);
+        })
+    };
+    let inbox = move |m, t, h| bar(Kind::Inbox { filter: None }, m, t, h);
+    let files = move |m, t, h| bar(Kind::Files { dir: files::HOME.into() }, m, t, h);
+    Scene::new("marks bar", (520.0, 40.0))
+        .note("What a list shows while any row is marked (CR-009): the count, the verbs on the marked set, all, clear.")
+        .note("Comes with the first mark, goes with the last. Every verb wears the letter its single-row twin wears.")
+        .node("three", inbox(3, 143, 0))
+        .about("of the rows under the filter")
+        .node("hidden", inbox(3, 12, 1))
+        .sized((520.0, 64.0))
+        .about("a mark the filter hides is still counted, and said; the verbs drop a line")
+        .node("all", inbox(143, 143, 0))
+        .about("all stands down")
+        .node("narrow", inbox(3, 143, 1))
+        .sized((356.0, 64.0))
+        .about("the phone's width: the verbs wrap")
+        .node("files", files(2, 8, 0))
+        .about("a files panel's own row verbs, on the set: copy ⌘p, move ⌘m, delete ⌘d")
+        .edge("three", "hidden", "/ github")
+        .edge("three", "all", "⌘l / all")
+}
+
+fn inbox_marks() -> Scene<Setup> {
+    let inbox = |script: &str| panel(|_| Kind::Inbox { filter: None }, script);
+    // The walk that marks: onto the first row, space on it, then a
+    // shift+↓ range over the two under it — three marks, the cursor left
+    // standing on the last of them.
+    let three = "click \"inbox\"\nwait 200\nkey down\nwait 300\ntype \" \"\nwait 300\nkey shift+down 2\nwait 400";
+    let filtered =
+        format!("{three}\nkey /\nwait 300\ntype \"vera\"\nwait 300\nkey enter\nwait 600");
+    let all = format!("{three}\nclick \"mark all\"\nwait 500");
+    Scene::new("inbox, marked", (520.0, 640.0))
+        .note("The inbox with marks (CR-009): the bar under the filter, an ink bar down every marked row, the cursor walking on.")
+        .note("Filtering never drops a mark: the ones it hides ride above the rows, under their own caption.")
+        .note("Live — space marks, shift+↓ ranges, all takes the rest; with nothing marked the list is the inbox scene's fresh.")
+        .node("three", inbox(three))
+        .about("space marked the cursor's row, shift+↓ the two under it")
+        .node("filtered", inbox(&filtered))
+        .about("the two the filter hides, kept in sight above the rows")
+        .node("all", inbox(&all))
+        .about("every row the filter shows, loaded or not; the button stands down")
+        .node("phone", inbox(three))
+        .sized((380.0, 720.0))
+        .about("the phone's width: the verbs drop under the count")
+        .edge("three", "filtered", "/ vera")
+        .edge("three", "all", "⌘l / all")
+}
+
 fn message() -> Scene<Setup> {
     Scene::new("message", (560.0, 640.0))
         .note("A conversation as a page: every message of the thread, the one it opened on and the unread ones open, the rest collapsed to their header lines.")
@@ -989,7 +1051,12 @@ fn entry(name: &str, is_dir: bool, size: u64) -> files::Entry {
 fn files_row() -> Scene<Setup> {
     let row = |e: files::Entry, selected: bool| {
         widget(live_id!(files_row_tpl), move |cx, w| {
-            w.as_files_row().populate(cx, &e, selected);
+            w.as_files_row().populate(cx, &e, selected, false);
+        })
+    };
+    let marked = |e: files::Entry, selected: bool| {
+        widget(live_id!(files_row_tpl), move |cx, w| {
+            w.as_files_row().populate(cx, &e, selected, true);
         })
     };
     Scene::new("files row", (520.0, 32.0))
@@ -1013,7 +1080,13 @@ fn files_row() -> Scene<Setup> {
             ),
         )
         .about("one line, ellipsized; the columns hold")
+        .node("marked", marked(entry("report-q3.pdf", false, 1_258_291), false))
+        .about("the mark (CR-009): an ink bar in the row's inset, no reflow")
+        .node("marked, cursor", marked(entry("report-q3.pdf", false, 1_258_291), true))
+        .about("both at once: the wash under the bar")
         .edge("file", "selected", "↓ / click")
+        .edge("file", "marked", "space")
+        .edge("selected", "marked, cursor", "space")
 }
 
 fn files() -> Scene<Setup> {

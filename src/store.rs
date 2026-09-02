@@ -77,6 +77,20 @@ pub enum Val {
     F(f64),
 }
 
+/// A datasource's key lands as a parameter this way (a rich table's
+/// `IN (…)`, its `key = ?`), so the key type stays the domain's own.
+impl From<i64> for Val {
+    fn from(i: i64) -> Self {
+        Val::I(i)
+    }
+}
+
+impl From<String> for Val {
+    fn from(s: String) -> Self {
+        Val::S(s)
+    }
+}
+
 impl rusqlite::ToSql for Val {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(match self {

@@ -112,21 +112,99 @@ again without walking anything; a thread that left leaves the cursor on the
 row it stood on. The cursor's identity is the thread, not the mail it
 opens, because that mail changes as replies arrive.
 
+## Marks
+
+A table carries **marks** beside its cursor: the rows picked out for a batch
+verb, held as a set of keys (`Marks`) rather than rows, so a mark survives
+the filter, the paging and a sync landing underneath. The set is std-only
+and knows nothing about rows or widgets — toggle one, add a range, keep
+what a verb could not do, clear.
+
+The datasource answers three more questions for them, all under the current
+filter, all one query on a `SqlSource`: **every matching key**, which is
+what `all` marks; **which of these keys** still match, which sorts a set
+into shown and hidden; and **the row for a key**, under the source's base
+`WHERE` and nothing else. A `SqlSpec` names its key: the group where there
+is one — a thread is its `message.thread` — else the unique column its
+order ends in. A source that is not SQL answers the same three off
+whatever it holds: `DirSource` reads them from its listing, keyed by entry
+name, and its base `WHERE` is the directory itself — so a dot-file the
+filter hides is hidden, not gone.
+
+`Table::split` sorts a set into what the filter shows and what it hides.
+**A hidden mark is still a mark**: it counts in the bar, it is drawn above
+the rows, and a batch verb acts on it — read fresh by its key on every
+draw, never from a snapshot taken when it was marked. A mark whose row is
+gone altogether — the thread left the inbox, the entry left the listing —
+is dropped at that same point: the bar counts rows that exist. And **`all`
+means all matching** — the table knows its count and the source can list
+its keys, so the rows off
+screen are marked too (`all 143 marked`).
+
+**Marks are context, not intent.** Filtering, walking and syncing never
+touch the set; `esc` and `clear` empty it; a batch verb consumes what it
+acted on and leaves what it could not do marked. They are never a history
+node of their own: the node a batch verb writes carries the keys it
+consumed, so an [undo](./interaction-grammar.md#undo) puts the rows back
+marked. They live in the panel's memory and go with the process, like the
+typed filter.
+
+A list draws three things for them. A marked row wears an ink bar down
+its left edge, inside the row's own inset, so nothing reflows when the
+first mark lands. The **marks bar** stands at the panel's **foot** while
+the set is not empty — `3 of 143 marked`, `all 143 marked`, or
+`3 marked · 1 hidden by the filter` — carrying the list's own row verbs on
+the set, then `all` and `clear`, beside the count or under it where the
+width cannot hold them. Which verbs those are is the list's to say
+(`ui::mark_verbs`): the inbox `archive` and `delete`, a files panel
+`copy`, `move` and `delete`.
+Under the list rather than over it, so it takes its height off the rows'
+own scroll instead of pushing every row down as the first mark lands; it
+wears the header's rule on its other side, and the rows end at it. And the
+marks the filter hides ride above the rows *in the same `PortalList`*, as a
+prefix: a caption, the rows, a strong rule closing the group. The arrows
+walk the table, so they never visit them.
+
+A batch verb runs its pre-flight over the set, thread by thread: one whose
+account has no such folder is skipped rather than failing the batch, and
+**stays marked**, so what is left marked afterwards is exactly what the
+verb could not do — `archived 10 of 12 conversations — 2 have no archive
+folder — ⌘z undoes`. When nothing in the set can be filed there is no
+action at all: the toast is the single row's error and the set stands as it
+was. A files panel's batch refuses the same way, path by path: `copy` and
+`move` hold every marked path the way they hold one, and a `copy here`
+performs the set into the directory a panel shows — refusing per path as it
+does for one, and still a draft, so the toast says the disk is untouched.
+
+None of that is the inbox's any more. `Marks` and the datasource's three
+questions were always the engine's; the panel side — the set beside the
+table, the hidden rows, the prefix arithmetic, the per-row stamps, the
+space / shift+arrow / esc keys and the bar itself — is one piece
+(`panels::PanelMarks<D>`) that a list holds beside its `Table`, generic
+over the same datasource. What stays a panel's own is only what a mark
+*means*: which row the cursor is on, which verbs the bar wears, and what a
+batch of them does. [A files panel](./interaction-grammar.md#files-a-directory-is-a-column-a-file-is-a-card)
+was the second list to want them, and cost the widget nothing but its own
+row twins.
+
 ## Drawing a long list
 
 Three measures keep a frame proportional to what is on screen: the data
 is virtual (pages, above); the `PortalList` reuses row widgets instead of
 minting them as rows scroll in; and a row is repopulated only when the
-mail or its selection changed, judged by a stamp the panel keeps per live
-row.
+mail, its selection or its mark changed, judged by a stamp the panel keeps
+per live row.
 
 ## Adding a table
 
-Declare the `SqlSpec` and its `TagDef`s beside the domain's queries, wrap
-them in a `SqlSource` with the row decoder, the order key and the
-suggestion function, and give the panel widget a `Table` over it. The
-autocomplete is a `Suggest` over that table, as the inbox's is; the
-filter field, the error line and the paging loop are the inbox panel's.
+Declare the `SqlSpec` and its `TagDef`s beside the domain's queries, naming
+the column that *is* a row — the group where there is one, else the unique
+column the order ends in — so its marks have an identity; wrap them in a
+`SqlSource` with the row decoder, the order key and the suggestion
+function, and give the panel widget a `Table` over it. The autocomplete is
+a `Suggest` over that table, as the inbox's is; the filter field, the error
+line and the paging loop are the inbox panel's, and the next list kind
+lifts them as they are.
 
 The effect log (`effect::LOG`) is what that costs, measured: a flat spec
 over one table, nine tags, a row decoder shared with the queue's own

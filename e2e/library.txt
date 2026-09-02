@@ -3,7 +3,8 @@
 #   --library --e2e e2e/library.txt --no-draw --draws 3000
 # under MAKEPAD=headless (rendered: drop --no-draw, set
 # MAKEPAD_HEADLESS_DPI=1 — the canvas is a big frame). The first wait lets
-# the stage nodes replay their steps, one node at a time.
+# the stage nodes replay their steps, one node at a time — so it grows with
+# the catalogue, and the run's --draws with it.
 wait 26000
 shot lib-01-overview
 

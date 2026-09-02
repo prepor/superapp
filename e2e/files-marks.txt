@@ -1,0 +1,127 @@
+# CR-009 — marks in a files panel: the same set, the same bar and the same
+# hidden group over a directory instead of the inbox.
+#
+# Run with `--demo-disk`: the browser then walks the demo tree the panels
+# library shows rather than whatever this machine's ~ holds, so a row can
+# be addressed by name. Assertions are the clicks — `delete` is the
+# panel's own object verb, `delete marked` · `copy marked` · `move marked`
+# · `mark all` · `clear marks` are the bar's, and each resolves only while
+# it is drawn.
+wait 900
+
+# The launcher opens the files root; ~ lists the demo tree.
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+key down 3
+wait 700
+click "Downloads/"
+wait 500
+
+# Enter goes: the Downloads panel is joined under ~ and drives nothing, so
+# it is the object — and wears the verbs of the directory it shows.
+key enter
+wait 800
+click "delete"
+wait 500
+shot f1-object-verbs
+
+# Space marks the cursor's row without moving it, so the panel is still an
+# object — and its own verbs stand down while the bar carries them.
+type " "
+wait 500
+shot f2-one-mark
+click "delete marked"
+wait 500
+# A draft leaves the set alone: nothing left the disk, so nothing was
+# consumed.
+click "clear marks"
+wait 500
+
+# …and with the last mark gone the panel's own verb answers again.
+click "delete"
+wait 500
+
+# A range by the walk's own keys: space, then shift+↓ twice.
+type " "
+wait 300
+key shift+down 2
+wait 600
+shot f3-range
+
+# `all` marks every row under the filter and stands down; `clear` empties.
+click "mark all"
+wait 600
+shot f4-all
+click "clear marks"
+wait 400
+
+# A filter that hides a marked row does not drop it: @hidden shows the
+# dot-file, space marks it, and a filter that leaves it out puts it above
+# the rows under its own caption — where the click below finds it.
+key /
+wait 300
+type "@hidden"
+wait 400
+key esc
+wait 300
+key enter
+wait 600
+key down
+wait 500
+type " "
+wait 400
+shot f5-dot-marked
+key /
+wait 300
+key cmd+a
+key backspace
+wait 300
+type "@kind:pdf"
+wait 400
+key esc
+wait 300
+key enter
+wait 700
+shot f6-hidden-by-the-filter
+click "report-q3.pdf"
+wait 500
+click ".DS_Store"
+wait 600
+shot f7-hidden-row-alive
+click "clear marks"
+wait 400
+
+# The bar's own verbs, on the set: ⌘p holds every marked path, and every
+# files panel then offers `copy here`, which performs the set.
+key /
+wait 300
+key cmd+a
+key backspace
+wait 400
+key esc
+wait 500
+type " "
+wait 300
+key shift+down 2
+wait 500
+key cmd+p
+wait 600
+shot f8-holding-a-set
+click "copy here"
+wait 700
+shot f9-copied
+
+# A move into the directory the paths are already in refuses — per path,
+# exactly as it does for one — and the marks stand.
+click "move marked"
+wait 500
+click "move here"
+wait 700
+shot f10-refused
+click "clear marks"
+wait 400
+quit

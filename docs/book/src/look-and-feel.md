@@ -24,7 +24,11 @@ control's [accelerator](./interaction-grammar.md#accelerators).
 1 pt near-black borders, sharp corners, 8 pt gaps, no shadows. Panel header:
 26 pt, tracked title, side-effect buttons right, × last. Focused header
 inverts; unfocused headers carry a 1 pt rule. Tables: strong rule under the
-header row, hairline rules between rows.
+header row, hairline rules between rows. A marked row wears a 3 pt ink bar
+down its left edge, drawn *inside* the row's own 8 pt inset, so the text
+keeps the header's columns and nothing shifts when the first mark lands; the
+marks a filter hides sit above the rows under a section caption, closed by a
+strong rule of their own.
 
 A link that holds keyboard focus wears a doubled underline, the way a
 focused button wears the grey wash. Text carries no padding of its own: a label, a section label, a link sits

@@ -25,7 +25,18 @@
 //! A source that cannot count (a remote one) says so, and the engine falls
 //! back to a growing window: one more page each time the end of the list
 //! comes on screen — the same scroll-driven load, without the total.
+//!
+//! # Marks
+//!
+//! Beside the cursor a table carries **marks** (CR-009): the rows the
+//! operator picked out for a batch verb, held as a set of keys ([`Marks`])
+//! rather than rows, so a mark survives the filter, the paging and a sync
+//! landing underneath. The datasource answers three more questions under
+//! the filter for them — every matching key, which of *these* keys match,
+//! and the row for a key regardless of the filter — and [`Table::split`]
+//! sorts a set into what the filter shows and what it hides.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::filter::{self, Ast, Context, Op, ParseError};
@@ -129,8 +140,16 @@ pub trait Datasource {
     /// One row, as the panel draws it.
     type Row: Clone + 'static;
 
+    /// What a row *is*, apart from what it currently shows: the inbox's
+    /// thread anchor, a feed item's id. A [`Marks`] set is made of these,
+    /// so a mark survives everything the store does under the row.
+    type Key: Ord + Clone + 'static;
+
     /// The tags the filter accepts.
     fn tags(&self) -> &'static [TagDef];
+
+    /// This row's identity.
+    fn key(&self, row: &Self::Row) -> Self::Key;
 
     /// How many rows match, or `None` for a source that cannot say.
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize>;
@@ -138,6 +157,33 @@ pub trait Datasource {
     /// Rows `offset..offset+limit` under the filter, in the source's order.
     fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize)
         -> Rc<Vec<Self::Row>>;
+
+    /// Every matching row's key, in the source's order — what `mark all`
+    /// marks. `None` from a source that cannot list them, and then the
+    /// surface does not offer it.
+    fn keys(&self, _store: &Store, _ast: Option<&Ast>) -> Option<Vec<Self::Key>> {
+        None
+    }
+
+    /// Which of these keys match the filter now; the rest are the marks it
+    /// hides. Order is the caller's business, and no key comes back twice.
+    fn present(&self, store: &Store, ast: Option<&Ast>, keys: &[Self::Key]) -> Vec<Self::Key> {
+        let Some(all) = self.keys(store, ast) else {
+            // A source that cannot list is taken at its word: nothing is
+            // known to be hidden.
+            return keys.to_vec();
+        };
+        let all: BTreeSet<Self::Key> = all.into_iter().collect();
+        keys.iter().filter(|k| all.contains(k)).cloned().collect()
+    }
+
+    /// The row for a key regardless of the filter — what a hidden mark
+    /// shows. The source's own `WHERE` still holds: the inbox knows inbox
+    /// threads and nothing else. `None` when the row is gone, and from a
+    /// source that cannot fetch one by key.
+    fn by_key(&self, _store: &Store, _key: &Self::Key) -> Option<Self::Row> {
+        None
+    }
 
     /// Where a row sits in the filtered order, if the source can tell
     /// without walking.
@@ -155,9 +201,14 @@ pub trait Datasource {
 /// A `static` source is shared by reference.
 impl<D: Datasource> Datasource for &D {
     type Row = D::Row;
+    type Key = D::Key;
 
     fn tags(&self) -> &'static [TagDef] {
         (**self).tags()
+    }
+
+    fn key(&self, row: &Self::Row) -> Self::Key {
+        (**self).key(row)
     }
 
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
@@ -169,12 +220,124 @@ impl<D: Datasource> Datasource for &D {
         (**self).page(store, ast, offset, limit)
     }
 
+    fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<Self::Key>> {
+        (**self).keys(store, ast)
+    }
+
+    fn present(&self, store: &Store, ast: Option<&Ast>, keys: &[Self::Key]) -> Vec<Self::Key> {
+        (**self).present(store, ast, keys)
+    }
+
+    fn by_key(&self, store: &Store, key: &Self::Key) -> Option<Self::Row> {
+        (**self).by_key(store, key)
+    }
+
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &Self::Row) -> Option<usize> {
         (**self).index_of(store, ast, row)
     }
 
     fn suggest(&self, store: &Store, tag: &str, prefix: &str) -> Vec<Suggestion> {
         (**self).suggest(store, tag, prefix)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marks
+// ---------------------------------------------------------------------------
+
+/// The rows the operator has **marked** for a batch verb (CR-009): a set of
+/// [`Datasource::Key`]s beside the cursor, and nothing else — no rows, no
+/// store, no widget. A mark is an identity, so it survives the filter, the
+/// paging and a sync landing under the list; sorting the set into what the
+/// filter shows and what it hides is the table's job ([`Table::split`]).
+///
+/// Marks are context, not intent: they are held in a panel's memory, never
+/// in the history, and go with the process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marks<K: Ord + Clone> {
+    set: BTreeSet<K>,
+}
+
+impl<K: Ord + Clone> Default for Marks<K> {
+    fn default() -> Self {
+        Marks {
+            set: BTreeSet::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> Marks<K> {
+    /// Nothing marked.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Whether this row is marked.
+    #[must_use]
+    pub fn has(&self, key: &K) -> bool {
+        self.set.contains(key)
+    }
+
+    /// Marks an unmarked row, unmarks a marked one; returns what it became.
+    pub fn toggle(&mut self, key: K) -> bool {
+        if self.set.remove(&key) {
+            false
+        } else {
+            self.set.insert(key);
+            true
+        }
+    }
+
+    /// Marks a row; marking a marked row does nothing.
+    pub fn add(&mut self, key: K) {
+        self.set.insert(key);
+    }
+
+    pub fn remove(&mut self, key: &K) {
+        self.set.remove(key);
+    }
+
+    /// Marks all of them — a range walked by shift+arrow, or every key
+    /// under the filter.
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = K>) {
+        self.set.extend(keys);
+    }
+
+    /// Keeps the marks the predicate holds — what a batch verb could not
+    /// do stays marked.
+    pub fn retain(&mut self, keep: impl FnMut(&K) -> bool) {
+        self.set.retain(keep);
+    }
+
+    /// Empties the set and hands it over: what a batch verb acts on.
+    pub fn take(&mut self) -> BTreeSet<K> {
+        std::mem::take(&mut self.set)
+    }
+
+    pub fn clear(&mut self) {
+        self.set.clear();
+    }
+
+    /// The marks in key order.
+    pub fn iter(&self) -> impl Iterator<Item = &K> + '_ {
+        self.set.iter()
+    }
+
+    /// The marks in key order, owned.
+    #[must_use]
+    pub fn keys(&self) -> Vec<K> {
+        self.set.iter().cloned().collect()
     }
 }
 
@@ -224,6 +387,13 @@ pub struct SqlSpec {
     /// the filter becomes a membership test: a group matches when **any**
     /// member matches, and its aggregates always cover the whole group.
     pub group: Option<&'static str>,
+    /// The column that *is* the row: what a mark holds and what
+    /// [`SqlSpec::keys`], [`SqlSpec::present`] and [`SqlSpec::by_key`] read
+    /// and compare. The `group`'s alias under a group (a thread is its
+    /// `thread`), else the unique column the `order` ends in. Named as the
+    /// page names it — an alias of `select` under a group, since the page
+    /// is read off the grouped subquery.
+    pub key: &'static str,
 }
 
 /// Built SQL and its parameters.
@@ -440,8 +610,22 @@ impl SqlSpec {
     /// its place: on the rows for a flat spec, as a membership test on the
     /// members for a grouped one.
     fn body(&self, tags: &[TagDef], ast: Option<&Ast>) -> (String, Vec<Val>) {
+        self.body_and(tags, ast, None)
+    }
+
+    /// [`SqlSpec::body`] with one more condition on the row — under a
+    /// group, on the group's own key, so it holds for the whole group and
+    /// not for the member that matched. Its parameters follow the filter's,
+    /// which sit further left in the text.
+    fn body_and(&self, tags: &[TagDef], ast: Option<&Ast>, extra: Option<&str>)
+        -> (String, Vec<Val>) {
         let (w, params) = self.where_clause(tags, ast);
         let Some(g) = self.group else {
+            let w = match (w.is_empty(), extra) {
+                (_, None) => w,
+                (true, Some(e)) => format!(" WHERE {e}"),
+                (false, Some(e)) => format!("{w} AND {e}"),
+            };
             return (format!("FROM {}{w}", self.from), params);
         };
         let mut parts: Vec<String> = Vec::new();
@@ -451,12 +635,22 @@ impl SqlSpec {
         if ast.and_then(|a| self.expr(tags, a, &mut Vec::new())).is_some() {
             parts.push(format!("{g} IN (SELECT {g} FROM {}{w})", self.from));
         }
+        if let Some(e) = extra {
+            parts.push(e.to_string());
+        }
         let wh = if parts.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", parts.join(" AND "))
         };
         (format!("FROM {}{wh} GROUP BY {g}", self.from), params)
+    }
+
+    /// The key as the body names it: the group's expression under a group
+    /// (the alias only exists once the rows are grouped), else the key
+    /// column itself.
+    fn key_col(&self) -> &'static str {
+        self.group.unwrap_or(self.key)
     }
 
     /// One page of rows.
@@ -489,10 +683,71 @@ impl SqlSpec {
         Sql { sql, params }
     }
 
-    /// How many matching rows the order puts *before* a row with this key
-    /// — its index. `key` has one value per `order` column.
+    /// Every matching row's key, in the table's order — what `mark all`
+    /// marks. Under a group it reads off the same grouped subquery the page
+    /// does, since the order names that subquery's aliases.
     #[must_use]
-    pub fn rank(&self, tags: &[TagDef], ast: Option<&Ast>, key: &[Val]) -> Sql {
+    pub fn keys(&self, tags: &[TagDef], ast: Option<&Ast>) -> Sql {
+        let (body, params) = self.body(tags, ast);
+        let sql = if self.group.is_some() {
+            format!(
+                "SELECT {} FROM (SELECT {} {body}){}",
+                self.key,
+                self.select,
+                self.order_by()
+            )
+        } else {
+            format!("SELECT {} {body}{}", self.key, self.order_by())
+        };
+        Sql { sql, params }
+    }
+
+    /// Which of `n` keys match — the marks the filter still shows. Built
+    /// like the count: the same body, so a group matches when any member
+    /// does, with `IN (?, …)` on the key. The keys' values follow the
+    /// returned parameters, in the order they are asked about.
+    #[must_use]
+    pub fn present(&self, tags: &[TagDef], ast: Option<&Ast>, n: usize) -> Sql {
+        let col = self.key_col();
+        let holes = vec!["?"; n].join(", ");
+        let (body, params) = self.body_and(tags, ast, Some(&format!("{col} IN ({holes})")));
+        Sql {
+            sql: format!("SELECT {col} {body}"),
+            params,
+        }
+    }
+
+    /// The row for one key, under the base condition only — a mark the
+    /// filter hides is still read fresh, not shown from a snapshot. The
+    /// key's value is the query's one parameter, appended by the caller.
+    #[must_use]
+    pub fn by_key(&self) -> Sql {
+        let col = self.key_col();
+        let sql = match (self.base.is_empty(), self.group) {
+            (true, None) => format!("SELECT {} FROM {} WHERE {col} = ?", self.select, self.from),
+            (false, None) => format!(
+                "SELECT {} FROM {} WHERE {} AND {col} = ?",
+                self.select, self.from, self.base
+            ),
+            (true, Some(g)) => format!(
+                "SELECT {} FROM {} WHERE {col} = ? GROUP BY {g}",
+                self.select, self.from
+            ),
+            (false, Some(g)) => format!(
+                "SELECT {} FROM {} WHERE {} AND {col} = ? GROUP BY {g}",
+                self.select, self.from, self.base
+            ),
+        };
+        Sql {
+            sql,
+            params: Vec::new(),
+        }
+    }
+
+    /// How many matching rows the order puts *before* a row with this
+    /// order key — its index. `order_key` has one value per `order` column.
+    #[must_use]
+    pub fn rank(&self, tags: &[TagDef], ast: Option<&Ast>, order_key: &[Val]) -> Sql {
         let (body, mut params) = self.body(tags, ast);
         let mut alts: Vec<String> = Vec::new();
         for (i, (col, dir)) in self.order.iter().enumerate() {
@@ -507,7 +762,7 @@ impl SqlSpec {
                     Dir::Desc => ">",
                 }
             ));
-            for k in &key[..=i] {
+            for k in &order_key[..=i] {
                 params.push(k.clone());
             }
             alts.push(format!("({})", conj.join(" AND ")));
@@ -537,25 +792,42 @@ fn cmp(op: Op) -> &'static str {
     }
 }
 
-/// A [`Datasource`] over the store: a [`SqlSpec`] plus how to read a row
-/// and what its rank key is. Declared `static` beside the domain's other
-/// queries; the suggest function is the one dynamic hook.
-pub struct SqlSource<R> {
+/// How many keys one `IN (…)` carries: a marked-all inbox can be longer
+/// than SQLite's parameter limit, so [`SqlSource::present`] asks in
+/// chunks — every full one the same SQL text, so the cache is not blown
+/// with a query text per set size either.
+const KEYS_PER_QUERY: usize = 400;
+
+/// A [`Datasource`] over the store: a [`SqlSpec`] plus how to read a row,
+/// what its identity is and what its rank key is. Declared `static` beside
+/// the domain's other queries; the suggest function is the one dynamic hook.
+pub struct SqlSource<R, K> {
     pub spec: &'static SqlSpec,
     pub tags: &'static [TagDef],
     /// Decodes one row of `spec.select`.
     pub map: fn(&rusqlite::Row) -> rusqlite::Result<R>,
+    /// A row's identity — the value of `spec.key`.
+    pub key: fn(&R) -> K,
     /// A row's values for `spec.order`, in order.
-    pub key: fn(&R) -> Vec<Val>,
+    pub rank: fn(&R) -> Vec<Val>,
     /// Suggestions for a dynamic tag: `(store, tag, typed prefix)`.
     pub suggest: fn(&Store, &str, &str) -> Vec<Suggestion>,
 }
 
-impl<R: Clone + 'static> Datasource for SqlSource<R> {
+impl<R, K> Datasource for SqlSource<R, K>
+where
+    R: Clone + 'static,
+    K: Ord + Clone + Into<Val> + rusqlite::types::FromSql + 'static,
+{
     type Row = R;
+    type Key = K;
 
     fn tags(&self) -> &'static [TagDef] {
         self.tags
+    }
+
+    fn key(&self, row: &R) -> K {
+        (self.key)(row)
     }
 
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
@@ -579,8 +851,38 @@ impl<R: Clone + 'static> Datasource for SqlSource<R> {
         store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
     }
 
+    fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<K>> {
+        let q = self.spec.keys(self.tags, ast);
+        let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
+            r.get::<_, K>(0)
+        });
+        Some(rows.as_ref().clone())
+    }
+
+    fn present(&self, store: &Store, ast: Option<&Ast>, keys: &[K]) -> Vec<K> {
+        let mut out = Vec::new();
+        for chunk in keys.chunks(KEYS_PER_QUERY) {
+            let mut q = self.spec.present(self.tags, ast, chunk.len());
+            q.params.extend(chunk.iter().cloned().map(Into::into));
+            let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
+                r.get::<_, K>(0)
+            });
+            out.extend(rows.iter().cloned());
+        }
+        out
+    }
+
+    fn by_key(&self, store: &Store, key: &K) -> Option<R> {
+        let mut q = self.spec.by_key();
+        q.params.push(key.clone().into());
+        store
+            .rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
+            .first()
+            .cloned()
+    }
+
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &R) -> Option<usize> {
-        let q = self.spec.rank(self.tags, ast, &(self.key)(row));
+        let q = self.spec.rank(self.tags, ast, &(self.rank)(row));
         store
             .rows_sql(
                 self.spec.id,
@@ -778,6 +1080,41 @@ impl<D: Datasource> Table<D> {
         (0..n).find(|&i| self.row(store, i).as_ref() == Some(row))
     }
 
+    /// A row's identity — what a mark holds.
+    #[must_use]
+    pub fn key(&self, row: &D::Row) -> D::Key {
+        self.ds.key(row)
+    }
+
+    /// Every key under the current filter, in the table's order — what
+    /// `mark all` marks; `None` from a source that cannot list them.
+    #[must_use]
+    pub fn keys(&self, store: &Store) -> Option<Vec<D::Key>> {
+        self.ds.keys(store, self.ast.as_ref())
+    }
+
+    /// Which of these keys the current filter still shows.
+    #[must_use]
+    pub fn present(&self, store: &Store, keys: &[D::Key]) -> Vec<D::Key> {
+        self.ds.present(store, self.ast.as_ref(), keys)
+    }
+
+    /// The row for a key, filter or no filter — how a hidden mark is drawn.
+    #[must_use]
+    pub fn by_key(&self, store: &Store, key: &D::Key) -> Option<D::Row> {
+        self.ds.by_key(store, key)
+    }
+
+    /// The marks the filter shows and the marks it hides, both in the set's
+    /// order. A hidden mark is still a mark: it counts, it is drawn above
+    /// the rows, and a batch verb acts on it.
+    #[must_use]
+    pub fn split(&self, store: &Store, marks: &Marks<D::Key>) -> (Vec<D::Key>, Vec<D::Key>) {
+        let keys = marks.keys();
+        let shown: BTreeSet<D::Key> = self.present(store, &keys).into_iter().collect();
+        keys.into_iter().partition(|k| shown.contains(k))
+    }
+
     /// The end of the list came on screen: a source without a count grows
     /// its window by a page, if the last one was full. A counted source
     /// needs nothing — every row already has a place.
@@ -943,6 +1280,7 @@ mod tests {
         ],
         order: &[("n", Dir::Desc), ("id", Dir::Asc)],
         group: None,
+        key: "id",
     };
 
     static TAGS: &[TagDef] = &[
@@ -976,6 +1314,46 @@ mod tests {
         },
     ];
 
+    /// The same items as **groups** — one row per `ok`, its members
+    /// aggregated — so the marks' queries can be held to the page's shape
+    /// under a `group`, where a group matches when any member does.
+    static GROUPS: SqlSpec = SqlSpec {
+        id: "groups",
+        describe: "the test items, grouped",
+        select: "i.ok AS g, MAX(i.at) AS last, COUNT(*) AS members",
+        from: "item i",
+        base: "i.id > 0",
+        text: &["i.name"],
+        tags: &[("ok", TagSql::Where("i.ok = 1")), ("name", TagSql::Col("i.name"))],
+        order: &[("last", Dir::Desc), ("g", Dir::Desc)],
+        group: Some("i.ok"),
+        key: "g",
+    };
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Group {
+        g: i64,
+        last: f64,
+        members: i64,
+    }
+
+    fn group_row(r: &rusqlite::Row) -> rusqlite::Result<Group> {
+        Ok(Group {
+            g: r.get(0)?,
+            last: r.get(1)?,
+            members: r.get(2)?,
+        })
+    }
+
+    static GROUP_SOURCE: SqlSource<Group, i64> = SqlSource {
+        spec: &GROUPS,
+        tags: TAGS,
+        map: group_row,
+        key: |g| g.g,
+        rank: |g| vec![Val::F(g.last), Val::I(g.g)],
+        suggest: suggest_names,
+    };
+
     fn suggest_names(store: &Store, tag: &str, prefix: &str) -> Vec<Suggestion> {
         assert_eq!(tag, "name");
         let p = prefix.to_string();
@@ -993,11 +1371,12 @@ mod tests {
             .collect()
     }
 
-    static SOURCE: SqlSource<Item> = SqlSource {
+    static SOURCE: SqlSource<Item, i64> = SqlSource {
         spec: &SPEC,
         tags: TAGS,
         map: item_row,
-        key: |it| vec![Val::F(it.n), Val::I(it.id)],
+        key: |it| it.id,
+        rank: |it| vec![Val::F(it.n), Val::I(it.id)],
         suggest: suggest_names,
     };
 
@@ -1057,6 +1436,70 @@ mod tests {
             "SELECT COUNT(*) FROM item WHERE id > 0 AND ((n > ?) OR (n = ? AND id < ?))"
         );
         assert_eq!(q.params, vec![Val::F(3.0), Val::F(3.0), Val::I(7)]);
+    }
+
+    /// The marks' three questions, as SQL: the keys in the table's order,
+    /// the `IN (…)` that sorts a set into shown and hidden, and the row for
+    /// one key under the base condition only. Under a `group` all three are
+    /// built the way the page and the count are, so a group answers for its
+    /// members.
+    #[test]
+    fn builds_the_marks_queries() {
+        let q = SPEC.keys(TAGS, None);
+        assert_eq!(q.sql, "SELECT id FROM item WHERE id > 0 ORDER BY n DESC, id");
+        assert!(q.params.is_empty());
+
+        let q = SPEC.keys(TAGS, a("@ok").as_ref());
+        assert_eq!(
+            q.sql,
+            "SELECT id FROM item WHERE id > 0 AND (ok = 1) ORDER BY n DESC, id"
+        );
+
+        let q = SPEC.present(TAGS, None, 3);
+        assert_eq!(q.sql, "SELECT id FROM item WHERE id > 0 AND id IN (?, ?, ?)");
+        assert!(q.params.is_empty(), "the keys' values are the caller's");
+
+        let q = SPEC.present(TAGS, a("@n>1").as_ref(), 2);
+        assert_eq!(
+            q.sql,
+            "SELECT id FROM item WHERE id > 0 AND n > ? AND id IN (?, ?)"
+        );
+        assert_eq!(q.params, vec![Val::F(1.0)], "the filter's, then the keys'");
+
+        let q = SPEC.by_key();
+        assert_eq!(q.sql, "SELECT id, name, n, ok, at FROM item WHERE id > 0 AND id = ?");
+
+        // Grouped: the keys read off the same subquery the page does (the
+        // order names its aliases), and the membership test is the filter's.
+        let q = GROUPS.keys(TAGS, None);
+        assert_eq!(
+            q.sql,
+            "SELECT g FROM (SELECT i.ok AS g, MAX(i.at) AS last, COUNT(*) AS members \
+             FROM item i WHERE i.id > 0 GROUP BY i.ok) ORDER BY last DESC, g DESC"
+        );
+        let q = GROUPS.keys(TAGS, a("@ok").as_ref());
+        assert_eq!(
+            q.sql,
+            "SELECT g FROM (SELECT i.ok AS g, MAX(i.at) AS last, COUNT(*) AS members \
+             FROM item i WHERE i.id > 0 \
+             AND i.ok IN (SELECT i.ok FROM item i WHERE i.id > 0 AND (i.ok = 1)) \
+             GROUP BY i.ok) ORDER BY last DESC, g DESC"
+        );
+        // The `IN (…)` is on the group's key, not on the member that
+        // matched — like the count, it needs no aggregates.
+        let q = GROUPS.present(TAGS, a("@ok").as_ref(), 2);
+        assert_eq!(
+            q.sql,
+            "SELECT i.ok FROM item i WHERE i.id > 0 \
+             AND i.ok IN (SELECT i.ok FROM item i WHERE i.id > 0 AND (i.ok = 1)) \
+             AND i.ok IN (?, ?) GROUP BY i.ok"
+        );
+        let q = GROUPS.by_key();
+        assert_eq!(
+            q.sql,
+            "SELECT i.ok AS g, MAX(i.at) AS last, COUNT(*) AS members \
+             FROM item i WHERE i.id > 0 AND i.ok = ? GROUP BY i.ok"
+        );
     }
 
     #[test]
@@ -1195,14 +1638,120 @@ mod tests {
         assert_eq!(t.row(&s, 0).unwrap().name, "new");
     }
 
+    /// The marks: a set of keys, and nothing else — no store in sight.
+    #[test]
+    fn marks_are_a_set_of_keys() {
+        let mut m: Marks<i64> = Marks::new();
+        assert!(m.is_empty() && !m.has(&1));
+        assert_eq!(m.len(), 0);
+        assert_eq!(m, Marks::default());
+
+        assert!(m.toggle(7), "marked");
+        assert!(!m.toggle(7), "and unmarked again");
+        assert!(m.is_empty());
+
+        m.add(3);
+        m.add(3);
+        assert_eq!(m.len(), 1, "marking a marked row does nothing");
+        m.extend([1, 2, 3]);
+        assert_eq!(m.keys(), vec![1, 2, 3], "in key order, whatever the order marked");
+        assert_eq!(m.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(m.has(&2));
+        m.remove(&2);
+        m.remove(&2);
+        assert_eq!(m.keys(), vec![1, 3]);
+
+        // What a verb could not do stays marked.
+        m.extend(4..=6);
+        m.retain(|k| k % 2 == 0);
+        assert_eq!(m.keys(), vec![4, 6]);
+
+        // Take empties and hands the set over; clear just empties.
+        let taken = m.take();
+        assert_eq!(taken.into_iter().collect::<Vec<_>>(), vec![4, 6]);
+        assert!(m.is_empty());
+        m.extend([9]);
+        m.clear();
+        assert!(m.is_empty());
+
+        // Any key, not just an id.
+        let mut s: Marks<String> = Marks::new();
+        assert!(s.toggle("b".to_string()));
+        s.add("a".to_string());
+        assert_eq!(s.keys(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The three questions under the filter: every matching key (what `all`
+    /// marks), which of a set the filter still shows, and the row for a key
+    /// whether or not it matches — so a mark the filter hides is still a
+    /// mark, read fresh.
+    #[test]
+    fn a_table_sorts_its_marks() {
+        let s = store_with(25);
+        let mut t = Table::new(&SOURCE, 10);
+
+        // Keys are the table's order, and all of it — past the page size.
+        let all = t.keys(&s).expect("a source that can list");
+        assert_eq!(all.len(), 25);
+        assert_eq!(all[..3], [6, 13, 20], "n DESC, id — the page's order");
+        assert_eq!(t.key(&t.row(&s, 0).unwrap()), 6);
+
+        t.set_filter("@ok");
+        let ok = t.keys(&s).expect("keys");
+        assert_eq!(ok.len(), 12);
+        assert_eq!(ok, t.rows(&s, 0, 12).iter().map(|i| i.id).collect::<Vec<_>>());
+
+        // A mark that left the filter sorts into hidden; the rest is shown.
+        let mut marks = Marks::new();
+        marks.extend([6, 7, 20]); // 7 is odd: not ok, so not shown.
+        assert_eq!(t.present(&s, &marks.keys()), vec![6, 20]);
+        assert_eq!(t.split(&s, &marks), (vec![6, 20], vec![7]));
+        assert_eq!(t.split(&s, &Marks::new()), (vec![], vec![]));
+
+        // And it still has a row: by_key ignores the filter, keeps the base.
+        let hidden = t.by_key(&s, &7).expect("the row behind a hidden mark");
+        assert_eq!((hidden.id, hidden.ok), (7, false));
+        assert_eq!(t.by_key(&s, &999), None, "a key that is not there");
+
+        // Reactive like the page: the keys follow a commit.
+        s.write(|c| c.execute("UPDATE item SET ok = 1 WHERE id = 7", []))
+            .unwrap();
+        assert_eq!(t.present(&s, &marks.keys()), vec![6, 7, 20]);
+        assert_eq!(t.keys(&s).map(|k| k.len()), Some(13));
+    }
+
+    /// Under a `group` the three queries answer for the group: it is marked
+    /// when any member matches the filter, and its row is the aggregate.
+    #[test]
+    fn a_grouped_source_marks_by_group() {
+        let s = store_with(25);
+        let mut t = Table::new(&GROUP_SOURCE, 10);
+        assert_eq!(t.len(&s), 2, "the ok items and the rest");
+        assert_eq!(t.keys(&s), Some(vec![0, 1]), "latest first: item 25 is not ok");
+
+        t.set_filter("@ok");
+        assert_eq!(t.keys(&s), Some(vec![1]));
+        let mut marks = Marks::new();
+        marks.extend([0, 1]);
+        assert_eq!(t.split(&s, &marks), (vec![1], vec![0]));
+        // A group whose *members* match a text filter comes back whole.
+        t.set_filter("alpha");
+        assert_eq!(t.keys(&s), Some(vec![0, 1]));
+        assert_eq!(t.by_key(&s, &0).map(|g| g.members), Some(13), "all of it");
+    }
+
     /// A source that cannot count: the window grows a page at a time as
     /// the end comes on screen.
     struct Stream(Vec<i64>);
 
     impl Datasource for Stream {
         type Row = i64;
+        type Key = i64;
         fn tags(&self) -> &'static [TagDef] {
             &[]
+        }
+        fn key(&self, row: &i64) -> i64 {
+            *row
         }
         fn count(&self, _: &Store, _: Option<&Ast>) -> Option<usize> {
             None
@@ -1225,6 +1774,12 @@ mod tests {
         assert_eq!(t.len(&s), 23);
         assert_eq!(t.index_of(&s, &22), Some(22));
         assert_eq!(t.index_of(&s, &99), None);
+        // It cannot list its keys either, so `all` is not offered; marks
+        // are taken at their word, and nothing is known to be hidden.
+        assert_eq!(t.keys(&s), None);
+        assert_eq!(t.present(&s, &[3, 99]), vec![3, 99]);
+        assert_eq!(t.split(&s, &Marks::default()), (vec![], vec![]));
+        assert_eq!(t.by_key(&s, &3), None);
         t.set_filter("x");
         assert_eq!(t.len(&s), 10, "a new filter resets the window");
     }

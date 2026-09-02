@@ -310,6 +310,7 @@ static THREADS_SPEC: SqlSpec = SqlSpec {
     ],
     order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
     group: Some("m.thread"),
+    key: "thread",
 };
 
 const DATE_OPS: &[Op] = &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte];
@@ -389,11 +390,12 @@ fn suggest_inbox(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
 }
 
 /// The inbox's datasource: what the inbox panel's rich table runs on.
-pub static THREADS: SqlSource<ThreadHead> = SqlSource {
+pub static THREADS: SqlSource<ThreadHead, i64> = SqlSource {
     spec: &THREADS_SPEC,
     tags: INBOX_TAGS,
     map: thread_head_row,
-    key: |t| vec![Val::F(t.last), Val::I(t.thread)],
+    key: |t| t.thread,
+    rank: |t| vec![Val::F(t.last), Val::I(t.thread)],
     suggest: suggest_inbox,
 };
 
@@ -661,6 +663,16 @@ pub fn thread_unread(store: &Store, id: MailId) -> Vec<MailId> {
         .filter(|(_, unread)| *unread)
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// Which folder a mail sits in now — read before filing it, so undo puts
+/// it back exactly there rather than guessing "the inbox".
+#[must_use]
+pub fn folder_of(store: &Store, id: MailId) -> i64 {
+    store
+        .conn()
+        .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap_or(0)
 }
 
 /// Which of a conversation's mails sit in the inbox — what filing it moves.
@@ -2560,6 +2572,7 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::richtable::Marks;
 
     fn store() -> Store {
         let s = Store::open(None).expect("in-memory store");
@@ -2831,6 +2844,55 @@ mod tests {
             Some("fyi".into()),
             "the new panel has the forward, seed and all"
         );
+    }
+
+    /// The marks' three questions on the inbox (CR-009), which are one
+    /// query each on the thread source: every thread the filter matches
+    /// (what `mark all` marks), which of a marked set it still shows, and
+    /// the row for a thread it hides — read fresh by its key, base
+    /// condition and all, so it is still an inbox row.
+    #[test]
+    fn threads_answer_for_a_marked_set() {
+        let s = store();
+        let mut t = Table::new(&THREADS, INBOX_PAGE);
+        let all = t.keys(&s).expect("the inbox can list its threads");
+        assert_eq!(all.len(), 69, "every conversation, not just a page of them");
+        assert_eq!(
+            all,
+            t.rows(&s, 0, 69).iter().map(|r| r.thread).collect::<Vec<_>>(),
+            "in the table's own order"
+        );
+        assert_eq!(t.key(&t.row(&s, 0).expect("a row")), all[0]);
+
+        // Under a filter: exactly the matching threads, by any member.
+        t.set_filter("@from:vera@kovac.io");
+        let hits = t.keys(&s).expect("keys");
+        assert_eq!(hits.len(), 1);
+        let (mine, other) = (hits[0], *all.iter().find(|k| **k != hits[0]).expect("another"));
+        assert_eq!(thread_of(&s, 1), Some(mine), "Vera's conversation");
+
+        // A mark the filter hides is sorted out, not dropped.
+        let mut marks = Marks::new();
+        marks.extend([mine, other]);
+        assert_eq!(t.present(&s, &marks.keys()), vec![mine]);
+        assert_eq!(t.split(&s, &marks), (vec![mine], vec![other]));
+
+        // And it still has a row: by_key ignores the filter, and gives the
+        // same aggregates the one-thread read does.
+        let head = t.by_key(&s, &other).expect("the hidden mark's row");
+        assert_eq!(head.thread, other);
+        assert_eq!(Some(head.clone()), thread_head(&s, head.target));
+        assert_eq!(t.by_key(&s, &-1), None, "no such thread");
+
+        // The inbox knows inbox threads: filed away, the row is gone —
+        // and so is the key from `keys`.
+        t.set_filter("");
+        for id in thread_inbox(&s, head.target) {
+            assert!(s.write(move |c| archive_tx(c, id)).unwrap());
+        }
+        assert_eq!(t.by_key(&s, &other), None);
+        assert_eq!(t.present(&s, &marks.keys()), vec![mine]);
+        assert_eq!(t.keys(&s).map(|k| k.len()), Some(68));
     }
 
     /// Archive moves a mail out of the inbox, the

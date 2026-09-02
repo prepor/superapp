@@ -55,8 +55,9 @@ current state; everything else in this book is settled.
 12. **The file browser reads; it does not write yet.** `new dir`, `copy`,
     `move` and `delete` are drawn with their chords and their whole
     grammar — the hold and its `… here`, the refusals, the end-of-chain
-    rule — and each of them toasts what it *would* have done rather than
-    touching the disk. What is settled and waiting: the verbs are effects
+    rule, and now the marked set they act on — and each of them toasts
+    what it *would* have done rather than touching the disk. What is
+    settled and waiting: the verbs are effects
     (the store cannot reproduce them), the rename-class ones performing
     inline like `clip` while a copy is a deferred job with its status on
     the panel; `delete` is the trash, never `rm`, so undo can restore;
@@ -85,7 +86,3 @@ current state; everything else in this book is settled.
     over that instead of a path, and compose gaining `attach` bound to a
     files panel by the join, the way `copy here` is bound to a directory.
 
-16. **A files selection spans nothing**: the unit is the row under the
-    cursor, because a multi-row selection would multiply every verb, and
-    the same question stands for the inbox (open question 3). Nothing has
-    hurt yet.

@@ -98,6 +98,10 @@ pub struct Node {
     pub after: WmSnap,
     pub intents: Vec<Box<dyn Intent>>,
     pub state: State,
+    /// Context restored with the delta (CR-009): the marks a batch verb
+    /// consumed, per list panel. Undo puts them back, redo takes them
+    /// again — marks are never a node of their own.
+    pub marks: Vec<(u64, Vec<i64>)>,
 }
 
 /// One action, as history is asked to record it.
@@ -125,10 +129,17 @@ pub struct Row {
     pub state: String,
 }
 
-/// What a walk produced: what to say, and the layout to restore.
+/// What a walk produced: what to say, the layout to restore, and the
+/// context that rides the node — the marks, put back by an undo and taken
+/// again by a redo.
 pub struct Step {
     pub label: String,
     pub snap: WmSnap,
+    /// The marks the node consumed, per list panel.
+    pub marks: Vec<(u64, Vec<i64>)>,
+    /// Whether the step undid the node (the marks go back) or applied it
+    /// (they go).
+    pub undone: bool,
 }
 
 /// The tree and its cursor.
@@ -218,11 +229,23 @@ impl History {
                 after,
                 intents,
                 state: State::Applied,
+                marks: Vec::new(),
             },
         );
         self.head = id;
         self.trim();
         id
+    }
+
+    /// Attaches the marks a batch verb consumed to the node just applied,
+    /// so undoing it gives them back (CR-009).
+    pub fn claim_marks(&mut self, pid: u64, keys: Vec<i64>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(n) = self.nodes.get_mut(&self.head) {
+            n.marks.push((pid, keys));
+        }
     }
 
     /// Attaches a claim to the node just applied. For the actions whose
@@ -274,6 +297,8 @@ impl History {
             let step = Step {
                 label: n.label.clone(),
                 snap: n.before.clone(),
+                marks: n.marks.clone(),
+                undone: true,
             };
             self.head = parent;
             return Some(step);
@@ -305,6 +330,8 @@ impl History {
         let step = Step {
             label: n.label.clone(),
             snap: n.after.clone(),
+            marks: n.marks.clone(),
+            undone: false,
         };
         self.head = id;
         Some(step)
@@ -362,6 +389,8 @@ impl History {
             last = Some(Step {
                 label: n.label.clone(),
                 snap: n.after.clone(),
+                marks: n.marks.clone(),
+                undone: false,
             });
             self.head = id;
         }
@@ -377,6 +406,8 @@ impl History {
             return Some(Step {
                 label: "the beginning".into(),
                 snap,
+                marks: Vec::new(),
+                undone: true,
             });
         }
         last

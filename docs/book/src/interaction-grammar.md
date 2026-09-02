@@ -13,7 +13,11 @@ know what it does; nothing may reuse a signal to mean something else.
 
 Nothing draws a dotted link at the moment: the message panel's newer/older
 walk was the last one, and the inbox cursor does that job now (see
-[Preview](#preview-the-one-open-that-does-not-go)).
+[Preview](#preview-the-one-open-that-does-not-go)). A list's
+[marks bar](./richtable.md#marks) is bordered buttons throughout: the
+list's own row verbs on the marked set — `archive` and `delete` in the
+inbox, `copy`, `move` and `delete` in a files panel — then `all` and
+`clear`. All of them act and go nowhere.
 
 **Cmd+click** (or cmd+enter in a list) always opens a fresh, **un-joined**
 panel — the workspace modifier means "workspace-level" with the mouse too
@@ -204,6 +208,20 @@ separator is refused on the status line. Note `copy` wears `p`, not `c`: a
 card's path is selectable, so rule 3 leaves `cmd+c` to the text. The file
 clipboard is not the text clipboard.
 
+**A directory's rows can be marked**, exactly as the inbox's are (see
+[The Rich Table](./richtable.md#marks)): `space` marks the row under the
+cursor, `shift+↓` / `shift+↑` mark a range, `esc` clears, the pointer
+never marks and a long press does. A files panel's marks are its
+**entries, by name**, so they belong to the directory it lists and go when
+it lands on another one. The bar at its foot carries the row's own verbs
+on the set — `copy` (`cmd+p`), `move` (`cmd+m`), `delete` (`cmd+d`) —
+then `all` and `clear`; and **while any row is marked the panel's own
+object verbs stand down**, back to `new dir` and `go to`, because with
+rows marked the verb meant is the set's. A hold is a set too: `copy` or
+`move` on marked rows holds every marked path, and `copy here` performs
+them all into the directory a panel shows, refusing per path exactly as it
+does for one. Drafts still, and the toast says so.
+
 
 ## Keyboard
 
@@ -230,7 +248,12 @@ Per panel, below the reserved set:
 
 - inbox: `enter` opens *and goes* (`cmd+enter` un-joined), `/` filter, arrows
   walk the rows — threads — (scrolling the list to keep the cursor visible,
-  and **previewing** each one beside it). In a message panel the arrows
+  and **previewing** each one beside it). `space` **marks** the cursor's row
+  — it arrives as text the way `/` does, so in a live filter it is a space —
+  `shift+↓` / `shift+↑` mark a range as they walk, and `esc` clears the
+  marks when no field is listening; the bar down a marked row's left edge is
+  an indicator, and nothing on the pointer marks — a click is the preview it
+  always was. In a message panel the arrows
   scroll; its rows open and close by pointer only. In the filter, `@` opens the tag
   autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
   [The Rich Table](./richtable.md) for the grammar
@@ -302,6 +325,16 @@ keyboard**, so `cmd+a` in a live filter is still select-all. Rule 3 survives:
 the list yields the text chords to its field exactly as before, and only
 lends them when the field is not listening.
 
+They stand down for the [marks bar](./richtable.md#marks) too. While a list
+has marked rows the bar wears its rows' own letters itself — `a`, `d` and
+`l` in the inbox; `p`, `m`, `d` and `l` in a files panel — because a batch
+verb is the same verb on a wider set. Whatever the bar wears goes quiet
+elsewhere: the borrowed chords in the inbox, and a files panel's own object
+verbs, which fall back to `new dir` and `go to` while any row is marked.
+Two visible controls may not answer to one chord. The guard is the
+filter's: with the field holding the keyboard `cmd+a` is select-all, not an
+archive of the set.
+
 ## Workspaces
 
 Nine numbered spaces on a vertical stack; a switch **slides** the viewport a
@@ -360,6 +393,12 @@ whole delta: undoing an archive restores the panel *and* the mail's folder;
 filing a thread carries the list's cursor to the next one in the same node,
 so one `cmd+z` takes back the filing and the move together;
 undoing an open makes every mail it read unread again, and none other.
+A batch verb is one node as well: archiving twelve marked conversations
+files every inbox mail of every one of them under a single `archive 12
+conversations`, and undoing it brings the rows back **marked**. A batch
+carries the cursor the same way, but only when the cursor's own row went
+with it; standing on a row that stayed, the cursor does not move and
+nothing new is previewed.
 Undo also puts you back where the action happened (its workspace and focus
 revert with it). `cmd+shift+z` re-applies.
 
@@ -371,11 +410,11 @@ cannot be undone today. The rows every action wrote are durable, and the
 background passes read only those, never the tree.
 
 What is deliberately *not* an action: focus walks, workspace switches,
-camera pans, row selection — context, not intent. They persist, but they
-never become history nodes; undo restores them only as part of a real
-action's delta. Rapid bursts of the same gesture on the same panel (arrow
-moves, the preview walk) **coalesce** into one node — one `cmd+z` takes
-back the whole burst.
+camera pans, row selection, a list's marks — context, not intent. They
+persist, but they never become history nodes; undo restores them only as
+part of a real action's delta. Rapid bursts of the same gesture on the same
+panel (arrow moves, the preview walk) **coalesce** into one node — one
+`cmd+z` takes back the whole burst.
 
 History is a **tree, not a line**: acting after an undo starts a branch and
 destroys nothing; redo follows the newest branch. **`cmd+u` raises the
@@ -438,6 +477,11 @@ The same grammar, re-based on fingers:
   one gap in from the right) and springs there. **Vertical, downward, raises
   the workspaces overlay** (upward dismisses it), then the gesture goes
   inert.
+- **long-press a list row** — marks it, in the inbox or a files panel: the
+  phone's way into a batch (a header's long press picks the panel up; a
+  row's was free). While any mark exists a tap **toggles** rather than
+  opens, and the last mark cleared gives the tap back. The bar's controls
+  are buttons, so nothing about marks is keyboard-only.
 - **long-press a panel header** — picks the panel up; it rides the finger
   (spring-following, so it trails with the same physics as everything else).
   While held, an **ink insertion bar previews the drop**, judged by the
