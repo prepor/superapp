@@ -668,7 +668,7 @@ static LOG_TAGS: &[TagDef] = &[
         name: "kind",
         kind: TagType::Text,
         ops: &[Op::Eq],
-        describe: "the effect's verb — move, seen, submit",
+        describe: "the effect's verb — move, seen, forwarded, submit",
         values: Values::Dynamic,
     },
     TagDef {

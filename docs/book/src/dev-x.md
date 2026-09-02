@@ -328,8 +328,8 @@ Components are their state from the first draw.
 Scenes are Rust, not a text file: fixtures are the real structs
 (`ThreadHead`, `ThreadMail`, `OverlayRowData`, `mail::Move`…) and a state is
 set through the widget's own methods, so a refactor that breaks a scene
-fails to compile rather than quietly rearranging the canvas. The catalogue's test
-checks that every scene is a DAG with a name per state; the shape and the
+fails to compile rather than quietly rearranging the canvas. The catalogue's
+test checks that every scene is a DAG with a name per state; the shape and the
 layout are pure (`src/scene.rs`), unit-tested without a window. Adding a
 state is one line in its subject's function.
 

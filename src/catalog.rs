@@ -381,7 +381,7 @@ fn stranger(kind: &str, payload: &str, f: &Filed) -> (effect::Job, String) {
     (job, payload.to_string())
 }
 
-/// The three effects this app files, as the scenes show them.
+/// The four effects this app files, as the scenes show them.
 fn a_move() -> mail::Move {
     mail::Move {
         account: 1,
@@ -400,6 +400,16 @@ fn a_seen() -> mail::Seen {
         folder: "INBOX".into(),
         uid: 121,
         seen: true,
+    }
+}
+
+fn a_forwarded() -> mail::Forwarded {
+    mail::Forwarded {
+        account: 1,
+        message: 51,
+        folder: "INBOX".into(),
+        uid: 121,
+        on: true,
     }
 }
 
@@ -684,11 +694,13 @@ fn effect_row() -> Scene<Setup> {
     };
     Scene::new("effect row", (560.0, 60.0))
         .note("One job of the effect queue: the verb and whose it was, then the sentence the effect describes itself with.")
-        .note("The first three are the effects this app files — everything it has tried on the outside world is one of them. The rest is what becomes of one.")
+        .note("The first four are the effects this app files — everything it has tried on the outside world is one of them. The rest is what becomes of one.")
         .node("move", row(shown(&a_move(), &queued()), false))
         .about("make the server agree which folder a mail lives in")
         .node("seen", row(shown(&a_seen(), &queued()), false))
         .about("…and whether it has been read")
+        .node("forwarded", row(shown(&a_forwarded(), &queued()), false))
+        .about("…and whether it has been passed on ($Forwarded)")
         .node("submit", row(shown(&a_submit(), &outbox()), false))
         .about("hand a mail to SMTP — the one effect a crash may not repeat, and the one that is not an account's")
         .node(
