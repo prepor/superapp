@@ -216,8 +216,14 @@ pub struct SqlSpec {
     /// Tag name → binding.
     pub tags: &'static [(&'static str, TagSql)],
     /// The order, which is also the rank key. Must be total (end with a
-    /// unique column) or paging tears.
+    /// unique column) or paging tears. Under a `group`, these name aliases
+    /// of `select`, since the page is read off the grouped subquery.
     pub order: &'static [(&'static str, Dir)],
+    /// A row is a group (CR-007: a thread is its inbox messages). The
+    /// select is then aggregates over the members, `GROUP BY` this key, and
+    /// the filter becomes a membership test: a group matches when **any**
+    /// member matches, and its aggregates always cover the whole group.
+    pub group: Option<&'static str>,
 }
 
 /// Built SQL and its parameters.
@@ -430,38 +436,64 @@ impl SqlSpec {
         }
     }
 
+    /// `FROM … WHERE …` (and `GROUP BY` under a group), with the filter in
+    /// its place: on the rows for a flat spec, as a membership test on the
+    /// members for a grouped one.
+    fn body(&self, tags: &[TagDef], ast: Option<&Ast>) -> (String, Vec<Val>) {
+        let (w, params) = self.where_clause(tags, ast);
+        let Some(g) = self.group else {
+            return (format!("FROM {}{w}", self.from), params);
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if !self.base.is_empty() {
+            parts.push(self.base.to_string());
+        }
+        if ast.and_then(|a| self.expr(tags, a, &mut Vec::new())).is_some() {
+            parts.push(format!("{g} IN (SELECT {g} FROM {}{w})", self.from));
+        }
+        let wh = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", parts.join(" AND "))
+        };
+        (format!("FROM {}{wh} GROUP BY {g}", self.from), params)
+    }
+
     /// One page of rows.
     #[must_use]
     pub fn page(&self, tags: &[TagDef], ast: Option<&Ast>, offset: usize, limit: usize) -> Sql {
-        let (w, mut params) = self.where_clause(tags, ast);
+        let (body, mut params) = self.body(tags, ast);
         params.push(Val::I(limit as i64));
         params.push(Val::I(offset as i64));
-        Sql {
-            sql: format!(
-                "SELECT {} FROM {}{w}{} LIMIT ? OFFSET ?",
+        let sql = if self.group.is_some() {
+            format!(
+                "SELECT * FROM (SELECT {} {body}){} LIMIT ? OFFSET ?",
                 self.select,
-                self.from,
                 self.order_by()
-            ),
-            params,
-        }
+            )
+        } else {
+            format!("SELECT {} {body}{} LIMIT ? OFFSET ?", self.select, self.order_by())
+        };
+        Sql { sql, params }
     }
 
     /// How many rows match.
     #[must_use]
     pub fn count(&self, tags: &[TagDef], ast: Option<&Ast>) -> Sql {
-        let (w, params) = self.where_clause(tags, ast);
-        Sql {
-            sql: format!("SELECT COUNT(*) FROM {}{w}", self.from),
-            params,
-        }
+        let (body, params) = self.body(tags, ast);
+        let sql = if self.group.is_some() {
+            format!("SELECT COUNT(*) FROM (SELECT 1 {body})")
+        } else {
+            format!("SELECT COUNT(*) {body}")
+        };
+        Sql { sql, params }
     }
 
     /// How many matching rows the order puts *before* a row with this key
     /// — its index. `key` has one value per `order` column.
     #[must_use]
     pub fn rank(&self, tags: &[TagDef], ast: Option<&Ast>, key: &[Val]) -> Sql {
-        let (w, mut params) = self.where_clause(tags, ast);
+        let (body, mut params) = self.body(tags, ast);
         let mut alts: Vec<String> = Vec::new();
         for (i, (col, dir)) in self.order.iter().enumerate() {
             let mut conj: Vec<String> = Vec::new();
@@ -481,15 +513,17 @@ impl SqlSpec {
             alts.push(format!("({})", conj.join(" AND ")));
         }
         let before = alts.join(" OR ");
-        let w = if w.is_empty() {
-            format!(" WHERE {before}")
+        let sql = if self.group.is_some() {
+            format!(
+                "SELECT COUNT(*) FROM (SELECT {} {body}) WHERE ({before})",
+                self.select
+            )
+        } else if body.contains(" WHERE ") {
+            format!("SELECT COUNT(*) {body} AND ({before})")
         } else {
-            format!("{w} AND ({before})")
+            format!("SELECT COUNT(*) {body} WHERE {before}")
         };
-        Sql {
-            sql: format!("SELECT COUNT(*) FROM {}{w}", self.from),
-            params,
-        }
+        Sql { sql, params }
     }
 }
 
@@ -908,6 +942,7 @@ mod tests {
             ("at", TagSql::Col("at")),
         ],
         order: &[("n", Dir::Desc), ("id", Dir::Asc)],
+        group: None,
     };
 
     static TAGS: &[TagDef] = &[

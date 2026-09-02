@@ -73,6 +73,11 @@ pub struct Outgoing {
     pub body: String,
     /// The Message-ID this replies to, for threading headers.
     pub in_reply_to: Option<String>,
+    /// What the mail replied to itself referenced, so `References` carries
+    /// the whole chain (RFC 5322) and a reply to a reply threads for the
+    /// other side too. Absent on payloads filed before CR-007.
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 /// How to reach a server. `Debug` redacts the password so a stray `{:?}`
@@ -1268,9 +1273,18 @@ impl Outside for Real {
             .to(m.to.parse().map_err(|e| s(&e))?)
             .subject(m.subject.clone());
         if let Some(mid) = &m.in_reply_to {
+            let bracket = |id: &String| {
+                format!("<{}>", id.trim().trim_start_matches('<').trim_end_matches('>'))
+            };
+            let mut refs: Vec<String> = Vec::new();
+            for id in m.references.iter().chain(std::iter::once(mid)).map(bracket) {
+                if !refs.contains(&id) {
+                    refs.push(id);
+                }
+            }
             b = b
-                .header(header::InReplyTo::from(mid.clone()))
-                .header(header::References::from(mid.clone()));
+                .header(header::InReplyTo::from(bracket(mid)))
+                .header(header::References::from(refs.join(" ")));
         }
         let msg = b.body(m.body.clone()).map_err(|e| s(&e))?;
         let raw = msg.formatted();

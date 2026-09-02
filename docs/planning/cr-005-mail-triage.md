@@ -3,7 +3,9 @@
 Status: **implemented** (Andrey, 2026-09-01: focusing a row should open the
 message immediately without moving focus; the message's shortcuts should work
 from the list; delete belongs beside archive; android needs row swipes —
-"smooth and nicely animated").
+"smooth and nicely animated"). Since CR-007 a row is a thread: the walk, the
+preview and the triage below act on conversations, and the `newer`/`older`
+walk inside a message is gone.
 
 ## Why
 

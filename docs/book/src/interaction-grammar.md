@@ -11,6 +11,10 @@ know what it does; nothing may reuse a signal to mean something else.
 | dotted underline | **replaces** the panel it lives in |
 | bordered button | **side effect only** — never navigation |
 
+Nothing draws a dotted link at the moment: the message panel's newer/older
+walk was the last one, and the inbox cursor does that job now (see
+[Preview](#preview-the-one-open-that-does-not-go)).
+
 **Cmd+click** (or cmd+enter in a list) always opens a fresh, **un-joined**
 panel — the workspace modifier means "workspace-level" with the mouse too
 (alt is kept as a quiet alias). Side-effect feedback is a transient toast in
@@ -37,6 +41,35 @@ them coalesces into a single history node, so one `cmd+z` takes it all back.
 Only a panel that *has* a cursor over a list can preview, and it previews into
 exactly one kind (the inbox into a message). The pair reads as one thing,
 which is also why it borrows keys — see [Accelerators](#accelerators).
+
+### Threads: the row is the conversation, the panel is the whole of it
+
+An inbox row is a **thread**: every mail of a conversation counts, and it is
+a row while at least one of them sits in the inbox. The row names who wrote
+in it — newest speaker first, `me` for your own address, first names once
+there are two — and the count past one (`Max, me · 3`), the subject with its
+`Re:` stripped, and the date of the latest inbox mail; it is bold while any
+of them is unread. Filing the row files every inbox mail of the thread in
+one undo node. A reply arriving later puts the thread back by itself.
+
+A message panel shows the thread its mail belongs to, oldest first, the
+account it came to once at the top and `reply` at the foot — a reply to the
+conversation, which is a reply to its newest mail. **Each message is one
+row, open or closed.** Closed, the row is the sender, the first line they
+wrote in grey (or the status line, red when it is an error) and the date.
+Open, the same row is the sender as a contact link and the date, with the
+letter unfolded under it; its quoted tail — the message above, usually —
+sits folded behind `› quoted`. Touching a closed row opens it in place;
+touching an open one's header closes it; touching the fold unfolds it. None
+of that is an action: like the inbox cursor it is panel context, no history
+node, gone with the process. There is no chord for it — a panel has many
+rows, and rule 4 gives chords only to controls a panel has one of.
+
+**Opening a thread reads it.** What starts open is what was new: the mail
+the row pointed at (the oldest unread inbox mail, else the newest) and every
+mail that was unread — and the open marks all of them read, one intent each,
+so one `cmd+z` puts every flag back. After a restart a panel comes back with
+only its own mail open; "what was new" dies with the process, as undo does.
 
 A preview needs somewhere to *be*. Where the pair cannot share the screen —
 a phone grid, where each panel is the whole of it — the open simply goes, as
@@ -66,8 +99,9 @@ That is the whole reserved set: `1…9`, the arrows, `w z u i t [ ] , .` and
 Per panel, below the reserved set:
 
 - inbox: `enter` opens *and goes* (`cmd+enter` un-joined), `/` filter, arrows
-  walk the rows (scrolling the list to keep the cursor visible, and
-  **previewing** each one beside it). In the filter, `@` opens the tag
+  walk the rows — threads — (scrolling the list to keep the cursor visible,
+  and **previewing** each one beside it). In a message panel the arrows
+  scroll; its rows open and close by pointer only. In the filter, `@` opens the tag
   autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
   [The Rich Table](./richtable.md) for the grammar
 - compose: in TO, typing offers the senders the store knows, by name or
@@ -88,10 +122,9 @@ typing; control keys (enter, arrows, backspace) are routed as key events.
 
 **A control carries its own key, drawn into its label.** One character of a
 button or link is **bold**, and `cmd`+that letter fires it: `archive` is
-`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, the message walk is
-`cmd+n` / `cmd+o` on `← newer` and `older →`, the inbox's `sync` is `cmd+s`,
-settings' `add account` is `cmd+d`. Nothing to memorise and no help panel to
-consult — the shortcut is a property of the thing it fires.
+`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, the inbox's `sync` is
+`cmd+s`, settings' `add account` is `cmd+d`. Nothing to memorise and no help
+panel to consult — the shortcut is a property of the thing it fires.
 
 This is the one place bold does a second job, so the rule is sharp:
 
@@ -121,10 +154,10 @@ by discipline:
 ### Borrowed keys
 
 A [preview](#preview-the-one-open-that-does-not-go) and the list driving it
-are one working surface, so they pool their accelerators: with a mail
-previewed, `cmd+a` archives it, `cmd+d` deletes it, `cmd+r` replies and
-`cmd+n` / `cmd+o` walk — all without leaving the list. The driver's own keys
-win first (`cmd+s` still syncs the inbox), and the preview lends what is left.
+are one working surface, so they pool their accelerators: with a thread
+previewed, `cmd+a` archives it, `cmd+d` deletes it and `cmd+r` replies — all
+without leaving the list. The driver's own keys win first (`cmd+s` still
+syncs the inbox), and the preview lends what is left.
 
 The mark stays honest because it never moves: it is drawn on the message
 panel's own chrome, one column over and in plain sight. Nothing is ever bold
@@ -191,9 +224,9 @@ this surface is where global search lives.
 **Every action is undoable** — open, close, replace, move, column ops,
 workspace moves, archive, delete — and `cmd+z` walks them back with their
 whole delta: undoing an archive restores the panel *and* the mail's folder;
-filing a mail carries the list's cursor to the next one in the same node, so
-one `cmd+z` takes back the filing and the move together;
-undoing an open makes the mail unread again exactly if the open unread it.
+filing a thread carries the list's cursor to the next one in the same node,
+so one `cmd+z` takes back the filing and the move together;
+undoing an open makes every mail it read unread again, and none other.
 Undo also puts you back where the action happened (its workspace and focus
 revert with it). `cmd+shift+z` re-applies.
 
@@ -208,7 +241,7 @@ What is deliberately *not* an action: focus walks, workspace switches,
 camera pans, row selection — context, not intent. They persist, but they
 never become history nodes; undo restores them only as part of a real
 action's delta. Rapid bursts of the same gesture on the same panel (arrow
-moves, j/k reading walks) **coalesce** into one node — one `cmd+z` takes
+moves, the preview walk) **coalesce** into one node — one `cmd+z` takes
 back the whole burst.
 
 History is a **tree, not a line**: acting after an undo starts a branch and
@@ -254,8 +287,8 @@ The same grammar, re-based on fingers:
   [Preview](#preview-the-one-open-that-does-not-go).)
 - **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
   Vertical keeps ties, so a diagonal is a scroll and never half a swipe.
-- **one-finger sideways drag on a mail row** — triage: **left archives,
-  right deletes**. An ink **curtain** wipes across the row carrying the name
+- **one-finger sideways drag on a mail row** — triage of the whole thread:
+  **left archives, right deletes**. An ink **curtain** wipes across the row carrying the name
   of what will happen, entering from the edge that action's button occupies
   in a message header — so the two surfaces agree about which side means
   which verb. Under a third of the way it is a grey wash with the word in

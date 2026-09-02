@@ -3,11 +3,12 @@
 //!
 //! Everything panels show comes through the registered [`Q`] queries — that
 //! is the reactive contract (see [`crate::store`]) and, later, the panel
-//! context an agent receives. The inbox is a rich table over [`INBOX`]: its
+//! context an agent receives. The inbox is a rich table over [`THREADS`]: its
 //! filter is the shared grammar ([`crate::filter`]), whose bare text is one
 //! substring over sender + subject — the shell's original semantics; the
 //! launcher's word-AND lives in [`crate::launcher`].
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use rusqlite::{Connection, Transaction};
@@ -55,6 +56,51 @@ pub struct MailFull {
 pub struct Sender {
     pub email: String,
     pub name: String,
+}
+
+/// One inbox row (CR-007): a conversation, as far as the inbox is
+/// concerned — every message of it counts, and it is a row while at least
+/// one of them sits in the inbox.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadHead {
+    /// The anchor: the lowest member's id. The row's identity.
+    pub thread: i64,
+    /// The mail the row opens: the oldest unread inbox message, else the
+    /// newest one.
+    pub target: MailId,
+    /// Who wrote in it, newest speaker first, `me` for the account's own
+    /// address — first names once there are two of them.
+    pub who: Vec<String>,
+    /// Its subject, reply prefixes stripped, from the oldest message.
+    pub topic: String,
+    /// The latest inbox message's date: the order.
+    pub last: f64,
+    /// Any inbox message unread.
+    pub unread: bool,
+    /// How many messages the whole conversation has, trash left out.
+    pub n: i64,
+}
+
+impl ThreadHead {
+    /// The row's first line: the participants, and the count past one.
+    #[must_use]
+    pub fn who_line(&self) -> String {
+        let who = self.who.join(", ");
+        if self.n > 1 {
+            format!("{who} · {}", self.n)
+        } else {
+            who
+        }
+    }
+}
+
+/// One message of a conversation, as the thread panel draws it.
+#[derive(Debug, Clone)]
+pub struct ThreadMail {
+    pub mail: MailFull,
+    /// The role of the folder it sits in: `inbox`, `archive`, `sent`.
+    pub role: String,
+    pub message_id: String,
 }
 
 static Q_INBOX: Q = Q {
@@ -108,6 +154,43 @@ static Q_ACCOUNTS: Q = Q {
     describe: "every account with its connection config and sync status",
 };
 
+static Q_THREAD: Q = Q {
+    id: "thread",
+    sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
+                 m.body, m.status, m.status_err, a.email, m.html,
+                 COALESCE(f.role, ''), COALESCE(m.message_id, '')
+          FROM message m JOIN account a ON a.id = m.account
+                         JOIN folder f ON f.id = m.folder
+          WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
+            AND f.role IS NOT 'trash'
+          ORDER BY m.date, m.id",
+    describe: "the conversation a mail belongs to, oldest first, trash left out",
+};
+
+static Q_THREAD_TOPIC: Q = Q {
+    id: "thread topic",
+    sql: "SELECT COALESCE(t.topic, t.subject) FROM message t
+          WHERE t.thread = (SELECT thread FROM message WHERE id = ?1)
+          ORDER BY t.date, t.id LIMIT 1",
+    describe: "a conversation's subject, reply prefixes stripped, off its oldest mail",
+};
+
+static Q_THREAD_MEMBERS: Q = Q {
+    id: "thread members",
+    sql: "SELECT m.id, m.unread, COALESCE(f.role, '')
+          FROM message m JOIN folder f ON f.id = m.folder
+          WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
+            AND f.role IS NOT 'trash'
+          ORDER BY m.date, m.id",
+    describe: "every mail of a conversation with its read flag and folder role",
+};
+
+static Q_THREAD_OF: Q = Q {
+    id: "thread of",
+    sql: "SELECT thread FROM message WHERE id = ?1",
+    describe: "which conversation a mail belongs to",
+};
+
 fn head_row(r: &rusqlite::Row) -> rusqlite::Result<MailHead> {
     Ok(MailHead {
         id: r.get(0)?,
@@ -131,6 +214,44 @@ fn full_row(r: &rusqlite::Row) -> rusqlite::Result<MailFull> {
     })
 }
 
+fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadMail> {
+    Ok(ThreadMail {
+        mail: full_row(r)?,
+        role: r.get(11)?,
+        message_id: r.get(12)?,
+    })
+}
+
+/// Decodes one grouped row of [`THREADS_SPEC`]: the participants arrive
+/// newest speaker first, one per sender, separated by the unit separator
+/// (a name may carry a comma; none carries that).
+fn thread_head_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadHead> {
+    let who: Option<String> = r.get(4)?;
+    let mut names: Vec<String> = Vec::new();
+    for n in who.as_deref().unwrap_or("").split('\u{1f}') {
+        let n = n.trim();
+        if !n.is_empty() && !names.iter().any(|x| x == n) {
+            names.push(n.to_string());
+        }
+    }
+    if names.len() > 1 {
+        for n in &mut names {
+            if let Some(first) = n.split_whitespace().next() {
+                *n = first.to_string();
+            }
+        }
+    }
+    Ok(ThreadHead {
+        thread: r.get(0)?,
+        last: r.get(1)?,
+        unread: r.get::<_, i64>(2)? != 0,
+        target: r.get(3)?,
+        who: names,
+        topic: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        n: r.get(6)?,
+    })
+}
+
 fn sender_row(r: &rusqlite::Row) -> rusqlite::Result<Sender> {
     Ok(Sender {
         email: r.get(0)?,
@@ -143,13 +264,35 @@ pub fn inbox(store: &Store) -> Rc<Vec<MailHead>> {
     store.rows(&Q_INBOX, &[], head_row)
 }
 
-/// The inbox as a rich table (CR-006): the fixed parts of its query, which
-/// the builder completes with the filter, the page and the rank. Same
-/// columns and order as [`inbox`]; the account join is for `@account:`.
-static INBOX_SPEC: SqlSpec = SqlSpec {
+/// The inbox as a rich table (CR-006) of **threads** (CR-007): the fixed
+/// parts of its query, which the builder completes with the filter, the
+/// page and the rank. The rows are inbox messages grouped by conversation;
+/// what a row shows is aggregates over them, or over the whole conversation
+/// (participants, count, topic — trash left out), read by subquery. The
+/// account join is for `@account:` and for `me`.
+static THREADS_SPEC: SqlSpec = SqlSpec {
     id: "inbox table",
-    describe: "the inbox under the panel's filter, newest first, one page at a time",
-    select: "m.id, m.from_name, m.from_email, m.subject, m.date, m.unread",
+    describe: "the inbox as conversations under the panel's filter, latest first, one page at a time",
+    select: "m.thread AS thread,
+             MAX(m.date) AS last,
+             MAX(m.unread) AS unread,
+             (SELECT t.id FROM message t JOIN folder tf ON tf.id = t.folder
+               WHERE t.thread = m.thread AND tf.role = 'inbox'
+               ORDER BY t.unread DESC,
+                        CASE WHEN t.unread THEN t.date ELSE -t.date END, t.id
+               LIMIT 1) AS target,
+             (SELECT GROUP_CONCAT(
+                 CASE WHEN t.from_email = ta.email THEN 'me'
+                      WHEN t.from_name = '' THEN t.from_email
+                      ELSE t.from_name END, char(31) ORDER BY t.date DESC)
+               FROM message t JOIN folder tf ON tf.id = t.folder
+                              JOIN account ta ON ta.id = t.account
+               WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS who,
+             (SELECT COALESCE(t.topic, t.subject) FROM message t
+               WHERE t.thread = m.thread ORDER BY t.date, t.id LIMIT 1) AS topic,
+             (SELECT COUNT(DISTINCT COALESCE(NULLIF(t.message_id, ''), 'id:' || t.id))
+               FROM message t JOIN folder tf ON tf.id = t.folder
+               WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS n",
     from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
     base: "f.role = 'inbox'",
     text: &["m.from_name", "m.from_email", "m.subject"],
@@ -161,12 +304,14 @@ static INBOX_SPEC: SqlSpec = SqlSpec {
         ("date", TagSql::Col("m.date")),
         ("account", TagSql::Col("a.email")),
     ],
-    order: &[("m.date", Dir::Desc), ("m.id", Dir::Desc)],
+    order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
+    group: Some("m.thread"),
 };
 
 const DATE_OPS: &[Op] = &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte];
 
-/// The inbox filter's tags: what `@` offers.
+/// The inbox filter's tags: what `@` offers. Each reads against the inbox
+/// messages, and a conversation matches when any of them does.
 static INBOX_TAGS: &[TagDef] = &[
     TagDef {
         name: "unread",
@@ -240,11 +385,11 @@ fn suggest_inbox(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
 }
 
 /// The inbox's datasource: what the inbox panel's rich table runs on.
-pub static INBOX: SqlSource<MailHead> = SqlSource {
-    spec: &INBOX_SPEC,
+pub static THREADS: SqlSource<ThreadHead> = SqlSource {
+    spec: &THREADS_SPEC,
     tags: INBOX_TAGS,
-    map: head_row,
-    key: |m| vec![Val::F(m.date), Val::I(m.id)],
+    map: thread_head_row,
+    key: |t| vec![Val::F(t.last), Val::I(t.thread)],
     suggest: suggest_inbox,
 };
 
@@ -253,9 +398,9 @@ pub static INBOX: SqlSource<MailHead> = SqlSource {
 pub const INBOX_PAGE: usize = 50;
 
 /// The whole inbox under a filter, materialized — for tests and the odd
-/// one-shot read; panels page through [`INBOX`] instead.
-pub fn inbox_filtered(store: &Store, filter: &str) -> Vec<MailHead> {
-    let mut t = Table::new(&INBOX, INBOX_PAGE);
+/// one-shot read; panels page through [`THREADS`] instead.
+pub fn inbox_filtered(store: &Store, filter: &str) -> Vec<ThreadHead> {
+    let mut t = Table::new(&THREADS, INBOX_PAGE);
     t.set_filter(filter);
     let n = t.len(store);
     t.rows(store, 0, n)
@@ -353,16 +498,275 @@ pub fn me(store: &Store) -> String {
         .unwrap_or_default()
 }
 
-/// The inbox neighbours of a mail: `(newer, older)`.
-pub fn neighbours(store: &Store, id: MailId) -> (Option<MailId>, Option<MailId>) {
-    let list = inbox(store);
-    let Some(i) = list.iter().position(|m| m.id == id) else {
-        return (None, None);
+// -- threads (CR-007) ---------------------------------------------------------
+
+/// The subject with its reply and forward prefixes stripped — what a
+/// conversation is called, whichever of its mails you read it off.
+#[must_use]
+pub fn topic_of(subject: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "re", "fw", "fwd", "aw", "wg", "sv", "vs", "tr", "antw", "ref", "res", "rif", "odp",
+        "ynt",
+    ];
+    let mut s = subject.trim();
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(colon) = lower.find(':') else { break };
+        // `re[2]:` and `re (2):` count as `re`.
+        let head = lower[..colon]
+            .split(['[', '('])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !PREFIXES.contains(&head) {
+            break;
+        }
+        s = s[colon + 1..].trim_start();
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        subject.trim().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Decides which conversation a mail belongs to and records it, in the
+/// transaction that stored the mail. Three lookups over the account, and
+/// their union merges into one thread:
+///
+/// 1. **my references name them** — mails whose id is in my `References`;
+/// 2. **they name me** — mails whose references carry my id (the parent
+///    arrived late: Sent syncs after Inbox, the window, a move);
+/// 3. **we name the same missing mail** — mails whose references share an
+///    id with mine (two GitHub comments under an issue mail never received).
+///
+/// Plus a mail already here under my own id (my reply, in Sent and back
+/// through a list). Every thread found merges into the lowest anchor; none
+/// found, and the mail anchors itself.
+pub fn thread_tx(
+    c: &rusqlite::Connection,
+    account: i64,
+    id: MailId,
+    message_id: &str,
+    refs: &[String],
+) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM reference WHERE message = ?1", [id])?;
+    for r in refs {
+        if !r.is_empty() {
+            c.execute(
+                "INSERT INTO reference(message, mid) VALUES(?1, ?2)",
+                rusqlite::params![id, r],
+            )?;
+        }
+    }
+    let found: Vec<i64> = c
+        .prepare(
+            "SELECT DISTINCT m.thread FROM message m
+             WHERE m.account = ?1 AND m.id != ?2 AND m.thread IS NOT NULL AND (
+                   (?3 != '' AND m.message_id = ?3)
+                OR m.message_id IN (SELECT mid FROM reference WHERE message = ?2)
+                OR (?3 != '' AND EXISTS (SELECT 1 FROM reference r
+                                          WHERE r.message = m.id AND r.mid = ?3))
+                OR EXISTS (SELECT 1 FROM reference r JOIN reference mine ON mine.mid = r.mid
+                            WHERE r.message = m.id AND mine.message = ?2))",
+        )?
+        .query_map(rusqlite::params![account, id, message_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let anchor = found.iter().copied().chain(std::iter::once(id)).min().unwrap_or(id);
+    c.execute(
+        "UPDATE message SET thread = ?1 WHERE id = ?2",
+        rusqlite::params![anchor, id],
+    )?;
+    if !found.is_empty() {
+        let list = found.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        c.execute(
+            &format!("UPDATE message SET thread = ?1 WHERE account = ?2 AND thread IN ({list})"),
+            rusqlite::params![anchor, account],
+        )?;
+    }
+    Ok(())
+}
+
+/// The conversation `id` belongs to, oldest first. A mail present twice in
+/// the account — my own reply, in Sent and back through a list — is one
+/// message here: the copy outside Sent wins.
+pub fn thread(store: &Store, id: MailId) -> Vec<ThreadMail> {
+    let rows = store.rows(&Q_THREAD, &[Val::I(id)], thread_row);
+    let mut out: Vec<ThreadMail> = Vec::with_capacity(rows.len());
+    for m in rows.iter() {
+        if !m.message_id.is_empty() {
+            if let Some(i) = out.iter().position(|o| o.message_id == m.message_id) {
+                if out[i].role == "sent" && m.role != "sent" {
+                    out[i] = m.clone();
+                }
+                continue;
+            }
+        }
+        out.push(m.clone());
+    }
+    out
+}
+
+/// A conversation's subject, off its oldest mail, reply prefixes stripped.
+pub fn thread_topic(store: &Store, id: MailId) -> Option<String> {
+    store
+        .rows(&Q_THREAD_TOPIC, &[Val::I(id)], |r| r.get::<_, String>(0))
+        .first()
+        .cloned()
+}
+
+/// The anchor of the conversation a mail belongs to.
+pub fn thread_of(store: &Store, id: MailId) -> Option<i64> {
+    store
+        .rows(&Q_THREAD_OF, &[Val::I(id)], |r| r.get::<_, Option<i64>>(0))
+        .first()
+        .cloned()
+        .flatten()
+}
+
+/// Which of a conversation's mails are unread — what opening it marks.
+pub fn thread_unread(store: &Store, id: MailId) -> Vec<MailId> {
+    store
+        .rows(&Q_THREAD_MEMBERS, &[Val::I(id)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?))
+        })
+        .iter()
+        .filter(|(_, unread)| *unread)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Which of a conversation's mails sit in the inbox — what filing it moves.
+pub fn thread_inbox(store: &Store, id: MailId) -> Vec<MailId> {
+    store
+        .rows(&Q_THREAD_MEMBERS, &[Val::I(id)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?))
+        })
+        .iter()
+        .filter(|(_, role)| role == "inbox")
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The inbox row a mail's conversation makes — the same aggregates the
+/// table shows, for one thread — or `None` while none of it is in the inbox.
+pub fn thread_head(store: &Store, id: MailId) -> Option<ThreadHead> {
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} AND m.thread = (SELECT thread FROM message WHERE id = ?1)
+         GROUP BY m.thread",
+        THREADS_SPEC.select, THREADS_SPEC.from, THREADS_SPEC.base
+    );
+    store
+        .rows_sql(
+            "thread head",
+            "one conversation's inbox row",
+            &sql,
+            &[Val::I(id)],
+            thread_head_row,
+        )
+        .first()
+        .cloned()
+}
+
+/// A plain-text letter split into what its author wrote and the quoted
+/// tail they wrote it over — the `On … wrote:` line and the `>` block under
+/// it, when that is how the text ends. A letter that is all quote stays
+/// whole.
+#[must_use]
+pub fn split_quote(text: &str) -> (String, Option<String>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = lines.len();
+    while i > 0 && {
+        let l = lines[i - 1].trim();
+        l.is_empty() || l.starts_with('>')
+    } {
+        i -= 1;
+    }
+    if !lines[i..].iter().any(|l| l.trim_start().starts_with('>')) {
+        return (text.to_string(), None);
+    }
+    let mut start = i;
+    let mut j = i;
+    while j > 0 && lines[j - 1].trim().is_empty() {
+        j -= 1;
+    }
+    if j > 0 && lines[j - 1].trim_end().ends_with("wrote:") {
+        start = j - 1;
+        // A wrapped attribution: `On …` on one line, `… wrote:` on the next.
+        if !lines[start].trim_start().starts_with("On ")
+            && start > 0
+            && lines[start - 1].trim_start().starts_with("On ")
+        {
+            start -= 1;
+        }
+    }
+    let own = lines[..start].join("\n").trim_end().to_string();
+    if own.is_empty() {
+        return (text.to_string(), None);
+    }
+    (own, Some(lines[start..].join("\n").trim().to_string()))
+}
+
+/// The HTML reading split the same way: at the first `<blockquote>`, with
+/// an attribution paragraph right before it going along.
+#[must_use]
+pub fn split_quote_html(html: &str) -> (String, Option<String>) {
+    let Some(at) = html.find("<blockquote") else {
+        return (html.to_string(), None);
     };
-    (
-        i.checked_sub(1).map(|j| list[j].id),
-        list.get(i + 1).map(|m| m.id),
-    )
+    let mut cut = at;
+    if let Some(p) = html[..at].trim_end().rfind("<p>") {
+        if crate::html::plain(&html[p..at]).trim_end().ends_with("wrote:") {
+            cut = p;
+        }
+    }
+    let own = html[..cut].trim_end().to_string();
+    if crate::html::plain(&own).trim().is_empty() {
+        return (html.to_string(), None);
+    }
+    (own, Some(html[cut..].to_string()))
+}
+
+/// What the author wrote, as plain text — the reading a collapsed line
+/// previews and the height wish measures.
+#[must_use]
+pub fn own_text(m: &MailFull) -> String {
+    match &m.html {
+        Some(h) => crate::html::plain(&split_quote_html(h).0),
+        None => split_quote(&m.body).0,
+    }
+}
+
+/// Lines a text takes wrapped at `cols` columns, counted by character.
+fn wrapped_lines(text: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
+    text.lines()
+        .map(|l| l.chars().count().div_ceil(cols).max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// How many lines a conversation reads as, wrapped at `cols`. A closed
+/// message is its one row, which with its inset stands half a line taller
+/// than a line of text; an open one is that row, its own text (the quote
+/// folded), the status line if it has one, and the spacing and rule around
+/// them — about four lines beyond the text. An estimate, like the chrome
+/// allowance it feeds: the wish only has to land on the right grid row.
+#[must_use]
+pub fn thread_lines(msgs: &[ThreadMail], open: &BTreeSet<MailId>, cols: usize) -> usize {
+    let lines: f64 = msgs
+        .iter()
+        .map(|t| {
+            if open.contains(&t.mail.head.id) {
+                4.0 + wrapped_lines(&own_text(&t.mail), cols) as f64
+                    + if t.mail.status.is_some() { 1.0 } else { 0.0 }
+            } else {
+                1.5
+            }
+        })
+        .sum();
+    (lines.ceil() as usize).max(1)
 }
 
 /// How many lines the letter reads as when wrapped at `cols` columns — how
@@ -395,9 +799,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::About => "about".into(),
         Kind::Inbox { filter: Some(f) } => format!("inbox · {f}"),
         Kind::Inbox { filter: None } => "inbox".into(),
-        Kind::Message { id } => mail(store, *id)
-            .map(|m| m.head.subject)
-            .unwrap_or_else(|| "message".into()),
+        Kind::Message { id } => thread_topic(store, *id).unwrap_or_else(|| "message".into()),
         Kind::Contact { email } => contact(store, email).0,
         Kind::Compose { re } => mail(store, *re)
             .map(|m| format!("re: {}", m.head.subject))
@@ -916,7 +1318,8 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
         "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
                 COALESCE((SELECT name FROM folder WHERE account=a.id AND role='sent'), 'Sent'),
                 d.to_addr, d.subject, d.body,
-                (SELECT message_id FROM message WHERE id = d.re_message)
+                (SELECT message_id FROM message WHERE id = d.re_message),
+                (SELECT GROUP_CONCAT(mid, ' ') FROM reference WHERE message = d.re_message)
          FROM outbox o
          JOIN account a ON a.id = o.account
          JOIN draft d ON d.panel = o.id
@@ -934,6 +1337,12 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                     subject: r.get(6)?,
                     body: r.get(7)?,
                     in_reply_to: r.get(8)?,
+                    references: r
+                        .get::<_, Option<String>>(9)?
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect(),
                 },
             })
         },
@@ -1306,23 +1715,29 @@ pub fn fmt_date(ts: f64) -> String {
 
 // -- the demo seed -----------------------------------------------------------
 
-struct SeedMail {
-    from_name: &'static str,
-    from_email: &'static str,
-    subject: &'static str,
+struct SeedMail<'a> {
+    from_name: &'a str,
+    from_email: &'a str,
+    subject: &'a str,
     date: f64,
     unread: bool,
-    body: &'static str,
+    body: &'a str,
     /// The HTML reading, when the demo sender sent one. Stored raw here
     /// and narrowed on the way in, exactly as a synced mail would be — the
     /// seed exercises the real path rather than a tidied version of it.
-    html: Option<&'static str>,
-    status: Option<(&'static str, bool)>,
+    html: Option<&'a str>,
+    status: Option<(&'a str, bool)>,
+    /// The folder's role: `inbox`, `archive` or `sent`.
+    folder: &'a str,
+    /// Message-ID and what it references — the threading headers (CR-007);
+    /// empty for a mail that stands alone.
+    mid: &'a str,
+    refs: &'a [&'a str],
 }
 
-/// The hand-written demo mail, newest first — ids land as 1..=8 in a fresh
+/// The hand-written demo mail, newest first — ids land as 1..=9 in a fresh
 /// store, which the tests and e2e suites rely on.
-fn base_mails() -> Vec<SeedMail> {
+fn base_mails() -> Vec<SeedMail<'static>> {
     vec![
         SeedMail {
             from_name: "Vera Kovac",
@@ -1333,6 +1748,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Draft for Q3 infra spend is ready. Main deltas: the old staging cluster goes away and CI runners move to the new box.\n\nCan you sanity-check the numbers before Thursday? Especially egress — I suspect the CDN line is stale.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         SeedMail {
             from_name: "GitHub",
@@ -1363,6 +1781,9 @@ fn base_mails() -> Vec<SeedMail> {
                  </body></html>",
             ),
             status: Some(("ci: FAILED — build (2m 14s), tests (41s)", true)),
+            folder: "inbox",
+            mid: "ci-4128@github.com",
+            refs: &["stelaxis-ci@github.com"],
         },
         SeedMail {
             from_name: "Max Ivanov",
@@ -1373,6 +1794,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Read your note on panels. The joined/replace rule feels like the right default — it is the preview-pane pattern, but generalized to everything.\n\nOne question though: what happens to a half-written draft if a joined compose panel gets replaced by the next link? Feels like some panels need a way to resist replacement.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "pm-1@ivanov.dev",
+            refs: &["pm-0@prepor.dev"],
         },
         SeedMail {
             from_name: "Elena Petrova",
@@ -1383,6 +1807,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Weather looks fine for Saturday. Early start (7:30) or lazy start (10:00)?\n\nThere is a new trail variant, ~14 km, one café stop. Bring the good thermos.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         SeedMail {
             from_name: "RSS Digest",
@@ -1393,6 +1820,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Unread this week: niri release notes (2), simonwillison.net (9), lobste.rs top (3).\n\nThis digest is itself a candidate for an rss/feed panel, by the way.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         SeedMail {
             from_name: "Calendar",
@@ -1403,6 +1833,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Dentist, Tuesday 10:00–10:45. Reminder set for 30 minutes before.\n\nReply yes to confirm, or propose a new time.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         SeedMail {
             from_name: "Hetzner",
@@ -1413,6 +1846,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Invoice 2026-08 for €46.20 is available. Auto-charge on Sep 3.\n\nUsage: 2× CX32, 1× volume 100 GB, egress 214 GB.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         SeedMail {
             from_name: "Dmitry Orlov",
@@ -1423,6 +1859,9 @@ fn base_mails() -> Vec<SeedMail> {
             body: "Found it — the airport design book you mentioned at dinner. Ordering a copy tomorrow.\n\nBorrowing rights claimed for after you finish, obviously.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
         // The one long letter in the demo world: it does not fit a message
         // panel's three rows, so the panel asks for more and opens tall.
@@ -1440,9 +1879,61 @@ fn base_mails() -> Vec<SeedMail> {
                    Anyway — this letter is its own test case. If it opens in three rows you have proven my point; if it opens tall, yours.",
             html: None,
             status: None,
+            folder: "inbox",
+            mid: "",
+            refs: &[],
         },
     ]
 }
+
+/// The demo world's conversations (CR-007), appended after the filler so
+/// the first nine ids stay what every suite expects: the note Max was
+/// replying to (mine, in Sent) and his second reply, which folds into his
+/// first one's inbox row.
+fn thread_mails() -> Vec<SeedMail<'static>> {
+    vec![
+        SeedMail {
+            from_name: "Andrey Rudenko",
+            from_email: "me@prepor.dev",
+            subject: "superapp panel model",
+            date: ts(2026, 8, 29, 14, 2),
+            unread: false,
+            body: "Wrote up the panel model: joined panels, replace in place, the chain closing behind a replacement. Curious what you make of the join rule in particular.\n\nThe draft is in the shared folder — comments welcome before Monday.",
+            html: None,
+            status: None,
+            folder: "sent",
+            mid: "pm-0@prepor.dev",
+            refs: &[],
+        },
+        SeedMail {
+            from_name: "Max Ivanov",
+            from_email: "max@ivanov.dev",
+            subject: "Re: superapp panel model",
+            date: ts(2026, 8, 31, 7, 30),
+            unread: false,
+            body: "One more thought after sleeping on it: the join rule is also what keeps a preview honest. The panel beside the list is always the list's, never a stray.\n\nOn Sun, 30 Aug 2026 at 22:47, Max Ivanov wrote:\n> Read your note on panels. The joined/replace rule feels like the right default — it is the preview-pane pattern, but generalized to everything.\n>\n> One question though: what happens to a half-written draft if a joined compose panel gets replaced by the next link?",
+            html: None,
+            status: None,
+            folder: "inbox",
+            mid: "pm-2@ivanov.dev",
+            refs: &["pm-0@prepor.dev", "pm-1@ivanov.dev"],
+        },
+    ]
+}
+
+/// The five earlier runs of the CI workflow the GitHub mail continues —
+/// `(run, day, hour, minute, failed)` — archived, so the inbox rows stay
+/// where they were; the thread they make is six long. None of them names
+/// the GitHub mail: every run references the same issue mail that never
+/// arrived, which is the third threading lookup's case. Two failed; the
+/// oldest carries the red status line, so a collapsed row has one to show.
+const CI_RUNS: [(u32, u32, u32, u32, bool); 5] = [
+    (4116, 28, 6, 10, true),
+    (4119, 28, 18, 30, false),
+    (4121, 29, 8, 45, false),
+    (4124, 30, 7, 15, true),
+    (4126, 30, 21, 0, false),
+];
 
 /// Seeds the demo account and mail into an empty store — the same content
 /// the static module used to hold, so panels and e2e suites behave
@@ -1468,19 +1959,26 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
             Ok(c.last_insert_rowid())
         };
         let inbox = folder("Inbox", "inbox")?;
-        folder("Archive", "archive")?;
-        folder("Sent", "sent")?;
+        let archive = folder("Archive", "archive")?;
+        let sent = folder("Sent", "sent")?;
         folder("Trash", "trash")?;
+        let folder_of = |role: &str| match role {
+            "archive" => archive,
+            "sent" => sent,
+            _ => inbox,
+        };
 
-        let insert = |m: &SeedMail| -> rusqlite::Result<()> {
+        // Every row goes through here, so every row is threaded and carries
+        // its topic — the seed walks the ingest path, not a tidier one.
+        let insert = |m: &SeedMail<'_>| -> rusqlite::Result<i64> {
             c.execute(
                 "INSERT INTO message(account, folder, from_name, from_email,
                                      subject, date, unread, body, html,
-                                     status, status_err)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                                     status, status_err, message_id, topic)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 rusqlite::params![
                     acct,
-                    inbox,
+                    folder_of(m.folder),
                     m.from_name,
                     m.from_email,
                     m.subject,
@@ -1490,9 +1988,14 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                     m.html.map(crate::html::sanitize),
                     m.status.map(|(s, _)| s),
                     m.status.map(|(_, e)| e).unwrap_or(false),
+                    (!m.mid.is_empty()).then_some(m.mid),
+                    topic_of(m.subject),
                 ],
             )?;
-            Ok(())
+            let id = c.last_insert_rowid();
+            let refs: Vec<String> = m.refs.iter().map(|r| (*r).to_string()).collect();
+            thread_tx(c, acct, id, m.mid, &refs)?;
+            Ok(id)
         };
         for m in &base_mails() {
             insert(m)?;
@@ -1508,22 +2011,48 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         for i in 0..60u32 {
             let (name, email) = senders[(i as usize) % senders.len()];
             let n = 60 - i;
-            c.execute(
-                "INSERT INTO message(account, folder, from_name, from_email,
-                                     subject, date, unread, body)
-                 VALUES(?1,?2,?3,?4,?5,?6,0,?7)",
-                rusqlite::params![
-                    acct,
-                    inbox,
-                    name,
-                    email,
-                    format!("archive digest #{n:02}"),
-                    ts(2026, 8, 27 - i / 6, 8 + (i % 12), (i * 7) % 60),
-                    format!(
-                        "Archive item #{n:02} from {name} — generated filler so the inbox overflows and in-panel scrolling is honest.\n\nNothing to see here beyond the scrollbar."
-                    ),
-                ],
-            )?;
+            let subject = format!("archive digest #{n:02}");
+            let body = format!(
+                "Archive item #{n:02} from {name} — generated filler so the inbox overflows and in-panel scrolling is honest.\n\nNothing to see here beyond the scrollbar."
+            );
+            insert(&SeedMail {
+                from_name: name,
+                from_email: email,
+                subject: &subject,
+                date: ts(2026, 8, 27 - i / 6, 8 + (i % 12), (i * 7) % 60),
+                unread: false,
+                body: &body,
+                html: None,
+                status: None,
+                folder: "inbox",
+                mid: "",
+                refs: &[],
+            })?;
+        }
+        for m in &thread_mails() {
+            insert(m)?;
+        }
+        for (run, day, hour, minute, failed) in CI_RUNS {
+            let mid = format!("ci-{run}@github.com");
+            let outcome = if failed { "failed" } else { "passed" };
+            let subject = format!("[stelaxis] CI {outcome} on main");
+            let body = format!(
+                "Workflow main #{run} {outcome} on push {:07x}.\n\nFull logs are attached to the run.",
+                run.wrapping_mul(2_654_435)
+            );
+            insert(&SeedMail {
+                from_name: "GitHub",
+                from_email: "notifications@github.com",
+                subject: &subject,
+                date: ts(2026, 8, day, hour, minute),
+                unread: false,
+                body: &body,
+                html: None,
+                status: (failed && run == 4116).then_some(("ci: FAILED — tests (1m 02s)", true)),
+                folder: "archive",
+                mid: &mid,
+                refs: &["stelaxis-ci@github.com"],
+            })?;
         }
         Ok(())
     })
@@ -1545,7 +2074,7 @@ mod tests {
     fn seed_reproduces_the_demo_world() {
         let s = store();
         let rows = inbox(&s);
-        assert_eq!(rows.len(), 69);
+        assert_eq!(rows.len(), 70);
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].subject, "Q3 infra budget draft");
         assert!(rows[0].unread && rows[1].unread && !rows[2].unread);
@@ -1553,7 +2082,7 @@ mod tests {
         assert_eq!(me(&s), "me@prepor.dev");
         // Seeding an already-seeded store is a no-op.
         seed_if_empty(&s).unwrap();
-        assert_eq!(inbox(&s).len(), 69);
+        assert_eq!(inbox(&s).len(), 70);
     }
 
     /// The compose panel's TO field completes the token under the caret
@@ -1641,25 +2170,28 @@ mod tests {
     }
 
     /// Bare text keeps the shell's original semantics — one substring,
-    /// sender + subject — and the tags reach the same rows.
+    /// sender + subject — and the tags reach the same rows, which are
+    /// conversations now (CR-007): a thread matches when any of its inbox
+    /// mails does, so Max's second reply, dated the 31st, brings his
+    /// thread into `@date>=31.08.2026`.
     #[test]
-    fn filter_and_neighbours_match_the_old_semantics() {
+    fn filter_matches_the_old_semantics() {
         let s = store();
         let hits = inbox_filtered(&s, "vera");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[0].target, 1);
         assert!(inbox_filtered(&s, "GITHUB").len() > 10, "case-insensitive");
         assert_eq!(inbox_filtered(&s, "@unread").len(), 2);
         assert_eq!(inbox_filtered(&s, "@not:unread").len(), 67);
-        assert_eq!(inbox_filtered(&s, "@from:vera@kovac.io")[0].id, 1);
-        assert_eq!(inbox_filtered(&s, "@html")[0].id, 2);
-        assert_eq!(inbox_filtered(&s, "@date>=31.08.2026").len(), 2);
+        assert_eq!(inbox_filtered(&s, "@from:vera@kovac.io")[0].target, 1);
+        assert_eq!(inbox_filtered(&s, "@html")[0].target, 2);
+        assert_eq!(inbox_filtered(&s, "@date>=31.08.2026").len(), 3);
         assert_eq!(inbox_filtered(&s, "@date:30.08.2026").len(), 3);
         assert_eq!(inbox_filtered(&s, "(@unread @or hike) @not:html").len(), 2);
         assert!(inbox_filtered(&s, "@account:me@prepor.dev").len() == 69);
         // The table pages: the whole inbox is more than one page, and the
         // rank query finds any row without a walk.
-        let mut t = Table::new(&INBOX, INBOX_PAGE);
+        let mut t = Table::new(&THREADS, INBOX_PAGE);
         assert_eq!(t.len(&s), 69);
         let last = t.row(&s, 68).expect("the oldest");
         assert_eq!(t.index_of(&s, &last), Some(68));
@@ -1667,19 +2199,15 @@ mod tests {
         assert_eq!(t.len(&s), 61);
         assert_eq!(t.index_of(&s, &last), Some(60));
         let (sug_from, sug_acct) = (
-            (INBOX.suggest)(&s, "from", "kov"),
-            (INBOX.suggest)(&s, "account", ""),
+            (THREADS.suggest)(&s, "from", "kov"),
+            (THREADS.suggest)(&s, "account", ""),
         );
         assert_eq!(sug_from[0].label, "Vera Kovac");
         assert_eq!(sug_from[0].value, "vera@kovac.io");
         assert_eq!(sug_acct[0].value, "me@prepor.dev");
-        let (newer, older) = neighbours(&s, 2);
-        assert_eq!(newer, Some(1));
-        assert_eq!(older, Some(3));
-        assert_eq!(neighbours(&s, 1).0, None);
     }
 
-    /// Archive moves a mail out of the inbox (and out of neighbours), the
+    /// Archive moves a mail out of the inbox, the
     /// read flag clears once, titles resolve through the store.
     #[test]
     fn mutations_and_titles() {
@@ -1695,9 +2223,9 @@ mod tests {
         s.write(|c| mark_read_tx(c, 1)).unwrap();
         assert!(!inbox(&s)[0].unread);
         assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "archive moved it");
-        assert_eq!(inbox(&s).len(), 68);
+        assert_eq!(inbox(&s).len(), 69);
         assert_ne!(inbox(&s)[0].id, 1);
-        assert_eq!(all(&s).len(), 69, "archived mail stays in the corpus");
+        assert_eq!(all(&s).len(), 76, "archived mail stays in the corpus");
         let (name, n) = contact(&s, "vera@kovac.io");
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
     }
@@ -1710,9 +2238,9 @@ mod tests {
         let s = store();
         assert!(can_file(&s, 2, "trash"));
         assert!(s.write(|c| delete_tx(c, 2)).unwrap(), "delete moved it");
-        assert_eq!(inbox(&s).len(), 68);
+        assert_eq!(inbox(&s).len(), 69);
         assert!(!inbox(&s).iter().any(|m| m.id == 2));
-        assert_eq!(all(&s).len(), 69, "deleted mail stays in the corpus");
+        assert_eq!(all(&s).len(), 76, "deleted mail stays in the corpus");
 
         // An account without the folder: the mail must stay exactly where it
         // is. A fresh store, because the folder can only be dropped while
@@ -1766,9 +2294,135 @@ mod tests {
             t.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec!["inbox", "mail"]
         );
-        assert_eq!(t[0].rows, 69);
+        assert_eq!(t[0].rows, 70);
         assert_eq!(t[1].params, "1");
         assert!(t[0].describe.contains("inbox"));
+    }
+
+    /// A conversation is called what its subject says once the reply
+    /// prefixes are off, in whichever language the client wrote them.
+    #[test]
+    fn topics_strip_reply_prefixes() {
+        assert_eq!(topic_of("Re: superapp panel model"), "superapp panel model");
+        assert_eq!(topic_of("RE: Re: Fwd: budget"), "budget");
+        assert_eq!(topic_of("AW: Re[2]: budget"), "budget");
+        assert_eq!(topic_of("[stelaxis] CI failed on main"), "[stelaxis] CI failed on main");
+        assert_eq!(topic_of("invite: dentist — tue 10:00"), "invite: dentist — tue 10:00");
+        assert_eq!(topic_of("Re:"), "Re:", "nothing left: the subject stands");
+    }
+
+    /// The three lookups, and the merge: a reply finds its parent, a late
+    /// parent finds its replies, two orphans sharing a missing parent find
+    /// each other — and when a bridge arrives, two threads become one.
+    #[test]
+    fn threading_joins_by_references_both_ways_and_merges() {
+        let s = store();
+        let put = |mid: &str, refs: &[&str]| -> i64 {
+            let refs: Vec<String> = refs.iter().map(|r| (*r).to_string()).collect();
+            s.write(|c| {
+                c.execute(
+                    "INSERT INTO message(account, folder, subject, date, message_id, topic)
+                     VALUES(1, 1, ?1, 0, ?1, ?1)",
+                    [mid],
+                )?;
+                let id = c.last_insert_rowid();
+                thread_tx(c, 1, id, mid, &refs)?;
+                Ok(id)
+            })
+            .unwrap()
+        };
+        // 1. a reply names its parent
+        let a = put("a@x", &[]);
+        let a1 = put("a1@x", &["a@x"]);
+        assert_eq!(thread_of(&s, a1), Some(a));
+        // 2. a parent arriving after its replies
+        let b1 = put("b1@x", &["b@x"]);
+        let b = put("b@x", &[]);
+        assert_eq!(thread_of(&s, b), Some(b1), "anchored on the earliest id");
+        // 3. two orphans under one missing parent
+        let c1 = put("c1@x", &["c@x"]);
+        let c2 = put("c2@x", &["c@x", "c1@x"]);
+        assert_eq!(thread_of(&s, c2), Some(c1));
+        // A bridge: a reply to a1 that also references b — one thread.
+        let bridge = put("ab@x", &["a1@x", "b@x"]);
+        assert_eq!(thread_of(&s, bridge), Some(a));
+        assert_eq!(thread_of(&s, b), Some(a));
+        assert_eq!(thread_of(&s, b1), Some(a));
+        assert_eq!(thread(&s, b1).len(), 5);
+        // Unrelated mail is untouched.
+        assert_eq!(thread_of(&s, c1), Some(c1));
+        assert_eq!(thread(&s, c1).len(), 2);
+    }
+
+    /// The demo world threads: Max's two replies and my note make one
+    /// conversation of three, and the GitHub mail continues five archived
+    /// runs. The inbox row shows the whole conversation; the walk opens
+    /// the newest inbox mail, or the oldest unread one.
+    #[test]
+    fn the_seed_threads_the_demo_world() {
+        let s = store();
+        let max = thread(&s, 3);
+        assert_eq!(
+            max.iter().map(|t| t.mail.head.id).collect::<Vec<_>>(),
+            vec![70, 3, 71],
+            "oldest first, my sent note included"
+        );
+        assert_eq!(max[0].role, "sent");
+        let row = thread_head(&s, 3).expect("in the inbox");
+        assert_eq!(row.who, vec!["Max", "me"]);
+        assert_eq!(row.who_line(), "Max, me · 3");
+        assert_eq!(row.topic, "superapp panel model");
+        assert_eq!(row.target, 71, "newest inbox mail: none unread");
+        assert!(!row.unread);
+        assert_eq!(thread_inbox(&s, 70), vec![3, 71]);
+
+        let gh = thread(&s, 2);
+        assert_eq!(gh.len(), 6);
+        assert_eq!(gh[5].mail.head.id, 2, "the inbox mail is the newest");
+        assert_eq!(gh[0].mail.status.as_ref().map(|s| s.1), Some(true), "one red run");
+        let row = thread_head(&s, 2).expect("in the inbox");
+        assert_eq!(row.who, vec!["GitHub"], "one participant keeps the full name");
+        assert_eq!(row.who_line(), "GitHub · 6");
+        assert_eq!(row.target, 2, "the unread one");
+        assert!(row.unread);
+        assert_eq!(thread_unread(&s, 2), vec![2]);
+
+        // Rows: 70 inbox mails fold into 69 conversations, and the two
+        // unread ones are the two bold rows.
+        let rows = inbox_filtered(&s, "");
+        assert_eq!(rows.len(), 69);
+        assert_eq!(rows[0].target, 1);
+        assert_eq!(rows[1].target, 2);
+        assert_eq!(rows[2].target, 71, "Max's thread, by its latest inbox mail");
+        assert_eq!(title(&s, &Kind::Message { id: 3 }), "superapp panel model");
+        assert_eq!(title(&s, &Kind::Message { id: 71 }), "superapp panel model");
+        // A lone mail is a row exactly as before.
+        assert_eq!(rows[3].who_line(), "Elena Petrova");
+    }
+
+    /// The quoted tail folds: the attribution line and the `>` block under
+    /// it, leaving what the author wrote. A letter without one stays whole,
+    /// and so does one that is nothing but quote.
+    #[test]
+    fn quotes_fold_off_the_tail() {
+        let (own, q) = split_quote("Agreed.\n\nOn Sun, Max wrote:\n> the note\n>\n> more");
+        assert_eq!(own, "Agreed.");
+        assert_eq!(q.as_deref(), Some("On Sun, Max wrote:\n> the note\n>\n> more"));
+        let (own, q) = split_quote("Agreed.\n\nOn Sun, 30 Aug 2026,\nMax Ivanov wrote:\n> the note");
+        assert_eq!(own, "Agreed.");
+        assert!(q.unwrap().starts_with("On Sun"), "a wrapped attribution goes too");
+        assert_eq!(split_quote("> only a quote").1, None);
+        assert_eq!(split_quote("no quote at all").1, None);
+        assert_eq!(split_quote("a > b in the middle\nthen more").1, None);
+        let (own, q) = split_quote_html("<p>Agreed.</p><p>On Sun, Max wrote:</p><blockquote>the note</blockquote>");
+        assert_eq!(own, "<p>Agreed.</p>");
+        assert_eq!(q.as_deref(), Some("<p>On Sun, Max wrote:</p><blockquote>the note</blockquote>"));
+        let s = store();
+        let m = mail(&s, 71).expect("max's second reply");
+        assert_eq!(own_text(&m).lines().count(), 1, "one paragraph; the quote is gone");
+        let open: BTreeSet<MailId> = [71].into_iter().collect();
+        let t = thread(&s, 71);
+        assert_eq!(thread_lines(&t, &open, 1000), 8, "1.5 + 1.5 + (4 + 1)");
     }
 
     /// The civil-date maths round-trips.

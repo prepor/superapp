@@ -17,7 +17,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 use makepad_widgets::*;
@@ -350,6 +350,10 @@ enum WidgetOp {
     /// The `i`-th row of a field's autocomplete (CR-006): the inbox
     /// filter's, or the compose TO field's.
     Suggest(usize),
+    /// A thread row's header (CR-007): open the message, or close it.
+    ToggleMail(i64),
+    /// A message's quoted tail: unfold it, or fold it back.
+    ToggleQuote(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -443,10 +447,10 @@ impl CmdTap {
 // Touch navigation
 // ---------------------------------------------------------------------------
 
-/// The action kind a reading walk records — a preview, or the newer/older
-/// step that does the same thing from inside a message. Named because two
-/// rules key off it: these coalesce per panel into one undo node, and they
-/// are the one kind that does **not** wake the sync workers ([`State::act`]).
+/// The action kind a reading walk records — a preview, or an in-place
+/// replace of one mail by another. Named because two rules key off it:
+/// these coalesce per panel into one undo node, and they are the one kind
+/// that does **not** wake the sync workers ([`State::act`]).
 const READ: &str = "read";
 
 /// How far a finger may wander and still be a tap, in points.
@@ -789,6 +793,10 @@ struct State {
     /// viewport change and worker poll, and a standing rule here would fight
     /// the user's own pans.
     show_also: Option<PanelId>,
+    /// Which messages each message panel shows open (CR-007): seeded when
+    /// the panel opens on a mail, toggled by touch, kept no further than
+    /// the process. Context, like the inbox cursor — never history.
+    expand: HashMap<PanelId, crate::panels::Expansion>,
 }
 
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
@@ -880,6 +888,7 @@ impl State {
             overlay_last: Overlay::None,
             launcher: LauncherUi::default(),
             show_also: None,
+            expand: HashMap::new(),
         }
     }
 
@@ -902,15 +911,18 @@ impl State {
     /// The measuring belongs to the shell rather than to [`core`]: only here
     /// are the column's width in characters and the share of the panel the
     /// body does *not* get both known.
-    fn message_rows(&self, id: core::MailId) -> Option<u32> {
+    fn message_rows(&self, id: core::MailId, open: &BTreeSet<core::MailId>) -> Option<u32> {
         /// Roughly how many lines of body the message panel spends on
-        /// everything that is not the letter: its own header, the
-        /// FROM/TO/DATE block and its rule, the walk of links at the foot,
-        /// and the padding around them. An estimate on purpose — the wish
-        /// only has to land on the right row.
-        const CHROME_LINES: f64 = 7.0;
+        /// everything that is not the letters: its own header, the TO
+        /// line and its rule, the reply link at the foot, and the padding
+        /// around them. An estimate on purpose — the wish only has to land
+        /// on the right row.
+        const CHROME_LINES: f64 = 6.0;
 
-        let m = mail::mail(&self.store, id)?;
+        let msgs = mail::thread(&self.store, id);
+        if msgs.is_empty() {
+            return None;
+        }
         let (vw, vh) = self.vp();
         let grid = self.ws.grid;
         let gap = theme::GAP;
@@ -921,7 +933,7 @@ impl State {
         let unit_w = (vw - gap) / f64::from(grid.w);
         let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
         let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
-        let need = mail::reading_lines(&m, cols) as f64;
+        let need = mail::thread_lines(&msgs, open, cols) as f64;
 
         // ...against how many lines a panel of `rows` rows has room for.
         let line_h = theme::FONT_SIZE * theme::LINE_H;
@@ -939,10 +951,40 @@ impl State {
     /// so the shell measures ahead of the mutation.
     fn wish_ahead(&mut self, kind: &Kind) {
         if let Kind::Message { id } = kind {
-            if let Some(h) = self.message_rows(*id) {
+            let open = self.seed_for(*id);
+            if let Some(h) = self.message_rows(*id, &open) {
                 let (w, _) = kind.grid();
                 self.ws.wish(kind, (w, h));
             }
+        }
+    }
+
+    /// What a panel opening on `id` shows open (CR-007): the mail itself
+    /// and every unread mail of its thread — read *before* the open marks
+    /// them, which is why the shell seeds rather than the widget.
+    fn seed_for(&self, id: core::MailId) -> BTreeSet<core::MailId> {
+        let mut open: BTreeSet<core::MailId> =
+            mail::thread_unread(&self.store, id).into_iter().collect();
+        open.insert(id);
+        open
+    }
+
+    /// Records `open` on every panel now showing `id` that was not seeded
+    /// for it already — the one just opened or re-targeted; a panel on
+    /// another workspace already reading the same mail keeps its own.
+    fn seed_expansion(&mut self, id: core::MailId, open: &BTreeSet<core::MailId>) {
+        for pid in self.ws.showing(&Kind::Message { id }) {
+            if self.expand.get(&pid).is_some_and(|e| e.for_mail == id) {
+                continue;
+            }
+            self.expand.insert(
+                pid,
+                crate::panels::Expansion {
+                    for_mail: id,
+                    open: open.clone(),
+                    quotes: BTreeSet::new(),
+                },
+            );
         }
     }
 
@@ -961,12 +1003,21 @@ impl State {
             .filter_map(|p| match &p.kind {
                 Kind::Message { id } => {
                     let (w, _) = p.kind.grid();
-                    Some((p.kind.clone(), (w, self.message_rows(*id)?)))
+                    let open =
+                        crate::panels::Expansion::for_panel(self.expand.get(&p.id), *id).open;
+                    Some((p.kind.clone(), (w, self.message_rows(*id, &open)?)))
                 }
                 _ => None,
             })
             .collect();
         self.ws.set_wishes(wishes);
+        // Expansion state dies with its panel.
+        let live: Vec<PanelId> = self.expand.keys().copied().collect();
+        for pid in live {
+            if self.ws.panel(pid).is_none() {
+                self.expand.remove(&pid);
+            }
+        }
         let vp = self.vp();
         let opts = self.opts();
         // A preview asked to be seen: reveal it first, then focus, so focus
@@ -2350,6 +2401,14 @@ impl Stage {
             launcher::Go::Open(kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                // Opening a mail reads its whole thread (CR-007): every
+                // unread mail of it is marked, one intent each, and the
+                // panel opens with exactly those unfolded.
+                let marks: Vec<core::MailId> =
+                    mid.map(|id| mail::thread_unread(&state.store, id)).unwrap_or_default();
+                let open: BTreeSet<core::MailId> =
+                    marks.iter().copied().chain(mid).collect();
+                let marks_tx = marks.clone();
                 state.wish_ahead(&kind);
                 state.act(
                     "open",
@@ -2358,11 +2417,20 @@ impl Stage {
                     move |ws| {
                         ws.open(kind, None, false);
                     },
-                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
-                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
-                        .into_iter()
+                    move |tx| {
+                        for m in &marks_tx {
+                            mail::mark_read_tx(tx, *m)?;
+                        }
+                        Ok(())
+                    },
+                    marks
+                        .iter()
+                        .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
                         .collect(),
                 );
+                if let Some(id) = mid {
+                    state.seed_expansion(id, &open);
+                }
                 state.sync();
             }
         }
@@ -2567,6 +2635,8 @@ impl Stage {
                         }
                         self.kick(cx);
                     }
+                    WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
+                    WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
                 }
                 return;
             }
@@ -2589,6 +2659,14 @@ impl Stage {
             Act::Open(pid, kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                // Opening a mail reads its whole thread (CR-007): every
+                // unread mail of it is marked, one intent each, and the
+                // panel opens with exactly those unfolded.
+                let marks: Vec<core::MailId> =
+                    mid.map(|id| mail::thread_unread(&state.store, id)).unwrap_or_default();
+                let open: BTreeSet<core::MailId> =
+                    marks.iter().copied().chain(mid).collect();
+                let marks_tx = marks.clone();
                 state.wish_ahead(&kind);
                 state.act(
                     "open",
@@ -2597,17 +2675,34 @@ impl Stage {
                     move |ws| {
                         ws.follow_open(pid, kind, alt);
                     },
-                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
-                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
-                        .into_iter()
+                    move |tx| {
+                        for m in &marks_tx {
+                            mail::mark_read_tx(tx, *m)?;
+                        }
+                        Ok(())
+                    },
+                    marks
+                        .iter()
+                        .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
                         .collect(),
                 );
+                if let Some(id) = mid {
+                    state.seed_expansion(id, &open);
+                }
                 self.sync(cx);
             }
             Act::Replace(pid, kind) => {
-                // Replacing with another mail (the newer/older links) is the
-                // same "read" walk as j/k — it coalesces per panel.
+                // Replacing with another mail is the same "read" walk as a
+                // preview — it coalesces per panel.
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
+                // Opening a mail reads its whole thread (CR-007): every
+                // unread mail of it is marked, one intent each, and the
+                // panel opens with exactly those unfolded.
+                let marks: Vec<core::MailId> =
+                    mid.map(|id| mail::thread_unread(&state.store, id)).unwrap_or_default();
+                let open: BTreeSet<core::MailId> =
+                    marks.iter().copied().chain(mid).collect();
+                let marks_tx = marks.clone();
                 state.wish_ahead(&kind);
                 let (akind, entity, label) = match mid {
                     Some(_) => (
@@ -2624,22 +2719,34 @@ impl Stage {
                     move |ws| {
                         ws.follow_replace(pid, kind, alt);
                     },
-                    move |tx| mid.map_or(Ok(()), |id| mail::mark_read_tx(tx, id)),
-                    mid.map(|id| Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>)
-                        .into_iter()
+                    move |tx| {
+                        for m in &marks_tx {
+                            mail::mark_read_tx(tx, *m)?;
+                        }
+                        Ok(())
+                    },
+                    marks
+                        .iter()
+                        .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
                         .collect(),
                 );
+                if let Some(id) = mid {
+                    state.seed_expansion(id, &open);
+                }
                 self.sync(cx);
             }
             Act::Preview(pid, id) => {
                 // The cursor walk's own open (CR-005). Same door as a solid
                 // link — join semantics, mark read, undoable — minus the one
                 // thing that would end the walk: it never takes focus. So it
-                // is a "read", coalescing per driver panel exactly like the
-                // newer/older walk does.
+                // is a "read", coalescing per driver panel.
                 let kind = Kind::Message { id };
                 let label = format!("read “{}”", state.panel_title(&kind));
                 let (vp, opts) = (state.vp(), state.opts());
+                let marks = mail::thread_unread(&state.store, id);
+                let open: BTreeSet<core::MailId> =
+                    marks.iter().copied().chain(std::iter::once(id)).collect();
+                let marks_tx = marks.clone();
                 state.wish_ahead(&kind);
                 state.act(
                     READ,
@@ -2664,11 +2771,20 @@ impl Stage {
                             ws.focus = held;
                         }
                     },
-                    move |tx| mail::mark_read_tx(tx, id),
+                    move |tx| {
+                        for m in &marks_tx {
+                            mail::mark_read_tx(tx, *m)?;
+                        }
+                        Ok(())
+                    },
                     // Same claim on the world an ordinary open makes: the
-                    // mail is read now, and undo un-reads it.
-                    vec![Box::new(mail::MarkRead { mail: id }) as Box<dyn crate::history::Intent>],
+                    // thread is read now, and undo un-reads what it read.
+                    marks
+                        .iter()
+                        .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
+                        .collect(),
                 );
+                state.seed_expansion(id, &open);
                 // The preview opened off to the right of a driver that never
                 // moved, so nothing has pulled the camera onto it.
                 state.show_also = state.ws.joined_child(pid);
@@ -2772,11 +2888,43 @@ impl Stage {
         }
     }
 
-    /// Files one mail out of the inbox — archive or delete — from wherever
+    /// Opens or closes one message of the thread a panel shows (CR-007),
+    /// or unfolds and folds its quoted tail. Panel context, like the inbox
+    /// cursor: no action, no history node — and a touch inside the panel
+    /// focuses it, as anywhere else.
+    fn toggle_msg(&mut self, cx: &mut Cx, pid: PanelId, id: core::MailId, quote: bool) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if state.ws.focus != Some(pid) {
+            state.ws.focus = Some(pid);
+        }
+        let Some(Kind::Message { id: cur }) = state.ws.panel(pid).map(|p| p.kind.clone()) else {
+            return;
+        };
+        let e = state
+            .expand
+            .entry(pid)
+            .or_insert_with(|| crate::panels::Expansion::just(cur));
+        if e.for_mail != cur {
+            *e = crate::panels::Expansion::just(cur);
+        }
+        let set = if quote { &mut e.quotes } else { &mut e.open };
+        if !set.remove(&id) {
+            set.insert(id);
+        }
+        // The panel's wish changed with what it shows.
+        self.sync(cx);
+    }
+
+    /// Files a thread out of the inbox — archive or delete — from wherever
     /// the intent came: a message panel's header button, the chord an inbox
     /// borrowed from its preview, or an android row swipe. One door, so the
-    /// undo node, the toast and the closing of the mail's readers are the
-    /// same story every time.
+    /// undo node, the toast and the closing of the thread's readers are the
+    /// same story every time. The row is the thread (CR-007), so every
+    /// inbox mail of the conversation goes together — one intent each, one
+    /// node — and the mail itself with them if it sits elsewhere (a reader
+    /// on an archived mail).
     fn triage(&mut self, cx: &mut Cx, id: core::MailId, delete: bool) {
         // Decided first, while the row is still in the list to have one.
         let next = self.successor_of(id);
@@ -2796,28 +2944,49 @@ impl Stage {
             self.kick(cx);
             return;
         }
-        let subject = mail::mail(&state.store, id)
-            .map(|m| m.head.subject)
-            .unwrap_or_default();
-        // Where it lives now, so undo puts it back exactly there rather than
-        // guessing "the inbox".
-        let from_folder: i64 = state
-            .store
-            .conn()
-            .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
-            .unwrap_or(0);
-        let readers = state.ws.showing(&Kind::Message { id });
+        let topic = mail::thread_topic(&state.store, id).unwrap_or_default();
+        let mut ids = mail::thread_inbox(&state.store, id);
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        // Where each lives now, so undo puts every one back exactly there
+        // rather than guessing "the inbox".
+        let from: Vec<(core::MailId, i64)> = ids
+            .iter()
+            .map(|&m| {
+                let f: i64 = state
+                    .store
+                    .conn()
+                    .query_row("SELECT folder FROM message WHERE id = ?1", [m], |r| r.get(0))
+                    .unwrap_or(0);
+                (m, f)
+            })
+            .collect();
+        let mut readers: Vec<PanelId> = Vec::new();
+        for m in &ids {
+            for r in state.ws.showing(&Kind::Message { id: *m }) {
+                if !readers.contains(&r) {
+                    readers.push(r);
+                }
+            }
+        }
         // The successor's preview is an open like any other: measured first,
-        // so it is placed by the rows its letter actually wants.
+        // so it is placed by the rows its thread actually wants — and it
+        // reads its thread, exactly as the walk would.
         if let Some((_, nid)) = next {
             state.wish_ahead(&Kind::Message { id: nid });
         }
+        let next_marks: Vec<core::MailId> = next
+            .map(|(_, nid)| mail::thread_unread(&state.store, nid))
+            .unwrap_or_default();
+        let n = ids.len();
+        let (ids_tx, marks_tx) = (ids.clone(), next_marks.clone());
         state.act(
             verb,
-            format!("{verb} “{subject}”"),
+            format!("{verb} “{topic}”"),
             None,
             move |ws| {
-                // The mail left the inbox, so its readers have nothing left
+                // The thread left the inbox, so its readers have nothing left
                 // to read — on whichever workspace they were opened.
                 for r in readers {
                     ws.close_anywhere(r);
@@ -2832,27 +3001,43 @@ impl Stage {
                 }
             },
             move |tx| {
-                if delete {
-                    mail::delete_tx(tx, id)?;
-                } else {
-                    mail::archive_tx(tx, id)?;
+                for m in &ids_tx {
+                    if delete {
+                        mail::delete_tx(tx, *m)?;
+                    } else {
+                        mail::archive_tx(tx, *m)?;
+                    }
                 }
-                next.map_or(Ok(()), |(_, nid)| mail::mark_read_tx(tx, nid))
+                for m in &marks_tx {
+                    mail::mark_read_tx(tx, *m)?;
+                }
+                Ok(())
             },
             // Both halves of the action claim something back: the filing, and
             // the read of whatever the cursor moved onto. One node, so one
             // ⌘z reverses the pair in step.
-            next.into_iter()
-                .map(|(_, nid)| Box::new(mail::MarkRead { mail: nid }) as Box<dyn crate::history::Intent>)
-                .chain(std::iter::once(Box::new(mail::Filed {
-                    mail: id,
-                    from_folder,
-                    role,
-                }) as Box<dyn crate::history::Intent>))
+            next_marks
+                .iter()
+                .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
+                .chain(from.iter().map(|(m, f)| {
+                    Box::new(mail::Filed {
+                        mail: *m,
+                        from_folder: *f,
+                        role,
+                    }) as Box<dyn crate::history::Intent>
+                }))
                 .collect(),
         );
-        state.toast(format!("{done} “{subject}” — ⌘z undoes"), false);
+        let what = if n > 1 {
+            format!("{done} “{topic}” ({n} mails) — ⌘z undoes")
+        } else {
+            format!("{done} “{topic}” — ⌘z undoes")
+        };
+        state.toast(what, false);
         if let Some((pid, nid)) = next {
+            let open: BTreeSet<core::MailId> =
+                next_marks.iter().copied().chain(std::iter::once(nid)).collect();
+            state.seed_expansion(nid, &open);
             state.show_also = state.ws.joined_child(pid);
             cx.action(crate::panels::PanelAction::SelectMail { pid, id: nid });
         }
@@ -2873,16 +3058,17 @@ impl Stage {
             .filter(|(_, p)| matches!(p.kind, Kind::Inbox { .. }))
             .map(|(pid, _)| *pid)
             .collect();
+        let store = self.state.as_deref()?.store.clone();
+        let th = mail::thread_of(&store, id)?;
         let pid = inboxes.into_iter().find(|pid| {
             self.hosted
                 .get(pid)
-                .and_then(|w| w.as_inbox_panel().selected())
-                == Some(id)
+                .and_then(|w| w.as_inbox_panel().selected_thread())
+                == Some(th)
         })?;
         // The rows as that panel has them — its own filter included: the
         // panel's table answers, exactly as it does for hit registration.
         let w = self.hosted.get(&pid)?.clone();
-        let store = self.state.as_deref()?.store.clone();
         w.as_inbox_panel()
             .neighbour_of(&store, id)
             .map(|next| (pid, next))
@@ -3563,6 +3749,7 @@ impl Stage {
                 store: state.store.clone(),
                 pid: *pid,
                 kind,
+                expand: state.expand.get(pid).cloned(),
             };
             let mut scope = Scope::with_props(&props);
             w.handle_event(cx, event, &mut scope);
@@ -3616,6 +3803,7 @@ impl Stage {
             store: state.store.clone(),
             pid,
             kind,
+            expand: state.expand.get(&pid).cloned(),
         };
         let mut scope = Scope::with_props(&props);
         w.handle_event(cx, event, &mut scope);
@@ -4892,6 +5080,7 @@ impl Stage {
             store: state.store.clone(),
             pid,
             kind: kind.clone().unwrap_or(Kind::About),
+            expand: state.expand.get(&pid).cloned(),
         };
         let mut scope = Scope::with_props(&props);
         cx.begin_turtle(
@@ -5020,22 +5209,22 @@ impl Stage {
                     for (idx, item) in list.items().iter() {
                         let r = item.widget.area().rect(cx);
                         if r.size.x > 0.0 {
-                            if let Some(m) = panel.row_at(&state.store, *idx) {
+                            if let Some(t) = panel.row_at(&state.store, *idx) {
                                 // A row with a curtain over it answers to
                                 // nothing: it is on its way out, and a tap
-                                // landing on it would open the mail being
+                                // landing on it would open the thread being
                                 // filed. Its rect still counts — that is
                                 // where the curtain is drawn.
-                                if swiping == Some(m.id) {
+                                if swiping == Some(t.target) {
                                     if let Some(rs) = self.row_swipe.as_mut() {
                                         rs.slot = r;
                                     }
                                     continue;
                                 }
                                 reg.push((
-                                    m.subject.clone(),
+                                    t.topic.clone(),
                                     r,
-                                    Act::WidgetOp(pid, WidgetOp::OpenMail(m.id)),
+                                    Act::WidgetOp(pid, WidgetOp::OpenMail(t.target)),
                                 ));
                             }
                         }
@@ -5050,55 +5239,54 @@ impl Stage {
             }
             Some(Kind::Message { id }) => {
                 let id = *id;
-                let m = mail::mail(&state.store, id);
-                let (newer, older) = mail::neighbours(&state.store, id);
-                let mut link = |path: &[LiveId], label: String, act: Act| {
-                    let r = w.widget(cx, path).area().rect(cx);
-                    if r.size.x > 0.0 {
-                        reg.push((label, r, act));
+                // The thread's rows (CR-007). A closed row is one target,
+                // addressed by its sender and the line it previews:
+                // touching it opens the message in place. An open one is
+                // the same row, addressed by sender and date: touching it
+                // closes the message — except on the contact link, which
+                // is registered after it and so wins where they overlap.
+                // The readings are selectable runs, registered like any
+                // hosted field; `mail html` is the same run in its other
+                // reading, and only one of the two is ever visible.
+                let panel = w.as_message_panel();
+                for h in panel.msg_hits(cx) {
+                    let label = if h.open {
+                        format!("{} · {}", h.name, h.date)
+                    } else {
+                        format!("{}: {}", h.name, h.preview)
+                    };
+                    reg.push((label, h.head, Act::WidgetOp(pid, WidgetOp::ToggleMail(h.id))));
+                    if let Some(r) = h.link {
+                        reg.push((
+                            format!("{} <{}>", h.name, h.email),
+                            r,
+                            Act::Open(pid, Kind::Contact { email: h.email.clone() }),
+                        ));
                     }
-                };
-                if let Some(m) = &m {
-                    link(
-                        ids!(from_link),
-                        format!("{} <{}>", m.head.from_name, m.head.from_email),
-                        Act::Open(pid, Kind::Contact { email: m.head.from_email.clone() }),
-                    );
-                }
-                if let Some(n) = newer {
-                    link(
-                        ids!(newer_link),
-                        "newer".into(),
-                        Act::Replace(pid, Kind::Message { id: n }),
-                    );
-                }
-                if let Some(o) = older {
-                    link(
-                        ids!(older_link),
-                        "older".into(),
-                        Act::Replace(pid, Kind::Message { id: o }),
-                    );
-                }
-                link(
-                    ids!(reply_link),
-                    "reply".into(),
-                    Act::Open(pid, Kind::Compose { re: id }),
-                );
-                // The selectable runs (CR-003). Registered like any hosted
-                // field: scripts drag them, and a real click on one keeps
-                // the key focus the TextInput just took.
-                // `mail html` is the same run in its other reading; only
-                // one of the two is ever visible, so only one registers.
-                for (label, path) in [
-                    ("mail body", ids!(body_lbl)),
-                    ("mail html", ids!(body_html)),
-                    ("mail to", ids!(to_lbl)),
-                    ("mail date", ids!(date_lbl)),
-                ] {
-                    let r = w.widget(cx, path).area().rect(cx);
-                    if r.size.x > 0.0 {
-                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    if let Some(r) = h.quote {
+                        reg.push((
+                            format!("quoted · {}", h.date),
+                            r,
+                            Act::WidgetOp(pid, WidgetOp::ToggleQuote(h.id)),
+                        ));
                     }
+                    if let Some(r) = h.text {
+                        reg.push(("mail body".to_string(), r, Act::Pointer(pid)));
+                    }
+                    if let Some(r) = h.html {
+                        reg.push(("mail html".to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let r = w.widget(cx, ids!(to_lbl)).area().rect(cx);
+                if r.size.x > 0.0 {
+                    reg.push(("mail to".to_string(), r, Act::Pointer(pid)));
+                }
+                let r = w.widget(cx, ids!(reply_link)).area().rect(cx);
+                if r.size.x > 0.0 {
+                    let re = mail::thread(&state.store, id)
+                        .last()
+                        .map_or(id, |t| t.mail.head.id);
+                    reg.push(("reply".to_string(), r, Act::Open(pid, Kind::Compose { re })));
                 }
             }
             Some(Kind::Contact { email }) => {

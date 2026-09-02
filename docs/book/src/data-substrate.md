@@ -48,9 +48,9 @@ exists as a side effect of how drawing works, never by declaration.
 **`cmd+i`** serializes the focused panel's context (identity, params, the
 traced queries with their SQL) to the clipboard and to `panel-context.md`
 beside the store — ready to hand to an agent; the agent hookup itself is
-future work. The trace is honest to a fault: a message panel's context
-includes the inbox query, because the newer/older links really read it.
-This is what "data centric" means mechanically.
+future work. The trace is honest to a fault: it records what a draw
+actually read, not what the panel is nominally about. This is what "data
+centric" means mechanically.
 
 At personal-mail scale, re-run-on-invalidate is microseconds; rel.systems'
 incremental Z-set engine remains the documented upgrade path if a view ever
@@ -76,6 +76,22 @@ disagree **is** the push queue — each pass turns every disagreement into a
 job, then fetches and reconciles facts.
 Reconciliation never fights the user: divergent intent is pushed over the
 server, never clobbered by it (deletion is the one place the server wins).
+
+**Threads** are decided at ingest, in the transaction that stores the mail
+(CR-007). `message.thread` is the id of the conversation's lowest member —
+an anchor, not a root; no row is the parent of another, and what a thread
+*has* is a `GROUP BY` at read time. A `reference` table keeps one row per
+id in a mail's `References` and `In-Reply-To`, and threading is the union of
+three lookups over the account: mails my references name, mails whose
+references name me (the parent arrived late — Sent syncs after Inbox, or it
+is below the window), and mails whose references share an id with mine
+(two GitHub comments under an issue mail that never arrived). Whatever they
+find merges into one anchor; nothing found, and the mail anchors itself. No
+subject heuristic. The schema migration re-parsed every mail's raw bytes to
+thread what was already here, and a reply of yours carries the parent's
+whole `References` chain so it threads for the other side too. A mail
+present twice in an account — your reply, in Sent and back through a list —
+is one message to the panel.
 And because `server_msg` lives outside the undo world, undoing an
 already-pushed archive needs no compensation machinery at all — intent
 flips back, the next pass moves the mail back. A moved mail whose new uid
