@@ -44,7 +44,12 @@ pub struct OverlayRowData {
     pub current: bool,
     /// Undone history branches draw muted but stay walkable.
     pub muted: bool,
+    /// Under the pointer: a grey wash, the way a button or a tab takes one.
+    pub hovered: bool,
 }
+
+/// One overlay row's height, in points — the shell sizes the sheet to fit.
+pub const OVERLAY_ROW_H: f64 = 40.0;
 
 /// What an overlay widget draws. Assembled by the shell each frame from the
 /// workspace roster, the undo DAG, or the launcher's live search.
@@ -53,6 +58,9 @@ pub struct OverlayProps {
     pub rows: Vec<OverlayRowData>,
     /// The launcher's query, pushed into the field when the overlay opens.
     pub query: String,
+    /// The chassis' presence, 0..1: the widget composites its whole
+    /// subtree at this alpha — the open/close fade.
+    pub alpha: f32,
 }
 
 /// Intent bubbled from panel widgets to the shell. The shell owns turning
@@ -1231,13 +1239,38 @@ script_mod! {
 
     // ---- the modal overlays ------------------------------------------------
 
-    /** One overlay row: a bordered card, inverted while current. The
-        shell registers the click (rows live in a PortalList, whose item
-        areas go stale mid-gesture — CR-002's fifth defect), so this is
-        presentation only. */
-    /** The card, in the one shape both variants share. A hand-drawn 1 px
-        frame on its own shader — a stock-shader quad merges into a call
-        that paints under the wash (CR-002's sixth defect). */
+    /** A view that renders its subtree to a texture and composites it at
+        one alpha. Widgets cannot alpha-fade as a subtree (CR-002's named
+        cost) — an offscreen pass can, and the composite is a single quad
+        whose `alpha` uniform the shell drives per frame. This is what lets
+        an overlay's field, caret, rows and all fade as one surface. */
+    mod.widgets.FadeView = mod.widgets.View {
+        texture_caching: true
+        draw_bg +: {
+            alpha: uniform(0.0)
+            image: texture_2d(float)
+            scale: varying(vec2(0))
+            shift: varying(vec2(0))
+            vertex: fn() {
+                let dpi = self.draw_pass.dpi_factor
+                let ceil_size = ceil(self.rect_size * dpi) / dpi
+                let floor_pos = floor(self.rect_pos * dpi) / dpi
+                self.scale = self.rect_size / ceil_size
+                self.shift = (self.rect_pos - floor_pos) / ceil_size
+                return self.clip_and_transform_vertex(self.rect_pos self.rect_size)
+            }
+            pixel: fn() {
+                return self.image.sample(self.pos * self.scale + self.shift) * self.alpha
+            }
+        }
+    }
+
+    /** One overlay row on the sheet: bare, inverted while current, a grey
+        wash under the pointer. The shell registers the click (rows live
+        in a PortalList, whose item areas go stale mid-gesture — CR-002's
+        fifth defect), so this is presentation only. The bg is on its own
+        shader — a stock-shader quad merges into a call that paints under
+        the wash (CR-002's sixth defect). */
     mod.widgets.OverlayCard = View {
         width: Fill, height: 40
         flow: Right
@@ -1245,16 +1278,9 @@ script_mod! {
         padding: Inset{left: 16, right: 16}
         show_bg: true
         draw_bg +: {
-            color: #ffffff
-            border_color: #141414
+            color: #ffffff00
             pixel: fn() {
-                let p = self.pos * self.rect_size
-                if p.x < 1.0 || p.y < 1.0
-                    || p.x > self.rect_size.x - 1.0
-                    || p.y > self.rect_size.y - 1.0 {
-                    return vec4(self.border_color.xyz, 1.0)
-                }
-                return vec4(self.color.xyz, 1.0)
+                return vec4(self.color.xyz * self.color.w, self.color.w)
             }
         }
         num_lbl := mod.widgets.SLabel {
@@ -1281,24 +1307,27 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
-        padding: Inset{bottom: 8}
-        // Twin cards rather than one card recoloured: a DrawQuad's shader
+        // Three cards rather than one recoloured: a DrawQuad's shader
         // vars are not struct fields, so a quad's colour cannot be set at
-        // draw time — and an Overlay-flow wash never resolves its walk.
-        // Exactly one of these draws; text colours stay static in the DSL.
-        // Label colours are painted per draw (a Label's draw_text.color IS
-        // reachable); only the quad needs a twin.
+        // draw time. Exactly one of these draws; label colours are
+        // painted per draw (a Label's draw_text.color IS reachable), so
+        // only the background needs the twins.
         card := mod.widgets.OverlayCard {}
+        card_hover := mod.widgets.OverlayCard {
+            visible: false
+            draw_bg +: { color: #efefef }
+        }
         card_inv := mod.widgets.OverlayCard {
             visible: false
-            draw_bg +: { color: #141414, border_color: #141414 }
+            draw_bg +: { color: #141414 }
         }
     }
 
-    /** The overlay chassis: a centred column of rows over the shell's wash.
-        Workspaces and history use it bare; the launcher puts a field on top. */
+    /** The overlay chassis: a column of rows on the shell's sheet, faded
+        as one surface. Workspaces and history use it bare; the launcher
+        puts a field on top. */
     mod.widgets.RowsOverlay = set_type_default() do #(RowsOverlay::register_widget(vm)) {
-        ..mod.widgets.View
+        ..mod.widgets.FadeView
         width: Fill, height: Fill
         flow: Down
         list := PortalList {
@@ -1308,11 +1337,13 @@ script_mod! {
         }
     }
 
-    /** The launcher: one field over the hits. The field is a real `SField`,
-        so the query has a caret, selection, and the platform IME — the char
-        grid drew a rectangle and tracked an index. */
+    /** The launcher: one field over the hits. The field is a real
+        `SField`, so the query has a caret, selection, and the platform
+        IME — the char grid drew a rectangle and tracked an index. Its own
+        frame is off: the sheet is the frame, and an ink rule parts the
+        query from the hits. */
     mod.widgets.LauncherOverlay = set_type_default() do #(LauncherOverlay::register_widget(vm)) {
-        ..mod.widgets.View
+        ..mod.widgets.FadeView
         width: Fill, height: Fill
         flow: Down
         query_input := mod.widgets.SField {
@@ -1321,13 +1352,43 @@ script_mod! {
             return_key_type: ReturnKeyType.Go
             autocapitalize: AutoCapitalize.None
             autocorrect: AutoCorrect.Disabled
-            padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
+            padding: Inset{left: 16, right: 16, top: 15, bottom: 15}
+            draw_bg +: {
+                border_size: 0.0
+                border_color: #00000000
+                border_color_hover: #00000000
+                border_color_focus: #00000000
+                border_color_down: #00000000
+                border_color_empty: #00000000
+                border_color_disabled: #00000000
+            }
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
         }
-        View { width: Fill, height: 12 }
+        query_rule := View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
         list := PortalList {
             width: Fill, height: Fill
             flow: Down
             row := mod.widgets.OverlayRow {}
+        }
+        empty_row := View {
+            visible: false
+            width: Fill, height: 40
+            flow: Right
+            align: Align{y: 0.5}
+            padding: Inset{left: 16, right: 16}
+            mod.widgets.SLabel {
+                text: "nothing matches"
+                draw_text +: { color: #909090 }
+            }
         }
     }
 }
@@ -2737,20 +2798,26 @@ impl OverlayRowRef {
     fn populate(&self, cx: &mut Cx, d: &OverlayRowData) {
         let Some(row) = self.borrow() else { return };
         // Inverted while current; an undone branch stays legible but quiet.
-        let (bg, fg, dim) = if d.current {
-            (vec4(0.078, 0.078, 0.078, 1.0), vec4(1.0, 1.0, 1.0, 1.0), vec4(0.75, 0.75, 0.75, 1.0))
+        let (fg, dim) = if d.current {
+            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.75, 0.75, 0.75, 1.0))
         } else if d.muted {
-            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.565, 0.565, 0.565, 1.0), vec4(0.72, 0.72, 0.72, 1.0))
+            (vec4(0.565, 0.565, 0.565, 1.0), vec4(0.72, 0.72, 0.72, 1.0))
         } else {
-            (vec4(1.0, 1.0, 1.0, 1.0), vec4(0.078, 0.078, 0.078, 1.0), vec4(0.353, 0.353, 0.353, 1.0))
+            (vec4(0.078, 0.078, 0.078, 1.0), vec4(0.353, 0.353, 0.353, 1.0))
         };
-        // One card draws; the other stands down. A quad's shader vars are
+        // One card draws; the others stand down. A quad's shader vars are
         // not struct fields (no runtime colour), but a Label's draw_text
-        // colour is — so the twin is only for the background.
-        row.view.view(cx, ids!(card)).set_visible(cx, !d.current);
+        // colour is — so the twins are only for the background.
+        let hovered = d.hovered && !d.current;
+        row.view
+            .view(cx, ids!(card))
+            .set_visible(cx, !d.current && !hovered);
+        row.view.view(cx, ids!(card_hover)).set_visible(cx, hovered);
         row.view.view(cx, ids!(card_inv)).set_visible(cx, d.current);
         let c = if d.current {
             ids!(card_inv)
+        } else if hovered {
+            ids!(card_hover)
         } else {
             ids!(card)
         };
@@ -2777,7 +2844,6 @@ impl OverlayRowRef {
         right.set_text(cx, &d.right);
         right.set_visible(cx, !d.right.is_empty());
         paint(cx, &right, dim);
-        let _ = bg;
     }
 }
 
@@ -2796,11 +2862,15 @@ impl Widget for RowsOverlay {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rows = scope
+        let (rows, alpha) = scope
             .props
             .get::<OverlayProps>()
-            .map(|p| p.rows.clone())
-            .unwrap_or_default();
+            .map(|p| (p.rows.clone(), p.alpha))
+            .unwrap_or((Vec::new(), 1.0));
+        // The subtree renders to a texture; this is the alpha it lands at.
+        self.view
+            .draw_bg
+            .set_uniform(cx, live_id!(alpha), &[alpha]);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
                 list.set_item_range(cx, 0, rows.len());
@@ -2838,11 +2908,19 @@ impl Widget for LauncherOverlay {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rows = scope
+        let (rows, query, alpha) = scope
             .props
             .get::<OverlayProps>()
-            .map(|p| p.rows.clone())
-            .unwrap_or_default();
+            .map(|p| (p.rows.clone(), p.query.clone(), p.alpha))
+            .unwrap_or((Vec::new(), String::new(), 1.0));
+        // The subtree renders to a texture; this is the alpha it lands at.
+        self.view
+            .draw_bg
+            .set_uniform(cx, live_id!(alpha), &[alpha]);
+        // A query nothing answers says so, instead of an empty sheet.
+        self.view
+            .view(cx, ids!(empty_row))
+            .set_visible(cx, rows.is_empty() && !query.is_empty());
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
                 list.set_item_range(cx, 0, rows.len());
