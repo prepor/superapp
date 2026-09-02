@@ -1631,6 +1631,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Job { id } => ("job", Some(*id), None),
         Kind::Files { dir } => ("files", None, Some(dir.clone())),
         Kind::File { path } => ("file", None, Some(path.clone())),
+        Kind::Bucket => ("bucket", None, None),
     }
 }
 
@@ -1658,6 +1659,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "job" => Kind::Job { id: p_int? },
         "files" => Kind::Files { dir: p_txt? },
         "file" => Kind::File { path: p_txt? },
+        "bucket" => Kind::Bucket,
         _ => return None,
     })
 }
@@ -1809,6 +1811,38 @@ mod tests {
         let empty = Wm::new().snapshot();
         s.save_wm(&empty).unwrap();
         assert_eq!(s.load_wm().unwrap(), Some(empty));
+    }
+
+    /// Every kind survives a save and a restore. The two halves are written
+    /// apart — a kind added to [`kind_cols`] but forgotten in `kind_from`
+    /// would drop that panel on the next boot, silently, which is the kind
+    /// of loss no one reports as a bug.
+    #[test]
+    fn every_kind_round_trips_through_its_row() {
+        for kind in [
+            Kind::Help,
+            Kind::About,
+            Kind::Inbox { filter: None },
+            Kind::Inbox { filter: Some("unread".into()) },
+            Kind::Message { id: 7 },
+            Kind::Contact { email: "v@k.io".into() },
+            Kind::Compose { seed: crate::core::Seed::Blank },
+            Kind::Compose { seed: crate::core::Seed::Reply(3) },
+            Kind::Compose { seed: crate::core::Seed::Forward(4) },
+            Kind::Settings,
+            Kind::AddAccount,
+            Kind::Problems,
+            Kind::Bucket,
+        ] {
+            let (name, p_int, p_txt) = kind_cols(&kind);
+            assert_eq!(
+                kind_from(name, p_int, p_txt).as_ref(),
+                Some(&kind),
+                "{kind:?} does not come back as itself"
+            );
+        }
+        // A row this build cannot read is skipped, not guessed at.
+        assert_eq!(kind_from("from_the_future", None, None), None);
     }
 
     /// The reader really is read-only: a write attempted on it fails at the

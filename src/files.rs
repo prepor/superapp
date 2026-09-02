@@ -761,7 +761,7 @@ impl DirSource {
         self.entries
             .iter()
             .filter(|e| hidden || !e.hidden())
-            .filter(|e| ast.map_or(true, |a| matches(e, a)))
+            .filter(|e| ast.is_none_or(|a| matches(e, a)))
             .cloned()
             .collect()
     }

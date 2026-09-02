@@ -1158,6 +1158,8 @@ fn small_panels() -> Scene<Setup> {
         .node("settings", panel(|_| Kind::Settings, ""))
         .node("add account", panel(|_| Kind::AddAccount, ""))
         .about("four fields and the one button")
+        .node("device sync", panel(|_| Kind::Bucket, ""))
+        .about("the bucket, and the key that opens it — typed, not pushed")
         .node("contact", panel(|s| Kind::Contact { email: sender_like(s, "Elena") }, ""))
         .sized((520.0, 260.0))
         .node("help", panel(|_| Kind::Help, ""))
@@ -1165,6 +1167,7 @@ fn small_panels() -> Scene<Setup> {
         .node("about", panel(|_| Kind::About, ""))
         .sized((420.0, 200.0))
         .edge("settings", "add account", "add an account")
+        .edge("settings", "device sync", "point at a bucket")
 }
 
 /// Two standing problems in a stage's world, written through the opener:

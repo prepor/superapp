@@ -240,6 +240,11 @@ pub trait Outside {
     /// cache that keeps it from happening per connect belongs to the
     /// backend that owns the process, not to the caller.
     fn access_token(&mut self, email: &str) -> Result<String, String>;
+    /// The device-sync bucket's secret access key, by key id (CR-005). Its
+    /// own door rather than [`Outside::secret_set`]'s: losing a mailbox and
+    /// losing a lineage are different accidents, and they are kept under
+    /// different services.
+    fn bucket_secret_set(&mut self, key_id: &str, secret: &str) -> bool;
     fn clip(&mut self, text: &str) -> Result<(), String>;
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     fn shot(&mut self, path: &Path) -> Result<(), String>;
@@ -376,6 +381,26 @@ impl Effect for SecretSet<'_> {
             .secret_set(self.email, self.pass)
             .then_some(())
             .ok_or_else(|| "the keychain refused the password".to_string())
+    }
+}
+
+/// Store the device-sync bucket's secret access key (CR-005).
+pub struct BucketSecret<'a> {
+    pub key_id: &'a str,
+    pub secret: &'a str,
+}
+
+impl Effect for BucketSecret<'_> {
+    const KIND: &'static str = "bucket_secret";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("store the bucket secret for {}", self.key_id)
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out
+            .bucket_secret_set(self.key_id, self.secret)
+            .then_some(())
+            .ok_or_else(|| "the keychain refused the bucket secret".to_string())
     }
 }
 
@@ -1286,6 +1311,9 @@ impl Outside for Deny {
     fn access_token(&mut self, _e: &str) -> Result<String, String> {
         Self::no("access_token")
     }
+    fn bucket_secret_set(&mut self, _k: &str, _s: &str) -> bool {
+        false
+    }
     fn clip(&mut self, _t: &str) -> Result<(), String> {
         Self::no("clip")
     }
@@ -1641,6 +1669,11 @@ impl Outside for Fake {
 
     fn secret_set(&mut self, email: &str, pass: &str) -> bool {
         self.secrets.insert(email.to_string(), pass.to_string());
+        true
+    }
+
+    fn bucket_secret_set(&mut self, key_id: &str, secret: &str) -> bool {
+        self.secrets.insert(format!("r2/{key_id}"), secret.to_string());
         true
     }
 
@@ -2003,6 +2036,21 @@ impl Outside for Real {
         self.tokens
             .insert(email.to_string(), (tok.clone(), until));
         Ok(tok)
+    }
+
+    fn bucket_secret_set(&mut self, key_id: &str, secret: &str) -> bool {
+        match &self.secrets {
+            Secrets::Keychain(dir) => crate::secret::set_bucket_secret(dir, key_id, secret),
+            // An e2e run never writes to a human's keychain. The replication
+            // worker reads the platform store directly (it has no World), so
+            // a suite that "connects" proves the form and the file, not a
+            // live bucket — which is the only half a suite could prove.
+            Secrets::Memory(m) => m
+                .0
+                .lock()
+                .map(|mut g| g.insert(format!("r2/{key_id}"), secret.to_string()))
+                .is_ok(),
+        }
     }
 
     fn clip(&mut self, text: &str) -> Result<(), String> {

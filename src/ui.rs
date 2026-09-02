@@ -200,6 +200,11 @@ pub const ACCEL_FORWARD: char = 'f';
 /// the same courtesy an editable field gets, for the same reason.
 pub const ACCEL_ADD_ACCOUNT: char = 'd';
 
+/// Settings' link to the device-sync form (CR-005). The `y` of "sync": `d`
+/// is next door on the same panel, and the letters before it are all either
+/// reserved or taken.
+pub const ACCEL_DEVICE_SYNC: char = 'y';
+
 /// The kind a panel **previews** into its joined child: a master/detail list
 /// whose cursor walk re-targets the child instead of opening a new panel, and
 /// which keeps focus while doing it (CR-005).
@@ -237,6 +242,7 @@ pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
     }
     if matches!(kind, Kind::Settings) {
         v.push((ACCEL_ADD_ACCOUNT, "add account"));
+        v.push((ACCEL_DEVICE_SYNC, "device sync"));
     }
     v
 }
@@ -282,6 +288,9 @@ pub enum FieldId {
     NewDir,
     /// A files panel's `go to` path field (CR-008).
     Path,
+    SetBucketUrl,
+    SetBucketKey,
+    SetBucketSecret,
 }
 
 /// The fields a kind's form carries, in walk order. The widgets own the walk
@@ -295,6 +304,11 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
             FieldId::SetPass,
             FieldId::SetImap,
             FieldId::SetSmtp,
+        ],
+        Kind::Bucket => &[
+            FieldId::SetBucketUrl,
+            FieldId::SetBucketKey,
+            FieldId::SetBucketSecret,
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
         Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
@@ -314,6 +328,7 @@ mod tests {
             Kind::Settings,
             Kind::AddAccount,
             Kind::Problems,
+            Kind::Bucket,
             Kind::Help,
             Kind::About,
             Kind::Inbox { filter: None },
@@ -477,6 +492,7 @@ mod tests {
             ("reply", ACCEL_REPLY),
             ("forward", ACCEL_FORWARD),
             ("add account", ACCEL_ADD_ACCOUNT),
+            ("device sync", ACCEL_DEVICE_SYNC),
         ] {
             assert!(accel_idx(label, c).is_some(), "“{label}” cannot show {c}");
         }

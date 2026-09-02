@@ -50,8 +50,23 @@ head pointer, so the compare-and-swap that advances the log *is* the check
 that this device still holds the lease. One device bootstraps the lineage
 (uploads a snapshot, writes the first `state`); the other installs that
 snapshot to gain a common ancestry, then applies each published batch
-forward. The transport is pluggable — R2 or S3 in the end, a small local
-`bucketd` daemon for a demo (see `docs/device-sync-demo.md`).
+forward.
+
+The transport is chosen by the URL: a small local `bucketd` daemon for a demo
+with no cloud account, or **Cloudflare R2** over its S3 API for real (TLS and
+signed requests, and nothing else different — see
+`docs/device-sync-demo.md`). The compare-and-swap is not emulated on top of
+either: R2 implements S3's conditional writes, so `If-None-Match: *` is the
+create-only put and `If-Match: <etag>` is the compare-and-swap. The
+single-writer property rests on the object store, which is why it can be
+model-checked rather than hoped for.
+
+A device is given its bucket the way it is given a mailbox: from a panel with
+three fields, not from a command line. The secret goes to the platform's
+secret store (never the SQLite file, never a config file); the endpoint and
+key id go to a `bucket` file beside the store; the worker restarts onto them.
+That road exists because the device most in need of it — a phone — has no
+shell to run a flag from.
 
 The role drives the UI and the write gate together. A **holder** writes;
 everyone else is read-only and sees a **locked screen** — who holds the

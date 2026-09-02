@@ -1,10 +1,12 @@
-# Device sync: a local demo (CR-005)
+# Device sync: the demo, and the real bucket (CR-005)
 
-Two devices, one store, a leased single writer. This runs the whole thing
-locally — a macOS build and an android emulator (or a second desktop
-instance) sharing one bucket, with no cloud account.
+Two devices, one store, a leased single writer. Two ways to run it: locally
+against `bucketd` with no cloud account (below), or against a real
+**Cloudflare R2** bucket ([The real bucket](#the-real-bucket-r2)). Same
+engine, same contract — only the transport differs, and the app picks it from
+the URL scheme.
 
-The transport is `bucketd`, a tiny local object-store daemon that stands in
+The local transport is `bucketd`, a tiny object-store daemon that stands in
 for R2/S3 (same compare-and-swap contract; see [`src/object.rs`]). The macOS
 side reaches it at `127.0.0.1`; the android emulator reaches the *same* host
 daemon at `10.0.2.2` (the emulator's alias for the host).
@@ -30,7 +32,8 @@ The bucket URL is resolved, in order, from:
 
 1. `--bucket http://HOST:9000` on the command line (desktop),
 2. the `SUPERAPP_BUCKET` environment variable,
-3. a one-line `bucket` file **beside the store** (how android is configured).
+3. the first line of a `bucket` file **beside the store** (how android is
+   configured).
 
 ## 4. Device A — the first to run
 
@@ -75,6 +78,12 @@ Two android networking notes, if B cannot reach the bucket:
 - `10.0.2.2` is the emulator's alias for the host loopback; a physical device
   needs the host's LAN address instead, and `bucketd --bind 0.0.0.0`.
 
+Against R2 the same two notes hold, minus the address: the socket is still a
+raw one, TLS is rustls against the Mozilla roots compiled in, so android's
+system trust store and network-security config are not in the path either —
+only `INTERNET` is. The crates are the ones imap and lettre already build for
+that target, so an APK that can fetch mail can reach R2.
+
 ## 6. The handoff
 
 - On A, quit the app (or background it): A **releases** the lease.
@@ -96,6 +105,131 @@ mise exec -- cargo run -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
 mise exec -- cargo run -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
 ```
 
+## The real bucket: R2
+
+Everything above is the same walk against a real endpoint; nothing in the
+engine changes. `https://` in the bucket URL selects [`src/r2.rs`] — R2 over
+its S3 API — and `http://` keeps the plain daemon client.
+
+Two things a local demo could do without: **TLS**, and **AWS SigV4** request
+signing. The compare-and-swap is *not* emulated on top of them: R2 implements
+S3's conditional writes, so `If-None-Match: *` is the create-only put and
+`If-Match: <etag>` is the compare-and-swap, each answered `412` when its
+precondition loses. The single-writer property the lease rests on — the one
+[`formal/Lease.tla`](../formal/README.md) checks — therefore rests on the
+object store itself.
+
+### 1. The bucket and a key
+
+In the Cloudflare dashboard: **R2 → Create bucket**, then **Manage R2 API
+Tokens → Create API token**, *Object Read & Write*, scoped to that bucket.
+The token page shows three things worth keeping: the **access key id**, the
+**secret access key** (once), and the S3 endpoint,
+`https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+
+The bucket URL the app wants is that endpoint plus the bucket, and optionally
+a prefix — a lineage can live in a subdirectory, so one bucket can hold
+several (a demo run, the real one):
+
+```
+https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>[/<PREFIX>]
+```
+
+### 2. Prove the credentials before trusting them
+
+```sh
+export SUPERAPP_R2_ACCESS_KEY_ID=…
+export SUPERAPP_R2_SECRET_ACCESS_KEY=…
+mise exec -- cargo run --bin sync-demo -- \
+  --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>
+```
+
+This runs the whole two-device story — bootstrap, snapshot install, sync both
+ways, a follower's write refused, release + acquire, an override that strands
+— against the real bucket, under a fresh `sync-demo/<stamp>/` prefix, and
+**deletes every object it made** on the way out. It starts with the three
+verbs alone (`404 → create → refuse → read → stale CAS refused → fresh CAS
+wins`), so a wrong key fails on the first line with `403
+SignatureDoesNotMatch` rather than as a puzzling bootstrap four steps later.
+
+### 3. Point the app at it
+
+```sh
+mise exec -- cargo run -- --db /tmp/superapp-A.db \
+  --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
+```
+
+The access key id and its secret are resolved, in order, from:
+
+1. `SUPERAPP_R2_ACCESS_KEY_ID` / `SUPERAPP_R2_SECRET_ACCESS_KEY`,
+2. lines 2 and 3 of the `bucket` file beside the store,
+3. the platform's secret store, for the secret half — the macOS login
+   keychain, written by:
+
+```sh
+mise exec -- cargo run -- --r2-login    # reads the secret from stdin, then exits
+```
+
+Stdin, not a flag: an argument is in `ps` and in the shell's history, and this
+one key can write the whole lineage. `--r2-login` needs the key id (from the
+environment or the file); it stores only the secret. Secrets never go in the
+store — same rule as mail passwords ([`src/secret.rs`]).
+
+### 4. On android: the form, not the cable
+
+A phone has no environment, no shell and no keychain command. It has the
+**device-sync panel**: settings → *device sync* (`cmd+y` where there is a
+keyboard), three fields — the bucket URL, the access key id, the secret — and
+a *connect* button.
+
+What connect does is the whole point of the panel:
+
+- the **secret** goes to the platform's secret store — the macOS keychain, or
+  a private 0600 file beside the store on android — through the effect
+  boundary, so an e2e run writes to memory and never to a human's keychain;
+- the **URL and key id** are written to the `bucket` file beside the store,
+  and *only* those two: a file that carried a secret on line 3 is rewritten
+  without it;
+- the replication worker is restarted onto the new bucket — the lease handed
+  back first — so connecting takes effect without a relaunch.
+
+The secret field is write-only: it seeds blank on a configured device, because
+a key that can be read back off a screen is a key that leaves by a route
+nobody chose. Leaving it empty on a device that already has one keeps it.
+
+The file is still the way to *prefill* a device from a host, and the only way
+to hand one a secret without typing it:
+
+```sh
+adb shell run-as dev.prepor.superapp sh -c 'cat > files/bucket' <<EOF
+https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
+<ACCESS_KEY_ID>
+<SECRET_ACCESS_KEY>
+EOF
+```
+
+(Blank lines and `#` comments are skipped, so the file can carry a note.)
+Open the panel once afterwards and press connect: the secret moves into the
+secret store and the file is rewritten without it.
+
+### What it costs, and what it says when it fails
+
+An idle follower polls a real bucket every **5 seconds**, not the 1.5 the
+local daemon gets — the transport sets its own cadence, because two million
+class-B operations a month is a lot to pay for asking a question whose answer
+almost never changes. A holder's write still publishes at once: the worker is
+kicked, not waited for.
+
+A bucket that refuses us is not the same thing as a dead network, and the app
+says which: the S3 error code rides into the status (`bucket GET state: 403
+SignatureDoesNotMatch`), onto the locked screen, into a toast, and onto
+stderr. Credentials that cannot be found at all refuse to start sync rather
+than run a device that only *looks* synced:
+
+```
+superapp: device sync is off — no secret for <key id> — run `superapp --r2-login`, …
+```
+
 ## The headless scripts
 
 The headless makepad loop needs **`--draws N`** to pump N frames — without it a
@@ -107,6 +241,13 @@ the same walk fast, asserting through label resolution instead of pixels).
 `bucketd` for a scripted walk (`e2e/sync-a.txt`, `e2e/sync-b.txt`). It needs
 a headless makepad event loop that pumps frames; where that is available it
 drives the passes on the virtual clock exactly like the mail engine.
+
+`e2e/bucket.sh` proves the panel: a device with **no** `--bucket` flag and no
+pushed file is pointed at a `bucketd` from inside the app — settings, the
+`cmd+y` link, the URL typed into the form, connect — and the assertions are
+outside the app, where a screenshot cannot lie about them: a one-line `bucket`
+file beside the store, and a lineage in the daemon's directory that only a
+holder ever writes.
 
 `e2e/reseed.sh` proves a subtler thing: a *running* follower whose open
 compose panel has a peer's draft edit materialized underneath it re-seeds the
@@ -140,3 +281,32 @@ transport:
 - `repl::tests::two_devices_sync_over_real_http` — the same stack over a live
   socket: snapshot upload/install, batch upload/apply, and the lease CAS
   through `bucketd`'s handler and the `HttpBucket` client.
+
+And the R2 client's own arithmetic, which no local run exercises:
+
+- `r2::tests::the_signature_matches_the_aws_test_vector` — the AWS SigV4 test
+  suite's `get-vanilla` case, byte for byte. It pins canonical request, scope,
+  signing key and signature at once, so a drift in any of them fails here
+  rather than at a real endpoint with a `SignatureDoesNotMatch` and no clue
+  which step moved.
+- the conditional headers are signed, the path is encoded the way S3 signs it
+  (once), the clock formats as `x-amz-date`, and an endpoint URL splits into
+  bucket and lineage prefix.
+
+Between the two there is one probe that needs no account at all: point the
+client at real AWS S3 with the documentation's example keys.
+
+```sh
+SUPERAPP_R2_REGION=us-east-1 \
+SUPERAPP_R2_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
+SUPERAPP_R2_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
+mise exec -- cargo run --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
+# → bucket GET contract-check: 403 InvalidAccessKeyId
+```
+
+`InvalidAccessKeyId` is the *good* answer: it means a real S3 endpoint
+completed the TLS handshake, accepted the request framing, and parsed the
+`Authorization` header far enough to look the key up — a malformed envelope
+would have come back `AuthorizationHeaderMalformed` instead. What is left
+after that is whether R2 agrees about the keys and the conditional writes,
+which is what `sync-demo --bucket https://…` is for.

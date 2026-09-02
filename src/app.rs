@@ -431,6 +431,7 @@ script_mod! {
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
                         add_account_tpl := mod.widgets.AddAccountPanel{}
+                        bucket_tpl := mod.widgets.BucketPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
                         inbox_tpl := mod.widgets.InboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
@@ -464,6 +465,7 @@ script_mod! {
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
+                            bucket_tpl := mod.widgets.BucketPanel{}
                             compose_tpl := mod.widgets.ComposePanel{}
                             inbox_tpl := mod.widgets.InboxPanel{}
                             message_tpl := mod.widgets.MessagePanel{}
@@ -600,6 +602,8 @@ enum WidgetOp {
     AddAccount,
     /// Press "sign in with google" on the add-account panel.
     GoogleSignIn,
+    /// The device-sync form's connect button (CR-005).
+    ConnectBucket,
     RemoveAccount(i64),
     /// A row of a list panel was clicked — an inbox thread, a job of the
     /// effect log, an entry of a files panel. One op, because a click on a
@@ -1025,6 +1029,14 @@ enum ReplMode {
     },
 }
 
+/// What one sync pass moved, and so what the shell owes the screen: a role
+/// change redraws the world; a new failure only needs saying.
+#[derive(Default)]
+struct ReplChange {
+    role: bool,
+    note: bool,
+}
+
 struct State {
     ws: Wm,
     /// Everything that leaves the process, plus the clock (CR-004). Holds
@@ -1233,6 +1245,7 @@ impl State {
                 epoch: 0,
                 unpublished: 0,
                 device: String::new(),
+                note: None,
             },
             seeded: false,
             signin: None,
@@ -1718,8 +1731,10 @@ impl State {
     /// Resolves the device-sync bucket URL from the three sources that let
     /// each platform configure it: the `--bucket` flag (desktop), the
     /// `SUPERAPP_BUCKET` environment variable, and a `bucket` file beside the
-    /// store (how android is pointed at `http://10.0.2.2:PORT` — `adb push` a
-    /// one-line file into the app's files dir).
+    /// store (how android is pointed at `http://10.0.2.2:PORT`, or at a real
+    /// R2 endpoint — `adb push` the file into the app's files dir; its first
+    /// line is the URL, and for a real bucket the next two are the keys, read
+    /// by [`crate::r2`]).
     fn resolve_bucket(db_path: Option<&std::path::Path>) -> Option<String> {
         if let Some(u) = config().bucket.clone() {
             return Some(u);
@@ -1730,9 +1745,7 @@ impl State {
                 return Some(u);
             }
         }
-        let dir = db_path.and_then(std::path::Path::parent)?;
-        let u = std::fs::read_to_string(dir.join("bucket")).ok()?.trim().to_string();
-        (!u.is_empty()).then_some(u)
+        crate::r2::url_from_file(db_path.and_then(std::path::Path::parent))
     }
 
     fn start_repl(
@@ -1740,8 +1753,21 @@ impl State {
         db_path: Option<&std::path::Path>,
     ) -> Option<ReplMode> {
         let url = Self::resolve_bucket(db_path)?;
-        let bucket: std::sync::Arc<dyn crate::object::Object> =
-            std::sync::Arc::new(crate::object::HttpBucket::new(&url));
+        // `https://` is a real R2 bucket (signed, over TLS); anything else is
+        // the plain `bucketd` demo daemon. A bucket that cannot be opened at
+        // all — no credentials, a malformed endpoint — still gets a worker,
+        // over a bucket that answers every verb with the reason. Returning
+        // `None` here would leave a device that had *already joined a
+        // lineage* with no worker and no locked screen, and the store opens
+        // writable: a follower would come back as a writer outside the
+        // lease. This way the ordinary path holds — the role falls to
+        // `Offline`, the gate stays shut, and the reason is on the screen
+        // instead of only in the console.
+        let bucket = crate::r2::open(&url, db_path.and_then(std::path::Path::parent))
+            .unwrap_or_else(|e| {
+                eprintln!("superapp: device sync cannot start — {e}");
+                std::sync::Arc::new(crate::r2::Broken(e))
+            });
         // Headless: inline passes driven by the frame loop's virtual clock, so
         // a scripted run is deterministic. Production: a background thread.
         #[cfg(headless)]
@@ -1760,13 +1786,16 @@ impl State {
     // -- device sync, mode-agnostic (CR-005) --------------------------------
 
     /// Reconciles the reported status: caches it, seeds the demo world the
-    /// first time this device holds (a holder-only act), and answers whether
-    /// the role changed.
-    fn apply_repl(&mut self, status: crate::repl::Status) -> bool {
+    /// first time this device holds (a holder-only act), and answers what
+    /// moved.
+    fn apply_repl(&mut self, status: crate::repl::Status) -> ReplChange {
         if status == self.repl_status {
-            return false;
+            return ReplChange::default();
         }
-        let role_changed = status.role != self.repl_status.role;
+        let changed = ReplChange {
+            role: status.role != self.repl_status.role,
+            note: status.note != self.repl_status.note,
+        };
         self.repl_status = status;
         if matches!(self.repl_status.role, crate::repl::Role::Holder) && !self.seeded {
             self.seeded = true;
@@ -1779,21 +1808,94 @@ impl State {
                 // The seed publishes on the next pass.
             }
         }
-        role_changed
+        changed
     }
 
-    /// Runs (or reads) one sync pass and reconciles the result. Answers
-    /// whether the role changed.
-    fn repl_poll(&mut self) -> bool {
+    /// Runs (or reads) one sync pass and reconciles the result.
+    fn repl_poll(&mut self) -> ReplChange {
         let status = match &self.repl {
             Some(ReplMode::Threads(w)) => w.status(),
             Some(ReplMode::Manual { bucket }) => {
                 let b = bucket.clone();
                 crate::repl::poll(&self.store, &*b)
             }
-            None => return false,
+            None => return ReplChange::default(),
         };
         self.apply_repl(status)
+    }
+
+    /// Points this device at a bucket (CR-005): the secret to the platform's
+    /// secret store, the URL and key id to the `bucket` file beside the
+    /// store, and the replication worker restarted onto them. Answers what to
+    /// say, either way.
+    ///
+    /// This is the road android has and the command line does not — a device
+    /// with no shell and no cable is still a device that has to be given a
+    /// key.
+    fn connect_bucket(&mut self, url: &str, key_id: &str, secret: &str) -> Result<String, String> {
+        let dir = self
+            .db_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .ok_or("no store file — device sync needs one")?
+            .to_path_buf();
+        if url.is_empty() {
+            return Err("the bucket url is required".into());
+        }
+        if url.starts_with("https://") && key_id.is_empty() {
+            return Err("an https bucket needs an access key id".into());
+        }
+        if !secret.is_empty() {
+            if key_id.is_empty() {
+                return Err("a secret needs the key id it belongs to".into());
+            }
+            // The secret goes first, because the check below has to be able
+            // to find it — and a key in the keychain that nothing points at
+            // is inert, which is not true of a written-down endpoint.
+            self.world
+                .run(&crate::effect::BucketSecret { key_id, secret })
+                .map_err(|e| format!("storing the bucket secret failed: {e}"))?;
+        }
+        // Check *before* anything is written down: a typo that reaches the
+        // `bucket` file is what the next launch will read, and the launch
+        // after that.
+        crate::r2::check(url, Some(&dir), key_id)?;
+
+        self.world
+            .run(&crate::effect::WriteFile {
+                path: &crate::r2::config_path(&dir),
+                bytes: &crate::r2::config_bytes(url, key_id),
+            })
+            .map_err(|e| format!("writing the bucket file failed: {e}"))?;
+
+        // Hand the lease back before the old worker goes — the bucket it
+        // holds it in may not be the one we are moving to — and then *wait*
+        // for it. A dropped handle leaves a thread that is still a device.
+        if let Some(ReplMode::Threads(w)) = self.repl.take() {
+            w.release_blocking();
+            w.stop();
+        }
+        self.repl = None;
+        // Shut the gate for the crossing. Until the first pass answers, this
+        // device does not know whether the lineage it is joining already has
+        // a writer, and an edit made in that window is one the install is
+        // about to discard.
+        self.store.set_writable(false);
+        self.repl_status = crate::repl::Status {
+            role: crate::repl::Role::Detached,
+            epoch: 0,
+            unpublished: 0,
+            device: self.store.device(),
+            note: None,
+        };
+        self.repl = Self::start_repl(&self.store, self.db_path.as_deref());
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or(url);
+        Ok(format!("device sync: connecting to {host}"))
     }
 
     /// Asks to take the lease.
@@ -3437,8 +3539,10 @@ impl Stage {
         if state.repl.is_none() {
             return;
         }
-        let role_changed = state.repl_poll();
-        if role_changed {
+        let changed = state.repl_poll();
+        // Taken before the role block below hands `self` to `update_menu`.
+        let note = changed.note.then(|| state.repl_status.note.clone()).flatten();
+        if changed.role {
             let line = state.repl_status.role.line();
             let err = matches!(state.repl_status.role, crate::repl::Role::Stranded { .. });
             state.toast(line, err);
@@ -3448,6 +3552,12 @@ impl Stage {
             }
             state.sync();
             self.update_menu(cx);
+        }
+        // A new reason to be offline is worth saying even when the role does
+        // not move: a holder whose bucket refuses its key keeps holding, and
+        // would otherwise accrue unpublished frames in silence.
+        if let (Some(note), Some(state)) = (note, self.state.as_deref_mut()) {
+            state.toast(note, true);
         }
         self.reseed_composes(cx);
         cx.redraw_all();
@@ -3845,6 +3955,16 @@ impl Stage {
                     WidgetOp::GoogleSignIn => {
                         cx.action(crate::panels::PanelAction::GoogleSignIn { pid });
                     }
+                    WidgetOp::ConnectBucket => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            if let Some(mut bp) = w.as_bucket_panel().borrow_mut() {
+                                let (url, key_id, secret) = bp.form_values(cx);
+                                cx.action(crate::panels::PanelAction::ConnectBucket {
+                                    pid, url, key_id, secret,
+                                });
+                            }
+                        }
+                    }
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
@@ -4160,11 +4280,17 @@ impl Stage {
                             // duplicate is the point.
                             let refuse = if into_itself {
                                 Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
-                            } else if same_dir && hold.op == crate::files::HoldOp::Move {
-                                Some(format!("“{name}” is already here"))
-                            } else if !same_dir
-                                && crate::files::stat_in(&state.world, &crate::files::join(&dir, &name)).is_some()
+                            } else if (same_dir && hold.op == crate::files::HoldOp::Move)
+                                || (!same_dir
+                                    && crate::files::stat_in(
+                                        &state.world,
+                                        &crate::files::join(&dir, &name),
+                                    )
+                                    .is_some())
                             {
+                                // A move that goes nowhere, or a name the
+                                // destination already has: one sentence
+                                // covers both, so it is written once.
                                 Some(format!("“{name}” is already here"))
                             } else {
                                 None
@@ -4850,6 +4976,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
         Kind::AddAccount => Some(live_id!(add_account_tpl)),
+        Kind::Bucket => Some(live_id!(bucket_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
@@ -5361,6 +5488,38 @@ impl Stage {
                         ),
                         false,
                     );
+                    refresh = true;
+                }
+                crate::panels::PanelAction::ConnectBucket {
+                    pid,
+                    url,
+                    key_id,
+                    secret,
+                } => {
+                    let done = self
+                        .state
+                        .as_deref_mut()
+                        .map(|state| state.connect_bucket(&url, &key_id, &secret));
+                    match done {
+                        // The secret is in the keychain now; a form is not a
+                        // place to keep one.
+                        Some(Ok(said)) => {
+                            if let Some(w) = self.hosted.get(&pid) {
+                                w.as_bucket_panel().clear_secret(cx);
+                            }
+                            if let Some(state) = self.state.as_deref_mut() {
+                                state.toast(said, false);
+                            }
+                        }
+                        Some(Err(why)) => {
+                            if let Some(state) = self.state.as_deref_mut() {
+                                state.toast(why, true);
+                            }
+                        }
+                        None => {}
+                    }
+                    self.tick_repl(cx);
+                    refresh = true;
                 }
                 crate::panels::PanelAction::TryIt { pid: _ } => {
                     if let Some(state) = self.state.as_deref_mut() {
@@ -6545,8 +6704,10 @@ impl Stage {
                 _ => ("read-only", Some("acquire")),
             };
 
+            let note = state.repl_status.note.clone();
             let cw = 460.0_f64.min(vp.size.x - 40.0);
-            let ch = 156.0;
+            // One more line when the pass had a reason to give.
+            let ch = 156.0 + if note.is_some() { self.cell.line_h + 6.0 } else { 0.0 };
             let card = rect(
                 vp.pos.x + (vp.size.x - cw) / 2.0,
                 vp.pos.y + (vp.size.y - ch) / 2.0,
@@ -6569,11 +6730,20 @@ impl Stage {
                 card.pos + dvec2(20.0, 20.0 + self.cell.line_h + 6.0),
                 &role.line(),
             );
+            let mut line = 2.0;
+            if let Some(note) = &note {
+                self.draw_mono.draw_abs(
+                    cx,
+                    card.pos + dvec2(20.0, 20.0 + line * (self.cell.line_h + 6.0)),
+                    note,
+                );
+                line += 1.0;
+            }
             let short: String = state.repl_status.device.chars().take(8).collect();
             let device = format!("this device: {short}");
             self.draw_mono.draw_abs(
                 cx,
-                card.pos + dvec2(20.0, 20.0 + 2.0 * (self.cell.line_h + 6.0)),
+                card.pos + dvec2(20.0, 20.0 + line * (self.cell.line_h + 6.0)),
                 &device,
             );
 
@@ -7084,6 +7254,14 @@ impl Stage {
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);
             }
+            // The device-sync form seeds from what this device is already
+            // pointed at — its bucket and key id, never its secret.
+            if matches!(&kind, Some(Kind::Bucket)) {
+                let dir = state.db_path.as_deref().and_then(std::path::Path::parent);
+                let url = State::resolve_bucket(state.db_path.as_deref()).unwrap_or_default();
+                let key_id = crate::r2::configured_key_id(dir);
+                w.as_bucket_panel().prefill(cx, &url, &key_id);
+            }
             // An inbox with a baked filter param seeds its field.
             if let Some(Kind::Inbox { filter: Some(f) }) = &kind {
                 w.widget(cx, ids!(filter_input))
@@ -7125,13 +7303,14 @@ impl Stage {
         let mut reg: Vec<(String, Rect, Act)> = Vec::new();
         match &kind {
             Some(Kind::Settings) => {
-                let lr = w.widget(cx, ids!(add_link)).area().rect(cx);
-                if lr.size.x > 0.0 {
-                    reg.push((
-                        "add account".to_string(),
-                        lr,
-                        Act::Open(pid, Kind::AddAccount),
-                    ));
+                for (label, path, target) in [
+                    ("add account", ids!(add_link), Kind::AddAccount),
+                    ("device sync", ids!(bucket_link), Kind::Bucket),
+                ] {
+                    let lr = w.widget(cx, path).area().rect(cx);
+                    if lr.size.x > 0.0 {
+                        reg.push((label.to_string(), lr, Act::Open(pid, target)));
+                    }
                 }
                 let accounts = mail::accounts(&state.store);
                 if let Some(list) =
@@ -7177,6 +7356,26 @@ impl Stage {
                             }
                         }
                     }
+                }
+            }
+            Some(Kind::Bucket) => {
+                for (label, path) in [
+                    ("bucket", ids!(url_input)),
+                    ("key id", ids!(key_input)),
+                    ("secret", ids!(secret_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let br = w.widget(cx, ids!(connect_btn)).area().rect(cx);
+                if br.size.x > 0.0 {
+                    reg.push((
+                        "connect".to_string(),
+                        br,
+                        Act::WidgetOp(pid, WidgetOp::ConnectBucket),
+                    ));
                 }
             }
             Some(Kind::AddAccount) => {

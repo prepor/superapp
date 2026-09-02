@@ -19,7 +19,6 @@
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +191,12 @@ pub struct Status {
     pub unpublished: i64,
     /// This install's device id.
     pub device: String,
+    /// Why the last pass failed, if it did. A bucket that refuses us —
+    /// `403 SignatureDoesNotMatch`, a bucket that does not exist — is not the
+    /// same thing as a dead network, and against a real endpoint that
+    /// difference is most of the debugging. `None` when the pass went
+    /// through.
+    pub note: Option<String>,
 }
 
 /// A batch object's header — enough to place it in the global order and walk
@@ -252,7 +257,10 @@ fn schema_of(store: &Store) -> i64 {
 pub fn poll(store: &Store, obj: &dyn Object) -> Status {
     match poll_inner(store, obj) {
         Ok(role) => status(store, role),
-        Err(_unreachable) => status(store, offline_role(store)),
+        Err(why) => Status {
+            note: Some(why),
+            ..status(store, offline_role(store))
+        },
     }
 }
 
@@ -280,17 +288,33 @@ fn status(store: &Store, role: Role) -> Status {
         unpublished: store.unpublished(),
         device: store.device(),
         role,
+        note: None,
     }
 }
 
 fn poll_inner(store: &Store, obj: &dyn Object) -> Result<Role, String> {
+    poll_from(store, obj, true)
+}
+
+/// One pass. `may_bootstrap` is spent on the first attempt: a bucket with no
+/// `state` is a lineage waiting to be started, but a bucket that *cannot* be
+/// written — a name with a typo in it, a key without permission — answers
+/// "no object" and refuses the write every time, and an unbounded retry
+/// there is a stack that grows until the process dies.
+fn poll_from(store: &Store, obj: &dyn Object, may_bootstrap: bool) -> Result<Role, String> {
     let device = store.device();
     let Some((state, etag)) = read_state(obj)? else {
+        if !may_bootstrap {
+            // Someone else's bootstrap should have been visible by now; that
+            // it is not makes this a pass with nothing to say, not a loop.
+            return Err("the lineage is neither there nor startable".into());
+        }
         // No lineage: try to become canonical. If someone beat us to it,
         // fall through and read their state on the next pass.
         return match bootstrap(store, obj) {
             Ok(true) => Ok(Role::Holder),
-            Ok(false) | Err(_) => poll_inner(store, obj),
+            Ok(false) => poll_from(store, obj, false),
+            Err(why) => Err(why),
         };
     };
 
@@ -633,12 +657,10 @@ pub fn override_lease(store: &Store, obj: &dyn Object) -> Result<Status, String>
 
 // -- the worker ---------------------------------------------------------------
 
-/// How often the worker polls the bucket when nothing kicks it — often enough
-/// that a handoff feels live in a demo, rare enough to be gentle.
-const POLL_EVERY: Duration = Duration::from_millis(1500);
-
 /// A command to the replication worker.
 enum Cmd {
+    /// Retire: finish what is in flight and end the thread.
+    Stop,
     /// Poll now (an action just captured something, or the UI woke).
     Kick,
     /// Take the lease from a free or held state.
@@ -657,6 +679,8 @@ pub struct Worker {
     status: Arc<Mutex<Status>>,
     db: Arc<Db>,
     bucket: Arc<dyn Object>,
+    /// Kept so a retiring worker can be *waited for*, not merely dropped.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Worker {
@@ -693,6 +717,22 @@ impl Worker {
             let _ = release(&store, &*self.bucket);
         }
     }
+
+    /// Retire this worker and **wait for it**. Dropping the handle is not
+    /// enough: the thread only notices a closed channel on its next timeout,
+    /// and until then it is still a device — it can materialize a snapshot,
+    /// publish frames, and move the write gate, all against the bucket its
+    /// replacement was configured to leave. Two workers over one store is
+    /// exactly the thing the lease forbids between machines.
+    ///
+    /// An idle worker stops at once (the command wakes it); one mid-request
+    /// finishes that request first.
+    pub fn stop(mut self) {
+        let _ = self.cmd.send(Cmd::Stop);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Spawns the replication worker over the shared writer and the given bucket.
@@ -710,24 +750,39 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
         epoch: 0,
         unpublished: 0,
         device: String::new(),
+        note: None,
     }));
     let wstatus = status.clone();
     let wdb = db.clone();
     let wbucket = bucket.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("repl".into())
         .spawn(move || {
             let Ok(store) = Store::with_db(wdb) else {
                 return;
             };
-            let report = |s: Status, st: &Arc<Mutex<Status>>| {
+            // A holder that cannot reach the bucket keeps its role, so a
+            // wrong key would otherwise be invisible on the way past: say
+            // each *new* reason once, on stderr.
+            let mut said: Option<String> = None;
+            let mut report = |s: Status, st: &Arc<Mutex<Status>>| {
+                if s.note != said {
+                    if let Some(why) = &s.note {
+                        eprintln!("repl: {why}");
+                    }
+                    said = s.note.clone();
+                }
                 *st.lock().expect("repl status") = s;
                 notify();
             };
             // First pass immediately, so the UI has a role at once.
             report(poll(&store, &*wbucket), &wstatus);
+            // The transport sets the cadence: a local daemon is free to poll
+            // hard, a metered bucket across the network is not.
+            let every = wbucket.poll_every();
             loop {
-                let next = match rx.recv_timeout(POLL_EVERY) {
+                let next = match rx.recv_timeout(every) {
+                    Ok(Cmd::Stop) => return,
                     Ok(Cmd::Kick) | Err(mpsc::RecvTimeoutError::Timeout) => poll(&store, &*wbucket),
                     Ok(Cmd::Acquire) => {
                         acquire(&store, &*wbucket).unwrap_or_else(|_| poll(&store, &*wbucket))
@@ -749,6 +804,7 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
         status,
         db,
         bucket,
+        thread: Some(thread),
     }
 }
 
@@ -858,6 +914,63 @@ mod tests {
         let b = Store::open(None).unwrap();
         assert_ne!(a.device(), b.device());
         assert!(!a.device().is_empty());
+    }
+
+    /// A bucket that answers "no object" and then refuses to create one — a
+    /// name with a typo in it, a key without permission — is not a lineage
+    /// waiting to be started. The pass says so once instead of asking again
+    /// forever: before this was bounded, the retry was a recursion and the
+    /// process died of it.
+    #[test]
+    fn a_bucket_that_cannot_be_written_is_not_bootstrapped_forever() {
+        struct RefusesWrites;
+        impl Object for RefusesWrites {
+            fn get(&self, _key: &str) -> Result<Option<object::Blob>, String> {
+                Ok(None)
+            }
+            fn put_new(&self, _key: &str, _body: &[u8]) -> Result<PutNew, String> {
+                Err("bucket PUT: 404 NoSuchBucket".into())
+            }
+            fn cas(&self, _key: &str, _body: &[u8], _etag: &str) -> Result<Cas, String> {
+                Err("bucket CAS: 404 NoSuchBucket".into())
+            }
+        }
+        let store = Store::open(None).unwrap();
+        // Returning at all is the assertion; the rest is what it should say.
+        let s = poll(&store, &RefusesWrites);
+        assert_eq!(s.role, Role::Detached, "a device that never joined stays local");
+        assert!(store.is_writable());
+        assert_eq!(s.note.as_deref(), Some("bucket PUT: 404 NoSuchBucket"));
+    }
+
+    /// A follower whose credentials go missing must not come back as a
+    /// writer. The store opens *writable*, so "no bucket" cannot mean "no
+    /// lease": a device that has joined a lineage keeps its gate shut and
+    /// says why.
+    #[test]
+    fn a_follower_that_loses_its_bucket_stays_locked() {
+        use crate::object::MemBucket;
+        let bucket = MemBucket::new();
+        let a = Store::open(None).unwrap();
+        let b = Store::open(None).unwrap();
+        assert_eq!(poll(&a, &bucket).role, Role::Holder);
+        assert!(matches!(poll(&b, &bucket).role, Role::Follower { .. }));
+        assert!(!b.is_writable());
+
+        let broken = crate::r2::Broken("no secret for AKIDEXAMPLE".into());
+        let s = poll(&b, &broken);
+        assert_eq!(s.role, Role::Offline);
+        assert!(
+            !b.is_writable(),
+            "a follower with no reachable bucket is still a follower"
+        );
+        assert_eq!(s.note.as_deref(), Some("no secret for AKIDEXAMPLE"));
+
+        // The holder is the other case: offline is allowed, and it keeps
+        // writing — the risk shows as the unpublished count, not a lock.
+        let sa = poll(&a, &broken);
+        assert_eq!(sa.role, Role::Holder);
+        assert!(a.is_writable());
     }
 
     /// The whole lease lifecycle across two devices sharing one bucket:

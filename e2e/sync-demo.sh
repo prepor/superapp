@@ -9,7 +9,10 @@ PORT=${PORT:-9100}
 DIR=/tmp/superapp-sync-demo
 OUT=e2e/out
 BIN=./target/debug/superapp
-DRAWS=${DRAWS:-260}
+# A cap, not a count — the walk ends at its `quit`. It was 260 when this
+# script was written; the shell has grown panels and passes since, and a
+# budget that runs out shows up as a suite that reported nothing at all.
+DRAWS=${DRAWS:-800}
 rm -rf "$DIR" /tmp/superapp-syncA.db /tmp/superapp-syncB.db /tmp/frA /tmp/frB
 mkdir -p "$DIR" "$OUT" /tmp/frA /tmp/frB
 

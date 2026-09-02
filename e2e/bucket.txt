@@ -1,0 +1,32 @@
+# CR-005: a device gives *itself* a bucket. No `--bucket` flag, no file
+# pushed over adb — the URL is typed into the device-sync form and the
+# button is pressed, which is the only road a phone has.
+#
+# The clicks are the assertions: "bucket" only resolves if the form is
+# really open, so the chord is proven without reading a screenshot. The
+# rest is proven outside the app by e2e/bucket.sh — the `bucket` file
+# beside the store, and a lineage in the daemon's directory that only a
+# holder ever writes.
+wait 700
+key cmd 2
+wait 400
+type "settings"
+wait 300
+key enter
+wait 600
+click "device sync"
+wait 600
+shot bp1-form
+# Close it and open it again with cmd+y, the key the link wears.
+key cmd+w
+wait 500
+key cmd+y
+wait 600
+click "bucket"
+type "http://127.0.0.1:{{PORT}}"
+wait 300
+shot bp2-filled
+click "connect"
+wait 2500
+shot bp3-connected
+quit

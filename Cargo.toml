@@ -59,15 +59,24 @@ rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Gmail sign-in (see `src/oauth.rs`). Three crates that were already in the
-# graph, promoted to direct deps rather than pulled in: `rustls-connector` is
-# what `imap`'s rustls-tls feature already uses, and it is the whole HTTP
-# client here — one POST to Google's token endpoint does not earn `reqwest`.
-# `ring` comes with rustls and carries PKCE's SHA-256 and its randomness;
-# `base64` is XOAUTH2's envelope and the id_token's.
+# Gmail sign-in (see `src/oauth.rs`) and the R2 device-sync transport (see
+# `src/r2.rs`) both wanted crates the graph already carried under imap and
+# lettre's `rustls-tls`, so these are promotions to direct deps, not new
+# dependencies:
+#
+#   base64            XOAUTH2's envelope and the id_token's.
+#   ring              PKCE's SHA-256 and randomness; and the SHA-256 and
+#                     HMAC-SHA256 an AWS SigV4 signature is made of.
+#   rustls-connector  the whole HTTP client for one POST to Google's token
+#                     endpoint — that does not earn `reqwest`.
+#   rustls            R2 over TLS, with the `ring` provider explicitly (never
+#                     aws-lc-rs: a new C toolchain on the android cross-build).
+#   webpki-roots      the Mozilla roots R2's certificate is checked against.
 base64 = "0.22"
 ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-connector = "0.19"
+webpki-roots = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
