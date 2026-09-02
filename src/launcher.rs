@@ -57,6 +57,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Compose { .. } => "draft",
         Kind::Settings => "settings",
         Kind::AddAccount => "add account",
+        Kind::Problems => "problems",
     }
 }
 
@@ -80,6 +81,18 @@ fn mail_extra(store: &Store, kind: &Kind) -> String {
             .unwrap_or_default(),
         Kind::Contact { email } => email.clone(),
         _ => String::new(),
+    }
+}
+
+/// Where a kind is to be found: focus it if it is open on any workspace,
+/// open it fresh otherwise — the launcher's verb, for anything else that
+/// reaches a root panel (the problems mark, a menu item). Never a second
+/// copy.
+#[must_use]
+pub fn locate(wm: &Wm, kind: &Kind) -> Go {
+    match wm.showing(kind).first() {
+        Some(pid) => Go::Focus(*pid),
+        None => Go::Open(kind.clone()),
     }
 }
 
@@ -169,6 +182,7 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
         Kind::Inbox { filter: None },
         Kind::Compose { re: 0 },
         Kind::Settings,
+        Kind::Problems,
         Kind::Help,
         Kind::About,
     ] {
@@ -218,7 +232,7 @@ mod tests {
         let (wm, store) = world();
         let hits = search(&wm, &store, "");
         // Open help + inbox, then the unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 5);
+        assert_eq!(hits.len(), 6);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
@@ -227,8 +241,19 @@ mod tests {
         assert!(matches!(hits[2].go, Go::Open(Kind::Compose { re: 0 })));
         assert_eq!(hits[3].label, "settings");
         assert!(matches!(hits[3].go, Go::Open(Kind::Settings)));
-        assert_eq!(hits[4].label, "about");
-        assert!(matches!(hits[4].go, Go::Open(Kind::About)));
+        assert_eq!(hits[4].label, "problems");
+        assert!(matches!(hits[4].go, Go::Open(Kind::Problems)));
+        assert_eq!(hits[5].label, "about");
+        assert!(matches!(hits[5].go, Go::Open(Kind::About)));
+    }
+
+    /// The mark's and the menu's verb: never a second copy.
+    #[test]
+    fn locate_finds_an_open_panel_before_opening_one() {
+        let (mut wm, _store) = world();
+        assert!(matches!(locate(&wm, &Kind::Problems), Go::Open(Kind::Problems)));
+        let pid = wm.open(Kind::Problems, None, false);
+        assert!(matches!(locate(&wm, &Kind::Problems), Go::Focus(p) if p == pid));
     }
 
     #[test]

@@ -178,7 +178,13 @@ same panel three rows tall, then six, then three, and `e2e/filter.txt`
 walks the rich table (tags, the autocomplete and its dynamic values, the
 grammar, the error line, and a keyboard walk onto the second page), and
 `e2e/compose.txt` the compose panel's TO field completing addresses (a
-pick by enter, a pick by click, esc putting the offer away, tab walking on).
+pick by enter, a pick by click, esc putting the offer away, tab walking on),
+and `e2e/problems.txt` (with `--send-delay 1 --draws 100000` — it waits out
+the executor's backoff in virtual time) the problems surface: a send
+the demo account cannot make raises the mark, the mark opens the panel,
+*retry* files it again, *reopen* brings the draft back and `cmd+z` takes
+that back; an account against an `.invalid` host joins the list, *sync*
+kicks it, and removing the account clears it.
 
 `click` resolves the element's action directly — it proves the action, not
 the click. `mouse` sends a real press-release pair into the stage, so the
@@ -254,8 +260,9 @@ it — roots left, a fan-out stacked in a column, arrows with elbows.
 A node is one of three things:
 
 - a **component** — a bare widget (an inbox row, a thread message, an
-  overlay row, the launcher sheet, an account row, a link) from the
-  library's template, populated once with a fixture through its own API.
+  overlay row, the launcher sheet, an account row, a problem row, a link)
+  from the library's template, populated once with a fixture through its
+  own API.
   No store, no clock; a texture the size of the piece.
 - a **panel** — one panel widget on a world of its own (an in-memory store
   with the demo seed, a sealed `Deny` outside, virtual time), chrome

@@ -71,6 +71,8 @@ pub enum Kind {
     Settings,
     /// The add-account form (settings links here).
     AddAccount,
+    /// Standing problems: failed syncs, failed sends, an unreachable bucket.
+    Problems,
 }
 
 impl Kind {
@@ -91,6 +93,7 @@ impl Kind {
             Kind::Compose { .. } => (4, 4),
             Kind::Settings => (4, 3),
             Kind::AddAccount => (4, 2),
+            Kind::Problems => (4, 3),
         }
     }
 }
@@ -1340,6 +1343,7 @@ mod tests {
                         Kind::Compose { .. } => "compose",
                         Kind::Settings => "settings",
                         Kind::AddAccount => "addaccount",
+                        Kind::Problems => "problems",
                     })
                     .collect()
             })

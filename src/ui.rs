@@ -213,6 +213,7 @@ mod tests {
         vec![
             Kind::Settings,
             Kind::AddAccount,
+            Kind::Problems,
             Kind::Help,
             Kind::About,
             Kind::Inbox { filter: None },

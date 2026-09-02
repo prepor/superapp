@@ -19,6 +19,7 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/object.rs` | the sync transport: object store (memory, HTTP) + `state` | no |
 | `src/secret.rs` | passwords: keychain (macOS) / private file | no |
 | `src/launcher.rs` | the launcher's search over panels + mail world | no |
+| `src/problems.rs` | standing problems, derived from the rows that carry them | no |
 | `src/spring.rs` | niri's closed-form spring (via mosaic) | no |
 | `src/ui.rs` | the semantic content vocabulary: lines, fields, forms | no |
 | `src/theme.rs` | the look: sizes and colours | no |

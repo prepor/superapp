@@ -75,6 +75,42 @@ A preview needs somewhere to *be*. Where the pair cannot share the screen —
 a phone grid, where each panel is the whole of it — the open simply goes, as
 any other open would; a preview nobody can see is worse than no preview.
 
+## Problems
+
+A toast is an **event**; a problem is a **condition**. When something in
+the background is wrong — an account whose last sync failed, a send the
+sender gave up on, a device-sync bucket that cannot be reached — the toast
+that announced it fades in three seconds, and what remains is the
+**mark**: a small red box in the toast's own corner, bottom-right on both
+platforms, that counts what stands (`2 problems`) and stays until the
+conditions clear. It is static, deliberately: the shell idles at zero
+frames, and red on a monochrome screen is already the alarm — that is the
+one job the colour has. It says what it is in words, because a dot would
+not.
+
+The mark is the launcher's verb in one click: it goes to the **problems
+panel** where that is open, or opens it fresh. The panel is a root like
+settings (the launcher finds it as *problems*) and lists every standing
+problem as a row — what it concerns, the error in red, a muted line under
+it (the last successful sync, the recipient, the frames waiting to
+publish) — with what can be done about it. An account offers *sync* and a
+link to *settings*. A failed send offers *retry*, a button that files the
+send again with its usual window, and *reopen*, a solid link that brings
+the draft back as a compose panel joined to the right (`cmd+z` puts the
+failed row back). Device sync offers only its count: the network coming
+back is what fixes it. With nothing standing, the panel says so. `tab`
+walks the rows' buttons; there are no chords, since a panel with a button
+per row gives none.
+
+The list is **derived**, never stored: it is read off the account's status
+line, the outbox's failed rows and the lease status the sync worker last
+reported, so it cannot disagree with them and nothing ever has to be
+dismissed — fix the condition and the row is gone. On macOS the menu bar
+mirrors it the way it mirrors the workspaces: a `! 2 problems` menu that
+exists only while something stands, one item per problem, each opening
+the panel. It is plain text; AppKit draws menu titles itself, and the
+colour lives in the window.
+
 ## Keyboard
 
 **Cmd carries two namespaces.** The **reserved set** below is global and

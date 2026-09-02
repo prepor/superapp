@@ -225,6 +225,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         message(),
         compose(),
         small_panels(),
+        problems(),
         phone_scene(),
         workspace_scene(),
     ]
@@ -488,6 +489,113 @@ fn small_panels() -> Scene<Setup> {
         .node("about", panel(|_| Kind::About, ""))
         .sized((420.0, 200.0))
         .edge("settings", "add account", "add an account")
+}
+
+/// Two standing problems in a stage's world, written through the opener:
+/// an account whose password expired, and a send the executor gave up on.
+fn seed_problems(s: &Store) {
+    let _ = s.write(|c| {
+        c.execute(
+            "INSERT INTO account(label, email, imap_host, smtp_host, status)
+             VALUES('fastmail', 'andrey@fastmail.com', 'imap.fastmail.com',
+                    'smtp.fastmail.com', 'error: login failed (535)')",
+            [],
+        )?;
+        c.execute(
+            "INSERT INTO draft(panel, account, to_addr, subject, body, updated)
+             VALUES(900, 1, 'vera@kovac.io', 'Re: Q3 infra', 'Thanks — will look today.', 0)",
+            [],
+        )?;
+        c.execute(
+            "INSERT INTO outbox(id, account, send_after, status, error)
+             VALUES(900, 1, 0, 'failed', 'connection refused')",
+            [],
+        )?;
+        c.execute(
+            "INSERT INTO effect(kind, payload, entity, status, idempotent, error,
+                                attempts, not_before, created, updated)
+             VALUES('submit', '{\"outbox\":900}', 'outbox:900', 'failed', 0,
+                    'connection refused', 6, 0, 0, 0)",
+            [],
+        )
+        .map(|_| ())
+    });
+}
+
+fn problems() -> Scene<Setup> {
+    use crate::problems::{Problem, Source};
+    let row = |p: Problem| {
+        widget(live_id!(problem_row_tpl), move |cx, w| {
+            w.as_problem_row().populate(cx, 0, &p);
+        })
+    };
+    let account = Problem {
+        source: Source::Account {
+            id: 1,
+            email: "andrey@fastmail.com".into(),
+        },
+        label: "andrey@fastmail.com".into(),
+        line: "login failed (535)".into(),
+        detail: "last synced aug 30 09:12".into(),
+    };
+    let send = |given_up: bool| Problem {
+        source: Source::Send {
+            outbox: 9,
+            subject: "Re: Q3 infra".into(),
+            re: 1,
+            given_up,
+        },
+        label: "send “Re: Q3 infra”".into(),
+        line: "connection refused".into(),
+        detail: if given_up {
+            "to vera@kovac.io — gave up after 6 attempts".into()
+        } else {
+            "to vera@kovac.io — attempt 2 of 6, next at aug 30 09:17".into()
+        },
+    };
+    let sync = Problem {
+        source: Source::Sync,
+        label: "device sync".into(),
+        line: "the bucket is unreachable".into(),
+        detail: "3 frames waiting to publish".into(),
+    };
+    // Solo stages on a world with the two problems above standing. The
+    // first pump round announces them — a toast — so the node waits for
+    // that round, then out-waits the toast: it freezes on the standing
+    // state, not the arrival. (Two waits: a replay consumes each whole,
+    // and one long wait would jump the clock before the round announces.)
+    let seeded = |kind: Kind| {
+        panel(
+            move |s: &Store| {
+                seed_problems(s);
+                kind.clone()
+            },
+            "wait 600\nwait 3600",
+        )
+    };
+    Scene::new("problems", (560.0, 100.0))
+        .note("What is wrong in the background, a row each: the account, the send, device sync — the error in the one colour, what can be done beside it.")
+        .note("A toast announced it; the mark in the toast's corner counts what still stands.")
+        .node("account", row(account))
+        .about("sync kicks the worker; settings is where the password lives")
+        .node("send retrying", row(send(false)))
+        .about("the executor is on it: nothing to press")
+        .node("send given up", row(send(true)))
+        .about("retry files it again; reopen brings the draft back")
+        .node("device sync", row(sync))
+        .about("fixed by the network coming back")
+        .node("mark", seeded(Kind::Inbox { filter: None }))
+        .sized((520.0, 640.0))
+        .about("bottom-right, static, red — the toast's corner, on any panel")
+        .node("panel", seeded(Kind::Problems))
+        .sized((560.0, 420.0))
+        .about("the rows, live: sync, settings, retry, reopen")
+        .node("clear", panel(|_| Kind::Problems, ""))
+        .sized((560.0, 420.0))
+        .about("nothing standing says so")
+        .edge("send retrying", "send given up", "the sixth attempt fails")
+        .edge("mark", "panel", "click the mark")
+        .edge("panel", "clear", "the conditions clear")
 }
 
 fn workspace_scene() -> Scene<Setup> {

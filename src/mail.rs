@@ -854,6 +854,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
         Kind::AddAccount => "add account".into(),
+        Kind::Problems => "problems".into(),
     }
 }
 
@@ -1126,6 +1127,49 @@ pub fn file_send_tx(
          SELECT panel, COALESCE(account, 1), ?2, 'pending', NULL FROM draft WHERE panel=?1",
         rusqlite::params![panel, send_after],
     )?;
+    // A send filed again — a retry from the problems panel, or a redo after
+    // a failure — must not be failed on sight by the job that failed *last*
+    // time: the outbox pass derives a row's failure from any failed submit
+    // for it, so those stand down first.
+    c.execute(
+        "UPDATE effect SET status = 'obsolete'
+         WHERE kind = 'submit' AND status = 'failed' AND payload ->> 'outbox' = ?1",
+        [panel],
+    )?;
+    Ok(())
+}
+
+/// Reopens a failed send as a draft on panel `new`: the draft rows move
+/// under the new panel's id (a compose reads its draft by its own id) and
+/// the failed outbox row goes, so the problem is gone with it. Reversed by
+/// [`Reopened`].
+pub fn reopen_send_tx(
+    c: &rusqlite::Connection,
+    old: i64,
+    new: i64,
+    now: f64,
+) -> rusqlite::Result<()> {
+    move_draft_tx(c, old, new, now)?;
+    c.execute(
+        "DELETE FROM outbox WHERE id = ?1 AND status = 'failed'",
+        [old],
+    )?;
+    Ok(())
+}
+
+/// Re-keys a draft from one panel to another, keeping its text and account.
+fn move_draft_tx(
+    c: &rusqlite::Connection,
+    from: i64,
+    to: i64,
+    now: f64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO draft(panel, account, re_message, to_addr, subject, body, updated)
+         SELECT ?2, account, re_message, to_addr, subject, body, ?3 FROM draft WHERE panel = ?1",
+        rusqlite::params![from, to, now],
+    )?;
+    c.execute("DELETE FROM draft WHERE panel = ?1", [from])?;
     Ok(())
 }
 
@@ -1515,6 +1559,68 @@ impl Intent for Sent {
         let (panel, after) = (self.panel, w.now() + self.delay);
         w.store()
             .write(move |c| file_send_tx(c, panel, after))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A failed send reopened as a draft (the problems panel's *reopen*): the
+/// draft moved from the outbox's id to a fresh compose panel, and the failed
+/// row went. Giving it back moves the draft home and restores the row with
+/// the error it carried.
+pub struct Reopened {
+    /// The failed outbox row — and the draft's old panel id.
+    pub old: i64,
+    /// The compose panel it reopened on. Minted while the action's layout
+    /// change ran, so it is read rather than carried.
+    pub new: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The failure the row carried, put back with it.
+    pub error: String,
+}
+
+impl Reopened {
+    fn new_id(&self) -> i64 {
+        self.new.load(std::sync::atomic::Ordering::Relaxed) as i64
+    }
+}
+
+impl Intent for Reopened {
+    fn describe(&self) -> String {
+        format!("outbox:{} reopened", self.old)
+    }
+
+    /// Once the reopened draft has *gone out* from its new panel, there is
+    /// no failed send to put back — the walk steps past this node.
+    fn blocked(&self, w: &World) -> Option<String> {
+        match w.store().conn().query_row(
+            "SELECT status FROM outbox WHERE id = ?1",
+            [self.new_id()],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) if s == "pending" || s == "failed" => None,
+            Ok(_) => Some("already sent".into()),
+            Err(_) => None,
+        }
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let (old, new, error, now) = (self.old, self.new_id(), self.error.clone(), w.now());
+        w.store()
+            .write(move |c| {
+                move_draft_tx(c, new, old, now)?;
+                c.execute(
+                    "INSERT OR REPLACE INTO outbox(id, account, send_after, status, error)
+                     SELECT panel, COALESCE(account, 1), 0, 'failed', ?2 FROM draft WHERE panel = ?1",
+                    rusqlite::params![old, error],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let (old, new, now) = (self.old, self.new_id(), w.now());
+        w.store()
+            .write(move |c| reopen_send_tx(c, old, new, now))
             .map_err(|e| e.to_string())
     }
 }

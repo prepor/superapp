@@ -431,6 +431,7 @@ script_mod! {
                         contact_tpl := mod.widgets.ContactPanel{}
                         help_tpl := mod.widgets.HelpPanel{}
                         about_tpl := mod.widgets.AboutPanel{}
+                        problems_tpl := mod.widgets.ProblemsPanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
@@ -447,6 +448,7 @@ script_mod! {
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         account_row_tpl := mod.widgets.AccountRow{}
                         link_tpl := mod.widgets.SLink{}
+                        problem_row_tpl := mod.widgets.ProblemRow{}
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
@@ -456,6 +458,7 @@ script_mod! {
                             contact_tpl := mod.widgets.ContactPanel{}
                             help_tpl := mod.widgets.HelpPanel{}
                             about_tpl := mod.widgets.AboutPanel{}
+                            problems_tpl := mod.widgets.ProblemsPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         }
@@ -562,6 +565,9 @@ enum Act {
     WidgetOp(PanelId, WidgetOp),
     /// The locked screen's button: take the device-sync lease (CR-005).
     Acquire,
+    /// The problems mark in the toast's corner: go to the problems panel
+    /// where it is open, or open it — the launcher's verb.
+    Problems,
     /// The locked screen's backdrop: absorbs the click, does nothing.
     Noop,
 }
@@ -579,6 +585,12 @@ enum WidgetOp {
     ToggleMail(i64),
     /// A message's quoted tail: unfold it, or fold it back.
     ToggleQuote(i64),
+    /// A problems row's *sync* button: kick the account's worker.
+    SyncAccount(i64),
+    /// A problems row's *retry* button: file the failed send again.
+    RetrySend(i64),
+    /// A problems row's *reopen* link: the failed send back as a draft.
+    ReopenSend(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -606,7 +618,7 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Preview(pid, _)
         | Act::Pointer(pid)
         | Act::WidgetOp(pid, _) => Some(*pid),
-        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Acquire | Act::Noop => None,
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Acquire | Act::Problems | Act::Noop => None,
     }
 }
 
@@ -1008,8 +1020,9 @@ struct State {
     /// What time the app thinks it is. Virtual under a headless build, so
     /// a send deadline moves with the script rather than with the machine.
     clock: crate::effect::Clock,
-    /// Failed outbox rows already toasted (new ones toast on signal).
-    failed_seen: usize,
+    /// Standing problems already announced, by key: a new one toasts on
+    /// the signal that brings it, and the mark carries it from then on.
+    seen_problems: BTreeSet<String>,
     /// The last persisted logical snapshot — [`State::sync`] only writes
     /// when the state actually changed.
     last_saved: Option<core::WmSnap>,
@@ -1140,6 +1153,12 @@ impl State {
         if repl.is_some() {
             store.set_writable(false);
         }
+        // What already stands at boot is old news: the mark shows it, the
+        // toasts are for what arrives from here on.
+        let seen_problems: BTreeSet<String> = crate::problems::list(&store, None)
+            .iter()
+            .map(crate::problems::Problem::key)
+            .collect();
         State {
             ws,
             world,
@@ -1167,7 +1186,7 @@ impl State {
             } else {
                 sync::Pump::threads()
             },
-            failed_seen: 0,
+            seen_problems,
             last_saved: None,
             anim: Anim::default(),
             viewport: dvec2(1440.0, 900.0),
@@ -1199,11 +1218,14 @@ impl State {
 
     /// One round of the manual pump: every account's sync pass, the
     /// outbox, then the effect queue.
-    fn pump_round(&self) {
+    fn pump_round(&mut self) {
         let w = self.world.clone();
         sync::tick(&w);
         crate::send::outbox_pass(&w);
         w.run_effects();
+        // No worker signal here to ride: what the round broke is announced
+        // by the round itself.
+        self.announce_problems();
     }
 
     fn opts(&self) -> core::LayoutOpts {
@@ -1386,6 +1408,48 @@ impl State {
     fn toast(&mut self, msg: impl Into<String>, err: bool) {
         let now = self.world.now();
         self.toast = Some((msg.into(), err, now));
+    }
+
+    /// The standing problems, derived afresh: the store's rows plus the
+    /// lease status the worker last reported (see [`crate::problems`]).
+    fn problems(&self) -> std::rc::Rc<Vec<crate::problems::Problem>> {
+        let repl = self.repl.as_ref().map(|_| &self.repl_status);
+        std::rc::Rc::new(crate::problems::list(&self.store, repl))
+    }
+
+    /// The rows a kind's props carry: the list for the problems panel,
+    /// nothing for anyone else.
+    fn problems_for(&self, kind: &Kind) -> std::rc::Rc<Vec<crate::problems::Problem>> {
+        if matches!(kind, Kind::Problems) {
+            self.problems()
+        } else {
+            std::rc::Rc::default()
+        }
+    }
+
+    /// Toasts each problem the first time it stands, and forgets the ones
+    /// that cleared, so a relapse is announced again. Device sync's line is
+    /// toasted by the role change that brings it ([`Stage::tick_repl`]).
+    fn announce_problems(&mut self) {
+        let now = self.problems();
+        for p in now.iter() {
+            if self.seen_problems.contains(&p.key()) {
+                continue;
+            }
+            match &p.source {
+                crate::problems::Source::Account { .. } => {
+                    self.toast(format!("sync failed — {}: {}", p.label, p.line), true);
+                }
+                crate::problems::Source::Send { given_up: true, .. } => {
+                    self.toast(format!("send failed: {} — ⌘z reopens", p.line), true);
+                }
+                crate::problems::Source::Send { .. } => {
+                    self.toast(format!("send failed: {} — retrying", p.line), true);
+                }
+                crate::problems::Source::Sync => {}
+            }
+        }
+        self.seen_problems = now.iter().map(crate::problems::Problem::key).collect();
     }
 
     /// A panel's title, wherever it lives — for action labels.
@@ -1759,9 +1823,10 @@ pub struct Stage {
     #[rust]
     insets: (f64, f64, f64, f64),
     /// What the macOS menu bar currently shows: `(workspace, is_current)`
-    /// per roster entry. Menus rebuild only when this changes.
+    /// per roster entry, and the problems' lines. Menus rebuild only when
+    /// this changes.
     #[rust]
-    menu_sig: Vec<(usize, bool)>,
+    menu_sig: (Vec<(usize, bool)>, Vec<String>),
     /// The double-cmd launcher trigger.
     #[rust]
     cmd_tap: CmdTap,
@@ -1841,6 +1906,17 @@ const MENU_LIBRARY: u64 = 0x5753_0600;
 pub enum DevAction {
     /// Show the panels library over the workspace, or put it away.
     ToggleLibrary,
+}
+
+/// The problems menu: every item goes to the problems panel.
+const MENU_PROBLEMS: u64 = 0x5753_0700;
+
+/// A draft's subject for an action label, `(no subject)` when it has none.
+fn draft_subject(store: &Store, panel: i64) -> String {
+    mail::draft(store, panel)
+        .map(|d| d.subject)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(no subject)".into())
 }
 
 /// The overlays are hosted like panels, so they need keys in the same map.
@@ -2055,16 +2131,23 @@ impl Stage {
         let Some(state) = self.state.as_deref() else {
             return;
         };
-        let sig: Vec<(usize, bool)> = state
+        let roster: Vec<(usize, bool)> = state
             .ws
             .roster()
             .into_iter()
             .map(|k| (k, k == state.ws.active))
             .collect();
+        let problems: Vec<String> = state
+            .problems()
+            .iter()
+            .map(|p| format!("{} — {}", p.label, p.line))
+            .collect();
+        let sig = (roster, problems);
         if sig == self.menu_sig {
             return;
         }
         self.menu_sig = sig.clone();
+        let (roster, problems) = sig;
         let mut items = vec![MacosMenu::Sub {
             name: "superapp".into(),
             items: vec![
@@ -2107,7 +2190,7 @@ impl Stage {
                 },
             ],
         }];
-        for (k, current) in sig {
+        for (k, current) in roster {
             let name = if current {
                 format!("[{}]", k + 1)
             } else {
@@ -2143,6 +2226,25 @@ impl Stage {
                 name: "Panels Library — ⇧⌘L".into(),
             }],
         });
+        // The problems, mirrored the way the workspaces are: a menu that
+        // exists only while something stands, one item per problem, each
+        // opening the panel. Plain text — AppKit draws these titles itself,
+        // so the colour lives in the window.
+        if !problems.is_empty() {
+            items.push(MacosMenu::Sub {
+                name: format!("! {}", crate::problems::count_line(problems.len())),
+                items: problems
+                    .into_iter()
+                    .map(|line| MacosMenu::Item {
+                        command: LiveId(MENU_PROBLEMS),
+                        key: KeyCode::Unknown,
+                        shift: false,
+                        enabled: true,
+                        name: line,
+                    })
+                    .collect(),
+            });
+        }
         cx.update_macos_menu(MacosMenu::Main { items });
     }
 
@@ -2915,18 +3017,22 @@ impl Stage {
     /// worker signal and by a coarse fallback timer — a lost wake must
     /// never strand the UI on cached rows.
     fn poll_store(&mut self, cx: &mut Cx) {
-        let Some(state) = self.state.as_deref_mut() else {
-            return;
-        };
-        if state.store.poll_external() {
-            let failures = mail::outbox_failures(&state.store);
-            if failures.len() > state.failed_seen {
-                if let Some((_, err)) = failures.last() {
-                    state.toast(format!("send failed: {err} — ⌘z reopens"), true);
+        let changed = match self.state.as_deref_mut() {
+            Some(state) => {
+                if state.store.poll_external() {
+                    state.announce_problems();
+                    true
+                } else {
+                    false
                 }
             }
-            state.failed_seen = failures.len();
+            None => return,
+        };
+        if changed {
             self.redraw_scoped(cx);
+            // The menu bar mirrors the problems; a pass that changed them
+            // rebuilds it (a signature check keeps it cheap).
+            self.update_menu(cx);
         }
         self.tick_repl(cx);
     }
@@ -3083,11 +3189,26 @@ impl Stage {
     }
 
     fn launcher_go(&mut self, cx: &mut Cx, hit: launcher::Hit) {
+        self.go(cx, hit.go);
+    }
+
+    /// Reaches a root panel the way the launcher does: focus it where it is
+    /// open, open it fresh otherwise. The problems mark and the menu bar's
+    /// problems items come through here.
+    fn go_to(&mut self, cx: &mut Cx, kind: Kind) {
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        let go = launcher::locate(&state.ws, &kind);
+        self.go(cx, go);
+    }
+
+    fn go(&mut self, cx: &mut Cx, go: launcher::Go) {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
         state.overlay = Overlay::None;
-        match hit.go {
+        match go {
             launcher::Go::Focus(pid) => {
                 let was = state.ws.active;
                 if let Some(k) = state.ws.focus_panel(pid) {
@@ -3297,6 +3418,10 @@ impl Stage {
                 self.kick(cx);
                 return;
             }
+            Act::Problems => {
+                self.go_to(cx, Kind::Problems);
+                return;
+            }
             Act::Noop => {
                 return; // the locked backdrop absorbs the click
             }
@@ -3361,6 +3486,28 @@ impl Stage {
                             }
                         }
                         self.kick(cx);
+                    }
+                    WidgetOp::SyncAccount(id) => {
+                        cx.action(crate::panels::PanelAction::SyncAccount(id));
+                    }
+                    WidgetOp::RetrySend(id) => {
+                        cx.action(crate::panels::PanelAction::RetrySend(id));
+                    }
+                    WidgetOp::ReopenSend(id) => {
+                        let re = state
+                            .problems()
+                            .iter()
+                            .find_map(|p| match &p.source {
+                                crate::problems::Source::Send { outbox, re, .. } if *outbox == id => Some(*re),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        cx.action(crate::panels::PanelAction::ReopenSend {
+                            pid,
+                            outbox: id,
+                            re,
+                            fresh: alt,
+                        });
                     }
                     WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
                     WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
@@ -3611,7 +3758,7 @@ impl Stage {
                 self.sync(cx);
             }
             // Handled above — they return before reaching this match.
-            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) | Act::Acquire | Act::Noop => {}
+            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) | Act::Acquire | Act::Problems | Act::Noop => {}
         }
     }
 
@@ -4172,6 +4319,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Contact { .. } => Some(live_id!(contact_tpl)),
         Kind::Help => Some(live_id!(help_tpl)),
         Kind::About => Some(live_id!(about_tpl)),
+        Kind::Problems => Some(live_id!(problems_tpl)),
     }
 }
 
@@ -4216,7 +4364,6 @@ impl Stage {
             }
             self.solo = Some(pid);
         }
-        s.failed_seen = mail::outbox_failures(&s.store).len();
         s.spawn_workers();
         s.sync();
         let virtual_time = s.virtual_time;
@@ -4254,7 +4401,7 @@ impl Stage {
 
     /// Runs the manual pump for every half second of virtual time that has
     /// passed since it last ran — however far one frame jumped.
-    fn pump_if_due(&mut self, state: &State) {
+    fn pump_if_due(&mut self, state: &mut State) {
         let now = state.world.now();
         while now >= self.pump_due {
             state.pump_round();
@@ -4287,9 +4434,9 @@ impl Stage {
         if settle {
             dt = r.take_wait();
         }
-        if let Some(state) = self.state.take() {
+        if let Some(mut state) = self.state.take() {
             state.advance_clock(dt / 1000.0);
-            self.pump_if_due(&state);
+            self.pump_if_due(&mut state);
             self.state = Some(state);
         }
         if !settle {
@@ -4560,6 +4707,88 @@ impl Stage {
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
                     refresh = true;
                 }
+                crate::panels::PanelAction::SyncAccount(id) => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    let email = mail::accounts(&state.store)
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| a.email.clone())
+                        .unwrap_or_default();
+                    state.pump.kick();
+                    state.toast(format!("syncing {email}…"), false);
+                    refresh = true;
+                }
+                crate::panels::PanelAction::RetrySend(id) => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    // The send action again, window and all: the same row,
+                    // re-filed, and the same claim to take it back.
+                    let delay = config().send_delay;
+                    let now = state.world.now();
+                    let subject = draft_subject(&state.store, id);
+                    let filed = state.act(
+                        "send",
+                        format!("retry “{subject}”"),
+                        Some(format!("outbox:{id}")),
+                        |_| {},
+                        move |tx| mail::file_send_tx(tx, id, now + delay),
+                        vec![Box::new(mail::Sent { panel: id, delay }) as Box<dyn crate::history::Intent>],
+                    );
+                    if filed.is_some() {
+                        state.toast(
+                            format!("sending in {}s — ⌘z undoes", delay as u32),
+                            false,
+                        );
+                    }
+                    refresh = true;
+                }
+                crate::panels::PanelAction::ReopenSend {
+                    pid,
+                    outbox,
+                    re,
+                    fresh,
+                } => {
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    let subject = draft_subject(&state.store, outbox);
+                    let error = mail::outbox_failures(&state.store)
+                        .iter()
+                        .find(|(i, _)| *i == outbox)
+                        .map(|(_, e)| e.clone())
+                        .unwrap_or_else(|| "send failed".into());
+                    let now = state.world.now();
+                    let kind = Kind::Compose { re };
+                    // The compose panel's id is minted by the layout change;
+                    // the data half and the claim read it from here.
+                    let minted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let (m_layout, m_data) = (minted.clone(), minted.clone());
+                    let reopened = state.act(
+                        "open",
+                        format!("reopen “{subject}”"),
+                        Some(format!("outbox:{outbox}")),
+                        move |ws| {
+                            let p = ws.follow_open(pid, kind, fresh);
+                            m_layout.store(p, std::sync::atomic::Ordering::Relaxed);
+                        },
+                        move |tx| {
+                            let new = m_data.load(std::sync::atomic::Ordering::Relaxed) as i64;
+                            mail::reopen_send_tx(tx, outbox, new, now)
+                        },
+                        vec![Box::new(mail::Reopened {
+                            old: outbox,
+                            new: minted,
+                            error,
+                        }) as Box<dyn crate::history::Intent>],
+                    );
+                    if reopened.is_some() {
+                        state.toast(format!("reopened “{subject}” — ⌘z undoes"), false);
+                    }
+                    refresh = true;
+                }
                 crate::panels::PanelAction::TryIt { pid: _ } => {
                     if let Some(state) = self.state.as_deref_mut() {
                         state.toast("side effect: nothing was opened or replaced", false);
@@ -4674,6 +4903,7 @@ impl Stage {
             let props = crate::panels::PanelProps {
                 store: state.store.clone(),
                 pid: *pid,
+                problems: state.problems_for(&kind),
                 kind,
                 expand: state.expand.get(pid).cloned(),
             };
@@ -4728,6 +4958,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             pid,
+            problems: state.problems_for(&kind),
             kind,
             expand: state.expand.get(&pid).cloned(),
         };
@@ -4921,6 +5152,8 @@ impl Widget for Stage {
                     self.do_undo(cx);
                 } else if id == MENU_REDO {
                     self.do_redo(cx);
+                } else if id == MENU_PROBLEMS {
+                    self.go_to(cx, Kind::Problems);
                 } else if id == MENU_HISTORY {
                     if let Some(state) = self.state.as_deref_mut() {
                         state.overlay = Overlay::History;
@@ -5085,7 +5318,7 @@ impl Widget for Stage {
                     if self.mount && self.e2e.is_some() {
                         dt_ms = self.replay_step(cx);
                     } else {
-                        if let Some(state) = self.state.take() {
+                        if let Some(mut state) = self.state.take() {
                             state.advance_clock(dt_ms / 1000.0);
                             // The manual pump, on a fixed cadence: a sync
                             // and send round every half second of virtual
@@ -5095,7 +5328,7 @@ impl Widget for Stage {
                             // screenshots were taken on; an entered mount
                             // counts seconds, like its replay did.
                             if self.mount {
-                                self.pump_if_due(&state);
+                                self.pump_if_due(&mut state);
                             } else {
                                 self.frame += 1;
                                 if self.frame % PUMP_EVERY == 0 {
@@ -5635,6 +5868,41 @@ impl Stage {
         // The overlays are retained widgets now (CR-002 F): the shell
         // supplies their rows and owns their clicks, exactly as it does for
         // a panel's in-list controls.
+        // The problems mark: what stands in the background, in the toast's
+        // corner, in the one colour — and static. A toast announced it; this
+        // stays until it clears. Drawn under the overlays' wash and the
+        // locked screen, which own every hit while they are up.
+        let problems = state.problems();
+        let mut lift = 0.0;
+        if !problems.is_empty() {
+            let msg = crate::problems::count_line(problems.len());
+            let w = msg.chars().count() as f64 * self.cell.adv + 20.0;
+            let h = self.cell.line_h + 10.0;
+            let r = rect(
+                vp.pos.x + vp.size.x - w - 12.0,
+                vp.pos.y + vp.size.y - h - 12.0,
+                w,
+                h,
+            );
+            let hovered = state.hover == Some(Act::Problems);
+            self.draw_panel.new_draw_call(cx);
+            self.draw_panel.color = rgba_a(if hovered { theme::HOVER } else { theme::BG }, 1.0);
+            self.draw_panel.border_color = rgba_a(theme::ERR, 1.0);
+            self.draw_panel.border_size = 1.0;
+            self.draw_panel.alpha = 1.0;
+            self.draw_panel.draw_abs(cx, r);
+            self.draw_mono.new_draw_call(cx);
+            self.set_text(Style::Err, 1.0);
+            self.draw_mono.draw_abs(cx, r.pos + dvec2(10.0, 5.0), &msg);
+            self.hits.push(HitR {
+                rect: r,
+                act: Act::Problems,
+                cursor: MouseCursor::Hand,
+                label: "problems".into(),
+            });
+            lift = h + 6.0;
+        }
+
         self.draw_overlay(cx, state, vp);
 
 
@@ -5724,9 +5992,11 @@ impl Stage {
             let wchars = msg.chars().count();
             let w = wchars as f64 * self.cell.adv + 20.0;
             let h = self.cell.line_h + 10.0;
+            // Above the mark, when one stands: the mark is a click target,
+            // so it keeps its place and the toast takes the row above.
             let r = rect(
                 vp.pos.x + vp.size.x - w - 12.0,
-                vp.pos.y + vp.size.y - h - 12.0,
+                vp.pos.y + vp.size.y - h - 12.0 - lift,
                 w,
                 h,
             );
@@ -6194,6 +6464,9 @@ impl Stage {
             pid,
             kind: kind.clone().unwrap_or(Kind::About),
             expand: state.expand.get(&pid).cloned(),
+            problems: kind
+                .as_ref()
+                .map_or_else(Default::default, |k| state.problems_for(k)),
         };
         let mut scope = Scope::with_props(&props);
         cx.begin_turtle(
@@ -6400,6 +6673,62 @@ impl Stage {
                         .last()
                         .map_or(id, |t| t.mail.head.id);
                     reg.push(("reply".to_string(), r, Act::Open(pid, Kind::Compose { re })));
+                }
+            }
+            Some(Kind::Problems) => {
+                // The rows' controls, by what they do: an account's *sync*
+                // wears its address (the inbox has a *sync* too), and the
+                // link to settings; a send's *retry* and *reopen*.
+                let problems = state.problems();
+                if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
+                    for (idx, item) in list.items().iter() {
+                        let Some(p) = problems.get(*idx) else {
+                            continue;
+                        };
+                        let lr = item.widget.widget(cx, ids!(label_lbl)).area().rect(cx);
+                        if lr.size.x > 0.0 {
+                            reg.push((p.label.clone(), lr, Act::Pointer(pid)));
+                        }
+                        match &p.source {
+                            crate::problems::Source::Account { id, email } => {
+                                let r = item.widget.button(cx, ids!(sync_btn)).area().rect(cx);
+                                if r.size.x > 0.0 {
+                                    reg.push((
+                                        format!("sync {email}"),
+                                        r,
+                                        Act::WidgetOp(pid, WidgetOp::SyncAccount(*id)),
+                                    ));
+                                }
+                                let r = item.widget.widget(cx, ids!(settings_link)).area().rect(cx);
+                                if r.size.x > 0.0 {
+                                    reg.push(("settings".to_string(), r, Act::Open(pid, Kind::Settings)));
+                                }
+                            }
+                            crate::problems::Source::Send {
+                                outbox,
+                                given_up: true,
+                                ..
+                            } => {
+                                let r = item.widget.button(cx, ids!(retry_btn)).area().rect(cx);
+                                if r.size.x > 0.0 {
+                                    reg.push((
+                                        "retry".to_string(),
+                                        r,
+                                        Act::WidgetOp(pid, WidgetOp::RetrySend(*outbox)),
+                                    ));
+                                }
+                                let r = item.widget.widget(cx, ids!(reopen_link)).area().rect(cx);
+                                if r.size.x > 0.0 {
+                                    reg.push((
+                                        "reopen".to_string(),
+                                        r,
+                                        Act::WidgetOp(pid, WidgetOp::ReopenSend(*outbox)),
+                                    ));
+                                }
+                            }
+                            crate::problems::Source::Send { .. } | crate::problems::Source::Sync => {}
+                        }
+                    }
                 }
             }
             Some(Kind::Contact { email }) => {

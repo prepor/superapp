@@ -30,6 +30,10 @@ pub struct PanelProps {
     /// Which messages of its thread a message panel shows open (CR-007).
     /// Panel context, owned by the shell; `None` for every other kind.
     pub expand: Option<Expansion>,
+    /// The standing problems — the problems panel's rows. Derived by the
+    /// shell, since device sync's entry lives outside the store; empty for
+    /// every other kind.
+    pub problems: std::rc::Rc<Vec<crate::problems::Problem>>,
 }
 
 /// Which messages of a conversation a panel shows open, and whose quoted
@@ -144,6 +148,20 @@ pub enum PanelAction {
     /// Help's demo button: the one side effect that does nothing, so the
     /// legend can show what a button is without moving anything.
     TryIt { pid: u64 },
+    /// A problems row's *sync*: kick the account's worker.
+    SyncAccount(i64),
+    /// A problems row's *retry*: file the failed send again — the send
+    /// action, with its window.
+    RetrySend(i64),
+    /// A problems row's *reopen* link: the failed send back as a compose
+    /// panel joined to the right, its draft along with it.
+    ReopenSend {
+        pid: u64,
+        outbox: i64,
+        /// The mail the draft replied to (0 for none).
+        re: i64,
+        fresh: bool,
+    },
 }
 
 script_mod! {
@@ -227,18 +245,27 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** Body text in the mono face. */
+    /** Body text in the mono face.
+
+        No padding of its own: a label sits exactly where its row puts it,
+        so every line a panel writes shares the panel's inset, and the
+        spacing between lines belongs to the rows (`SRow`, `SRule`, a
+        margin). makepad's Label ships a theme inset on every side, which
+        every panel used to zero, or pad around, by hand. */
     mod.widgets.SLabel = Label {
         width: Fit, height: Fit
+        padding: 0
         draw_text +: {
             color: #141414
             text_style: mod.widgets.SMonoStyle{}
         }
     }
 
-    /** An uppercase section label (the char grid's Style::Label). */
+    /** An uppercase section label (the char grid's Style::Label). Bare,
+        like `SLabel`: it shares the inset of the lines under it. */
     mod.widgets.SSection = Label {
         width: Fit, height: Fit
+        padding: 0
         draw_text +: {
             color: #5a5a5a
             text_style: mod.widgets.SMonoStyle{font_size: 8.25}
@@ -486,18 +513,17 @@ script_mod! {
         // that the key is real bold — `←` arrives from the symbol
         // fallback, whose advance is not the mono cell, so padding a twin
         // with spaces would not line up.
-        // Label's base padding is mspace_1 — invisible around a single run,
-        // but it would open a gap between each of the three, so the split
-        // parts zero it and the row carries the word's own spacing.
+        // The three parts butt against each other: a label has no padding
+        // of its own, so the split leaves no seam in the word.
         row := View {
             width: Fit, height: Fit
             flow: Right
-            pre := mod.widgets.SLabel { padding: 0, text: "" }
+            pre := mod.widgets.SLabel { text: "" }
             // One pass. It took three nudged copies to make a single
             // character read as bold at this size; the weight axis does it
             // properly.
-            key := mod.widgets.SBoldLabel { padding: 0, text: "" }
-            post := mod.widgets.SLabel { padding: 0, text: "" }
+            key := mod.widgets.SBoldLabel { text: "" }
+            post := mod.widgets.SLabel { text: "" }
         }
         // The solid underline needs its own `pixel` for the same reason the
         // row wash does (CR-002's sixth defect): a stock-shader quad merges
@@ -568,24 +594,100 @@ script_mod! {
         }
     }
 
-    /** One line of prose: children laid out left to right, shared baseline. */
+    /** One line of prose: children laid out left to right, shared
+        baseline. The row carries the line's leading — the labels have
+        none — so a line of text, a line with a key cap and a line with a
+        button all sit on one rhythm. */
     mod.widgets.SRow = View {
         width: Fill, height: Fit
         flow: Right
         align: Align{y: 0.5}
-        padding: Inset{top: 1, bottom: 1}
+        padding: Inset{top: 6, bottom: 6}
     }
 
-    /** The hairline under a section label. */
+    /** The hairline under a section label: a little air above it, and the
+        first line hangs off it by its own leading. */
     mod.widgets.SRule = View {
         width: Fill, height: 1
-        margin: Inset{top: 3, bottom: 5}
+        margin: Inset{top: 6, bottom: 4}
         show_bg: true
         draw_bg +: {
             color: #141414
             pixel: fn() {
                 return vec4(self.color.xyz * self.color.w, self.color.w)
             }
+        }
+    }
+
+    // ---- problems ----------------------------------------------------------
+
+    /** One standing problem: what it concerns, the error in the one colour,
+        a muted detail — and what can be done. An account offers *sync* and
+        a link to settings; a failed send offers *retry* (a button: it files
+        the send again) and *reopen* (a link: it opens the draft). Device
+        sync offers nothing: the network coming back is what fixes it.
+        Every control is here; `ProblemRow::populate` shows the row's own. */
+    mod.widgets.ProblemRow = set_type_default() do #(ProblemRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{top: 6, bottom: 6}
+        View {
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            label_lbl := mod.widgets.SText { width: Fit, is_multiline: false }
+            View { width: Fill, height: 1 }
+            sync_btn := mod.widgets.SBtn { text: "sync" }
+            retry_btn := mod.widgets.SBtn { text: "retry" }
+        }
+        line_lbl := mod.widgets.SLabel {
+            width: Fill
+            margin: Inset{top: 6}
+            text: "", draw_text +: { color: #a01500 }
+        }
+        View {
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            margin: Inset{top: 5}
+            // Fill, so a long detail wraps on a phone grid rather than
+            // running under the link.
+            detail_lbl := mod.widgets.SLabel { width: Fill, text: "", draw_text +: { color: #909090 } }
+            settings_link := mod.widgets.SLink { margin: Inset{left: 12} }
+            reopen_link := mod.widgets.SLink { margin: Inset{left: 12} }
+        }
+        View { width: Fill, height: 8 }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** The problems panel: every standing problem as a row, or one muted
+        line saying nothing is wrong. */
+    mod.widgets.ProblemsPanel = set_type_default() do #(ProblemsPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        mod.widgets.SSection { text: "PROBLEMS" }
+        mod.widgets.SRule {}
+        none_lbl := mod.widgets.SLabel {
+            margin: Inset{top: 6}
+            text: "nothing is wrong", draw_text +: { color: #909090 }
+        }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            problem_row := mod.widgets.ProblemRow {}
         }
     }
 
@@ -615,13 +717,14 @@ script_mod! {
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
+        // The status line hangs under the address, on the same edge.
         status_lbl := mod.widgets.SLabel {
-            margin: Inset{left: 17, top: 3}
+            margin: Inset{top: 6}
             text: "", draw_text +: { color: #909090 }
         }
         status_err_lbl := mod.widgets.SLabel {
             visible: false
-            margin: Inset{left: 17, top: 3}
+            margin: Inset{top: 6}
             text: "", draw_text +: { color: #a01500 }
         }
         View { width: Fill, height: 8 }
@@ -649,8 +752,7 @@ script_mod! {
         spacing: 0
 
         mod.widgets.SSection { text: "ACCOUNTS" }
-        View { width: Fill, height: 5 }
-        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
+        mod.widgets.SRule {}
 
         accounts_list := PortalList {
             // PortalList virtualizes against a fixed viewport (Fit would
@@ -733,10 +835,9 @@ script_mod! {
         width: Fill, height: Fit
         align: Align{y: 0.5}
         padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
-        lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
+        lbl := mod.widgets.SLabel { width: Fit, max_lines: 1, text: "" }
         View { width: 10, height: 1 }
         desc := mod.widgets.SLabel {
-            padding: 0
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
             draw_text +: { color: #909090 }
         }
@@ -866,28 +967,23 @@ script_mod! {
                 width: Fill, height: Fit
                 flow: Down
                 from_lbl := mod.widgets.SLabel {
-                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
                 from_b := mod.widgets.SBoldLabel {
                     visible: false
-                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
             }
             View { width: 10, height: 1 }
             date_lbl := mod.widgets.SLabel {
-                padding: 0
                 width: Fit, text: "", draw_text +: { color: #909090 }
             }
         }
         subject_lbl := mod.widgets.SLabel {
-            padding: 0
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
         subject_b := mod.widgets.SBoldLabel {
             visible: false
-            padding: 0
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
     }
@@ -945,25 +1041,24 @@ script_mod! {
         // What the filter could not read, in the one colour errors get.
         err_lbl := mod.widgets.SLabel {
             visible: false
-            padding: 0
             margin: Inset{left: 8, top: 4}
             text: "", draw_text +: { color: #a01500 }
         }
         View { width: Fill, height: 6 }
         // Header cells for the columns only — the subject rides each row's
         // extra line, owns no column, and so gets no header. The header
-        // wears the rows' inset and its labels shed the theme padding, so
-        // FROM shares the rows' left edge and DATE their right. FROM sits
-        // in a Fill View, not at Fill itself — the rows' construction,
-        // so it walks exactly like their from label.
+        // wears the rows' inset, so FROM shares the rows' left edge and
+        // DATE their right. FROM sits in a Fill View, not at Fill itself —
+        // the rows' construction, so it walks exactly like their from
+        // label.
         View {
             width: Fill, height: Fit
             padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
             View {
                 width: Fill, height: Fit
-                mod.widgets.SSection { padding: 0, text: "FROM" }
+                mod.widgets.SSection { text: "FROM" }
             }
-            mod.widgets.SSection { padding: 0, width: Fit, text: "DATE" }
+            mod.widgets.SSection { width: Fit, text: "DATE" }
         }
         View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
         list := PortalList {
@@ -993,7 +1088,7 @@ script_mod! {
         head := View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             padding: Inset{top: 4, bottom: 4}
-            name_lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
+            name_lbl := mod.widgets.SLabel { width: Fit, max_lines: 1, text: "" }
             from_link := mod.widgets.SLink { visible: false }
             View { width: 10, height: 1 }
             // The preview rides a Fill View whose flow is Down, for the
@@ -1003,13 +1098,11 @@ script_mod! {
                 width: Fill, height: Fit
                 flow: Down
                 preview_lbl := mod.widgets.SLabel {
-                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                     draw_text +: { color: #909090 }
                 }
                 preview_err := mod.widgets.SLabel {
                     visible: false
-                    padding: 0
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                     draw_text +: { color: #a01500 }
                 }
@@ -1017,7 +1110,6 @@ script_mod! {
             spacer := View { visible: false, width: Fill, height: 1 }
             View { width: 10, height: 1 }
             date_lbl := mod.widgets.SLabel {
-                padding: 0
                 width: Fit, text: "", draw_text +: { color: #909090 }
             }
         }
@@ -1050,7 +1142,7 @@ script_mod! {
             quote_fold := View {
                 visible: false
                 width: Fit, height: Fit
-                mod.widgets.SLabel { padding: 0, text: "› quoted", draw_text +: { color: #909090 } }
+                mod.widgets.SLabel { text: "› quoted", draw_text +: { color: #909090 } }
             }
             quote_text := View {
                 width: Fill, height: Fit
@@ -1132,7 +1224,7 @@ script_mod! {
         width: Fill, height: Fill
         flow: Down
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
-        spacing: 6
+        spacing: 8
 
         View {
             width: Fill, height: Fit
@@ -1191,6 +1283,9 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "color is reserved for errors: " }
             mod.widgets.SLabel { text: "like this", draw_text +: { color: #a01500 } }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { width: Fill, text: "a red mark in the corner counts what is wrong in the background (a sync, a send); it opens the problems panel" }
         }
 
         View { width: Fill, height: 10 }
@@ -1423,7 +1518,7 @@ script_mod! {
         }
         detail_lbl := mod.widgets.SLabel {
             width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
-            margin: Inset{left: 8}
+            margin: Inset{left: 12}
             draw_text +: { color: #5a5a5a }
         }
         View { width: Fill, height: 1 }
@@ -1524,6 +1619,171 @@ script_mod! {
 }
 
 // ---------------------------------------------------------------------------
+// ProblemRow / ProblemsPanel
+// ---------------------------------------------------------------------------
+
+/// One standing problem. Presentation plus the intent its button fires;
+/// clicks resolve through the shell's semantic rects, as every list item's
+/// do (areas go stale mid-gesture), and the tab ring presses through
+/// [`ProblemRow::action`].
+#[derive(Script, ScriptHook, Widget)]
+pub struct ProblemRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// What the row's button fires — `None` when nothing can be done.
+    #[rust]
+    action: Option<PanelAction>,
+}
+
+impl Widget for ProblemRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl ProblemRowRef {
+    pub fn populate(&self, cx: &mut Cx, pid: u64, p: &crate::problems::Problem) {
+        use crate::problems::Source;
+        let Some(mut row) = self.borrow_mut() else {
+            return;
+        };
+        row.view.text_input(cx, ids!(label_lbl)).set_text(cx, &p.label);
+        row.view.label(cx, ids!(line_lbl)).set_text(cx, &p.line);
+        row.view.label(cx, ids!(detail_lbl)).set_text(cx, &p.detail);
+        // A send the executor is still retrying offers nothing: the machine
+        // is on it, and a second filing would only race the first.
+        let (sync, retry, settings, reopen) = match &p.source {
+            Source::Account { .. } => (true, false, true, false),
+            Source::Send { given_up, .. } => (false, *given_up, false, *given_up),
+            Source::Sync => (false, false, false, false),
+        };
+        row.view.widget(cx, ids!(sync_btn)).set_visible(cx, sync);
+        row.view.widget(cx, ids!(retry_btn)).set_visible(cx, retry);
+        row.view.widget(cx, ids!(settings_link)).set_visible(cx, settings);
+        if settings {
+            row.view.link(cx, ids!(settings_link)).set(
+                cx,
+                pid,
+                "settings",
+                crate::core::Kind::Settings,
+                false,
+            );
+        }
+        row.view.widget(cx, ids!(reopen_link)).set_visible(cx, reopen);
+        if reopen {
+            row.view.link(cx, ids!(reopen_link)).set_label(cx, "reopen");
+        }
+        row.action = match &p.source {
+            Source::Account { id, .. } => Some(PanelAction::SyncAccount(*id)),
+            Source::Send {
+                outbox,
+                given_up: true,
+                ..
+            } => Some(PanelAction::RetrySend(*outbox)),
+            Source::Send { .. } | Source::Sync => None,
+        };
+    }
+}
+
+/// Every standing problem as a row (see [`crate::problems`]). Its rows are
+/// handed in through the props — the shell derives them, since device
+/// sync's entry is not in the store.
+#[derive(Script, ScriptHook, Widget)]
+pub struct ProblemsPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl ProblemsPanel {
+    /// The tab ring in visual order: the visible rows' buttons. No chords:
+    /// a panel with a button per row gives none (rule 4).
+    fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
+        let mut v = Vec::new();
+        if let Some(list) = self
+            .view
+            .widget(cx, ids!(list))
+            .as_portal_list()
+            .borrow()
+        {
+            let mut rows: Vec<(usize, WidgetRef)> = list
+                .items()
+                .iter()
+                .map(|(i, item)| (*i, item.widget.clone()))
+                .collect();
+            rows.sort_by_key(|(i, _)| *i);
+            for (_, row) in rows {
+                let Some(act) = row.as_problem_row().borrow().and_then(|r| r.action.clone())
+                else {
+                    continue;
+                };
+                let b = match act {
+                    PanelAction::SyncAccount(_) => row.button(cx, ids!(sync_btn)),
+                    _ => row.button(cx, ids!(retry_btn)),
+                };
+                v.push(RingStop::Act(b, act));
+            }
+        }
+        v
+    }
+}
+
+impl Widget for ProblemsPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Event::KeyDown(k) = event {
+            if k.modifiers.logo {
+                return;
+            }
+            if k.key_code == KeyCode::Tab {
+                let ring = self.ring(cx);
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
+            }
+            if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+                for stop in self.ring(cx) {
+                    if stop.is_focused(cx) {
+                        if let RingStop::Act(_, a) = stop {
+                            cx.action(a);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let props = scope.props.get::<PanelProps>();
+        let pid = props.map_or(0, |p| p.pid);
+        let problems = props.map(|p| p.problems.clone()).unwrap_or_default();
+        self.view
+            .label(cx, ids!(none_lbl))
+            .set_visible(cx, problems.is_empty());
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, problems.len());
+                while let Some(idx) = list.next_visible_item(cx) {
+                    if let Some(p) = problems.get(idx) {
+                        let row = list.item(cx, idx, live_id!(problem_row));
+                        row.as_problem_row().populate(cx, pid, p);
+                        row.draw_all(cx, scope);
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AccountRow
 // ---------------------------------------------------------------------------
 
@@ -1592,20 +1852,26 @@ enum RingStop {
     Input(TextInputRef),
     Remove(ButtonRef, i64),
     Add(ButtonRef),
+    /// A problems row's button and the intent it fires.
+    Act(ButtonRef, PanelAction),
 }
 
 impl RingStop {
     fn is_focused(&self, cx: &Cx) -> bool {
         match self {
             RingStop::Input(t) => t.key_focus(cx),
-            RingStop::Remove(b, _) | RingStop::Add(b) => cx.has_key_focus(b.area()),
+            RingStop::Remove(b, _) | RingStop::Add(b) | RingStop::Act(b, _) => {
+                cx.has_key_focus(b.area())
+            }
         }
     }
 
     fn focus(&self, cx: &mut Cx) {
         match self {
             RingStop::Input(t) => focus_input(cx, t),
-            RingStop::Remove(b, _) | RingStop::Add(b) => cx.set_key_focus(b.area()),
+            RingStop::Remove(b, _) | RingStop::Add(b) | RingStop::Act(b, _) => {
+                cx.set_key_focus(b.area())
+            }
         }
     }
 }
@@ -2677,6 +2943,28 @@ impl SLinkRef {
         key_l.set_visible(cx, !key.is_empty());
         l.view.view(cx, ids!(ul)).set_visible(cx, !dotted);
         l.view.view(cx, ids!(ul_dotted)).set_visible(cx, dotted);
+    }
+
+    /// A solid link with no target of its own: the same underline, but the
+    /// tap is the *row's* to answer, through the shell's hit table. The
+    /// problems panel's *reopen* is one — it opens a panel, so the grammar
+    /// makes it a link, but what it opens carries a draft along, which no
+    /// `Kind` can say.
+    pub fn set_label(&self, cx: &mut Cx, text: &str) {
+        let Some(mut l) = self.borrow_mut() else { return };
+        l.target = None;
+        l.dotted = false;
+        let pre_l = l.view.label(cx, ids!(row.pre));
+        pre_l.set_text(cx, text);
+        pre_l.set_visible(cx, true);
+        let key_l = l.view.label(cx, ids!(row.key));
+        key_l.set_text(cx, "");
+        key_l.set_visible(cx, false);
+        let post_l = l.view.label(cx, ids!(row.post));
+        post_l.set_text(cx, "");
+        post_l.set_visible(cx, false);
+        l.view.view(cx, ids!(ul)).set_visible(cx, true);
+        l.view.view(cx, ids!(ul_dotted)).set_visible(cx, false);
     }
 }
 
