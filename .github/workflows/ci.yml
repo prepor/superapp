@@ -19,7 +19,7 @@ jobs:
   # One job, not a lint job beside a test job: building the makepad graph *is*
   # the cost of a run, and two jobs would pay it twice for no extra signal.
   check:
-    name: clippy + tests
+    name: clippy + tests + e2e
     # macOS is the target platform — `makepad-objc-sys`/`makepad-apple-sys` and
     # the keychain in `src/mac.rs` are cfg'd to it, so a linux runner would be
     # checking a different dependency graph than the one that ships.
@@ -50,3 +50,20 @@ jobs:
       # network, no keychain. See docs/book/src/dev-x.md.
       - name: tests
         run: cargo test --locked
+
+      # The e2e battery: every single-process suite replayed against the
+      # shell's real input paths, through makepad's headless backend. Last,
+      # because `MAKEPAD=headless` is a *build-time* switch — build.rs turns
+      # it into cfg(headless) — so it re-does the four crates that read it
+      # and leaves the earlier steps' artifacts alone until then.
+      #
+      # `--no-draw` (inside run-all.sh) runs the full widget draw pass and
+      # rasterizes nothing: hits and labels resolve exactly as they do with
+      # pictures, at ~80× less cost — the whole battery in a couple of
+      # seconds. A failure here is a label that did not resolve.
+      - name: e2e
+        env:
+          MAKEPAD: headless
+        run: |
+          cargo build --locked
+          ./e2e/run-all.sh
