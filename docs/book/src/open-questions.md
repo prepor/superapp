@@ -42,12 +42,11 @@ current state; everything else in this book is settled.
     stelaxis-style: name the meaning, never the pixels. `src/ui.rs` keeps
     the rest — the accelerator rules and the chrome's `Style`/`BtnAct`.
 
-11. **The panels library replays every node from the seed**, one step per
-    frame, one node at a time. Starting node *k* from node *k−1*'s world
-    (an SQLite backup is milliseconds; the retained widgets' scroll and
-    caret state is what would have to be rebuilt) would cut a story's cost
-    from a triangle to a line, and is un-answered until the shelf is opened
-    often enough to hurt. Also open there: a DSL change is still a rebuild
-    and a reopen, a flow continued by hand inside a node cannot yet be
-    saved back as a `shot`, and a node's pass texture stays allocated at
-    the last size it was seen at.
+11. **The panels library's catalogue is Rust**, one function per subject,
+    and every panel or workspace node boots its own world and replays its
+    steps from the seed. Open there: whether scenes want to live beside
+    their widgets once the catalogue outgrows one file; pointer states
+    (hover, press) are fixtures today, not events the mount receives; a
+    DSL change is still a rebuild and a reopen; a state reached by hand
+    inside a node cannot be saved back as a node; and a node's pass
+    texture stays allocated at the last size it was seen at.

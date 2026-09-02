@@ -217,33 +217,21 @@ rows (by subject) and panel titles. Steps that mutate the workspace need a
 walks the whole join/replace grammar; the first frame also logs panel count
 and measured cell metrics to stderr.
 
-A script may open with a `#!` header naming the flags it needs — the
-panels library reads it (below); the harness treats it as a comment, so
-the flags still have to be passed on the command line:
-
-```text
-#! window 380x780 grid 4x3      # e2e/phone.txt: --window 380x780 --grid 4x3
-#! send-delay 1                 # e2e/send.txt:  --send-delay 1
-```
-
 ## Panels library
 
 ```sh
-# the shelf: the scripts marked `#! library`, live, on one canvas
+# every scene of the catalogue, live, on one canvas
 mise exec -- cargo run -- --library
 
-# the stories you name — or every script, with the directory
-mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt
-mise exec -- cargo run -- --library e2e
+# the scenes whose names contain these
+mise exec -- cargo run -- --library "inbox row" message
 
-# the canvas's own suite — the fast path: replays and labels, no rendering
-MAKEPAD=headless mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
-  --e2e e2e/library.txt --no-draw --draws 700
+# the canvas's own suite — the fast path: mounts, steps and labels, no rendering
+MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 600
 
-# …and rendered, for screenshots (a small story set: the canvas is a big frame)
+# …and rendered, for screenshots (the canvas is a big frame)
 MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
-  mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
-  --e2e e2e/library.txt --e2e-out e2e/out --draws 700
+  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 600
 ```
 
 Under `--no-draw` a `shot` is logged and skipped rather than failed, for the
@@ -251,44 +239,60 @@ canvas and the workspace suites alike, so a green fast-path run means what
 it says.
 
 `--library` opens the window on an **infinite canvas** instead of the
-workspace. An e2e script is a **story** row on it — by default the few
-marked `#! library`, the *shelf*, because there will always be more
-scripts than anyone wants to review at once; name the ones you want, or
-the directory for all of them. Every `shot` in a story is a **node** — a whole stage on a world of its own
-(an in-memory store with the demo seed, a sealed `Deny` outside with a
-clock, virtual time, the story's grid and send window) that replayed the
-story up to that shot and stopped there. The steps between two shots label
-the arrow between their nodes; the script's comments are the annotations,
-the opening block the story's description. So the canvas is a second
-reading of the suites, and a change to the UI is reviewed across every
-state the suites already walk — at 12×6 and on the phone grid in the same
-view.
+workspace, showing the **catalogue** (`src/catalog.rs`): one **scene** per
+subject, each the states worth a look while that subject is being worked
+on. The e2e suites are not the source — they check behaviour, one walk per
+file, and a design review wants the same thing in its variants, which fans
+out. So a scene is a DAG: **nodes** are named states, **edges** say what
+takes one to another, notes annotate both, and the layout is layered from
+it — roots left, a fan-out stacked in a column, arrows with elbows.
 
-Replays are fast-forwarded — a `wait` is consumed in the frame of the
-step after it — so a node arrives in as many frames as it has steps on
-the way, one per frame like the harness's ticks. Nodes replay one at a
-time, in canvas order (there is one keyboard, and stories type), so a
-single story fills in within a few seconds and the whole `e2e/` directory
-in about a minute; a node still on its way draws washed out, the legend
-counts the rest down, and stderr reports when the last one arrives. A node that has arrived is **frozen**: a picture that hears no
-events and asks for no frames until you enter it. Rendering is budgeted per frame, and a
-zoom change re-renders nothing on the spot — nodes show their last
+A node is one of three things:
+
+- a **component** — a bare widget (an inbox row, a thread message, an
+  overlay row, the launcher sheet, an account row, a link) from the
+  library's template, populated once with a fixture through its own API.
+  No store, no clock; a texture the size of the piece.
+- a **panel** — one panel widget on a world of its own (an in-memory store
+  with the demo seed, a sealed `Deny` outside, virtual time), chrome
+  included: the stage comes up *solo* on that panel and draws it at the
+  whole viewport. Enter it and the keys work — the walk, ⌘a, ⌘z.
+- the **workspace** — the whole stage, kept for the shell's own subjects:
+  joins, tabs, the phone grid.
+
+A panel or workspace node may name a few steps in the harness's grammar,
+inline, that lead to its state (`key down 3`; `click "filter"` then `type
+"github"`). Those replay one node at a time (there is one keyboard), one
+step per frame, fast-forwarded through waits: the whole catalogue fills in
+within a few seconds, and stderr reports when the last node arrives.
+Components are their state from the first draw.
+
+Scenes are Rust, not a text file: fixtures are the real structs
+(`ThreadHead`, `ThreadMail`, `OverlayRowData`…) and a state is set through
+the widget's own methods, so a refactor that breaks a scene fails to
+compile rather than quietly rearranging the canvas. The catalogue's test
+checks that every scene is a DAG with a name per state; the shape and the
+layout are pure (`src/scene.rs`), unit-tested without a window. Adding a
+state is one line in its subject's function.
+
+A node that has arrived is **frozen**: a picture that hears no events and
+asks for no frames until you enter it. Rendering is budgeted per frame,
+and a zoom change re-renders nothing on the spot — nodes show their last
 texture scaled, and re-render crisp at the new level once the zoom has
 stood still, nearest the pointer first — so panning and zooming stay
-smooth however many nodes are on the canvas.
+smooth however many nodes are on the canvas. Mounts render into their own
+passes at the canvas's zoom, so text is crisp at every level rather than
+scaled.
 
 - **Pan**: drag the canvas, or scroll. **Zoom**: ⌘scroll around the
   pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
 - **Enter** a node with a click (on it, or its name): the camera flies to
-  1:1 and the keyboard and pointer go to that stage, remapped into its own
-  coordinates, so a flow can be continued by hand from any of its states.
-  Click outside it, or ⌘esc, to leave. A story's name fits its row.
+  1:1 and the keyboard and pointer go to that mount, remapped into its own
+  coordinates. Click outside it, or ⌘esc, to leave. A scene's name fits
+  its block.
 - The legend along the bottom spells all of it out.
 
-Mounts render into their own passes at the canvas's zoom, so text is
-crisp at every level rather than scaled. A `#! outside fake` or `#!
-outside real` header gives a story's mounts the in-memory mail world or
-the network instead of `Deny` (whose refusals read "this world has no
-outside"). `e2e/library.txt` is a `#! canvas` script: it drives the canvas
-itself — `wait`, `shot`, `click` on a node's or a story's name, and the
-canvas chords — and is never mounted.
+`e2e/library.txt` drives the canvas itself: `wait`, `shot`, `click` on a
+scene's name or a node's (`scene/node`), and the canvas chords. A step
+that fails inside a node's replay is reported on stderr under the node's
+name and counts against the run.

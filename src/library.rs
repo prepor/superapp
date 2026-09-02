@@ -1,32 +1,39 @@
-//! The panels library (CR-006): an infinite canvas of live stages.
+//! The panels library (CR-006): an infinite canvas of live scenes.
 //!
 //! `--library` opens the window on a zoomable, pannable canvas instead of
-//! the workspace. Every e2e script under `e2e/` is a **story** row; every
-//! `shot` in it is a **node** — a whole [`Stage`] on a world of its own, an
-//! in-memory store, a sealed outside and a virtual clock — that replayed
-//! the story up to that shot and stopped there. The steps between two
-//! shots label the arrow between their nodes; the script's comments are
-//! the annotations. See [`crate::story`] for the reading, this module for
-//! the mounting.
+//! the workspace. Every scene of the [`crate::catalog`] is a block on it;
+//! every node a **mount**: a bare component populated with its fixture, or
+//! a whole [`Stage`] — solo on one panel, or the workspace — on a world of
+//! its own (an in-memory store, a sealed outside, a virtual clock) that ran
+//! the node's few steps and stopped there. The edges are the arrows, the
+//! notes the annotations. See [`crate::scene`] for the shape and the
+//! layout, this module for the mounting.
 //!
 //! A mount renders into its own pass at the canvas's zoom (crisp text at
 //! every level: the pass's dpi factor is the zoom), and the canvas shows
 //! the pass's texture. Entering a node — a click — brings it to 1:1 and
 //! routes the keyboard and the pointer to it, remapped into its own
-//! coordinates, so a flow can be continued by hand from any of its states.
-//! Actions a mount's widgets raise are captured and handed straight back
-//! to it, so a hundred stages never hear each other.
+//! coordinates, so a state can be worked by hand. Actions a mount's
+//! widgets raise are captured and handed straight back to it, so a hundred
+//! mounts never hear each other.
+
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use makepad_widgets::makepad_platform::event::{
     LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollEvent,
 };
 use makepad_widgets::*;
 
-use crate::app::{self, rgba_a, Boot, BootOutside, DrawFlat, Stage, FRAME_MS};
+use crate::app::{self, rgba_a, Boot, BootOutside, DrawFlat, Opener, Stage, FRAME_MS};
+use crate::catalog::{self, Open, Populate, Setup};
+use crate::core::Grid;
 use crate::e2e::{self, Step};
 use crate::effect::{Clock, MemSecrets, Outside, Real, Secrets};
+use crate::panels::OverlayProps;
+use crate::scene::{self, Canvas, Metrics, Scene, TEXT_PT, TITLE_PT};
 use crate::spring::{Spring, SpringParams};
-use crate::story::{self, Canvas, Metrics, OutsideKind, Story, TEXT_PT, TITLE_PT};
+use crate::store::Store;
 use crate::theme;
 
 /// A quad that shows a mount's pass texture.
@@ -54,7 +61,7 @@ const Z_MAX: f64 = 2.0;
 const Z_STEP: f64 = 0.5;
 /// One arrow-key pan, screen points.
 const PAN_STEP: f64 = 240.0;
-/// The dpi a mount is drawn at while it replays, as a fraction of the
+/// The dpi a stage is drawn at while it replays, as a fraction of the
 /// window's. A step needs fresh hits, not pixels: layout and hits are in
 /// logical points whatever the dpi, so a replay draws small — a quarter
 /// keeps the headless rasterizer's render-to-texture, which costs seconds
@@ -69,6 +76,10 @@ const RENDER_COUNT: u32 = 6;
 /// Frames the zoom has to stand still before frozen mounts re-render at
 /// the new level; until then they show their last texture, scaled.
 const SETTLE_TICKS: u32 = 6;
+/// Below this natural size (screen points) node names are left out: they
+/// are clamped to a legible minimum, and far out that minimum no longer
+/// fits between one node and the next.
+const NAME_MIN_PT: f64 = 5.0;
 
 /// The frame's render budget. One render is always allowed, so there is
 /// progress even when a single one overruns.
@@ -134,19 +145,29 @@ impl Camera {
     }
 }
 
-/// One node's live stage — booted the first time it is the one replaying,
-/// or entered, so opening the canvas costs no stores at all and each
-/// frame boots at most one.
+/// What lives in a mount: a component, or a stage.
+#[derive(Clone)]
+enum Live {
+    /// A bare widget, populated once with its fixture.
+    Widget(WidgetRef),
+    /// A stage on a world of its own.
+    Stage(WidgetRef),
+}
+
+/// One node's mount. A component is instantiated on the first draw; a
+/// stage is booted the first time it is the one replaying, or entered, so
+/// opening the canvas costs no stores at all and each frame boots at most
+/// one.
 struct Mount {
-    stage: Option<WidgetRef>,
-    story: usize,
+    live: Option<Live>,
+    scene: usize,
     node: usize,
-    /// The viewport the story asked for, points.
+    /// The node's viewport, points.
     size: DVec2,
     pass: Option<MountPass>,
     /// The dpi factor the pass was last rendered at; zero before the first.
     dpi: f64,
-    /// The stage drew (or stepped) since the pass was last rendered. Held
+    /// The mount drew (or stepped) since the pass was last rendered. Held
     /// here rather than in makepad's redraw marks, which a draw event
     /// consumes whether or not the budget let this mount render.
     pending: bool,
@@ -186,8 +207,8 @@ impl MountPass {
 enum HitAct {
     /// Enter this mount.
     Enter(usize),
-    /// Fit this story's row.
-    Story(usize),
+    /// Fit this scene's block.
+    Scene(usize),
 }
 
 struct Hit {
@@ -222,11 +243,13 @@ pub struct Library {
     #[live]
     draw_mono: DrawText,
 
-    /// The stage template (the DSL's `stage_tpl`), one instance per node.
+    /// The templates by DSL name: the component widgets' and the stage's,
+    /// never auto-drawn, instantiated per node.
     #[rust]
-    tpl: Option<ScriptObjectRef>,
+    tpl: HashMap<LiveId, ScriptObjectRef>,
+    /// Shared with the draw loop, which borrows the widget mutably.
     #[rust]
-    stories: Vec<Story>,
+    scenes: Rc<Vec<Scene<Setup>>>,
     #[rust]
     canvas: Option<Canvas>,
     #[rust]
@@ -291,7 +314,7 @@ impl ScriptHook for Library {
         _value: ScriptValue,
     ) {
         if apply.is_reload() {
-            self.tpl = None;
+            self.tpl.clear();
         }
     }
 
@@ -302,15 +325,15 @@ impl ScriptHook for Library {
         _scope: &mut Scope,
         value: ScriptValue,
     ) {
-        // The named child is a template, never auto-drawn (the Stage's own
+        // Named children are templates, never auto-drawn (the Stage's own
         // pattern for its panels).
         if !apply.is_eval() {
             if let Some(obj) = value.as_object() {
                 vm.vec_with(obj, |vm, vec| {
                     for kv in vec {
-                        if kv.key.as_id() == Some(live_id!(stage_tpl)) {
+                        if let Some(id) = kv.key.as_id() {
                             if let Some(t) = kv.value.as_object() {
-                                self.tpl = Some(vm.bx.heap.new_object_ref(t));
+                                self.tpl.insert(id, vm.bx.heap.new_object_ref(t));
                             }
                         }
                     }
@@ -342,8 +365,8 @@ fn render_zoom(zoom: f64) -> f64 {
     2f64.powf((zoom.log2() * 4.0).round() / 4.0)
 }
 
-/// The dpi a mount's pass renders at. A replaying mount draws for its
-/// hits, small, whatever the canvas shows; a frozen mount draws at the
+/// The dpi a mount's pass renders at. A replaying stage draws for its
+/// hits, small, whatever the canvas shows; anything else draws at the
 /// zoom it is shown at, so its text is crisp there.
 fn mount_dpi(win_dpi: f64, zoom: f64, replaying: bool) -> f64 {
     if replaying {
@@ -351,6 +374,11 @@ fn mount_dpi(win_dpi: f64, zoom: f64, replaying: bool) -> f64 {
     } else {
         win_dpi * render_zoom(zoom)
     }
+}
+
+/// The legend strip's height, screen points.
+fn legend_h() -> f64 {
+    (theme::FONT_SIZE * 2.4).round()
 }
 
 /// A canvas chord, for the script and the keyboard alike.
@@ -415,41 +443,55 @@ fn remap(event: &Event, origin: DVec2, zoom: f64) -> Option<Event> {
     })
 }
 
+/// What a mount needs to come up, taken out of its node's setup so the
+/// scenes are not borrowed while it boots.
+enum Plan {
+    Widget {
+        tpl: LiveId,
+        populate: Populate,
+    },
+    Stage {
+        open: Option<Open>,
+        steps: Option<Vec<Step>>,
+        grid: Option<Grid>,
+        outside: BootOutside,
+    },
+}
+
 impl Library {
     // -- boot ---------------------------------------------------------------
 
-    /// Reads the stories and mounts one stage per node, each replaying its
-    /// story prefix on a world of its own.
+    /// Reads the catalogue and lays one mount per node.
     fn boot(&mut self, cx: &mut Cx) {
-        let Some(paths) = app::library_paths() else {
+        let Some(filter) = app::library_filter() else {
             return;
         };
-        // No stories named: the shelf — what is worth reviewing now.
-        let shelf = paths.is_empty();
-        let all = ["e2e".to_string()];
-        let paths = if shelf { &all[..] } else { paths };
-        let stories = match story::load(paths, shelf) {
-            Ok(s) if s.is_empty() => {
-                if shelf {
-                    eprintln!("library: nothing on the shelf — mark a script under e2e/ with `#! library`");
-                } else {
-                    eprintln!("library: no stories under {paths:?}");
-                }
-                std::process::exit(2);
-            }
-            Ok(s) => s,
-            Err(e) => {
+        let mut scenes = catalog::scenes();
+        if !filter.is_empty() {
+            let wanted: Vec<String> = filter.iter().map(|f| f.to_lowercase()).collect();
+            scenes.retain(|s| {
+                let name = s.name.to_lowercase();
+                wanted.iter().any(|w| name.contains(w))
+            });
+        }
+        if scenes.is_empty() {
+            let all: Vec<String> = catalog::scenes().iter().map(|s| s.name.clone()).collect();
+            eprintln!("library: no scene named like {filter:?}; the catalogue has {all:?}");
+            std::process::exit(2);
+        }
+        for s in &scenes {
+            if let Err(e) = s.check() {
                 eprintln!("library: {e}");
                 std::process::exit(2);
             }
-        };
-        for (si, s) in stories.iter().enumerate() {
-            for ni in 0..s.nodes.len() {
+        }
+        for (si, s) in scenes.iter().enumerate() {
+            for (ni, n) in s.nodes.iter().enumerate() {
                 self.mounts.push(Mount {
-                    stage: None,
-                    story: si,
+                    live: None,
+                    scene: si,
                     node: ni,
-                    size: dvec2(s.cfg.window.0, s.cfg.window.1),
+                    size: dvec2(n.size.0, n.size.1),
                     pass: None,
                     dpi: 0.0,
                     pending: true,
@@ -457,12 +499,12 @@ impl Library {
             }
         }
         eprintln!(
-            "library: {} stor{} on the canvas, {} nodes",
-            stories.len(),
-            if stories.len() == 1 { "y" } else { "ies" },
+            "library: {} scene{} on the canvas, {} nodes",
+            scenes.len(),
+            if scenes.len() == 1 { "" } else { "s" },
             self.mounts.len()
         );
-        self.stories = stories;
+        self.scenes = Rc::new(scenes);
         // The canvas's own script.
         let (script, out) = app::e2e_script();
         if let Some(path) = script {
@@ -487,55 +529,110 @@ impl Library {
         cx.redraw_all();
     }
 
-    /// Boots a mount's stage on its story's world, if it has none yet. One
-    /// in-memory store with the demo seed, a widget tree — a few
-    /// milliseconds, paid when the mount's turn comes rather than a hundred
-    /// times at open.
+    fn is_stage(&self, i: usize) -> bool {
+        let m = &self.mounts[i];
+        matches!(self.scenes[m.scene].nodes[m.node].setup, Setup::Stage { .. })
+    }
+
+    fn plan(&self, i: usize) -> Plan {
+        let m = &self.mounts[i];
+        match &self.scenes[m.scene].nodes[m.node].setup {
+            Setup::Widget { tpl, populate, .. } => Plan::Widget {
+                tpl: *tpl,
+                populate: populate.clone(),
+            },
+            Setup::Stage {
+                open,
+                steps,
+                grid,
+                outside,
+            } => Plan::Stage {
+                open: open.clone(),
+                steps: steps.clone(),
+                grid: *grid,
+                outside: *outside,
+            },
+        }
+    }
+
+    /// The sheet props a component mount draws and hears with, if it is one.
+    fn overlay_props(&self, i: usize) -> Option<OverlayProps> {
+        let m = &self.mounts[i];
+        match &self.scenes[m.scene].nodes[m.node].setup {
+            Setup::Widget { overlay, .. } => overlay.clone(),
+            Setup::Stage { .. } => None,
+        }
+    }
+
+    fn tag(&self, i: usize) -> String {
+        let m = &self.mounts[i];
+        format!(
+            "{}/{}: ",
+            self.scenes[m.scene].name, self.scenes[m.scene].nodes[m.node].name
+        )
+    }
+
+    /// Brings a mount up if it is not yet: a component from its template,
+    /// populated; a stage on its world — one in-memory store with the demo
+    /// seed, a widget tree, a few milliseconds paid when the mount's turn
+    /// comes rather than a hundred times at open.
     fn ensure_booted(&mut self, cx: &mut Cx, i: usize) {
-        if self.mounts[i].stage.is_some() {
+        if self.mounts[i].live.is_some() {
             return;
         }
         let started = std::time::Instant::now();
-        let (si, ni) = (self.mounts[i].story, self.mounts[i].node);
-        let Some(stage) = self.instantiate(cx) else {
-            eprintln!("library: the DSL has no stage_tpl to mount");
-            std::process::exit(2);
-        };
-        let s = &self.stories[si];
-        let n = &s.nodes[ni];
-        let boot = Boot {
-            db: None,
-            grid: s.cfg.grid,
-            send_delay: s.cfg.send_delay,
-            virtual_time: true,
-            outside: match s.cfg.outside {
-                OutsideKind::Deny => BootOutside::Deny,
-                OutsideKind::Fake => BootOutside::Fake,
-                OutsideKind::Real => BootOutside::Real,
-            },
-            secrets_in_memory: true,
-            steps: Some(s.steps[..=n.until].to_vec()),
-            primary: false,
-            tag: format!("{}/{}: ", s.name, n.name),
-        };
-        if let Some(mut st) = stage.borrow_mut::<Stage>() {
-            st.boot(cx, boot);
+        match self.plan(i) {
+            Plan::Widget { tpl, populate } => {
+                let Some(w) = self.instantiate(cx, tpl) else {
+                    eprintln!("library: the DSL has no template {tpl:?} to mount");
+                    std::process::exit(2);
+                };
+                populate(cx, &w);
+                self.mounts[i].live = Some(Live::Widget(w));
+            }
+            Plan::Stage {
+                open,
+                steps,
+                grid,
+                outside,
+            } => {
+                let Some(stage) = self.instantiate(cx, live_id!(stage_tpl)) else {
+                    eprintln!("library: the DSL has no stage_tpl to mount");
+                    std::process::exit(2);
+                };
+                let boot = Boot {
+                    db: None,
+                    grid,
+                    send_delay: 10.0,
+                    virtual_time: true,
+                    outside,
+                    secrets_in_memory: true,
+                    steps,
+                    primary: false,
+                    tag: self.tag(i),
+                    open: open.map(|f| Box::new(move |s: &Store| f(s)) as Opener),
+                };
+                if let Some(mut st) = stage.borrow_mut::<Stage>() {
+                    st.boot(cx, boot);
+                }
+                self.mounts[i].live = Some(Live::Stage(stage));
+            }
         }
-        self.mounts[i].stage = Some(stage);
         self.boot_ms += started.elapsed().as_secs_f64() * 1000.0;
     }
 
-    /// A mount that has not reached its shot: waiting for its turn, or
-    /// replaying.
+    /// A stage mount that has not reached its state: waiting for its turn,
+    /// or replaying. A component is its state from the start.
     fn mount_replaying(&self, i: usize) -> bool {
-        match &self.mounts[i].stage {
-            None => true,
-            Some(w) => w.borrow::<Stage>().is_some_and(|s| s.replaying()),
+        match &self.mounts[i].live {
+            None => self.is_stage(i),
+            Some(Live::Stage(w)) => w.borrow::<Stage>().is_some_and(|s| s.replaying()),
+            Some(Live::Widget(_)) => false,
         }
     }
 
-    fn instantiate(&self, cx: &mut Cx) -> Option<WidgetRef> {
-        let template_ref = self.tpl.as_ref()?;
+    fn instantiate(&self, cx: &mut Cx, tpl: LiveId) -> Option<WidgetRef> {
+        let template_ref = self.tpl.get(&tpl)?;
         let template_value: ScriptValue = template_ref.as_object().into();
         let vm_id = cx.script_ref_vm_id(template_ref)?;
         Some(cx.with_script_vm_id(vm_id, |vm| {
@@ -573,8 +670,12 @@ impl Library {
     /// A mount's canvas rect.
     fn mount_rect(&self, i: usize) -> Option<Rect> {
         let m = self.mounts.get(i)?;
-        let row = self.canvas.as_ref()?.rows.get(m.story)?;
-        row.nodes.get(m.node).map(|n| to_rect(n.rect))
+        let block = self.canvas.as_ref()?.blocks.get(m.scene)?;
+        block
+            .nodes
+            .iter()
+            .find(|nb| nb.node == m.node)
+            .map(|nb| to_rect(nb.rect))
     }
 
     /// The camera that shows `r` (canvas) centred at `zoom`.
@@ -584,7 +685,7 @@ impl Library {
         let c = r.pos + r.size * 0.5;
         (
             c.x - self.vp.size.x / (2.0 * zoom),
-            c.y - self.vp.size.y / (2.0 * zoom),
+            c.y - (self.vp.size.y - legend_h()) / (2.0 * zoom),
             z,
         )
     }
@@ -599,10 +700,10 @@ impl Library {
         self.kick(cx);
     }
 
-    /// The zoom that shows all of `r` in the viewport.
+    /// The zoom that shows all of `r` in the viewport, above the legend.
     fn zoom_to_fit(&self, r: Rect) -> f64 {
         let zx = self.vp.size.x / r.size.x.max(1.0);
-        let zy = self.vp.size.y / r.size.y.max(1.0);
+        let zy = (self.vp.size.y - legend_h()) / r.size.y.max(1.0);
         zx.min(zy)
     }
 
@@ -618,21 +719,13 @@ impl Library {
         self.fly_to(cx, r, z);
     }
 
-    fn fit_story(&mut self, cx: &mut Cx, si: usize) {
-        let Some(row) = self.canvas.as_ref().and_then(|c| c.rows.get(si)) else {
+    fn fit_scene(&mut self, cx: &mut Cx, si: usize) {
+        let Some(b) = self.canvas.as_ref().and_then(|c| c.blocks.get(si)) else {
             return;
         };
-        let Some(first) = row.nodes.first() else {
-            return;
-        };
-        let last = row.nodes.last().unwrap_or(first);
-        let x0 = row.title.0;
-        let y0 = row.title.1;
-        let x1 = last.rect.x + last.rect.w;
-        let y1 = first.rect.y + first.rect.h;
         let r = Rect {
-            pos: dvec2(x0 - story::MARGIN / 2.0, y0 - story::MARGIN / 2.0),
-            size: dvec2(x1 - x0 + story::MARGIN, y1 - y0 + story::MARGIN),
+            pos: dvec2(b.bounds.x - scene::MARGIN / 2.0, b.bounds.y - scene::MARGIN / 2.0),
+            size: dvec2(b.bounds.w + scene::MARGIN, b.bounds.h + scene::MARGIN),
         };
         let z = self.zoom_to_fit(r);
         self.fly_to(cx, r, z);
@@ -688,17 +781,20 @@ impl Library {
 
     // -- entering ---------------------------------------------------------------
 
+    fn set_active(&mut self, cx: &mut Cx, i: usize, active: bool) {
+        if let Some(Live::Stage(w)) = &self.mounts[i].live {
+            if let Some(mut st) = w.borrow_mut::<Stage>() {
+                st.set_active(cx, active);
+            }
+        }
+    }
+
     fn enter(&mut self, cx: &mut Cx, i: usize) {
         if self.entered != Some(i) {
             self.leave(cx);
             self.ensure_booted(cx, i);
-            if let Some(mut st) = self.mounts[i]
-                .stage
-                .as_ref()
-                .and_then(|w| w.borrow_mut::<Stage>())
-            {
-                st.set_active(cx, true);
-            }
+            self.set_active(cx, i, true);
+            self.mounts[i].pending = true;
             self.entered = Some(i);
         }
         if let Some(r) = self.mount_rect(i) {
@@ -708,13 +804,7 @@ impl Library {
 
     fn leave(&mut self, cx: &mut Cx) {
         if let Some(i) = self.entered.take() {
-            if let Some(mut st) = self.mounts[i]
-                .stage
-                .as_ref()
-                .and_then(|w| w.borrow_mut::<Stage>())
-            {
-                st.set_active(cx, false);
-            }
+            self.set_active(cx, i, false);
             cx.set_key_focus(self.area);
             self.redraw(cx);
         }
@@ -738,25 +828,32 @@ impl Library {
     /// widgets raised, so nothing leaks to the others (a `PanelAction`
     /// carries a panel id, and every mount numbers its panels from one).
     fn send(&mut self, cx: &mut Cx, i: usize, event: &Event) {
-        let Some(w) = self.mounts[i].stage.clone() else {
+        let Some(live) = self.mounts[i].live.clone() else {
             return;
         };
-        let mut acts = cx.capture_actions(|cx| w.handle_event(cx, event, &mut Scope::empty()));
+        let (w, props) = match live {
+            Live::Stage(w) => (w, None),
+            Live::Widget(w) => (w, self.overlay_props(i)),
+        };
+        let mut scope = match &props {
+            Some(p) => Scope::with_props(p),
+            None => Scope::empty(),
+        };
+        let mut acts = cx.capture_actions(|cx| w.handle_event(cx, event, &mut scope));
         for _ in 0..4 {
             if acts.is_empty() {
                 break;
             }
             let ev = Event::Actions(acts);
-            acts = cx.capture_actions(|cx| w.handle_event(cx, &ev, &mut Scope::empty()));
+            acts = cx.capture_actions(|cx| w.handle_event(cx, &ev, &mut scope));
         }
     }
 
-    /// The one mount replaying right now: the first that has not arrived.
+    /// The one stage replaying right now: the first that has not arrived.
     /// Replays run one at a time because makepad has one key focus and one
-    /// IME — a story that types into a field (the launcher's query, the
-    /// settings form, the inbox filter) cannot share the keyboard with
-    /// another replaying beside it. The rest wait their turn, in canvas
-    /// order.
+    /// IME — a node that types into a field (the inbox filter, the compose
+    /// TO) cannot share the keyboard with another replaying beside it. The
+    /// rest wait their turn, in canvas order.
     fn current_replayer(&self) -> Option<usize> {
         (0..self.mounts.len()).find(|&i| self.mount_replaying(i))
     }
@@ -866,9 +963,9 @@ impl Library {
                             eprintln!("e2e: click {label:?} — enter");
                             self.enter(cx, i);
                         }
-                        Some(HitAct::Story(s)) => {
-                            eprintln!("e2e: click {label:?} — fit story");
-                            self.fit_story(cx, s);
+                        Some(HitAct::Scene(s)) => {
+                            eprintln!("e2e: click {label:?} — fit scene");
+                            self.fit_scene(cx, s);
                         }
                         None => {
                             eprintln!("e2e: FAIL click {label:?}: no matching element");
@@ -915,7 +1012,7 @@ impl Library {
 
     /// Canvas text: `pt` points at zoom 1, scaled with the camera. Below
     /// `min` screen points it is not drawn at all — unless `min` clamps it,
-    /// which is how story and node names stay legible from any height.
+    /// which is how scene and node names stay legible from any height.
     fn text(&mut self, cx: &mut Cx2d, pos: DVec2, pt: f64, color: theme::Rgba, s: &str) {
         self.text_min(cx, pos, pt, 2.0, false, color, s);
     }
@@ -924,6 +1021,7 @@ impl Library {
         self.text_min(cx, pos, pt, 10.0, true, color, s);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn text_min(
         &mut self,
         cx: &mut Cx2d,
@@ -984,16 +1082,45 @@ impl Library {
         }
     }
 
+    /// A one-pixel line, horizontal or vertical, between two screen points.
+    fn line(&mut self, cx: &mut Cx2d, a: DVec2, b: DVec2, color: theme::Rgba) {
+        if (a.y - b.y).abs() < 0.5 {
+            let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+            if x1 - x0 < 0.5 {
+                return;
+            }
+            self.fill(
+                cx,
+                Rect {
+                    pos: dvec2(x0, a.y - 0.5),
+                    size: dvec2(x1 - x0, 1.0),
+                },
+                color,
+            );
+        } else {
+            let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+            self.fill(
+                cx,
+                Rect {
+                    pos: dvec2(a.x - 0.5, y0),
+                    size: dvec2(1.0, y1 - y0),
+                },
+                color,
+            );
+        }
+    }
+
     /// Decides which mounts render this frame, and what the rest show.
     ///
-    /// Live mounts — the entered one, and the ones still replaying — render
-    /// whenever they drew or stepped; the entered one unbudgeted, the
-    /// replaying ones within the frame's budget (a replay cannot step past
-    /// a click until it has drawn). A frozen mount renders once more when
-    /// its arrival is pending, and re-renders at a new zoom level only
-    /// after the zoom has stood still, nearest the pointer first, within
-    /// the same budget — until then it shows its last texture, scaled.
-    /// Anything left over sets `more_work`, so the next frame comes.
+    /// Live mounts — the entered one, and the stages still replaying —
+    /// render whenever they drew or stepped; the entered one unbudgeted,
+    /// the replaying ones within the frame's budget (a replay cannot step
+    /// past a click until it has drawn). A frozen mount renders once more
+    /// when its arrival is pending, and re-renders at a new zoom level
+    /// only after the zoom has stood still, nearest the pointer first,
+    /// within the same budget — until then it shows its last texture,
+    /// scaled. Anything left over sets `more_work`, so the next frame
+    /// comes.
     fn plan_renders(&mut self, cx: &mut Cx2d, zoom: f64) -> Vec<bool> {
         let n = self.mounts.len();
         let mut render = vec![false; n];
@@ -1004,7 +1131,7 @@ impl Library {
         let mut deferred: Vec<(f64, usize)> = Vec::new();
         let mut more_work = false;
         for i in 0..n {
-            if self.mounts[i].stage.is_none() {
+            if self.mounts[i].live.is_none() {
                 continue;
             }
             let replaying = self.mount_replaying(i);
@@ -1067,7 +1194,7 @@ impl Library {
         if !render && (!visible || self.mounts[i].pass.is_none()) {
             return;
         }
-        let Some(stage) = self.mounts[i].stage.clone() else {
+        let Some(live) = self.mounts[i].live.clone() else {
             return;
         };
         let win_dpi = cx.current_dpi_factor();
@@ -1100,15 +1227,37 @@ impl Library {
             });
             self.mounts[i].dpi = dpi;
             self.mounts[i].pending = false;
-            if let (Some(mut st), Some(canvas)) = (stage.borrow_mut::<Stage>(), self.list_id) {
-                st.set_lists(mp.list.id(), canvas);
-            }
+            let props = self.overlay_props(i);
             cx.make_child_pass(&mp.pass);
             cx.begin_pass(&mp.pass, Some(dpi));
             mp.list.begin_always(cx);
-            cx.begin_turtle(walk, Layout::default());
-            stage.draw_all(cx, &mut Scope::empty());
-            cx.end_turtle();
+            match &live {
+                Live::Stage(stage) => {
+                    if let (Some(mut st), Some(canvas)) =
+                        (stage.borrow_mut::<Stage>(), self.list_id)
+                    {
+                        st.set_lists(mp.list.id(), canvas);
+                    }
+                    cx.begin_turtle(walk, Layout::default());
+                    stage.draw_all(cx, &mut Scope::empty());
+                    cx.end_turtle();
+                }
+                Live::Widget(w) => {
+                    let mut scope = match &props {
+                        Some(p) => Scope::with_props(p),
+                        None => Scope::empty(),
+                    };
+                    cx.begin_turtle(
+                        walk,
+                        Layout {
+                            flow: Flow::Down,
+                            ..Layout::default()
+                        },
+                    );
+                    w.draw_all(cx, &mut scope);
+                    cx.end_turtle();
+                }
+            }
             mp.list.end(cx);
             cx.end_pass(&mp.pass);
         }
@@ -1124,92 +1273,96 @@ impl Library {
         let Some(canvas) = self.canvas.clone() else {
             return;
         };
+        // Components come up on the first draw: a widget each, no store.
+        for i in 0..self.mounts.len() {
+            if !self.is_stage(i) {
+                self.ensure_booted(cx, i);
+            }
+        }
         let zoom = self.zoom();
         let line = self.metrics.map_or(20.0, |m| m.line * TEXT_PT);
         self.hits.clear();
         let entered = self.entered;
         let plan = self.plan_renders(cx, zoom);
-        // Out of `self` for the loop: drawing borrows the widget mutably.
-        let stories = std::mem::take(&mut self.stories);
-        // Mounts by (story, node), for the hits.
-        let index: std::collections::HashMap<(usize, usize), usize> = self
+        let scenes = self.scenes.clone();
+        // Mounts by (scene, node), for the hits.
+        let index: HashMap<(usize, usize), usize> = self
             .mounts
             .iter()
             .enumerate()
-            .map(|(i, m)| ((m.story, m.node), i))
+            .map(|(i, m)| ((m.scene, m.node), i))
             .collect();
 
-        for row in &canvas.rows {
-            let story = &stories[row.story];
+        for block in &canvas.blocks {
+            let sc = &scenes[block.scene];
             // Names are clamped to a legible size, so far out they would
-            // sit on the frames they belong to: the row's labels are laid
-            // in screen space instead — the node names just above the
-            // mounts, the title just above those.
+            // sit on the frames they belong to: the block's labels are
+            // laid in screen space instead — a node's name just above its
+            // mount, the title just above the first row of those.
             let line_px = self.metrics.map_or(1.3, |m| m.line);
             let name_px = (TEXT_PT * zoom).max(10.0) * line_px;
-            let first_top = row
+            let first_top = block
                 .nodes
-                .first()
-                .map_or(0.0, |nb| self.to_screen(dvec2(nb.rect.x, nb.rect.y)).y);
-            let names_y = row.nodes.first().map_or(0.0, |nb| {
-                self.to_screen(dvec2(nb.caption.0, nb.caption.1))
-                    .y
+                .iter()
+                .map(|nb| self.to_screen(dvec2(nb.rect.x, nb.rect.y)).y)
+                .fold(f64::INFINITY, f64::min);
+            // Far out the names are left out (below), and the title sits
+            // right over the first mount instead of over where they were.
+            let names_shown = zoom * TEXT_PT >= NAME_MIN_PT;
+            let names_y = if names_shown {
+                block
+                    .nodes
+                    .iter()
+                    .map(|nb| self.to_screen(dvec2(nb.caption.0, nb.caption.1)).y)
+                    .fold(f64::INFINITY, f64::min)
                     .min(first_top - name_px - 4.0)
-            });
+            } else {
+                first_top - 4.0
+            };
             let title_px = (TITLE_PT * zoom).max(10.0) * line_px;
-            let title_canvas = self.to_screen(dvec2(row.title.0, row.title.1));
-            let title_at = dvec2(title_canvas.x, title_canvas.y.min(names_y - title_px - 6.0));
-            let title_h = title_px;
-            self.label(cx, title_at, TITLE_PT, theme::INK, &story.name);
-            let cfg = format!(
-                "{}×{} · {} · {}",
-                story.cfg.window.0,
-                story.cfg.window.1,
-                story
-                    .cfg
-                    .grid
-                    .map_or("default grid".to_string(), |g| format!("grid {}×{}", g.w, g.h)),
-                match story.cfg.outside {
-                    OutsideKind::Deny => "deny",
-                    OutsideKind::Fake => "fake",
-                    OutsideKind::Real => "real",
-                }
+            let title_canvas = self.to_screen(dvec2(block.title.0, block.title.1));
+            let title_at = dvec2(
+                title_canvas.x,
+                title_canvas.y.min(names_y - title_px - 6.0),
             );
-            let name_w = story.name.chars().count() as f64
+            self.label(cx, title_at, TITLE_PT, theme::INK, &sc.name);
+            let name_w = sc.name.chars().count() as f64
                 * self.metrics.map_or(0.6, |m| m.adv)
                 * (TITLE_PT * zoom).max(10.0);
+            let count = format!(
+                "{} state{}",
+                sc.nodes.len(),
+                if sc.nodes.len() == 1 { "" } else { "s" }
+            );
             self.text(
                 cx,
-                title_at + dvec2(name_w + 24.0 * zoom, title_h - line * zoom),
+                title_at + dvec2(name_w + 24.0 * zoom, title_px - line * zoom),
                 TEXT_PT,
                 theme::MUTED,
-                &cfg,
+                &count,
             );
             self.hits.push(Hit {
-                label: story.name.clone(),
+                label: sc.name.clone(),
                 rect: Rect {
                     pos: title_at,
-                    size: dvec2(name_w, title_h),
+                    size: dvec2(name_w, title_px),
                 },
-                act: HitAct::Story(row.story),
+                act: HitAct::Scene(block.scene),
             });
-            let mut y = self.to_screen(dvec2(row.intro.0, row.intro.1)).y;
-            for l in &story.intro {
+            let mut y = self.to_screen(dvec2(block.note.0, block.note.1)).y;
+            for l in &sc.note {
                 self.text(cx, dvec2(title_at.x, y), TEXT_PT, theme::TEXT2, l);
                 y += line * zoom;
             }
-            for a in &row.arrows {
+            for a in &block.arrows {
                 let from = self.to_screen(dvec2(a.from.0, a.from.1));
                 let to = self.to_screen(dvec2(a.to.0, a.to.1));
+                let ex = self.to_screen(dvec2(a.elbow_x, 0.0)).x;
                 let head = (14.0 * zoom).max(4.0);
-                self.fill(
-                    cx,
-                    Rect {
-                        pos: dvec2(from.x, from.y - 0.5),
-                        size: dvec2((to.x - from.x - head).max(0.0), 1.0),
-                    },
-                    theme::INK,
-                );
+                // Out to the right, along the elbow, in from the left.
+                self.line(cx, from, dvec2(ex, from.y), theme::INK);
+                self.line(cx, dvec2(ex, from.y), dvec2(ex, to.y), theme::INK);
+                self.line(cx, dvec2(ex, to.y), dvec2(to.x - head, to.y), theme::INK);
                 self.draw_head.color = rgba_a(theme::INK, 1.0);
                 self.draw_head.draw_abs(
                     cx,
@@ -1218,22 +1371,21 @@ impl Library {
                         size: dvec2(head, head),
                     },
                 );
-                let mut ly = self.to_screen(dvec2(a.labels_at.0, a.labels_at.1)).y;
-                let lx = self.to_screen(dvec2(a.labels_at.0, 0.0)).x;
-                for l in &a.labels {
-                    self.text(cx, dvec2(lx, ly), TEXT_PT, theme::INK, l);
-                    ly += line * zoom;
-                }
+                let at = self.to_screen(dvec2(a.label_at.0, a.label_at.1));
+                self.text(cx, at, TEXT_PT, theme::INK, &a.label);
             }
-            for nb in &row.nodes {
-                let node = &story.nodes[nb.node];
+            for nb in &block.nodes {
+                let node = &sc.nodes[nb.node];
                 let screen = self.screen_rect(to_rect(nb.rect));
-                let i = index.get(&(row.story, nb.node)).copied();
+                let i = index.get(&(block.scene, nb.node)).copied();
                 let is_entered = i.is_some() && i == entered;
-                // The caption: the shot's name (inverted while entered,
+                // The caption: the node's name (inverted while entered,
                 // the way a focused panel's header is), then the note.
                 let cap_canvas = self.to_screen(dvec2(nb.caption.0, nb.caption.1));
-                let cap = dvec2(cap_canvas.x, cap_canvas.y.min(names_y));
+                let cap = dvec2(
+                    cap_canvas.x,
+                    cap_canvas.y.min(screen.pos.y - name_px - 4.0),
+                );
                 let name_w = node.name.chars().count() as f64
                     * self.metrics.map_or(0.6, |m| m.adv)
                     * (TEXT_PT * zoom).max(10.0);
@@ -1247,11 +1399,15 @@ impl Library {
                         theme::INK,
                     );
                 }
-                // The name stays legible from any height; far out, it is
-                // cut to what fits over its own mount.
+                // The name stays legible from any height while there is
+                // room for it: far out, names would pile onto the nodes
+                // above, so only the scene titles remain until the zoom
+                // comes in. The entered node always keeps its name.
                 let adv_px = self.metrics.map_or(0.6, |m| m.adv) * (TEXT_PT * zoom).max(10.0);
                 let fit = (screen.size.x / adv_px).floor() as usize;
-                let shown = if name_w <= screen.size.x || zoom * TEXT_PT >= 10.0 {
+                let shown = if !is_entered && !names_shown {
+                    String::new()
+                } else if name_w <= screen.size.x || zoom * TEXT_PT >= 10.0 {
                     node.name.clone()
                 } else if fit >= 4 {
                     crate::ui::trunc(&node.name, fit)
@@ -1287,8 +1443,9 @@ impl Library {
                         self.draw_flat.color = rgba_a(theme::BG, 0.6);
                         self.draw_flat.draw_abs(cx, screen);
                     }
+                    let label = format!("{}/{}", sc.name, node.name);
                     self.hits.push(Hit {
-                        label: node.name.clone(),
+                        label: label.clone(),
                         rect: Rect {
                             pos: cap,
                             size: dvec2(name_w, name_px),
@@ -1296,14 +1453,13 @@ impl Library {
                         act: HitAct::Enter(i),
                     });
                     self.hits.push(Hit {
-                        label: node.name.clone(),
+                        label,
                         rect: screen,
                         act: HitAct::Enter(i),
                     });
                 }
             }
         }
-        self.stories = stories;
     }
 
     /// The legend, screen-fixed at the bottom: every control, spelled out.
@@ -1318,7 +1474,7 @@ impl Library {
             "{status}drag · scroll  pan   ⌘scroll · ⌘= · ⌘-  zoom   ⌘0  fit   click  enter   click outside · ⌘esc  leave"
         );
         let size = theme::FONT_SIZE as f32;
-        let h = (f64::from(size) * 2.4).round();
+        let h = legend_h();
         self.fill(
             cx,
             Rect {
@@ -1382,9 +1538,9 @@ impl Widget for Library {
                         self.zoom_ticks = self.zoom_ticks.saturating_add(1);
                     }
                     self.e2e_tick(cx, dt * 1000.0);
-                    // While nodes replay, the legend counts them down; while
-                    // renders are owed, the draw pays them off a frame at a
-                    // time.
+                    // While stages replay, the legend counts them down;
+                    // while renders are owed, the draw pays them off a
+                    // frame at a time.
                     self.frames += 1;
                     let replaying = self.replaying() > 0;
                     if !replaying && !self.filled {
@@ -1422,9 +1578,9 @@ impl Widget for Library {
                 }
                 match self.hit_at(p) {
                     Some(HitAct::Enter(i)) => self.enter(cx, i),
-                    Some(HitAct::Story(s)) => {
+                    Some(HitAct::Scene(s)) => {
                         self.leave(cx);
-                        self.fit_story(cx, s);
+                        self.fit_scene(cx, s);
                     }
                     None => {
                         self.leave(cx);
@@ -1508,7 +1664,7 @@ impl Widget for Library {
         }
         if self.canvas.is_none() {
             if let Some(m) = self.metrics {
-                let c = story::layout(&self.stories, &m);
+                let c = scene::layout(&self.scenes[..], &m);
                 let r = Rect {
                     pos: dvec2(0.0, 0.0),
                     size: dvec2(c.w, c.h),

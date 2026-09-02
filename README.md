@@ -27,7 +27,7 @@ panel; the help panel documents the rest.
 ```sh
 mise exec -- cargo test                        # pure core: panel mechanics, springs, e2e grammar
 mise exec -- cargo run -- --e2e e2e/basic.txt  # scripted run + screenshots to e2e/out (--front to watch)
-mise exec -- cargo run -- --library            # the panels library: every e2e script live on one canvas
+mise exec -- cargo run -- --library            # the panels library: the catalogue's scenes, live, on one canvas
 ```
 
 ## Layout

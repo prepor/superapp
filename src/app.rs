@@ -84,9 +84,9 @@ struct Config {
     /// When set, replication is on: this device joins the lineage, follows or
     /// holds the lease, and the locked screen appears when it does not write.
     bucket: Option<String>,
-    /// Open the panels library on these scripts and directories instead of
-    /// the workspace (`--library [PATH...]`); none means the shelf — the
-    /// scripts under `e2e/` marked `#! library`. CR-006.
+    /// Open the panels library instead of the workspace (`--library
+    /// [NAME...]`): the catalogue's scenes whose names contain one of
+    /// these, or every scene when none is given. CR-006.
     library: Option<Vec<String>>,
     /// The headless backend's `--no-draw`: the widget pass runs, nothing is
     /// rasterized. Read here so a `shot` knows there is nothing to keep.
@@ -98,8 +98,8 @@ pub(crate) fn no_draw() -> bool {
     config().no_draw
 }
 
-/// The panels library's story sources, when `--library` asked for it.
-pub(crate) fn library_paths() -> Option<&'static [String]> {
+/// The scene names `--library` asked for (none: every scene), when it did.
+pub(crate) fn library_filter() -> Option<&'static [String]> {
     config().library.as_deref()
 }
 
@@ -110,7 +110,7 @@ pub(crate) fn e2e_script() -> (Option<&'static str>, &'static str) {
 
 /// Everything a stage needs to come up (CR-006). The window's own stage
 /// builds one from argv at startup; the panels library builds one per
-/// mount from a story's header.
+/// mount from a scene's node.
 pub struct Boot {
     /// The store's path; `None` is in memory.
     pub db: Option<std::path::PathBuf>,
@@ -132,9 +132,17 @@ pub struct Boot {
     /// The window's own stage: owns the menu bar, the IME, the fallback
     /// store poll. A mount owns nothing outside its pass.
     pub primary: bool,
-    /// A prefix for the script's messages — a mount's story and node.
+    /// A prefix for the script's messages — a mount's scene and node.
     pub tag: String,
+    /// Solo: come up on this one panel alone, drawn at the whole viewport,
+    /// chrome included — a panel node of the library. Otherwise the
+    /// workspace is the restored session, or the default layout.
+    pub open: Option<Opener>,
 }
+
+/// What a solo stage opens on: the kind, resolved against the seeded
+/// store (a mail by its subject, a sender by name).
+pub type Opener = Box<dyn FnOnce(&Store) -> Kind>;
 
 /// Which [`crate::effect::Outside`] a booting stage gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +184,7 @@ impl Boot {
             steps,
             primary: true,
             tag: String::new(),
+            open: None,
         }
     }
 }
@@ -418,8 +427,16 @@ script_mod! {
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                     }
                     library := Library{
-                        // One mount per story node is instantiated from
-                        // this template, exactly as panels are from theirs.
+                        // Templates, never auto-drawn: a component node is
+                        // instantiated from its widget's, a panel or
+                        // workspace node from the stage's — exactly as
+                        // panels are from theirs.
+                        inbox_row_tpl := mod.widgets.InboxRow{}
+                        thread_msg_tpl := mod.widgets.ThreadMsg{}
+                        overlay_row_tpl := mod.widgets.OverlayRow{}
+                        launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
+                        account_row_tpl := mod.widgets.AccountRow{}
+                        link_tpl := mod.widgets.SLink{}
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
@@ -1021,7 +1038,7 @@ struct State {
     /// panels-library mount. False only for a windowed primary stage — the
     /// one place the wall clock is read.
     virtual_time: bool,
-    /// A forced grid: `--grid`, or a story's header.
+    /// A forced grid: `--grid`, or a scene's.
     grid: Option<core::Grid>,
     /// The send-undo window, seconds.
     send_delay: f64,
@@ -1763,8 +1780,8 @@ pub struct Stage {
     ime_guard_timer: Timer,
     #[rust]
     state: Option<Box<State>>,
-    /// A panels-library mount (CR-006): booted by the canvas with a story's
-    /// config, replays a story prefix, owns nothing outside its pass. The
+    /// A panels-library mount (CR-006): booted by the canvas from a scene's
+    /// node, replays its steps, owns nothing outside its pass. The
     /// window's own stage boots from argv and owns the menu bar.
     #[rust]
     mount: bool,
@@ -1786,6 +1803,10 @@ pub struct Stage {
     /// the draw, which the canvas schedules within its frame budget.
     #[rust]
     stale_hits: bool,
+    /// A panel node (CR-006): the one panel this stage draws, at the whole
+    /// viewport, instead of the workspace.
+    #[rust]
+    solo: Option<PanelId>,
 }
 
 /// Menu command id bases: workspace `k`'s items are `base + k`. Plain
@@ -2113,10 +2134,9 @@ impl Stage {
         if let Some(step) = runner.next_step(dt_ms) {
             match step {
                 e2e::Step::Wait(_) => {}
-                // A mount's shot is where its story stops: the state on the
-                // canvas is the state the suite would have photographed.
-                // The runner goes with it — nothing else to do, and nothing
-                // to keep asking for frames.
+                // A mount's last step is where it stops: the state on the
+                // canvas. The runner goes with it — nothing else to do, and
+                // nothing to keep asking for frames.
                 e2e::Step::Shot(_) | e2e::Step::Quit if self.mount => {
                     // Only the last shot is this mount's own; the ones on
                     // the way are earlier nodes', and nothing to do.
@@ -4067,15 +4087,17 @@ impl Stage {
     /// Brings the stage up on a world: opens (or creates) its store, seeds
     /// the demo mail, restores the session, starts the engine, and arms a
     /// script if there is one. The primary stage does this at startup from
-    /// argv; the panels library does it per mount with a story's config.
+    /// argv; the panels library does it per mount from a scene's node.
     pub fn boot(&mut self, cx: &mut Cx, boot: Boot) {
         if self.state.is_some() {
             return;
         }
         self.mount = !boot.primary;
         self.active = boot.primary;
-        // A mount's first step waits for its first draw.
+        // A mount's first step waits for its first draw; a mount with no
+        // steps is its state from the start.
         self.stale_hits = self.mount;
+        self.arrived = self.mount && boot.steps.is_none();
         let store = Store::open(boot.db.as_deref())
             .unwrap_or_else(|e| panic!("store: opening {:?} failed: {e}", boot.db));
         // Seeding is a write, so under replication it waits for this device
@@ -4090,6 +4112,18 @@ impl Stage {
         // A delivered send can no longer be undone — the walk marks it
         // expired and steps past.
         let mut s = State::new(store, &boot);
+        if let Some(open) = boot.open {
+            // Solo: one panel, fresh, in place of the session.
+            let kind = open(&s.store);
+            let mut ws = Wm::new();
+            let pid = ws.open(kind.clone(), None, false);
+            s.ws = ws;
+            if let Kind::Message { id } = kind {
+                let open = s.seed_for(id);
+                s.seed_expansion(id, &open);
+            }
+            self.solo = Some(pid);
+        }
         s.failed_seen = mail::outbox_failures(&s.store).len();
         s.spawn_workers();
         s.sync();
@@ -4120,7 +4154,7 @@ impl Stage {
         redraw_scoped(cx, self.lists, self.mount);
     }
 
-    /// A mount is still replaying its story.
+    /// A mount is still replaying its steps.
     #[must_use]
     pub fn replaying(&self) -> bool {
         self.e2e.is_some()
@@ -5066,7 +5100,10 @@ impl Widget for Stage {
         self.hits.clear();
         let mut state = self.state.take();
         if let Some(state) = state.as_deref_mut() {
-            self.draw_scene(cx, state, vp);
+            match self.solo {
+                Some(pid) => self.draw_solo(cx, state, vp, pid),
+                None => self.draw_scene(cx, state, vp),
+            }
             if !self.reported && !self.mount {
                 self.reported = true;
                 eprintln!(
@@ -5093,6 +5130,23 @@ impl Widget for Stage {
 // ---------------------------------------------------------------------------
 
 impl Stage {
+    /// A panel node (CR-006): the one panel at the whole viewport, then
+    /// the sheet over it — so the archive's toast and the launcher still
+    /// show.
+    fn draw_solo(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect, pid: PanelId) {
+        let r = rect(
+            vp.pos.x + theme::GAP,
+            vp.pos.y + theme::GAP,
+            (vp.size.x - 2.0 * theme::GAP).max(40.0),
+            (vp.size.y - 2.0 * theme::GAP).max(40.0),
+        );
+        if state.ws.panel(pid).is_some() {
+            self.draw_panel_full(cx, state, pid, r, 1.0);
+            state.store.trace_end();
+        }
+        self.draw_sheet(cx, state, vp);
+    }
+
     fn draw_scene(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
         // Retained widgets otherwise outlive their panels: a closed panel drops
         // from the workspace, but its entry here would linger — a slow leak,
@@ -5344,6 +5398,11 @@ impl Stage {
             );
         }
 
+        self.draw_sheet(cx, state, vp);
+    }
+
+    /// The modal overlays and the toast, over whatever the stage drew.
+    fn draw_sheet(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
         // The modal overlays share a chassis: an ink wash that owns every
         // hit (a tap outside the sheet dismisses), and the sheet on it.
         // The wash rides the chassis' presence spring, so it fades in and

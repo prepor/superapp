@@ -1,5 +1,3 @@
-#! library
-#! window 380x780 grid 4x3
 # The cover-display preview: run with --window 380x780 --grid 4x3.
 # Panels clamp to the small grid — the inbox fills the screen.
 wait 900

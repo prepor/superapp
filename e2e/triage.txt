@@ -1,4 +1,3 @@
-#! library
 # CR-005 — walk, read, triage, next.
 #
 # Assertions here are the clicks and swipes: a label that does not resolve is

@@ -22,13 +22,15 @@
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
 //! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
 //! | [`theme`] | the look: sizes and colours | no |
-//! | [`story`] | e2e scripts read as flows, and the library canvas's layout | no |
+//! | [`scene`] | a subject in its named states, and the library canvas's layout | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
-//! | [`library`] | the panels library: a canvas of live stages (CR-006) | yes |
+//! | [`catalog`] | the scenes the panels library shows (CR-006) | yes |
+//! | [`library`] | the panels library: a canvas of live scenes (CR-006) | yes |
 //!
 //! Everything above `app` is pure and unit-tested without opening a window.
 
 pub mod app;
+pub mod catalog;
 pub mod core;
 pub mod e2e;
 pub mod effect;
@@ -44,11 +46,11 @@ pub mod object;
 pub mod panels;
 pub mod repl;
 pub mod richtable;
+pub mod scene;
 pub mod secret;
 pub mod send;
 pub mod spring;
 pub mod store;
-pub mod story;
 pub mod sync;
 pub mod theme;
 pub mod ui;

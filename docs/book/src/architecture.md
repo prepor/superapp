@@ -23,11 +23,12 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/ui.rs` | the semantic content vocabulary: lines, fields, forms | no |
 | `src/theme.rs` | the look: sizes and colours | no |
 | `src/e2e.rs` | e2e script grammar + runner state | no |
-| `src/story.rs` | e2e scripts read as flows, and the library canvas's layout | no |
+| `src/scene.rs` | a subject in its named states, and the library canvas's layout | no |
 | `src/mac.rs` | screen geometry, activation, window screenshots | no (apple-sys) |
 | `src/panels.rs` | retained panel widgets | yes |
 | `src/app.rs` | the makepad shell: drawing, events, animation | yes |
-| `src/library.rs` | the panels library: a canvas of live stages | yes |
+| `src/catalog.rs` | the scenes the panels library shows | yes |
+| `src/library.rs` | the panels library: a canvas of live scenes | yes |
 
 Everything above `panels` is std-only and unit-tested without opening a
 window.
@@ -46,13 +47,15 @@ Substrate](./data-substrate.md).
 The shell's widget is the `Stage`: the workspace, its springs, its hits,
 its script runner. It comes up on a `Boot` — a store path or memory, a
 grid, the send window, whether time is virtual, which outside — and the
-window's own stage builds its boot from argv. The panels library
-builds one per story node instead and **mounts** the stage on the canvas:
-each mount renders into its own pass at the canvas's zoom, replays its
-story prefix on virtual time, and owns nothing outside that pass — no menu
-bar, the IME only while entered, redraws scoped to its own draw list, and
-the actions its widgets raise captured and handed back to it alone. See
-[Developer Experience](./dev-x.md#panels-library).
+window's own stage builds its boot from argv. The panels library builds
+one per panel or workspace node of a scene instead and **mounts** the
+stage on the canvas — solo on the one panel the node names, or the whole
+workspace: each mount renders into its own pass at the canvas's zoom,
+replays the node's steps on virtual time, and owns nothing outside that
+pass — no menu bar, the IME only while entered, redraws scoped to its own
+draw list, and the actions its widgets raise captured and handed back to
+it alone. A component node mounts a bare widget the same way, with no
+stage at all. See [Developer Experience](./dev-x.md#panels-library).
 
 ## Frame loop
 
