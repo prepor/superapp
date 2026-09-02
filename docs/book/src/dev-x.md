@@ -177,7 +177,9 @@ needed — `e2e/select.txt` covers selectable content, `e2e/height.txt`
 reads a short letter, the demo world's long one and a short one again: the
 same panel three rows tall, then six, then three, and `e2e/filter.txt`
 walks the rich table (tags, the autocomplete and its dynamic values, the
-grammar, the error line, and a keyboard walk onto the second page).
+grammar, the error line, and a keyboard walk onto the second page), and
+`e2e/compose.txt` the compose panel's TO field completing addresses (a
+pick by enter, a pick by click, esc putting the offer away, tab walking on).
 
 `click` resolves the element's action directly — it proves the action, not
 the click. `mouse` sends a real press-release pair into the stage, so the
@@ -191,6 +193,16 @@ row — walk there with `key down N`, which scroll-follows deterministically.
 And under `--no-draw` no frame is written, so every `shot` step fails and
 the run exits non-zero on those alone; read that mode for the *other*
 failures (a label that did not resolve).
+
+A `mouse` or `click` on a hosted **field** is trustworthy once per run.
+makepad applies a key-focus change after the event that asked for it, and
+releases a press's capture from the platform side — both `pub(crate)`. A
+synthesized down/up pair runs inside one tick, so the field still holding
+focus sees the up as a click outside itself and clears the focus the
+pressed field just asked for; and the pressed field stays captured, so
+every later press in the run is handed to it wherever it lands. A real
+click has neither problem. Reach a second field with `key tab` (the
+compose scripts do), and press at most one field per run.
 
 `drag` is weaker than it looks: drag-selection runs on `Hit::FingerMove`,
 which fires only for the area that **captured** the finger, and that

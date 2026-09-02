@@ -127,6 +127,15 @@ overlap; the e2e harness addresses them by their label.
 Errors show under the field in the one colour errors get, minus the tag
 still being typed at the end of the line — `@fr` is not wrong yet.
 
+**The box left the table** (follow-up, 2026-09-02). What a field
+completes is a `Completion` — context off the line, offer for it, splice
+of a pick — and the box, the keys and the pick are one `Suggest` over any
+of them. The table implements the trait for the grammar above; the
+compose panel's TO field is the second completion, over the senders the
+store knows, so a name fragment lands an address the way `@from:` does.
+The `SuggestBox` DSL is now shared too, one `suggest:` property per panel
+that completes.
+
 ### What rendering a long list costs
 
 Three measures, each answering one cost the old inbox paid per frame:
