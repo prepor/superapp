@@ -1,7 +1,7 @@
 //! The IMAP sync engine: one worker thread per account, each with its own
-//! [`World`] over its own connection to the one store (WAL; the UI notices
-//! foreign commits via `data_version` — see
-//! [`crate::store::Store::poll_external`]).
+//! [`World`] over its own **reader** on the one store — writes go to the
+//! shared single writer (CR-005 phase 0), and the UI notices a worker's
+//! commit via `data_version` (see [`crate::store::Store::poll_external`]).
 //!
 //! Sync is **ingest**, not action: nothing here is undoable, and nothing
 //! here fights the user. Local intent (`message`) and server fact
@@ -20,8 +20,8 @@
 //!   to hold `BEGIN IMMEDIATE` across three round trips per folder.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::Transaction;
@@ -132,42 +132,51 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
     };
 
     for p in rows {
-        w.store()
-            .write(|tx| {
-                if p.moving {
-                    if !in_flight(tx, "move", p.message)? {
-                        w.enqueue_in(
-                            tx,
-                            &mail::Move {
-                                account,
-                                message: p.message,
-                                to_folder: p.want_folder,
-                                from: p.have_name.clone(),
-                                to: p.want_name.clone(),
-                                uid: p.uid,
-                            },
-                        )?;
+        let message = p.message;
+        if p.moving {
+            // The job is encoded *outside* the write: the payload and the
+            // clock read need the `World`, which cannot travel to the writer
+            // thread (CR-005 phase 0). The `in_flight` guard stays inside the
+            // transaction, so the claim is still atomic.
+            let job = w
+                .prepare(&mail::Move {
+                    account,
+                    message: p.message,
+                    to_folder: p.want_folder,
+                    from: p.have_name.clone(),
+                    to: p.want_name.clone(),
+                    uid: p.uid,
+                })
+                .map_err(err)?;
+            w.store()
+                .write(move |tx| {
+                    if !in_flight(tx, "move", message)? {
+                        job.insert(tx)?;
                     }
-                    // The flag push waits for the move to re-establish
-                    // identity — a uid in the old folder means nothing in
-                    // the new one.
-                    return Ok(());
-                }
-                if p.unread == p.seen && !in_flight(tx, "seen", p.message)? {
-                    w.enqueue_in(
-                        tx,
-                        &mail::Seen {
-                            account,
-                            message: p.message,
-                            folder: p.have_name.clone(),
-                            uid: p.uid,
-                            seen: !p.unread,
-                        },
-                    )?;
-                }
-                Ok(())
-            })
-            .map_err(err)?;
+                    Ok(())
+                })
+                .map_err(err)?;
+            // The flag push waits for the move to re-establish identity — a
+            // uid in the old folder means nothing in the new one.
+        } else if p.unread == p.seen {
+            let job = w
+                .prepare(&mail::Seen {
+                    account,
+                    message: p.message,
+                    folder: p.have_name.clone(),
+                    uid: p.uid,
+                    seen: !p.unread,
+                })
+                .map_err(err)?;
+            w.store()
+                .write(move |tx| {
+                    if !in_flight(tx, "seen", message)? {
+                        job.insert(tx)?;
+                    }
+                    Ok(())
+                })
+                .map_err(err)?;
+        }
     }
     Ok(())
 }
@@ -217,20 +226,22 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
         })?;
 
         // The folder row and what we last knew about it — a short write,
-        // no network in sight.
+        // no network in sight. Owned copies cross to the writer thread; the
+        // originals stay for the round trips below (CR-005 phase 0).
+        let name = rf.name.clone();
         let (fid, known): (i64, (Option<i64>, Option<i64>)) = w
             .store()
-            .write(|tx| {
+            .write(move |tx| {
                 let fid: i64 = tx
                     .query_row(
                         "SELECT id FROM folder WHERE account = ?1 AND name = ?2",
-                        rusqlite::params![account, rf.name],
+                        rusqlite::params![account, name],
                         |r| r.get(0),
                     )
                     .or_else(|_| {
                         tx.execute(
                             "INSERT INTO folder(account, name, role) VALUES(?1, ?2, ?3)",
-                            rusqlite::params![account, rf.name, role],
+                            rusqlite::params![account, name, role],
                         )
                         .map(|_| tx.last_insert_rowid())
                     })?;
@@ -285,7 +296,7 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
             unseen,
         };
         w.store()
-            .write(|tx| land(tx, account, from, &g))
+            .write(move |tx| land(tx, account, from, &g))
             .map_err(err)?;
     }
     Ok(())
@@ -565,7 +576,7 @@ impl Worker {
 ///
 /// If the thread cannot be spawned.
 pub fn spawn(
-    db: PathBuf,
+    db: Arc<crate::store::Db>,
     account: i64,
     secrets: Secrets,
     clock: Clock,
@@ -575,7 +586,9 @@ pub fn spawn(
     std::thread::Builder::new()
         .name(format!("sync-{account}"))
         .spawn(move || {
-            let Ok(store) = crate::store::Store::open(Some(&db)) else {
+            // The worker joins the *one* writer (CR-005 phase 0) — its own
+            // reader over the shared `Db`, never a second writable connection.
+            let Ok(store) = crate::store::Store::with_db(db) else {
                 return;
             };
             let w = World::new(
@@ -605,14 +618,11 @@ pub fn spawn(
                     Ok(()) => format!("ok · {}", mail::fmt_date(w.now())),
                     Err(e) => format!("error: {e}"),
                 };
-                let _ = w.store().write(|c| {
+                let synced = outcome.is_ok().then(|| w.now());
+                let _ = w.store().write(move |c| {
                     c.execute(
                         "UPDATE account SET status = ?1, synced = ?2 WHERE id = ?3",
-                        rusqlite::params![
-                            status,
-                            outcome.is_ok().then(|| w.now()),
-                            account
-                        ],
+                        rusqlite::params![status, synced, account],
                     )
                     .map(|_| ())
                 });
@@ -644,10 +654,11 @@ pub fn tick(w: &World) {
     };
     for a in accounts {
         if let Err(e) = sync_account(w, a) {
-            let _ = w.store().write(|c| {
+            let status = format!("error: {e}");
+            let _ = w.store().write(move |c| {
                 c.execute(
                     "UPDATE account SET status = ?1 WHERE id = ?2",
-                    rusqlite::params![format!("error: {e}"), a],
+                    rusqlite::params![status, a],
                 )
                 .map(|_| ())
             });
@@ -744,7 +755,7 @@ impl Pump {
     pub fn ensure(
         &mut self,
         w: &World,
-        db: &std::path::Path,
+        db: &Arc<crate::store::Db>,
         secrets: &Secrets,
         clock: &Clock,
         notify: impl Fn() + Send + Clone + 'static,
@@ -754,7 +765,7 @@ impl Pump {
         };
         if sender.is_none() {
             *sender = Some(crate::send::spawn(
-                db.to_path_buf(),
+                db.clone(),
                 secrets.clone(),
                 clock.clone(),
                 notify.clone(),
@@ -770,7 +781,7 @@ impl Pump {
                 continue;
             }
             workers.push(spawn(
-                db.to_path_buf(),
+                db.clone(),
                 a.id,
                 secrets.clone(),
                 clock.clone(),
@@ -961,7 +972,7 @@ Content-Transfer-Encoding: quoted-printable\r\n\
         // Archive, then undo it — both before any pass runs.
         w.store().write(|c| mail::archive_tx(c, 1)).unwrap();
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute("UPDATE message SET folder=?1 WHERE id=1", [inbox])
                     .map(|_| ())
             })
@@ -994,7 +1005,7 @@ Content-Transfer-Encoding: quoted-printable\r\n\
 
         // Undo lands while the job waits.
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute("UPDATE message SET folder=?1 WHERE id=1", [inbox])
                     .map(|_| ())
             })
@@ -1138,7 +1149,7 @@ Content-Transfer-Encoding: quoted-printable\r\n\
                 .expect("the row")
         };
         assert_eq!(html_of(), None);
-        crate::store::backfill_html(w.store().conn()).unwrap();
+        w.store().write(|tx| crate::store::backfill_html(tx)).unwrap();
         assert!(html_of().expect("backfilled").contains("<b>reading</b>"));
     }
 }

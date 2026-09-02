@@ -21,13 +21,18 @@ directly:
   the full hook surface — `update_hook` drives query invalidation, the
   authorizer captures each query's dependencies — on macOS and android
   alike, the same choice rel.systems' research validated. The **session
-  extension is not used**: undo is typed values in memory rather than
-  invertible changesets, so the build needs no `buildtime_bindgen` and the
-  android cross-build is the simpler for it. SQLite's **JSON1** functions
-  carry the effect queue's payloads (TEXT, not JSONB — a shell must be
-  able to read them).
+  extension** records each write's changeset into a replication log, which
+  device sync carries from one device to the other. It reinstates
+  `buildtime_bindgen` on the android cross-build, a known-good configuration.
+  SQLite's **JSON1** functions carry the effect queue's payloads (TEXT, not
+  JSONB — a shell must be able to read them).
 - **`serde` + `serde_json`** — effects are serializable values, and the
-  deferred ones are JSON payloads in the `effect` table.
+  deferred ones are JSON payloads in the `effect` table; the device-sync
+  `state` object and batch headers are JSON too.
+- **No new crate for device sync.** The object-store transport (CR-005) is a
+  plain-HTTP client and a tiny `bucketd` daemon over `std::net` — a demo
+  stand-in for R2/S3, kept dependency-free (a real signed backend would add
+  one). Content hashing for snapshot integrity is a dependency-free FNV-1a.
 - **`imap` (rustls) + `mail-parser`** — the sync engine's protocol and
   MIME layers; the TLS stack is rustls-on-ring, which cross-compiles for
   android without ceremony. All engine logic runs against an `Outside`

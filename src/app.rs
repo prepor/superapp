@@ -78,6 +78,10 @@ struct Config {
     db: Option<String>,
     /// The send-undo window in seconds (`--send-delay 1` for e2e).
     send_delay: f64,
+    /// The device-sync bucket base URL (`--bucket http://127.0.0.1:9000`).
+    /// When set, replication is on: this device joins the lineage, follows or
+    /// holds the lease, and the locked screen appears when it does not write.
+    bucket: Option<String>,
 }
 
 fn parse_wxh(s: &str) -> Option<(f64, f64)> {
@@ -113,6 +117,7 @@ fn config() -> &'static Config {
                 }
                 "--window" => c.window = args.next().and_then(|s| parse_wxh(&s)),
                 "--db" => c.db = args.next(),
+                "--bucket" => c.bucket = args.next(),
                 "--send-delay" => {
                     if let Some(d) = args.next().and_then(|s| s.parse().ok()) {
                         c.send_delay = d;
@@ -339,6 +344,10 @@ enum Act {
     /// A retained widget's *button*, semantically (CR-002): e2e resolves it
     /// to the same PanelAction the button's own click emits.
     WidgetOp(PanelId, WidgetOp),
+    /// The locked screen's button: take the device-sync lease (CR-005).
+    Acquire,
+    /// The locked screen's backdrop: absorbs the click, does nothing.
+    Noop,
 }
 
 /// Semantic button operations on retained panels (the e2e bridge).
@@ -381,7 +390,7 @@ fn act_pid(act: &Act) -> Option<PanelId> {
         | Act::Preview(pid, _)
         | Act::Pointer(pid)
         | Act::WidgetOp(pid, _) => Some(*pid),
-        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose => None,
+        Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Acquire | Act::Noop => None,
     }
 }
 
@@ -746,6 +755,20 @@ struct LauncherUi {
     hits: Vec<launcher::Hit>,
 }
 
+/// How device sync runs. Production spawns a worker thread; a headless run
+/// drives the passes inline from the frame loop against the virtual clock, so
+/// a scripted `wait` advances a handoff exactly the way it advances the mail
+/// engine (mirroring [`sync::Pump::Manual`]).
+#[allow(dead_code)]
+enum ReplMode {
+    /// A background worker thread (production).
+    Threads(crate::repl::Worker),
+    /// Inline passes on the UI thread, driven by the frame loop (headless).
+    Manual {
+        bucket: std::sync::Arc<dyn crate::object::Object>,
+    },
+}
+
 struct State {
     ws: Wm,
     /// Everything that leaves the process, plus the clock (CR-004). Holds
@@ -797,6 +820,14 @@ struct State {
     /// the panel opens on a mail, toggled by touch, kept no further than
     /// the process. Context, like the inbox cursor — never history.
     expand: HashMap<PanelId, crate::panels::Expansion>,
+    /// The device-sync driver (CR-005), when a `--bucket` is configured.
+    /// `None` means replication is off and the store is a plain local one.
+    repl: Option<ReplMode>,
+    /// The lease status the worker last reported — drives the locked screen.
+    repl_status: crate::repl::Status,
+    /// Whether the canonical device has seeded the demo world since it began
+    /// holding (seeding is a holder-only act under replication).
+    seeded: bool,
 }
 
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
@@ -860,6 +891,15 @@ impl State {
                 Wm::new()
             }
         };
+        // Under replication, nothing is written until the first pass resolves
+        // this device's role: a would-be follower must not seed demo mail or
+        // persist a boot layout into a store it is about to replace with the
+        // holder's snapshot. The gate opens (or stays shut) when the role is
+        // known.
+        let repl = Self::start_repl(&store, db_path.as_deref());
+        if repl.is_some() {
+            store.set_writable(false);
+        }
         State {
             ws,
             world,
@@ -868,6 +908,14 @@ impl State {
             history: crate::history::History::new(),
             store,
             db_path,
+            repl,
+            repl_status: crate::repl::Status {
+                role: crate::repl::Role::Detached,
+                epoch: 0,
+                unpublished: 0,
+                device: String::new(),
+            },
+            seeded: false,
             // Headless: no threads at all. The passes run inline from the
             // frame loop, so ingest, push and send land at frame
             // boundaries instead of whenever a worker happens to wake —
@@ -1087,25 +1135,41 @@ impl State {
     /// layout before and after, plus whatever the action claimed of the
     /// world. Nav-only actions carry no claims and undo for free off the
     /// snapshot.
-    fn act(
+    /// The `data` closure runs on the store's writer thread (CR-005 phase
+    /// 0), so it must own what it touches — `Send + 'static`. Its value is
+    /// returned, which is how an action learns a freshly minted row id
+    /// without a shared cell.
+    fn act<R: Send + 'static>(
         &mut self,
         kind: &str,
         label: String,
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
-        data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()>,
+        data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<R> + Send + 'static,
         intents: Vec<Box<dyn crate::history::Intent>>,
-    ) {
+    ) -> Option<R> {
+        // Under replication, a follower does not write — the gate would refuse
+        // it anyway, but returning here keeps the in-memory `Wm` from drifting
+        // ahead of a store that never took the change (CR-005).
+        if self.repl.is_some() && !self.store.is_writable() {
+            self.toast("read-only — acquire the lease to write", true);
+            return None;
+        }
         let before = self.ws.snapshot();
         mutate(&mut self.ws);
         let snap = self.ws.snapshot();
-        let r = self.store.write(|tx| {
-            crate::store::save_wm_tx(tx, &snap)?;
+        let for_write = snap.clone();
+        let r = self.store.write(move |tx| {
+            crate::store::save_wm_tx(tx, &for_write)?;
             data(tx)
         });
-        if let Err(e) = r {
-            eprintln!("store: action “{label}” failed: {e}");
-        }
+        let out = match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("store: action “{label}” failed: {e}");
+                None
+            }
+        };
         let now = self.world.now();
         self.history.apply(crate::history::Action {
             kind,
@@ -1121,6 +1185,9 @@ impl State {
         // worker makes the server agree without waiting for the poll —
         // and the sender re-times its next deadline.
         self.pump.kick();
+        // And publish what we just captured to the other device promptly.
+        self.repl_kick();
+        out
     }
 
     /// An undoable action that only moves panels around.
@@ -1131,7 +1198,14 @@ impl State {
         entity: Option<String>,
         mutate: impl FnOnce(&mut Wm),
     ) {
-        self.act(kind, label, entity, mutate, |_| Ok(()), Vec::new());
+        self.act(
+            kind,
+            label,
+            entity,
+            mutate,
+            |_| Ok::<(), rusqlite::Error>(()),
+            Vec::new(),
+        );
     }
 
     /// Restores the layout a history walk landed on, writing it through.
@@ -1147,11 +1221,149 @@ impl State {
     /// Spawns a sync worker for every configured account that lacks one.
     /// Idempotent — call after boot and after adding an account. Workers
     /// for removed accounts retire themselves.
-    fn spawn_workers(&mut self) {
-        let Some(db) = self.db_path.clone() else {
-            return; // in memory: no file for a worker to open
+    /// Starts the device-sync worker when a `--bucket` is configured; `None`
+    /// leaves the store a plain local one. The worker polls the bucket, drives
+    /// the lease, and reports status the UI reads each signal (CR-005).
+    /// Resolves the device-sync bucket URL from the three sources that let
+    /// each platform configure it: the `--bucket` flag (desktop), the
+    /// `SUPERAPP_BUCKET` environment variable, and a `bucket` file beside the
+    /// store (how android is pointed at `http://10.0.2.2:PORT` — `adb push` a
+    /// one-line file into the app's files dir).
+    fn resolve_bucket(db_path: Option<&std::path::Path>) -> Option<String> {
+        if let Some(u) = config().bucket.clone() {
+            return Some(u);
+        }
+        if let Ok(u) = std::env::var("SUPERAPP_BUCKET") {
+            let u = u.trim().to_string();
+            if !u.is_empty() {
+                return Some(u);
+            }
+        }
+        let dir = db_path.and_then(std::path::Path::parent)?;
+        let u = std::fs::read_to_string(dir.join("bucket")).ok()?.trim().to_string();
+        (!u.is_empty()).then_some(u)
+    }
+
+    fn start_repl(
+        store: &std::rc::Rc<Store>,
+        db_path: Option<&std::path::Path>,
+    ) -> Option<ReplMode> {
+        let url = Self::resolve_bucket(db_path)?;
+        let bucket: std::sync::Arc<dyn crate::object::Object> =
+            std::sync::Arc::new(crate::object::HttpBucket::new(&url));
+        // Headless: inline passes driven by the frame loop's virtual clock, so
+        // a scripted run is deterministic. Production: a background thread.
+        #[cfg(headless)]
+        {
+            let _ = store;
+            Some(ReplMode::Manual { bucket })
+        }
+        #[cfg(not(headless))]
+        {
+            Some(ReplMode::Threads(crate::repl::spawn(store.db(), bucket, || {
+                SignalToUI::set_ui_signal();
+            })))
+        }
+    }
+
+    // -- device sync, mode-agnostic (CR-005) --------------------------------
+
+    /// Reconciles the reported status: caches it, seeds the demo world the
+    /// first time this device holds (a holder-only act), and answers whether
+    /// the role changed.
+    fn apply_repl(&mut self, status: crate::repl::Status) -> bool {
+        if status == self.repl_status {
+            return false;
+        }
+        let role_changed = status.role != self.repl_status.role;
+        self.repl_status = status;
+        if matches!(self.repl_status.role, crate::repl::Role::Holder) && !self.seeded {
+            self.seeded = true;
+            let empty = mail::inbox(&self.store).is_empty()
+                && mail::accounts(&self.store).is_empty();
+            if empty {
+                if let Err(e) = mail::seed_if_empty(&self.store) {
+                    eprintln!("store: seeding demo mail failed: {e}");
+                }
+                // The seed publishes on the next pass.
+            }
+        }
+        role_changed
+    }
+
+    /// Runs (or reads) one sync pass and reconciles the result. Answers
+    /// whether the role changed.
+    fn repl_poll(&mut self) -> bool {
+        let status = match &self.repl {
+            Some(ReplMode::Threads(w)) => w.status(),
+            Some(ReplMode::Manual { bucket }) => {
+                let b = bucket.clone();
+                crate::repl::poll(&self.store, &*b)
+            }
+            None => return false,
         };
+        self.apply_repl(status)
+    }
+
+    /// Asks to take the lease.
+    fn repl_acquire(&mut self) {
+        match &self.repl {
+            Some(ReplMode::Threads(w)) => w.acquire(),
+            Some(ReplMode::Manual { bucket }) => {
+                let b = bucket.clone();
+                let s = crate::repl::acquire(&self.store, &*b)
+                    .unwrap_or_else(|_| crate::repl::poll(&self.store, &*b));
+                self.apply_repl(s);
+            }
+            None => {}
+        }
+    }
+
+    /// Publishes promptly after an action (or nudges the worker to).
+    fn repl_kick(&mut self) {
+        match &self.repl {
+            Some(ReplMode::Threads(w)) => w.kick(),
+            Some(ReplMode::Manual { bucket }) => {
+                let b = bucket.clone();
+                let s = crate::repl::poll(&self.store, &*b);
+                self.apply_repl(s);
+            }
+            None => {}
+        }
+    }
+
+    /// Hands the lease back (best effort).
+    fn repl_release(&mut self) {
+        match &self.repl {
+            Some(ReplMode::Threads(w)) => w.release(),
+            Some(ReplMode::Manual { bucket }) => {
+                let b = bucket.clone();
+                let s = crate::repl::release(&self.store, &*b)
+                    .unwrap_or_else(|_| crate::repl::poll(&self.store, &*b));
+                self.apply_repl(s);
+            }
+            None => {}
+        }
+    }
+
+    /// Releases synchronously on close — the last chance to hand back.
+    fn repl_release_blocking(&self) {
+        match &self.repl {
+            Some(ReplMode::Threads(w)) => w.release_blocking(),
+            Some(ReplMode::Manual { bucket }) => {
+                let b = bucket.clone();
+                let _ = crate::repl::release(&self.store, &*b);
+            }
+            None => {}
+        }
+    }
+
+    fn spawn_workers(&mut self) {
+        if self.db_path.is_none() {
+            return; // in memory: production workers never spawn here
+        }
         let world = self.world.clone();
+        let db = self.store.db();
         let secrets = self.secrets.clone();
         let clock = self.clock.clone();
         self.pump.ensure(&world, &db, &secrets, &clock, || {
@@ -1298,6 +1510,9 @@ pub struct Stage {
     #[rust]
     #[allow(dead_code)]
     frame: u64,
+    /// e2e ticks — the cadence counter for the headless device-sync pass.
+    #[rust]
+    repl_ticks: u64,
     /// android: after a field-to-field focus move, the blurring TextInput
     /// hides the soft keyboard and the next field's one draw-time show can
     /// lose the race against the hide animation. The guard re-issues it —
@@ -1617,6 +1832,14 @@ impl Stage {
 
     /// Executes at most one e2e step per timer tick; waits pace the script.
     fn e2e_tick(&mut self, cx: &mut Cx, dt_ms: f64) {
+        // Device sync advances with the run: `e2e_tick` is the one place every
+        // headless path drives, so a scripted `wait` moves a handoff exactly
+        // the way it moves the mail engine. Every ~20 ticks keeps the bucket
+        // round trips gentle while staying live within a `wait`.
+        self.repl_ticks = self.repl_ticks.wrapping_add(1);
+        if self.repl_ticks.is_multiple_of(20) {
+            self.tick_repl(cx);
+        }
         let Some(mut runner) = self.e2e.take() else {
             return;
         };
@@ -2305,6 +2528,84 @@ impl Stage {
             state.failed_seen = failures.len();
             cx.redraw_all();
         }
+        self.tick_repl(cx);
+    }
+
+    /// Runs (production: reads) one device-sync pass and reacts: on a role
+    /// change, announce it, reload the layout (an install or materialize may
+    /// have replaced rows), and redraw so the locked screen appears or clears.
+    /// Called on every worker signal and, headless, from the frame loop.
+    fn tick_repl(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if state.repl.is_none() {
+            return;
+        }
+        let role_changed = state.repl_poll();
+        if role_changed {
+            let line = state.repl_status.role.line();
+            let err = matches!(state.repl_status.role, crate::repl::Role::Stranded { .. });
+            state.toast(line, err);
+            if let Ok(Some(snap)) = state.store.load_wm() {
+                state.ws = Wm::restore(snap);
+                state.last_saved = Some(state.ws.snapshot());
+            }
+            state.sync();
+            self.update_menu(cx);
+        }
+        self.reseed_composes(cx);
+        cx.redraw_all();
+    }
+
+    /// Re-seeds compose panels whose `draft` row has drifted from what their
+    /// retained widget shows. A compose seeds its fields from the row exactly
+    /// once, when its widget is built ([`Self::draw_hosted`]); a peer's
+    /// materialized edit — or the canonical draft adopted when this device
+    /// takes over or recovers — then rewrites that row underneath, but the live
+    /// TextInputs keep their own buffers, so the panel would otherwise show a
+    /// stale draft that no reopen can dislodge.
+    ///
+    /// The one thing never overwritten is an *active* edit on the holder: a
+    /// compose with key focus may be mid-typing, and `save_draft` can lag the
+    /// widget, so a writable device leaves a focused field alone. A read-only
+    /// device cannot type at all — and its compose auto-focuses its body on
+    /// open (`pending_focus`) yet sits behind the lock showing a peer's stale
+    /// draft — so there the re-seed always runs. Idempotent: rows equal to the
+    /// widget are left alone (single-writer, CR-005).
+    fn reseed_composes(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref() else {
+            return;
+        };
+        if state.repl.is_none() {
+            return;
+        }
+        if state.store.is_writable() {
+            let focus = cx.key_focus();
+            if focus != Area::Empty && focus != self.area {
+                return;
+            }
+        }
+        let drafts: Vec<(PanelId, mail::Draft)> = state
+            .ws
+            .wss
+            .iter()
+            .flat_map(|w| w.panels.iter())
+            .filter(|(_, p)| matches!(p.kind, Kind::Compose { .. }))
+            .map(|(id, _)| (*id, mail::draft(&state.store, *id as i64).unwrap_or_default()))
+            .collect();
+        for (id, want) in &drafts {
+            if let Some(w) = self.hosted.get(id) {
+                let c = w.as_compose_panel();
+                let cur = c.values(cx);
+                if cur.to.as_str() != want.to.trim()
+                    || cur.subject != want.subject
+                    || cur.body != want.body
+                {
+                    c.prefill(cx, &want.to, &want.subject, &want.body);
+                }
+            }
+        }
     }
 
     /// Serializes the focused panel's context — identity, params, and the
@@ -2572,6 +2873,32 @@ impl Stage {
                 state.overlay = Overlay::None;
                 self.kick(cx);
                 return;
+            }
+            Act::Acquire => {
+                // The locked screen's button: ask the worker to take the
+                // lease. Whether this is a plain acquire (from a free lease) or
+                // an override (from a live holder) is the worker's to decide.
+                if state.repl.is_some() {
+                    let overriding = matches!(
+                        state.repl_status.role,
+                        crate::repl::Role::Follower { .. } | crate::repl::Role::Stranded { .. }
+                    );
+                    state.toast(
+                        if overriding {
+                            "taking over — the other device may hold unpublished work"
+                        } else {
+                            "acquiring the lease…"
+                        },
+                        false,
+                    );
+                    state.repl_acquire();
+                }
+                self.tick_repl(cx);
+                self.kick(cx);
+                return;
+            }
+            Act::Noop => {
+                return; // the locked backdrop absorbs the click
             }
             Act::Pointer(pid) => {
                 // The widget under it got the real event via forwarding;
@@ -2884,7 +3211,7 @@ impl Stage {
                 self.sync(cx);
             }
             // Handled above — they return before reaching this match.
-            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) => {}
+            Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) | Act::Acquire | Act::Noop => {}
         }
     }
 
@@ -3518,22 +3845,22 @@ impl Stage {
                         if !stored {
                             state.toast("storing the password failed", true);
                         } else {
-                            let added = std::cell::Cell::new(0i64);
-                            state.act(
-                                "account",
-                                format!("add account {email}"),
-                                None,
-                                |_| {},
-                                |tx| {
-                                    added.set(mail::add_account_tx(
-                                        tx, &email, &imap, &smtp,
-                                    )?);
-                                    Ok(())
-                                },
-                                Vec::new(),
-                            );
+                            // The new row's id comes back from `act` (the
+                            // write runs on the store's writer thread), so
+                            // the claim needs no shared cell.
+                            let (e, i, sm) = (email.clone(), imap.clone(), smtp.clone());
+                            let added = state
+                                .act(
+                                    "account",
+                                    format!("add account {email}"),
+                                    None,
+                                    |_| {},
+                                    move |tx| mail::add_account_tx(tx, &e, &i, &sm),
+                                    Vec::new(),
+                                )
+                                .unwrap_or(0);
                             state.history.claim(Box::new(mail::AccountAdded {
-                                id: added.get(),
+                                id: added,
                                 email: email.clone(),
                                 imap: imap.clone(),
                                 smtp: smtp.clone(),
@@ -3877,8 +4204,14 @@ impl Widget for Stage {
                 let store = Store::open(path.as_deref()).unwrap_or_else(|e| {
                     panic!("store: opening {path:?} failed: {e}")
                 });
-                if let Err(e) = mail::seed_if_empty(&store) {
-                    eprintln!("store: seeding demo mail failed: {e}");
+                // Seeding is a write, so under replication it waits for this
+                // device to resolve as the holder (a follower installs the
+                // holder's snapshot instead of seeding its own). Without a
+                // bucket, seed at boot as before.
+                if config().bucket.is_none() {
+                    if let Err(e) = mail::seed_if_empty(&store) {
+                        eprintln!("store: seeding demo mail failed: {e}");
+                    }
                 }
                 // A delivered send can no longer be undone — the walk
                 // marks it expired and steps past.
@@ -3987,6 +4320,29 @@ impl Widget for Stage {
             // ui-signal flag before delivering this event (macos.rs checks
             // and clears it itself) — so never re-check it here, just poll.
             Event::Signal => self.poll_store(cx),
+
+            // Device-sync lease lifecycle (CR-005): hand the lease back when
+            // this device steps away, so the other can take over without an
+            // override; re-poll when it returns. On android these are the
+            // activity's stop/start; on macOS the app-terminate path below
+            // (Shutdown) is the reliable release.
+            Event::Background | Event::Pause => {
+                if let Some(state) = self.state.as_deref_mut() {
+                    state.repl_release();
+                }
+            }
+            Event::Foreground | Event::Resume => {
+                if let Some(state) = self.state.as_deref_mut() {
+                    state.repl_kick();
+                }
+            }
+            Event::Shutdown => {
+                // The last chance to release: run it synchronously, since the
+                // worker may never get another turn.
+                if let Some(state) = self.state.as_deref() {
+                    state.repl_release_blocking();
+                }
+            }
 
             // A menu item (macOS menu bar).
             Event::MacosMenuCommand(cmd) => {
@@ -4130,6 +4486,8 @@ impl Widget for Stage {
                             w.run_effects();
                         }
                     }
+                    // Device sync advances from `e2e_tick` (the one driver
+                    // every headless path shares), so it is not repeated here.
                     self.e2e_tick(cx, FRAME_MS);
                     self.next_frame = cx.new_next_frame();
                 }
@@ -4328,6 +4686,14 @@ impl Widget for Stage {
 
 impl Stage {
     fn draw_scene(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
+        // Retained widgets otherwise outlive their panels: a closed panel drops
+        // from the workspace, but its entry here would linger — a slow leak,
+        // and a stale instance were its id ever reused. Keep only live panels
+        // and the two overlay slots (managed in `draw_overlay`).
+        self.hosted.retain(|pid, _| {
+            *pid == OVERLAY_PID_L || *pid == OVERLAY_PID_R || state.ws.panel(*pid).is_some()
+        });
+
         // Workspaces stack vertically, one viewport (and a gap) apart; the
         // slide spring carries the view between rows on a switch. Each
         // workspace pans on its own x-camera — the active one live, the
@@ -4603,6 +4969,85 @@ impl Stage {
         // a panel's in-list controls.
         self.draw_overlay(cx, state, vp);
 
+
+        // The device-sync locked screen (CR-005): when a bucket is configured
+        // and this device does not hold the lease, a full-window modal owns
+        // every hit and offers to take the lease. Drawn under the toast so an
+        // "acquiring…" message still shows.
+        if state.repl.is_some() && !state.store.is_writable() {
+            self.hits.clear();
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 0.72);
+            self.draw_flat.draw_abs(cx, vp);
+            self.hits.push(HitR {
+                rect: vp,
+                act: Act::Noop,
+                cursor: MouseCursor::Default,
+                label: "locked".into(),
+            });
+
+            let role = state.repl_status.role.clone();
+            let (title, btn) = match &role {
+                crate::repl::Role::Free => ("the lease is free", Some("acquire")),
+                crate::repl::Role::Follower { .. } => ("another device is writing", Some("take over")),
+                crate::repl::Role::Stranded { .. } => ("this device has diverged", Some("recover")),
+                crate::repl::Role::Offline => ("offline — the bucket is unreachable", None),
+                _ => ("read-only", Some("acquire")),
+            };
+
+            let cw = 460.0_f64.min(vp.size.x - 40.0);
+            let ch = 156.0;
+            let card = rect(
+                vp.pos.x + (vp.size.x - cw) / 2.0,
+                vp.pos.y + (vp.size.y - ch) / 2.0,
+                cw,
+                ch,
+            );
+            self.draw_panel.new_draw_call(cx);
+            self.draw_panel.color = rgba_a(theme::BG, 1.0);
+            self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+            self.draw_panel.border_size = 1.0;
+            self.draw_panel.alpha = 1.0;
+            self.draw_panel.draw_abs(cx, card);
+
+            self.draw_mono.new_draw_call(cx);
+            self.set_text(Style::Bold, 1.0);
+            self.draw_mono.draw_abs(cx, card.pos + dvec2(20.0, 20.0), title);
+            self.set_text(Style::Muted, 1.0);
+            self.draw_mono.draw_abs(
+                cx,
+                card.pos + dvec2(20.0, 20.0 + self.cell.line_h + 6.0),
+                &role.line(),
+            );
+            let short: String = state.repl_status.device.chars().take(8).collect();
+            let device = format!("this device: {short}");
+            self.draw_mono.draw_abs(
+                cx,
+                card.pos + dvec2(20.0, 20.0 + 2.0 * (self.cell.line_h + 6.0)),
+                &device,
+            );
+
+            if let Some(btn) = btn {
+                let bw = btn.chars().count() as f64 * self.cell.adv + 26.0;
+                let bh = self.cell.line_h + 12.0;
+                let br = rect(card.pos.x + 20.0, card.pos.y + ch - bh - 18.0, bw, bh);
+                self.draw_panel.new_draw_call(cx);
+                self.draw_panel.color = rgba_a(theme::INK, 1.0);
+                self.draw_panel.border_size = 0.0;
+                self.draw_panel.alpha = 1.0;
+                self.draw_panel.draw_abs(cx, br);
+                self.draw_mono.new_draw_call(cx);
+                self.set_text(Style::N, 1.0);
+                self.draw_mono.color = rgba_a(theme::BG, 1.0);
+                self.draw_mono.draw_abs(cx, br.pos + dvec2(13.0, 6.0), btn);
+                self.hits.push(HitR {
+                    rect: br,
+                    act: Act::Acquire,
+                    cursor: MouseCursor::Hand,
+                    label: btn.into(),
+                });
+            }
+        }
 
         // The toast, above everything.
         if let Some((msg, err, since)) = state.toast.clone() {

@@ -15,6 +15,8 @@
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
+//! | [`repl`] | device sync: the changeset log, the lease, the passes | no |
+//! | [`object`] | the sync transport: object store (memory, HTTP) + `state` | no |
 //! | [`secret`] | passwords: keychain (macOS) / private file | no |
 //! | [`launcher`] | the launcher's search over panels + mail world | no |
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
@@ -35,7 +37,9 @@ pub mod launcher;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod mail;
+pub mod object;
 pub mod panels;
+pub mod repl;
 pub mod richtable;
 pub mod secret;
 pub mod send;

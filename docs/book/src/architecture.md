@@ -15,6 +15,8 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/html.rs` | narrowing a mail's HTML to what a panel can draw | no |
 | `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |
 | `src/send.rs` | drafts → outbox → SMTP, with the undo window | no |
+| `src/repl.rs` | device sync: the log, the lease, and the sync passes | no |
+| `src/object.rs` | the sync transport: object store (memory, HTTP) + `state` | no |
 | `src/secret.rs` | passwords: keychain (macOS) / private file | no |
 | `src/launcher.rs` | the launcher's search over panels + mail world | no |
 | `src/spring.rs` | niri's closed-form spring (via mosaic) | no |

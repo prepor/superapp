@@ -1027,10 +1027,8 @@ pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
 /// **not** an action (text editing is the future editor's local undo).
 /// The caller skips no-op saves; this just writes.
 pub fn save_draft(store: &Store, panel: i64, re: Option<MailId>, d: &Draft, now: f64) {
-    let _ = store.write(|c| {
-        upsert_draft_tx(c, panel, re, d, now)?;
-        Ok(())
-    });
+    let d = d.clone();
+    let _ = store.write(move |c| upsert_draft_tx(c, panel, re, &d, now));
 }
 
 /// The transaction-level draft upsert (also part of the send action, so
@@ -1373,16 +1371,18 @@ impl Intent for MarkRead {
         format!("mail:{} read", self.mail)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
+        let mail = self.mail;
         w.store()
-            .write(|c| {
-                c.execute("UPDATE message SET unread = 1 WHERE id = ?1", [self.mail])
+            .write(move |c| {
+                c.execute("UPDATE message SET unread = 1 WHERE id = ?1", [mail])
                     .map(|_| ())
             })
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
+        let mail = self.mail;
         w.store()
-            .write(|c| mark_read_tx(c, self.mail))
+            .write(move |c| mark_read_tx(c, mail))
             .map_err(|e| e.to_string())
     }
 }
@@ -1404,20 +1404,21 @@ impl Intent for Filed {
         format!("mail:{} {verb}", self.mail)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
+        let (mail, from_folder) = (self.mail, self.from_folder);
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute(
                     "UPDATE message SET folder = ?1 WHERE id = ?2",
-                    rusqlite::params![self.from_folder, self.mail],
+                    rusqlite::params![from_folder, mail],
                 )
                 .map(|_| ())
             })
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let role = self.role;
+        let (mail, role) = (self.mail, self.role);
         w.store()
-            .write(|c| file_tx(c, self.mail, role).map(|_| ()))
+            .write(move |c| file_tx(c, mail, role).map(|_| ()))
             .map_err(|e| e.to_string())
     }
 }
@@ -1450,11 +1451,12 @@ impl Intent for Sent {
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
+        let panel = self.panel;
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute(
                     "DELETE FROM outbox WHERE id = ?1 AND status IN ('pending','failed')",
-                    [self.panel],
+                    [panel],
                 )
                 .map(|_| ())
             })
@@ -1462,9 +1464,9 @@ impl Intent for Sent {
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let after = w.now() + self.delay;
+        let (panel, after) = (self.panel, w.now() + self.delay);
         w.store()
-            .write(|c| file_send_tx(c, self.panel, after))
+            .write(move |c| file_send_tx(c, panel, after))
             .map_err(|e| e.to_string())
     }
 }
@@ -1481,14 +1483,15 @@ impl Intent for Discarded {
         format!("panel:{} draft discarded", self.panel)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let now = w.now();
+        let (now, panel, re, draft) = (w.now(), self.panel, self.re, self.draft.clone());
         w.store()
-            .write(|c| upsert_draft_tx(c, self.panel, self.re, &self.draft, now))
+            .write(move |c| upsert_draft_tx(c, panel, re, &draft, now))
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
+        let panel = self.panel;
         w.store()
-            .write(|c| discard_draft_tx(c, self.panel))
+            .write(move |c| discard_draft_tx(c, panel))
             .map_err(|e| e.to_string())
     }
 }
@@ -1507,17 +1510,20 @@ impl Intent for AccountAdded {
         format!("account:{} added", self.id)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
+        let id = self.id;
         w.store()
-            .write(|c| remove_account_tx(c, self.id))
+            .write(move |c| remove_account_tx(c, id))
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
+        let (id, email, imap, smtp) =
+            (self.id, self.email.clone(), self.imap.clone(), self.smtp.clone());
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute(
                     "INSERT INTO account(id, label, email, imap_host, smtp_host)
                      VALUES(?1, ?2, ?2, ?3, ?4)",
-                    rusqlite::params![self.id, self.email, self.imap, self.smtp],
+                    rusqlite::params![id, email, imap, smtp],
                 )
                 .map(|_| ())
             })
@@ -2319,14 +2325,15 @@ mod tests {
         let s = store();
         let put = |mid: &str, refs: &[&str]| -> i64 {
             let refs: Vec<String> = refs.iter().map(|r| (*r).to_string()).collect();
-            s.write(|c| {
+            let mid = mid.to_string();
+            s.write(move |c| {
                 c.execute(
                     "INSERT INTO message(account, folder, subject, date, message_id, topic)
                      VALUES(1, 1, ?1, 0, ?1, ?1)",
-                    [mid],
+                    [mid.as_str()],
                 )?;
                 let id = c.last_insert_rowid();
-                thread_tx(c, 1, id, mid, &refs)?;
+                thread_tx(c, 1, id, &mid, &refs)?;
                 Ok(id)
             })
             .unwrap()
