@@ -146,23 +146,29 @@ pub enum PanelAction {
         subject: String,
         body: String,
     },
-    /// Open a mail from the inbox (the solid-link semantics; `fresh` is
-    /// the workspace modifier).
-    OpenMail { pid: u64, id: i64, fresh: bool },
-    /// The inbox cursor landed on a mail (CR-005): open it joined but leave
-    /// focus in the list, so the walk carries on. Deliberately not a flag on
-    /// [`PanelAction::OpenMail`] — a preview is never the `fresh` variant,
-    /// and two bools would let that nonsense be spelled.
-    PreviewMail { pid: u64, id: i64 },
-    /// Panel-internal: an inbox row was tapped outside its subject.
-    SelectMail { pid: u64, id: i64 },
-    /// The same three, for the effect log and the job it previews into. The
-    /// log is the inbox's master/detail over another table, so it wants the
-    /// same verbs — separate rather than generic because the shell's reply
-    /// to each is the domain's (a mail is read by opening it; a job is not).
-    OpenJob { pid: u64, id: i64, fresh: bool },
-    PreviewJob { pid: u64, id: i64 },
-    SelectJob { pid: u64, id: i64 },
+    /// **The list verbs.** Every list panel — the inbox over threads, the
+    /// effect log over jobs, a files panel over entries — says the same
+    /// three things about the row under its cursor, and the shell answers
+    /// each the same way whatever the domain, so there is one of each
+    /// rather than one per table. What differs is only the `target`: the
+    /// kind that row names.
+    ///
+    /// Open it — the solid-link semantics; `fresh` is the workspace
+    /// modifier.
+    Open {
+        pid: u64,
+        target: crate::core::Kind,
+        fresh: bool,
+    },
+    /// The cursor landed on it (CR-005): open it joined but leave focus in
+    /// the list, so the walk carries on. Deliberately not a flag on
+    /// [`PanelAction::Open`] — a preview is never the `fresh` variant, and
+    /// two bools would let that nonsense be spelled.
+    Preview { pid: u64, target: crate::core::Kind },
+    /// Panel-internal: put the cursor on this row. The shell raises it
+    /// when it moved the cursor on a list's behalf — a row clicked, or the
+    /// walk carried past what was just filed away.
+    Select { pid: u64, target: crate::core::Kind },
     /// A link was followed: solid opens joined, dotted replaces in place,
     /// `fresh` (the workspace modifier) always opens un-joined.
     FollowLink {
@@ -192,11 +198,6 @@ pub enum PanelAction {
     /// shell toasts; the effect and its undo arrive with the
     /// implementation.
     NewDir { pid: u64, dir: String, name: String },
-    /// A list's cursor landed on a row (CR-008): open what it names —
-    /// a directory as a column, a file as a card — joined beside the
-    /// list, and leave focus in the list. [`PanelAction::PreviewMail`]
-    /// for any kind.
-    Preview { pid: u64, target: crate::core::Kind },
 }
 
 script_mod! {
@@ -3305,7 +3306,10 @@ impl InboxPanel {
         if !visible {
             list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
         }
-        cx.action(PanelAction::PreviewMail { pid, id: m.target });
+        cx.action(PanelAction::Preview {
+            pid,
+            target: crate::core::Kind::Message { id: m.target },
+        });
         self.redraw(cx);
     }
 
@@ -3409,9 +3413,9 @@ impl Widget for InboxPanel {
                         if let Some(id) = target {
                             // Enter *goes*: unlike the walk's preview, it
                             // hands focus to the mail (the solid-link rule).
-                            cx.action(PanelAction::OpenMail {
+                            cx.action(PanelAction::Open {
                                 pid,
-                                id,
+                                target: crate::core::Kind::Message { id },
                                 fresh: k.modifiers.logo || k.modifiers.alt,
                             });
                         }
@@ -3453,8 +3457,10 @@ impl Widget for InboxPanel {
                 self.redraw(cx);
             }
             for a in actions {
-                if let Some(PanelAction::SelectMail { pid: p, id }) =
-                    a.downcast_ref::<PanelAction>()
+                if let Some(PanelAction::Select {
+                    pid: p,
+                    target: crate::core::Kind::Message { id },
+                }) = a.downcast_ref::<PanelAction>()
                 {
                     if *p == pid {
                         // The shell moved the cursor for us (a mail opened by
@@ -3838,7 +3844,10 @@ impl EffectsPanel {
         if !visible {
             list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
         }
-        cx.action(PanelAction::PreviewJob { pid, id });
+        cx.action(PanelAction::Preview {
+            pid,
+            target: crate::core::Kind::Job { id },
+        });
         self.redraw(cx);
     }
 
@@ -3937,9 +3946,9 @@ impl Widget for EffectsPanel {
                         if let Some(id) = id {
                             // Enter *goes*: unlike the walk's preview, it
                             // hands focus to the job (the solid-link rule).
-                            cx.action(PanelAction::OpenJob {
+                            cx.action(PanelAction::Open {
                                 pid,
-                                id,
+                                target: crate::core::Kind::Job { id },
                                 fresh: k.modifiers.logo || k.modifiers.alt,
                             });
                         }
@@ -3975,7 +3984,10 @@ impl Widget for EffectsPanel {
                 self.redraw(cx);
             }
             for a in actions {
-                if let Some(PanelAction::SelectJob { pid: p, id }) = a.downcast_ref::<PanelAction>()
+                if let Some(PanelAction::Select {
+                    pid: p,
+                    target: crate::core::Kind::Job { id },
+                }) = a.downcast_ref::<PanelAction>()
                 {
                     if *p == pid {
                         // The shell moved the cursor for us (a job opened by
@@ -4784,18 +4796,21 @@ impl Widget for FilePanel {
                                 }
                             }
                             files::FileKind::Image => {
-                                if let Some(fmt) = files::image_format(&e.name) {
+                                // The name says whether to read it; the
+                                // bytes say how to decode it.
+                                if files::image_format(&e.name).is_some() {
                                     if let Ok(bytes) =
                                         files::read_in(&world, &path, files::IMAGE_PREVIEW_MAX)
                                     {
                                         let img = img_prev.as_image();
-                                        image = match fmt {
-                                            files::ImageFormat::Png => {
+                                        image = match files::sniff(&bytes) {
+                                            Some(files::ImageFormat::Png) => {
                                                 img.load_png_from_data(cx, &bytes).is_ok()
                                             }
-                                            files::ImageFormat::Jpeg => {
+                                            Some(files::ImageFormat::Jpeg) => {
                                                 img.load_jpg_from_data(cx, &bytes).is_ok()
                                             }
+                                            None => false,
                                         };
                                     }
                                 }

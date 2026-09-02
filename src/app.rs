@@ -592,13 +592,20 @@ enum Act {
 }
 
 /// Semantic button operations on retained panels (the e2e bridge).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `Clone`, not `Copy`: [`WidgetOp::OpenRow`] carries the kind its row
+/// names, and a kind owns its params.
+#[derive(Debug, Clone, PartialEq)]
 enum WidgetOp {
     AddAccount,
     /// Press "sign in with google" on the add-account panel.
     GoogleSignIn,
     RemoveAccount(i64),
-    OpenMail(i64),
+    /// A row of a list panel was clicked — an inbox thread, a job of the
+    /// effect log, an entry of a files panel. One op, because a click on a
+    /// row means one thing everywhere: the list takes focus, its cursor
+    /// follows, and what the row names previews beside it.
+    OpenRow(Kind),
     /// The `i`-th row of a field's autocomplete (CR-006): the inbox
     /// filter's, or the compose TO field's.
     Suggest(usize),
@@ -612,9 +619,6 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
-    /// A row of the effect log: preview the job it stands for, the way a
-    /// click on an inbox row previews its mail.
-    OpenJob(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3844,7 +3848,7 @@ impl Stage {
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
-                    WidgetOp::OpenMail(id) => {
+                    WidgetOp::OpenRow(target) => {
                         // A click inside a panel focuses it, as anywhere
                         // else. The preview below keeps *whoever* holds
                         // focus — right for the walk, which must not snap
@@ -3853,17 +3857,20 @@ impl Stage {
                             state.ws.focus = Some(pid);
                         }
                         // The cursor follows what you clicked, so the wash
-                        // marks the mail on screen and the arrows carry on
-                        // from there (panel-internal: the inbox listens).
-                        cx.action(crate::panels::PanelAction::SelectMail { pid, id });
+                        // marks the row on screen and the arrows carry on
+                        // from there (panel-internal: the list listens).
+                        cx.action(crate::panels::PanelAction::Select {
+                            pid,
+                            target: target.clone(),
+                        });
                         // Clicking a row is the same move as walking onto it:
                         // it previews, and the list keeps the keyboard.
                         // `enter` is what *goes*. Cmd+click still means what
                         // it means everywhere — a fresh, un-joined panel.
                         if alt {
-                            self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), true);
+                            self.resolve_click(cx, Act::Open(pid, target), true);
                         } else {
-                            self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
+                            self.resolve_click(cx, Act::Preview(pid, target), false);
                         }
                     }
                     WidgetOp::Suggest(i) => {
@@ -3908,20 +3915,6 @@ impl Stage {
                     }
                     WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
                     WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
-                    WidgetOp::OpenJob(id) => {
-                        // The inbox row's move, over the other table: the
-                        // list takes focus, the cursor follows the click,
-                        // and the job opens joined without stealing it back.
-                        if state.ws.focus != Some(pid) {
-                            state.ws.focus = Some(pid);
-                        }
-                        cx.action(crate::panels::PanelAction::SelectJob { pid, id });
-                        if alt {
-                            self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), true);
-                        } else {
-                            self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
-                        }
-                    }
                 }
                 return;
             }
@@ -4451,7 +4444,10 @@ impl Stage {
                 next_marks.iter().copied().chain(std::iter::once(nid)).collect();
             state.seed_expansion(nid, &open);
             state.show_also = state.ws.joined_child(pid);
-            cx.action(crate::panels::PanelAction::SelectMail { pid, id: nid });
+            cx.action(crate::panels::PanelAction::Select {
+                pid,
+                target: Kind::Message { id: nid },
+            });
         }
         self.sync(cx);
     }
@@ -4537,7 +4533,7 @@ impl Stage {
                 // two fingers). Vertical is the panel's scroll, and keeps
                 // ties — a diagonal is a scroll, never a half-swipe.
                 let row = match act {
-                    Some(Act::WidgetOp(pid, WidgetOp::OpenMail(id))) => Some((*pid, *id)),
+                    Some(Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))) => Some((*pid, *id)),
                     _ => None,
                 };
                 self.touch.mode = match (row, act.as_ref().and_then(act_pid)) {
@@ -4760,7 +4756,7 @@ impl Stage {
     fn row_rect(&self, pid: PanelId, id: core::MailId) -> Option<Rect> {
         self.hits
             .iter()
-            .find(|h| h.act == Act::WidgetOp(pid, WidgetOp::OpenMail(id)))
+            .find(|h| h.act == Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id })))
             .map(|h| h.rect)
     }
 
@@ -5179,10 +5175,14 @@ impl Stage {
                         state.world.now(),
                     );
                 }
-                crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
-                    self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), fresh);
+                // The list verbs, one door each whatever the list is: the
+                // inbox over threads, the effect log over jobs, a files
+                // panel over entries. The row's kind is the whole of what
+                // differs, and `Act::Open` / `Act::Preview` already take one.
+                crate::panels::PanelAction::Open { pid, target, fresh } => {
+                    self.resolve_click(cx, Act::Open(pid, target), fresh);
                 }
-                crate::panels::PanelAction::PreviewMail { pid, id } => {
+                crate::panels::PanelAction::Preview { pid, target } => {
                     // Straight through, no pacing. A preview costs ~0.2 ms —
                     // one small transaction over a handful of UI rows, on a
                     // WAL store with `synchronous=NORMAL`, coalescing into the
@@ -5191,19 +5191,10 @@ impl Stage {
                     // them would only put a delay between the cursor and what
                     // it is pointing at, and could land a stale focus restore
                     // on top of a cmd+arrow the user has since pressed.
-                    self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
-                }
-                crate::panels::PanelAction::Preview { pid, target } => {
                     self.resolve_click(cx, Act::Preview(pid, target), false);
                 }
-                crate::panels::PanelAction::SelectMail { .. } => {}
-                crate::panels::PanelAction::OpenJob { pid, id, fresh } => {
-                    self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), fresh);
-                }
-                crate::panels::PanelAction::PreviewJob { pid, id } => {
-                    self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
-                }
-                crate::panels::PanelAction::SelectJob { .. } => {}
+                // Panel-internal: the list itself listens for this one.
+                crate::panels::PanelAction::Select { .. } => {}
                 crate::panels::PanelAction::FollowLink {
                     pid,
                     target,
@@ -5220,7 +5211,10 @@ impl Stage {
                             ui::preview_kind(&k).map(|_| p)
                         });
                         if let Some(p) = driver {
-                            cx.action(crate::panels::PanelAction::SelectMail { pid: p, id: *id });
+                            cx.action(crate::panels::PanelAction::Select {
+                                pid: p,
+                                target: Kind::Message { id: *id },
+                            });
                         }
                     }
                     let act = if dotted {
@@ -7271,7 +7265,7 @@ impl Stage {
                                 reg.push((
                                     t.topic.clone(),
                                     r,
-                                    Act::WidgetOp(pid, WidgetOp::OpenMail(t.target)),
+                                    Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id: t.target })),
                                 ));
                             }
                         }
@@ -7407,7 +7401,11 @@ impl Stage {
                 // name it the same way. Touching it previews the job.
                 let panel = w.as_effects_panel();
                 for h in panel.row_hits(cx) {
-                    reg.push((h.label, h.rect, Act::WidgetOp(pid, WidgetOp::OpenJob(h.id))));
+                    reg.push((
+                        h.label,
+                        h.rect,
+                        Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Job { id: h.id })),
+                    ));
                 }
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
@@ -7456,8 +7454,9 @@ impl Stage {
                 for (label, r, target) in panel.crumb_hits(cx) {
                     reg.push((label, r, Act::Replace(pid, target)));
                 }
-                // The rows: a directory opens as a column, a file as a
-                // card — joined, the solid-link rule. Addressed by name.
+                // The rows: a directory previews as a column, a file as a
+                // card — the one row-click move, so the list keeps the
+                // keyboard and `enter` is what goes. Addressed by name.
                 if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
                     for (idx, item) in list.items().iter() {
                         let r = item.widget.area().rect(cx);
@@ -7466,7 +7465,11 @@ impl Stage {
                                 panel.row_at(&state.store, *idx),
                                 panel.target_at(&state.store, *idx),
                             ) {
-                                reg.push((e.label(), r, Act::Open(pid, target)));
+                                reg.push((
+                                    e.label(),
+                                    r,
+                                    Act::WidgetOp(pid, WidgetOp::OpenRow(target)),
+                                ));
                             }
                         }
                     }

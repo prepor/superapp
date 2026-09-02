@@ -142,8 +142,10 @@ impl FileKind {
     }
 }
 
-/// Which decoder a picture wants, off its name; `None` for what the card
-/// cannot draw.
+/// Which decoder a picture *probably* wants, off its name — enough to
+/// decide whether to read the file at all. What actually decodes it is
+/// [`sniff`], on the bytes: a name lies often enough (a PNG saved as
+/// `.jpg`) that trusting it would leave a picture unshown.
 #[must_use]
 pub fn image_format(name: &str) -> Option<ImageFormat> {
     match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
@@ -158,6 +160,19 @@ pub fn image_format(name: &str) -> Option<ImageFormat> {
 pub enum ImageFormat {
     Png,
     Jpeg,
+}
+
+/// What these bytes actually are, by their magic: PNG's signature, a
+/// JPEG's `FF D8 FF`. The card decodes by this, never by the name.
+#[must_use]
+pub fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageFormat::Jpeg)
+    } else {
+        None
+    }
 }
 
 /// A picture's `(width, height)` in pixels off its header alone — the
@@ -1005,6 +1020,13 @@ mod tests {
         assert_eq!(FileKind::of_name("Lease.tla"), FileKind::Text);
         assert_eq!(image_format("a.jpeg"), Some(ImageFormat::Jpeg));
         assert_eq!(image_format("a.gif"), None);
+        // What decodes is the bytes' own account of themselves: the demo
+        // tree's `.jpg` is a PNG, and it draws.
+        let icon = include_bytes!("../resources/icon_256.png");
+        assert_eq!(sniff(icon), Some(ImageFormat::Png));
+        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(ImageFormat::Jpeg));
+        assert_eq!(sniff(b"GIF89a"), None);
+        assert_eq!(sniff(&demo::bytes_of("~/Downloads/2026/photo-lisbon.jpg").unwrap()), Some(ImageFormat::Png));
         // The card's wish reads a picture's size off its header alone.
         let icon = include_bytes!("../resources/icon_256.png");
         assert_eq!(image_size(icon), Some((256, 256)));
