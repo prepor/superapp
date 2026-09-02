@@ -341,7 +341,7 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
     // breaking ties.
     let mut cols: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
     let mut row = vec![0usize; n];
-    for l in 0..n_layers {
+    for (l, col) in cols.iter_mut().enumerate() {
         let mut members: Vec<usize> = (0..n).filter(|&i| layer[i] == l).collect();
         let key = |i: usize| {
             edges
@@ -355,7 +355,7 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
         for (r, &i) in members.iter().enumerate() {
             row[i] = r;
         }
-        cols[l] = members;
+        *col = members;
     }
 
     // Row bands across the block: a row's caption block is as tall as

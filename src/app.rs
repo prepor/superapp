@@ -5042,7 +5042,9 @@ impl Widget for Stage {
                 // A replaying mount ticks whenever the canvas hands it a
                 // frame: the canvas decides which mount replays when, so
                 // the frame it asked for may long since have gone by.
-                if !ne.set.contains(&self.next_frame) && !(self.mount && self.e2e.is_some()) {
+                let asked = ne.set.contains(&self.next_frame);
+                let replaying_mount = self.mount && self.e2e.is_some();
+                if !(asked || replaying_mount) {
                     return;
                 }
                 // Virtual time: one draw cycle is one e2e tick of exactly
@@ -5097,7 +5099,7 @@ impl Widget for Stage {
                                 self.pump_if_due(&state);
                             } else {
                                 self.frame += 1;
-                                if self.frame % PUMP_EVERY == 0 {
+                                if self.frame.is_multiple_of(PUMP_EVERY) {
                                     state.pump_round();
                                 }
                             }
