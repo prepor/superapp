@@ -22,17 +22,17 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/theme.rs` | the look: sizes and colours | no |
 | `src/e2e.rs` | e2e script grammar + runner state | no |
 | `src/mac.rs` | screen geometry, activation, window screenshots | no (apple-sys) |
-| `src/panels.rs` | retained panel widgets (CR-002) | yes |
+| `src/panels.rs` | retained panel widgets | yes |
 | `src/app.rs` | the makepad shell: drawing, events, animation | yes |
 
 Everything above `panels` is std-only and unit-tested without opening a
-window. `src/data.rs` retired into the store's seed in CR-001.
+window.
 
 ## The world
 
-`World` (CR-004) is the one handle to everything outside the pure core: the
-store, the outside (`Real` / `Fake` / `Deny`), the effect registry. It is a
-value you construct, never a global — the UI thread owns one, and each
+`World` is the one handle to everything outside the pure core: the store,
+the outside (`Real` / `Fake` / `Deny`), the effect registry. It is a value
+you construct, never a global — the UI thread owns one, and each
 worker thread builds its own. That is what lets a whole app instance exist
 in memory, which is what makes tests isolated and parallel. See [The Data
 Substrate](./data-substrate.md).

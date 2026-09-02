@@ -4,8 +4,8 @@ Every list panel is the same engine over a different **datasource**: the
 inbox today, feeds and calendar events when they arrive. The engine
 (`src/richtable.rs`, std-only) owns a **filter** and a **paging window**
 and holds no rows; the panel widget draws what the engine hands it. The
-design is CR-006, a port of stelaxis's rich table with the paging rebuilt
-for an in-process store.
+design is a port of stelaxis's rich table, with the paging rebuilt for an
+in-process store.
 
 ## Datasources
 
@@ -24,10 +24,10 @@ A source may declare a **group key**, and then a row is a group: the
 columns are aggregates over its members, the page reads off the grouped
 subquery, and the filter becomes a membership test — a group matches when
 **any** member matches, and its aggregates always cover the whole group.
-The inbox is such a source (CR-007): its rows are threads, grouped by
+The inbox is such a source: its rows are threads, grouped by
 `message.thread` over the inbox messages, so `@from:vera` finds the
-conversations Vera wrote in and still shows everyone in them, and
-`@unread` finds the ones with unread mail.
+conversations Vera wrote in and still shows everyone in them, and `@unread`
+finds the ones with unread mail.
 The **SQL builder** completes that with the filter's `WHERE`, the page and
 the rank. A built query goes through the store's cache, dependency capture
 and trace exactly like a `static` one (`Store::rows_sql`), so a page is

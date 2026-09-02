@@ -28,6 +28,6 @@ change is done, pushed at the *start* of the work and shrinking as it lands.
 A CR is scaffolding, not a record. When the work lands, everything of it that
 still matters is *in the book* — so the CR is **deleted** in the same change,
 and `docs/planning/` holds only what is in flight. Git keeps the reasoning for
-anyone who wants it; the book keeps the decision. The `CR-00n` labels scattered
-through the book and the source are pointers into that history, not into a file
-you will find on disk.
+anyone who wants it; the book keeps the decision, and does not name the CR
+that carried it. A chapter that says *when* something changed, or what it
+replaced, has stopped describing the current state.

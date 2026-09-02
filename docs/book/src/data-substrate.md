@@ -4,8 +4,8 @@ One SQLite file holds **all** durable data — the mail *and* the UI: which
 panels are open, where, joined to what, focused on which workspace. `sqlite3
 "~/Library/Application Support/superapp/superapp.db"` shows your session as
 rows; that inspectability is a feature, not a debugging aid. The design is
-CR-001 and CR-004, rel.systems' idioms brought in-process: single writer,
-WAL, hook-driven change capture, and side effects as rows.
+rel.systems' idioms brought in-process: single writer, WAL, hook-driven
+change capture, and side effects as rows.
 
 ## Three write paths
 
@@ -76,21 +76,20 @@ job, then fetches and reconciles facts.
 Reconciliation never fights the user: divergent intent is pushed over the
 server, never clobbered by it (deletion is the one place the server wins).
 
-**Threads** are decided at ingest, in the transaction that stores the mail
-(CR-007). `message.thread` is the id of the conversation's lowest member —
-an anchor, not a root; no row is the parent of another, and what a thread
-*has* is a `GROUP BY` at read time. A `reference` table keeps one row per
-id in a mail's `References` and `In-Reply-To`, and threading is the union of
-three lookups over the account: mails my references name, mails whose
+**Threads** are decided at ingest, in the transaction that stores the mail.
+`message.thread` is the id of the conversation's lowest member — an anchor,
+not a root; no row is the parent of another, and what a thread *has* is a
+`GROUP BY` at read time. A `reference` table keeps one row per id in a
+mail's `References` and `In-Reply-To`, and threading is the union of three
+lookups over the account: mails my references name, mails whose
 references name me (the parent arrived late — Sent syncs after Inbox, or it
 is below the window), and mails whose references share an id with mine
 (two GitHub comments under an issue mail that never arrived). Whatever they
 find merges into one anchor; nothing found, and the mail anchors itself. No
-subject heuristic. The schema migration re-parsed every mail's raw bytes to
-thread what was already here, and a reply of yours carries the parent's
-whole `References` chain so it threads for the other side too. A mail
-present twice in an account — your reply, in Sent and back through a list —
-is one message to the panel.
+subject heuristic. A reply of yours carries the parent's whole `References`
+chain, so it threads for the other side too. A mail present twice in an
+account — your reply, in Sent and back through a list — is one message to
+the panel.
 And because `server_msg` lives outside the undo world, undoing an
 already-pushed archive needs no compensation machinery at all — intent
 flips back, the next pass moves the mail back. A moved mail whose new uid
@@ -155,11 +154,11 @@ the draft. The launcher's *new mail* root opens a blank compose.
   blink, where the camera is mid-slide. The line: *if losing it in a crash
   would annoy you, it belongs in the store.* Layout, focus, filters — in.
   Motion — out, re-derived at boot.
-- **History.** The undo tree is in memory (CR-004), so it dies with the
-  process. A node is a layout snapshot plus its claims on the world; the
-  claims are in memory too, and never serialized. What survives is the row
-  each one wrote — which is all the background passes ever read, and why a
-  restart loses undo but never loses work. See [Interaction
+- **History.** The undo tree is in memory, so it dies with the process. A
+  node is a layout snapshot plus its claims on the world; the claims are in
+  memory too, and never serialized. What survives is the row each one wrote
+  — which is all the background passes ever read, and why a restart loses
+  undo but never loses work. See [Interaction
   Grammar](./interaction-grammar.md).
 - **Secrets**: the macOS keychain (android: an app-private file until a
   Keystore binding exists), never this file — it is meant to be handed to
