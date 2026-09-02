@@ -98,6 +98,14 @@ pub(crate) fn no_draw() -> bool {
     config().no_draw
 }
 
+/// `SUPERAPP_FRAME_LOG=1`: every frame's draw cost, and every event that
+/// took over a millisecond, on stderr — for finding out where a window
+/// spends its time. Read once: it is on the paint path.
+pub(crate) fn frame_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUPERAPP_FRAME_LOG").is_some())
+}
+
 /// The scene names `--library` asked for (none: every scene), when it did.
 pub(crate) fn library_filter() -> Option<&'static [String]> {
     config().library.as_deref()
@@ -5121,9 +5129,19 @@ impl Widget for Stage {
         self.hits.clear();
         let mut state = self.state.take();
         if let Some(state) = state.as_deref_mut() {
+            let t0 = frame_log().then(Instant::now);
             match self.solo {
                 Some(pid) => self.draw_solo(cx, state, vp, pid),
                 None => self.draw_scene(cx, state, vp),
+            }
+            if let Some(t0) = t0 {
+                eprintln!(
+                    "{}: draw {:.2} ms, {} panels, {} hits",
+                    if self.mount { "mount" } else { "superapp" },
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    state.ws.panels.len(),
+                    self.hits.len()
+                );
             }
             if !self.reported && !self.mount {
                 self.reported = true;

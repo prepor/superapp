@@ -303,6 +303,14 @@ pub struct Library {
     /// the zoom to settle — so keep the frames coming.
     #[rust]
     more_work: bool,
+    /// What the last draw spent inside mounts' own draws, and how many it
+    /// rendered — the frame log's numbers.
+    #[rust]
+    mount_ms: f64,
+    #[rust]
+    renders: usize,
+    #[rust]
+    last_draw: Option<std::time::Instant>,
 }
 
 impl ScriptHook for Library {
@@ -1221,12 +1229,14 @@ impl Library {
         let helper = self.draw_flat.area();
 
         if render {
+            let t0 = std::time::Instant::now();
             let walk = Walk::abs_rect(Rect {
                 pos: dvec2(0.0, 0.0),
                 size,
             });
             self.mounts[i].dpi = dpi;
             self.mounts[i].pending = false;
+            self.renders += 1;
             let props = self.overlay_props(i);
             cx.make_child_pass(&mp.pass);
             cx.begin_pass(&mp.pass, Some(dpi));
@@ -1260,6 +1270,15 @@ impl Library {
             }
             mp.list.end(cx);
             cx.end_pass(&mp.pass);
+            self.mount_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            if app::frame_log() && self.entered == Some(i) {
+                eprintln!(
+                    "library: entered mount rendered at {:.0}×{:.0} px (dpi {:.2})",
+                    size.x * dpi,
+                    size.y * dpi,
+                    dpi
+                );
+            }
         }
         cx.set_pass_area_with_origin(&mp.pass, helper, dvec2(0.0, 0.0));
         if visible {
@@ -1505,6 +1524,24 @@ impl Library {
     }
 }
 
+/// An event's name, for the frame log.
+fn event_kind(e: &Event) -> &'static str {
+    match e {
+        Event::NextFrame(_) => "next-frame",
+        Event::KeyDown(_) => "key-down",
+        Event::KeyUp(_) => "key-up",
+        Event::TextInput(_) => "text",
+        Event::MouseDown(_) => "mouse-down",
+        Event::MouseMove(_) => "mouse-move",
+        Event::MouseUp(_) => "mouse-up",
+        Event::Scroll(_) => "scroll",
+        Event::Timer(_) => "timer",
+        Event::Signal => "signal",
+        Event::Actions(_) => "actions",
+        _ => "other",
+    }
+}
+
 impl Widget for Library {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         if matches!(event, Event::Startup) {
@@ -1513,6 +1550,50 @@ impl Widget for Library {
         if !self.booted {
             return;
         }
+        let t0 = app::frame_log().then(std::time::Instant::now);
+        self.handle(cx, event);
+        if let Some(t0) = t0 {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if ms > 1.0 {
+                eprintln!(
+                    "library: event {} took {:.2} ms (entered {:?})",
+                    event_kind(event),
+                    ms,
+                    self.entered
+                );
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        let t0 = app::frame_log().then(std::time::Instant::now);
+        self.mount_ms = 0.0;
+        self.renders = 0;
+        let step = self.draw(cx, walk);
+        if let Some(t0) = t0 {
+            if self.booted {
+                let since = self
+                    .last_draw
+                    .map_or(0.0, |t| (t0 - t).as_secs_f64() * 1000.0);
+                self.last_draw = Some(t0);
+                eprintln!(
+                    "library: frame {} (+{:.0} ms): draw {:.2} ms, {:.2} ms in {} mount render(s), zoom {:.3}, entered {:?}",
+                    self.frames,
+                    since,
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    self.mount_ms,
+                    self.renders,
+                    self.zoom(),
+                    self.entered
+                );
+            }
+        }
+        step
+    }
+}
+
+impl Library {
+    fn handle(&mut self, cx: &mut Cx, event: &Event) {
         match event {
             Event::NextFrame(ne) => {
                 if ne.set.contains(&self.next_frame) {
@@ -1640,7 +1721,7 @@ impl Widget for Library {
         }
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+    fn draw(&mut self, cx: &mut Cx2d, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, Layout::default());
         if !self.booted {
             cx.end_turtle_with_area(&mut self.area);

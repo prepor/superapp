@@ -297,3 +297,8 @@ scaled.
 scene's name or a node's (`scene/node`), and the canvas chords. A step
 that fails inside a node's replay is reported on stderr under the node's
 name and counts against the run.
+
+`SUPERAPP_FRAME_LOG=1` prints every frame's draw cost (the canvas's, and
+what was spent inside mount renders, with the interval since the last
+frame) and every event that took over a millisecond, for the library and
+the app alike — the first thing to read when a window feels slow.
