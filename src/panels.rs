@@ -3607,16 +3607,7 @@ impl KeyBtnRef {
     /// The label, its `accel` letter drawn bold where the label carries it.
     pub fn set(&self, cx: &mut Cx, text: &str, accel: Option<char>) {
         let Some(b) = self.borrow() else { return };
-        let at = accel.and_then(|c| ui::accel_idx(text, c));
-        let (pre, key, post) = match at {
-            Some(i) => {
-                let mut it = text.chars();
-                let pre: String = it.by_ref().take(i).collect();
-                let key: String = it.next().into_iter().collect();
-                (pre, key, it.collect::<String>())
-            }
-            None => (text.to_string(), String::new(), String::new()),
-        };
+        let (pre, key, post) = ui::split_accel(text, accel);
         for (id, s) in [(ids!(pre), pre), (ids!(key), key), (ids!(post), post)] {
             let l = b.view.label(cx, id);
             l.set_text(cx, &s);
@@ -3659,6 +3650,14 @@ impl Widget for MarkBar {
     }
 }
 
+/// The bar's buttons, in [`ui::MARK_VERBS`] order.
+const VERB_BTNS: [&[LiveId]; 4] = [
+    ids!(archive_btn),
+    ids!(delete_btn),
+    ids!(all_btn),
+    ids!(clear_btn),
+];
+
 impl MarkBarRef {
     /// The bar's buttons as drawn, `(label, rect, verb)` — the copy of the
     /// verbs the last draw showed, only the ones offered.
@@ -3670,15 +3669,9 @@ impl MarkBarRef {
             ids!(verbs_below)
         };
         let g = b.view.widget(cx, group);
-        let ids = [
-            ids!(archive_btn),
-            ids!(delete_btn),
-            ids!(all_btn),
-            ids!(clear_btn),
-        ];
         ui::MARK_VERBS
             .iter()
-            .zip(ids)
+            .zip(VERB_BTNS)
             .filter_map(|(v, id)| {
                 let btn = g.widget(cx, id);
                 let r = btn.area().rect(cx);
@@ -3710,22 +3703,17 @@ impl MarkBarRef {
         let h = b.view.label(cx, ids!(line.hidden_lbl));
         h.set_text(cx, &hid);
         h.set_visible(cx, hidden > 0);
-        let verbs: [(&str, Option<char>, bool); 4] = [
-            ("archive", Some('a'), true),
-            ("delete", Some('d'), true),
-            ("all", Some('l'), !all),
-            ("clear", None, true),
-        ];
-        let ids = [
-            ids!(archive_btn),
-            ids!(delete_btn),
-            ids!(all_btn),
-            ids!(clear_btn),
-        ];
+        // The labels and the letters come from the one table the
+        // accelerator rules are tested against — a button never advertises
+        // a key the chord dispatch does not answer to.
+        let verbs: Vec<(&'static str, Option<char>, bool)> = ui::MARK_VERBS
+            .iter()
+            .map(|v| (v.label(), v.accel(), *v != ui::MarkVerb::All || !all))
+            .collect();
         let groups: [&[LiveId]; 2] = [ids!(line.verbs_inline), ids!(verbs_below)];
         for g in groups {
             let group = b.view.widget(cx, g);
-            for (id, (text, accel, on)) in ids.iter().zip(verbs.iter()) {
+            for (id, (text, accel, on)) in VERB_BTNS.iter().zip(verbs.iter()) {
                 let btn = group.widget(cx, *id);
                 btn.as_key_btn().set(cx, text, *accel);
                 btn.set_visible(cx, *on);
@@ -3902,6 +3890,8 @@ impl InboxPanel {
     /// fresh panel, a filter just cleared — the top row is the row, the
     /// rule `enter` and the arrows already follow.
     fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
+        // Without a cursor the first row is the one meant, as it is for
+        // every other list key.
         let Some(m) = self
             .cursor_index(store)
             .or(Some(0))
@@ -3916,20 +3906,21 @@ impl InboxPanel {
     /// Shift+arrow: marks the cursor's row, steps, and marks the row it
     /// lands on — a range, by the keys the walk already uses.
     fn mark_and_step(&mut self, cx: &mut Cx, store: &Store, pid: u64, d: isize) {
-        let n = self.table.len(store);
-        if n == 0 {
-            return;
-        }
-        let from = self.cursor_index(store).unwrap_or(0);
-        if let Some(m) = self.table.row(store, from) {
-            self.marks.add(m.thread);
-        }
-        let to = (from as isize + d).clamp(0, n as isize - 1) as usize;
-        self.set_sel(cx, pid, store, to);
-        if let Some(m) = self.table.row(store, to) {
-            self.marks.add(m.thread);
-        }
+        self.mark_cursor_row(store);
+        self.move_sel(cx, store, pid, d);
+        self.mark_cursor_row(store);
         self.redraw(cx);
+    }
+
+    /// Marks the row the cursor stands on, if there is one to mark.
+    fn mark_cursor_row(&mut self, store: &Store) {
+        if let Some(m) = self
+            .cursor_index(store)
+            .or(Some(0))
+            .and_then(|i| self.table.row(store, i))
+        {
+            self.marks.add(m.thread);
+        }
     }
 }
 
@@ -5704,16 +5695,7 @@ impl SLinkRef {
         l.pid = pid;
         l.target = Some(target);
         l.dotted = dotted;
-        let at = accel.and_then(|c| ui::accel_idx(text, c));
-        let (pre, key, post) = match at {
-            Some(i) => {
-                let mut it = text.chars();
-                let pre: String = it.by_ref().take(i).collect();
-                let key: String = it.next().into_iter().collect();
-                (pre, key, it.collect::<String>())
-            }
-            None => (text.to_string(), String::new(), String::new()),
-        };
+        let (pre, key, post) = ui::split_accel(text, accel);
         // An empty label still reserves width, which would push the text
         // right of an underline that spans the whole row — so the unused
         // parts stand down entirely rather than render nothing.

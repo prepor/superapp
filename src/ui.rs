@@ -329,6 +329,22 @@ pub fn accel_idx(label: &str, accel: char) -> Option<usize> {
     label.chars().position(|c| c.eq_ignore_ascii_case(&accel))
 }
 
+/// A label split around its accelerator: what comes before the letter, the
+/// letter, and what follows. A control draws the three as its own labels,
+/// the middle one bold — the one place the design spends bold on a key, so
+/// the split is one function rather than one per control. A label that does
+/// not carry its key is all `pre`, and so draws no mark.
+#[must_use]
+pub fn split_accel(label: &str, accel: Option<char>) -> (String, String, String) {
+    let Some(i) = accel.and_then(|c| accel_idx(label, c)) else {
+        return (label.to_string(), String::new(), String::new());
+    };
+    let mut it = label.chars();
+    let pre: String = it.by_ref().take(i).collect();
+    let key: String = it.next().into_iter().collect();
+    (pre, key, it.collect())
+}
+
 // ---------------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------------
@@ -560,6 +576,26 @@ mod tests {
         assert_eq!(held.last().map(|(l, _)| *l), Some("move here"));
         let card = Kind::File { path: "~/a".into() };
         assert_eq!(head_btns_of(&card, None, false).len(), head_btns(&card).len());
+    }
+
+    #[test]
+    fn a_label_splits_around_its_key() {
+        assert_eq!(
+            split_accel("archive", Some('a')),
+            (String::new(), "a".into(), "rchive".into())
+        );
+        assert_eq!(
+            split_accel("add account", Some('d')),
+            ("a".into(), "d".into(), "d account".into())
+        );
+        // Case-insensitive, like `accel_idx`; a key the label does not
+        // carry leaves the label whole.
+        assert_eq!(split_accel("Reply", Some('r')).1, "R");
+        assert_eq!(
+            split_accel("clear", None),
+            ("clear".into(), String::new(), String::new())
+        );
+        assert_eq!(split_accel("clear", Some('z')).0, "clear");
     }
 
     #[test]

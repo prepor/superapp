@@ -665,6 +665,16 @@ pub fn thread_unread(store: &Store, id: MailId) -> Vec<MailId> {
         .collect()
 }
 
+/// Which folder a mail sits in now — read before filing it, so undo puts
+/// it back exactly there rather than guessing "the inbox".
+#[must_use]
+pub fn folder_of(store: &Store, id: MailId) -> i64 {
+    store
+        .conn()
+        .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap_or(0)
+}
+
 /// Which of a conversation's mails sit in the inbox — what filing it moves.
 pub fn thread_inbox(store: &Store, id: MailId) -> Vec<MailId> {
     store

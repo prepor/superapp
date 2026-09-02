@@ -4517,6 +4517,121 @@ impl Stage {
         self.sync(cx);
     }
 
+    /// Files a set of inbox mails: the pipeline both triage paths share —
+    /// a row's own verb ([`Stage::triage`]) and the marks bar's, over a set.
+    ///
+    /// `next` is the mail the cursor should land on once these are gone and
+    /// the panel doing the walking: its preview opens inside the same node,
+    /// so one ⌘z takes the filing and the move together. Answers whether the
+    /// action was recorded — a read-only follower's write is refused (CR-005)
+    /// and then nothing happened to report.
+    fn file_mails(
+        &mut self,
+        cx: &mut Cx,
+        ids: &[core::MailId],
+        next: Option<(PanelId, core::MailId)>,
+        delete: bool,
+        label: String,
+    ) -> bool {
+        let verb = if delete { "delete" } else { "archive" };
+        let role = if delete { "trash" } else { "archive" };
+        let Some(state) = self.state.as_deref_mut() else {
+            return false;
+        };
+        // Where each lives now, so undo puts every one back exactly there
+        // rather than guessing "the inbox".
+        let from: Vec<(core::MailId, i64)> = ids
+            .iter()
+            .map(|&m| (m, mail::folder_of(&state.store, m)))
+            .collect();
+        let mut readers: Vec<PanelId> = Vec::new();
+        for m in ids {
+            for r in state.ws.showing(&Kind::Message { id: *m }) {
+                if !readers.contains(&r) {
+                    readers.push(r);
+                }
+            }
+        }
+        // The successor's preview is an open like any other: measured first,
+        // so it is placed by the rows its thread actually wants — and it
+        // reads its thread, exactly as the walk would.
+        if let Some((_, nid)) = next {
+            state.wish_ahead(&Kind::Message { id: nid });
+        }
+        let next_marks: Vec<core::MailId> = next
+            .map(|(_, nid)| mail::thread_unread(&state.store, nid))
+            .unwrap_or_default();
+        let (ids_tx, marks_tx) = (ids.to_vec(), next_marks.clone());
+        let recorded = state
+            .act(
+                verb,
+                label,
+                None,
+                move |ws| {
+                    // The threads left the inbox, so their readers have
+                    // nothing left to read — on whichever workspace they
+                    // were opened.
+                    for r in readers {
+                        ws.close_anywhere(r);
+                    }
+                    // The walk survives filing the row it stood on: the
+                    // cursor moves to what stayed and its preview opens in
+                    // the same breath. Same action, so one ⌘z takes the
+                    // whole thing back.
+                    if let Some((pid, nid)) = next {
+                        let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
+                        ws.activate(child);
+                        ws.focus = Some(pid);
+                    }
+                },
+                move |tx| {
+                    for m in &ids_tx {
+                        if delete {
+                            mail::delete_tx(tx, *m)?;
+                        } else {
+                            mail::archive_tx(tx, *m)?;
+                        }
+                    }
+                    for m in &marks_tx {
+                        mail::mark_read_tx(tx, *m)?;
+                    }
+                    Ok(())
+                },
+                // Both halves of the action claim something back: the
+                // filing, and the read of whatever the cursor moved onto.
+                // One node, so one ⌘z reverses the pair in step.
+                next_marks
+                    .iter()
+                    .map(|m| {
+                        Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>
+                    })
+                    .chain(from.iter().map(|(m, f)| {
+                        Box::new(mail::Filed {
+                            mail: *m,
+                            from_folder: *f,
+                            role,
+                        }) as Box<dyn crate::history::Intent>
+                    }))
+                    .collect(),
+            )
+            .is_some();
+        if !recorded {
+            self.kick(cx);
+            return false;
+        }
+        if let Some((pid, nid)) = next {
+            let open: BTreeSet<core::MailId> =
+                next_marks.iter().copied().chain(std::iter::once(nid)).collect();
+            state.seed_expansion(nid, &open);
+            state.show_also = state.ws.joined_child(pid);
+            cx.action(crate::panels::PanelAction::Select {
+                pid,
+                target: Kind::Message { id: nid },
+            });
+        }
+        true
+    }
+
     /// Files a thread out of the inbox — archive or delete — from wherever
     /// the intent came: a message panel's header button, the chord an inbox
     /// borrowed from its preview, or an android row swipe. One door, so the
@@ -4549,101 +4664,19 @@ impl Stage {
         if !ids.contains(&id) {
             ids.push(id);
         }
-        // Where each lives now, so undo puts every one back exactly there
-        // rather than guessing "the inbox".
-        let from: Vec<(core::MailId, i64)> = ids
-            .iter()
-            .map(|&m| {
-                let f: i64 = state
-                    .store
-                    .conn()
-                    .query_row("SELECT folder FROM message WHERE id = ?1", [m], |r| r.get(0))
-                    .unwrap_or(0);
-                (m, f)
-            })
-            .collect();
-        let mut readers: Vec<PanelId> = Vec::new();
-        for m in &ids {
-            for r in state.ws.showing(&Kind::Message { id: *m }) {
-                if !readers.contains(&r) {
-                    readers.push(r);
-                }
-            }
-        }
-        // The successor's preview is an open like any other: measured first,
-        // so it is placed by the rows its thread actually wants — and it
-        // reads its thread, exactly as the walk would.
-        if let Some((_, nid)) = next {
-            state.wish_ahead(&Kind::Message { id: nid });
-        }
-        let next_marks: Vec<core::MailId> = next
-            .map(|(_, nid)| mail::thread_unread(&state.store, nid))
-            .unwrap_or_default();
         let n = ids.len();
-        let (ids_tx, marks_tx) = (ids.clone(), next_marks.clone());
-        state.act(
-            verb,
-            format!("{verb} “{topic}”"),
-            None,
-            move |ws| {
-                // The thread left the inbox, so its readers have nothing left
-                // to read — on whichever workspace they were opened.
-                for r in readers {
-                    ws.close_anywhere(r);
-                }
-                // The walk survives triaging the row it stood on: the cursor
-                // moves up one and its preview opens in the same breath. Same
-                // action, so one ⌘z takes the whole thing back.
-                if let Some((pid, nid)) = next {
-                    let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
-                    ws.activate(child);
-                    ws.focus = Some(pid);
-                }
-            },
-            move |tx| {
-                for m in &ids_tx {
-                    if delete {
-                        mail::delete_tx(tx, *m)?;
-                    } else {
-                        mail::archive_tx(tx, *m)?;
-                    }
-                }
-                for m in &marks_tx {
-                    mail::mark_read_tx(tx, *m)?;
-                }
-                Ok(())
-            },
-            // Both halves of the action claim something back: the filing, and
-            // the read of whatever the cursor moved onto. One node, so one
-            // ⌘z reverses the pair in step.
-            next_marks
-                .iter()
-                .map(|m| Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>)
-                .chain(from.iter().map(|(m, f)| {
-                    Box::new(mail::Filed {
-                        mail: *m,
-                        from_folder: *f,
-                        role,
-                    }) as Box<dyn crate::history::Intent>
-                }))
-                .collect(),
-        );
+        if !self.file_mails(cx, &ids, next, delete, format!("{verb} “{topic}”")) {
+            return;
+        }
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
         let what = if n > 1 {
             format!("{done} “{topic}” ({n} mails) — ⌘z undoes")
         } else {
             format!("{done} “{topic}” — ⌘z undoes")
         };
         state.toast(what, false);
-        if let Some((pid, nid)) = next {
-            let open: BTreeSet<core::MailId> =
-                next_marks.iter().copied().chain(std::iter::once(nid)).collect();
-            state.seed_expansion(nid, &open);
-            state.show_also = state.ws.joined_child(pid);
-            cx.action(crate::panels::PanelAction::Select {
-                pid,
-                target: Kind::Message { id: nid },
-            });
-        }
         self.sync(cx);
     }
 
@@ -4733,87 +4766,17 @@ impl Stage {
         }
         let gone: BTreeSet<i64> = filed.iter().copied().collect();
         // Decided first, while the rows are still in the list to have one.
-        let next = panel.survivor(&store, &gone);
+        let next = panel.survivor(&store, &gone).map(|nid| (pid, nid));
+        let (n_threads, n_mails) = (filed.len(), ids.len());
+        let noun = if n_threads == 1 { "conversation" } else { "conversations" };
+        if !self.file_mails(cx, &ids, next, delete, format!("{verb} {n_threads} {noun}")) {
+            // A read-only follower (CR-005) never got its node: the marks are
+            // still what they were, and nothing was filed to say otherwise.
+            return;
+        }
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        let from: Vec<(core::MailId, i64)> = ids
-            .iter()
-            .map(|&m| {
-                let f: i64 = state
-                    .store
-                    .conn()
-                    .query_row("SELECT folder FROM message WHERE id = ?1", [m], |r| r.get(0))
-                    .unwrap_or(0);
-                (m, f)
-            })
-            .collect();
-        let mut readers: Vec<PanelId> = Vec::new();
-        for m in &ids {
-            for r in state.ws.showing(&Kind::Message { id: *m }) {
-                if !readers.contains(&r) {
-                    readers.push(r);
-                }
-            }
-        }
-        if let Some(nid) = next {
-            state.wish_ahead(&Kind::Message { id: nid });
-        }
-        let next_marks: Vec<core::MailId> = next
-            .map(|nid| mail::thread_unread(&state.store, nid))
-            .unwrap_or_default();
-        let (n_threads, n_mails) = (filed.len(), ids.len());
-        let noun = if n_threads == 1 { "conversation" } else { "conversations" };
-        let (ids_tx, marks_tx) = (ids.clone(), next_marks.clone());
-        let recorded = state
-            .act(
-                verb,
-                format!("{verb} {n_threads} {noun}"),
-                None,
-                move |ws| {
-                    for r in readers {
-                        ws.close_anywhere(r);
-                    }
-                    if let Some(nid) = next {
-                        let child = ws.follow_open(pid, Kind::Message { id: nid }, false);
-                        ws.activate(child);
-                        ws.focus = Some(pid);
-                    }
-                },
-                move |tx| {
-                    for m in &ids_tx {
-                        if delete {
-                            mail::delete_tx(tx, *m)?;
-                        } else {
-                            mail::archive_tx(tx, *m)?;
-                        }
-                    }
-                    for m in &marks_tx {
-                        mail::mark_read_tx(tx, *m)?;
-                    }
-                    Ok(())
-                },
-                next_marks
-                    .iter()
-                    .map(|m| {
-                        Box::new(mail::MarkRead { mail: *m }) as Box<dyn crate::history::Intent>
-                    })
-                    .chain(from.iter().map(|(m, f)| {
-                        Box::new(mail::Filed {
-                            mail: *m,
-                            from_folder: *f,
-                            role,
-                        }) as Box<dyn crate::history::Intent>
-                    }))
-                    .collect(),
-            )
-            .is_some();
-        // A read-only follower (CR-005) never got its node: the marks are
-        // still what they were, and nothing was filed to say otherwise.
-        if !recorded {
-            self.kick(cx);
-            return;
-        }
         // The node carries the marks it consumed: context restored with the
         // delta, so ⌘z brings the rows back marked.
         state.history.claim_marks(pid, filed.clone());
@@ -4829,16 +4792,6 @@ impl Stage {
             format!("{done} {n_threads} {noun} — ⌘z undoes")
         };
         state.toast(what, false);
-        if let Some(nid) = next {
-            let open: BTreeSet<core::MailId> =
-                next_marks.iter().copied().chain(std::iter::once(nid)).collect();
-            state.seed_expansion(nid, &open);
-            state.show_also = state.ws.joined_child(pid);
-            cx.action(crate::panels::PanelAction::Select {
-                pid,
-                target: Kind::Message { id: nid },
-            });
-        }
         // What was filed is no longer a mark; what could not be stays one.
         panel.remove_marks(cx, &filed);
         self.sync(cx);
