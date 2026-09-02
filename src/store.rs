@@ -1625,6 +1625,8 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Problems => ("problems", None, None),
         Kind::Effects => ("effects", None, None),
         Kind::Job { id } => ("job", Some(*id), None),
+        Kind::Files { dir } => ("files", None, Some(dir.clone())),
+        Kind::File { path } => ("file", None, Some(path.clone())),
     }
 }
 
@@ -1650,6 +1652,8 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "problems" => Kind::Problems,
         "effects" => Kind::Effects,
         "job" => Kind::Job { id: p_int? },
+        "files" => Kind::Files { dir: p_txt? },
+        "file" => Kind::File { path: p_txt? },
         _ => return None,
     })
 }

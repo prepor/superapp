@@ -60,6 +60,17 @@ pub enum BtnAct {
     Send,
     Discard,
     TryIt,
+    /// A file card's `open`: hand the path to the OS (CR-008).
+    Open,
+    /// A files panel's `new dir`: the one-line field above the rows.
+    NewDir,
+    /// `copy` / `move`: **hold** the object the panel shows; nothing
+    /// touches the disk until a `… here`.
+    CopyHold,
+    MoveHold,
+    /// `copy here` / `move here`: perform the held item into the
+    /// directory this files panel shows.
+    Here,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +100,65 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
         // the same order compose puts discard and send in.
         Kind::Message { .. } => &[("archive", BtnAct::Archive), ("delete", BtnAct::Delete)],
         Kind::Compose { .. } => &[("send", BtnAct::Send), ("discard", BtnAct::Discard)],
+        // Every verb acts on the thing the panel shows — a card's on its
+        // file, a files panel's on its directory (CR-008). Reads
+        // "delete move copy new dir ×": the destructive one furthest from
+        // the corner, as on a message. A files panel wears the three
+        // object verbs only while it is joined under someone's cursor —
+        // see [`head_btns_of`]; this is the full set.
+        Kind::Files { .. } => &[
+            ("new dir", BtnAct::NewDir),
+            ("copy", BtnAct::CopyHold),
+            ("move", BtnAct::MoveHold),
+            ("delete", BtnAct::Delete),
+        ],
+        Kind::File { .. } => &[
+            ("open", BtnAct::Open),
+            ("copy", BtnAct::CopyHold),
+            ("move", BtnAct::MoveHold),
+            ("delete", BtnAct::Delete),
+        ],
         _ => &[],
     }
+}
+
+/// The button a files panel gains while something is held (CR-008):
+/// `copy here` or `move here`, naming what will happen. Drawn leftmost —
+/// past `delete` — so the contextual verb is the first thing read.
+#[must_use]
+pub fn hold_btn(op: crate::files::HoldOp) -> (&'static str, BtnAct) {
+    (op.here_label(), BtnAct::Here)
+}
+
+/// What one panel's header wears now: its kind's buttons, the held item's
+/// if one is held and the kind takes it, and — for a files panel — the
+/// object verbs only while it is the **end of a chain**: joined under a
+/// parent and driving nothing (CR-008).
+///
+/// The end of a chain is the thing under the cursor. A row previews the
+/// directory's own panel beside the list, and *that* panel wears `copy`,
+/// `move`, `delete` for the directory it shows, which the list borrows.
+/// A root, an un-joined files panel, or a list that is itself driving a
+/// preview is nobody's object right now, so it wears only `new dir`:
+/// `~` cannot be deleted, and a chord in a list never hits the directory
+/// the list itself shows — it hits what the cursor is on.
+///
+/// The shell asks this, never [`head_btns`] alone, so the width, the
+/// chords and the drawing agree.
+#[must_use]
+pub fn head_btns_of(
+    kind: &Kind,
+    hold: Option<crate::files::HoldOp>,
+    object: bool,
+) -> Vec<(&'static str, BtnAct)> {
+    let mut v: Vec<(&'static str, BtnAct)> = match kind {
+        Kind::Files { .. } if !object => vec![("new dir", BtnAct::NewDir)],
+        _ => head_btns(kind).to_vec(),
+    };
+    if let (Kind::Files { .. }, Some(op)) = (kind, hold) {
+        v.push(hold_btn(op));
+    }
+    v
 }
 
 /// The key a side-effect button carries.
@@ -103,6 +171,14 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
         BtnAct::Discard => Some('d'),
         // The help panel's demo button fires nothing worth a chord.
         BtnAct::TryIt => None,
+        BtnAct::Open => Some('o'),
+        BtnAct::NewDir => Some('n'),
+        // The `p` of "copy", not the `c`: a card's path is selectable, so
+        // cmd+c copies the path — the file clipboard is not the text
+        // clipboard (CR-008).
+        BtnAct::CopyHold => Some('p'),
+        BtnAct::MoveHold => Some('m'),
+        BtnAct::Here => Some('h'),
     }
 }
 
@@ -130,6 +206,12 @@ pub fn preview_kind(kind: &Kind) -> Option<Kind> {
     match kind {
         Kind::Inbox { .. } => Some(Kind::Message { id: 0 }),
         Kind::Effects => Some(Kind::Job { id: 0 }),
+        // A files list previews into the kind its row names — a directory
+        // as a column, a file as a card (CR-008). The placeholder is the
+        // card; the union test covers both children.
+        Kind::Files { .. } => Some(Kind::File {
+            path: String::new(),
+        }),
         _ => None,
     }
 }
@@ -189,6 +271,8 @@ pub enum FieldId {
     SetPass,
     SetImap,
     SetSmtp,
+    /// A files panel's `new dir` field (CR-008).
+    NewDir,
 }
 
 /// The fields a kind's form carries, in walk order. The widgets own the walk
@@ -205,6 +289,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
         Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
+        Kind::Files { .. } => &[FieldId::Filter, FieldId::NewDir],
         _ => &[],
     }
 }
@@ -236,7 +321,33 @@ mod tests {
             },
             Kind::Effects,
             Kind::Job { id: 1 },
+            Kind::Files { dir: "~".into() },
+            Kind::File {
+                path: "~/notes.md".into(),
+            },
         ]
+    }
+
+    /// A files panel holding something shows one more button; the union
+    /// has to obey the rules like any header.
+    #[test]
+    fn the_held_button_collides_with_nothing() {
+        for op in [crate::files::HoldOp::Copy, crate::files::HoldOp::Move] {
+            let k = Kind::Files { dir: "~".into() };
+            let btns = head_btns_of(&k, Some(op), true);
+            assert_eq!(btns.len(), head_btns(&k).len() + 1);
+            let mut seen = Vec::new();
+            for (label, act) in &btns {
+                let c = btn_accel(*act).expect("every files button has a chord");
+                assert!(!RESERVED.contains(&c) && !TEXT_CHORDS.contains(&c), "{label}: cmd+{c}");
+                assert!(!seen.contains(&c), "{label}: cmd+{c} twice");
+                assert!(accel_idx(label, c).is_some(), "“{label}” cannot show its key {c}");
+                seen.push(c);
+            }
+            // A card never grows the button: it is not a destination.
+            let card = Kind::File { path: "~/a".into() };
+            assert_eq!(head_btns_of(&card, Some(op), true).len(), head_btns(&card).len());
+        }
     }
 
     // The four rules of CR-003, held by test rather than by discipline.
@@ -287,24 +398,57 @@ mod tests {
     /// union of the two sets. That union has to obey the same rules a single
     /// panel does — otherwise a borrowed chord could shadow a reserved one,
     /// or two visible controls could answer to the same key.
+    ///
+    /// One allowance (CR-008): a driver and its preview may share a key
+    /// for the **same verb** — a files list and the directory it previews
+    /// both wear `copy`. The driver's wins, and the shell draws the
+    /// preview's mark plain while it is shadowed, so no visible bold
+    /// letter lies. Two *different* verbs on one key stay forbidden.
     #[test]
     fn a_preview_lends_without_colliding_with_its_driver() {
         for k in every_kind() {
             let Some(child) = preview_kind(&k) else {
                 continue;
             };
-            let mut seen: Vec<(char, &'static str)> = accels(&k);
-            for (c, what) in accels(&child) {
-                assert!(
-                    !RESERVED.contains(&c),
-                    "{k:?} would borrow cmd+{c} for {what}, but the workspace owns it"
-                );
-                if let Some((_, mine)) = seen.iter().find(|(s, _)| *s == c) {
-                    panic!("{k:?} claims cmd+{c} for {mine}, so its preview cannot lend {what}");
+            // A files list previews into a card or another list.
+            let children: Vec<Kind> = match k {
+                Kind::Files { .. } => vec![child, Kind::Files { dir: "~/x".into() }],
+                _ => vec![child],
+            };
+            for child in children {
+                let mut seen: Vec<(char, &'static str)> = accels(&k);
+                for (c, what) in accels(&child) {
+                    assert!(
+                        !RESERVED.contains(&c),
+                        "{k:?} would borrow cmd+{c} for {what}, but the workspace owns it"
+                    );
+                    if let Some((_, mine)) = seen.iter().find(|(s, _)| *s == c) {
+                        assert_eq!(
+                            *mine, what,
+                            "{k:?} claims cmd+{c} for {mine}, so its preview cannot lend {what}"
+                        );
+                        continue;
+                    }
+                    seen.push((c, what));
                 }
-                seen.push((c, what));
             }
         }
+    }
+
+    /// A files panel wears the object verbs only at the end of a chain —
+    /// under a parent's cursor, driving nothing; a root, or a list that
+    /// is driving, wears `new dir` alone (CR-008).
+    #[test]
+    fn a_files_panel_wears_its_object_verbs_only_at_the_end_of_a_chain() {
+        let k = Kind::Files { dir: "~".into() };
+        let root: Vec<&str> = head_btns_of(&k, None, false).iter().map(|(l, _)| *l).collect();
+        assert_eq!(root, ["new dir"]);
+        let joined: Vec<&str> = head_btns_of(&k, None, true).iter().map(|(l, _)| *l).collect();
+        assert_eq!(joined, ["new dir", "copy", "move", "delete"]);
+        let held = head_btns_of(&k, Some(crate::files::HoldOp::Move), false);
+        assert_eq!(held.last().map(|(l, _)| *l), Some("move here"));
+        let card = Kind::File { path: "~/a".into() };
+        assert_eq!(head_btns_of(&card, None, false).len(), head_btns(&card).len());
     }
 
     #[test]

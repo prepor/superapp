@@ -129,6 +129,16 @@ pub enum Kind {
         /// The `effect` row.
         id: i64,
     },
+    /// One directory as a list (CR-008).
+    Files {
+        /// The directory, in display form (`~/Downloads`).
+        dir: String,
+    },
+    /// One file as a card (CR-008).
+    File {
+        /// The file's path, in display form.
+        path: String,
+    },
 }
 
 impl Kind {
@@ -152,6 +162,10 @@ impl Kind {
             Kind::Problems => (4, 3),
             Kind::Effects => (5, 6),
             Kind::Job { .. } => (4, 3),
+            // Four wide: the header carries five verbs, and three columns
+            // of `Files → Files → File` still fill a 12-grid.
+            Kind::Files { .. } => (4, 6),
+            Kind::File { .. } => (4, 3),
         }
     }
 }
@@ -1404,6 +1418,8 @@ mod tests {
                         Kind::Problems => "problems",
                         Kind::Effects => "effects",
                         Kind::Job { .. } => "job",
+                        Kind::Files { .. } => "files",
+                        Kind::File { .. } => "file",
                     })
                     .collect()
             })

@@ -19,6 +19,7 @@ use crate::core::Seed;
 use crate::effect::{self, Job};
 use crate::mail;
 use crate::richtable::{self, Completion, SqlSource, Suggestion, Table};
+use crate::files;
 use crate::store::Store;
 use crate::ui;
 
@@ -183,6 +184,15 @@ pub enum PanelAction {
         seed: crate::core::Seed,
         fresh: bool,
     },
+    /// A files panel's `new dir` field was submitted (CR-008). The draft
+    /// shell toasts; the effect and its undo arrive with the
+    /// implementation.
+    NewDir { pid: u64, dir: String, name: String },
+    /// A list's cursor landed on a row (CR-008): open what it names —
+    /// a directory as a column, a file as a card — joined beside the
+    /// list, and leave focus in the list. [`PanelAction::PreviewMail`]
+    /// for any kind.
+    Preview { pid: u64, target: crate::core::Kind },
 }
 
 script_mod! {
@@ -1389,6 +1399,204 @@ script_mod! {
             mod.widgets.SSection { text: "REPLY" }
             mod.widgets.SRule {}
             reply_txt := mod.widgets.SText { is_multiline: true }
+        }
+    }
+
+    // ---- files (CR-008, draft) ---------------------------------------------
+
+    /** One entry of a directory: the name (a directory wears its slash),
+        the size and the date at the right, on the columns the header
+        above them draws. */
+    mod.widgets.FilesLine = set_type_default() do #(FilesLine::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{left: 8, right: 8, top: 4, bottom: 4}
+        View {
+            width: Fill, height: Fit
+            flow: Down
+            name_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            }
+        }
+        View { width: 10, height: 1 }
+        View {
+            width: 60, height: Fit
+            align: Align{x: 1.0}
+            size_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fit, text: "", draw_text +: { color: #5a5a5a }
+            }
+        }
+        View { width: 12, height: 1 }
+        date_lbl := mod.widgets.SLabel {
+            padding: 0
+            width: Fit, text: "", draw_text +: { color: #909090 }
+        }
+    }
+
+    /** A files row: the line, its selected twin, a hairline. */
+    mod.widgets.FilesRow = set_type_default() do #(FilesRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        line := mod.widgets.FilesLine {}
+        line_sel := mod.widgets.FilesLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** A directory as a column (CR-008): where the panel stands as crumbs,
+        the filter, the `new dir` field while it is up, the header over
+        the rows, the status line under them. */
+    mod.widgets.FilesPanel = set_type_default() do #(FilesPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        // Every ancestor a dotted link — it replaces the panel with that
+        // directory in place — and the directory itself plain, last.
+        crumbs := View {
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            padding: Inset{left: 8, right: 8, bottom: 8}
+            c0 := mod.widgets.SLink {}
+            s0 := mod.widgets.SLabel { padding: 0, text: " / ", draw_text +: { color: #909090 } }
+            c1 := mod.widgets.SLink {}
+            s1 := mod.widgets.SLabel { padding: 0, text: " / ", draw_text +: { color: #909090 } }
+            c2 := mod.widgets.SLink {}
+            s2 := mod.widgets.SLabel { padding: 0, text: " / ", draw_text +: { color: #909090 } }
+            c3 := mod.widgets.SLink {}
+            s3 := mod.widgets.SLabel { padding: 0, text: " / ", draw_text +: { color: #909090 } }
+            here_lbl := mod.widgets.SLabel { padding: 0, text: "" }
+        }
+        filter_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "filter…  ( / )   @ for tags"
+            return_key_type: ReturnKeyType.Search
+            autocapitalize: AutoCapitalize.None
+            autocorrect: AutoCorrect.Disabled
+        }
+        err_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            margin: Inset{left: 8, top: 4}
+            text: "", draw_text +: { color: #a01500 }
+        }
+        // The `new dir` field: up while the button asked for it; enter
+        // creates, esc puts it away.
+        newdir := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            margin: Inset{top: 6}
+            mod.widgets.SSection { width: 82, text: "NEW DIR" }
+            newdir_input := mod.widgets.SField {
+                empty_text: "name"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
+        View { width: Fill, height: 6 }
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
+            View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { padding: 0, text: "NAME" }
+            }
+            View { width: 10, height: 1 }
+            View {
+                width: 60, height: Fit
+                align: Align{x: 1.0}
+                mod.widgets.SSection { padding: 0, width: Fit, text: "SIZE" }
+            }
+            View { width: 12, height: 1 }
+            mod.widgets.SSection { padding: 0, width: Fit, text: "MODIFIED" }
+        }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            reuse_items: true
+            row := mod.widgets.FilesRow {}
+        }
+        // A refused verb, a directory that is gone: the one colour
+        // errors get.
+        status_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            margin: Inset{left: 8, top: 6}
+            text: "", draw_text +: { color: #a01500 }
+        }
+        suggest: mod.widgets.SuggestBox {}
+    }
+
+    /** A file as a card (CR-008): name, kind and size, when it changed,
+        the path selectable, and under a rule the preview — text or a
+        picture; anything else says so. */
+    mod.widgets.FilePanel = set_type_default() do #(FilePanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 6
+
+        name_lbl := mod.widgets.SBoldLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
+        }
+        kind_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #5a5a5a } }
+        when_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+        path_txt := mod.widgets.SText { text: "" }
+        mod.widgets.SRule {}
+        // A text input carries no `visible` either; its box does.
+        text_box := View {
+            visible: false
+            width: Fill, height: Fill
+            text_prev := mod.widgets.SText {
+                width: Fill, height: Fill
+                is_multiline: true
+            }
+        }
+        // `Image` carries no `visible` of its own, so the box around it
+        // is what shows and hides the picture.
+        img_box := View {
+            visible: false
+            width: Fill, height: Fit
+            img_prev := mod.widgets.Image {
+                width: Fill, height: Fit
+                fit: ImageFit.Horizontal
+            }
+        }
+        none_lbl := mod.widgets.SLabel {
+            visible: false
+            text: "no preview — open shows it"
+            draw_text +: { color: #909090 }
         }
     }
 
@@ -3800,6 +4008,556 @@ impl Widget for EffectsPanel {
         self.ac
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
         DrawStep::done()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Files (CR-008, draft)
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FilesLine {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for FilesLine {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl FilesLineRef {
+    pub fn populate(&self, cx: &mut Cx, e: &files::Entry) {
+        let Some(inner) = self.borrow() else { return };
+        inner.view.label(cx, ids!(name_lbl)).set_text(cx, &e.label());
+        let size = if e.is_dir { "—".to_string() } else { files::fmt_size(e.size) };
+        inner.view.label(cx, ids!(size_lbl)).set_text(cx, &size);
+        inner
+            .view
+            .label(cx, ids!(date_lbl))
+            .set_text(cx, &mail::fmt_date(e.modified));
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FilesRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for FilesRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        // Clicks resolve through the shell's registered rects, as an
+        // inbox row's do; the row's share is the hand.
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.area()) {
+            cx.set_cursor(MouseCursor::Hand);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl FilesRowRef {
+    pub fn populate(&self, cx: &mut Cx, e: &files::Entry, selected: bool) {
+        let Some(row) = self.borrow() else { return };
+        let line = row.view.widget(cx, ids!(line));
+        let line_sel = row.view.widget(cx, ids!(line_sel));
+        line.as_files_line().populate(cx, e);
+        line_sel.as_files_line().populate(cx, e);
+        line.set_visible(cx, !selected);
+        line_sel.set_visible(cx, selected);
+    }
+}
+
+/// The files panel's table: the shared engine over one directory.
+type FilesTable = Table<files::DirSource>;
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FilesPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The filter's autocomplete box, drawn over the rows last.
+    #[live]
+    suggest: View,
+    /// The rich table over the directory the panel's params name; a
+    /// replace onto another directory swaps the source.
+    #[rust(Table::new(files::DirSource::new(files::HOME), files::PAGE))]
+    table: FilesTable,
+    /// The cursor: the entry's name, and the row it sat on.
+    #[rust]
+    sel: Option<(String, usize)>,
+    #[rust]
+    ac: Suggest<FilesTable>,
+    /// What the panel could not do, until the next verb.
+    #[rust]
+    status: Option<String>,
+    /// The `new dir` field is up.
+    #[rust]
+    newdir_open: bool,
+    /// The `new dir` field wants the keyboard once it has been drawn in
+    /// place — focus set on a field with no area yet lands nowhere.
+    #[rust]
+    focus_pending: bool,
+    /// The hidden field has been drawn once (see `draw_walk`): a
+    /// never-drawn TextInput has `Area::Empty`, and makepad's
+    /// `has_key_focus(Area::Empty)` is *true* whenever nothing has focus —
+    /// so the phantom would clear the focus the filter just took on the
+    /// mouse-up it still receives (only mouse-down is gated on
+    /// visibility).
+    #[rust]
+    primed: bool,
+}
+
+impl FilesPanel {
+    fn dir_of(scope: &Scope) -> Option<String> {
+        match scope.props.get::<PanelProps>().map(|p| &p.kind) {
+            Some(crate::core::Kind::Files { dir }) => Some(dir.clone()),
+            _ => None,
+        }
+    }
+
+    /// Follows the panel's params: a crumb replaced it onto an ancestor,
+    /// or a preview re-aimed it. The filter and the cursor start over.
+    fn sync_dir(&mut self, dir: &str) {
+        if self.table.source().dir != dir {
+            self.table = Table::new(files::DirSource::new(dir), files::PAGE);
+            self.sel = None;
+            self.status = None;
+        }
+    }
+
+    fn sync_filter(&mut self, cx: &mut Cx) {
+        let text = self.view.text_input(cx, ids!(filter_input)).text();
+        if self.table.set_filter(&text) {
+            self.sel = None;
+        }
+    }
+
+    /// Where the cursor stands: the remembered row if it still holds the
+    /// name, else the name's row, else the row clamped into the table.
+    fn cursor_index(&self, store: &Store) -> Option<usize> {
+        let (name, idx) = self.sel.as_ref()?;
+        if self.table.row(store, *idx).is_some_and(|e| &e.name == name) {
+            return Some(*idx);
+        }
+        let n = self.table.len(store);
+        (0..n)
+            .find(|&i| self.table.row(store, i).is_some_and(|e| &e.name == name))
+            .or_else(|| (n > 0).then(|| (*idx).min(n - 1)))
+    }
+
+    /// Puts the cursor on row `i` and previews what it names — every
+    /// cursor move goes through here, so walking and previewing can never
+    /// disagree (the inbox's rule).
+    fn set_sel(&mut self, cx: &mut Cx, pid: u64, store: &Store, i: usize) {
+        let Some(e) = self.table.row(store, i) else { return };
+        let target = Self::target_of(&self.table.source().dir, &e);
+        self.sel = Some((e.name, i));
+        let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let visible = list
+            .borrow()
+            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == i));
+        if !visible {
+            list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
+        }
+        cx.action(PanelAction::Preview { pid, target });
+        self.redraw(cx);
+    }
+
+    fn move_sel(&mut self, cx: &mut Cx, pid: u64, store: &Store, d: isize) {
+        let n = self.table.len(store);
+        if n == 0 {
+            return;
+        }
+        let i = match self.cursor_index(store) {
+            Some(i) => (i as isize + d).clamp(0, n as isize - 1) as usize,
+            None => 0,
+        };
+        self.set_sel(cx, pid, store, i);
+    }
+
+    /// The kind a row opens: a directory as a column, a file as a card.
+    fn target_of(dir: &str, e: &files::Entry) -> crate::core::Kind {
+        let path = files::join(dir, &e.name);
+        if e.is_dir {
+            crate::core::Kind::Files { dir: path }
+        } else {
+            crate::core::Kind::File { path }
+        }
+    }
+
+    fn close_newdir(&mut self, cx: &mut Cx) {
+        self.newdir_open = false;
+        self.view.view(cx, ids!(newdir)).set_visible(cx, false);
+        cx.set_key_focus(Area::Empty);
+        self.redraw(cx);
+    }
+}
+
+impl FilesPanelRef {
+    /// Row `i` of the table as this panel has it — its own filter included.
+    pub fn row_at(&self, store: &Store, i: usize) -> Option<files::Entry> {
+        self.borrow().and_then(|p| p.table.row(store, i))
+    }
+
+    /// What row `i` opens.
+    pub fn target_at(&self, store: &Store, i: usize) -> Option<crate::core::Kind> {
+        let p = self.borrow()?;
+        let e = p.table.row(store, i)?;
+        Some(FilesPanel::target_of(&p.table.source().dir, &e))
+    }
+
+    /// Whether one of the panel's fields owns the keyboard, so borrowed
+    /// chords stand down (the fifth accelerator rule).
+    pub fn field_focused(&self, cx: &mut Cx) -> bool {
+        self.borrow().is_some_and(|p| {
+            p.view.text_input(cx, ids!(filter_input)).key_focus(cx)
+                || p.view.text_input(cx, ids!(newdir_input)).key_focus(cx)
+        })
+    }
+
+    /// The `new dir` button: raise the field and put the caret in it.
+    pub fn open_new_dir(&self, cx: &mut Cx) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        p.status = None;
+        p.newdir_open = true;
+        p.view.view(cx, ids!(newdir)).set_visible(cx, true);
+        p.view.text_input(cx, ids!(newdir_input)).set_text(cx, "");
+        // The keyboard follows on the next event, once the row has been
+        // drawn where it will stand.
+        p.focus_pending = true;
+        p.redraw(cx);
+    }
+
+    /// Whether the `new dir` field is up — its rect counts only then.
+    pub fn new_dir_open(&self) -> bool {
+        self.borrow().is_some_and(|p| p.newdir_open)
+    }
+
+    /// The shell's word on what a verb could not do.
+    pub fn set_status(&self, cx: &mut Cx, msg: Option<String>) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        p.status = msg;
+        p.redraw(cx);
+    }
+
+    /// The crumbs on screen, `(label, rect, the directory it replaces
+    /// with)`, for the shell's hit table.
+    pub fn crumb_hits(&self, cx: &mut Cx) -> Vec<(String, Rect, crate::core::Kind)> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        let crumbs = files::crumbs(&p.table.source().dir);
+        let n = crumbs.len();
+        let ancestors: Vec<&(String, String)> =
+            crumbs[..n.saturating_sub(1)].iter().rev().take(4).rev().collect();
+        let slots = [ids!(crumbs.c0), ids!(crumbs.c1), ids!(crumbs.c2), ids!(crumbs.c3)];
+        ancestors
+            .iter()
+            .zip(slots.iter())
+            .filter_map(|((label, path), slot)| {
+                let r = p.view.widget(cx, *slot).area().rect(cx);
+                (r.size.x > 0.0).then(|| {
+                    (
+                        label.clone(),
+                        r,
+                        crate::core::Kind::Files { dir: path.clone() },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The open autocomplete's rows, `(label, rect)`.
+    pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        self.borrow()
+            .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
+    }
+
+    /// Commits the `i`-th suggestion on offer.
+    pub fn pick(&self, cx: &mut Cx, i: usize) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        let filter = p.view.text_input(cx, ids!(filter_input));
+        p.ac.pick(cx, &p.table, &filter, i);
+    }
+}
+
+impl Widget for FilesPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let newdir_input = self.view.text_input(cx, ids!(newdir_input));
+        // The deferred focus of `new dir`: the row is drawn now, so the
+        // field has a place to take the keyboard at.
+        if self.focus_pending && newdir_input.area().rect(cx).size.y > 0.0 {
+            self.focus_pending = false;
+            focus_input(cx, &newdir_input);
+        }
+        let filter_focused = filter.key_focus(cx);
+        let newdir_focused = newdir_input.key_focus(cx);
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+
+        if let Event::KeyDown(k) = event {
+            if self.ac.key(cx, &self.table, &filter, k) {
+                self.redraw(cx);
+                return;
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        let Some(store) = panel_store(scope) else { return };
+        let dir = self.table.source().dir.clone();
+
+        // `/` focuses the filter, as in the inbox.
+        if let Event::TextInput(t) = event {
+            if !filter_focused && !newdir_focused && t.input == "/" {
+                focus_input(cx, &filter);
+            }
+        }
+        if let Event::KeyDown(k) = event {
+            if !filter_focused && !newdir_focused {
+                match k.key_code {
+                    // Enter *goes*: the row's target opens with focus, the
+                    // solid-link rule. The walk's preview is the
+                    // implementation's; the draft only selects.
+                    KeyCode::ReturnKey => {
+                        let target = self
+                            .cursor_index(&store)
+                            .or(Some(0))
+                            .and_then(|i| self.table.row(&store, i))
+                            .map(|e| Self::target_of(&dir, &e));
+                        if let Some(target) = target {
+                            cx.action(PanelAction::FollowLink {
+                                pid,
+                                target,
+                                dotted: false,
+                                fresh: k.modifiers.logo || k.modifiers.alt,
+                            });
+                        }
+                    }
+                    KeyCode::ArrowDown => self.move_sel(cx, pid, &store, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, pid, &store, -1),
+                    KeyCode::Tab => focus_input(cx, &filter),
+                    _ => {}
+                }
+            }
+        }
+        if let Event::Actions(actions) = event {
+            if filter.key_focus_lost(actions) {
+                filter.set_cursor(cx, filter.cursor(), false);
+            }
+            if filter.returned(actions).is_some() || filter.escaped(actions) {
+                cx.set_key_focus(Area::Empty);
+                if filter.returned(actions).is_some() {
+                    self.sync_filter(cx);
+                    self.set_sel(cx, pid, &store, 0);
+                }
+                self.redraw(cx);
+            }
+            if filter.changed(actions).is_some() {
+                self.sel = None;
+                self.redraw(cx);
+            }
+            // The `new dir` field: enter creates, esc puts it away. A
+            // name that exists, or holds a separator, is refused.
+            if newdir_input.returned(actions).is_some() {
+                let name = newdir_input.text().trim().to_string();
+                if name.is_empty() {
+                    self.close_newdir(cx);
+                } else if name.contains('/') {
+                    self.status = Some("a name cannot hold a slash".into());
+                    self.redraw(cx);
+                } else if files::exists(&files::join(&dir, &name)) {
+                    self.status = Some(format!("{name} is already here"));
+                    self.redraw(cx);
+                } else {
+                    cx.action(PanelAction::NewDir { pid, dir: dir.clone(), name });
+                    self.close_newdir(cx);
+                }
+            }
+            if newdir_input.escaped(actions) {
+                self.close_newdir(cx);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let Some(store) = panel_store(scope) else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        if let Some(dir) = Self::dir_of(scope) {
+            self.sync_dir(&dir);
+        }
+        let dir = self.table.source().dir.clone();
+        self.sync_filter(cx);
+
+        // The crumbs: the last four ancestors as dotted links, the
+        // directory itself plain.
+        let crumbs = files::crumbs(&dir);
+        let n = crumbs.len();
+        let ancestors: Vec<&(String, String)> =
+            crumbs[..n.saturating_sub(1)].iter().rev().take(4).rev().collect();
+        let slots = [ids!(crumbs.c0), ids!(crumbs.c1), ids!(crumbs.c2), ids!(crumbs.c3)];
+        let seps = [ids!(crumbs.s0), ids!(crumbs.s1), ids!(crumbs.s2), ids!(crumbs.s3)];
+        for (i, (slot, sep)) in slots.iter().zip(seps.iter()).enumerate() {
+            let link = self.view.link(cx, *slot);
+            let shown = ancestors.get(i).is_some();
+            if let Some((label, path)) = ancestors.get(i) {
+                link.set(
+                    cx,
+                    pid,
+                    label,
+                    crate::core::Kind::Files { dir: (*path).clone() },
+                    true,
+                );
+            }
+            self.view.widget(cx, *slot).set_visible(cx, shown);
+            self.view.widget(cx, *sep).set_visible(cx, shown);
+        }
+        let here = crumbs.last().map(|(l, _)| l.clone()).unwrap_or_default();
+        self.view.label(cx, ids!(crumbs.here_lbl)).set_text(cx, &here);
+
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let focused = filter.key_focus(cx);
+        let err = if focused {
+            self.table.errors_while_typing().first().map(|e| e.message.clone())
+        } else {
+            self.table.errors().first().map(|e| e.message.clone())
+        };
+        let err_lbl = self.view.label(cx, ids!(err_lbl));
+        err_lbl.set_text(cx, err.as_deref().unwrap_or(""));
+        err_lbl.set_visible(cx, err.is_some());
+
+        // A directory the tree does not have is *gone*; the crumbs still
+        // climb out.
+        let status = if files::exists(&dir) {
+            self.status.clone()
+        } else {
+            Some("gone".to_string())
+        };
+        let status_lbl = self.view.label(cx, ids!(status_lbl));
+        status_lbl.set_text(cx, status.as_deref().unwrap_or(""));
+        status_lbl.set_visible(cx, status.is_some());
+
+        // Prime the hidden `new dir` row with one draw into a zero-size
+        // clipped turtle, so its field owns a real area from the first
+        // frame and never passes for the focused one (see `primed`).
+        if !self.primed {
+            self.primed = true;
+            if !self.newdir_open {
+                let newdir = self.view.widget(cx, ids!(newdir));
+                newdir.set_visible(cx, true);
+                let at = cx.turtle().pos();
+                cx.begin_turtle(
+                    Walk::abs_rect(Rect {
+                        pos: at,
+                        size: DVec2::default(),
+                    }),
+                    Layout {
+                        clip_x: true,
+                        clip_y: true,
+                        ..Default::default()
+                    },
+                );
+                newdir.draw_all(cx, scope);
+                cx.end_turtle();
+                newdir.set_visible(cx, false);
+            }
+        }
+
+        let sel = self.sel.as_ref().map(|(name, _)| name.clone());
+        let n = self.table.len(&store);
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, n);
+                while let Some(idx) = list.next_visible_item(cx) {
+                    let Some(e) = self.table.row(&store, idx) else { continue };
+                    let (row, _) = list.item_with_existed(cx, idx, live_id!(row));
+                    row.as_files_row()
+                        .populate(cx, &e, sel.as_deref() == Some(e.name.as_str()));
+                    row.draw_all(cx, scope);
+                }
+            }
+        }
+        self.ac
+            .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
+        DrawStep::done()
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct FilePanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The path the card was last filled for, so a preview is decoded once.
+    #[rust]
+    shown: Option<String>,
+}
+
+impl Widget for FilePanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let path = match scope.props.get::<PanelProps>().map(|p| &p.kind) {
+            Some(crate::core::Kind::File { path }) => Some(path.clone()),
+            _ => None,
+        };
+        if let Some(path) = path {
+            if self.shown.as_deref() != Some(path.as_str()) {
+                let v = &self.view;
+                v.label(cx, ids!(name_lbl)).set_text(cx, files::basename(&path));
+                v.text_input(cx, ids!(path_txt)).set_text(cx, &path);
+                let text_prev = v.text_input(cx, ids!(text_box.text_prev));
+                let text_box = v.view(cx, ids!(text_box));
+                let img_prev = v.widget(cx, ids!(img_box.img_prev));
+                let img_box = v.view(cx, ids!(img_box));
+                let none_lbl = v.label(cx, ids!(none_lbl));
+                match files::entry(&path) {
+                    Some(e) => {
+                        v.label(cx, ids!(kind_lbl)).set_text(
+                            cx,
+                            &format!("{} · {}", e.kind().word(), files::fmt_size(e.size)),
+                        );
+                        v.label(cx, ids!(when_lbl))
+                            .set_text(cx, &format!("modified {}", mail::fmt_date(e.modified)));
+                        let text = files::text_of(&path);
+                        let image = files::image_of(&path);
+                        text_prev.set_text(cx, text.as_deref().unwrap_or(""));
+                        text_box.set_visible(cx, text.is_some());
+                        if let Some(bytes) = image {
+                            let _ = img_prev.as_image().load_png_from_data(cx, bytes);
+                        }
+                        img_box.set_visible(cx, image.is_some());
+                        none_lbl.set_visible(cx, text.is_none() && image.is_none());
+                    }
+                    None => {
+                        v.label(cx, ids!(kind_lbl)).set_text(cx, "gone");
+                        v.label(cx, ids!(when_lbl)).set_text(cx, "");
+                        text_box.set_visible(cx, false);
+                        img_box.set_visible(cx, false);
+                        none_lbl.set_visible(cx, false);
+                    }
+                }
+                self.shown = Some(path);
+            }
+        }
+        self.view.draw_walk(cx, scope, walk)
     }
 }
 

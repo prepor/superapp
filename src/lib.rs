@@ -13,6 +13,7 @@
 //! | [`filter`] | the rich table's filter grammar and completion context | no |
 //! | [`richtable`] | the rich table: datasources, the SQL builder, paging | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
+//! | [`files`] | the file browser's domain: listings, the card, the held item (CR-008 draft) | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
 //! | [`repl`] | device sync: the changeset log, the lease, the passes | no |
@@ -36,6 +37,7 @@ pub mod catalog;
 pub mod core;
 pub mod e2e;
 pub mod effect;
+pub mod files;
 pub mod filter;
 pub mod history;
 pub mod html;

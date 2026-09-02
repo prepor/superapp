@@ -26,6 +26,7 @@ use crate::app::BootOutside;
 use crate::core::{Grid, Kind, Seed};
 use crate::effect;
 use crate::e2e::{self, Step};
+use crate::files;
 use crate::mail;
 use crate::panels::*;
 use crate::scene::Scene;
@@ -51,9 +52,13 @@ pub enum Setup {
         overlay: Option<OverlayProps>,
     },
     /// A stage on a world of its own: solo on the one panel `open` names,
-    /// or the whole workspace. `steps` lead to the state.
+    /// the whole workspace starting from that panel, or the default
+    /// session. `steps` lead to the state.
     Stage {
         open: Option<Open>,
+        /// With `open`: the panel alone at the viewport (a panel node)
+        /// rather than as the first column of a strip.
+        solo: bool,
         steps: Option<Vec<Step>>,
         grid: Option<Grid>,
         outside: BootOutside,
@@ -79,15 +84,31 @@ fn sheet(tpl: LiveId, props: OverlayProps, f: impl Fn(&mut Cx, &WidgetRef) + 'st
 fn panel(open: impl Fn(&Store) -> Kind + 'static, script: &str) -> Setup {
     Setup::Stage {
         open: Some(Rc::new(open)),
+        solo: true,
         steps: steps(script),
         grid: None,
         outside: BootOutside::Deny,
     }
 }
 
+/// The default session — help and the inbox — for the shell's own
+/// subjects.
 fn workspace(script: &str) -> Setup {
     Setup::Stage {
         open: None,
+        solo: false,
+        steps: steps(script),
+        grid: None,
+        outside: BootOutside::Deny,
+    }
+}
+
+/// A workspace that starts from one panel and nothing else: a story about
+/// what that panel opens beside itself.
+fn workspace_on(open: impl Fn(&Store) -> Kind + 'static, script: &str) -> Setup {
+    Setup::Stage {
+        open: Some(Rc::new(open)),
+        solo: false,
         steps: steps(script),
         grid: None,
         outside: BootOutside::Deny,
@@ -97,6 +118,7 @@ fn workspace(script: &str) -> Setup {
 fn phone(script: &str) -> Setup {
     Setup::Stage {
         open: None,
+        solo: false,
         steps: steps(script),
         grid: Some(Grid { w: 4, h: 3 }),
         outside: BootOutside::Deny,
@@ -500,6 +522,10 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         job(),
         message(),
         compose(),
+        files_row(),
+        files(),
+        file_card(),
+        files_walk(),
         small_panels(),
         problems(),
         phone_scene(),
@@ -934,6 +960,153 @@ fn compose() -> Scene<Setup> {
         .node("blank", panel(|_| Kind::Compose { seed: Seed::Blank }, ""))
         .about("from the launcher's root: nothing prefilled")
         .edge("reply", "suggesting", "type in TO")
+}
+
+// ---- files (CR-008, draft) --------------------------------------------------
+
+fn entry(name: &str, is_dir: bool, size: u64) -> files::Entry {
+    files::Entry {
+        name: name.to_string(),
+        is_dir,
+        size,
+        modified: at(9, 12),
+    }
+}
+
+fn files_row() -> Scene<Setup> {
+    let row = |e: files::Entry, selected: bool| {
+        widget(live_id!(files_row_tpl), move |cx, w| {
+            w.as_files_row().populate(cx, &e, selected);
+        })
+    };
+    Scene::new("files row", (520.0, 32.0))
+        .note("One entry of a directory: the name, the size, when it changed.")
+        .note("A directory wears its slash and no size — the slash is the whole mark.")
+        .node("file", row(entry("report-q3.pdf", false, 1_258_291), false))
+        .node("directory", row(entry("2026", true, 0), false))
+        .node("selected", row(entry("report-q3.pdf", false, 1_258_291), true))
+        .about("the cursor's wash; focus stays in the list")
+        .node("hidden", row(entry(".DS_Store", false, 6_144), false))
+        .about("out of a listing unless @hidden asks")
+        .node(
+            "long name",
+            row(
+                entry(
+                    "screenshot-2026-08-30-at-14.02.11-the-whole-workspace-at-once.png",
+                    false,
+                    421_888,
+                ),
+                false,
+            ),
+        )
+        .about("one line, ellipsized; the columns hold")
+        .edge("file", "selected", "↓ / click")
+}
+
+fn files() -> Scene<Setup> {
+    let dir = |d: &'static str, script: &str| panel(move |_| Kind::Files { dir: d.into() }, script);
+    Scene::new("files", (520.0, 640.0))
+        .note("A directory as a column: the crumbs, the filter, the rows; every header verb acts on the directory shown.")
+        .note("Live — enter a node: arrows walk, enter goes, / filters, ⌘n asks for a name, ⌘p and ⌘m hold.")
+        .node("home", dir(files::HOME, ""))
+        .about("the launcher's root; dot-files out")
+        .node("downloads", dir("~/Downloads", ""))
+        .about("one crumb up, a dotted link; the directory first")
+        .node(
+            "cursor",
+            dir("~/Downloads", "click \"Downloads\"\nwait 200\nkey down 2\nwait 400"),
+        )
+        .about("the cursor; alone here — what it previews is in the files walk")
+        .node(
+            "filtered",
+            dir("~/Downloads", "click \"filter\"\nwait 200\ntype \"@kind:image\"\nwait 400"),
+        )
+        .about("the inbox's grammar: @dir @hidden @kind: @size> @modified>")
+        .node(
+            "new dir",
+            dir(
+                "~/Downloads",
+                "click \"Downloads\"\nwait 200\nkey cmd+n\nwait 300\ntype \"invoices\"\nwait 300",
+            ),
+        )
+        .about("⌘n: a field above the rows; enter creates, esc puts it away")
+        .node(
+            "refused",
+            dir(
+                "~/Downloads",
+                "click \"Downloads\"\nwait 200\nkey cmd+n\nwait 300\ntype \"2026\"\nwait 200\nkey enter\nwait 400",
+            ),
+        )
+        .about("a name already here: the status line, in the one colour errors get")
+        .node(
+            "holding",
+            dir("~/Downloads", "click \"Downloads\"\nwait 200\nkey cmd+m\nwait 500"),
+        )
+        .about("⌘m holds the directory shown: every files panel now offers move here")
+        .node("gone", dir("~/Downloads/2027", ""))
+        .about("a directory that left under the panel; the crumbs still climb")
+        .node("phone", dir("~/Downloads", ""))
+        .sized((380.0, 720.0))
+        .edge("home", "downloads", "click Downloads/")
+        .edge("downloads", "cursor", "↓ ×2")
+        .edge("downloads", "filtered", "/ @kind:image")
+        .edge("downloads", "new dir", "⌘n")
+        .edge("new dir", "refused", "2026, enter")
+        .edge("downloads", "holding", "⌘m")
+}
+
+fn file_card() -> Scene<Setup> {
+    let card = |p: &'static str, script: &str| panel(move |_| Kind::File { path: p.into() }, script);
+    Scene::new("file card", (520.0, 360.0))
+        .note("A file as a card: name, kind and size, when it changed, the path selectable; under the rule, the preview.")
+        .node("text", card("~/Downloads/README.txt", ""))
+        .about("the first 64 KB, in the app's one face")
+        .node("image", card("~/Downloads/2026/photo-lisbon.jpg", ""))
+        .sized((520.0, 480.0))
+        .about("fit to the width (the demo tree's pictures are the icon)")
+        .node("other", card("~/Downloads/report-q3.pdf", ""))
+        .sized((520.0, 220.0))
+        .about("no preview: open shows it")
+        .node(
+            "held",
+            card("~/Downloads/report-q3.pdf", "click \"report-q3\"\nwait 200\nkey cmd+p\nwait 500"),
+        )
+        .sized((520.0, 300.0))
+        .about("⌘p holds a copy; the toast says where to go next")
+        .edge("other", "held", "⌘p")
+}
+
+fn files_walk() -> Scene<Setup> {
+    let from_home = |script: &str| workspace_on(|_| Kind::Files { dir: files::HOME.into() }, script);
+    // The walk by keys alone: ↓ previews beside the list, enter goes.
+    let preview = "key down 3\nwait 700\n";
+    let chain = "key down 3\nwait 700\nkey enter\nwait 500\nkey down 1\nwait 700\nkey enter\nwait 500\nkey down 3\nwait 700\n";
+    Scene::new("files walk", (1440.0, 900.0))
+        .note("The column walk: the cursor previews a directory or a card joined beside the list, enter goes, the next row replaces.")
+        .note("A workspace that starts from the files root alone — no help, no inbox. Live: enter a node and walk it.")
+        .node("root", from_home(""))
+        .about("~ as the first column")
+        .node("preview", from_home(preview))
+        .about("↓ ×3: Downloads previews beside ~; focus stays in the list, so the walk goes on")
+        .node("chain", from_home(chain))
+        .about("enter goes; ~ → Downloads → 2026 → a card, the list still driving")
+        .node("replaced", from_home(&format!("{chain}key up 2\nwait 700")))
+        .about("↑ ×2: the next row replaces the card in place")
+        .node(
+            "holding",
+            from_home(&format!("{chain}key enter\nwait 400\nkey cmd+p\nwait 300\nkey cmd+left\nwait 300\nkey cmd+left\nwait 700")),
+        )
+        .about("enter into the card, ⌘p holds it, ⌘← twice: Downloads now offers copy here")
+        .node(
+            "pasted",
+            from_home(&format!("{chain}key enter\nwait 400\nkey cmd+p\nwait 300\nkey cmd+left\nwait 300\nkey cmd+left\nwait 400\nkey cmd+h\nwait 700")),
+        )
+        .about("⌘h — copy here — performs into the directory shown (the draft only says so)")
+        .edge("root", "preview", "↓")
+        .edge("preview", "chain", "enter, ↓, enter, ↓")
+        .edge("chain", "replaced", "↑")
+        .edge("chain", "holding", "enter, ⌘p, ⌘← ⌘←")
+        .edge("holding", "pasted", "⌘h")
 }
 
 fn small_panels() -> Scene<Setup> {

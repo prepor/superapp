@@ -468,6 +468,7 @@ enum Plan {
     },
     Stage {
         open: Option<Open>,
+        solo: bool,
         steps: Option<Vec<Step>>,
         grid: Option<Grid>,
         outside: BootOutside,
@@ -578,11 +579,13 @@ impl Library {
             },
             Setup::Stage {
                 open,
+                solo,
                 steps,
                 grid,
                 outside,
             } => Plan::Stage {
                 open: open.clone(),
+                solo: *solo,
                 steps: steps.clone(),
                 grid: *grid,
                 outside: *outside,
@@ -627,6 +630,7 @@ impl Library {
             }
             Plan::Stage {
                 open,
+                solo,
                 steps,
                 grid,
                 outside,
@@ -646,6 +650,7 @@ impl Library {
                     primary: false,
                     tag: self.tag(i),
                     open: open.map(|f| Box::new(move |s: &Store| f(s)) as Opener),
+                    solo,
                 };
                 if let Some(mut st) = stage.borrow_mut::<Stage>() {
                     st.boot(cx, boot);

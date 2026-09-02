@@ -80,10 +80,35 @@ list borrows the preview's keys** (rule 5). Cursor on `2026/`, `cmd+d`:
 the previewed directory's own `delete` fires, its mark in plain sight one
 column over. A panel has exactly one of each, so rule 4 holds.
 
+A files panel wears `copy`, `move`, `delete` for the directory it shows
+**only while it is joined under a parent** — while it is the object under
+someone's cursor. A root, or a list opened un-joined from the launcher, is
+nobody's object and wears `new dir` alone: `~` cannot be deleted, and a
+chord pressed in a list never hits the directory the list itself shows.
+The bridge is the whole explanation, as with the attach binding.
+
 | panel | header |
 |---|---|
 | `File` | `open` · `copy` · `move` · `delete` · `×` |
-| `Files` | `new dir` · `copy` · `move` · `delete` · `×` — and, while something is held, `copy here` or `move here` |
+| `Files` | `new dir` · `×`; **at the end of a chain** — joined under a parent, driving nothing — also `copy` · `move` · `delete` for the directory it shows; and, while something is held, `copy here` or `move here` |
+
+A files panel is both a list and, when a row of its parent previews it,
+an object. It wears the object verbs only while it is the **end of a
+chain**: the thing under someone's cursor. A root, a list opened from the
+launcher, or a list that is itself driving a preview wears `new dir`
+alone — so `~` cannot be deleted, and a chord pressed in a list never
+hits the directory the list shows; it hits what the cursor is on, one
+column over, where the mark is. Where a driver and its preview share a
+key for the same verb (`new dir` on both), the driver's wins and the
+preview's mark is drawn plain while it is shadowed, so no bold letter
+promises a chord it will not get.
+
+Where a joined list drives a preview of its own — the middle of a chain —
+its verbs and its preview's share letters (`copy` on both). The driver's
+own key wins, as the fifth rule says, and **the shell draws the preview's
+shadowed mark plain**, so no bold letter ever promises a chord the driver
+would take. Two *different* verbs on one key stay forbidden by test; the
+same verb twice is allowed exactly because the mark stays honest.
 
 - **`open`** — hands the path to the OS (`NSWorkspace` through makepad's
   `open_url`). Nothing is executed by us; Gatekeeper does its job. macOS
@@ -252,6 +277,39 @@ says nothing it does not know.
   readings (text, image, other), the `new dir` field, a header holding
   `move here`, the column walk as a workspace scene, the phone grid.
 
+## The draft in the panels library
+
+The UI is drafted as live scenes before anything touches a disk:
+
+```sh
+mise exec -- cargo run -- --library file      # the four scenes below
+```
+
+- **`files row`** — a file, a directory, the cursor's wash, a dot-file, a
+  long name.
+- **`files`** — `~`, `Downloads`, the cursor walk, `@kind:image`, the
+  `new dir` field, a refused name on the status line, the header holding
+  `move here`, a directory that is *gone*, the phone grid.
+- **`file card`** — a text preview, an image, a bare card, and the card
+  with a copy held.
+- **`files walk`** — a workspace that starts from the files root alone
+  (no help, no inbox: a stage may now boot on one panel as the strip's
+  first column, not only solo), walked by keys: `↓` previews Downloads
+  beside `~`, enter goes, `~ → Downloads → 2026 → a card` with the list
+  still driving, `↑` replacing the card in place; then `⌘p` on the card,
+  `⌘←` back to Downloads whose header now offers `copy here`, and `⌘h`.
+
+What is real in the draft: the two kinds and their chrome, the header
+verbs with their chords, the cursor **previewing** joined beside the list
+(the inbox's preview for any kind: `Act::PreviewKind`), the borrowed keys
+with shadowed marks, the hold and the `… here` button it raises, the
+`new dir` field and its refusals, the filter grammar over the listing, the
+crumbs as dotted links, rows opening joined, `enter` going. What is not:
+the listing is a **demo tree** in `src/files.rs`, and every verb that
+would write **toasts** what it would have done — nothing leaves the
+process. The datasource (`files::DirSource`) is the shape the
+implementation fills in with the disk and the watcher.
+
 ## Considered and not chosen
 
 - **Mirroring the directory into the store** (`dir_entry` rows, a scan
@@ -291,6 +349,12 @@ says nothing it does not know.
   the whole directory, one keystroke, no question — as `cmd+d` on a thread
   deletes the mail. The trash and `cmd+z` are the answer; the mark on the
   previewed panel's chrome is the warning.
+- **In the middle of a chain the list's own verbs win.** Focused in
+  `2026` (joined under Downloads) with a file previewed, `cmd+d` trashes
+  `2026`, not the file: the list wears `delete` for itself, the card's
+  mark is drawn plain. The file is one `enter` away. Whether a joined
+  list should instead yield its own verbs while it drives a preview is a
+  question for real use.
 - **A big copy is a job, not a gesture.** Gigabytes take their time; the
   status line says so, and there is no cancel in v1.
 - **Not searchable.** The launcher opens `files` and nothing finer.
@@ -321,7 +385,8 @@ says nothing it does not know.
 ## Decisions to take first
 
 1. **Verbs act on the shown object, the list borrows them** — not on the
-   cursor row directly.
+   cursor row directly; a files panel wears its object verbs only while
+   joined, and a driver's own key shadows its preview's mark.
 2. **Hold, then `copy here` / `move here`** — not cut/paste, not a pick
    mode.
 3. **Clashes refuse**, except a copy into its own directory.
