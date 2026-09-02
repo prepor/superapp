@@ -1,0 +1,52 @@
+# The compose panel's TO field completes addresses — CR-006's box over the
+# mail world rather than the filter grammar: the senders the store has
+# heard from, by name or address. A row that does not resolve fails the
+# run, so "Elena was offered" is checked by the click, not by a reader.
+wait 700
+
+# A blank compose from the launcher's root; it starts in the body.
+key cmd 2
+wait 400
+type "new mail"
+wait 400
+key enter
+wait 700
+shot c1-new-mail
+
+# Into TO by tab (the ring wraps from the body). Not by a press: a
+# synthesized press captures the field and the harness has no way to
+# release it, and the deferred focus switch lands after the up — see
+# dev-x, "what a script cannot lean on". A fragment of the name offers the
+# sender; enter takes the address and the box closes, since a full address
+# needs no completing.
+key tab
+wait 300
+type "kov"
+wait 400
+shot c2-offer
+key enter
+wait 400
+shot c3-taken
+
+# A second address after the comma: the first is not offered again, the
+# click on the row is the assertion, and the pick keeps the first.
+type ", pet"
+wait 400
+shot c4-second-offer
+click "Elena Petrova"
+wait 400
+shot c5-two-recipients
+
+# esc puts the offer away and keeps the text; tab then walks on to the
+# subject with nothing taken — the box owns tab only while it is up.
+type ", max"
+wait 400
+key esc
+wait 300
+shot c6-dismissed
+key tab
+wait 300
+type "Egress numbers"
+wait 300
+shot c7-subject
+quit

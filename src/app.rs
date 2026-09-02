@@ -347,7 +347,8 @@ enum WidgetOp {
     AddAccount,
     RemoveAccount(i64),
     OpenMail(i64),
-    /// The `i`-th row of the inbox filter's autocomplete (CR-006).
+    /// The `i`-th row of a field's autocomplete (CR-006): the inbox
+    /// filter's, or the compose TO field's.
     Suggest(usize),
 }
 
@@ -2505,9 +2506,15 @@ impl Stage {
                     }
                     WidgetOp::Suggest(i) => {
                         // The pick splices into the field and keeps its
-                        // focus; the shell's share is a redraw.
+                        // focus; the shell's share is a redraw. Which
+                        // field is the panel's kind to say.
                         if let Some(w) = self.hosted.get(&pid) {
-                            w.as_inbox_panel().pick(cx, i);
+                            match state.ws.panels.get(&pid).map(|p| &p.kind) {
+                                Some(Kind::Compose { .. }) => {
+                                    w.as_compose_panel().pick(cx, pid, i);
+                                }
+                                _ => w.as_inbox_panel().pick(cx, i),
+                            }
                         }
                         self.kick(cx);
                     }
@@ -4878,6 +4885,13 @@ impl Stage {
                     if r.size.x > 0.0 {
                         reg.push((label.to_string(), r, Act::Pointer(pid)));
                     }
+                }
+                // The TO field's autocomplete rows, registered after the
+                // fields they cover: `hit_at` searches back to front, so
+                // the box wins where they overlap.
+                let hits = w.as_compose_panel().suggestion_hits(cx);
+                for (i, (label, r)) in hits.into_iter().enumerate() {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
             }
             Some(Kind::Inbox { .. }) => {

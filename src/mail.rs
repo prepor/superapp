@@ -18,7 +18,8 @@ use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
 use crate::filter::Op;
 use crate::history::Intent;
 use crate::richtable::{
-    Dir, SqlSource, SqlSpec, Suggestion, Table, TagDef, TagSql, TagType, Values,
+    Completion, Dir, SqlSource, SqlSpec, Suggestion, Table, TagDef, TagSql, TagType, Values,
+    MAX_SUGGESTIONS,
 };
 use crate::store::{Q, Store, Val};
 
@@ -472,6 +473,124 @@ pub fn can_file(store: &Store, id: MailId, role: &str) -> bool {
             |_| Ok(true),
         )
         .unwrap_or(false)
+}
+
+// -- recipients: what the compose panel's TO field completes -----------------
+
+/// The compose panel's TO field as a completion — the rich table's box
+/// (CR-006) over the mail world rather than the filter grammar. The token
+/// under the caret, comma-separated from its neighbours, is matched as a
+/// substring against every sender the store has heard from, by name or
+/// address: the `@from:` offer, landing in a different field. A pick lands
+/// the bare address, which is what a reply prefills and what the send
+/// pipeline reads.
+pub struct Recipients;
+
+/// What the caret is in the middle of typing in a recipient list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientCtx {
+    /// Where the token starts: after the last comma before the caret and
+    /// the spaces that follow it.
+    pub start: usize,
+    /// The token as typed up to the caret, lowercased.
+    pub partial: String,
+    /// The addresses the other tokens already hold, lowercased — offered
+    /// no second time.
+    pub taken: Vec<String>,
+}
+
+impl Completion for Recipients {
+    type Ctx = RecipientCtx;
+
+    fn context(&self, text: &str, cursor: usize) -> Option<RecipientCtx> {
+        recipient_context(text, cursor)
+    }
+
+    fn offer(&self, store: &Store, ctx: &RecipientCtx) -> Vec<Suggestion> {
+        let typed = ctx.partial.trim_end();
+        let mut out: Vec<Suggestion> = senders(store)
+            .iter()
+            .filter(|s| {
+                let email = s.email.to_lowercase();
+                // Typed out in full, an address needs no completing; one
+                // already in the list needs no repeating.
+                email != typed
+                    && !ctx.taken.contains(&email)
+                    && (email.contains(typed) || s.name.to_lowercase().contains(typed))
+            })
+            .map(|s| {
+                if s.name.is_empty() {
+                    Suggestion::value(s.email.clone())
+                } else {
+                    Suggestion::labeled(s.name.clone(), s.email.clone())
+                }
+            })
+            .collect();
+        out.truncate(MAX_SUGGESTIONS);
+        out
+    }
+
+    fn splice(
+        &self,
+        text: &str,
+        cursor: usize,
+        ctx: &RecipientCtx,
+        pick: &Suggestion,
+    ) -> (String, usize) {
+        let cursor = cursor.min(text.len()).max(ctx.start);
+        let out = format!("{}{}{}", &text[..ctx.start], pick.value, &text[cursor..]);
+        (out, ctx.start + pick.value.len())
+    }
+}
+
+/// Classifies the caret in a recipient list: the token is what sits
+/// between the last comma before the caret and the caret itself, less the
+/// spaces after the comma. An empty token is `None` — typing is what opens
+/// the offer, not landing in the field.
+#[must_use]
+pub fn recipient_context(text: &str, cursor: usize) -> Option<RecipientCtx> {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let before = &text[..cursor];
+    let after_comma = before.rfind(',').map_or(0, |i| i + 1);
+    let start = after_comma + leading_spaces(&before[after_comma..]);
+    let partial = before[start..].to_lowercase();
+    if partial.trim().is_empty() {
+        return None;
+    }
+    // Every other token's address — the one under the caret is the piece
+    // that starts where the token does.
+    let mut taken = Vec::new();
+    let mut pos = 0;
+    for piece in text.split(',') {
+        if pos + leading_spaces(piece) != start {
+            let addr = address_of(piece.trim()).to_lowercase();
+            if !addr.is_empty() {
+                taken.push(addr);
+            }
+        }
+        pos += piece.len() + 1;
+    }
+    Some(RecipientCtx {
+        start,
+        partial,
+        taken,
+    })
+}
+
+fn leading_spaces(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// The address in a recipient token: the angle-bracketed part of
+/// `Name <addr>`, else the token itself.
+fn address_of(token: &str) -> &str {
+    match (token.rfind('<'), token.ends_with('>')) {
+        (Some(i), true) => &token[i + 1..token.len() - 1],
+        _ => token,
+    }
 }
 
 // -- drafts and the send window ----------------------------------------------
@@ -1435,6 +1554,63 @@ mod tests {
         // Seeding an already-seeded store is a no-op.
         seed_if_empty(&s).unwrap();
         assert_eq!(inbox(&s).len(), 69);
+    }
+
+    /// The compose panel's TO field completes the token under the caret
+    /// against the senders the store knows, by name or address; a pick
+    /// lands the bare address over the token and nothing else moves.
+    #[test]
+    fn recipients_complete_the_token_under_the_caret() {
+        let s = store();
+        let r = Recipients;
+        let ctx = |text: &str| r.context(text, text.len());
+        let labels = |v: Vec<Suggestion>| v.into_iter().map(|s| s.label).collect::<Vec<_>>();
+        // An empty token is nothing to complete: landing in the field, or
+        // typing the comma for the next address, opens no box.
+        assert_eq!(ctx(""), None);
+        assert_eq!(ctx("vera@kovac.io, "), None);
+        // Name or address, as a substring, the way `@from:` matches.
+        let c = ctx("kov").unwrap();
+        assert_eq!((c.start, c.partial.as_str()), (0, "kov"));
+        assert_eq!(labels(r.offer(&s, &c)), vec!["Vera Kovac"]);
+        assert_eq!(labels(r.offer(&s, &ctx("ELENA").unwrap())), vec!["Elena Petrova"]);
+        let vera = &r.offer(&s, &c)[0];
+        assert_eq!(
+            (vera.value.as_str(), vera.describe.as_str()),
+            ("vera@kovac.io", "vera@kovac.io")
+        );
+        assert_eq!(r.splice("kov", 3, &c, vera), ("vera@kovac.io".into(), 13));
+        // A second recipient: the token starts after the comma and its
+        // space, the first address is not offered again, and the splice
+        // keeps it.
+        let text = "vera@kovac.io, v";
+        let c = ctx(text).unwrap();
+        assert_eq!((c.start, c.partial.as_str()), (15, "v"));
+        assert_eq!(c.taken, vec!["vera@kovac.io"]);
+        let offer = r.offer(&s, &c);
+        assert!(offer.iter().all(|s| s.value != "vera@kovac.io"), "{offer:?}");
+        let max = offer.iter().find(|s| s.label == "Max Ivanov").expect("Ivanov has a v");
+        assert_eq!(
+            r.splice(text, text.len(), &c, max),
+            ("vera@kovac.io, max@ivanov.dev".into(), 29)
+        );
+        // Typed out in full, an address needs no completing.
+        assert!(r.offer(&s, &ctx("vera@kovac.io").unwrap()).is_empty());
+        // The caret in the middle of the line completes the token it is in
+        // and leaves the rest of the line alone.
+        let text = "ele, max@ivanov.dev";
+        let c = r.context(text, 3).unwrap();
+        assert_eq!((c.start, c.partial.as_str()), (0, "ele"));
+        assert_eq!(c.taken, vec!["max@ivanov.dev"]);
+        let elena = &r.offer(&s, &c)[0];
+        assert_eq!(
+            r.splice(text, 3, &c, elena),
+            ("elena.p@gmail.com, max@ivanov.dev".into(), 17)
+        );
+        // A `Name <addr>` token counts by its address.
+        let c = ctx("Vera Kovac <vera@kovac.io>, ver").unwrap();
+        assert_eq!(c.taken, vec!["vera@kovac.io"]);
+        assert!(r.offer(&s, &c).is_empty());
     }
 
     /// The demo world carries one HTML sender, narrowed on the way in: the

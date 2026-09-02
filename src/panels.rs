@@ -13,9 +13,8 @@ use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use makepad_widgets::text::selection::Cursor;
 use makepad_widgets::*;
 
-use crate::filter;
 use crate::mail;
-use crate::richtable::{self, SqlSource, Suggestion, Table};
+use crate::richtable::{self, Completion, SqlSource, Suggestion, Table};
 use crate::store::Store;
 use crate::ui;
 
@@ -661,6 +660,76 @@ script_mod! {
         }
     }
 
+    // ---- autocomplete ------------------------------------------------------
+
+    /** One autocomplete row: the pick, then what it means, muted. Twin
+        lines again (see `InboxRow`): the highlighted one is inverted, and
+        a quad's colour is not a runtime value. */
+    mod.widgets.SuggestLine = View {
+        width: Fill, height: Fit
+        align: Align{y: 0.5}
+        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
+        lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
+        View { width: 10, height: 1 }
+        desc := mod.widgets.SLabel {
+            padding: 0
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { color: #909090 }
+        }
+    }
+
+    mod.widgets.SuggestRow = View {
+        width: Fill, height: Fit
+        flow: Down
+        line := mod.widgets.SuggestLine {}
+        line_sel := mod.widgets.SuggestLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** A field's autocomplete (CR-006): a bordered box hung under the
+        field, over whatever follows it — the inbox filter's `@tag` names
+        and values, the compose TO field's addresses. Eight fixed slots,
+        shown as needed; the offer is capped there. The panel holds one as
+        a `suggest:` property and drives it through `Suggest`. */
+    // Drawn after everything else in the panel, at an absolute position,
+    // so it must land in a draw call *after* the content it covers. The
+    // background's own pixel fn (a hairline ink border, the design's) makes
+    // it a shader no earlier call shares — the same ordering trap the
+    // selection wash documents, answered the same way.
+    mod.widgets.SuggestBox = View {
+        width: Fill, height: Fit
+        flow: Down
+        show_bg: true
+        padding: Inset{left: 1, right: 1, top: 1, bottom: 1}
+        draw_bg +: {
+            color: #ffffff
+            pixel: fn() {
+                let px = 1.0 / self.rect_size.x
+                let py = 1.0 / self.rect_size.y
+                if self.pos.x < px || self.pos.x > 1.0 - px || self.pos.y < py || self.pos.y > 1.0 - py {
+                    return vec4(0.078, 0.078, 0.078, 1.0)
+                }
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        s0 := mod.widgets.SuggestRow {}
+        s1 := mod.widgets.SuggestRow {}
+        s2 := mod.widgets.SuggestRow {}
+        s3 := mod.widgets.SuggestRow {}
+        s4 := mod.widgets.SuggestRow {}
+        s5 := mod.widgets.SuggestRow {}
+        s6 := mod.widgets.SuggestRow {}
+        s7 := mod.widgets.SuggestRow {}
+    }
+
     // ---- compose -----------------------------------------------------------
 
     /** The compose panel: to/subject fields over a multiline body. Send
@@ -694,6 +763,9 @@ script_mod! {
             // Multiline: the keyboard's return stays a newline.
             return_key_type: ReturnKeyType.Default
         }
+        // The TO field's autocomplete, drawn last and over the fields under
+        // it (see `SuggestBox`).
+        suggest: mod.widgets.SuggestBox {}
     }
 
     // ---- inbox -------------------------------------------------------------
@@ -785,72 +857,6 @@ script_mod! {
                 }
             }
         }
-    }
-
-    /** One autocomplete row: the pick, then what it means, muted. Twin
-        lines again (see `InboxRow`): the highlighted one is inverted, and
-        a quad's colour is not a runtime value. */
-    mod.widgets.SuggestLine = View {
-        width: Fill, height: Fit
-        align: Align{y: 0.5}
-        padding: Inset{left: 8, right: 8, top: 3, bottom: 3}
-        lbl := mod.widgets.SLabel { padding: 0, width: Fit, max_lines: 1, text: "" }
-        View { width: 10, height: 1 }
-        desc := mod.widgets.SLabel {
-            padding: 0
-            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
-            draw_text +: { color: #909090 }
-        }
-    }
-
-    mod.widgets.SuggestRow = View {
-        width: Fill, height: Fit
-        flow: Down
-        line := mod.widgets.SuggestLine {}
-        line_sel := mod.widgets.SuggestLine {
-            visible: false
-            show_bg: true
-            draw_bg +: {
-                color: #141414
-                pixel: fn() {
-                    return vec4(self.color.xyz * self.color.w, self.color.w)
-                }
-            }
-        }
-    }
-
-    /** The filter's autocomplete (CR-006): a bordered box hung under the
-        field, over the rows, offering `@tag` names and then a tag's values.
-        Eight fixed slots, shown as needed — the offer is capped there. */
-    // Drawn after everything else in the panel, at an absolute position,
-    // so it must land in a draw call *after* the rows it covers. The
-    // background's own pixel fn (a hairline ink border, the design's) makes
-    // it a shader no earlier call shares — the same ordering trap the
-    // selection wash documents, answered the same way.
-    mod.widgets.SuggestBox = View {
-        width: Fill, height: Fit
-        flow: Down
-        show_bg: true
-        padding: Inset{left: 1, right: 1, top: 1, bottom: 1}
-        draw_bg +: {
-            color: #ffffff
-            pixel: fn() {
-                let px = 1.0 / self.rect_size.x
-                let py = 1.0 / self.rect_size.y
-                if self.pos.x < px || self.pos.x > 1.0 - px || self.pos.y < py || self.pos.y > 1.0 - py {
-                    return vec4(0.078, 0.078, 0.078, 1.0)
-                }
-                return vec4(self.color.xyz * self.color.w, self.color.w)
-            }
-        }
-        s0 := mod.widgets.SuggestRow {}
-        s1 := mod.widgets.SuggestRow {}
-        s2 := mod.widgets.SuggestRow {}
-        s3 := mod.widgets.SuggestRow {}
-        s4 := mod.widgets.SuggestRow {}
-        s5 := mod.widgets.SuggestRow {}
-        s6 := mod.widgets.SuggestRow {}
-        s7 := mod.widgets.SuggestRow {}
     }
 
     /** The inbox: the filter over the header over the virtualized list —
@@ -1649,6 +1655,196 @@ impl Widget for AddAccountPanel {
 
 
 // ---------------------------------------------------------------------------
+// Suggest — the autocomplete any field hangs under itself
+// ---------------------------------------------------------------------------
+
+/// The eight suggestion slots of a `SuggestBox`, by name.
+const SUGGEST_SLOTS: [LiveId; richtable::MAX_SUGGESTIONS] = [
+    live_id!(s0),
+    live_id!(s1),
+    live_id!(s2),
+    live_id!(s3),
+    live_id!(s4),
+    live_id!(s5),
+    live_id!(s6),
+    live_id!(s7),
+];
+
+/// A field's autocomplete (CR-006): the offer under the caret, where the
+/// highlight is, and a dismissal that holds until the caret moves on.
+/// Generic over a [`Completion`] — the part that differs between fields:
+/// the filter's tag grammar, compose's recipient list — while the box, the
+/// keys and the pick are this, once.
+///
+/// The panel owns the box (a `#[live] suggest: View` its DSL fills with
+/// `SuggestBox`) and lends it per call, and it draws the box **last**, at
+/// an absolute rect hung under the field, so the box covers what follows
+/// the field instead of pushing it. The completion is lent per call too,
+/// because for the inbox it is the table the panel already holds.
+pub struct Suggest<C: Completion> {
+    ctx: Option<C::Ctx>,
+    items: Vec<Suggestion>,
+    sel: usize,
+    dismissed: Option<C::Ctx>,
+}
+
+impl<C: Completion> Default for Suggest<C> {
+    fn default() -> Self {
+        Suggest {
+            ctx: None,
+            items: Vec::new(),
+            sel: 0,
+            dismissed: None,
+        }
+    }
+}
+
+impl<C: Completion> Suggest<C> {
+    /// Whether the box is up: a context with an offer, not put away.
+    pub fn open(&self) -> bool {
+        self.ctx.is_some() && self.dismissed != self.ctx && !self.items.is_empty()
+    }
+
+    /// The keys the box owns while it is open and its field holds the
+    /// keyboard: the arrows walk the offer, enter and tab take it, esc puts
+    /// it away. `true` when the key was one of them — the field must not
+    /// see it (a swallowed enter is the point), and the panel redraws.
+    pub fn key(&mut self, cx: &mut Cx, c: &C, field: &TextInputRef, k: &KeyEvent) -> bool {
+        if !self.open() || !field.key_focus(cx) {
+            return false;
+        }
+        match k.key_code {
+            KeyCode::ArrowDown => self.sel = (self.sel + 1).min(self.items.len() - 1),
+            KeyCode::ArrowUp => self.sel = self.sel.saturating_sub(1),
+            KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab => {
+                self.pick(cx, c, field, self.sel);
+            }
+            KeyCode::Escape => self.dismissed = self.ctx.clone(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Commits suggestion `i`: splices it over what the caret was typing,
+    /// parks the caret after it and keeps the field's focus, so a picked
+    /// `@from:` opens its values without another keystroke.
+    pub fn pick(&mut self, cx: &mut Cx, c: &C, field: &TextInputRef, i: usize) {
+        let (Some(ctx), Some(item)) = (self.ctx.as_ref(), self.items.get(i)) else {
+            return;
+        };
+        let text = field.text();
+        let (line, at) = c.splice(&text, field.cursor().index, ctx, item);
+        field.set_text(cx, &line);
+        field.set_cursor(
+            cx,
+            Cursor {
+                index: at,
+                prefer_next_row: false,
+            },
+            false,
+        );
+        field.set_key_focus(cx);
+        self.dismissed = None;
+    }
+
+    /// Re-derives the offer from the caret — while the field holds the
+    /// keyboard; a blurred field offers nothing — fills the slots and draws
+    /// the box under the field. Call it after the rest of the panel has
+    /// drawn, so the box lands in a draw call over what it covers.
+    pub fn draw(
+        &mut self,
+        cx: &mut Cx2d,
+        scope: &mut Scope,
+        store: &Store,
+        c: &C,
+        field: &TextInputRef,
+        view: &mut View,
+    ) {
+        let ctx = if field.key_focus(cx) {
+            c.context(&field.text(), field.cursor().index)
+        } else {
+            None
+        };
+        if ctx != self.ctx {
+            self.items = ctx.as_ref().map(|x| c.offer(store, x)).unwrap_or_default();
+            self.ctx = ctx;
+            self.sel = 0;
+            if self.dismissed != self.ctx {
+                self.dismissed = None;
+            }
+        }
+        let open = self.open();
+        view.set_visible(cx, open);
+        if !open {
+            return;
+        }
+        let (ink, bg, dim, dim_inv) = (
+            vec4(0.078, 0.078, 0.078, 1.0),
+            vec4(1.0, 1.0, 1.0, 1.0),
+            vec4(0.565, 0.565, 0.565, 1.0),
+            vec4(0.75, 0.75, 0.75, 1.0),
+        );
+        for (i, slot) in SUGGEST_SLOTS.iter().enumerate() {
+            let row = view.view(cx, &[*slot]);
+            let Some(it) = self.items.get(i) else {
+                row.set_visible(cx, false);
+                continue;
+            };
+            row.set_visible(cx, true);
+            let selected = i == self.sel;
+            for (line, on, fg, fg_dim) in [
+                (live_id!(line), !selected, ink, dim),
+                (live_id!(line_sel), selected, bg, dim_inv),
+            ] {
+                view.view(cx, &[*slot, line]).set_visible(cx, on);
+                if !on {
+                    continue;
+                }
+                let lbl = view.label(cx, &[*slot, line, live_id!(lbl)]);
+                lbl.set_text(cx, &it.label);
+                lbl.set_text_color(cx, fg);
+                let desc = view.label(cx, &[*slot, line, live_id!(desc)]);
+                desc.set_text(cx, &it.describe);
+                desc.set_visible(cx, !it.describe.is_empty());
+                desc.set_text_color(cx, fg_dim);
+            }
+        }
+        let fr = field.area().rect(cx);
+        if fr.size.x <= 0.0 {
+            return;
+        }
+        view.draw_walk_all(
+            cx,
+            scope,
+            Walk {
+                abs_pos: Some(dvec2(fr.pos.x, fr.pos.y + fr.size.y + 2.0)),
+                width: Size::Fixed(fr.size.x),
+                ..Walk::fit()
+            },
+        );
+    }
+
+    /// The open box's rows, `(label, rect)`, for the shell's hit table — a
+    /// click on one is a [`Suggest::pick`].
+    pub fn hits(&self, cx: &mut Cx, view: &View) -> Vec<(String, Rect)> {
+        if !self.open() {
+            return Vec::new();
+        }
+        self.items
+            .iter()
+            .zip(SUGGEST_SLOTS.iter())
+            .map(|(it, slot)| (it.label.clone(), view.view(cx, &[*slot]).area().rect(cx)))
+            .filter(|(_, r)| r.size.x > 0.0)
+            .collect()
+    }
+}
+
+/// The store a panel widget reads while drawing, off the scope.
+fn panel_store(scope: &Scope) -> Option<std::rc::Rc<Store>> {
+    scope.props.get::<PanelProps>().map(|p| p.store.clone())
+}
+
+// ---------------------------------------------------------------------------
 // ComposePanel
 // ---------------------------------------------------------------------------
 
@@ -1658,6 +1854,13 @@ pub struct ComposePanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    /// The TO field's autocomplete box, drawn over the fields under it
+    /// after everything else.
+    #[live]
+    suggest: View,
+    /// The offer under the TO caret: the senders the store knows.
+    #[rust]
+    ac: Suggest<mail::Recipients>,
 }
 
 impl ComposePanel {
@@ -1668,10 +1871,37 @@ impl ComposePanel {
             self.view.text_input(cx, ids!(body_input)),
         ]
     }
+
+    /// The fields changed — hands them to the shell, which persists the
+    /// draft.
+    fn draft_edited(&self, cx: &mut Cx, pid: u64) {
+        let [to, subject, body] = self.inputs(cx);
+        cx.action(PanelAction::DraftEdited {
+            pid,
+            to: to.text(),
+            subject: subject.text(),
+            body: body.text(),
+        });
+    }
 }
 
 impl Widget for ComposePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        // The TO field's autocomplete owns the arrows, enter, tab and esc
+        // while it is open (see `Suggest`); neither the field nor the tab
+        // ring sees them. A pick is an edit like any typing.
+        if let Event::KeyDown(k) = event {
+            let to = self.view.text_input(cx, ids!(to_input));
+            let before = to.text();
+            if self.ac.key(cx, &mail::Recipients, &to, k) {
+                if to.text() != before {
+                    self.draft_edited(cx, pid);
+                }
+                self.redraw(cx);
+                return;
+            }
+        }
         self.view.handle_event(cx, event, scope);
 
         // Tab walks to → subject → body, wrapping; from panel focus it
@@ -1707,23 +1937,41 @@ impl Widget for ComposePanel {
                 || subject.changed(actions).is_some()
                 || body.changed(actions).is_some()
             {
-                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
-                cx.action(PanelAction::DraftEdited {
-                    pid,
-                    to: to.text(),
-                    subject: subject.text(),
-                    body: body.text(),
-                });
+                self.draft_edited(cx, pid);
             }
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.view.draw_walk(cx, scope, walk)
+        self.view.draw_walk_all(cx, scope, walk);
+        // The TO field's offer, over the subject and the body.
+        if let Some(store) = panel_store(scope) {
+            let to = self.view.text_input(cx, ids!(to_input));
+            self.ac
+                .draw(cx, scope, &store, &mail::Recipients, &to, &mut self.suggest);
+        }
+        DrawStep::done()
     }
 }
 
 impl ComposePanelRef {
+    /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
+    /// table — a click on one is [`ComposePanelRef::pick`].
+    pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        self.borrow()
+            .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
+    }
+
+    /// Commits the `i`-th address on offer in the TO field; the draft
+    /// follows, as for any edit.
+    pub fn pick(&self, cx: &mut Cx, pid: u64, i: usize) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        let to = p.view.text_input(cx, ids!(to_input));
+        p.ac.pick(cx, &mail::Recipients, &to, i);
+        p.draft_edited(cx, pid);
+    }
+
     /// Seeds the fields (once, at instantiation) and focuses the body.
     pub fn prefill(&self, cx: &mut Cx, to: &str, subject: &str, body: &str) {
         let Some(inner) = self.borrow() else { return };
@@ -1844,37 +2092,8 @@ impl InboxRowRef {
 // InboxPanel
 // ---------------------------------------------------------------------------
 
-/// The filter's autocomplete: what it offers under the caret and where
-/// the highlight is. Re-derived from the caret every draw; the one thing
-/// it remembers is a dismissal, which holds until the caret moves on.
-#[derive(Default)]
-struct Suggest {
-    ctx: Option<filter::Context>,
-    items: Vec<Suggestion>,
-    sel: usize,
-    dismissed: Option<filter::Context>,
-}
-
-impl Suggest {
-    fn open(&self) -> bool {
-        self.ctx.is_some() && self.dismissed != self.ctx && !self.items.is_empty()
-    }
-}
-
 /// The inbox's table: the shared engine over the mail datasource.
 type InboxTable = Table<&'static SqlSource<mail::MailHead>>;
-
-/// The eight suggestion slots, by name.
-const SUGGEST_SLOTS: [LiveId; richtable::MAX_SUGGESTIONS] = [
-    live_id!(s0),
-    live_id!(s1),
-    live_id!(s2),
-    live_id!(s3),
-    live_id!(s4),
-    live_id!(s5),
-    live_id!(s6),
-    live_id!(s7),
-];
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct InboxPanel {
@@ -1900,13 +2119,15 @@ pub struct InboxPanel {
     /// scrolling a long list costs its new rows and nothing else.
     #[rust]
     stamps: HashMap<usize, (mail::MailHead, bool)>,
+    /// The filter's autocomplete: the table is its completion — tag
+    /// names, then a tag's values.
     #[rust]
-    ac: Suggest,
+    ac: Suggest<InboxTable>,
 }
 
 impl InboxPanel {
     fn store(scope: &Scope) -> Option<std::rc::Rc<Store>> {
-        scope.props.get::<PanelProps>().map(|p| p.store.clone())
+        panel_store(scope)
     }
 
     /// Hands the field's text to the table. The field is the one source of
@@ -1975,111 +2196,6 @@ impl InboxPanel {
         };
         self.set_sel(cx, pid, store, i);
     }
-
-    /// Commits suggestion `i`: splices it over what the caret was typing,
-    /// parks the caret after it and keeps the field's focus, so a picked
-    /// `@from:` opens its values without another keystroke.
-    fn pick(&mut self, cx: &mut Cx, i: usize) {
-        let (Some(ctx), Some(item)) = (self.ac.ctx.clone(), self.ac.items.get(i).cloned()) else {
-            return;
-        };
-        let filter = self.view.text_input(cx, ids!(filter_input));
-        let text = filter.text();
-        let cursor = filter.cursor().index;
-        let (line, at) = match &ctx {
-            filter::Context::Tag { start, .. } => {
-                let takes_value = self.table.tag(&item.value).is_some_and(|t| t.takes_value());
-                filter::insert_tag(&text, cursor, *start, &item.value, takes_value)
-            }
-            filter::Context::Value { start, .. } => {
-                filter::insert_value(&text, cursor, *start, &item.value)
-            }
-        };
-        filter.set_text(cx, &line);
-        filter.set_cursor(
-            cx,
-            Cursor {
-                index: at,
-                prefer_next_row: false,
-            },
-            false,
-        );
-        filter.set_key_focus(cx);
-        self.ac.dismissed = None;
-        self.redraw(cx);
-    }
-
-    /// Re-derives the offer from the caret, fills the slots and draws the
-    /// box under the field — after the rest of the panel, so it covers the
-    /// rows rather than pushing them.
-    fn draw_suggest(&mut self, cx: &mut Cx2d, scope: &mut Scope, store: &Store, focused: bool) {
-        let filter = self.view.text_input(cx, ids!(filter_input));
-        let ctx = if focused {
-            filter::context(&filter.text(), filter.cursor().index)
-        } else {
-            None
-        };
-        if ctx != self.ac.ctx {
-            self.ac.items = ctx
-                .as_ref()
-                .map(|c| self.table.suggestions(store, c))
-                .unwrap_or_default();
-            self.ac.ctx = ctx;
-            self.ac.sel = 0;
-            if self.ac.dismissed != self.ac.ctx {
-                self.ac.dismissed = None;
-            }
-        }
-        let open = self.ac.open();
-        self.suggest.set_visible(cx, open);
-        if !open {
-            return;
-        }
-        let (ink, bg, dim, dim_inv) = (
-            vec4(0.078, 0.078, 0.078, 1.0),
-            vec4(1.0, 1.0, 1.0, 1.0),
-            vec4(0.565, 0.565, 0.565, 1.0),
-            vec4(0.75, 0.75, 0.75, 1.0),
-        );
-        for (i, slot) in SUGGEST_SLOTS.iter().enumerate() {
-            let row = self.suggest.view(cx, &[*slot]);
-            let Some(it) = self.ac.items.get(i) else {
-                row.set_visible(cx, false);
-                continue;
-            };
-            row.set_visible(cx, true);
-            let selected = i == self.ac.sel;
-            for (line, on, fg, fg_dim) in [
-                (live_id!(line), !selected, ink, dim),
-                (live_id!(line_sel), selected, bg, dim_inv),
-            ] {
-                self.suggest.view(cx, &[*slot, line]).set_visible(cx, on);
-                if !on {
-                    continue;
-                }
-                let lbl = self.suggest.label(cx, &[*slot, line, live_id!(lbl)]);
-                lbl.set_text(cx, &it.label);
-                lbl.set_text_color(cx, fg);
-                let desc = self.suggest.label(cx, &[*slot, line, live_id!(desc)]);
-                desc.set_text(cx, &it.describe);
-                desc.set_visible(cx, !it.describe.is_empty());
-                desc.set_text_color(cx, fg_dim);
-            }
-        }
-        let fr = filter.area().rect(cx);
-        if fr.size.x <= 0.0 {
-            return;
-        }
-        self.suggest.draw_walk_all(
-            cx,
-            scope,
-            Walk {
-                abs_pos: Some(dvec2(fr.pos.x, fr.pos.y + fr.size.y + 2.0)),
-                width: Size::Fixed(fr.size.x),
-                ..Walk::fit()
-            },
-        );
-    }
 }
 
 impl InboxPanelRef {
@@ -2116,24 +2232,16 @@ impl InboxPanelRef {
     /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
     /// table — a click on one is [`InboxPanelRef::pick`].
     pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
-        let Some(p) = self.borrow() else { return Vec::new() };
-        if !p.ac.open() {
-            return Vec::new();
-        }
-        p.ac
-            .items
-            .iter()
-            .zip(SUGGEST_SLOTS.iter())
-            .map(|(it, slot)| (it.label.clone(), p.suggest.view(cx, &[*slot]).area().rect(cx)))
-            .filter(|(_, r)| r.size.x > 0.0)
-            .collect()
+        self.borrow()
+            .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
     }
 
     /// Commits the `i`-th suggestion on offer.
     pub fn pick(&self, cx: &mut Cx, i: usize) {
-        if let Some(mut p) = self.borrow_mut() {
-            p.pick(cx, i);
-        }
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        let filter = p.view.text_input(cx, ids!(filter_input));
+        p.ac.pick(cx, &p.table, &filter, i);
     }
 }
 
@@ -2143,33 +2251,13 @@ impl Widget for InboxPanel {
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
 
-        // The autocomplete owns these keys while it is open: the arrows
-        // walk the offer, enter and tab take it, esc puts it away. The
-        // field never sees them — a swallowed enter is the point.
+        // The autocomplete owns the arrows, enter, tab and esc while it is
+        // open (see `Suggest`); the field never sees them — a swallowed
+        // enter is the point.
         if let Event::KeyDown(k) = event {
-            if filter_focused && self.ac.open() {
-                match k.key_code {
-                    KeyCode::ArrowDown => {
-                        self.ac.sel = (self.ac.sel + 1).min(self.ac.items.len() - 1);
-                        self.redraw(cx);
-                        return;
-                    }
-                    KeyCode::ArrowUp => {
-                        self.ac.sel = self.ac.sel.saturating_sub(1);
-                        self.redraw(cx);
-                        return;
-                    }
-                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab => {
-                        self.pick(cx, self.ac.sel);
-                        return;
-                    }
-                    KeyCode::Escape => {
-                        self.ac.dismissed = self.ac.ctx.clone();
-                        self.redraw(cx);
-                        return;
-                    }
-                    _ => {}
-                }
+            if self.ac.key(cx, &self.table, &filter, k) {
+                self.redraw(cx);
+                return;
             }
         }
         self.view.handle_event(cx, event, scope);
@@ -2295,7 +2383,9 @@ impl Widget for InboxPanel {
             }
         }
         self.stamps.retain(|k, _| live.contains(k));
-        self.draw_suggest(cx, scope, &store, focused);
+        // The filter's offer, over the rows.
+        self.ac
+            .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
         DrawStep::done()
     }
 }

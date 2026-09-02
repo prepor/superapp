@@ -70,6 +70,9 @@ Per panel, below the reserved set:
   **previewing** each one beside it). In the filter, `@` opens the tag
   autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
   [The Rich Table](./richtable.md) for the grammar
+- compose: in TO, typing offers the senders the store knows, by name or
+  address — the same box, the same keys; `enter` and `tab` take the
+  address and stay in the field, so a comma starts the next one
 - forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
   wrapping; `enter` advances and **submits past the last field**. Read
   panels have no ring: their controls wear chords instead.

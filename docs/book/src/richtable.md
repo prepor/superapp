@@ -61,6 +61,19 @@ value keeps its spaces while it is typed. Arrows walk the offer, `enter`
 and `tab` take it, `esc` puts it away (a second `esc` leaves the field);
 a pick keeps the field's focus. The box is capped at eight rows.
 
+The box is not the filter's. What a field completes is a **completion**
+(`richtable::Completion`): how the caret's context is read off the line,
+what is offered for it, and how a pick splices back in — pure text, tested
+without a widget. The table is one completion (the grammar above); the
+compose panel's TO field is another (`mail::Recipients`): the
+comma-separated token under the caret, matched as a substring against
+every sender the store has heard from, by name or address — the `@from:`
+offer, landing in a different field. A pick lands the bare address; an
+address already in the list, or one typed out in full, is not offered.
+The box, its keys and the pick are one component (`panels::Suggest`) that
+takes any completion; a panel holds one per field that completes and
+draws it last, so it covers what follows the field instead of pushing it.
+
 ## Paging and the cursor
 
 The table's length is one `COUNT(*)` under the filter. Rows come in pages
@@ -91,5 +104,6 @@ row.
 Declare the `SqlSpec` and its `TagDef`s beside the domain's queries, wrap
 them in a `SqlSource` with the row decoder, the order key and the
 suggestion function, and give the panel widget a `Table` over it. The
-filter field, the error line, the autocomplete box and the paging loop are
-the inbox panel's; the next list kind lifts them as they are.
+autocomplete is a `Suggest` over that table, as the inbox's is; the
+filter field, the error line and the paging loop are the inbox panel's,
+and the next list kind lifts them as they are.

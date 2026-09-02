@@ -811,6 +811,66 @@ impl<D: Datasource> Table<D> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Completion
+// ---------------------------------------------------------------------------
+
+/// What a text field completes: how the caret's context is read off the
+/// line, what is offered for it, and how a pick splices back in. The box
+/// under the field, its keys and the pick itself are one component in
+/// `panels` (`Suggest`) that takes any of these — the filter grammar is one
+/// ([`Table`] implements it), a compose panel's recipient list is another.
+///
+/// Pure by design: a completion is text in, text out, so it is tested
+/// without a widget in sight.
+pub trait Completion {
+    /// What the caret is in the middle of typing.
+    type Ctx: Clone + PartialEq;
+
+    /// Classifies the caret, or `None` when completion would only be
+    /// noise. Offsets in the context are byte indices into `text`.
+    fn context(&self, text: &str, cursor: usize) -> Option<Self::Ctx>;
+
+    /// The offer for a context — at most [`MAX_SUGGESTIONS`] rows.
+    fn offer(&self, store: &Store, ctx: &Self::Ctx) -> Vec<Suggestion>;
+
+    /// Splices a pick over what the context covers: the new line and
+    /// where the caret lands.
+    fn splice(&self, text: &str, cursor: usize, ctx: &Self::Ctx, pick: &Suggestion)
+        -> (String, usize);
+}
+
+/// The filter grammar as a completion: tag names, then a tag's values,
+/// spliced by [`filter::insert_tag`] and [`filter::insert_value`] — a
+/// picked `@from` lands as `@from:` so its values open at once.
+impl<D: Datasource> Completion for Table<D> {
+    type Ctx = Context;
+
+    fn context(&self, text: &str, cursor: usize) -> Option<Context> {
+        filter::context(text, cursor)
+    }
+
+    fn offer(&self, store: &Store, ctx: &Context) -> Vec<Suggestion> {
+        self.suggestions(store, ctx)
+    }
+
+    fn splice(
+        &self,
+        text: &str,
+        cursor: usize,
+        ctx: &Context,
+        pick: &Suggestion,
+    ) -> (String, usize) {
+        match ctx {
+            Context::Tag { start, .. } => {
+                let takes_value = self.tag(&pick.value).is_some_and(|t| t.takes_value());
+                filter::insert_tag(text, cursor, *start, &pick.value, takes_value)
+            }
+            Context::Value { start, .. } => filter::insert_value(text, cursor, *start, &pick.value),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,5 +1222,25 @@ mod tests {
         // No values declared: nothing to offer.
         assert!(t.suggestions(&s, &ctx("@n>")).is_empty());
         assert!(t.suggestions(&s, &ctx("@bogus:")).is_empty());
+    }
+
+    /// The table as a completion: a pick over a tag context lands `@name:`
+    /// for a tag with values and `@name ` for a boolean, so the value list
+    /// opens by itself only where there is one; a value pick lands quoted
+    /// when it has to be, with a space to type on.
+    #[test]
+    fn the_filter_is_a_completion() {
+        let s = store_with(3);
+        let t = Table::new(&SOURCE, 10);
+        let pick = |text: &str, i: usize| {
+            let c = t.context(text, text.len()).expect("a context");
+            let offer = t.offer(&s, &c);
+            t.splice(text, text.len(), &c, &offer[i])
+        };
+        assert_eq!(pick("@na", 0), ("@name:".into(), 6));
+        assert_eq!(pick("@o", 0), ("@ok ".into(), 4));
+        assert_eq!(pick("@ok @name:\"item 00", 0), ("@ok @name:\"item 001 beta\" ".into(), 26));
+        assert_eq!(pick("x @at:t", 0), ("x @at:02.09.2026 ".into(), 17));
+        assert_eq!(t.context("plain words", 5), None);
     }
 }
