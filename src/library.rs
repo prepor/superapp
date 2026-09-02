@@ -311,6 +311,9 @@ pub struct Library {
     renders: usize,
     #[rust]
     last_draw: Option<std::time::Instant>,
+    /// Events since the last draw, by kind — what a frame answers to.
+    #[rust]
+    since_draw: Vec<(&'static str, u32)>,
 }
 
 impl ScriptHook for Library {
@@ -1553,6 +1556,11 @@ impl Widget for Library {
         let t0 = app::frame_log().then(std::time::Instant::now);
         self.handle(cx, event);
         if let Some(t0) = t0 {
+            let kind = event_kind(event);
+            match self.since_draw.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => *n += 1,
+                None => self.since_draw.push((kind, 1)),
+            }
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             if ms > 1.0 {
                 eprintln!(
@@ -1576,15 +1584,21 @@ impl Widget for Library {
                     .last_draw
                     .map_or(0.0, |t| (t0 - t).as_secs_f64() * 1000.0);
                 self.last_draw = Some(t0);
+                let after: Vec<String> = self
+                    .since_draw
+                    .drain(..)
+                    .map(|(k, n)| format!("{k}×{n}"))
+                    .collect();
                 eprintln!(
-                    "library: frame {} (+{:.0} ms): draw {:.2} ms, {:.2} ms in {} mount render(s), zoom {:.3}, entered {:?}",
+                    "library: frame {} (+{:.0} ms): draw {:.2} ms, {:.2} ms in {} mount render(s), zoom {:.3}, entered {:?}, after {}",
                     self.frames,
                     since,
                     t0.elapsed().as_secs_f64() * 1000.0,
                     self.mount_ms,
                     self.renders,
                     self.zoom(),
-                    self.entered
+                    self.entered,
+                    after.join(" ")
                 );
             }
         }

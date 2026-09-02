@@ -5038,6 +5038,15 @@ impl Widget for Stage {
                 if springs_active || toast_active || dragging || swiping {
                     self.next_frame = cx.new_next_frame();
                 }
+                if frame_log() && self.mount {
+                    eprintln!(
+                        "mount: tick dt {:.1} ms, springs {}, toast {}, wants a frame {}",
+                        dt * 1000.0,
+                        springs_active,
+                        toast_active,
+                        springs_active || toast_active || dragging || swiping
+                    );
+                }
                 redraw_scoped(cx, self.lists, self.mount);
                 // Mutates the world, so it runs after the frame's own
                 // bookkeeping rather than in the middle of it.
