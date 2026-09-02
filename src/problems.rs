@@ -10,6 +10,7 @@
 
 use std::rc::Rc;
 
+use crate::core::Seed;
 use crate::mail;
 use crate::repl;
 use crate::store::{Store, Q};
@@ -26,7 +27,9 @@ pub enum Source {
     Send {
         outbox: i64,
         subject: String,
-        re: i64,
+        /// What the draft started from, so reopening it comes back as the
+        /// same reply or forward — not as a blank sheet.
+        seed: Seed,
         given_up: bool,
     },
     /// Device sync: the bucket could not be reached this pass.
@@ -66,7 +69,7 @@ static Q_FAILING_SENDS: Q = Q {
     id: "failing_sends",
     sql: "SELECT o.id, o.status, COALESCE(o.error, e.error, 'send failed'),
                  COALESCE(d.subject, ''), COALESCE(d.to_addr, ''),
-                 COALESCE(d.re_message, 0), COALESCE(e.attempts, 0),
+                 d.re_message, d.fwd_message, COALESCE(e.attempts, 0),
                  COALESCE(e.not_before, 0), COALESCE(e.status, '')
           FROM outbox o
           LEFT JOIN draft d ON d.panel = o.id
@@ -111,7 +114,18 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             },
         });
     }
-    type SendRow = (i64, String, String, String, String, i64, i64, f64, String);
+    type SendRow = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        f64,
+        String,
+    );
     let sends: Rc<Vec<SendRow>> = store.rows(&Q_FAILING_SENDS, &[], |r| {
         Ok((
             r.get(0)?,
@@ -123,9 +137,10 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             r.get(6)?,
             r.get(7)?,
             r.get(8)?,
+            r.get(9)?,
         ))
     });
-    for (outbox, status, error, subject, to, re, attempts, next, job) in sends.iter() {
+    for (outbox, status, error, subject, to, re, fwd, attempts, next, job) in sends.iter() {
         let subject = if subject.is_empty() {
             "(no subject)".to_string()
         } else {
@@ -141,7 +156,11 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             source: Source::Send {
                 outbox: *outbox,
                 subject: subject.clone(),
-                re: *re,
+                seed: match (*re, *fwd) {
+                    (Some(id), _) => Seed::Reply(id),
+                    (None, Some(id)) => Seed::Forward(id),
+                    (None, None) => Seed::Blank,
+                },
                 given_up,
             },
             label: format!("send “{subject}”"),
@@ -298,7 +317,7 @@ mod tests {
             Source::Send {
                 outbox: 9,
                 subject: "Hi".into(),
-                re: 0,
+                seed: Seed::Blank,
                 given_up: true,
             }
         );
@@ -306,6 +325,22 @@ mod tests {
         assert_eq!(v[0].line, "account has no smtp host");
         assert_eq!(v[0].detail, "to x@y — gave up after 6 attempts");
         assert_eq!(v[0].key(), "outbox:9");
+
+        // The seed comes back whole, so reopening a failed forward gives a
+        // forward — the row carries what the draft was, not just its text.
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE draft SET fwd_message = 4 WHERE panel = 9", [])
+                    .map(|_| ())
+            })
+            .unwrap();
+        assert!(matches!(
+            list(w.store(), None)[0].source,
+            Source::Send {
+                seed: Seed::Forward(4),
+                ..
+            }
+        ));
     }
 
     /// A send is wrong from its first failed attempt — the executor's
@@ -350,7 +385,7 @@ mod tests {
             Source::Send {
                 outbox: 9,
                 subject: "(no subject)".into(),
-                re: 0,
+                seed: Seed::Blank,
                 given_up: false,
             }
         );

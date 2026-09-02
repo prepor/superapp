@@ -3538,18 +3538,20 @@ impl Stage {
                         cx.action(crate::panels::PanelAction::RetrySend(id));
                     }
                     WidgetOp::ReopenSend(id) => {
-                        let re = state
+                        let seed = state
                             .problems()
                             .iter()
                             .find_map(|p| match &p.source {
-                                crate::problems::Source::Send { outbox, re, .. } if *outbox == id => Some(*re),
+                                crate::problems::Source::Send { outbox, seed, .. } if *outbox == id => {
+                                    Some(*seed)
+                                }
                                 _ => None,
                             })
-                            .unwrap_or(0);
+                            .unwrap_or(crate::core::Seed::Blank);
                         cx.action(crate::panels::PanelAction::ReopenSend {
                             pid,
                             outbox: id,
-                            re,
+                            seed,
                             fresh: alt,
                         });
                     }
@@ -4821,7 +4823,7 @@ impl Stage {
                 crate::panels::PanelAction::ReopenSend {
                     pid,
                     outbox,
-                    re,
+                    seed,
                     fresh,
                 } => {
                     let Some(state) = self.state.as_deref_mut() else {
@@ -4834,7 +4836,7 @@ impl Stage {
                         .map(|(_, e)| e.clone())
                         .unwrap_or_else(|| "send failed".into());
                     let now = state.world.now();
-                    let kind = Kind::Compose { re };
+                    let kind = Kind::Compose { seed };
                     // The compose panel's id is minted by the layout change;
                     // the data half and the claim read it from here.
                     let minted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
