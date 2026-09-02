@@ -5550,6 +5550,24 @@ impl Widget for Stage {
         if self.frozen() {
             return;
         }
+        // Images the open letters asked for (see `Pictures`): filed as they
+        // arrive, and everything redraws to place them. An HTTP reply, bytes
+        // the picture reader took out of a letter's raw, a texture makepad's
+        // decode pool finished — all three land in a `Cx` global that is no
+        // stage's property, so they are filed above the suspend gate below:
+        // each is delivered once, and a stage that let one past would strand
+        // the item waiting on it. Before the hosted content sees the same
+        // actions, so an item that asked finds its texture already cached.
+        if let Event::NetworkResponses(responses) = event {
+            if crate::panels::pictures_arrived(cx, responses) {
+                cx.redraw_all();
+            }
+        }
+        if let Event::Actions(actions) = event {
+            if crate::panels::pictures_landed(cx, actions) {
+                cx.redraw_all();
+            }
+        }
         // Under the library: the world keeps turning (timers, the store's
         // signals, a running script), the window is not this stage's.
         if self.suspended
@@ -5560,13 +5578,6 @@ impl Widget for Stage {
             && !(matches!(event, Event::NextFrame(_)) && self.e2e.is_some())
         {
             return;
-        }
-        // Images the open letters asked for (see `Pictures`): filed as they
-        // arrive, and everything redraws to place them.
-        if let Event::NetworkResponses(responses) = event {
-            if crate::panels::pictures_arrived(cx, responses) {
-                cx.redraw_all();
-            }
         }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
