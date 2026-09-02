@@ -55,11 +55,11 @@ pub struct RemoteFolder {
 pub struct FolderMeta {
     pub uidvalidity: u32,
     pub uidnext: u32,
-    /// Whether the folder keeps keywords such as `$Forwarded` — from
-    /// `PERMANENTFLAGS`, which may name the keyword, allow any (`\*`), or
-    /// be absent, which RFC 3501 reads as "all flags are permanent". A
-    /// server without it may accept a `STORE` and forget the flag by the
-    /// next session, so a mark is neither pushed to nor read from one.
+    /// Whether the folder keeps keywords such as `$Forwarded` — its
+    /// `PERMANENTFLAGS` name the keyword or allow any (`\*`). A server
+    /// that says otherwise, or says nothing, may accept a `STORE` and
+    /// forget the flag by the next session, so a mark is neither pushed
+    /// to nor read from one; it stays local there.
     pub keywords: bool,
 }
 
@@ -1578,6 +1578,23 @@ mod imap_session {
     /// what Apple Mail, Thunderbird, Fastmail and Dovecot set and read.
     const FORWARDED: &str = "$Forwarded";
 
+    /// Whether a folder's `PERMANENTFLAGS` let the keyword be kept: the
+    /// keyword itself, or `\*` (any keyword). An empty list is *not*
+    /// support — the crate hands back the same empty list for
+    /// `PERMANENTFLAGS ()` (a folder that keeps nothing, an EXAMINEd one)
+    /// and for a server that sent no such response at all, and only the
+    /// second could be read as "all flags are permanent" (RFC 3501 §7.1).
+    /// Between a mark kept local on a server that said nothing and a
+    /// mark taken and forgotten by one that said `()`, keep it local.
+    pub(super) fn keeps_keywords(permanent: &[imap::types::Flag<'_>]) -> bool {
+        use imap::types::Flag;
+        permanent.iter().any(|f| match f {
+            Flag::MayCreate => true,
+            Flag::Custom(k) => k.eq_ignore_ascii_case(FORWARDED),
+            _ => false,
+        })
+    }
+
     pub fn connect(host: &str, user: &str, pass: &str) -> Result<Imap, String> {
         let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
         let session = client.login(user, pass).map_err(|e| s(e.0))?;
@@ -1589,21 +1606,12 @@ mod imap_session {
 
     impl Imap {
         pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
-            use imap::types::Flag;
             let mb = self.session.select(name).map_err(s)?;
             self.selected = Some(name.to_string());
-            // No PERMANENTFLAGS at all means every flag is permanent
-            // (RFC 3501 §7.1); otherwise the keyword itself or `\*`.
-            let keywords = mb.permanent_flags.is_empty()
-                || mb.permanent_flags.iter().any(|f| match f {
-                    Flag::MayCreate => true,
-                    Flag::Custom(k) => k.eq_ignore_ascii_case(FORWARDED),
-                    _ => false,
-                });
             Ok(FolderMeta {
                 uidvalidity: mb.uid_validity.unwrap_or(0),
                 uidnext: mb.uid_next.unwrap_or(1),
-                keywords,
+                keywords: keeps_keywords(&mb.permanent_flags),
             })
         }
 
@@ -1765,6 +1773,21 @@ mod tests {
         let mut reg = Registry::new();
         reg.register::<Poke>();
         World::fake(reg)
+    }
+
+    /// What a folder's PERMANENTFLAGS say about keeping `$Forwarded`: the
+    /// keyword, or the `\*` wildcard; not the system flags alone, and not
+    /// an empty list, which is what `()` and no response both arrive as.
+    #[test]
+    fn keywords_need_the_servers_word() {
+        use imap::types::Flag;
+        use std::borrow::Cow;
+        let keeps = imap_session::keeps_keywords;
+        assert!(!keeps(&[]), "`()` and no response look alike: kept local");
+        assert!(!keeps(&[Flag::Seen, Flag::Flagged]));
+        assert!(keeps(&[Flag::Seen, Flag::MayCreate]));
+        assert!(keeps(&[Flag::Custom(Cow::Borrowed("$forwarded"))]));
+        assert!(!keeps(&[Flag::Custom(Cow::Borrowed("$MDNSent"))]));
     }
 
     /// The threading headers a draft goes out with: a reply names its

@@ -3597,12 +3597,21 @@ impl Stage {
                     }
                     BtnAct::Discard => {
                         let label = format!("discard “{}”", state.title_of(pid));
-                        // The text goes with the panel, so undo has to carry it.
-                        let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
                         let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
                             Some(Kind::Compose { seed }) => seed,
                             _ => Seed::Blank,
                         };
+                        // The text goes with the panel, so undo has to carry
+                        // it — the text the panel *shows*. The row can lag
+                        // it (a keystroke), be missing (never typed in) or
+                        // predate it (a compose retargeted in place, unedited
+                        // since); what undo puts back is what was on screen.
+                        let draft = self
+                            .hosted
+                            .get(&pid)
+                            .map(|w| w.as_compose_panel().values(cx))
+                            .or_else(|| mail::draft_for(&state.store, pid as i64, seed))
+                            .unwrap_or_else(|| mail::seed_draft(&state.store, seed));
                         state.act(
                             "close",
                             label,

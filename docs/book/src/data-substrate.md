@@ -181,7 +181,8 @@ conversation when it syncs back), appends the sent bytes to the account's
 Sent folder over IMAP, and records the outcome — for a forward, that the
 mail it passed on is now *forwarded*, an intent the next push pass sets on
 the server as the `$Forwarded` keyword, the one other clients draw their
-arrow from. Because both the outbox row
+arrow from — where the folder's `PERMANENTFLAGS` say it keeps keywords;
+elsewhere the mark stays local, neither pushed nor read back. Because both the outbox row
 and the job are durable, a mail that hit *send* and never left goes out late
 rather than never. A delivered send is physics: its claim refuses, the
 history node goes **expired**, and the walk skips it transparently.
