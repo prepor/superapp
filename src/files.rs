@@ -1,4 +1,4 @@
-//! The file browser's domain (CR-008): what a directory lists, what a
+//! The file browser's domain: what a directory lists, what a
 //! file card shows, the path field's completion, and the one held item
 //! `copy`/`move` carry to a `… here`.
 //!
@@ -481,7 +481,7 @@ pub mod demo {
         Fx { path: "~/.zshrc", dir: false, size: KB + 90, at: (2026, 6, 2, 9, 0) },
         Fx { path: "~/Desktop/todo.txt", dir: false, size: 300, at: (2026, 8, 31, 18, 40) },
         Fx { path: "~/Documents/panel-model.md", dir: false, size: 9 * KB, at: (2026, 8, 29, 11, 5) },
-        Fx { path: "~/Documents/cr-008-files.md", dir: false, size: 14 * KB, at: (2026, 9, 2, 6, 55) },
+        Fx { path: "~/Documents/interaction-grammar.md", dir: false, size: 14 * KB, at: (2026, 9, 2, 6, 55) },
         Fx { path: "~/Documents/Lease.tla", dir: false, size: 5 * KB, at: (2026, 8, 28, 15, 20) },
         Fx { path: "~/Downloads/2026", dir: true, size: 0, at: (2026, 8, 17, 12, 0) },
         Fx { path: "~/Downloads/report-q3.pdf", dir: false, size: MB + 200 * KB, at: (2026, 8, 31, 9, 14) },

@@ -975,7 +975,7 @@ fn compose() -> Scene<Setup> {
         .edge("reply", "suggesting", "type in TO")
 }
 
-// ---- files (CR-008, draft) --------------------------------------------------
+// ---- files --------------------------------------------------------------
 
 fn entry(name: &str, is_dir: bool, size: u64) -> files::Entry {
     files::Entry {
@@ -1143,7 +1143,7 @@ fn files_walk() -> Scene<Setup> {
             "pasted",
             from_home(&format!("{chain}key enter\nwait 400\nkey cmd+p\nwait 300\nkey cmd+left\nwait 300\nkey cmd+left\nwait 400\nkey cmd+h\nwait 700")),
         )
-        .about("⌘h — copy here — performs into the directory shown (the draft only says so)")
+        .about("⌘h — copy here — performs into the directory shown (it says so; the write is not built)")
         .edge("root", "preview", "↓")
         .edge("preview", "re-aimed", "enter, ↓, ↓")
         .edge("preview", "chain", "enter, ↓, enter, ↓")

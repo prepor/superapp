@@ -24,7 +24,9 @@ link/button grammar, keyboard and mouse parity — exercised by fake mail panels
 `email/inbox`, `email/message`, `email/compose`, `contact`, plus `settings`,
 `problems`, `help`, `about`, and `effects` with the `job` it previews into —
 the queue of everything the app has tried on the outside world, read back as
-a list panel and its detail. No real data sources are wired yet.
+a list panel and its detail. Mail talks to a real IMAP account; the **file
+browser** (`files` and the `file` card) reads the real disk, which is the
+first thing here that is not the app's own data at all.
 
 The first, throwaway web prototype that validated the interaction model is kept
 under `web/`.

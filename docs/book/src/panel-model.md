@@ -19,7 +19,8 @@ unfolded phone screen, 4×3 on a cover display** (the shell switches at the
 ~600 dp breakpoint when a fold/unfold resize crosses it, and the springs
 animate the relayout). Every kind requests grid units (inbox 4×6, message 4×3,
 contact 3×2, compose 4×4, settings 4×3, problems 4×3, help 4×6, about 3×2,
-effects 5×6, job 4×3); a request larger than the active grid **clamps to it**
+effects 5×6, job 4×3, files 4×6, file 4×3); a request larger than the active
+grid **clamps to it**
 — which is why a phone shows the inbox full-screen with no phone-specific
 layout code. Requests are honoured
 **literally** while a column's requests fit: a 3-row panel in an otherwise

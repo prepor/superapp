@@ -4090,9 +4090,10 @@ impl Stage {
                             state.toast("syncing…", false);
                         }
                     }
-                    // The files verbs (CR-008, draft): the hold and its
-                    // `… here` are real as far as the chrome goes; the
-                    // disk is untouched, and the toasts say so.
+                    // The files verbs (CR-008): `open` performs, and the
+                    // hold and its `… here` are real as far as the chrome
+                    // goes — but nothing here writes yet, and the toasts
+                    // say so rather than pretending.
                     BtnAct::Open => {
                         // The card's path to the OS, through the outside:
                         // the first real verb of the browser (CR-008).

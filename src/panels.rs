@@ -194,9 +194,9 @@ pub enum PanelAction {
         seed: crate::core::Seed,
         fresh: bool,
     },
-    /// A files panel's `new dir` field was submitted (CR-008). The draft
-    /// shell toasts; the effect and its undo arrive with the
-    /// implementation.
+    /// A files panel's `new dir` field was submitted (CR-008). The shell
+    /// toasts what it would have made; the effect and its undo are open
+    /// work (see the book's open questions).
     NewDir { pid: u64, dir: String, name: String },
 }
 
@@ -1407,7 +1407,7 @@ script_mod! {
         }
     }
 
-    // ---- files (CR-008, draft) ---------------------------------------------
+    // ---- files (CR-008) ----------------------------------------------------
 
     /** One entry of a directory: the name (a directory wears its slash),
         the size and the date at the right, on the columns the header
@@ -4063,7 +4063,7 @@ impl Widget for EffectsPanel {
 }
 
 // ---------------------------------------------------------------------------
-// Files (CR-008, draft)
+// Files (CR-008)
 // ---------------------------------------------------------------------------
 
 #[derive(Script, ScriptHook, Widget)]
@@ -4552,7 +4552,7 @@ impl Widget for FilesPanel {
                 match k.key_code {
                     // Enter *goes*: the row's target opens with focus, the
                     // solid-link rule. The walk's preview is the
-                    // implementation's; the draft only selects.
+                    // shell's; the panel only moves its cursor.
                     KeyCode::ReturnKey => {
                         let target = self
                             .cursor_index(&store)

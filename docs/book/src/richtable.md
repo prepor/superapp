@@ -16,6 +16,15 @@ A datasource answers, under the current filter: *how many rows*, *rows
 a one-line description and, optionally, its values — a closed set, or
 *dynamic*, asked of the source as the operator types.
 
+A source need not be SQL, and one is not: a files panel's `DirSource` holds
+one directory's listing — read through the [outside](./data-substrate.md),
+not the store — and answers the same three questions off it, evaluating the
+filter's AST in Rust over the entries. Everything above the datasource is
+unchanged by that: the same grammar, the same autocomplete, the same error
+line, the same paging. What it costs is what the store was giving for free —
+the listing is not reactive, so a panel re-reads when it lands on another
+directory rather than when the disk moves under it.
+
 A SQL-backed source is declared as a `static` beside the domain's other
 queries (`mail::THREADS`): the fixed parts of its query — columns, `FROM`,
 a base `WHERE`, the text-search columns, tag bindings, the order — plus a
