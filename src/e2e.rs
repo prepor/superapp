@@ -124,14 +124,17 @@ pub enum Step {
 
 impl Step {
     /// Whether the step resolves against the drawn hit list — a click, a
-    /// drag, a swipe, a long press. Keys and text resolve semantically, a
-    /// wait or a shot resolves nothing; a replaying mount runs those
-    /// without drawing in between.
+    /// drag, a swipe, a long press. Keys and text resolve semantically; a
+    /// wait or a shot resolves nothing.
     #[must_use]
     pub fn needs_hits(&self) -> bool {
         matches!(
             self,
-            Step::Click { .. } | Step::Drag { .. } | Step::Swipe { .. } | Step::HoldMove { .. }
+            Step::Click { .. }
+                | Step::Mouse { .. }
+                | Step::Drag { .. }
+                | Step::Swipe { .. }
+                | Step::HoldMove { .. }
         )
     }
 }
@@ -160,92 +163,92 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
     }
     let err = |m: &str| format!("line {lineno}: {m}: {raw}");
     let (cmd, rest) = match line.split_once(char::is_whitespace) {
-            Some((c, r)) => (c, r.trim()),
-            None => (line, ""),
-        };
-        let quoted = || -> Result<String, String> {
-            let a = rest.find('"').ok_or_else(|| err("expected a \"quoted\" argument"))?;
-            let b = rest.rfind('"').filter(|&b| b > a).ok_or_else(|| err("unclosed quote"))?;
-            Ok(rest[a + 1..b].to_string())
-        };
-        Ok(Some(match cmd {
-            "wait" => Step::Wait(rest.parse().map_err(|_| err("expected milliseconds"))?),
-            "shot" => {
-                if rest.is_empty() {
-                    return Err(err("expected a name"));
+        Some((c, r)) => (c, r.trim()),
+        None => (line, ""),
+    };
+    let quoted = || -> Result<String, String> {
+        let a = rest.find('"').ok_or_else(|| err("expected a \"quoted\" argument"))?;
+        let b = rest.rfind('"').filter(|&b| b > a).ok_or_else(|| err("unclosed quote"))?;
+        Ok(rest[a + 1..b].to_string())
+    };
+    Ok(Some(match cmd {
+        "wait" => Step::Wait(rest.parse().map_err(|_| err("expected milliseconds"))?),
+        "shot" => {
+            if rest.is_empty() {
+                return Err(err("expected a name"));
+            }
+            Step::Shot(rest.to_string())
+        }
+        "click" => Step::Click {
+            label: quoted()?,
+            fresh: false,
+        },
+        // cmd+click: always a fresh, un-joined panel (altclick = old alias).
+        "cmdclick" | "altclick" => Step::Click {
+            label: quoted()?,
+            fresh: true,
+        },
+        "mouse" => Step::Mouse { label: quoted()? },
+        "key" => {
+            let mut it = rest.split_whitespace();
+            let chord = it.next().ok_or_else(|| err("expected a key chord"))?;
+            let times = match it.next() {
+                Some(n) => n.parse().map_err(|_| err("expected a repeat count"))?,
+                None => 1,
+            };
+            Step::Key {
+                chord: chord.to_lowercase(),
+                times,
+            }
+        }
+        "type" => Step::Type(quoted()?),
+        "drag" | "swipe" | "holdmove" => {
+            let label = quoted()?;
+            let after = &rest[rest.rfind('"').unwrap() + 1..];
+            let mut it = after.split_whitespace();
+            let dx: f64 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| err("expected dx dy"))?;
+            let dy: f64 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| err("expected dx dy"))?;
+            let hold = it.next() == Some("hold");
+            if cmd == "drag" {
+                Step::Drag { label, dx, dy }
+            } else if cmd == "swipe" {
+                Step::Swipe {
+                    label,
+                    dx,
+                    dy,
+                    hold,
                 }
-                Step::Shot(rest.to_string())
-            }
-            "click" => Step::Click {
-                label: quoted()?,
-                fresh: false,
-            },
-            // cmd+click: always a fresh, un-joined panel (altclick = old alias).
-            "cmdclick" | "altclick" => Step::Click {
-                label: quoted()?,
-                fresh: true,
-            },
-            "mouse" => Step::Mouse { label: quoted()? },
-            "key" => {
-                let mut it = rest.split_whitespace();
-                let chord = it.next().ok_or_else(|| err("expected a key chord"))?;
-                let times = match it.next() {
-                    Some(n) => n.parse().map_err(|_| err("expected a repeat count"))?,
-                    None => 1,
-                };
-                Step::Key {
-                    chord: chord.to_lowercase(),
-                    times,
+            } else {
+                Step::HoldMove {
+                    label,
+                    dx,
+                    dy,
+                    hold,
                 }
             }
-            "type" => Step::Type(quoted()?),
-            "drag" | "swipe" | "holdmove" => {
-                let label = quoted()?;
-                let after = &rest[rest.rfind('"').unwrap() + 1..];
-                let mut it = after.split_whitespace();
-                let dx: f64 = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| err("expected dx dy"))?;
-                let dy: f64 = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| err("expected dx dy"))?;
-                let hold = it.next() == Some("hold");
-                if cmd == "drag" {
-                    Step::Drag { label, dx, dy }
-                } else if cmd == "swipe" {
-                    Step::Swipe {
-                        label,
-                        dx,
-                        dy,
-                        hold,
-                    }
-                } else {
-                    Step::HoldMove {
-                        label,
-                        dx,
-                        dy,
-                        hold,
-                    }
-                }
-            }
-            "drop" => Step::Drop,
-            "pan2" => {
-                let mut it = rest.split_whitespace();
-                let dx: f64 = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| err("expected dx [dy]"))?;
-                let dy: f64 = match it.next() {
-                    Some(s) => s.parse().map_err(|_| err("expected dx [dy]"))?,
-                    None => 0.0,
-                };
-                Step::Pan2 { dx, dy }
-            }
-            "quit" => Step::Quit,
-            _ => return Err(err("unknown command")),
-        }))
+        }
+        "drop" => Step::Drop,
+        "pan2" => {
+            let mut it = rest.split_whitespace();
+            let dx: f64 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| err("expected dx [dy]"))?;
+            let dy: f64 = match it.next() {
+                Some(s) => s.parse().map_err(|_| err("expected dx [dy]"))?,
+                None => 0.0,
+            };
+            Step::Pan2 { dx, dy }
+        }
+        "quit" => Step::Quit,
+        _ => return Err(err("unknown command")),
+    }))
 }
 
 /// A run in progress.
@@ -267,6 +270,9 @@ pub struct Runner {
     pub out: PathBuf,
     /// Failed steps so far (missing labels, failed captures).
     pub failures: u32,
+    /// A prefix for the run's messages — a library mount names its story
+    /// and node; the window's own run has none.
+    pub tag: String,
 }
 
 impl Runner {
@@ -279,6 +285,7 @@ impl Runner {
             wait_ms: 0.0,
             out,
             failures: 0,
+            tag: String::new(),
         }
     }
 
@@ -304,6 +311,22 @@ impl Runner {
     #[must_use]
     pub fn pending_wait(&self) -> f64 {
         self.wait_ms.max(0.0)
+    }
+
+    /// Consumes the pending `wait` whole without taking the step after it,
+    /// answering the milliseconds it was worth. The next step it guards
+    /// resolves against hits, and those want a draw of the settled state
+    /// first — which is the frame this leaves for.
+    pub fn take_wait(&mut self) -> f64 {
+        let ms = self.wait_ms.max(0.0);
+        self.wait_ms = 0.0;
+        ms
+    }
+
+    /// The step the cursor is on, if any.
+    #[must_use]
+    pub fn next(&self) -> Option<&Step> {
+        self.steps.get(self.idx)
     }
 }
 

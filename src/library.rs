@@ -54,9 +54,52 @@ const Z_MAX: f64 = 2.0;
 const Z_STEP: f64 = 0.5;
 /// One arrow-key pan, screen points.
 const PAN_STEP: f64 = 240.0;
-/// The dpi a mount is drawn at while it replays out of view: the widget
-/// pass still runs (a step needs fresh hits), the rasterizer barely does.
-const DPI_OFFSCREEN: f64 = 0.1;
+/// The dpi a mount is drawn at while it replays, as a fraction of the
+/// window's. A step needs fresh hits, not pixels: layout and hits are in
+/// logical points whatever the dpi, so a replay draws small — a quarter
+/// keeps the headless rasterizer's render-to-texture, which costs seconds
+/// per full-size stage, at a fraction of a second, and costs nothing on a
+/// GPU either way.
+const DPI_REPLAY_FRACTION: f64 = 0.25;
+/// What one frame may spend rendering mounts that are not live: a time
+/// slice windowed, a count under a headless build (whose frames are
+/// virtual, and whose runs must stay reproducible).
+const RENDER_MS: f64 = 8.0;
+const RENDER_COUNT: u32 = 6;
+/// Frames the zoom has to stand still before frozen mounts re-render at
+/// the new level; until then they show their last texture, scaled.
+const SETTLE_TICKS: u32 = 6;
+
+/// The frame's render budget. One render is always allowed, so there is
+/// progress even when a single one overruns.
+struct Budget {
+    started: std::time::Instant,
+    spent: u32,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget {
+            started: std::time::Instant::now(),
+            spent: 0,
+        }
+    }
+
+    fn ok(&self) -> bool {
+        if self.spent == 0 {
+            return true;
+        }
+        if cfg!(headless) {
+            self.spent < RENDER_COUNT
+        } else {
+            self.started.elapsed().as_secs_f64() * 1000.0 < RENDER_MS
+        }
+    }
+
+    fn spend(&mut self) {
+        self.spent += 1;
+    }
+}
 
 /// The camera: the canvas point at the viewport's top-left, and log2 zoom.
 struct Camera {
@@ -101,6 +144,10 @@ struct Mount {
     pass: Option<MountPass>,
     /// The dpi factor the pass was last rendered at; zero before the first.
     dpi: f64,
+    /// The stage drew (or stepped) since the pass was last rendered. Held
+    /// here rather than in makepad's redraw marks, which a draw event
+    /// consumes whether or not the budget let this mount render.
+    pending: bool,
 }
 
 struct MountPass {
@@ -210,6 +257,24 @@ pub struct Library {
     list_id: Option<DrawListId>,
     #[rust]
     last_frame: Option<std::time::Instant>,
+    /// Where the pointer was last seen: deferred re-renders go nearest
+    /// first.
+    #[rust]
+    pointer: Option<DVec2>,
+    /// Frames since the zoom last changed, and the zoom it was checked at.
+    #[rust]
+    zoom_ticks: u32,
+    #[rust]
+    last_zoom: f64,
+    /// Frames since boot, and whether the fill-in has been reported.
+    #[rust]
+    frames: u64,
+    #[rust]
+    filled: bool,
+    /// The last draw left renders undone — over budget, or waiting for
+    /// the zoom to settle — so keep the frames coming.
+    #[rust]
+    more_work: bool,
 }
 
 impl ScriptHook for Library {
@@ -270,6 +335,17 @@ fn intersects(a: Rect, b: Rect) -> bool {
 /// on-screen size.
 fn render_zoom(zoom: f64) -> f64 {
     2f64.powf((zoom.log2() * 4.0).round() / 4.0)
+}
+
+/// The dpi a mount's pass renders at. A replaying mount draws for its
+/// hits, small, whatever the canvas shows; a frozen mount draws at the
+/// zoom it is shown at, so its text is crisp there.
+fn mount_dpi(win_dpi: f64, zoom: f64, replaying: bool) -> f64 {
+    if replaying {
+        win_dpi * DPI_REPLAY_FRACTION
+    } else {
+        win_dpi * render_zoom(zoom)
+    }
 }
 
 /// A canvas chord, for the script and the keyboard alike.
@@ -373,6 +449,7 @@ impl Library {
                     secrets_in_memory: true,
                     steps: Some(s.steps[..=n.until].to_vec()),
                     primary: false,
+                    tag: format!("{}/{}: ", s.name, n.name),
                 };
                 if let Some(mut st) = stage.borrow_mut::<Stage>() {
                     st.boot(cx, boot);
@@ -384,6 +461,7 @@ impl Library {
                     size: dvec2(s.cfg.window.0, s.cfg.window.1),
                     pass: None,
                     dpi: 0.0,
+                    pending: true,
                 });
             }
         }
@@ -624,9 +702,30 @@ impl Library {
         }
     }
 
+    /// The one mount replaying right now: the first that has not arrived.
+    /// Replays run one at a time because makepad has one key focus and one
+    /// IME — a story that types into a field (the launcher's query, the
+    /// settings form, the inbox filter) cannot share the keyboard with
+    /// another replaying beside it. The rest wait their turn, in canvas
+    /// order.
+    fn current_replayer(&self) -> Option<usize> {
+        (0..self.mounts.len()).find(|&i| {
+            self.mounts[i]
+                .stage
+                .borrow::<Stage>()
+                .is_some_and(|s| s.replaying())
+        })
+    }
+
+    /// Every mount that is awake — the entered one, and the one replaying.
+    /// A frozen mount is a picture, a waiting one has not started; neither
+    /// hears anything.
     fn broadcast(&mut self, cx: &mut Cx, event: &Event) {
+        let current = self.current_replayer();
         for i in 0..self.mounts.len() {
-            self.send(cx, i, event);
+            if self.entered == Some(i) || current == Some(i) {
+                self.send(cx, i, event);
+            }
         }
     }
 
@@ -687,6 +786,10 @@ impl Library {
         if let Some(step) = runner.next_step(dt_ms) {
             match step {
                 Step::Wait(_) => {}
+                Step::Shot(_) if app::no_draw() => {
+                    // Nothing was rasterized, so there is nothing to keep;
+                    // the labels and the replays are what this run checks.
+                }
                 Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
                     let mut real = Real::new(Secrets::Memory(MemSecrets::new()), Clock::System);
@@ -835,22 +938,95 @@ impl Library {
         }
     }
 
-    /// Renders (if needed) and shows one mount.
-    fn draw_mount(&mut self, cx: &mut Cx2d, i: usize, screen: Rect) {
+    /// Decides which mounts render this frame, and what the rest show.
+    ///
+    /// Live mounts — the entered one, and the ones still replaying — render
+    /// whenever they drew or stepped; the entered one unbudgeted, the
+    /// replaying ones within the frame's budget (a replay cannot step past
+    /// a click until it has drawn). A frozen mount renders once more when
+    /// its arrival is pending, and re-renders at a new zoom level only
+    /// after the zoom has stood still, nearest the pointer first, within
+    /// the same budget — until then it shows its last texture, scaled.
+    /// Anything left over sets `more_work`, so the next frame comes.
+    fn plan_renders(&mut self, cx: &mut Cx2d, zoom: f64) -> Vec<bool> {
+        let n = self.mounts.len();
+        let mut render = vec![false; n];
+        let win_dpi = cx.current_dpi_factor();
+        let settled = self.zoom_ticks >= SETTLE_TICKS;
+        let anchor = self.pointer.unwrap_or(self.vp.pos + self.vp.size * 0.5);
+        let mut budget = Budget::new();
+        let mut deferred: Vec<(f64, usize)> = Vec::new();
+        let mut more_work = false;
+        for i in 0..n {
+            let replaying = self.mounts[i]
+                .stage
+                .borrow::<Stage>()
+                .is_some_and(|s| s.replaying());
+            let entered = self.entered == Some(i);
+            let screen = self.mount_rect(i).map(|r| self.screen_rect(r));
+            let visible = screen.is_some_and(|r| intersects(r, self.vp));
+            let want = mount_dpi(win_dpi, zoom, replaying);
+            // Fold makepad's redraw mark into the mount's own flag: the
+            // mark is consumed by this draw event whether or not the budget
+            // lets the mount render in it.
+            let walk = Walk::abs_rect(Rect {
+                pos: dvec2(0.0, 0.0),
+                size: self.mounts[i].size,
+            });
+            let marked = match self.mounts[i].pass.as_mut() {
+                Some(mp) => cx.will_redraw(&mut mp.list, walk),
+                None => true,
+            };
+            let m = &mut self.mounts[i];
+            m.pending |= marked;
+            let mismatch = (m.dpi - want).abs() > 1e-9;
+            if entered {
+                render[i] = m.pending || mismatch;
+            } else if replaying || (visible && m.pending) {
+                if m.pending {
+                    if budget.ok() {
+                        render[i] = true;
+                        budget.spend();
+                    } else {
+                        more_work = true;
+                    }
+                }
+            } else if visible && mismatch {
+                if settled {
+                    let c = screen.map_or(anchor, |r| r.pos + r.size * 0.5);
+                    deferred.push(((c - anchor).length(), i));
+                } else {
+                    more_work = true;
+                }
+            }
+        }
+        deferred.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, i) in deferred {
+            if budget.ok() {
+                render[i] = true;
+                budget.spend();
+            } else {
+                more_work = true;
+            }
+        }
+        self.more_work = more_work;
+        render
+    }
+
+    /// Shows one mount: renders its pass if the plan says so, then draws
+    /// its texture — the fresh one, or the last one scaled to the current
+    /// zoom. A mount with no texture yet draws nothing but its frame.
+    fn draw_mount(&mut self, cx: &mut Cx2d, i: usize, screen: Rect, render: bool) {
         let visible = intersects(screen, self.vp);
+        if !render && (!visible || self.mounts[i].pass.is_none()) {
+            return;
+        }
+        let win_dpi = cx.current_dpi_factor();
         let replaying = self.mounts[i]
             .stage
             .borrow::<Stage>()
             .is_some_and(|s| s.replaying());
-        if !visible && !replaying {
-            return;
-        }
-        let win_dpi = cx.current_dpi_factor();
-        let dpi = if visible {
-            win_dpi * render_zoom(self.zoom())
-        } else {
-            DPI_OFFSCREEN
-        };
+        let dpi = mount_dpi(win_dpi, self.zoom(), replaying);
         let size = self.mounts[i].size;
         let stage = self.mounts[i].stage.clone();
         let mut mp = self.mounts[i]
@@ -860,7 +1036,8 @@ impl Library {
 
         // The pass rect comes from an area of the parent: a transparent
         // quad the mount's logical size, so the texture is `size × dpi`
-        // whatever the canvas shows it at.
+        // whatever the canvas shows it at. Drawn every frame — the area is
+        // an instance in this draw list, which is rebuilt with it.
         self.draw_flat.color = vec4(0.0, 0.0, 0.0, 0.0);
         self.draw_flat.draw_abs(
             cx,
@@ -871,14 +1048,13 @@ impl Library {
         );
         let helper = self.draw_flat.area();
 
-        let walk = Walk::abs_rect(Rect {
-            pos: dvec2(0.0, 0.0),
-            size,
-        });
-        let dpi_changed = (self.mounts[i].dpi - dpi).abs() > 1e-9;
-        let redraw = dpi_changed || cx.will_redraw(&mut mp.list, walk);
-        if redraw {
+        if render {
+            let walk = Walk::abs_rect(Rect {
+                pos: dvec2(0.0, 0.0),
+                size,
+            });
             self.mounts[i].dpi = dpi;
+            self.mounts[i].pending = false;
             if let (Some(mut st), Some(canvas)) = (stage.borrow_mut::<Stage>(), self.list_id) {
                 st.set_lists(mp.list.id(), canvas);
             }
@@ -907,6 +1083,7 @@ impl Library {
         let line = self.metrics.map_or(20.0, |m| m.line * TEXT_PT);
         self.hits.clear();
         let entered = self.entered;
+        let plan = self.plan_renders(cx, zoom);
         // Out of `self` for the loop: drawing borrows the widget mutably.
         let stories = std::mem::take(&mut self.stories);
         // Mounts by (story, node), for the hits.
@@ -1049,7 +1226,7 @@ impl Library {
                     ny += line * zoom;
                 }
                 if let Some(i) = i {
-                    self.draw_mount(cx, i, screen);
+                    self.draw_mount(cx, i, screen, plan[i]);
                     let replaying = self.mounts[i]
                         .stage
                         .borrow::<Stage>()
@@ -1091,7 +1268,7 @@ impl Library {
     fn draw_legend(&mut self, cx: &mut Cx2d) {
         let replaying = self.replaying();
         let status = if replaying > 0 {
-            format!("{replaying} of {} nodes replaying · ", self.mounts.len())
+            format!("{replaying} of {} nodes to go · ", self.mounts.len())
         } else {
             String::new()
         };
@@ -1154,13 +1331,34 @@ impl Widget for Library {
                         dt
                     };
                     let moving = self.cam.as_mut().is_some_and(|c| c.advance(dt));
+                    // Deferred re-renders wait for the zoom to stand still.
+                    let z = self.zoom();
+                    if (z - self.last_zoom).abs() > 1e-9 {
+                        self.zoom_ticks = 0;
+                        self.last_zoom = z;
+                    } else {
+                        self.zoom_ticks = self.zoom_ticks.saturating_add(1);
+                    }
                     self.e2e_tick(cx, dt * 1000.0);
-                    // While nodes replay, the legend counts them down.
+                    // While nodes replay, the legend counts them down; while
+                    // renders are owed, the draw pays them off a frame at a
+                    // time.
+                    self.frames += 1;
                     let replaying = self.replaying() > 0;
-                    if moving || self.e2e.is_some() || replaying {
+                    if !replaying && !self.filled {
+                        self.filled = true;
+                        eprintln!(
+                            "library: all {} nodes arrived after {} frames ({:.1} s at 60 fps)",
+                            self.mounts.len(),
+                            self.frames,
+                            self.frames as f64 / 60.0
+                        );
+                    }
+                    let work = self.more_work;
+                    if moving || self.e2e.is_some() || replaying || work {
                         self.next_frame = cx.new_next_frame();
                     }
-                    if moving || replaying {
+                    if moving || replaying || work {
                         self.redraw(cx);
                     }
                 }
@@ -1195,6 +1393,7 @@ impl Widget for Library {
                 }
             }
             Event::MouseMove(e) => {
+                self.pointer = Some(e.abs);
                 if let Some(d) = &self.drag {
                     let zoom = self.zoom();
                     let pos = d.cam - (e.abs - d.start) / zoom;
@@ -1279,6 +1478,9 @@ impl Widget for Library {
         }
         self.draw_canvas(cx);
         self.draw_legend(cx);
+        if self.more_work {
+            self.next_frame = cx.new_next_frame();
+        }
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }

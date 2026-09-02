@@ -55,15 +55,19 @@ story's grid and send window, passwords in memory, **virtual time**
 you look at it fails loudly and the clock still runs (CR-004's open
 question 4, settled).
 
-**Replay.** A mount replays `steps[..=shot]` and stops. Drawing is what a
-replay costs — a hundred mounts, a full widget pass each — so a frame runs
-steps until the next one resolves against the hit list (a click, a drag, a
-swipe), each on its own jump of the virtual clock: a pending `wait` is
-consumed whole, and the manual pump runs for every half second of virtual
-time that passed. A node therefore needs one frame per click on its way,
-not one per millisecond. Earlier nodes' shots on the way are no-ops; the
-mount's own shot is arrival, and its clock stops there. An *entered* mount
-ticks a frame at a time, so its toasts fade and its deadlines pass.
+**Replay.** A mount replays `steps[..=shot]` and stops, one step per
+frame, the way the harness runs one per tick — a pending `wait` is
+consumed whole together with the step after it, and the manual pump runs
+for every half second of virtual time that passed, so a node needs one
+frame per step on its way rather than one per millisecond. One per frame
+is not a limitation but the contract: anything a step did — the hits it
+changed, the hosted widgets it created, and above all the actions its
+widgets raised, which the canvas hands back only after the event returns —
+has to land before the next step. A first cut ran several steps per frame
+and lost every launcher query, preview and walk to exactly that. Earlier
+nodes' shots on the way are no-ops; the mount's own shot is arrival, and
+its clock stops there. An *entered* mount ticks a frame at a time, so its
+toasts fade and its deadlines pass.
 
 **Nothing outside its pass.** A mount never touches the menu bar; the IME
 and key focus only while the canvas has entered it; its redraws mark its
@@ -71,6 +75,13 @@ own draw list and the canvas's, never everything; and the actions its
 widgets raise are captured and handed straight back to it, so a hundred
 stages never hear each other (a `PanelAction` carries a panel id, and every
 mount numbers its panels from one).
+
+**Frozen means frozen.** A mount that has arrived and is not entered is a
+picture: it gets no events, asks for no frames, and never re-runs its
+widget pass. Without this a node whose shot landed inside a toast's three
+seconds kept asking for frames forever — its clock stopped, so the toast
+never expired — and re-drew its whole stage sixty times a second. Only the
+entered mount is live; entering wakes it, leaving freezes it again.
 
 ## The canvas
 
@@ -87,8 +98,35 @@ because it is rasterised at that level, not scaled. The pass rect comes
 from a transparent quad the mount's logical size with the origin at zero,
 so a mount's own coordinates never move: hits recorded during its draw
 stay valid however the camera moves. Off-screen mounts that have arrived
-are not drawn at all; off-screen mounts still replaying draw at a tenth of
-a dpi, because a step needs fresh hits, not pixels.
+are not drawn at all. A replaying mount draws small — a quarter of the
+window's dpi, whatever the canvas shows — because a step needs fresh
+hits, not pixels, and hits are logical: layout does not depend on the dpi.
+It matters under the headless backend, whose render-to-texture costs
+seconds per full-size stage; a first cut drew replays at full dpi and the
+canvas suite went from a minute to ten.
+
+**Replays run one mount at a time.** makepad has one key focus and one
+IME, and a story that types — into the launcher's query, the settings
+form, the inbox filter — cannot share the keyboard with another replaying
+beside it: run in parallel, a hundred mounts fought over focus and a
+quarter of them lost their typed text and every label after it. So the
+canvas hands frames to one replaying mount at a time, in canvas order,
+and the rest wait their turn; a replay costs one frame per step on its
+way, and the total is the sum of those.
+
+**Rendering is budgeted; zoom never waits for it.** Every frame plans
+which mounts render: the entered one whenever it drew, unbudgeted; the
+replaying one when it stepped, within a budget (8 ms windowed, a count
+under headless, always at least one); a frozen mount once more when its
+arrival is pending. A zoom change re-renders nothing on the spot — frozen
+mounts show their last texture scaled (soft for a moment, like any canvas
+tool mid-zoom) and re-render at the new level only once the zoom has stood
+still for six frames, nearest the pointer first, within the same budget.
+Whatever the budget leaves over sets `more_work`, and the next frame comes.
+A replay cannot take its next step until its last one has been drawn, so a
+mount whose render was deferred simply waits (`stale_hits`); makepad's own
+redraw marks are folded into a per-mount `pending` flag, since a draw
+event consumes them whether or not the budget let the mount render.
 
 **Entering.** A click on a node (or its name) flies the camera to 1:1 on
 it and routes the keyboard and the pointer to that stage, remapped into
@@ -98,16 +136,24 @@ along the bottom.
 
 **The canvas's own suite.** `e2e/library.txt` (`#! canvas`) drives the
 canvas: `wait`, `shot`, `click` on a node's name or a story's, and the
-canvas chords. Run headless with a small story set and `MAKEPAD_HEADLESS_DPI=1`.
+canvas chords. Its fast path is `--no-draw` — replays and labels, seconds;
+under it a `shot` is logged and skipped rather than failed, for the
+workspace suites too. Rendered runs, for screenshots, take a small story
+set and `MAKEPAD_HEADLESS_DPI=1`, and a minute or two.
 
 ## Costs, named honestly
 
-- **Replay is draws.** Every node replays from the seed; the total is the
-  sum over nodes of the clicks on the way, each a full stage draw. Thirteen
-  nodes replay in under a second of frames; the hundred nodes of the whole
-  `e2e/` directory take a while on first open, and the canvas stays live
-  while they do. Sharing a story's prefix between its nodes would cut it
-  and is not done (see open 2).
+- **Replay is draws, one mount at a time.** Every node replays from the
+  seed; the total is the sum over nodes of the steps on its way, each a
+  full stage draw, one per frame. Thirteen nodes fill in within three
+  seconds, the hundred nodes of the whole `e2e/` directory in about a
+  minute, with the canvas at frame rate throughout (the canvas logs the
+  count and the frames when the last one arrives). Sharing a story's
+  prefix between its nodes would cut the total and is not done (see open
+  2).
+- **Zoomed-in nodes are soft until the zoom settles**, and a wheel gesture
+  that never rests keeps them so. The price of never re-rendering a hundred
+  mounts inside one frame.
 - **Textures stay allocated** once a mount has rendered, at its last size.
   Bounded by the last zoom each was seen at; not freed.
 - **`Deny` is not `Real`.** A settings story that adds an `.invalid` host
@@ -132,8 +178,12 @@ canvas chords. Run headless with a small story set and `MAKEPAD_HEADLESS_DPI=1`.
 - **Boot is a value** (`Boot`) for the primary stage and every mount alike;
   the cfg(headless) forks in the shell became one `virtual_time` flag.
 - **`Deny` by default, with a clock.**
-- **Replays fast-forward and draw only before hit-resolving steps.**
+- **Replays fast-forward through waits, one step per frame.**
 - **Per-mount passes at zoom dpi, events remapped, actions captured.**
+- **Frozen mounts are pictures**; only the entered one is live.
+- **Replays are sequential**, because the keyboard is one.
+- **Renders are planned per frame within a budget**; zoom re-renders are
+  deferred until the zoom settles, nearest the pointer first.
 
 ## Still open
 

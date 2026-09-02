@@ -87,6 +87,14 @@ struct Config {
     /// Open the panels library on these scripts and directories instead of
     /// the workspace (`--library [PATH...]`, default `e2e/`). CR-006.
     library: Option<Vec<String>>,
+    /// The headless backend's `--no-draw`: the widget pass runs, nothing is
+    /// rasterized. Read here so a `shot` knows there is nothing to keep.
+    no_draw: bool,
+}
+
+/// Whether this run rasterizes nothing (`--no-draw`).
+pub(crate) fn no_draw() -> bool {
+    config().no_draw
 }
 
 /// The panels library's story sources, when `--library` asked for it.
@@ -123,6 +131,8 @@ pub struct Boot {
     /// The window's own stage: owns the menu bar, the IME, the fallback
     /// store poll. A mount owns nothing outside its pass.
     pub primary: bool,
+    /// A prefix for the script's messages — a mount's story and node.
+    pub tag: String,
 }
 
 /// Which [`crate::effect::Outside`] a booting stage gets.
@@ -164,6 +174,7 @@ impl Boot {
             secrets_in_memory: config().e2e.is_some(),
             steps,
             primary: true,
+            tag: String::new(),
         }
     }
 }
@@ -184,6 +195,12 @@ fn config() -> &'static Config {
         let mut args = std::env::args().skip(1).peekable();
         while let Some(a) = args.next() {
             match a.as_str() {
+                // The headless backend's own flags: read (and, for the
+                // budget, skipped) here so they are not reported as unknown.
+                "--no-draw" => c.no_draw = true,
+                "--draws" => {
+                    args.next();
+                }
                 "--library" => {
                     let mut paths = Vec::new();
                     while let Some(p) = args.next_if(|p| !p.starts_with("--")) {
@@ -462,12 +479,16 @@ pub(crate) fn rgba_a(c: theme::Rgba, alpha: f64) -> Vec4f {
 /// the window, so that is everything; a panels-library mount redraws only
 /// its own pass — and the canvas that composites it — so one mount's
 /// keystroke does not re-lay-out a hundred others.
-fn redraw_scoped(cx: &mut Cx, lists: Option<(DrawListId, DrawListId)>) {
+fn redraw_scoped(cx: &mut Cx, lists: Option<(DrawListId, DrawListId)>, mount: bool) {
     match lists {
         Some((own, canvas)) => {
             cx.redraw_list_and_children(own);
             cx.redraw_list(canvas);
         }
+        // A mount the canvas has not rendered yet is pending there already;
+        // marking the whole window would make every other mount pending
+        // too, and the budget would never get past the first few.
+        None if mount => {}
         None => cx.redraw_all(),
     }
 }
@@ -1763,6 +1784,10 @@ pub struct Stage {
     /// The manual pump's next due time on a mount's virtual clock.
     #[rust]
     pump_due: f64,
+    /// A mount's last step has not been drawn yet: the next step waits for
+    /// the draw, which the canvas schedules within its frame budget.
+    #[rust]
+    stale_hits: bool,
 }
 
 /// Menu command id bases: workspace `k`'s items are `base + k`. Plain
@@ -1962,7 +1987,7 @@ impl Stage {
             }
         }
         self.next_frame = cx.new_next_frame();
-        redraw_scoped(cx, self.lists);
+        redraw_scoped(cx, self.lists, self.mount);
     }
 
     /// A mutation happened: recompute targets, animate, redraw.
@@ -2101,12 +2126,17 @@ impl Stage {
                         self.arrived = true;
                         if runner.failures > 0 {
                             eprintln!(
-                                "library: a mount reached its shot with {} failed step(s)",
-                                runner.failures
+                                "library: {}reached its shot with {} failed step(s)",
+                                runner.tag, runner.failures
                             );
                         }
                         return;
                     }
+                }
+                // The fast path rasterizes nothing: a shot is logged, not
+                // failed, so a green `--no-draw` run means what it says.
+                e2e::Step::Shot(name) if config().no_draw => {
+                    eprintln!("e2e: shot {name} (skipped: --no-draw)");
                 }
                 e2e::Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
@@ -2117,13 +2147,13 @@ impl Stage {
                     {
                         Ok(()) => eprintln!("e2e: shot {}", path.display()),
                         Err(e) => {
-                            eprintln!("e2e: FAIL shot {name}: {e}");
+                            eprintln!("{}e2e: FAIL shot {name}: {e}", runner.tag);
                             runner.failures += 1;
                         }
                     }
                     #[cfg(any())]
                     {
-                        eprintln!("e2e: FAIL shot {}: screenshots need macos", path.display());
+                        eprintln!("{}e2e: FAIL shot {}: screenshots need macos", runner.tag, path.display());
                         runner.failures += 1;
                     }
                 }
@@ -2158,7 +2188,7 @@ impl Stage {
                             self.resolve_click(cx, act, fresh);
                         }
                         None => {
-                            eprintln!("e2e: FAIL click {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL click {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2192,7 +2222,7 @@ impl Stage {
                         }
                     }
                     None => {
-                        eprintln!("e2e: FAIL key {chord:?}: cannot parse chord");
+                        eprintln!("{}e2e: FAIL key {chord:?}: cannot parse chord", runner.tag);
                         runner.failures += 1;
                     }
                 },
@@ -2216,7 +2246,7 @@ impl Stage {
                             self.synth_drag(cx, c, dvec2(c.x + dx, c.y + dy));
                         }
                         None => {
-                            eprintln!("e2e: FAIL drag {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL drag {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2293,7 +2323,7 @@ impl Stage {
                             }
                         }
                         None => {
-                            eprintln!("e2e: FAIL swipe {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL swipe {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2332,7 +2362,7 @@ impl Stage {
                         eprintln!("e2e: drop");
                         self.touch_stop(cx, uid, p);
                     } else {
-                        eprintln!("e2e: FAIL drop: no gesture is being held");
+                        eprintln!("{}e2e: FAIL drop: no gesture is being held", runner.tag);
                         runner.failures += 1;
                     }
                 }
@@ -2359,7 +2389,7 @@ impl Stage {
                             self.touch_start(1, c);
                             self.long_press(cx, 1, c);
                             if !matches!(self.touch.mode, TouchMode::Drag { .. }) {
-                                eprintln!("e2e: FAIL holdmove {label:?}: header did not grab");
+                                eprintln!("{}e2e: FAIL holdmove {label:?}: header did not grab", runner.tag);
                                 runner.failures += 1;
                                 self.touch_stop(cx, 1, c);
                             } else {
@@ -2373,7 +2403,7 @@ impl Stage {
                             }
                         }
                         None => {
-                            eprintln!("e2e: FAIL holdmove {label:?}: no matching panel");
+                            eprintln!("{}e2e: FAIL holdmove {label:?}: no matching panel", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2786,7 +2816,7 @@ impl Stage {
                 }
             }
             state.failed_seen = failures.len();
-            redraw_scoped(cx, self.lists);
+            redraw_scoped(cx, self.lists, self.mount);
         }
         self.tick_repl(cx);
     }
@@ -4046,6 +4076,8 @@ impl Stage {
         }
         self.mount = !boot.primary;
         self.active = boot.primary;
+        // A mount's first step waits for its first draw.
+        self.stale_hits = self.mount;
         let store = Store::open(boot.db.as_deref())
             .unwrap_or_else(|e| panic!("store: opening {:?} failed: {e}", boot.db));
         // Seeding is a write, so under replication it waits for this device
@@ -4077,7 +4109,9 @@ impl Stage {
         if let Some(steps) = boot.steps {
             let out = std::path::PathBuf::from(&config().out);
             let _ = std::fs::create_dir_all(&out);
-            self.e2e = Some(e2e::Runner::new(steps, out));
+            let mut runner = e2e::Runner::new(steps, out);
+            runner.tag = boot.tag;
+            self.e2e = Some(runner);
             // Windowed: a real timer paces the run. Virtual time: the draw
             // cycle does, so ask for the first frame and keep asking.
             if !virtual_time {
@@ -4085,7 +4119,7 @@ impl Stage {
             }
         }
         self.next_frame = cx.new_next_frame();
-        redraw_scoped(cx, self.lists);
+        redraw_scoped(cx, self.lists, self.mount);
     }
 
     /// A mount is still replaying its story.
@@ -4104,41 +4138,59 @@ impl Stage {
         }
     }
 
-    /// One frame of a mount's replay. Drawing is what a replay costs — a
-    /// hundred mounts, a full widget pass each — and only a step that
-    /// resolves against the hit list needs a fresh one. So a frame runs
-    /// steps until the next one is such a step (or the story arrives),
-    /// each on its own jump of the virtual clock: a pending `wait` is
-    /// consumed whole. Answers the virtual milliseconds advanced, for the
-    /// springs.
-    fn replay_burst(&mut self, cx: &mut Cx) -> f64 {
-        let mut total = 0.0;
-        for _ in 0..64 {
-            let Some(r) = &self.e2e else {
-                break;
-            };
-            let dt = r.pending_wait().max(FRAME_MS);
-            if let Some(state) = self.state.take() {
-                state.advance_clock(dt / 1000.0);
-                self.pump_if_due(&state);
-                self.state = Some(state);
-            }
-            total += dt;
-            self.e2e_tick(cx, dt);
-            let Some(r) = &self.e2e else {
-                break;
-            };
-            if r.steps.get(r.idx).is_none_or(e2e::Step::needs_hits) {
-                break;
-            }
+    /// One frame of a mount's replay: one step, the way the harness runs
+    /// one per tick. A pending `wait` is consumed whole, together with the
+    /// step after it, so a node needs as many frames as it has steps rather
+    /// than milliseconds. Anything a step did — the hits it changed, the
+    /// hosted widgets it created, the actions its widgets raised (the
+    /// canvas hands those back after this returns) — lands before the next
+    /// step, which waits for the draw. Answers the virtual milliseconds
+    /// advanced, for the springs.
+    fn replay_step(&mut self, cx: &mut Cx) -> f64 {
+        if self.stale_hits {
+            return 0.0;
         }
-        total
+        let Some(r) = &mut self.e2e else {
+            return 0.0;
+        };
+        // A wait before a hit-resolving step gets a frame of its own: the
+        // harness draws throughout a wait, so the click that follows finds
+        // a panel where it settled, not where it was when the wait began.
+        // Before a key, a shot or another wait it is consumed together
+        // with that step.
+        let mut dt = r.pending_wait().max(FRAME_MS);
+        let settle = r.pending_wait() > 0.0 && r.next().is_some_and(e2e::Step::needs_hits);
+        if settle {
+            dt = r.take_wait();
+        }
+        if let Some(state) = self.state.take() {
+            state.advance_clock(dt / 1000.0);
+            self.pump_if_due(&state);
+            self.state = Some(state);
+        }
+        if !settle {
+            self.e2e_tick(cx, dt);
+        }
+        // Every replay frame ends with a draw before the next step: the
+        // clock moved, so did the springs, and a hit-resolving step must
+        // see the state after them, not whatever the budget last drew.
+        self.stale_hits = true;
+        dt
     }
 
     /// A mount reached its shot.
     #[must_use]
     pub fn arrived(&self) -> bool {
         self.arrived
+    }
+
+    /// A mount that reached its shot and is not entered: a picture. It
+    /// gets no events, asks for no frames, and never re-runs its widget
+    /// pass until the canvas enters it — that is what keeps a hundred of
+    /// them free.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.mount && self.arrived && !self.active
     }
 
     /// The canvas entered (or left) this mount: it may (or may no longer)
@@ -4527,6 +4579,10 @@ impl Stage {
 
 impl Widget for Stage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        // A frozen mount is a picture: nothing to hear, nothing to ask for.
+        if self.frozen() {
+            return;
+        }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
         // handlers instead (so the e2e paths share the exact route);
@@ -4620,7 +4676,7 @@ impl Widget for Stage {
                     self.ime_guard_tries -= 1;
                     log!("ime guard: re-issuing keyboard show");
                     cx.hide_text_ime();
-                    redraw_scoped(cx, self.lists);
+                    redraw_scoped(cx, self.lists, self.mount);
                     if self.ime_guard_tries > 0 {
                         self.ime_guard_timer = cx.start_timeout(0.5);
                     }
@@ -4635,7 +4691,7 @@ impl Widget for Stage {
                 // carves out. The next draw picks up both.
                 let ins = e.new_geom.safe_area_insets;
                 self.insets = (ins.top, ins.right, ins.bottom, ins.left);
-                redraw_scoped(cx, self.lists);
+                redraw_scoped(cx, self.lists, self.mount);
             }
 
             Event::TouchUpdate(e) => self.touch_update(cx, e),
@@ -4748,7 +4804,7 @@ impl Widget for Stage {
                 cx.set_cursor(act.map(|(_, c)| c).unwrap_or(MouseCursor::Default));
                 if new_hover != state.hover {
                     state.hover = new_hover;
-                    redraw_scoped(cx, self.lists);
+                    redraw_scoped(cx, self.lists, self.mount);
                 }
             }
 
@@ -4795,7 +4851,10 @@ impl Widget for Stage {
             }
 
             Event::NextFrame(ne) => {
-                if !ne.set.contains(&self.next_frame) {
+                // A replaying mount ticks whenever the canvas hands it a
+                // frame: the canvas decides which mount replays when, so
+                // the frame it asked for may long since have gone by.
+                if !ne.set.contains(&self.next_frame) && !(self.mount && self.e2e.is_some()) {
                     return;
                 }
                 // Virtual time: one draw cycle is one e2e tick of exactly
@@ -4814,7 +4873,7 @@ impl Widget for Stage {
                 let mut dt_ms = FRAME_MS;
                 if ticking {
                     if self.mount && self.e2e.is_some() {
-                        dt_ms = self.replay_burst(cx);
+                        dt_ms = self.replay_step(cx);
                     } else {
                         if let Some(state) = self.state.take() {
                             state.advance_clock(dt_ms / 1000.0);
@@ -4918,7 +4977,7 @@ impl Widget for Stage {
                 if springs_active || toast_active || dragging || swiping {
                     self.next_frame = cx.new_next_frame();
                 }
-                redraw_scoped(cx, self.lists);
+                redraw_scoped(cx, self.lists, self.mount);
                 // Mutates the world, so it runs after the frame's own
                 // bookkeeping rather than in the middle of it.
                 self.settle_row_swipe(cx);
@@ -5023,6 +5082,8 @@ impl Widget for Stage {
             }
         }
         self.state = state;
+        // Drawn: a mount's replay may take its next step.
+        self.stale_hits = false;
 
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()

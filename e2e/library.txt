@@ -5,7 +5,7 @@
 # under MAKEPAD=headless (and MAKEPAD_HEADLESS_DPI=1: the canvas is a big
 # frame). The first wait lets the mounts replay their stories — a node
 # needs one frame per step that resolves against the hit list.
-wait 2500
+wait 4000
 shot lib-01-overview
 
 # A node's caption enters it: the camera flies to 1:1 and the keyboard and

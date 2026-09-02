@@ -235,11 +235,19 @@ mise exec -- cargo run -- --library
 # a few stories
 mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt
 
-# the canvas's own suite, headless (a small story set; the canvas is a big frame)
+# the canvas's own suite — the fast path: replays and labels, no rendering
+MAKEPAD=headless mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
+  --e2e e2e/library.txt --no-draw --draws 700
+
+# …and rendered, for screenshots (a small story set: the canvas is a big frame)
 MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
   mise exec -- cargo run -- --library e2e/basic.txt e2e/phone.txt \
-  --e2e e2e/library.txt --e2e-out e2e/out --draws 600
+  --e2e e2e/library.txt --e2e-out e2e/out --draws 700
 ```
+
+Under `--no-draw` a `shot` is logged and skipped rather than failed, for the
+canvas and the workspace suites alike, so a green fast-path run means what
+it says.
 
 `--library` opens the window on an **infinite canvas** instead of the
 workspace (CR-006). Every e2e script is a **story** row on it; every
@@ -253,10 +261,18 @@ reading of the suites, and a change to the UI is reviewed across every
 state the suites already walk — at 12×6 and on the phone grid in the same
 view.
 
-Replays are fast-forwarded — a `wait` is consumed in one frame, and a
-frame runs steps until the next one needs fresh hits (a click, a swipe) —
-so a node arrives in as many frames as it has clicks on the way. A node
-still on its way draws washed out and counts down in the legend.
+Replays are fast-forwarded — a `wait` is consumed in the frame of the
+step after it — so a node arrives in as many frames as it has steps on
+the way, one per frame like the harness's ticks. Nodes replay one at a
+time, in canvas order (there is one keyboard, and stories type), so a
+single story fills in within a few seconds and the whole `e2e/` directory
+in about a minute; a node still on its way draws washed out, the legend
+counts the rest down, and stderr reports when the last one arrives. A node that has arrived is **frozen**: a picture that hears no
+events and asks for no frames until you enter it. Rendering is budgeted per frame, and a
+zoom change re-renders nothing on the spot — nodes show their last
+texture scaled, and re-render crisp at the new level once the zoom has
+stood still, nearest the pointer first — so panning and zooming stay
+smooth however many nodes are on the canvas.
 
 - **Pan**: drag the canvas, or scroll. **Zoom**: ⌘scroll around the
   pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
