@@ -7,10 +7,12 @@
 //! as [`PanelAction`]s (global actions the shell catches and turns into
 //! store actions — so undo semantics never enter this module).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use makepad_widgets::text::selection::Cursor;
+use makepad_widgets::image_cache::ImageCacheImpl;
 use makepad_widgets::*;
 
 use crate::mail;
@@ -375,6 +377,18 @@ script_mod! {
         Emphasis is real: `<b>` is the weight axis and `<i>` is Geist
         Mono's drawn italic, so the four `text_style_*` slots are four
         actual faces rather than one face repeated (see `SMonoStyle`). */
+    /** Declared before `SHtml`, which names it: an image in a letter or an article (see `HtmlImage`): its own size,
+        never wider than the column; its alt text in the muted ink until
+        the bytes arrive, or for good when they never will. */
+    mod.widgets.HtmlImage = set_type_default() do #(HtmlImage::register_widget(vm)) {
+        width: Fit, height: Fit
+        image: mod.widgets.Image { width: Fill, height: Fill }
+        draw_text +: {
+            text_style: mod.widgets.SMonoStyle{}
+            color: #909090
+        }
+    }
+
     mod.widgets.SHtml = Html {
         width: Fill, height: Fit
         padding: 0
@@ -402,6 +416,8 @@ script_mod! {
             color: #141414
             pressed_color: #5a5a5a
         }
+        // The picture an `<img>` becomes (see `HtmlImage`).
+        img := mod.widgets.HtmlImage {}
 
         // The wash SText already wears. `Html` is its own widget type, not
         // a `TextFlow` derivation, so it inherits none of `TextFlowBase`'s
@@ -420,7 +436,9 @@ script_mod! {
             quote_fg_color: #141414
             code_color: #f4f4f4
             table_border_color: #dcdcdc
-            table_header_bg_color: #f4f4f4
+            // Painted over the header's text, not under it: a fill would
+            // hide the words. Bold is the header's mark.
+            table_header_bg_color: #0000
             selection_color: #00000020
         }
     }
@@ -1093,6 +1111,12 @@ script_mod! {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
+            // A finger drags the thread; a mouse button on it is a
+            // selection, never a scroll. The list would otherwise turn a
+            // press that lands while a coast is still live into a drag,
+            // and pull the letter away from under a selection begun a
+            // moment after scrolling.
+            drag_scrolling: #(cfg!(target_os = "android"))
             msg := mod.widgets.ThreadMsg {}
         }
         View {
@@ -2751,7 +2775,9 @@ impl ThreadMsgRef {
         let (own_text, own_html, quote): (String, String, Option<String>) = if !open {
             (String::new(), String::new(), None)
         } else if let Some(h) = &m.html {
-            let (own, q) = mail::split_quote_html(h);
+            // Its images are filed under its own name (see `Pictures`).
+            let h = crate::html::scope_cids(h, &format!("m{}", m.head.id));
+            let (own, q) = mail::split_quote_html(&h);
             (String::new(), own, q)
         } else {
             let (own, q) = mail::split_quote(&m.body);
@@ -2858,6 +2884,232 @@ impl ThreadMsgRef {
 }
 
 // ---------------------------------------------------------------------------
+// Pictures: the images the open letters show
+// ---------------------------------------------------------------------------
+
+/// The bytes of every image an open letter or article refers to, by the
+/// source its `<img>` names — filed by whoever has them: the message panel
+/// for a letter's own `cid:` parts, the shell for an HTTP reply — and read
+/// by [`HtmlImage`] as it draws. Lives on `Cx` as a global: the items are
+/// minted by the `Html` widget from a template and can reach nothing else.
+#[derive(Default)]
+pub struct Pictures {
+    bytes: HashMap<String, Rc<[u8]>>,
+    /// Requests out on the network, by request id.
+    inflight: HashMap<LiveId, String>,
+    /// Sources that did not arrive or did not decode: asked once, not again.
+    failed: HashSet<String>,
+}
+
+impl Pictures {
+    pub fn put(&mut self, src: String, bytes: Vec<u8>) {
+        self.bytes.insert(src, bytes.into());
+    }
+}
+
+/// Asks the network for `src` unless it is here, on its way, or known not
+/// to come. The reply lands in [`pictures_arrived`].
+fn fetch_picture(cx: &mut Cx, src: &str) {
+    let id = LiveId::from_str(src);
+    {
+        let p = cx.global::<Pictures>();
+        if p.bytes.contains_key(src) || p.failed.contains(src) || p.inflight.contains_key(&id) {
+            return;
+        }
+        p.inflight.insert(id, src.to_string());
+    }
+    cx.http_request(id, HttpRequest::new(src.to_string(), HttpMethod::GET));
+}
+
+/// Files the replies to [`fetch_picture`]; true when any image landed or
+/// failed, so the shell redraws.
+pub fn pictures_arrived(cx: &mut Cx, responses: &[NetworkResponse]) -> bool {
+    let p = cx.global::<Pictures>();
+    let mut any = false;
+    for r in responses {
+        match r {
+            NetworkResponse::HttpResponse {
+                request_id,
+                response,
+            } => {
+                let Some(src) = p.inflight.remove(request_id) else { continue };
+                match response.get_body() {
+                    Some(body) if (200..300).contains(&response.status_code) && !body.is_empty() => {
+                        p.bytes.insert(src, body.clone().into());
+                    }
+                    _ => {
+                        p.failed.insert(src);
+                    }
+                }
+                any = true;
+            }
+            NetworkResponse::HttpError { request_id, .. } => {
+                if let Some(src) = p.inflight.remove(request_id) {
+                    p.failed.insert(src);
+                    any = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    any
+}
+
+/// An `<img>` in a letter or an article: the image item the `Html` widget
+/// places in its flow for the tag, sized to its own pixels or its `width`
+/// hint and never wider than the column. Its bytes come from [`Pictures`]
+/// (a `cid:` part the panel filed, an HTTP reply) or from the source itself
+/// (`data:`); until they do, or when they never will, it is its alt text.
+/// With an `href` — the link the picture sat in — a tap on it is a link
+/// click, the same action the text links raise.
+#[derive(Script, Widget)]
+pub struct HtmlImage {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[walk]
+    walk: Walk,
+    #[layout]
+    layout: Layout,
+    #[redraw]
+    #[live]
+    image: Image,
+    #[live]
+    draw_text: DrawText,
+    #[rust]
+    src: String,
+    #[rust]
+    alt: String,
+    #[rust]
+    width: Option<f64>,
+    #[rust]
+    href: String,
+    #[rust]
+    loaded: bool,
+    #[rust]
+    failed: bool,
+}
+
+impl ScriptHook for HtmlImage {
+    fn on_after_new_scoped(&mut self, _vm: &mut ScriptVm, scope: &mut Scope) {
+        // The tag's attributes, the way `HtmlLink` reads its href.
+        let Some(doc) = scope.props.get::<makepad_html::HtmlDoc>() else { return };
+        let mut walker = doc.new_walker_with_index(scope.index + 1);
+        while let Some((lc, attr)) = walker.while_attr_lc() {
+            match lc {
+                live_id!(src) => self.src = attr.into(),
+                live_id!(alt) => self.alt = attr.into(),
+                live_id!(width) => self.width = attr.parse().ok(),
+                live_id!(href) => self.href = attr.into(),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Widget for HtmlImage {
+    /// To the list around it, a picture that is a link is a control — a
+    /// press on it taps or drag-scrolls, as on a text link — and any other
+    /// is part of the prose: a selection can start on it.
+    fn is_interactive(&self) -> bool {
+        self.is_link()
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // An animated texture ticks through the image's own next-frame.
+        self.image.handle_event(cx, event, scope);
+        if self.href.is_empty() || !self.loaded {
+            return;
+        }
+        match event.hits(cx, self.image.area()) {
+            Hit::FingerHoverIn(_) => cx.set_cursor(MouseCursor::Hand),
+            Hit::FingerHoverOut(_) => cx.set_cursor(MouseCursor::Default),
+            Hit::FingerUp(fe) if fe.is_over && fe.is_primary_hit() && fe.was_tap() => {
+                cx.widget_action(
+                    self.widget_uid(),
+                    HtmlLinkAction::Clicked {
+                        url: self.href.clone(),
+                        key_modifiers: fe.modifiers,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
+        if !self.loaded && !self.failed {
+            self.load(cx);
+        }
+        if self.loaded {
+            let (nw, nh) = self.image.size_in_pixels(cx).unwrap_or((1, 1));
+            let (nw, nh) = (nw.max(1) as f64, nh.max(1) as f64);
+            let mut w = self.width.filter(|w| *w >= 1.0).unwrap_or(nw);
+            let avail = cx.turtle().inner_width();
+            if avail.is_finite() && avail > 1.0 {
+                w = w.min(avail);
+            }
+            let walk = Walk {
+                width: Size::Fixed(w),
+                height: Size::Fixed(w * nh / nw),
+                ..Walk::default()
+            };
+            return self.image.draw_walk_image(cx, walk);
+        }
+        if !self.alt.is_empty() {
+            self.draw_text
+                .draw_walk(cx, Walk::fit(), Align::default(), &self.alt);
+        }
+        DrawStep::done()
+    }
+}
+
+impl HtmlImage {
+    /// Shown, and a link: a tap on it goes somewhere.
+    pub fn is_link(&self) -> bool {
+        self.loaded && !self.href.is_empty()
+    }
+
+    /// Finds the bytes and decodes them, once. A source that cannot be had
+    /// or read is given up on rather than asked every frame; a `cid:` part
+    /// not filed yet is waited for, since the panel files them as it draws.
+    fn load(&mut self, cx: &mut Cx2d) {
+        let bytes: Rc<[u8]> = if let Some(rest) = self.src.strip_prefix("data:") {
+            match rest.split_once(',').and_then(|(_, b)| crate::html::base64_decode(b)) {
+                Some(b) => b.into(),
+                None => {
+                    self.failed = true;
+                    return;
+                }
+            }
+        } else {
+            let p = cx.global::<Pictures>();
+            if p.failed.contains(&self.src) {
+                self.failed = true;
+                return;
+            }
+            match p.bytes.get(&self.src).cloned() {
+                Some(b) => b,
+                None => {
+                    if self.src.starts_with("http") {
+                        fetch_picture(cx, &self.src);
+                    }
+                    return;
+                }
+            }
+        };
+        match ImageCacheImpl::load_image_from_data(&mut self.image, cx, &bytes, 0) {
+            Ok(()) => self.loaded = true,
+            Err(_) => {
+                self.failed = true;
+                cx.global::<Pictures>().failed.insert(self.src.clone());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MessagePanel
 // ---------------------------------------------------------------------------
 
@@ -2878,6 +3130,10 @@ pub struct MessagePanel {
     /// with the mail it opened on at the top, once per seeding.
     #[rust]
     scrolled_for: Option<(i64, i64)>,
+    /// Mails whose own images (`cid:` parts) have been filed in
+    /// [`Pictures`]: the raw is read and parsed once per panel.
+    #[rust]
+    pictured: HashSet<i64>,
 }
 
 impl Widget for MessagePanel {
@@ -2972,6 +3228,25 @@ impl Widget for MessagePanel {
                     .set_first_id(i);
             }
             self.scrolled_for = Some(seed);
+        }
+        // A letter's own images — the `cid:` parts of its raw — are filed
+        // under its name before its rows draw: the image items look them
+        // up by the source the narrowing wrote (see `scope_cids`).
+        for t in msgs.iter() {
+            let mid = t.mail.head.id;
+            if !expand.open.contains(&mid)
+                || self.pictured.contains(&mid)
+                || !t.mail.html.as_deref().is_some_and(|h| h.contains("src=\"cid:"))
+            {
+                continue;
+            }
+            self.pictured.insert(mid);
+            if let Some(raw) = mail::raw(&p.store, mid) {
+                let pics = cx.global::<Pictures>();
+                for (cid, bytes) in crate::sync::inline_images(&raw) {
+                    pics.put(format!("cid:m{mid}/{cid}"), bytes);
+                }
+            }
         }
         let n = msgs.len();
         let mut live: Vec<usize> = Vec::new();

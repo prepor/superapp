@@ -9,7 +9,7 @@
 //! | [`store`] | the one SQLite file + the reactive query layer | no |
 //! | [`effect`] | the boundary: what leaves the process, and the job queue | no |
 //! | [`history`] | the in-memory tree of actions and their claims | no |
-//! | [`html`] | narrowing a mail's HTML to what a panel can draw | no |
+//! | [`html`] | narrowing HTML from outside — mail, feed articles — to what a panel draws | no |
 //! | [`filter`] | the rich table's filter grammar and completion context | no |
 //! | [`richtable`] | the rich table: datasources, the SQL builder, paging | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |

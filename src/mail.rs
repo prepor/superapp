@@ -416,6 +416,22 @@ pub fn mail(store: &Store, id: MailId) -> Option<MailFull> {
     store.rows(&Q_MAIL, &[Val::I(id)], full_row).first().cloned()
 }
 
+/// The mail as it arrived, for what its reading refers to but does not
+/// hold: the images it carries as parts. `None` for the demo seed, which
+/// has no raw. Read straight off the connection rather than through the
+/// query cache — a blob with attachments is megabytes, and a panel wants
+/// it once.
+#[must_use]
+pub fn raw(store: &Store, id: MailId) -> Option<Vec<u8>> {
+    store
+        .conn()
+        .query_row("SELECT raw FROM message WHERE id = ?1", [id], |r| {
+            r.get::<_, Option<Vec<u8>>>(0)
+        })
+        .ok()
+        .flatten()
+}
+
 /// Distinct senders, most recent first.
 pub fn senders(store: &Store) -> Rc<Vec<Sender>> {
     store.rows(&Q_SENDERS, &[], sender_row)
@@ -709,19 +725,51 @@ pub fn split_quote(text: &str) -> (String, Option<String>) {
 }
 
 /// The HTML reading split the same way: at the first `<blockquote>`, with
-/// an attribution paragraph right before it going along.
+/// the attribution line right before it going along — a paragraph of its
+/// own, or the last of a run of `<br>`-separated lines, which is what the
+/// narrowing makes of the `<div>` Gmail and Apple Mail write it in. A
+/// wrapped attribution (`On …` above `… wrote:`) goes as a whole.
 #[must_use]
 pub fn split_quote_html(html: &str) -> (String, Option<String>) {
     let Some(at) = html.find("<blockquote") else {
         return (html.to_string(), None);
     };
+    let head = &html[..at];
+    let wrote = |from: usize| crate::html::plain(&head[from..]).trim_end().ends_with("wrote:");
+    let on = |from: usize, to: usize| {
+        crate::html::plain(&head[from..to]).trim_start().starts_with("On ")
+    };
+    // Where the line ending at `end` begins: at its own `<p>`, or after the
+    // last `<br>` — unless that `<br>` sits inside a paragraph still open,
+    // in which case the paragraph is the line.
+    let line_start = |end: usize| -> usize {
+        let h = &head[..end];
+        let p = h.rfind("<p>");
+        let closed = h.rfind("</p>");
+        let br = h.rfind("<br>").map(|i| i + 4);
+        match (p, br) {
+            (Some(p), Some(b)) if b > p && closed.is_some_and(|c| p < c && c < b) => b,
+            (Some(p), _) => p,
+            (None, Some(b)) => b,
+            (None, None) => 0,
+        }
+    };
     let mut cut = at;
-    if let Some(p) = html[..at].trim_end().rfind("<p>") {
-        if crate::html::plain(&html[p..at]).trim_end().ends_with("wrote:") {
-            cut = p;
+    let last = line_start(at);
+    if wrote(last) {
+        cut = last;
+        if !on(last, at) {
+            let end = if head[..last].ends_with("<br>") { last - 4 } else { last };
+            let prev = line_start(end);
+            if prev < last && on(prev, last) {
+                cut = prev;
+            }
         }
     }
-    let own = html[..cut].trim_end().to_string();
+    let mut own = html[..cut].trim_end().to_string();
+    while own.ends_with("<br>") {
+        own.truncate(own.len() - 4);
+    }
     if crate::html::plain(&own).trim().is_empty() {
         return (html.to_string(), None);
     }
@@ -1777,6 +1825,8 @@ fn base_mails() -> Vec<SeedMail<'static>> {
                  </td></tr><tr><td>\
                  <p>Run <b>main #4128</b> failed on push <code>9f3c2a1</code>.</p>\
                  <p>Failed steps: &#55357;&#56960;</p>\
+                 <p><img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAAAUCAIAAAD9Sa+4AAAAOklEQVR42u3XMQ0AAAgDQfybBgFMEBaSewmXLo2QDkq1AM2BbBYQIECAAAECBAgQIECAnFVAf4CkZQX8qiSFOZw4FwAAAABJRU5ErkJggg==\" \
+                 alt=\"the build badge\" width=\"96\" height=\"20\"></p>\
                  <ul><li>mix test &mdash; <b>2 failures</b></li>\
                  <li>credo --strict &mdash; <i>1 warning</i></li></ul>\
                  <p><i>This run was triggered by a push to </i><b><i>main</i></b>.</p>\
@@ -2157,9 +2207,9 @@ mod tests {
         let h = mail(&s, 2).expect("the github mail").html.expect("html");
         assert!(h.contains("<ul><li>mix test"), "the list survives: {h}");
         assert!(h.contains(r#"<a href="https://github.com/x/stelaxis">"#));
-        assert!(h.contains("&mdash;"), "entities are makepad's to decode");
-        // …except the ones it decodes by unwrapping `char::from_u32`. The
-        // seed carries an emoji spelled as its UTF-16 surrogate pair, the way
+        assert!(h.contains("test — <b>2"), "entities are decoded on the way in: {h}");
+        // Including the ones makepad's own parser would die on: the seed
+        // carries an emoji spelled as its UTF-16 surrogate pair, the way
         // real composers send them, so every run that draws this mail is a
         // check that the pair was put back together before the widget saw it.
         assert!(h.contains('🚀'), "the surrogate pair is repaired: {h}");
@@ -2167,6 +2217,7 @@ mod tests {
         assert!(!h.contains("background:#24292f"), "the stylesheet is gone");
         assert!(!h.contains("<table") && !h.contains("<td"), "layout is gone");
         assert!(!h.contains("pixel.gif"), "the tracking pixel is gone");
+        assert!(h.contains("<img src=\"data:image/png;base64,"), "the badge stays: {h}");
         assert!(!h.contains("javascript:"), "the script link is defused");
         assert!(h.contains("unsubscribe"), "but its text is kept");
         // Its plain reading is still there for quoting a reply.
@@ -2424,6 +2475,17 @@ mod tests {
         let (own, q) = split_quote_html("<p>Agreed.</p><p>On Sun, Max wrote:</p><blockquote>the note</blockquote>");
         assert_eq!(own, "<p>Agreed.</p>");
         assert_eq!(q.as_deref(), Some("<p>On Sun, Max wrote:</p><blockquote>the note</blockquote>"));
+        // Gmail and Apple Mail write the attribution in a `<div>` of its own,
+        // which the narrowing turns into a `<br>`-separated line.
+        let (own, q) = split_quote_html("Agreed.<br>On Sun, Max wrote:<blockquote>the note</blockquote>");
+        assert_eq!(own, "Agreed.");
+        assert_eq!(q.as_deref(), Some("On Sun, Max wrote:<blockquote>the note</blockquote>"));
+        let (own, q) = split_quote_html("Agreed.<br>On Sun, 30 Aug 2026,<br>Max wrote:<blockquote>x</blockquote>");
+        assert_eq!(own, "Agreed.");
+        assert!(q.unwrap().starts_with("On Sun"), "a wrapped attribution goes too");
+        // An attribution sharing its paragraph with the letter is not cut
+        // out of it: the reading stays whole rather than losing its shape.
+        assert_eq!(split_quote_html("<p>Agreed.<br>On Sun, Max wrote:</p><blockquote>x</blockquote>").1, None);
         let s = store();
         let m = mail(&s, 71).expect("max's second reply");
         assert_eq!(own_text(&m).lines().count(), 1, "one paragraph; the quote is gone");

@@ -2146,6 +2146,18 @@ impl Stage {
         cx.update_macos_menu(MacosMenu::Main { items });
     }
 
+    /// Whether an HTML link — a text link, or a picture carrying one — lies
+    /// under `p` in the hosted widget of `pid`.
+    fn link_under(&self, cx: &Cx, pid: u64, p: DVec2) -> bool {
+        let Some(w) = self.hosted.get(&pid) else { return false };
+        let mut hand = false;
+        w.find_widgets_from_point(cx, p, &mut |x| {
+            hand |= x.as_html_link().borrow().is_some()
+                || x.as_html_image().borrow().is_some_and(|i| i.is_link());
+        });
+        hand
+    }
+
     fn hit_at(&self, p: DVec2) -> Option<&HitR> {
         self.hits.iter().rev().find(|h| h.rect.contains(p))
     }
@@ -2299,6 +2311,47 @@ impl Stage {
                         }
                         None => {
                             eprintln!("{}e2e: FAIL drag {label:?}: no matching element", runner.tag);
+                            runner.failures += 1;
+                        }
+                    }
+                }
+                e2e::Step::SelectAll(label) => {
+                    let needle = label.to_lowercase();
+                    let hit = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| h.label.to_lowercase().contains(&needle))
+                        .map(|h| (h.act.clone(), h.rect));
+                    match hit {
+                        Some((Act::Pointer(pid), r)) => {
+                            eprintln!("e2e: selectall {label:?}");
+                            // Just inside the run's top-left corner: the
+                            // registered rect is unclipped, and the middle
+                            // of a tall letter lies below the viewport,
+                            // where nothing is hit.
+                            let p = r.pos + dvec2(4.0, 4.0);
+                            // Found while the tree is borrowed; acted on
+                            // after, or the widget would be borrowed twice.
+                            let mut runs = Vec::new();
+                            if let Some(w) = self.hosted.get(&pid).cloned() {
+                                w.find_widgets_from_point(cx, p, &mut |x| {
+                                    if x.as_html().borrow().is_some() {
+                                        runs.push(x.clone());
+                                    }
+                                });
+                            }
+                            if runs.is_empty() {
+                                eprintln!("e2e: FAIL selectall {label:?}: no run under the point");
+                                runner.failures += 1;
+                            }
+                            for run in runs {
+                                run.selection_select_all();
+                            }
+                            cx.redraw_all();
+                        }
+                        _ => {
+                            eprintln!("e2e: FAIL selectall {label:?}: no hosted run");
                             runner.failures += 1;
                         }
                     }
@@ -4700,6 +4753,13 @@ impl Widget for Stage {
         {
             return;
         }
+        // Images the open letters asked for (see `Pictures`): filed as they
+        // arrive, and everything redraws to place them.
+        if let Event::NetworkResponses(responses) = event {
+            if crate::panels::pictures_arrived(cx, responses) {
+                cx.redraw_all();
+            }
+        }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
         // handlers instead (so the e2e paths share the exact route);
@@ -4913,6 +4973,12 @@ impl Widget for Stage {
             Event::MouseMove(e) => {
                 let p = e.abs;
                 let act = self.hit_at(p).map(|h| (h.act.clone(), h.cursor));
+                // A hosted reading is registered as one rect with the text
+                // cursor, and this runs after the hosted widgets, so the
+                // hand a link inside it set would be overruled here. Ask
+                // the widget what lies under the point: a link, or a
+                // picture that is one, wears the hand.
+                let hand = matches!(&act, Some((Act::Pointer(pid), _)) if self.link_under(cx, *pid, p));
                 let Some(state) = self.state.as_deref_mut() else {
                     return;
                 };
@@ -4920,7 +4986,11 @@ impl Widget for Stage {
                     Act::Focus(_) => None,
                     other => Some(other.clone()),
                 });
-                cx.set_cursor(act.map(|(_, c)| c).unwrap_or(MouseCursor::Default));
+                cx.set_cursor(if hand {
+                    MouseCursor::Hand
+                } else {
+                    act.map(|(_, c)| c).unwrap_or(MouseCursor::Default)
+                });
                 if new_hover != state.hover {
                     state.hover = new_hover;
                     self.redraw_scoped(cx);

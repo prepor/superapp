@@ -19,6 +19,9 @@
 //! altclick "subject"  — the same, with alt held (fresh un-joined panel)
 //! drag "body" 200 0   — mouse press-drag-release from the element's left
 //!                       edge: selects text under the pointer
+//! selectall "mail html" — select the whole run under the label, no keys,
+//!                       no capture: the one way to photograph a wash over
+//!                       an HTML body (a synthesized drag cannot select)
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
@@ -69,6 +72,10 @@ pub enum Step {
     },
     /// Text input into whatever owns the keyboard.
     Type(String),
+    /// Select everything in the selectable run under the labelled element,
+    /// straight on the widget: a synthesized drag never selects (see the
+    /// module doc), so this is how a wash gets photographed.
+    SelectAll(String),
     /// A mouse press-drag-release from the labelled element's left edge by
     /// `(dx, dy)` points — how text gets selected.
     Drag {
@@ -189,6 +196,7 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             fresh: true,
         },
         "mouse" => Step::Mouse { label: quoted()? },
+        "selectall" => Step::SelectAll(quoted()?),
         "key" => {
             let mut it = rest.split_whitespace();
             let chord = it.next().ok_or_else(|| err("expected a key chord"))?;
