@@ -34,10 +34,12 @@ makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65ea
 # The one store: bundled SQLite (same pin rel.systems validated) so the hook
 # surface and version are identical on macOS and android. `hooks` powers the
 # query layer's table-level invalidation (update_hook); `session` records
-# every action's transaction as an invertible changeset — the undo system
-# (CR-001 phase 2). session ⇒ buildtime_bindgen: bindgen runs on the host
-# for both targets (verified on the android cross-build).
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+# every write's transaction as a changeset into `repl_log` — the device-sync
+# replication log (CR-005). (CR-004 had removed `session` with the
+# changeset-based undo; CR-005 brings it back for a different job — carrying
+# one device's writes to the other.) session ⇒ buildtime_bindgen: bindgen
+# runs on the host for both targets (verified on the android cross-build).
+rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 
 # CR-004: effects are serializable values, and the deferred ones are JSON
 # payloads in the `effect` table. serde is already in the graph transitively;

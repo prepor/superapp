@@ -1007,7 +1007,7 @@ mod tests {
 
     fn store_with(n: usize) -> Store {
         let s = Store::open(None).expect("store");
-        s.write(|c| {
+        s.write(move |c| {
             c.execute_batch(
                 "CREATE TABLE item(id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                                    n REAL NOT NULL, ok INTEGER NOT NULL, at REAL NOT NULL)",

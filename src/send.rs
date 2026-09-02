@@ -11,8 +11,8 @@
 //! caught mid-flight by a crash is failed rather than retried — nobody
 //! double-sends on a guess.
 
-use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::effect::{Clock, Secrets, World};
@@ -36,17 +36,23 @@ pub fn outbox_pass(w: &World) -> usize {
 
     let mut claimed = 0;
     for id in due {
+        // The submit job is encoded outside the write — the payload and the
+        // clock need the `World`, which cannot cross to the writer thread
+        // (CR-005 phase 0).
+        let Ok(job) = w.prepare(&mail::Submit { outbox: id }) else {
+            continue;
+        };
         // The claim: one winner between this pass and a concurrent undo,
         // whose reversal only deletes the row while it is 'pending'.
         let won = w
             .store()
-            .write(|tx| {
+            .write(move |tx| {
                 let n = tx.execute(
                     "UPDATE outbox SET status = 'sending' WHERE id = ?1 AND status = 'pending'",
                     [id],
                 )?;
                 if n == 1 {
-                    w.enqueue_in(tx, &mail::Submit { outbox: id })?;
+                    job.insert(tx)?;
                 }
                 Ok(n)
             })
@@ -88,13 +94,14 @@ impl Sender {
 
 /// The sender thread: sleep until the next deadline (or a kick), claim what
 /// is due, run the queue, notify the UI. It builds its own [`World`] — its
-/// own store connection, its own `Real` outside.
+/// own reader over the shared writer (CR-005 phase 0), its own `Real`
+/// outside.
 ///
 /// # Panics
 ///
 /// If the thread cannot be spawned.
 pub fn spawn(
-    db: PathBuf,
+    db: Arc<crate::store::Db>,
     secrets: Secrets,
     clock: Clock,
     notify: impl Fn() + Send + 'static,
@@ -103,7 +110,8 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("sender".into())
         .spawn(move || {
-            let Ok(store) = crate::store::Store::open(Some(&db)) else {
+            // Its own reader over the *one* writer (CR-005 phase 0).
+            let Ok(store) = crate::store::Store::with_db(db) else {
                 return;
             };
             let w = World::new(
@@ -151,8 +159,9 @@ mod tests {
     /// process and deleted it on the way out.
     fn world(smtp: &str) -> World {
         let w = World::fake(mail::registry());
+        let smtp = smtp.to_string();
         w.store()
-            .write(|c| {
+            .write(move |c| {
                 c.execute(
                     "INSERT INTO account(label, email, imap_host, smtp_host)
                      VALUES('t','t@t','',?1)",
@@ -264,7 +273,7 @@ mod tests {
             })
             .unwrap();
 
-        crate::store::sweep_effects(w.store().conn()).unwrap();
+        w.store().write(|tx| crate::store::sweep_effects(tx)).unwrap();
 
         let j = &w.jobs()[0];
         assert_eq!(j.status, "failed");

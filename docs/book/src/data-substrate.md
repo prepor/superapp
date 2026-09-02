@@ -26,6 +26,41 @@ clipboard, a file beside the store, the screen and the clock are. The
 corollary is the one that shapes everything below: **archiving a mail is not
 an effect; pushing the archive is.**
 
+## One writer, and the replication log
+
+There is exactly **one writable connection**, private to a dedicated writer
+thread. Every mutation in the process — from the UI, from a sync worker, from
+the sender — is a closure submitted to that thread and awaited; the closure
+runs on the writer, so it owns what it touches rather than borrowing UI
+state. Every *other* connection is a `query_only` reader, so a write that
+tries to skip the gate fails with `SQLITE_READONLY` loudly in a test rather
+than racing silently in production. That single door is what device sync
+needs (CR-005): a write nobody captured would be divergence no changeset can
+reconstruct.
+
+Inside the gate, a SQLite **session** over the durable tables records what
+each transaction wrote as a changeset and queues it in `repl_log`, in the
+same transaction. That log is a queue that drains and prunes, not a table
+anything migrates through.
+
+Those frames reach the other device through an **object store** — three
+verbs, get and create-only and compare-and-swap — with a lease so only one
+device writes at a time. A single `state` object fuses the lease with the
+head pointer, so the compare-and-swap that advances the log *is* the check
+that this device still holds the lease. One device bootstraps the lineage
+(uploads a snapshot, writes the first `state`); the other installs that
+snapshot to gain a common ancestry, then applies each published batch
+forward. The transport is pluggable — R2 or S3 in the end, a small local
+`bucketd` daemon for a demo (see `docs/device-sync-demo.md`).
+
+The role drives the UI and the write gate together. A **holder** writes;
+everyone else is read-only and sees a **locked screen** — who holds the
+lease, and a button to take it. The holder hands the lease back on sleep and
+on close, so the other device can acquire it without an override; taking it
+from a live holder is an override, worded as the risk it is (that device may
+hold work it never published). A device overridden while it thought it held
+the lease is **stranded**: read-only, recovery by hand, never a silent merge.
+
 Effects are values that describe themselves in one line and know how to do
 themselves, behind one swappable backend — the real one, an in-memory fake,
 or one that refuses everything. That last is what lets a panel be drawn in

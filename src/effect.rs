@@ -174,9 +174,12 @@ pub trait Effect: Sized {
 /// readable from the table. Both the effect and its reply must survive a
 /// round trip through JSON, so an effect that cannot be written down is a
 /// compile error rather than a discovery.
-pub trait Deferred: Effect + Serialize + DeserializeOwned + 'static
+// `Send` is required because a job's `settle` closure travels to the store's
+// writer thread (CR-005 phase 0): the effect value and its reply are captured
+// and committed there. Every real effect is plain data, so this is free.
+pub trait Deferred: Effect + Serialize + DeserializeOwned + Send + 'static
 where
-    Self::Reply: Serialize + DeserializeOwned,
+    Self::Reply: Serialize + DeserializeOwned + Send,
 {
     /// Is running this twice safe? No default — it is the one judgement a
     /// crash cannot guess, and it drives the boot sweep.
@@ -310,7 +313,8 @@ impl Effect for Shot<'_> {
 // -- the registry --------------------------------------------------------------
 
 /// The bookkeeping a success carries, committed with its status update.
-type Settle = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<()>>;
+/// `Send`, because it is committed on the store's writer thread (CR-005).
+type Settle = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<()> + Send>;
 
 /// What running one claimed job produced.
 pub(crate) enum Ran {
@@ -345,7 +349,7 @@ impl Registry {
     /// Registers one deferred effect kind.
     pub fn register<E: Deferred>(&mut self)
     where
-        E::Reply: Serialize + DeserializeOwned,
+        E::Reply: Serialize + DeserializeOwned + Send,
     {
         self.handlers.insert(
             E::KIND,
@@ -476,6 +480,60 @@ fn json_err(e: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
+/// A deferred effect encoded and timestamped, ready to insert inside any
+/// write transaction. Owned and `Send`, so it can be moved into a
+/// [`Store::write`](crate::store::Store::write) closure that runs on the
+/// writer thread — the composition primitive the passes build their jobs
+/// from (CR-005 phase 0).
+pub struct Enqueue {
+    kind: &'static str,
+    payload: String,
+    entity: Option<String>,
+    idempotent: bool,
+    not_before: f64,
+    now: f64,
+}
+
+impl Enqueue {
+    /// Inserts the job row into the caller's transaction, answering its id.
+    ///
+    /// # Errors
+    ///
+    /// If the insert fails.
+    pub fn insert(&self, tx: &Transaction) -> rusqlite::Result<i64> {
+        tx.execute(
+            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+                                attempts, not_before, created, updated)
+             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
+            rusqlite::params![
+                self.kind,
+                self.payload,
+                self.entity,
+                self.idempotent,
+                self.not_before,
+                self.now
+            ],
+        )?;
+        Ok(tx.last_insert_rowid())
+    }
+}
+
+/// Cancels an unclaimed job inside the caller's transaction — undo's half of
+/// the race with the executor, as a free function so a `Send` write closure
+/// can call it without capturing the `World`.
+///
+/// # Errors
+///
+/// If the update fails.
+pub fn cancel_tx(tx: &Transaction, id: i64, now: f64) -> rusqlite::Result<bool> {
+    let n = tx.execute(
+        "UPDATE effect SET status='obsolete', updated=?2
+         WHERE id=?1 AND status='pending'",
+        rusqlite::params![id, now],
+    )?;
+    Ok(n == 1)
+}
+
 /// The store, the outside and the registry, as one value you construct —
 /// never a global, never a path, never a thread you cannot see.
 /// Single-threaded: the UI owns one, and each worker thread builds its own.
@@ -578,7 +636,7 @@ impl World {
     /// If the payload will not encode, or the insert fails.
     pub fn enqueue_in<E: Deferred>(&self, tx: &Transaction, e: &E) -> rusqlite::Result<i64>
     where
-        E::Reply: Serialize + DeserializeOwned,
+        E::Reply: Serialize + DeserializeOwned + Send,
     {
         self.enqueue_at_in(tx, e, 0.0)
     }
@@ -596,7 +654,7 @@ impl World {
         not_before: f64,
     ) -> rusqlite::Result<i64>
     where
-        E::Reply: Serialize + DeserializeOwned,
+        E::Reply: Serialize + DeserializeOwned + Send,
     {
         let payload = serde_json::to_string(e).map_err(json_err)?;
         let now = self.now();
@@ -609,6 +667,41 @@ impl World {
         Ok(tx.last_insert_rowid())
     }
 
+    /// Encodes and timestamps a deferred effect into an owned [`Enqueue`],
+    /// **outside** any transaction. This is the `Send`-safe half of filing a
+    /// job: the caller can then insert it inside a write closure that runs on
+    /// the store's writer thread, where the `&World` itself cannot travel
+    /// (CR-005 phase 0).
+    ///
+    /// # Errors
+    ///
+    /// If the payload will not encode.
+    pub fn prepare<E: Deferred>(&self, e: &E) -> rusqlite::Result<Enqueue>
+    where
+        E::Reply: Serialize + DeserializeOwned + Send,
+    {
+        self.prepare_at(e, 0.0)
+    }
+
+    /// The same, held back until `not_before`.
+    ///
+    /// # Errors
+    ///
+    /// If the payload will not encode.
+    pub fn prepare_at<E: Deferred>(&self, e: &E, not_before: f64) -> rusqlite::Result<Enqueue>
+    where
+        E::Reply: Serialize + DeserializeOwned + Send,
+    {
+        Ok(Enqueue {
+            kind: E::KIND,
+            payload: serde_json::to_string(e).map_err(json_err)?,
+            entity: e.entity(),
+            idempotent: e.idempotent(),
+            not_before,
+            now: self.now(),
+        })
+    }
+
     /// Files a deferred effect in its own transaction.
     ///
     /// # Errors
@@ -616,9 +709,10 @@ impl World {
     /// If the payload will not encode, or the insert fails.
     pub fn enqueue<E: Deferred>(&self, e: &E) -> rusqlite::Result<i64>
     where
-        E::Reply: Serialize + DeserializeOwned,
+        E::Reply: Serialize + DeserializeOwned + Send,
     {
-        self.store.write(|tx| self.enqueue_in(tx, e))
+        let spec = self.prepare(e)?;
+        self.store.write(move |tx| spec.insert(tx))
     }
 
     /// Cancels a job that has not been claimed — undo's half of the race
@@ -628,12 +722,7 @@ impl World {
     ///
     /// If the update fails.
     pub fn cancel_in(&self, tx: &Transaction, id: i64) -> rusqlite::Result<bool> {
-        let n = tx.execute(
-            "UPDATE effect SET status='obsolete', updated=?2
-             WHERE id=?1 AND status='pending'",
-            rusqlite::params![id, self.now()],
-        )?;
-        Ok(n == 1)
+        cancel_tx(tx, id, self.now())
     }
 
     /// One executor pass: claim every due job and run it. Answers how many
@@ -658,7 +747,7 @@ impl World {
             // undo, whose cancel only fires while the row is 'pending'.
             let won = self
                 .store
-                .write(|tx| {
+                .write(move |tx| {
                     tx.execute(
                         "UPDATE effect SET status='processing', attempts=attempts+1,
                                            updated=?2
@@ -684,7 +773,7 @@ impl World {
             };
 
             let closed = match ran {
-                Ran::Done(reply, settle) => self.store.write(|tx| {
+                Ran::Done(reply, settle) => self.store.write(move |tx| {
                     settle(tx)?;
                     tx.execute(
                         "UPDATE effect SET status='done', reply=?2, error=NULL, updated=?3
@@ -693,7 +782,7 @@ impl World {
                     )?;
                     Ok(())
                 }),
-                Ran::Obsolete => self.store.write(|tx| {
+                Ran::Obsolete => self.store.write(move |tx| {
                     tx.execute(
                         "UPDATE effect SET status='obsolete', updated=?2 WHERE id=?1",
                         rusqlite::params![id, now],
@@ -716,7 +805,8 @@ impl World {
     /// being tried again.
     fn fail(&self, id: i64, err: &str, terminal: bool) -> rusqlite::Result<()> {
         let now = self.now();
-        self.store.write(|tx| {
+        let err = err.to_string();
+        self.store.write(move |tx| {
             let attempts: i64 = tx
                 .query_row("SELECT attempts FROM effect WHERE id=?1", [id], |r| r.get(0))
                 .unwrap_or(MAX_ATTEMPTS);
@@ -1579,14 +1669,15 @@ mod tests {
         let w = world();
         let id = w.enqueue(&Poke::ok("doomed")).unwrap();
 
-        let won = w.store().write(|tx| w.cancel_in(tx, id)).unwrap();
+        let now = w.now();
+        let won = w.store().write(move |tx| cancel_tx(tx, id, now)).unwrap();
         assert!(won);
         assert_eq!(w.jobs()[0].status, "obsolete");
         assert_eq!(w.run_effects(), 0);
         assert!(w.with_fake(|f| f.clips.is_empty()), "never performed");
 
         // A second cancel loses — there is exactly one winner.
-        assert!(!w.store().write(|tx| w.cancel_in(tx, id)).unwrap());
+        assert!(!w.store().write(move |tx| cancel_tx(tx, id, now)).unwrap());
     }
 
     /// A job the world no longer wants goes obsolete instead of running.
@@ -1650,7 +1741,7 @@ mod tests {
             })
             .unwrap();
 
-        crate::store::sweep_effects(w.store().conn()).unwrap();
+        w.store().write(|tx| crate::store::sweep_effects(tx)).unwrap();
 
         let by_id = |id: i64| w.jobs().into_iter().find(|j| j.id == id).unwrap();
         assert_eq!(by_id(safe).status, "pending", "idempotent: retry it");
