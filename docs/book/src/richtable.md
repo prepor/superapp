@@ -147,13 +147,29 @@ typed filter.
 
 The inbox draws three things for them. A marked row wears an ink bar down
 its left edge, inside the row's own inset, so nothing reflows when the
-first mark lands. The **marks bar** sits between the filter and the header
-while the set is not empty — `3 of 143 marked`, `all 143 marked`, or
+first mark lands. The **marks bar** stands at the panel's **foot** while
+the set is not empty — `3 of 143 marked`, `all 143 marked`, or
 `3 marked · 1 hidden by the filter` — carrying `archive`, `delete`, `all`
 and `clear` beside the count, or under it where the width cannot hold them.
-And the marks the filter hides ride above the rows *in the same
-`PortalList`*, as a prefix: a caption, the rows, a strong rule closing the
-group. The arrows walk the table, so they never visit them.
+Under the list rather than over it, so it takes its height off the rows'
+own scroll instead of pushing every row down as the first mark lands; it
+wears the header's rule on its other side, and the rows end at it. And the
+marks the filter hides ride above the rows *in the same `PortalList`*, as a
+prefix: a caption, the rows, a strong rule closing the group. The arrows
+walk the table, so they never visit them.
+
+A batch verb runs its pre-flight over the set, thread by thread: one whose
+account has no such folder is skipped rather than failing the batch, and
+**stays marked**, so what is left marked afterwards is exactly what the
+verb could not do — `archived 10 of 12 conversations — 2 have no archive
+folder — ⌘z undoes`. When nothing in the set can be filed there is no
+action at all: the toast is the single row's error and the set stands as it
+was.
+
+`Marks` and the datasource's three questions are the engine's, and belong
+to any table; the ink bar, the bar and the hidden group are the inbox's own
+until a second list panel wants them — as the filter field was, before the
+next list lifted it.
 
 ## Drawing a long list
 
