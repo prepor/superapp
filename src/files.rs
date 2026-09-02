@@ -160,6 +160,63 @@ pub enum ImageFormat {
     Jpeg,
 }
 
+/// A picture's `(width, height)` in pixels off its header alone — the
+/// PNG's IHDR, a JPEG's first frame marker — so the card can wish its
+/// rows before anything is decoded. `None` for what is not one.
+#[must_use]
+pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG: an 8-byte signature, then the IHDR chunk: length, "IHDR",
+    // width, height — big-endian.
+    if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    // JPEG: segments of `FF xx len…`; the size sits in the first SOF
+    // segment (C0–CF, not the tables at C4, C8, CC).
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut i = 2;
+        while i + 4 <= bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            if (0xD0..=0xD9).contains(&marker) || marker == 0x01 {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            let sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if sof {
+                if i + 9 > bytes.len() {
+                    return None;
+                }
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]);
+                return (w > 0 && h > 0).then_some((u32::from(w), u32::from(h)));
+            }
+            i += 2 + len.max(2);
+        }
+    }
+    None
+}
+
+/// How many lines a text preview takes at `cols` characters a line,
+/// wrapped the way the card draws it: every line at least one.
+#[must_use]
+pub fn text_lines(text: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
+    text.lines()
+        .map(|l| l.chars().count().div_ceil(cols).max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
 // -- paths -------------------------------------------------------------------
 
 /// `~/Downloads` + `2026` → `~/Downloads/2026`; `/` + `tmp` → `/tmp`.
@@ -948,6 +1005,16 @@ mod tests {
         assert_eq!(FileKind::of_name("Lease.tla"), FileKind::Text);
         assert_eq!(image_format("a.jpeg"), Some(ImageFormat::Jpeg));
         assert_eq!(image_format("a.gif"), None);
+        // The card's wish reads a picture's size off its header alone.
+        let icon = include_bytes!("../resources/icon_256.png");
+        assert_eq!(image_size(icon), Some((256, 256)));
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0x90, 0x02, 0x80, 0x01, 0x01, 0x11, 0x00]);
+        assert_eq!(image_size(&jpeg), Some((640, 400)));
+        assert_eq!(image_size(b"not a picture"), None);
+        assert_eq!(text_lines("", 40), 1);
+        assert_eq!(text_lines("a\nb\nc", 40), 3);
+        assert_eq!(text_lines(&"x".repeat(100), 40), 3, "a long line wraps");
         assert!(demo::text_of("~/Downloads/README.txt").is_some());
         assert!(demo::text_of("~/Downloads/report-q3.pdf").is_none());
         assert!(demo::bytes_of("~/Downloads/2026/photo-lisbon.jpg").is_some_and(|b| !b.is_empty()));

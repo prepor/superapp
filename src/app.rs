@@ -1076,6 +1076,11 @@ struct State {
     /// The one held item `copy`/`move` carry to a `… here` (CR-008):
     /// context, not history — never persisted, gone with the process.
     hold: Option<crate::files::Hold>,
+    /// What a card's preview needs, in lines, by `(path, columns)`: the
+    /// measure reads the file through the outside, and `sync` re-takes
+    /// the wishes on every mutation, so it is read once and remembered.
+    /// Pruned to the cards on screen.
+    measured: HashMap<(String, usize), f64>,
     /// The device-sync driver (CR-005), when a `--bucket` is configured.
     /// `None` means replication is off and the store is a plain local one.
     repl: Option<ReplMode>,
@@ -1252,6 +1257,7 @@ impl State {
             show_also: None,
             expand: HashMap::new(),
             hold: None,
+            measured: HashMap::new(),
             virtual_time: boot.virtual_time,
             grid: boot.grid,
             send_delay: boot.send_delay,
@@ -1334,17 +1340,87 @@ impl State {
         Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
     }
 
+    /// The rows a file card wants (CR-008): its three as the floor, more
+    /// when the preview needs them — a long text file opens tall rather
+    /// than scrolled, a tall picture is seen whole — up to the grid. The
+    /// need is measured once per path and column width, off the first 64
+    /// KB of a text file or a picture's header, and remembered.
+    fn file_rows(&mut self, path: &str) -> Option<u32> {
+        /// What the card spends on everything that is not the preview:
+        /// the name, the kind line, the date, the path, the rule and the
+        /// padding around them, in lines.
+        const CHROME_LINES: f64 = 7.0;
+
+        let (vw, vh) = self.vp();
+        let grid = self.ws.grid;
+        let gap = theme::GAP;
+        let kind = Kind::File {
+            path: path.to_string(),
+        };
+        let (gw, floor) = kind.grid();
+        let unit_w = (vw - gap) / f64::from(grid.w);
+        let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
+        let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
+        let line_h = theme::FONT_SIZE * theme::LINE_H;
+
+        let key = (path.to_string(), cols);
+        let need = match self.measured.get(&key) {
+            Some(n) => *n,
+            None => {
+                let entry = crate::files::stat_in(&self.world, path)?;
+                let need = match entry.kind() {
+                    crate::files::FileKind::Text => {
+                        let bytes = crate::files::read_in(
+                            &self.world,
+                            path,
+                            crate::files::TEXT_PREVIEW_MAX,
+                        )
+                        .ok()?;
+                        crate::files::text_lines(&String::from_utf8_lossy(&bytes), cols) as f64
+                    }
+                    crate::files::FileKind::Image => {
+                        // The header is enough for the size; the card
+                        // draws the picture at the text's width.
+                        let head = crate::files::read_in(&self.world, path, 64 * 1024).ok()?;
+                        let (w, h) = crate::files::image_size(&head)?;
+                        text_w * f64::from(h) / f64::from(w.max(1)) / line_h
+                    }
+                    _ => 0.0,
+                };
+                self.measured.insert(key, need);
+                need
+            }
+        };
+
+        let row_h = (vh - 2.0 * gap - f64::from(grid.h - 1) * gap) / f64::from(grid.h);
+        let holds = |rows: u32| {
+            let h = f64::from(rows) * row_h + f64::from(rows - 1) * gap;
+            h / line_h - CHROME_LINES
+        };
+        Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
+    }
+
     /// Measures a kind before a panel shows it. Placement consults the wish
     /// — a tall letter earns a column of its own instead of squeezing into
     /// a neighbour — and a panel about to be born has no id to hang one on,
     /// so the shell measures ahead of the mutation.
     fn wish_ahead(&mut self, kind: &Kind) {
-        if let Kind::Message { id } = kind {
-            let open = self.seed_for(*id);
-            if let Some(h) = self.message_rows(*id, &open) {
-                let (w, _) = kind.grid();
-                self.ws.wish(kind, (w, h));
+        match kind {
+            Kind::Message { id } => {
+                let open = self.seed_for(*id);
+                if let Some(h) = self.message_rows(*id, &open) {
+                    let (w, _) = kind.grid();
+                    self.ws.wish(kind, (w, h));
+                }
             }
+            Kind::File { path } => {
+                let path = path.clone();
+                if let Some(h) = self.file_rows(&path) {
+                    let (w, _) = kind.grid();
+                    self.ws.wish(kind, (w, h));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1384,22 +1460,36 @@ impl State {
         // Wishes measured from content, re-taken from scratch: a letter that
         // arrived, changed or left changes what its panel asks for. Ephemeral
         // like the grid above — measured here, never snapshotted.
-        let wishes = self
+        let kinds: Vec<(PanelId, Kind)> = self
             .ws
             .wss
             .iter()
             .flat_map(|w| w.panels.values())
-            .filter_map(|p| match &p.kind {
+            .map(|p| (p.id, p.kind.clone()))
+            .collect();
+        let mut wishes = HashMap::new();
+        let mut cards: Vec<String> = Vec::new();
+        for (pid, kind) in kinds {
+            let (w, _) = kind.grid();
+            let h = match &kind {
                 Kind::Message { id } => {
-                    let (w, _) = p.kind.grid();
                     let open =
-                        crate::panels::Expansion::for_panel(self.expand.get(&p.id), *id).open;
-                    Some((p.kind.clone(), (w, self.message_rows(*id, &open)?)))
+                        crate::panels::Expansion::for_panel(self.expand.get(&pid), *id).open;
+                    self.message_rows(*id, &open)
+                }
+                Kind::File { path } => {
+                    cards.push(path.clone());
+                    self.file_rows(path)
                 }
                 _ => None,
-            })
-            .collect();
+            };
+            if let Some(h) = h {
+                wishes.insert(kind, (w, h));
+            }
+        }
         self.ws.set_wishes(wishes);
+        // A card's measure lives as long as a panel shows the file.
+        self.measured.retain(|(path, _), _| cards.contains(path));
         // Expansion state dies with its panel.
         let live: Vec<PanelId> = self.expand.keys().copied().collect();
         for pid in live {
