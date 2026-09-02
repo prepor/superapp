@@ -1498,6 +1498,26 @@ impl Fake {
     }
 }
 
+/// The demo tree as a disk, in the panels' spelling: what a fake world
+/// serves, and what a real one serves under `--demo-disk` — the panels
+/// library's fixture, a machine-independent `~` a suite can address a row
+/// of by name.
+fn demo_list(dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
+    let d = crate::files::display_path(dir);
+    crate::files::demo::list(&d).ok_or_else(|| format!("{d}: no such directory"))
+}
+
+fn demo_stat(path: &Path) -> Result<Option<crate::files::Entry>, String> {
+    Ok(crate::files::demo::entry(&crate::files::display_path(path)))
+}
+
+fn demo_read(path: &Path, max: usize) -> Result<Vec<u8>, String> {
+    let d = crate::files::display_path(path);
+    let mut bytes = crate::files::demo::bytes_of(&d).ok_or_else(|| format!("{d}: no such file"))?;
+    bytes.truncate(max);
+    Ok(bytes)
+}
+
 impl Outside for Fake {
     fn now(&mut self) -> f64 {
         self.clock
@@ -1697,20 +1717,15 @@ impl Outside for Fake {
 
     // The demo tree, in the panels' spelling: a fake world's disk.
     fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
-        let d = crate::files::display_path(dir);
-        crate::files::demo::list(&d).ok_or_else(|| format!("{d}: no such directory"))
+        demo_list(dir)
     }
 
     fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
-        Ok(crate::files::demo::entry(&crate::files::display_path(path)))
+        demo_stat(path)
     }
 
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
-        let d = crate::files::display_path(path);
-        let mut bytes =
-            crate::files::demo::bytes_of(&d).ok_or_else(|| format!("{d}: no such file"))?;
-        bytes.truncate(max);
-        Ok(bytes)
+        demo_read(path, max)
     }
 
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
@@ -1877,6 +1892,12 @@ pub struct Real {
     /// the refresh that mints one is a network round trip no connect
     /// should pay twice.
     tokens: HashMap<String, (String, f64)>,
+    /// The disk this outside reads is the **demo tree**, not the machine's
+    /// (`--demo-disk`). Everything else stays real: an e2e run's file
+    /// browser then walks the same fixture the panels library shows — a
+    /// suite can address a row by name — while its screenshots, its
+    /// network and its keychain are the ones a run always had.
+    demo_disk: bool,
 }
 
 /// How early a cached access token is treated as spent, so a long sync
@@ -1900,7 +1921,15 @@ impl Real {
             clock,
             dir,
             tokens: HashMap::new(),
+            demo_disk: false,
         }
+    }
+
+    /// The same outside with the demo tree for a disk (see [`Real`]).
+    #[must_use]
+    pub fn with_demo_disk(mut self) -> Real {
+        self.demo_disk = true;
+        self
     }
 
     fn session(&mut self, account: i64) -> Result<&mut imap_session::Imap, String> {
@@ -2103,6 +2132,9 @@ impl Outside for Real {
     }
 
     fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
+        if self.demo_disk {
+            return demo_list(dir);
+        }
         let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut out = Vec::new();
         for ent in rd.flatten() {
@@ -2121,6 +2153,9 @@ impl Outside for Real {
     }
 
     fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
+        if self.demo_disk {
+            return demo_stat(path);
+        }
         match std::fs::metadata(path) {
             Ok(m) => {
                 let name = path
@@ -2135,6 +2170,9 @@ impl Outside for Real {
     }
 
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
+        if self.demo_disk {
+            return demo_read(path, max);
+        }
         use std::io::Read;
         let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut buf = Vec::new();
@@ -2148,6 +2186,11 @@ impl Outside for Real {
     /// picks the viewer, and nothing runs under our name. Elsewhere there
     /// is no opener yet (android wants a FileProvider).
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
+        // A demo path names a file only the fixture has: nothing is handed
+        // to the OS, and the card's `open` still answers.
+        if self.demo_disk {
+            return Ok(());
+        }
         #[cfg(target_os = "macos")]
         {
             let status = std::process::Command::new("/usr/bin/open")

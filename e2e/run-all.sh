@@ -34,6 +34,7 @@ extra_args() {
     problems) echo "--send-delay 1" ;;               # the same, for its failing send
     effects)  echo "--send-delay 1" ;;               # …so a job reaches the queue
     library)  echo "--library" ;;                    # the canvas, not a workspace
+    files-marks) echo "--demo-disk" ;;               # the demo tree, not this machine's ~
     *)        echo "" ;;
   esac
 }

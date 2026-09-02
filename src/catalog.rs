@@ -945,24 +945,29 @@ fn job() -> Scene<Setup> {
 }
 
 fn marks_bar() -> Scene<Setup> {
-    let bar = |marked: usize, total: usize, hidden: usize| {
+    let bar = |kind: Kind, marked: usize, total: usize, hidden: usize| {
         widget(live_id!(mark_bar_tpl), move |cx, w| {
-            w.as_mark_bar().populate(cx, marked, total, hidden);
+            w.as_mark_bar()
+                .populate(cx, crate::ui::mark_verbs(&kind), marked, total, hidden);
         })
     };
+    let inbox = move |m, t, h| bar(Kind::Inbox { filter: None }, m, t, h);
+    let files = move |m, t, h| bar(Kind::Files { dir: files::HOME.into() }, m, t, h);
     Scene::new("marks bar", (520.0, 40.0))
         .note("What a list shows while any row is marked (CR-009): the count, the verbs on the marked set, all, clear.")
-        .note("Comes with the first mark, goes with the last. archive and delete wear the letters their single-row twins wear.")
-        .node("three", bar(3, 143, 0))
+        .note("Comes with the first mark, goes with the last. Every verb wears the letter its single-row twin wears.")
+        .node("three", inbox(3, 143, 0))
         .about("of the rows under the filter")
-        .node("hidden", bar(3, 12, 1))
+        .node("hidden", inbox(3, 12, 1))
         .sized((520.0, 64.0))
         .about("a mark the filter hides is still counted, and said; the verbs drop a line")
-        .node("all", bar(143, 143, 0))
+        .node("all", inbox(143, 143, 0))
         .about("all stands down")
-        .node("narrow", bar(3, 143, 1))
+        .node("narrow", inbox(3, 143, 1))
         .sized((356.0, 64.0))
         .about("the phone's width: the verbs wrap")
+        .node("files", files(2, 8, 0))
+        .about("a files panel's own row verbs, on the set: copy ⌘p, move ⌘m, delete ⌘d")
         .edge("three", "hidden", "/ github")
         .edge("three", "all", "⌘l / all")
 }
@@ -1046,7 +1051,12 @@ fn entry(name: &str, is_dir: bool, size: u64) -> files::Entry {
 fn files_row() -> Scene<Setup> {
     let row = |e: files::Entry, selected: bool| {
         widget(live_id!(files_row_tpl), move |cx, w| {
-            w.as_files_row().populate(cx, &e, selected);
+            w.as_files_row().populate(cx, &e, selected, false);
+        })
+    };
+    let marked = |e: files::Entry, selected: bool| {
+        widget(live_id!(files_row_tpl), move |cx, w| {
+            w.as_files_row().populate(cx, &e, selected, true);
         })
     };
     Scene::new("files row", (520.0, 32.0))
@@ -1070,7 +1080,13 @@ fn files_row() -> Scene<Setup> {
             ),
         )
         .about("one line, ellipsized; the columns hold")
+        .node("marked", marked(entry("report-q3.pdf", false, 1_258_291), false))
+        .about("the mark (CR-009): an ink bar in the row's inset, no reflow")
+        .node("marked, cursor", marked(entry("report-q3.pdf", false, 1_258_291), true))
+        .about("both at once: the wash under the bar")
         .edge("file", "selected", "↓ / click")
+        .edge("file", "marked", "space")
+        .edge("selected", "marked, cursor", "space")
 }
 
 fn files() -> Scene<Setup> {

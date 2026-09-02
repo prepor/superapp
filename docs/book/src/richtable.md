@@ -126,15 +126,19 @@ what `all` marks; **which of these keys** still match, which sorts a set
 into shown and hidden; and **the row for a key**, under the source's base
 `WHERE` and nothing else. A `SqlSpec` names its key: the group where there
 is one — a thread is its `message.thread` — else the unique column its
-order ends in.
+order ends in. A source that is not SQL answers the same three off
+whatever it holds: `DirSource` reads them from its listing, keyed by entry
+name, and its base `WHERE` is the directory itself — so a dot-file the
+filter hides is hidden, not gone.
 
 `Table::split` sorts a set into what the filter shows and what it hides.
 **A hidden mark is still a mark**: it counts in the bar, it is drawn above
 the rows, and a batch verb acts on it — read fresh by its key on every
 draw, never from a snapshot taken when it was marked. A mark whose row is
-gone altogether — the thread left the inbox — is dropped at that same
-point: the bar counts rows that exist. And **`all` means all matching** —
-the table knows its count and the source can list its keys, so the rows off
+gone altogether — the thread left the inbox, the entry left the listing —
+is dropped at that same point: the bar counts rows that exist. And **`all`
+means all matching** — the table knows its count and the source can list
+its keys, so the rows off
 screen are marked too (`all 143 marked`).
 
 **Marks are context, not intent.** Filtering, walking and syncing never
@@ -145,12 +149,15 @@ consumed, so an [undo](./interaction-grammar.md#undo) puts the rows back
 marked. They live in the panel's memory and go with the process, like the
 typed filter.
 
-The inbox draws three things for them. A marked row wears an ink bar down
+A list draws three things for them. A marked row wears an ink bar down
 its left edge, inside the row's own inset, so nothing reflows when the
 first mark lands. The **marks bar** stands at the panel's **foot** while
 the set is not empty — `3 of 143 marked`, `all 143 marked`, or
-`3 marked · 1 hidden by the filter` — carrying `archive`, `delete`, `all`
-and `clear` beside the count, or under it where the width cannot hold them.
+`3 marked · 1 hidden by the filter` — carrying the list's own row verbs on
+the set, then `all` and `clear`, beside the count or under it where the
+width cannot hold them. Which verbs those are is the list's to say
+(`ui::mark_verbs`): the inbox `archive` and `delete`, a files panel
+`copy`, `move` and `delete`.
 Under the list rather than over it, so it takes its height off the rows'
 own scroll instead of pushing every row down as the first mark lands; it
 wears the header's rule on its other side, and the rows end at it. And the
@@ -164,12 +171,21 @@ account has no such folder is skipped rather than failing the batch, and
 verb could not do — `archived 10 of 12 conversations — 2 have no archive
 folder — ⌘z undoes`. When nothing in the set can be filed there is no
 action at all: the toast is the single row's error and the set stands as it
-was.
+was. A files panel's batch refuses the same way, path by path: `copy` and
+`move` hold every marked path the way they hold one, and a `copy here`
+performs the set into the directory a panel shows — refusing per path as it
+does for one, and still a draft, so the toast says the disk is untouched.
 
-`Marks` and the datasource's three questions are the engine's, and belong
-to any table; the ink bar, the bar and the hidden group are the inbox's own
-until a second list panel wants them — as the filter field was, before the
-next list lifted it.
+None of that is the inbox's any more. `Marks` and the datasource's three
+questions were always the engine's; the panel side — the set beside the
+table, the hidden rows, the prefix arithmetic, the per-row stamps, the
+space / shift+arrow / esc keys and the bar itself — is one piece
+(`panels::PanelMarks<D>`) that a list holds beside its `Table`, generic
+over the same datasource. What stays a panel's own is only what a mark
+*means*: which row the cursor is on, which verbs the bar wears, and what a
+batch of them does. [A files panel](./interaction-grammar.md#files-a-directory-is-a-column-a-file-is-a-card)
+was the second list to want them, and cost the widget nothing but its own
+row twins.
 
 ## Drawing a long list
 

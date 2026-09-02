@@ -137,7 +137,8 @@ pub fn hold_btn(op: crate::files::HoldOp) -> (&'static str, BtnAct) {
 /// What one panel's header wears now: its kind's buttons, the held item's
 /// if one is held and the kind takes it, and — for a files panel — the
 /// object verbs only while it is the **end of a chain**: joined under a
-/// parent and driving nothing (CR-008).
+/// parent and driving nothing (CR-008), and no row of it is marked
+/// (CR-009).
 ///
 /// The end of a chain is the thing under the cursor. A row previews the
 /// directory's own panel beside the list, and *that* panel wears `copy`,
@@ -147,6 +148,10 @@ pub fn hold_btn(op: crate::files::HoldOp) -> (&'static str, BtnAct) {
 /// `~` cannot be deleted, and a chord in a list never hits the directory
 /// the list itself shows — it hits what the cursor is on.
 ///
+/// Marked rows take the verbs the same way: two visible controls may not
+/// answer to one chord, and with rows marked the verb meant is the set's
+/// ([`mark_verbs`]), so the header falls back to its non-object set.
+///
 /// The shell asks this, never [`head_btns`] alone, so the width, the
 /// chords and the drawing agree.
 #[must_use]
@@ -154,9 +159,10 @@ pub fn head_btns_of(
     kind: &Kind,
     hold: Option<crate::files::HoldOp>,
     object: bool,
+    marked: bool,
 ) -> Vec<(&'static str, BtnAct)> {
     let mut v: Vec<(&'static str, BtnAct)> = match kind {
-        Kind::Files { .. } if !object => {
+        Kind::Files { .. } if !object || marked => {
             vec![("new dir", BtnAct::NewDir), ("go to", BtnAct::GoTo)]
         }
         _ => head_btns(kind).to_vec(),
@@ -206,23 +212,54 @@ pub const ACCEL_ADD_ACCOUNT: char = 'd';
 pub const ACCEL_DEVICE_SYNC: char = 'y';
 
 /// The verbs of the marks bar (CR-009): what a list offers on its marked
-/// set. `archive` and `delete` are the row's own verbs, on the set; `all`
-/// marks every row under the filter; `clear` empties the set.
+/// set. The first ones are the row's own verbs, on the set — the inbox
+/// files, a files panel copies, moves and deletes; then `all`, which marks
+/// every row under the filter, and `clear`, which empties it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkVerb {
     Archive,
+    Copy,
+    Move,
     Delete,
     All,
     Clear,
 }
 
-/// The bar's order, left to right.
+/// Every verb a bar can wear — the order the buttons take, and what the
+/// rules are held against. A list wears the ones [`mark_verbs`] gives it.
 pub const MARK_VERBS: &[MarkVerb] = &[
     MarkVerb::Archive,
+    MarkVerb::Copy,
+    MarkVerb::Move,
     MarkVerb::Delete,
     MarkVerb::All,
     MarkVerb::Clear,
 ];
+
+/// The bar a list's marks raise, left to right: the row's own verbs on the
+/// set, then `all` and `clear`. A batch verb is the single verb on a wider
+/// set, so it wears the same letter — which is why the borrowed chords
+/// stand down while the bar is up, and why a files panel's own object
+/// verbs do (see [`head_btns_of`]).
+#[must_use]
+pub fn mark_verbs(kind: &Kind) -> &'static [MarkVerb] {
+    match kind {
+        Kind::Inbox { .. } => &[
+            MarkVerb::Archive,
+            MarkVerb::Delete,
+            MarkVerb::All,
+            MarkVerb::Clear,
+        ],
+        Kind::Files { .. } => &[
+            MarkVerb::Copy,
+            MarkVerb::Move,
+            MarkVerb::Delete,
+            MarkVerb::All,
+            MarkVerb::Clear,
+        ],
+        _ => &[],
+    }
+}
 
 impl MarkVerb {
     /// The button's text.
@@ -230,6 +267,8 @@ impl MarkVerb {
     pub fn label(self) -> &'static str {
         match self {
             MarkVerb::Archive => "archive",
+            MarkVerb::Copy => "copy",
+            MarkVerb::Move => "move",
             MarkVerb::Delete => "delete",
             MarkVerb::All => "all",
             MarkVerb::Clear => "clear",
@@ -237,30 +276,35 @@ impl MarkVerb {
     }
 
     /// The key it wears: the letter the single-row verb wears, so a batch
-    /// is nothing new to learn. `clear` wears none — `esc` is its key, and
-    /// esc cannot be drawn into a label.
+    /// is nothing new to learn (`copy` is `p`, not `c`, for the reason a
+    /// files panel's own is — see [`btn_accel`]). `clear` wears none —
+    /// `esc` is its key, and esc cannot be drawn into a label.
     #[must_use]
     pub fn accel(self) -> Option<char> {
         match self {
             MarkVerb::Archive => Some('a'),
+            MarkVerb::Copy => Some('p'),
+            MarkVerb::Move => Some('m'),
             MarkVerb::Delete => Some('d'),
             MarkVerb::All => Some('l'),
             MarkVerb::Clear => None,
         }
     }
 
-    /// The verb a chord fires, while the bar is up.
+    /// The verb a chord fires among the ones this bar wears.
     #[must_use]
-    pub fn from_accel(c: char) -> Option<MarkVerb> {
-        MARK_VERBS.iter().copied().find(|v| v.accel() == Some(c))
+    pub fn from_accel(verbs: &[MarkVerb], c: char) -> Option<MarkVerb> {
+        verbs.iter().copied().find(|v| v.accel() == Some(c))
     }
 
-    /// What the harness addresses the button by — apart from the message
-    /// panel's own `archive`, one column over.
+    /// What the harness addresses the button by — apart from the panel's
+    /// own verb of the same name, one column over.
     #[must_use]
     pub fn hit_label(self) -> &'static str {
         match self {
             MarkVerb::Archive => "archive marked",
+            MarkVerb::Copy => "copy marked",
+            MarkVerb::Move => "move marked",
             MarkVerb::Delete => "delete marked",
             MarkVerb::All => "mark all",
             MarkVerb::Clear => "clear marks",
@@ -297,7 +341,9 @@ pub fn preview_kind(kind: &Kind) -> Option<Kind> {
 /// one piece of state the table depends on: a list with marked rows wears
 /// its bar's verbs too (CR-009), and its borrowed chords stand down.
 pub fn accels(kind: &Kind, marks: bool) -> Vec<(char, &'static str)> {
-    let mut v: Vec<(char, &'static str)> = head_btns(kind)
+    // As an object — the state that wears the most — and with the marks
+    // standing its object verbs down where they do.
+    let mut v: Vec<(char, &'static str)> = head_btns_of(kind, None, true, marks)
         .iter()
         .filter_map(|(label, act)| btn_accel(*act).map(|c| (c, *label)))
         .collect();
@@ -309,8 +355,8 @@ pub fn accels(kind: &Kind, marks: bool) -> Vec<(char, &'static str)> {
         v.push((ACCEL_ADD_ACCOUNT, "add account"));
         v.push((ACCEL_DEVICE_SYNC, "device sync"));
     }
-    if marks && matches!(kind, Kind::Inbox { .. }) {
-        for verb in MARK_VERBS {
+    if marks {
+        for verb in mark_verbs(kind) {
             if let Some(c) = verb.accel() {
                 v.push((c, verb.label()));
             }
@@ -455,7 +501,7 @@ mod tests {
     fn the_held_button_collides_with_nothing() {
         for op in [crate::files::HoldOp::Copy, crate::files::HoldOp::Move] {
             let k = Kind::Files { dir: "~".into() };
-            let btns = head_btns_of(&k, Some(op), true);
+            let btns = head_btns_of(&k, Some(op), true, false);
             assert_eq!(btns.len(), head_btns(&k).len() + 1);
             let mut seen = Vec::new();
             for (label, act) in &btns {
@@ -467,7 +513,12 @@ mod tests {
             }
             // A card never grows the button: it is not a destination.
             let card = Kind::File { path: "~/a".into() };
-            assert_eq!(head_btns_of(&card, Some(op), true).len(), head_btns(&card).len());
+            assert_eq!(head_btns_of(&card, Some(op), true, false).len(), head_btns(&card).len());
+            // Marked rows stand the object verbs down, but never the
+            // destination: `… here` is what a hold is for.
+            let marked = head_btns_of(&k, Some(op), true, true);
+            let labels: Vec<&str> = marked.iter().map(|(l, _)| *l).collect();
+            assert_eq!(labels, ["new dir", "go to", op.here_label()]);
         }
     }
 
@@ -560,18 +611,22 @@ mod tests {
 
     /// A files panel wears the object verbs only at the end of a chain —
     /// under a parent's cursor, driving nothing; a root, or a list that
-    /// is driving, wears `new dir` alone (CR-008).
+    /// is driving, wears `new dir` alone (CR-008). Marked rows take them
+    /// too: the verb meant is then the set's (CR-009).
     #[test]
     fn a_files_panel_wears_its_object_verbs_only_at_the_end_of_a_chain() {
         let k = Kind::Files { dir: "~".into() };
-        let root: Vec<&str> = head_btns_of(&k, None, false).iter().map(|(l, _)| *l).collect();
-        assert_eq!(root, ["new dir", "go to"]);
-        let joined: Vec<&str> = head_btns_of(&k, None, true).iter().map(|(l, _)| *l).collect();
-        assert_eq!(joined, ["new dir", "go to", "copy", "move", "delete"]);
-        let held = head_btns_of(&k, Some(crate::files::HoldOp::Move), false);
+        let worn = |object, marked| -> Vec<&'static str> {
+            head_btns_of(&k, None, object, marked).iter().map(|(l, _)| *l).collect()
+        };
+        assert_eq!(worn(false, false), ["new dir", "go to"]);
+        assert_eq!(worn(true, false), ["new dir", "go to", "copy", "move", "delete"]);
+        assert_eq!(worn(true, true), ["new dir", "go to"], "the marks have them");
+        assert_eq!(worn(false, true), ["new dir", "go to"]);
+        let held = head_btns_of(&k, Some(crate::files::HoldOp::Move), false, false);
         assert_eq!(held.last().map(|(l, _)| *l), Some("move here"));
         let card = Kind::File { path: "~/a".into() };
-        assert_eq!(head_btns_of(&card, None, false).len(), head_btns(&card).len());
+        assert_eq!(head_btns_of(&card, None, false, false).len(), head_btns(&card).len());
     }
 
     #[test]
@@ -626,23 +681,49 @@ mod tests {
         }
     }
 
-    /// The marks bar's verbs (CR-009): a list with marks wears `a`, `d` and
-    /// `l` — the first two the very letters its preview lends it, which is
-    /// the point (a batch is the row's verb on a set) and the reason the
-    /// borrowed chords stand down while the bar is up. Nothing else on the
-    /// list collides with them.
+    /// Every verb a bar wears is one of the ones the rules above cover,
+    /// and no bar wears one twice.
+    #[test]
+    fn a_bar_wears_verbs_the_table_knows() {
+        for k in every_kind() {
+            let verbs = mark_verbs(&k);
+            let list = matches!(k, Kind::Inbox { .. } | Kind::Files { .. });
+            assert_eq!(!verbs.is_empty(), list, "{k:?}: only a list has a bar");
+            let mut seen = Vec::new();
+            for v in verbs {
+                assert!(MARK_VERBS.contains(v), "{v:?} is not in the table");
+                assert!(!seen.contains(v), "{k:?}'s bar wears {v:?} twice");
+                seen.push(*v);
+            }
+            if list {
+                assert_eq!(
+                    &verbs[verbs.len() - 2..],
+                    [MarkVerb::All, MarkVerb::Clear],
+                    "all and clear close every bar"
+                );
+            }
+        }
+    }
+
+    /// The marks bar's verbs (CR-009): a list with marks wears the letters
+    /// its own rows' verbs wear — the inbox `a`, `d`, `l`, a files panel
+    /// `p`, `m`, `d`, `l` — which is the point (a batch is the row's verb
+    /// on a set) and the reason the chords it borrows, or wears on its own
+    /// object, stand down while the bar is up. Nothing else on the list
+    /// collides with them.
     #[test]
     fn a_marked_list_takes_its_verbs_and_the_preview_stands_down() {
         let inbox = Kind::Inbox { filter: None };
         let bare = accels(&inbox, false);
         let marked = accels(&inbox, true);
         assert!(bare.iter().all(|(c, _)| !"adl".contains(*c)));
-        for verb in MARK_VERBS {
+        for verb in mark_verbs(&inbox) {
             let Some(c) = verb.accel() else { continue };
             assert!(marked.contains(&(c, verb.label())), "the bar wears {c}");
-            assert!(MarkVerb::from_accel(c) == Some(*verb));
+            assert!(MarkVerb::from_accel(mark_verbs(&inbox), c) == Some(*verb));
         }
-        assert_eq!(MarkVerb::from_accel('z'), None);
+        assert_eq!(MarkVerb::from_accel(mark_verbs(&inbox), 'z'), None);
+        assert_eq!(MarkVerb::from_accel(mark_verbs(&inbox), 'p'), None, "no copy on a mail list");
         // The bar's `a` is a text chord on a kind with a field. Like the
         // borrowed `a` it stands down while the filter holds the keyboard
         // (the shell's guard), so select-all in a live filter never
@@ -657,9 +738,25 @@ mod tests {
             let shared = lent.iter().any(|(l, _)| l == c);
             assert!(shared || *c == 'l' || *c == 's', "cmd+{c} is neither lent nor the bar's own");
         }
+        // A files panel's are its own object verbs, one column over: the
+        // set takes p, m and d, and the header hands them over rather than
+        // answering to the same chord twice.
+        let files = Kind::Files { dir: "~".into() };
+        let object = accels(&files, false);
+        let marked = accels(&files, true);
+        for verb in mark_verbs(&files) {
+            let Some(c) = verb.accel() else { continue };
+            assert!(marked.contains(&(c, verb.label())), "the bar wears {c}");
+            assert!(MarkVerb::from_accel(mark_verbs(&files), c) == Some(*verb));
+        }
+        for (c, _) in &marked {
+            let own = object.iter().any(|(o, _)| o == c);
+            assert!(own || *c == 'l', "cmd+{c} is neither the panel's own nor the bar's");
+        }
+        assert!(marked.iter().all(|(c, _)| !TEXT_CHORDS.contains(c)));
         // Only a list has marks: the flag changes nothing else.
         for k in every_kind() {
-            if !matches!(k, Kind::Inbox { .. }) {
+            if !matches!(k, Kind::Inbox { .. } | Kind::Files { .. }) {
                 assert_eq!(accels(&k, true), accels(&k, false));
             }
         }

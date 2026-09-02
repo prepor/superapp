@@ -14,8 +14,10 @@ know what it does; nothing may reuse a signal to mean something else.
 Nothing draws a dotted link at the moment: the message panel's newer/older
 walk was the last one, and the inbox cursor does that job now (see
 [Preview](#preview-the-one-open-that-does-not-go)). A list's
-[marks bar](./richtable.md#marks) is bordered buttons throughout: `archive`,
-`delete`, `all` and `clear` act on the marked set and go nowhere.
+[marks bar](./richtable.md#marks) is bordered buttons throughout: the
+list's own row verbs on the marked set — `archive` and `delete` in the
+inbox, `copy`, `move` and `delete` in a files panel — then `all` and
+`clear`. All of them act and go nowhere.
 
 **Cmd+click** (or cmd+enter in a list) always opens a fresh, **un-joined**
 panel — the workspace modifier means "workspace-level" with the mouse too
@@ -206,6 +208,20 @@ separator is refused on the status line. Note `copy` wears `p`, not `c`: a
 card's path is selectable, so rule 3 leaves `cmd+c` to the text. The file
 clipboard is not the text clipboard.
 
+**A directory's rows can be marked**, exactly as the inbox's are (see
+[The Rich Table](./richtable.md#marks)): `space` marks the row under the
+cursor, `shift+↓` / `shift+↑` mark a range, `esc` clears, the pointer
+never marks and a long press does. A files panel's marks are its
+**entries, by name**, so they belong to the directory it lists and go when
+it lands on another one. The bar at its foot carries the row's own verbs
+on the set — `copy` (`cmd+p`), `move` (`cmd+m`), `delete` (`cmd+d`) —
+then `all` and `clear`; and **while any row is marked the panel's own
+object verbs stand down**, back to `new dir` and `go to`, because with
+rows marked the verb meant is the set's. A hold is a set too: `copy` or
+`move` on marked rows holds every marked path, and `copy here` performs
+them all into the directory a panel shows, refusing per path exactly as it
+does for one. Drafts still, and the toast says so.
+
 
 ## Keyboard
 
@@ -310,11 +326,14 @@ the list yields the text chords to its field exactly as before, and only
 lends them when the field is not listening.
 
 They stand down for the [marks bar](./richtable.md#marks) too. While a list
-has marked rows the bar wears `a`, `d` and `l` itself — a batch verb is the
-same verb on a wider set, so it takes the same letter — and the borrowed
-chords go quiet, because two visible controls may not answer to one chord.
-The guard is the filter's: with the field holding the keyboard `cmd+a` is
-select-all, not an archive of the set.
+has marked rows the bar wears its rows' own letters itself — `a`, `d` and
+`l` in the inbox; `p`, `m`, `d` and `l` in a files panel — because a batch
+verb is the same verb on a wider set. Whatever the bar wears goes quiet
+elsewhere: the borrowed chords in the inbox, and a files panel's own object
+verbs, which fall back to `new dir` and `go to` while any row is marked.
+Two visible controls may not answer to one chord. The guard is the
+filter's: with the field holding the keyboard `cmd+a` is select-all, not an
+archive of the set.
 
 ## Workspaces
 
@@ -458,11 +477,11 @@ The same grammar, re-based on fingers:
   one gap in from the right) and springs there. **Vertical, downward, raises
   the workspaces overlay** (upward dismisses it), then the gesture goes
   inert.
-- **long-press a mail row** — marks it: the phone's way into a batch (a
-  header's long press picks the panel up; a row's was free). While any mark
-  exists a tap **toggles** rather than opens, and the last mark cleared
-  gives the tap back. The bar's controls are buttons, so nothing about
-  marks is keyboard-only.
+- **long-press a list row** — marks it, in the inbox or a files panel: the
+  phone's way into a batch (a header's long press picks the panel up; a
+  row's was free). While any mark exists a tap **toggles** rather than
+  opens, and the last mark cleared gives the tap back. The bar's controls
+  are buttons, so nothing about marks is keyboard-only.
 - **long-press a panel header** — picks the panel up; it rides the finger
   (spring-following, so it trails with the same physics as everything else).
   While held, an **ink insertion bar previews the drop**, judged by the

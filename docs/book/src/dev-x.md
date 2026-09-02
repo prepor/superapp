@@ -134,7 +134,11 @@ one comfortably past the script's own waits — the run ends at `quit`, not at N
 An e2e run replays a line-based script against the shell's real input paths
 — hit resolution, key handling, text input. Every run opens a **fresh
 seeded temp store** (unless `--db` overrides it), so suites never touch your
-session.
+session. The one thing a store cannot seed is the **disk**: `--demo-disk`
+gives the file browser the demo tree the [panels library](#panels-library)
+shows instead of this machine’s own, so a files suite can address a row by
+name. Nothing else changes — the network, the keychain and the screenshots
+are the ones a run always had.
 
 Runs go through makepad's **headless backend** (`MAKEPAD=headless`), a
 software rasterizer with a virtual GPU and a shader JIT. There is no window,
@@ -223,7 +227,12 @@ grammar, the error line, and a keyboard walk onto the second page), and
 pick by enter, a pick by click, esc putting the offer away, tab walking on),
 `e2e/marks.txt` the marks (space, a shift+arrow range, `all`, a
 mark the filter hides, cmd+a still select-all in a live field, and a batch
-archive undone back to marked), and `e2e/problems.txt` (with `--send-delay 1
+archive undone back to marked), `e2e/files-marks.txt` (with `--demo-disk`)
+the same marks over a directory — the object verbs a joined files panel
+wears, then the bar taking them while rows are marked, a dot-file marked
+under `@hidden` and still drawn above the rows once the filter leaves it
+out, `⌘p` holding the whole set and `copy here` performing it, and a
+`move here` refusing it path by path — and `e2e/problems.txt` (with `--send-delay 1
 --draws 100000` — it waits out the executor's backoff in virtual time) the
 problems surface: a send the demo account cannot make raises the mark, the
 mark opens the panel, *retry* files it again, *reopen* brings the draft back

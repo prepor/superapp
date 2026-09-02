@@ -444,11 +444,55 @@ impl HoldOp {
     }
 }
 
-/// The one held item, process-wide: context, not history.
+/// What is held, process-wide: context, not history. A **set** of paths
+/// (CR-009): a panel's own `copy`/`move` holds the one thing it shows, a
+/// marked list holds every marked row, and a `… here` performs the set —
+/// refusing per path exactly as it does for one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hold {
     pub op: HoldOp,
-    pub path: String,
+    pub paths: Vec<String>,
+}
+
+impl Hold {
+    /// One object held: what a panel's own verb holds.
+    #[must_use]
+    pub fn one(op: HoldOp, path: impl Into<String>) -> Hold {
+        Hold {
+            op,
+            paths: vec![path.into()],
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// What a toast calls it: the name where one thing is held, the count
+    /// where a set is.
+    #[must_use]
+    pub fn what(&self) -> String {
+        match self.paths.as_slice() {
+            [one] => format!("“{}”", basename(one)),
+            many => plural(many.len()),
+        }
+    }
+}
+
+/// `1 file`, `3 files` — what a set of paths is called.
+#[must_use]
+pub fn plural(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
+    }
 }
 
 // -- the demo tree -----------------------------------------------------------
@@ -845,6 +889,28 @@ impl Datasource for DirSource {
         row.name.clone()
     }
 
+    /// Every name the filter shows, in the table's order — what `all`
+    /// marks (CR-009). The listing is in memory, so this is the order
+    /// itself, read once.
+    fn keys(&self, _store: &Store, ast: Option<&Ast>) -> Option<Vec<String>> {
+        Some(self.filtered(ast).into_iter().map(|e| e.name).collect())
+    }
+
+    /// Which of these names the filter still shows; the rest are the marks
+    /// it hides. The caller's order is kept.
+    fn present(&self, _store: &Store, ast: Option<&Ast>, keys: &[String]) -> Vec<String> {
+        let shown: std::collections::BTreeSet<String> =
+            self.filtered(ast).into_iter().map(|e| e.name).collect();
+        keys.iter().filter(|k| shown.contains(*k)).cloned().collect()
+    }
+
+    /// The entry by name, filter or no filter: a directory's own listing
+    /// is its base condition, and a dot-file the filter hid is hidden,
+    /// not gone.
+    fn by_key(&self, _store: &Store, key: &String) -> Option<Entry> {
+        self.entries.iter().find(|e| &e.name == key).cloned()
+    }
+
     fn count(&self, _store: &Store, ast: Option<&Ast>) -> Option<usize> {
         Some(self.filtered(ast).len())
     }
@@ -923,6 +989,46 @@ mod tests {
         assert_eq!(names(&page), ["report-q3.pdf"]);
         let row = page[0].clone();
         assert_eq!(src.index_of(&store, None, &row), Some(4));
+    }
+
+    /// The three questions a mark asks (CR-009), answered off the listing
+    /// the source already holds: every name under the filter, which of
+    /// these it still shows, and the entry by name whatever the filter —
+    /// a directory's own listing is its base `WHERE`, so a dot-file the
+    /// filter hides is hidden, not gone.
+    #[test]
+    fn a_listing_answers_the_marks_three_questions() {
+        let store = Store::open(None).unwrap();
+        let src = downloads();
+        let keys = |q: &str| src.keys(&store, filter::parse(q).ast.as_ref()).unwrap();
+        assert_eq!(
+            keys(""),
+            [
+                "2026",
+                "budget-2026.xlsx",
+                "logs.tar.gz",
+                "README.txt",
+                "report-q3.pdf",
+                "screenshot-2026-08-30.png",
+                "superapp-0.1.0.dmg",
+            ],
+            "the filtered names, in the table's order"
+        );
+        assert_eq!(keys("@hidden")[1], ".DS_Store");
+        assert_eq!(keys("@dir"), ["2026"]);
+        // A set marked under `@hidden`, then read back without it: the
+        // dot-file is the one the filter hides.
+        let marked = vec!["2026".to_string(), ".DS_Store".to_string()];
+        let hidden = filter::parse("@hidden").ast;
+        assert_eq!(src.present(&store, hidden.as_ref(), &marked), marked);
+        assert_eq!(src.present(&store, None, &marked), ["2026"]);
+        let none: [String; 0] = [];
+        assert_eq!(src.present(&store, filter::parse("q3").ast.as_ref(), &marked), none);
+        // …and it is still an entry: the row a hidden mark draws.
+        let dot = src.by_key(&store, &".DS_Store".to_string());
+        assert_eq!(dot.map(|e| e.size), Some(6 * demo::KB));
+        assert_eq!(src.by_key(&store, &"2026".to_string()).map(|e| e.is_dir), Some(true));
+        assert_eq!(src.by_key(&store, &"gone.txt".to_string()), None, "a mark whose entry left");
     }
 
     /// What does not bind is dropped, as the SQL builder drops it — under

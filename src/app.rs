@@ -91,6 +91,11 @@ struct Config {
     /// The headless backend's `--no-draw`: the widget pass runs, nothing is
     /// rasterized. Read here so a `shot` knows there is nothing to keep.
     no_draw: bool,
+    /// `--demo-disk`: the file browser reads the demo tree instead of this
+    /// machine's disk. What `~` holds is the one thing about a run that is
+    /// not the same everywhere, so a files suite asks for the fixture the
+    /// panels library shows and can then address a row by name.
+    demo_disk: bool,
 }
 
 /// Whether this run rasterizes nothing (`--no-draw`).
@@ -160,8 +165,10 @@ pub type Opener = Box<dyn FnOnce(&Store) -> Kind>;
 /// Which [`crate::effect::Outside`] a booting stage gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootOutside {
-    /// The network, the keychain (or memory), the clipboard, the screen.
-    Real,
+    /// The network, the keychain (or memory), the clipboard, the screen —
+    /// and, unless a run asked for the demo tree (`--demo-disk`), this
+    /// machine's own disk.
+    Real { demo_disk: bool },
     /// Every verb fails, loudly; the clock still runs.
     Deny,
     /// The in-memory mail world.
@@ -194,7 +201,9 @@ impl Boot {
             grid: config().grid,
             send_delay: config().send_delay,
             virtual_time: cfg!(headless),
-            outside: BootOutside::Real,
+            outside: BootOutside::Real {
+                demo_disk: config().demo_disk,
+            },
             secrets_in_memory: config().e2e.is_some(),
             steps,
             primary: true,
@@ -224,6 +233,7 @@ fn config() -> &'static Config {
                 // The headless backend's own flags: read (and, for the
                 // budget, skipped) here so they are not reported as unknown.
                 "--no-draw" => c.no_draw = true,
+                "--demo-disk" => c.demo_disk = true,
                 "--draws" => {
                     args.next();
                 }
@@ -624,12 +634,21 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
-    /// Toggle a thread's mark (CR-009). Touch only: a long press raises it,
+    /// Toggle a row's mark (CR-009). Touch only: a long press raises it,
     /// and a tap while any mark stands. The bar in the row's inset is an
     /// indicator, not a control.
-    Mark(i64),
+    Mark(MarkRow),
     /// A button of the marks bar.
     MarkVerb(ui::MarkVerb),
+}
+
+/// What identifies the row a mark is on, per list (CR-009) — the way
+/// [`WidgetOp::OpenRow`] carries the kind its row names: the inbox's
+/// thread anchor, a files panel's entry name.
+#[derive(Debug, Clone, PartialEq)]
+enum MarkRow {
+    Thread(i64),
+    Entry(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1217,7 +1236,10 @@ impl State {
             crate::effect::Clock::System
         };
         let outside: Box<dyn crate::effect::Outside> = match boot.outside {
-            BootOutside::Real => Box::new(crate::effect::Real::new(secrets.clone(), clock.clone())),
+            BootOutside::Real { demo_disk } => {
+                let real = crate::effect::Real::new(secrets.clone(), clock.clone());
+                Box::new(if demo_disk { real.with_demo_disk() } else { real })
+            }
             BootOutside::Deny => Box::new(crate::effect::Deny::with_clock(clock.clone())),
             BootOutside::Fake => Box::new(crate::effect::Fake {
                 clock: epoch,
@@ -1648,16 +1670,17 @@ impl State {
 
     /// The header buttons a panel wears right now (CR-008): its kind's,
     /// the held item's, and — for a files panel — the object verbs only
-    /// while it is the end of a join chain: joined under a parent and
-    /// driving nothing, which is to say the thing under someone's cursor.
+    /// while it is the end of a join chain (joined under a parent and
+    /// driving nothing, which is to say the thing under someone's cursor)
+    /// and no row of it is marked (CR-009).
     /// One door for the width, the chords, the lender and the drawing.
-    fn wears(&self, pid: PanelId) -> Vec<(&'static str, BtnAct)> {
+    fn wears(&self, pid: PanelId, marked: bool) -> Vec<(&'static str, BtnAct)> {
         let Some(kind) = self.ws.panel(pid).map(|p| p.kind.clone()) else {
             return Vec::new();
         };
         let hold = self.hold.as_ref().map(|h| h.op);
         let object = self.ws.join_parent_of(pid).is_some() && self.ws.joined_child(pid).is_none();
-        ui::head_btns_of(&kind, hold, object)
+        ui::head_btns_of(&kind, hold, object, marked)
     }
 
     /// A panel's title, wherever it lives — for action labels.
@@ -3174,8 +3197,9 @@ impl Stage {
             // the shell's; links resolve inside the panel widget, which
             // owns them — so an unclaimed chord falls through to it rather
             // than dying here.
-            let accel = state.ws.focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
-                let act = state
+            let focus = state.ws.focus;
+            let accel = focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
+                let act = self
                     .wears(f)
                     .iter()
                     .find(|(_, a)| ui::btn_accel(*a) == Some(c))
@@ -3188,21 +3212,20 @@ impl Stage {
                 return;
             }
             // The marks bar's verbs (CR-009): while the focused list has
-            // marks it wears a, d and l itself, and the keys it borrows from
-            // its preview stand down (see `lender`).
-            let focus = self.state.as_deref().and_then(|s| s.ws.focus);
+            // marks it wears its rows' own verbs on the set, and the keys
+            // its chrome or its preview would answer to stand down (see
+            // `wears` and `lender`).
+            let kind = self
+                .state
+                .as_deref()
+                .and_then(|s| s.ws.panel(focus?).map(|p| p.kind.clone()));
             let marked = focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
-                // The same guard the borrowed chords have: with the filter
+                // The same guard the borrowed chords have: with a field
                 // holding the keyboard, cmd+a is select-all, not archive.
-                let has = self.hosted.get(&f).is_some_and(|w| {
-                    let p = w.as_inbox_panel();
-                    p.has_marks() && !p.filter_focused(cx)
-                });
-                if has {
-                    ui::MarkVerb::from_accel(c).map(|v| (f, v))
-                } else {
-                    None
+                if !self.marked(f) || self.field_focused(cx, f) {
+                    return None;
                 }
+                ui::MarkVerb::from_accel(ui::mark_verbs(kind.as_ref()?), c).map(|v| (f, v))
             });
             if let Some((f, verb)) = marked {
                 self.mark_verb(cx, f, verb);
@@ -3216,9 +3239,7 @@ impl Stage {
             // column over and in plain sight.
             if let Some(child) = self.lender(cx) {
                 let lent = key_char(k.key_code).and_then(|c| {
-                    self.state
-                        .as_deref()?
-                        .wears(child)
+                    self.wears(child)
                         .iter()
                         .find(|(_, a)| ui::btn_accel(*a) == Some(c))
                         .map(|(_, a)| *a)
@@ -3244,6 +3265,36 @@ impl Stage {
         }
     }
 
+    /// Whether the list this panel hosts has marked rows (CR-009): its bar
+    /// is up, so the verbs it wears there take the chords its own chrome —
+    /// or its preview — would otherwise answer to. Both list widgets are
+    /// asked: a ref of the wrong kind borrows nothing and says no.
+    fn marked(&self, pid: PanelId) -> bool {
+        self.hosted.get(&pid).is_some_and(|w| {
+            w.as_inbox_panel().has_marks() || w.as_files_panel().has_marks()
+        })
+    }
+
+    /// Whether one of this panel's own text fields holds the keyboard —
+    /// the third accelerator rule's guard, shared by the chords a list
+    /// borrows and the ones its marks bar wears: in a live field `cmd+a`
+    /// is select-all and nothing else.
+    fn field_focused(&self, cx: &mut Cx, pid: PanelId) -> bool {
+        self.hosted.get(&pid).is_some_and(|w| {
+            w.as_inbox_panel().filter_focused(cx) || w.as_files_panel().field_focused(cx)
+        })
+    }
+
+    /// What a panel wears now, its marks included — the shell's own door
+    /// to [`State::wears`], which knows the layout but not the widgets.
+    fn wears(&self, pid: PanelId) -> Vec<(&'static str, BtnAct)> {
+        let marked = self.marked(pid);
+        self.state
+            .as_deref()
+            .map(|s| s.wears(pid, marked))
+            .unwrap_or_default()
+    }
+
     /// The panel the focused one may borrow accelerators from: its live
     /// preview child, if it drives one.
     ///
@@ -3262,15 +3313,9 @@ impl Stage {
         if !state.ws.panels.contains_key(&child) {
             return None;
         }
-        let w = self.hosted.get(&f).cloned();
-        let editing = w.as_ref().is_some_and(|w| match kind {
-            Kind::Files { .. } => w.as_files_panel().field_focused(cx),
-            _ => w.as_inbox_panel().filter_focused(cx),
-        });
         // …and while the list has marks: its bar wears the very letters the
         // preview would lend, on the set (CR-009).
-        let marked = w.is_some_and(|w| w.as_inbox_panel().has_marks());
-        (!editing && !marked).then_some(child)
+        (!self.field_focused(cx, f) && !self.marked(f)).then_some(child)
     }
 
     /// Only the launcher trigger cares about key releases: a clean second
@@ -4016,7 +4061,7 @@ impl Stage {
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
-                    WidgetOp::Mark(th) => {
+                    WidgetOp::Mark(row) => {
                         // Touch's way in (CR-009): a long press marks, and
                         // while any mark stands a tap toggles rather than
                         // opens. Nothing on the pointer raises this — the
@@ -4025,9 +4070,7 @@ impl Stage {
                         if state.ws.focus != Some(pid) {
                             state.ws.focus = Some(pid);
                         }
-                        if let Some(w) = self.hosted.get(&pid) {
-                            w.as_inbox_panel().toggle_mark(cx, th);
-                        }
+                        self.toggle_mark(cx, pid, row);
                         self.kick(cx);
                     }
                     WidgetOp::MarkVerb(verb) => {
@@ -4319,16 +4362,17 @@ impl Stage {
                             } else {
                                 crate::files::HoldOp::Move
                             };
+                            let hold = crate::files::Hold::one(op, path);
                             state.toast(
                                 format!(
-                                    "{} “{}”: choose where, then {}",
+                                    "{} {}: choose where, then {}",
                                     op.verb(),
-                                    crate::files::basename(&path),
+                                    hold.what(),
                                     op.here_label()
                                 ),
                                 false,
                             );
-                            state.hold = Some(crate::files::Hold { op, path });
+                            state.hold = Some(hold);
                         }
                     }
                     BtnAct::Here => {
@@ -4337,48 +4381,86 @@ impl Stage {
                             _ => None,
                         };
                         if let (Some(hold), Some(dir)) = (state.hold.clone(), dir) {
-                            let name = crate::files::basename(&hold.path).to_string();
-                            let same_dir = crate::files::parent(&hold.path) == Some(dir.as_str());
-                            let into_itself = hold.path == dir || dir.starts_with(&format!("{}/", hold.path));
-                            // Clashes refuse — except a copy into its own
-                            // directory, which is the one case the
-                            // duplicate is the point.
-                            let refuse = if into_itself {
-                                Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
-                            } else if (same_dir && hold.op == crate::files::HoldOp::Move)
-                                || (!same_dir
-                                    && crate::files::stat_in(
-                                        &state.world,
-                                        &crate::files::join(&dir, &name),
-                                    )
-                                    .is_some())
-                            {
-                                // A move that goes nowhere, or a name the
-                                // destination already has: one sentence
-                                // covers both, so it is written once.
-                                Some(format!("“{name}” is already here"))
-                            } else {
-                                None
-                            };
-                            match refuse {
-                                Some(msg) => {
-                                    if let Some(w) = self.hosted.get(&pid) {
-                                        w.as_files_panel().set_status(cx, Some(msg.clone()));
-                                    }
-                                    state.toast(msg, true);
+                            // The set, path by path: what can be performed
+                            // and what each refusal was — a batch refuses
+                            // exactly as one does (CR-009).
+                            let mut done: Vec<String> = Vec::new();
+                            let mut refused: Vec<String> = Vec::new();
+                            for path in &hold.paths {
+                                let name = crate::files::basename(path).to_string();
+                                let same_dir = crate::files::parent(path) == Some(dir.as_str());
+                                let into_itself =
+                                    *path == dir || dir.starts_with(&format!("{path}/"));
+                                // Clashes refuse — except a copy into its
+                                // own directory, which is the one case the
+                                // duplicate is the point.
+                                let refuse = if into_itself {
+                                    Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
+                                } else if (same_dir && hold.op == crate::files::HoldOp::Move)
+                                    || (!same_dir
+                                        && crate::files::stat_in(
+                                            &state.world,
+                                            &crate::files::join(&dir, &name),
+                                        )
+                                        .is_some())
+                                {
+                                    // A move that goes nowhere, or a name
+                                    // the destination already has: one
+                                    // sentence covers both, so it is
+                                    // written once.
+                                    Some(format!("“{name}” is already here"))
+                                } else {
+                                    None
+                                };
+                                match refuse {
+                                    Some(msg) => refused.push(msg),
+                                    None => done.push(name),
                                 }
-                                None => {
-                                    state.toast(
-                                        format!(
-                                            "{} “{name}” into {} — draft: the disk is untouched",
-                                            hold.op.done(),
-                                            crate::files::basename(&dir)
-                                        ),
-                                        false,
-                                    );
-                                    if hold.op == crate::files::HoldOp::Move {
-                                        state.hold = None;
-                                    }
+                            }
+                            let here = crate::files::basename(&dir).to_string();
+                            if done.is_empty() {
+                                // Nothing could be done: the refusal is the
+                                // word, and the hold stands as it was.
+                                let msg = if refused.len() == 1 {
+                                    refused.remove(0)
+                                } else {
+                                    format!(
+                                        "nothing to {} into {here} — {} refused",
+                                        hold.op.verb(),
+                                        refused.len()
+                                    )
+                                };
+                                if let Some(w) = self.hosted.get(&pid) {
+                                    w.as_files_panel().set_status(cx, Some(msg.clone()));
+                                }
+                                state.toast(msg, true);
+                            } else {
+                                let what = if done.len() == 1 && refused.is_empty() {
+                                    format!("“{}”", done[0])
+                                } else if refused.is_empty() {
+                                    crate::files::plural(done.len())
+                                } else {
+                                    format!(
+                                        "{} of {}",
+                                        done.len(),
+                                        crate::files::plural(done.len() + refused.len())
+                                    )
+                                };
+                                let but = if refused.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" — {}", refused.join(", "))
+                                };
+                                state.toast(
+                                    format!(
+                                        "{} {what} into {here}{but} — draft: the disk is untouched",
+                                        hold.op.done()
+                                    ),
+                                    false,
+                                );
+                                // A move clears the hold; a copy keeps it.
+                                if hold.op == crate::files::HoldOp::Move {
+                                    state.hold = None;
                                 }
                             }
                         }
@@ -4677,25 +4759,92 @@ impl Stage {
         self.sync(cx);
     }
 
-    /// One of the marks bar's verbs (CR-009), from its button or its chord.
+    /// One of the marks bar's verbs (CR-009), from its button or its
+    /// chord. `all` and `clear` mean the same on any list; the rest are
+    /// the list's own row verbs, over its set.
     fn mark_verb(&mut self, cx: &mut Cx, pid: PanelId, verb: ui::MarkVerb) {
+        let kind = self
+            .state
+            .as_deref()
+            .and_then(|s| s.ws.panel(pid).map(|p| p.kind.clone()));
+        let files = matches!(kind, Some(Kind::Files { .. }));
         match verb {
             ui::MarkVerb::Archive => self.triage_marked(cx, pid, false),
+            ui::MarkVerb::Delete if files => self.delete_marked(cx, pid),
             ui::MarkVerb::Delete => self.triage_marked(cx, pid, true),
+            ui::MarkVerb::Copy => self.hold_marked(cx, pid, crate::files::HoldOp::Copy),
+            ui::MarkVerb::Move => self.hold_marked(cx, pid, crate::files::HoldOp::Move),
             ui::MarkVerb::All => {
                 let store = self.state.as_deref().map(|s| s.store.clone());
                 if let (Some(store), Some(w)) = (store, self.hosted.get(&pid).cloned()) {
-                    w.as_inbox_panel().mark_all(cx, &store);
+                    if files {
+                        w.as_files_panel().mark_all(cx, &store);
+                    } else {
+                        w.as_inbox_panel().mark_all(cx, &store);
+                    }
                 }
                 self.kick(cx);
             }
             ui::MarkVerb::Clear => {
                 if let Some(w) = self.hosted.get(&pid).cloned() {
                     w.as_inbox_panel().clear_marks(cx);
+                    w.as_files_panel().clear_marks(cx);
                 }
                 self.kick(cx);
             }
         }
+    }
+
+    /// `copy` / `move` on a files panel's marked set (CR-009): the hold is
+    /// a set of paths, and every files panel then offers `… here`. The
+    /// marks stand — nothing has been consumed, and the destination is
+    /// still to be walked to.
+    fn hold_marked(&mut self, cx: &mut Cx, pid: PanelId, op: crate::files::HoldOp) {
+        let Some(w) = self.hosted.get(&pid).cloned() else { return };
+        let panel = w.as_files_panel();
+        let (Some(dir), names) = (panel.dir(), panel.marks()) else { return };
+        if names.is_empty() {
+            return;
+        }
+        let hold = crate::files::Hold {
+            op,
+            paths: names.iter().map(|n| crate::files::join(&dir, n)).collect(),
+        };
+        if let Some(state) = self.state.as_deref_mut() {
+            state.toast(
+                format!(
+                    "{} {}: choose where, then {}",
+                    op.verb(),
+                    hold.what(),
+                    op.here_label()
+                ),
+                false,
+            );
+            state.hold = Some(hold);
+        }
+        self.kick(cx);
+    }
+
+    /// `delete` on a files panel's marked set — a draft like the single
+    /// row's, so the toast says the disk is untouched and the marks stay
+    /// exactly where they were.
+    fn delete_marked(&mut self, cx: &mut Cx, pid: PanelId) {
+        let Some(w) = self.hosted.get(&pid).cloned() else { return };
+        let names = w.as_files_panel().marks();
+        // The row's own wording where the set is one, as a batch archive
+        // has it.
+        let what = match names.as_slice() {
+            [] => return,
+            [one] => format!("“{one}”"),
+            many => crate::files::plural(many.len()),
+        };
+        if let Some(state) = self.state.as_deref_mut() {
+            state.toast(
+                format!("{what} to the trash — draft: nothing left the disk"),
+                false,
+            );
+        }
+        self.kick(cx);
     }
 
     /// The batch verb (CR-009): [`Stage::triage`] over a list's marked set.
@@ -5016,15 +5165,10 @@ impl Stage {
                         // While a list has marks, a tap on a row toggles its
                         // mark rather than opening it (CR-009); the last
                         // mark cleared gives the tap back.
-                        Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))
-                            if self
-                                .hosted
-                                .get(&pid)
-                                .is_some_and(|w| w.as_inbox_panel().has_marks()) =>
-                        {
-                            match self.state.as_deref().and_then(|s| mail::thread_of(&s.store, id)) {
-                                Some(th) => Act::WidgetOp(pid, WidgetOp::Mark(th)),
-                                None => Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id })),
+                        Act::WidgetOp(pid, WidgetOp::OpenRow(target)) if self.marked(pid) => {
+                            match self.mark_row(&target) {
+                                Some(row) => Act::WidgetOp(pid, WidgetOp::Mark(row)),
+                                None => Act::WidgetOp(pid, WidgetOp::OpenRow(target)),
                             }
                         }
                         a => a,
@@ -5130,6 +5274,35 @@ impl Stage {
             .map(|h| h.rect)
     }
 
+    /// Marks the row this panel has, or unmarks it: the one door touch
+    /// has (CR-009), whichever list the row belongs to.
+    fn toggle_mark(&self, cx: &mut Cx, pid: PanelId, row: MarkRow) {
+        let Some(w) = self.hosted.get(&pid) else { return };
+        match row {
+            MarkRow::Thread(th) => w.as_inbox_panel().toggle_mark(cx, th),
+            MarkRow::Entry(name) => w.as_files_panel().toggle_mark(cx, name),
+        }
+    }
+
+    /// What a mark on the row that opens `target` holds (CR-009): the
+    /// inbox's thread anchor, a files panel's entry name — the row's own
+    /// identity, read off the kind the row names.
+    fn mark_row(&self, target: &Kind) -> Option<MarkRow> {
+        match target {
+            Kind::Message { id } => {
+                let store = self.state.as_deref()?.store.clone();
+                mail::thread_of(&store, *id).map(MarkRow::Thread)
+            }
+            Kind::Files { dir } => {
+                Some(MarkRow::Entry(crate::files::basename(dir).to_string()))
+            }
+            Kind::File { path } => {
+                Some(MarkRow::Entry(crate::files::basename(path).to_string()))
+            }
+            _ => None,
+        }
+    }
+
     /// The platform's long-press (android's GestureDetector; e2e on desktop):
     /// on a panel header it picks the panel up.
     fn long_press(&mut self, cx: &mut Cx, uid: u64, p: DVec2) {
@@ -5141,15 +5314,11 @@ impl Stage {
         // A long press on a row marks it (CR-009): the pointer has no way
         // in, so this is the phone's. From then on taps toggle, until the
         // last mark is cleared.
-        if let Some(Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))) =
+        if let Some(Act::WidgetOp(pid, WidgetOp::OpenRow(target))) =
             self.hit_at(p).map(|h| h.act.clone())
         {
-            let th = self
-                .state
-                .as_deref()
-                .and_then(|s| mail::thread_of(&s.store, id));
-            if let (Some(th), Some(w)) = (th, self.hosted.get(&pid).cloned()) {
-                w.as_inbox_panel().toggle_mark(cx, th);
+            if let Some(row) = self.mark_row(&target) {
+                self.toggle_mark(cx, pid, row);
                 self.touch.mode = TouchMode::Idle;
                 self.kick(cx);
                 return;
@@ -7952,6 +8121,10 @@ impl Stage {
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
+                // The marks bar's verbs (CR-009), while the bar is up.
+                for (label, r, verb) in panel.verb_hits(cx) {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::MarkVerb(verb))));
+                }
             }
             Some(Kind::File { .. }) => {
                 // The selectable runs: the path, and a text preview.
@@ -8083,7 +8256,7 @@ impl Stage {
         // What this panel wears now (CR-008): its kind's buttons, the
         // object verbs if it is the end of a chain, the held item's
         // button if one is held.
-        let head_btns = state.wears(pid);
+        let head_btns = state.wears(pid, self.marked(pid));
         let btns_w = self.cell.head_btns_w(&head_btns);
         self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref(), btns_w);
 
@@ -8097,7 +8270,7 @@ impl Stage {
             .filter(|p| state.ws.panel(*p).is_some_and(|q| ui::preview_kind(&q.kind).is_some()))
             .map(|p| {
                 state
-                    .wears(p)
+                    .wears(p, self.marked(p))
                     .iter()
                     .filter_map(|(_, a)| ui::btn_accel(*a))
                     .collect()
