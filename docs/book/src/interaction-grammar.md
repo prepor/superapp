@@ -58,9 +58,12 @@ both on the conversation's newest mail. A **reply** answers it: TO and
 SUBJECT prefilled, the cursor in the body, and the send threads to it. A
 **forward** passes it on: the letter sits in the body under a header block
 (who wrote it, about what, when, to whom), SUBJECT is prefilled and TO is
-empty, so the cursor lands there. A forward carries no threading headers —
-whoever receives it was not in this conversation, so for them it starts
-one. **Each message is one row, open or closed.** Closed, the row is the
+empty, so the cursor lands there. A forward is not a reply — it names no
+parent — but it carries the conversation's chain, so it threads for anyone
+who already has it, your own Sent folder included. Once it has gone, the
+mail it passed on wears a muted `↪` by its date, in every client that
+reads the `$Forwarded` keyword. **Each message is one row, open or
+closed.** Closed, the row is the
 sender, the first line they wrote in grey (or the status line, red when it
 is an error) and the date.
 Open, the same row is the sender as a contact link and the date, with the

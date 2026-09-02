@@ -1017,6 +1017,13 @@ script_mod! {
             }
             spacer := View { visible: false, width: Fill, height: 1 }
             View { width: 10, height: 1 }
+            // Passed on: the mark every client draws for `$Forwarded`, by
+            // the date, muted like it.
+            fwd_lbl := mod.widgets.SLabel {
+                visible: false
+                padding: 0
+                width: Fit, text: "↪ ", draw_text +: { color: #909090 }
+            }
             date_lbl := mod.widgets.SLabel {
                 padding: 0
                 width: Fit, text: "", draw_text +: { color: #909090 }
@@ -2838,6 +2845,7 @@ impl ThreadMsgRef {
         pe.set_visible(cx, err);
         v.view(cx, ids!(preview_wrap)).set_visible(cx, !open);
         v.view(cx, ids!(spacer)).set_visible(cx, open);
+        v.label(cx, ids!(fwd_lbl)).set_visible(cx, m.forwarded);
         v.label(cx, ids!(date_lbl)).set_text(cx, &w.date);
 
         // The letter, while open. Both readings are written every time —

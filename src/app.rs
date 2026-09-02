@@ -3546,9 +3546,9 @@ impl Stage {
                         return;
                     }
                     BtnAct::Send => {
-                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { seed }) => seed.in_reply_to(),
-                            _ => None,
+                        let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { seed }) => seed,
+                            _ => Seed::Blank,
                         };
                         let d = self
                             .hosted
@@ -3573,7 +3573,7 @@ impl Stage {
                                     ws.close(pid);
                                 },
                                 move |tx| {
-                                    mail::upsert_draft_tx(tx, pid as i64, re, &d, now)?;
+                                    mail::upsert_draft_tx(tx, pid as i64, seed, &d, now)?;
                                     mail::file_send_tx(tx, pid as i64, now + delay)
                                 },
                                 vec![Box::new(mail::Sent { panel: pid as i64, delay }) as Box<dyn crate::history::Intent>],
@@ -3588,9 +3588,9 @@ impl Stage {
                         let label = format!("discard “{}”", state.title_of(pid));
                         // The text goes with the panel, so undo has to carry it.
                         let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
-                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { seed }) => seed.in_reply_to(),
-                            _ => None,
+                        let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { seed }) => seed,
+                            _ => Seed::Blank,
                         };
                         state.act(
                             "close",
@@ -3603,7 +3603,7 @@ impl Stage {
                             vec![Box::new(mail::Discarded {
                                 panel: pid as i64,
                                 draft,
-                                re,
+                                seed,
                             }) as Box<dyn crate::history::Intent>],
                         );
                     }
@@ -4484,14 +4484,14 @@ impl Stage {
                     let Some(state) = self.state.as_deref_mut() else {
                         continue;
                     };
-                    let re = match state.ws.panel(pid).map(|p| p.kind.clone()) {
-                        Some(Kind::Compose { seed }) => seed.in_reply_to(),
-                        _ => None,
+                    let seed = match state.ws.panel(pid).map(|p| p.kind.clone()) {
+                        Some(Kind::Compose { seed }) => seed,
+                        _ => Seed::Blank,
                     };
                     mail::save_draft(
                         &state.store,
                         pid as i64,
-                        re,
+                        seed,
                         &mail::Draft { to, subject, body },
                         state.world.now(),
                     );

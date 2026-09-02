@@ -55,14 +55,34 @@ pub enum Seed {
 }
 
 impl Seed {
-    /// The mail a send answers — what `In-Reply-To` and `References` name.
-    /// A forward names nothing: whoever receives it was not in the
-    /// conversation, so for them it starts one.
+    /// The mail a send answers — what `In-Reply-To` names. A forward is not
+    /// a reply: it carries the conversation's chain in `References` (see
+    /// [`Seed::source`]) but names no parent.
     #[must_use]
     pub fn in_reply_to(self) -> Option<MailId> {
         match self {
             Seed::Reply(id) => Some(id),
             Seed::Blank | Seed::Forward(_) => None,
+        }
+    }
+
+    /// The mail the draft is about, either way — what a reply answers or a
+    /// forward passes on. Its chain is what the send carries in
+    /// `References`, and its account is the one to send from.
+    #[must_use]
+    pub fn source(self) -> Option<MailId> {
+        match self {
+            Seed::Reply(id) | Seed::Forward(id) => Some(id),
+            Seed::Blank => None,
+        }
+    }
+
+    /// The mail a forward passes on — marked `$Forwarded` once it has gone.
+    #[must_use]
+    pub fn forwards(self) -> Option<MailId> {
+        match self {
+            Seed::Forward(id) => Some(id),
+            Seed::Blank | Seed::Reply(_) => None,
         }
     }
 }

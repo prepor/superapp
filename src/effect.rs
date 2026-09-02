@@ -62,7 +62,29 @@ pub struct FolderMeta {
 pub struct RemoteMail {
     pub uid: u32,
     pub unread: bool,
+    /// The `$Forwarded` keyword — set by this app or by another client.
+    pub forwarded: bool,
     pub raw: Vec<u8>,
+}
+
+/// Which of a folder's uids to list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UidSet {
+    All,
+    /// Without `\Seen`.
+    Unseen,
+    /// With the `$Forwarded` keyword.
+    Forwarded,
+}
+
+/// A per-message flag the app keeps on both sides of the desired/actual
+/// split, and pushes when they disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailFlag {
+    /// `\Seen`.
+    Seen,
+    /// `$Forwarded` — the keyword every client's forwarded arrow reads.
+    Forwarded,
 }
 
 /// A mail on its way out.
@@ -117,15 +139,15 @@ pub trait Outside {
     /// Messages with `uid >= from`, ascending.
     fn fetch(&mut self, account: i64, folder: &str, from: u32)
         -> Result<Vec<RemoteMail>, String>;
-    /// Every uid in the folder, or only the unseen ones.
-    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+    /// The uids in the folder: every one, or those with a flag.
+    fn uids(&mut self, account: i64, folder: &str, which: UidSet)
         -> Result<HashSet<u32>, String>;
     /// `UID MOVE`; the new uid when the server says (UIDPLUS' COPYUID),
     /// `None` otherwise — adoption by Message-ID covers that.
     fn move_uid(&mut self, account: i64, from: &str, to: &str, uid: u32)
         -> Result<Option<u32>, String>;
-    /// `UID STORE` the `\Seen` flag.
-    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+    /// `UID STORE` a flag on or off.
+    fn store_flag(&mut self, account: i64, folder: &str, uid: u32, flag: MailFlag, on: bool)
         -> Result<(), String>;
     /// `APPEND` raw bytes (filing sent mail).
     fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String>;
@@ -890,14 +912,16 @@ impl Outside for Deny {
     fn fetch(&mut self, _a: i64, _f: &str, _u: u32) -> Result<Vec<RemoteMail>, String> {
         Self::no("fetch")
     }
-    fn uids(&mut self, _a: i64, _f: &str, _n: bool) -> Result<HashSet<u32>, String> {
+    fn uids(&mut self, _a: i64, _f: &str, _w: UidSet) -> Result<HashSet<u32>, String> {
         Self::no("uids")
     }
     fn move_uid(&mut self, _a: i64, _f: &str, _t: &str, _u: u32) -> Result<Option<u32>, String> {
         Self::no("move")
     }
-    fn store_seen(&mut self, _a: i64, _f: &str, _u: u32, _s: bool) -> Result<(), String> {
-        Self::no("seen")
+    fn store_flag(&mut self, _a: i64, _f: &str, _u: u32, _fl: MailFlag, _on: bool)
+        -> Result<(), String>
+    {
+        Self::no("flag")
     }
     fn append(&mut self, _a: i64, _f: &str, _r: &[u8]) -> Result<(), String> {
         Self::no("append")
@@ -951,6 +975,7 @@ impl FakeServer {
         f.2.push(RemoteMail {
             uid,
             unread,
+            forwarded: false,
             raw: raw.as_bytes().to_vec(),
         });
         uid
@@ -973,6 +998,17 @@ impl FakeServer {
             for m in &mut f.2 {
                 if m.uid == uid {
                     m.unread = false;
+                }
+            }
+        }
+    }
+
+    /// Sets or clears `$Forwarded`, as another client would.
+    pub fn set_forwarded(&mut self, folder: &str, uid: u32, on: bool) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            for m in &mut f.2 {
+                if m.uid == uid {
+                    m.forwarded = on;
                 }
             }
         }
@@ -1081,13 +1117,17 @@ impl Outside for Fake {
         Ok(f.2.iter().filter(|m| m.uid >= from).cloned().collect())
     }
 
-    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+    fn uids(&mut self, account: i64, folder: &str, which: UidSet)
         -> Result<HashSet<u32>, String>
     {
         let f = self.live(account)?.get(folder)?;
         Ok(f.2
             .iter()
-            .filter(|m| !unread_only || m.unread)
+            .filter(|m| match which {
+                UidSet::All => true,
+                UidSet::Unseen => m.unread,
+                UidSet::Forwarded => m.forwarded,
+            })
             .map(|m| m.uid)
             .collect())
     }
@@ -1114,7 +1154,7 @@ impl Outside for Fake {
         Ok(s.copyuid.then_some(new))
     }
 
-    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+    fn store_flag(&mut self, account: i64, folder: &str, uid: u32, flag: MailFlag, on: bool)
         -> Result<(), String>
     {
         let s = self.live(account)?;
@@ -1124,7 +1164,10 @@ impl Outside for Fake {
             .ok_or_else(|| "no such folder".to_string())?;
         for m in &mut f.2 {
             if m.uid == uid {
-                m.unread = !seen;
+                match flag {
+                    MailFlag::Seen => m.unread = !on,
+                    MailFlag::Forwarded => m.forwarded = on,
+                }
             }
         }
         Ok(())
@@ -1141,6 +1184,7 @@ impl Outside for Fake {
         f.2.push(RemoteMail {
             uid,
             unread: false,
+            forwarded: false,
             raw: raw.to_vec(),
         });
         Ok(())
@@ -1153,10 +1197,26 @@ impl Outside for Fake {
         if self.secrets.get(&c.user).map(String::as_str) != Some(c.pass.as_str()) {
             return Err("authentication failed".into());
         }
-        let raw = format!(
-            "From: {}\r\nTo: {}\r\nSubject: {}\r\n\r\n{}",
-            c.user, m.to, m.subject, m.body
+        // The bytes the real transport would file to Sent, headers
+        // included, so a sent mail that syncs back threads as it would.
+        let n = self
+            .servers
+            .values()
+            .map(|s| s.submitted.len())
+            .sum::<usize>()
+            + 1;
+        let mut raw = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nMessage-ID: <sent-{n}@fake>\r\n",
+            c.user, m.to, m.subject
         );
+        if let Some(mid) = &m.in_reply_to {
+            raw += &format!("In-Reply-To: <{mid}>\r\n");
+        }
+        if !m.references.is_empty() {
+            let refs: Vec<String> = m.references.iter().map(|r| format!("<{r}>")).collect();
+            raw += &format!("References: {}\r\n", refs.join(" "));
+        }
+        raw += &format!("\r\n{}", m.body);
         // Whichever account owns this address; the first server otherwise.
         let acct = *self.servers.keys().next().unwrap_or(&1);
         self.server(acct).submitted.push(m.clone());
@@ -1190,6 +1250,40 @@ impl Outside for Fake {
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+/// The RFC 822 message a draft goes out as. `In-Reply-To` names the parent
+/// a reply answers; `References` carries whatever chain the draft has — a
+/// reply's parent and what it referenced, a forward's source and what *it*
+/// referenced — so both thread for anyone who already has the
+/// conversation. A forward names no parent: it is not a reply.
+pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
+    use lettre::message::header;
+    use lettre::Message;
+    let s = |e: &dyn std::fmt::Display| format!("{e}");
+    let bracket = |id: &str| {
+        format!(
+            "<{}>",
+            id.trim().trim_start_matches('<').trim_end_matches('>')
+        )
+    };
+    let mut b = Message::builder()
+        .from(from.parse().map_err(|e| s(&e))?)
+        .to(m.to.parse().map_err(|e| s(&e))?)
+        .subject(m.subject.clone());
+    if let Some(mid) = &m.in_reply_to {
+        b = b.header(header::InReplyTo::from(bracket(mid)));
+    }
+    let mut refs: Vec<String> = Vec::new();
+    for id in m.references.iter().map(|r| bracket(r)) {
+        if !refs.contains(&id) {
+            refs.push(id);
+        }
+    }
+    if !refs.is_empty() {
+        b = b.header(header::References::from(refs.join(" ")));
+    }
+    b.body(m.body.clone()).map_err(|e| s(&e))
 }
 
 // -- Real ----------------------------------------------------------------------
@@ -1343,10 +1437,10 @@ impl Outside for Real {
         self.session(account)?.fetch_from(folder, from)
     }
 
-    fn uids(&mut self, account: i64, folder: &str, unread_only: bool)
+    fn uids(&mut self, account: i64, folder: &str, which: UidSet)
         -> Result<HashSet<u32>, String>
     {
-        self.session(account)?.uids(folder, unread_only)
+        self.session(account)?.uids(folder, which)
     }
 
     fn move_uid(&mut self, account: i64, from: &str, to: &str, uid: u32)
@@ -1355,10 +1449,10 @@ impl Outside for Real {
         self.session(account)?.move_uid(from, to, uid)
     }
 
-    fn store_seen(&mut self, account: i64, folder: &str, uid: u32, seen: bool)
+    fn store_flag(&mut self, account: i64, folder: &str, uid: u32, flag: MailFlag, on: bool)
         -> Result<(), String>
     {
-        self.session(account)?.store_seen(folder, uid, seen)
+        self.session(account)?.store_flag(folder, uid, flag, on)
     }
 
     fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
@@ -1366,29 +1460,10 @@ impl Outside for Real {
     }
 
     fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
-        use lettre::message::header;
         use lettre::transport::smtp::authentication::Credentials;
-        use lettre::{Message, SmtpTransport, Transport};
+        use lettre::{SmtpTransport, Transport};
         let s = |e: &dyn std::fmt::Display| format!("{e}");
-        let mut b = Message::builder()
-            .from(c.user.parse().map_err(|e| s(&e))?)
-            .to(m.to.parse().map_err(|e| s(&e))?)
-            .subject(m.subject.clone());
-        if let Some(mid) = &m.in_reply_to {
-            let bracket = |id: &String| {
-                format!("<{}>", id.trim().trim_start_matches('<').trim_end_matches('>'))
-            };
-            let mut refs: Vec<String> = Vec::new();
-            for id in m.references.iter().chain(std::iter::once(mid)).map(bracket) {
-                if !refs.contains(&id) {
-                    refs.push(id);
-                }
-            }
-            b = b
-                .header(header::InReplyTo::from(bracket(mid)))
-                .header(header::References::from(refs.join(" ")));
-        }
-        let msg = b.body(m.body.clone()).map_err(|e| s(&e))?;
+        let msg = rfc822(&c.user, m)?;
         let raw = msg.formatted();
         let t = SmtpTransport::relay(&c.host)
             .map_err(|e| s(&e))?
@@ -1470,7 +1545,7 @@ impl Outside for Real {
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod imap_session {
-    use super::{FolderMeta, RemoteFolder, RemoteMail};
+    use super::{FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet};
     use std::collections::HashSet;
 
     type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
@@ -1483,6 +1558,10 @@ mod imap_session {
     fn s<E: std::fmt::Display>(e: E) -> String {
         format!("{e}")
     }
+
+    /// The IMAP keyword for "passed on" (registered in RFC 5788's list):
+    /// what Apple Mail, Thunderbird, Fastmail and Dovecot set and read.
+    const FORWARDED: &str = "$Forwarded";
 
     pub fn connect(host: &str, user: &str, pass: &str) -> Result<Imap, String> {
         let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
@@ -1549,9 +1628,13 @@ mod imap_session {
                         .flags()
                         .iter()
                         .any(|fl| matches!(fl, imap::types::Flag::Seen));
+                    let forwarded = f.flags().iter().any(|fl| {
+                        matches!(fl, imap::types::Flag::Custom(k) if k.eq_ignore_ascii_case(FORWARDED))
+                    });
                     Some(RemoteMail {
                         uid,
                         unread,
+                        forwarded,
                         raw: raw.to_vec(),
                     })
                 })
@@ -1560,11 +1643,14 @@ mod imap_session {
             Ok(out)
         }
 
-        pub fn uids(&mut self, name: &str, unread_only: bool) -> Result<HashSet<u32>, String> {
+        pub fn uids(&mut self, name: &str, which: UidSet) -> Result<HashSet<u32>, String> {
             self.ensure(name)?;
-            self.session
-                .uid_search(if unread_only { "UNSEEN" } else { "ALL" })
-                .map_err(s)
+            let query = match which {
+                UidSet::All => "ALL".to_string(),
+                UidSet::Unseen => "UNSEEN".to_string(),
+                UidSet::Forwarded => format!("KEYWORD {FORWARDED}"),
+            };
+            self.session.uid_search(query).map_err(s)
         }
 
         pub fn move_uid(&mut self, from: &str, to: &str, uid: u32)
@@ -1577,14 +1663,18 @@ mod imap_session {
             Ok(None)
         }
 
-        pub fn store_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String> {
+        pub fn store_flag(&mut self, folder: &str, uid: u32, flag: MailFlag, on: bool)
+            -> Result<(), String>
+        {
             self.ensure(folder)?;
-            let flags = if seen {
-                "+FLAGS (\\Seen)"
-            } else {
-                "-FLAGS (\\Seen)"
+            let name = match flag {
+                MailFlag::Seen => "\\Seen",
+                MailFlag::Forwarded => FORWARDED,
             };
-            self.session.uid_store(uid.to_string(), flags).map_err(s)?;
+            let sign = if on { '+' } else { '-' };
+            self.session
+                .uid_store(uid.to_string(), format!("{sign}FLAGS ({name})"))
+                .map_err(s)?;
             Ok(())
         }
 
@@ -1650,6 +1740,48 @@ mod tests {
         let mut reg = Registry::new();
         reg.register::<Poke>();
         World::fake(reg)
+    }
+
+    /// The threading headers a draft goes out with: a reply names its
+    /// parent and carries the chain; a forward carries the chain alone;
+    /// a blank mail carries nothing.
+    #[test]
+    fn threading_headers_follow_the_draft() {
+        let out =
+            |m: &Outgoing| String::from_utf8(rfc822("me@b.c", m).unwrap().formatted()).unwrap();
+        let reply = Outgoing {
+            to: "a@b.c".into(),
+            subject: "Re: x".into(),
+            body: "hi".into(),
+            in_reply_to: Some("p@b.c".into()),
+            references: vec!["r@b.c".into(), "p@b.c".into()],
+        };
+        let raw = out(&reply);
+        assert!(raw.contains("In-Reply-To: <p@b.c>\r\n"), "{raw}");
+        assert!(raw.contains("References: <r@b.c> <p@b.c>\r\n"), "{raw}");
+
+        let forward = Outgoing {
+            in_reply_to: None,
+            references: vec!["p@b.c".into()],
+            ..reply.clone()
+        };
+        let raw = out(&forward);
+        assert!(
+            !raw.contains("In-Reply-To"),
+            "a forward is not a reply: {raw}"
+        );
+        assert!(raw.contains("References: <p@b.c>\r\n"), "{raw}");
+
+        let blank = Outgoing {
+            in_reply_to: None,
+            references: Vec::new(),
+            ..reply
+        };
+        let raw = out(&blank);
+        assert!(
+            !raw.contains("In-Reply-To") && !raw.contains("References"),
+            "{raw}"
+        );
     }
 
     /// The row exists, `pending`, *before* anything is performed — and the

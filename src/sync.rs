@@ -11,7 +11,8 @@
 //! Two rules this module exists to obey (CR-004):
 //!
 //! - **The push pass does not talk to the server.** It materializes each
-//!   disagreement as a [`mail::Move`] or [`mail::Seen`] job and lets the
+//!   disagreement as a [`mail::Move`], [`mail::Seen`] or
+//!   [`mail::Forwarded`] job and lets the
 //!   executor perform it. Every job revalidates first, so a disagreement
 //!   that undo removes before the executor reaches it is never pushed at
 //!   all — undo still costs zero server traffic.
@@ -26,7 +27,7 @@ use std::time::Duration;
 
 use rusqlite::Transaction;
 
-use crate::effect::{Clock, Creds, RemoteMail, Secrets, World};
+use crate::effect::{Clock, Creds, RemoteMail, Secrets, UidSet, World};
 use crate::mail;
 
 /// How many most-recent messages a folder retains on first contact (and
@@ -82,8 +83,8 @@ pub fn connect(w: &World, account: i64) -> Result<(), String> {
 }
 
 /// The push pass: every message whose intent differs from the server —
-/// folder or read state — becomes a job, unless one is already in flight
-/// for it. No network here at all.
+/// folder, read state, or passed on — becomes a job, unless one is already
+/// in flight for it. No network here at all.
 ///
 /// # Errors
 ///
@@ -99,19 +100,24 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
         moving: bool,
         unread: bool,
         seen: bool,
+        /// Intent, then fact, for `$Forwarded`.
+        forwarded: bool,
+        has_forwarded: bool,
     }
     let rows: Vec<Row> = {
         let db = w.store().conn();
         let mut stmt = db
             .prepare(
                 "SELECT m.id, s.uid, m.folder, fw.name, fh.name,
-                        m.folder != s.folder, m.unread, s.seen
+                        m.folder != s.folder, m.unread, s.seen,
+                        m.forwarded, s.forwarded
                  FROM message m
                  JOIN server_msg s ON s.message = m.id
                  JOIN folder fw ON fw.id = m.folder
                  JOIN folder fh ON fh.id = s.folder
                  WHERE m.account = ?1 AND s.uid IS NOT NULL
-                   AND (m.folder != s.folder OR m.unread = s.seen)",
+                   AND (m.folder != s.folder OR m.unread = s.seen
+                        OR m.forwarded != s.forwarded)",
             )
             .map_err(err)?;
         let it = stmt
@@ -125,6 +131,8 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                     moving: r.get(5)?,
                     unread: r.get(6)?,
                     seen: r.get(7)?,
+                    forwarded: r.get(8)?,
+                    has_forwarded: r.get(9)?,
                 })
             })
             .map_err(err)?;
@@ -158,7 +166,9 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                 .map_err(err)?;
             // The flag push waits for the move to re-establish identity — a
             // uid in the old folder means nothing in the new one.
-        } else if p.unread == p.seen {
+            continue;
+        }
+        if p.unread == p.seen {
             let job = w
                 .prepare(&mail::Seen {
                     account,
@@ -171,6 +181,25 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
             w.store()
                 .write(move |tx| {
                     if !in_flight(tx, "seen", message)? {
+                        job.insert(tx)?;
+                    }
+                    Ok(())
+                })
+                .map_err(err)?;
+        }
+        if p.forwarded != p.has_forwarded {
+            let job = w
+                .prepare(&mail::Forwarded {
+                    account,
+                    message: p.message,
+                    folder: p.have_name.clone(),
+                    uid: p.uid,
+                    on: p.forwarded,
+                })
+                .map_err(err)?;
+            w.store()
+                .write(move |tx| {
+                    if !in_flight(tx, "forwarded", message)? {
                         job.insert(tx)?;
                     }
                     Ok(())
@@ -208,6 +237,7 @@ struct Gathered {
     mails: Vec<RemoteMail>,
     server: HashSet<u32>,
     unseen: HashSet<u32>,
+    forwarded: HashSet<u32>,
 }
 
 /// The fetch/reconcile pass: for each folder, gather over the network, then
@@ -274,16 +304,16 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
         } else {
             Vec::new()
         };
-        let server = w.run(&mail::Uids {
-            account,
-            folder: rf.name.clone(),
-            unread_only: false,
-        })?;
-        let unseen = w.run(&mail::Uids {
-            account,
-            folder: rf.name.clone(),
-            unread_only: true,
-        })?;
+        let search = |which: UidSet| {
+            w.run(&mail::Uids {
+                account,
+                folder: rf.name.clone(),
+                which,
+            })
+        };
+        let server = search(UidSet::All)?;
+        let unseen = search(UidSet::Unseen)?;
+        let forwarded = search(UidSet::Forwarded)?;
 
         // Commit. One transaction, no network.
         let g = Gathered {
@@ -294,6 +324,7 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
             mails,
             server,
             unseen,
+            forwarded,
         };
         w.store()
             .write(move |tx| land(tx, account, from, &g))
@@ -326,42 +357,68 @@ fn land(tx: &Transaction, account: i64, from: u32, g: &Gathered) -> rusqlite::Re
     // Reconcile facts over the retained window, by the *server's* view.
     // Divergent intent stays local truth: an unpushed read or archive is
     // never clobbered, only recorded.
-    let local: Vec<(i64, u32, bool, bool)> = {
+    struct Local {
+        id: i64,
+        uid: u32,
+        seen: bool,
+        unread: bool,
+        has_forwarded: bool,
+        forwarded: bool,
+    }
+    let local: Vec<Local> = {
         let mut stmt = tx.prepare(
-            "SELECT m.id, s.uid, s.seen, m.unread
+            "SELECT m.id, s.uid, s.seen, m.unread, s.forwarded, m.forwarded
              FROM server_msg s JOIN message m ON m.id = s.message
              WHERE s.folder = ?1 AND s.uid IS NOT NULL",
         )?;
         let rows = stmt.query_map([g.fid], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)? as u32,
-                r.get(2)?,
-                r.get(3)?,
-            ))
+            Ok(Local {
+                id: r.get(0)?,
+                uid: r.get::<_, i64>(1)? as u32,
+                seen: r.get(2)?,
+                unread: r.get(3)?,
+                has_forwarded: r.get(4)?,
+                forwarded: r.get(5)?,
+            })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, uid, seen, unread) in local {
-        if !g.server.contains(&uid) {
+    for l in local {
+        let id = l.id;
+        if !g.server.contains(&l.uid) {
             // Gone upstream (deleted, or moved beyond our mirror): deletion
             // wins, divergent intent included.
             tx.execute("DELETE FROM message WHERE id = ?1", [id])?;
             tx.execute("DELETE FROM server_msg WHERE message = ?1", [id])?;
             continue;
         }
-        let now_seen = !g.unseen.contains(&uid);
-        if now_seen != seen {
+        let now_seen = !g.unseen.contains(&l.uid);
+        if now_seen != l.seen {
             tx.execute(
                 "UPDATE server_msg SET seen = ?1 WHERE message = ?2",
                 rusqlite::params![now_seen, id],
             )?;
             // Clean rows (intent agrees with the old server state) follow
             // the server; divergent intent will be pushed over it instead.
-            if unread != seen {
+            if l.unread != l.seen {
                 tx.execute(
                     "UPDATE message SET unread = ?1 WHERE id = ?2",
                     rusqlite::params![!now_seen, id],
+                )?;
+            }
+        }
+        // `$Forwarded`, by the same rule: another client's mark (or its
+        // clearing) is followed unless this one disagrees unpushed.
+        let now_fwd = g.forwarded.contains(&l.uid);
+        if now_fwd != l.has_forwarded {
+            tx.execute(
+                "UPDATE server_msg SET forwarded = ?1 WHERE message = ?2",
+                rusqlite::params![now_fwd, id],
+            )?;
+            if l.forwarded == l.has_forwarded {
+                tx.execute(
+                    "UPDATE message SET forwarded = ?1 WHERE id = ?2",
+                    rusqlite::params![now_fwd, id],
                 )?;
             }
         }
@@ -401,16 +458,18 @@ fn ingest_message(
             .ok();
         if let Some(id) = orphan {
             tx.execute(
-                "UPDATE server_msg SET folder = ?1, uid = ?2, seen = ?3 WHERE message = ?4",
-                rusqlite::params![folder, m.uid, !m.unread, id],
+                "UPDATE server_msg SET folder = ?1, uid = ?2, seen = ?3, forwarded = ?4
+                 WHERE message = ?5",
+                rusqlite::params![folder, m.uid, !m.unread, m.forwarded, id],
             )?;
             return Ok(());
         }
     }
     tx.execute(
         "INSERT INTO message(account, folder, from_name, from_email,
-                             subject, date, unread, body, html, raw, message_id, topic)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                             subject, date, unread, body, html, raw, message_id, topic,
+                             forwarded)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         rusqlite::params![
             account,
             folder,
@@ -424,13 +483,14 @@ fn ingest_message(
             m.raw,
             p.message_id,
             p.topic,
+            m.forwarded,
         ],
     )?;
     let id = tx.last_insert_rowid();
     tx.execute(
-        "INSERT INTO server_msg(message, folder, uid, seen)
-         VALUES(?1, ?2, ?3, ?4)",
-        rusqlite::params![id, folder, m.uid, !m.unread],
+        "INSERT INTO server_msg(message, folder, uid, seen, forwarded)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![id, folder, m.uid, !m.unread, m.forwarded],
     )?;
     // Which conversation it belongs to (CR-007) — decided here, in the same
     // transaction, so no draw ever sees an unthreaded mail.
@@ -820,6 +880,7 @@ impl Pump {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Seed;
     use crate::effect::World;
 
     const RAW: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
@@ -1120,6 +1181,109 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         w.store().write(|c| mail::mark_read_tx(c, 1)).unwrap();
         settle(&w);
         assert!(!w.with_fake(|f| f.server(1).folders["Archive"].2[0].unread));
+    }
+
+    fn forwarded_of(w: &World, id: i64) -> bool {
+        w.store()
+            .conn()
+            .query_row("SELECT forwarded FROM message WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// `$Forwarded` rides the desired/actual split like the read flag: it
+    /// arrives with a fetch, a mark another client clears is followed
+    /// while nothing local disagrees, and a local mark pushes.
+    #[test]
+    fn the_forwarded_keyword_syncs_both_ways() {
+        let w = world();
+        let uid = w.with_fake(|f| {
+            let u = f.server(1).deliver("INBOX", false, RAW);
+            f.server(1).set_forwarded("INBOX", u, true);
+            u
+        });
+        settle(&w);
+        assert!(forwarded_of(&w, 1), "ingested with the mail");
+        assert!(deeds(&w).is_empty(), "a fact queues nothing");
+
+        w.with_fake(|f| f.server(1).set_forwarded("INBOX", uid, false));
+        settle(&w);
+        assert!(
+            !forwarded_of(&w, 1),
+            "another client's clearing is followed"
+        );
+
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE message SET forwarded = 1 WHERE id = 1", [])
+                    .map(|_| ())
+            })
+            .unwrap();
+        settle(&w);
+        assert!(
+            w.with_fake(|f| f.server(1).folders["INBOX"].2[0].forwarded),
+            "pushed"
+        );
+        assert!(deeds(&w).contains(&("forwarded".to_string(), "done".to_string())));
+        let before = w.jobs().len();
+        settle(&w);
+        assert_eq!(w.jobs().len(), before, "convergence is quiet");
+    }
+
+    /// A forward carries its source's chain in `References` and no
+    /// `In-Reply-To`, so its Sent copy folds into the conversation when it
+    /// syncs back; the mail it passed on is marked once the send has gone,
+    /// and the mark reaches the server as `$Forwarded` on the next push.
+    #[test]
+    fn a_sent_forward_threads_with_its_source_and_marks_it() {
+        let w = world();
+        w.with_fake(|f| {
+            f.server(1).folder("Sent", 5);
+            f.server(1).deliver("INBOX", false, RAW);
+        });
+        settle(&w);
+
+        let now = w.now();
+        let draft = mail::Draft {
+            to: "x@y".into(),
+            subject: "Fwd: Budget v2".into(),
+            body: "fyi".into(),
+        };
+        w.store()
+            .write(move |c| {
+                mail::upsert_draft_tx(c, 9, Seed::Forward(1), &draft, now)?;
+                mail::file_send_tx(c, 9, now)
+            })
+            .unwrap();
+        assert!(!forwarded_of(&w, 1), "not before it has gone");
+        settle(&w);
+
+        let sent = w.with_fake(|f| f.server(1).submitted.clone());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].in_reply_to, None, "a forward is not a reply");
+        assert_eq!(sent[0].references, vec!["budget-v2@kovac.io".to_string()]);
+
+        assert!(forwarded_of(&w, 1), "marked once sent");
+        assert!(
+            w.with_fake(|f| f.server(1).folders["INBOX"].2[0].forwarded),
+            "$Forwarded set upstream"
+        );
+        let sent_id: i64 = w
+            .store()
+            .conn()
+            .query_row(
+                "SELECT m.id FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE f.role = 'sent'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the Sent copy synced back");
+        assert_eq!(
+            mail::thread_of(w.store(), sent_id),
+            mail::thread_of(w.store(), 1),
+            "the forward is in the conversation"
+        );
     }
 
     /// A UIDVALIDITY change wipes the folder and refetches inside the cap.

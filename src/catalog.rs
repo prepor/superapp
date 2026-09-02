@@ -158,6 +158,7 @@ fn letter(
             html: html.map(str::to_string),
             status: status.map(|(s, e)| (s.to_string(), e)),
             to: "me@prepor.dev".to_string(),
+            forwarded: false,
         },
         role: "inbox".to_string(),
         message_id: format!("fixture-{id}@prepor.dev"),
@@ -458,6 +459,8 @@ fn message() -> Scene<Setup> {
         .about("the CI thread: six runs, two failed")
         .node("single", panel(|s| Kind::Message { id: mail_like(s, "Sat hike") }, ""))
         .about("one mail is a thread of one")
+        .node("forwarded", panel(|s| Kind::Message { id: mail_like(s, "invoice 2026-08") }, ""))
+        .about("passed on: the mark by the date, off the $Forwarded keyword")
         .node("phone", panel(|s| Kind::Message { id: mail_like(s, "[stelaxis] CI") }, ""))
         .sized((380.0, 720.0))
 }

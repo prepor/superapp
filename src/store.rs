@@ -423,6 +423,18 @@ CREATE TABLE repl(
   holding INTEGER NOT NULL DEFAULT 0
 );
 ";
+/// Schema v11 (forward): the mail a draft passes on, beside the one it
+/// answers — the send reads the chain off whichever is set — and the
+/// `$Forwarded` keyword on both sides of the desired/actual split, exactly
+/// as the read flag lives there: `message.forwarded` is intent (set when a
+/// forward has gone), `server_msg.forwarded` is what the server holds, and
+/// their disagreement is pushed like any other.
+const SCHEMA_V11: &str = "
+ALTER TABLE draft ADD COLUMN fwd_message INTEGER;
+ALTER TABLE message ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE server_msg ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Rewrites `message.html` from the `raw` blob each synced mail keeps. The
 /// narrowing ([`crate::html::sanitize`]) runs at ingest, so a stored reading
 /// is only as good as the build that stored it, and a better narrowing has
@@ -722,6 +734,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(SCHEMA_V10)?;
         conn.execute("INSERT INTO repl(id, device) VALUES(1, ?1)", [device_id()])?;
         conn.pragma_update(None, "user_version", 10)?;
+    }
+    if version < 11 {
+        conn.execute_batch(SCHEMA_V11)?;
+        conn.pragma_update(None, "user_version", 11)?;
     }
     // The HTML narrowing runs at ingest, so a stored reading is as good as
     // the build that wrote it. The version of the narrowing the store holds
