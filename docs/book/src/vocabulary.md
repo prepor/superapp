@@ -35,3 +35,6 @@
 - **Problem** — a standing background condition (a failed sync, a failed
   send, an unreachable bucket), derived from the rows that carry it. The
   **mark** in the toast's corner counts them; the problems panel lists them.
+- **Effect / job** — anything whose result the store cannot reproduce: a
+  socket, the keychain, the clipboard, the clock. The ones worth retrying are
+  rows in one queue, and the `effects` panel is that queue read back.

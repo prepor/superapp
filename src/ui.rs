@@ -129,6 +129,7 @@ pub const ACCEL_ADD_ACCOUNT: char = 'd';
 pub fn preview_kind(kind: &Kind) -> Option<Kind> {
     match kind {
         Kind::Inbox { .. } => Some(Kind::Message { id: 0 }),
+        Kind::Effects => Some(Kind::Job { id: 0 }),
         _ => None,
     }
 }
@@ -203,7 +204,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
             FieldId::SetSmtp,
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
-        Kind::Inbox { .. } => &[FieldId::Filter],
+        Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
         _ => &[],
     }
 }
@@ -233,6 +234,8 @@ mod tests {
             Kind::Contact {
                 email: "a@b.c".into(),
             },
+            Kind::Effects,
+            Kind::Job { id: 1 },
         ]
     }
 

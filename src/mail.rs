@@ -842,6 +842,25 @@ pub fn reading_lines(m: &MailFull, cols: usize) -> usize {
         .max(1)
 }
 
+/// A job's panel title: its verb and whose work it was, which is what the
+/// log's row leads with too. Read off the row rather than decoded — a title
+/// is drawn on every frame of a tab strip, and the sentence lives one panel
+/// over anyway.
+fn job_title(store: &Store, id: i64) -> String {
+    store
+        .conn()
+        .query_row(
+            "SELECT kind, entity FROM effect WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .map(|(kind, entity)| match entity {
+            Some(e) if !e.is_empty() => format!("{kind} · {e}"),
+            _ => kind,
+        })
+        .unwrap_or_else(|_| format!("job #{id}"))
+}
+
 /// The panel's display title for a kind — what headers, tab strips, the
 /// overlay and the launcher all show. Data-carrying kinds resolve through
 /// the store (cached like everything else).
@@ -867,6 +886,8 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Settings => "settings".into(),
         Kind::AddAccount => "add account".into(),
         Kind::Problems => "problems".into(),
+        Kind::Effects => "effects".into(),
+        Kind::Job { id } => job_title(store, *id),
     }
 }
 

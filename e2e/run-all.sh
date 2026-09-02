@@ -31,6 +31,7 @@ extra_args() {
     phone)    echo "--window 380x780 --grid 4x3" ;;  # the cover display
     send)     echo "--send-delay 1" ;;               # a one-second undo window
     problems) echo "--send-delay 1" ;;               # the same, for its failing send
+    effects)  echo "--send-delay 1" ;;               # …so a job reaches the queue
     library)  echo "--library" ;;                    # the canvas, not a workspace
     *)        echo "" ;;
   esac

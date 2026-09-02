@@ -1,0 +1,91 @@
+# The effect log (CR-004's queue, read): every job the app has filed on the
+# outside world — its status, the sentence the effect describes itself
+# with, and the JSON it was filed as, unfolded in place.
+#
+# Run with --send-delay 1. The demo account has no SMTP host, so a send is
+# the shortest honest way to put a real job in this queue: it is submitted,
+# it fails, and the log is where that failure is legible.
+wait 700
+
+# The launcher finds the panel under the word one actually reaches for.
+key cmd 2
+wait 400
+type "log"
+wait 400
+shot g1-launcher
+key enter
+wait 800
+# Nothing has left the process yet — said, rather than left blank.
+shot g2-empty
+key cmd+w
+wait 600
+
+# File a send against an account with nowhere to send it.
+click "Q3 infra"
+wait 600
+click "reply"
+wait 500
+type "Checking egress today."
+wait 300
+click "send"
+wait 2500
+
+# Back to the log: one job, and the server's own words under it.
+key cmd 2
+wait 300
+type "effects"
+wait 400
+key enter
+wait 900
+shot g3-log
+# A row is addressed by the sentence its effect describes itself with —
+# so a log that stopped naming its jobs fails the run, no picture needed.
+# Touching it previews the job beside the list, joined, the way an inbox
+# row previews its mail; the list keeps the keyboard.
+click "submit outbox:"
+wait 700
+shot g4-previewed
+
+# The job panel is the whole row: its facts, the payload it was filed as,
+# the answer. All of it selectable — a payload is something one copies
+# into a bug report.
+click "job payload"
+wait 300
+key cmd+a
+wait 400
+shot g5-payload-selected
+
+# The filter is the rich table's, over the queue's own columns — reached by
+# its own field rather than by `/`, because the payload click above handed
+# the keyboard to the job panel, and a key pressed there never reaches the
+# log. (The cursor walk wants more than one job; the panels library's
+# effect-log scene plants five and walks them.)
+click "filter"
+wait 300
+type "@"
+wait 400
+shot g6-tags
+# esc puts the offer away and the field keeps the keyboard.
+key esc
+wait 200
+key cmd+a
+type "@kind:submit"
+wait 500
+key esc
+wait 400
+shot g7-kept
+# Still addressable: which is how the run knows the filter was typed into
+# the log's own field, and that it kept this row.
+click "submit outbox:"
+wait 500
+
+# A filter nothing answers says so rather than showing a blank list.
+click "filter"
+wait 300
+key cmd+a
+type "@kind:move"
+wait 500
+key esc
+wait 500
+shot g8-none
+quit

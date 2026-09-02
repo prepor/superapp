@@ -1,7 +1,8 @@
 # The Rich Table
 
 Every list panel is the same engine over a different **datasource**: the
-inbox today, feeds and calendar events when they arrive. The engine
+inbox and [the effect log](./data-substrate.md#the-log-panel) today, feeds
+and calendar events when they arrive. The engine
 (`src/richtable.rs`, std-only) owns a **filter** and a **paging window**
 and holds no rows; the panel widget draws what the engine hands it. The
 design is a port of stelaxis's rich table, with the paging rebuilt for an
@@ -116,5 +117,10 @@ Declare the `SqlSpec` and its `TagDef`s beside the domain's queries, wrap
 them in a `SqlSource` with the row decoder, the order key and the
 suggestion function, and give the panel widget a `Table` over it. The
 autocomplete is a `Suggest` over that table, as the inbox's is; the
-filter field, the error line and the paging loop are the inbox panel's,
-and the next list kind lifts them as they are.
+filter field, the error line and the paging loop are the inbox panel's.
+
+The effect log (`effect::LOG`) is what that costs, measured: a flat spec
+over one table, nine tags, a row decoder shared with the queue's own
+helpers, and a panel that lifted the inbox's filter, error line and paging
+loop unchanged. It carries no aggregate and no group key — so it is also
+the plain case the inbox's grouping is the exception to.

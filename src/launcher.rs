@@ -58,6 +58,8 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Settings => "settings",
         Kind::AddAccount => "add account",
         Kind::Problems => "problems",
+        Kind::Effects => "effects",
+        Kind::Job { .. } => "job",
     }
 }
 
@@ -183,10 +185,16 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
         Kind::Compose { seed: Seed::Blank },
         Kind::Settings,
         Kind::Problems,
+        Kind::Effects,
         Kind::Help,
         Kind::About,
     ] {
-        let extra = format!("{} panel", kind_word(&kind));
+        // The word a person reaches for is not always the panel's name:
+        // the effect queue is what one goes looking for as "the log".
+        let extra = match kind {
+            Kind::Effects => "effects panel log queue".to_string(),
+            _ => format!("{} panel", kind_word(&kind)),
+        };
         candidate(&mut hits, &mut seen, kind, &extra);
     }
 
@@ -232,7 +240,7 @@ mod tests {
         let (wm, store) = world();
         let hits = search(&wm, &store, "");
         // Open help + inbox, then the unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 6);
+        assert_eq!(hits.len(), 7);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
@@ -246,8 +254,10 @@ mod tests {
         assert!(matches!(hits[3].go, Go::Open(Kind::Settings)));
         assert_eq!(hits[4].label, "problems");
         assert!(matches!(hits[4].go, Go::Open(Kind::Problems)));
-        assert_eq!(hits[5].label, "about");
-        assert!(matches!(hits[5].go, Go::Open(Kind::About)));
+        assert_eq!(hits[5].label, "effects");
+        assert!(matches!(hits[5].go, Go::Open(Kind::Effects)));
+        assert_eq!(hits[6].label, "about");
+        assert!(matches!(hits[6].go, Go::Open(Kind::About)));
     }
 
     /// The mark's and the menu's verb: never a second copy.
