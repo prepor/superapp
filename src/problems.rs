@@ -67,16 +67,17 @@ static Q_FAILING_SENDS: Q = Q {
     sql: "SELECT o.id, o.status, COALESCE(o.error, e.error, 'send failed'),
                  COALESCE(d.subject, ''), COALESCE(d.to_addr, ''),
                  COALESCE(d.re_message, 0), COALESCE(e.attempts, 0),
-                 COALESCE(e.not_before, 0)
+                 COALESCE(e.not_before, 0), COALESCE(e.status, '')
           FROM outbox o
           LEFT JOIN draft d ON d.panel = o.id
           LEFT JOIN effect e ON e.id = (SELECT MAX(id) FROM effect
                                         WHERE kind = 'submit' AND status != 'obsolete'
                                           AND payload ->> 'outbox' = o.id)
           WHERE o.status = 'failed'
-             OR (o.status = 'sending' AND e.status = 'pending' AND e.error IS NOT NULL)
+             OR (o.status = 'sending' AND e.status IN ('pending', 'processing')
+                 AND e.error IS NOT NULL)
           ORDER BY o.id",
-    describe: "every send whose last attempt failed — still retrying, or given up",
+    describe: "every send whose last attempt failed — retrying, trying now, or given up",
 };
 
 /// Every standing problem, accounts first, then sends, then device sync.
@@ -110,7 +111,7 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             },
         });
     }
-    type SendRow = (i64, String, String, String, String, i64, i64, f64);
+    type SendRow = (i64, String, String, String, String, i64, i64, f64, String);
     let sends: Rc<Vec<SendRow>> = store.rows(&Q_FAILING_SENDS, &[], |r| {
         Ok((
             r.get(0)?,
@@ -121,9 +122,10 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             r.get(5)?,
             r.get(6)?,
             r.get(7)?,
+            r.get(8)?,
         ))
     });
-    for (outbox, status, error, subject, to, re, attempts, next) in sends.iter() {
+    for (outbox, status, error, subject, to, re, attempts, next, job) in sends.iter() {
         let subject = if subject.is_empty() {
             "(no subject)".to_string()
         } else {
@@ -146,6 +148,13 @@ pub fn list(store: &Store, repl: Option<&repl::Status>) -> Vec<Problem> {
             line: error.clone(),
             detail: if given_up {
                 format!("{to} — gave up after {attempts} attempts")
+            } else if job == "processing" {
+                // Mid-attempt: the row stays, so a slow call never blinks
+                // the mark off and announces the same failure twice.
+                format!(
+                    "{to} — attempt {attempts} of {}, trying now",
+                    crate::effect::MAX_ATTEMPTS
+                )
             } else {
                 format!(
                     "{to} — attempt {attempts} of {}, next at {}",
@@ -347,6 +356,29 @@ mod tests {
         );
         assert_eq!(v[0].line, "connection refused");
         assert_eq!(v[0].detail, "to x@y — attempt 2 of 6, next at sep 01 12:05");
+
+        // The executor has the job: still the same problem, still standing.
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE effect SET status = 'processing' WHERE status = 'pending'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let v = list(w.store(), None);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].detail, "to x@y — attempt 2 of 6, trying now");
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE effect SET status = 'pending' WHERE status = 'processing'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
 
         // A send that is merely waiting for its window is not a problem.
         w.store()

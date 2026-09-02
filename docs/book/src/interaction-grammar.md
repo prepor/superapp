@@ -99,8 +99,8 @@ send again with its usual window, and *reopen*, a solid link that brings
 the draft back as a compose panel joined to the right (`cmd+z` puts the
 failed row back). Device sync offers only its count: the network coming
 back is what fixes it. With nothing standing, the panel says so. `tab`
-walks the rows' buttons; there are no chords, since a panel with a button
-per row gives none.
+walks each row's button and link and `enter` presses; there are no chords,
+since a panel with a control per row gives none.
 
 The list is **derived**, never stored: it is read off the account's status
 line, the outbox's failed rows and the lease status the sync worker last

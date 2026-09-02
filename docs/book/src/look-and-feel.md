@@ -26,7 +26,8 @@ control's [accelerator](./interaction-grammar.md#accelerators).
 inverts; unfocused headers carry a 1 pt rule. Tables: strong rule under the
 header row, hairline rules between rows.
 
-Text carries no padding of its own: a label, a section label, a link sits
+A link that holds keyboard focus wears a doubled underline, the way a
+focused button wears the grey wash. Text carries no padding of its own: a label, a section label, a link sits
 exactly where its row puts it, so every line a panel writes shares the
 panel's inset, and the spacing between lines belongs to the rows and rules
 rather than to the words. Nothing zeroes or pads around a label at the

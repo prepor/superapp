@@ -766,6 +766,16 @@ impl Pump {
         }
     }
 
+    /// Wakes one account's worker — a *sync* pressed on its row. The other
+    /// accounts and the sender sleep on.
+    pub fn kick_account(&self, account: i64) {
+        if let Pump::Threads { workers, .. } = self {
+            for w in workers.iter().filter(|w| w.account == account) {
+                w.kick();
+            }
+        }
+    }
+
     /// Whether any account currently has a worker.
     #[must_use]
     pub fn idle(&self) -> bool {

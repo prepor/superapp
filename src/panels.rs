@@ -539,6 +539,19 @@ script_mod! {
                 }
             }
         }
+        // Keyboard focus on a link: the underline doubles, the way a focused
+        // button wears the grey wash — visible, and still no second colour.
+        ul_focus := View {
+            visible: false
+            width: Fill, height: 2
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
         ul_dotted := View {
             visible: false
             width: Fill, height: 1
@@ -1635,6 +1648,10 @@ pub struct ProblemRow {
     /// What the row's button fires — `None` when nothing can be done.
     #[rust]
     action: Option<PanelAction>,
+    /// What the row's link fires, for the tab ring; the pointer path goes
+    /// through the shell's hit table like every list item's.
+    #[rust]
+    link_action: Option<PanelAction>,
 }
 
 impl Widget for ProblemRow {
@@ -1688,6 +1705,26 @@ impl ProblemRowRef {
             } => Some(PanelAction::RetrySend(*outbox)),
             Source::Send { .. } | Source::Sync => None,
         };
+        row.link_action = match &p.source {
+            Source::Account { .. } => Some(PanelAction::FollowLink {
+                pid,
+                target: crate::core::Kind::Settings,
+                dotted: false,
+                fresh: false,
+            }),
+            Source::Send {
+                outbox,
+                re,
+                given_up: true,
+                ..
+            } => Some(PanelAction::ReopenSend {
+                pid,
+                outbox: *outbox,
+                re: *re,
+                fresh: false,
+            }),
+            Source::Send { .. } | Source::Sync => None,
+        };
     }
 }
 
@@ -1703,8 +1740,8 @@ pub struct ProblemsPanel {
 }
 
 impl ProblemsPanel {
-    /// The tab ring in visual order: the visible rows' buttons. No chords:
-    /// a panel with a button per row gives none (rule 4).
+    /// The tab ring in visual order: each visible row's button, then its
+    /// link. No chords: a panel with a control per row gives none (rule 4).
     fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
         let mut v = Vec::new();
         if let Some(list) = self
@@ -1720,15 +1757,24 @@ impl ProblemsPanel {
                 .collect();
             rows.sort_by_key(|(i, _)| *i);
             for (_, row) in rows {
-                let Some(act) = row.as_problem_row().borrow().and_then(|r| r.action.clone())
-                else {
-                    continue;
+                let (act, link) = match row.as_problem_row().borrow() {
+                    Some(r) => (r.action.clone(), r.link_action.clone()),
+                    None => continue,
                 };
-                let b = match act {
-                    PanelAction::SyncAccount(_) => row.button(cx, ids!(sync_btn)),
-                    _ => row.button(cx, ids!(retry_btn)),
-                };
-                v.push(RingStop::Act(b, act));
+                if let Some(act) = act {
+                    let b = match act {
+                        PanelAction::SyncAccount(_) => row.button(cx, ids!(sync_btn)),
+                        _ => row.button(cx, ids!(retry_btn)),
+                    };
+                    v.push(RingStop::Act(b, act));
+                }
+                if let Some(link) = link {
+                    let w = match link {
+                        PanelAction::FollowLink { .. } => row.widget(cx, ids!(settings_link)),
+                        _ => row.widget(cx, ids!(reopen_link)),
+                    };
+                    v.push(RingStop::Link(w, link));
+                }
             }
         }
         v
@@ -1750,7 +1796,7 @@ impl Widget for ProblemsPanel {
             if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
                 for stop in self.ring(cx) {
                     if stop.is_focused(cx) {
-                        if let RingStop::Act(_, a) = stop {
+                        if let RingStop::Act(_, a) | RingStop::Link(_, a) = stop {
                             cx.action(a);
                         }
                         break;
@@ -1854,6 +1900,9 @@ enum RingStop {
     Add(ButtonRef),
     /// A problems row's button and the intent it fires.
     Act(ButtonRef, PanelAction),
+    /// A problems row's link and the intent it fires: a link on the ring
+    /// wears its focus as a doubled underline (see `SLink`).
+    Link(WidgetRef, PanelAction),
 }
 
 impl RingStop {
@@ -1863,6 +1912,7 @@ impl RingStop {
             RingStop::Remove(b, _) | RingStop::Add(b) | RingStop::Act(b, _) => {
                 cx.has_key_focus(b.area())
             }
+            RingStop::Link(w, _) => cx.has_key_focus(w.area()),
         }
     }
 
@@ -1872,6 +1922,7 @@ impl RingStop {
             RingStop::Remove(b, _) | RingStop::Add(b) | RingStop::Act(b, _) => {
                 cx.set_key_focus(b.area())
             }
+            RingStop::Link(w, _) => cx.set_key_focus(w.area()),
         }
     }
 }
@@ -2868,6 +2919,10 @@ pub struct SLink {
     target: Option<crate::core::Kind>,
     #[rust]
     dotted: bool,
+    /// Whether the last draw saw key focus on this link; the underline
+    /// variants flip only when it changes.
+    #[rust]
+    focused: bool,
 }
 
 impl Widget for SLink {
@@ -2888,6 +2943,13 @@ impl Widget for SLink {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let focused = cx.has_key_focus(self.view.area());
+        if focused != self.focused {
+            self.focused = focused;
+            let solid = !self.dotted;
+            self.view.view(cx, ids!(ul)).set_visible(cx, solid && !focused);
+            self.view.view(cx, ids!(ul_focus)).set_visible(cx, solid && focused);
+        }
         self.view.draw_walk(cx, scope, walk)
     }
 }

@@ -1926,16 +1926,30 @@ fn dev_menu(cx: &mut Cx) {
         return;
     }
     cx.update_macos_menu(MacosMenu::Main {
-        items: vec![MacosMenu::Sub {
-            name: "Dev".into(),
-            items: vec![MacosMenu::Item {
-                command: LiveId(MENU_LIBRARY),
-                key: KeyCode::Unknown,
-                shift: true,
-                enabled: true,
-                name: "Panels Library — ⇧⌘L".into(),
-            }],
-        }],
+        items: vec![
+            // The app menu is AppKit's; replacing the bar without it would
+            // take Quit — and ⌘Q — with it.
+            MacosMenu::Sub {
+                name: "superapp".into(),
+                items: vec![MacosMenu::Item {
+                    command: live_id!(quit),
+                    key: KeyCode::KeyQ,
+                    shift: false,
+                    enabled: true,
+                    name: "Quit superapp".into(),
+                }],
+            },
+            MacosMenu::Sub {
+                name: "Dev".into(),
+                items: vec![MacosMenu::Item {
+                    command: LiveId(MENU_LIBRARY),
+                    key: KeyCode::Unknown,
+                    shift: true,
+                    enabled: true,
+                    name: "Panels Library — ⇧⌘L".into(),
+                }],
+            },
+        ],
     });
 }
 
@@ -4409,6 +4423,9 @@ impl Stage {
                 self.e2e_timer = cx.start_interval(E2E_TICK_MS / 1000.0);
             }
         }
+        // The menu bar is this stage's from here: a window that opened on
+        // the library carried only the Dev menu until now.
+        self.update_menu(cx);
         self.next_frame = cx.new_next_frame();
         self.redraw_scoped(cx);
     }
@@ -4725,6 +4742,7 @@ impl Stage {
                     );
                     state.spawn_workers();
                     state.toast(format!("removed {email} — ⌘z undoes"), false);
+                    state.announce_problems();
                     refresh = true;
                 }
                 crate::panels::PanelAction::SyncAccount(id) => {
@@ -4736,7 +4754,7 @@ impl Stage {
                         .find(|a| a.id == id)
                         .map(|a| a.email.clone())
                         .unwrap_or_default();
-                    state.pump.kick();
+                    state.pump.kick_account(id);
                     state.toast(format!("syncing {email}…"), false);
                     refresh = true;
                 }
@@ -4749,13 +4767,25 @@ impl Stage {
                     let delay = config().send_delay;
                     let now = state.world.now();
                     let subject = draft_subject(&state.store, id);
+                    let error = mail::outbox_failures(&state.store)
+                        .iter()
+                        .find(|(i, _)| *i == id)
+                        .map(|(_, e)| e.clone())
+                        .unwrap_or_else(|| "send failed".into());
+                    // Not a `Sent`: undoing that deletes the row, and with
+                    // no compose to reopen the draft would be stranded.
+                    // Undoing a retry puts the *failure* back.
                     let filed = state.act(
                         "send",
                         format!("retry “{subject}”"),
                         Some(format!("outbox:{id}")),
                         |_| {},
                         move |tx| mail::file_send_tx(tx, id, now + delay),
-                        vec![Box::new(mail::Sent { panel: id, delay }) as Box<dyn crate::history::Intent>],
+                        vec![Box::new(mail::Retried {
+                            outbox: id,
+                            error,
+                            delay,
+                        }) as Box<dyn crate::history::Intent>],
                     );
                     if filed.is_some() {
                         state.toast(
@@ -4763,6 +4793,10 @@ impl Stage {
                             false,
                         );
                     }
+                    // The list changed under our own hand: reconcile what
+                    // counts as announced now, not at the next poll, so the
+                    // next failure of this send is news again.
+                    state.announce_problems();
                     refresh = true;
                 }
                 crate::panels::PanelAction::ReopenSend {
@@ -4807,6 +4841,7 @@ impl Stage {
                     if reopened.is_some() {
                         state.toast(format!("reopened “{subject}” — ⌘z undoes"), false);
                     }
+                    state.announce_problems();
                     refresh = true;
                 }
                 crate::panels::PanelAction::TryIt { pid: _ } => {
@@ -5857,41 +5892,11 @@ impl Stage {
 
     /// The modal overlays and the toast, over whatever the stage drew.
     fn draw_sheet(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
-        // The modal overlays share a chassis: an ink wash that owns every
-        // hit (a tap outside the sheet dismisses), and the sheet on it.
-        // The wash rides the chassis' presence spring, so it fades in and
-        // out with the sheet; only a live overlay takes the tap.
-        let up = state.overlay != Overlay::None;
-        let presence = state.anim.overlay().value();
-        if up || presence > 0.0 {
-            if up {
-                self.hits.clear();
-            }
-            self.draw_flat.new_draw_call(cx);
-            self.draw_flat.color = rgba_a(theme::INK, 0.30 * presence);
-            self.draw_flat.draw_abs(cx, vp);
-            if up {
-                self.hits.push(HitR {
-                    rect: vp,
-                    act: Act::OverlayClose,
-                    cursor: MouseCursor::Default,
-                    label: match state.overlay {
-                        Overlay::Ws => "workspaces",
-                        Overlay::History => "history",
-                        _ => "launcher",
-                    }
-                    .into(),
-                });
-            }
-        }
-
-        // The overlays are retained widgets now (CR-002 F): the shell
-        // supplies their rows and owns their clicks, exactly as it does for
-        // a panel's in-list controls.
         // The problems mark: what stands in the background, in the toast's
         // corner, in the one colour — and static. A toast announced it; this
-        // stays until it clears. Drawn under the overlays' wash and the
-        // locked screen, which own every hit while they are up.
+        // stays until it clears. Drawn and registered *before* the overlays'
+        // wash and the locked screen: they own every hit while they are up,
+        // so the mark has to sit under them, not over.
         let problems = state.problems();
         let mut lift = 0.0;
         if !problems.is_empty() {
@@ -5923,6 +5928,37 @@ impl Stage {
             lift = h + 6.0;
         }
 
+        // The modal overlays share a chassis: an ink wash that owns every
+        // hit (a tap outside the sheet dismisses), and the sheet on it.
+        // The wash rides the chassis' presence spring, so it fades in and
+        // out with the sheet; only a live overlay takes the tap.
+        let up = state.overlay != Overlay::None;
+        let presence = state.anim.overlay().value();
+        if up || presence > 0.0 {
+            if up {
+                self.hits.clear();
+            }
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 0.30 * presence);
+            self.draw_flat.draw_abs(cx, vp);
+            if up {
+                self.hits.push(HitR {
+                    rect: vp,
+                    act: Act::OverlayClose,
+                    cursor: MouseCursor::Default,
+                    label: match state.overlay {
+                        Overlay::Ws => "workspaces",
+                        Overlay::History => "history",
+                        _ => "launcher",
+                    }
+                    .into(),
+                });
+            }
+        }
+
+        // The overlays are retained widgets now (CR-002 F): the shell
+        // supplies their rows and owns their clicks, exactly as it does for
+        // a panel's in-list controls.
         self.draw_overlay(cx, state, vp);
 
 

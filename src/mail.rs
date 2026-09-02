@@ -1625,6 +1625,68 @@ impl Intent for Reopened {
     }
 }
 
+/// A failed send filed again (the problems panel's *retry*): the row went
+/// back to `pending` with a fresh window, and the submit job that failed
+/// last time stood down. Giving it back puts the failure back — the row
+/// and the job — so the draft stays reachable through the problems panel
+/// rather than stranded behind a compose that no snapshot reopens.
+pub struct Retried {
+    pub outbox: i64,
+    /// The failure the row carried, put back with it.
+    pub error: String,
+    /// How long the window is, so redo files a fresh one.
+    pub delay: f64,
+}
+
+impl Intent for Retried {
+    fn describe(&self) -> String {
+        format!("outbox:{} retried", self.outbox)
+    }
+
+    /// As a send's: once the executor has taken the row, the mail is gone.
+    fn blocked(&self, w: &World) -> Option<String> {
+        match w.store().conn().query_row(
+            "SELECT status FROM outbox WHERE id = ?1",
+            [self.outbox],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) if s == "pending" || s == "failed" => None,
+            Ok(_) => Some("already sent".into()),
+            Err(_) => None,
+        }
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let (outbox, error) = (self.outbox, self.error.clone());
+        w.store()
+            .write(move |c| {
+                c.execute(
+                    "UPDATE outbox SET status = 'failed', error = ?2
+                     WHERE id = ?1 AND status IN ('pending', 'failed')",
+                    rusqlite::params![outbox, error],
+                )?;
+                // The job the retry stood down stands again, so the row
+                // reads as it did: the attempts it took, the error it gave.
+                c.execute(
+                    "UPDATE effect SET status = 'failed'
+                     WHERE id = (SELECT MAX(id) FROM effect
+                                 WHERE kind = 'submit' AND status = 'obsolete'
+                                   AND payload ->> 'outbox' = ?1)",
+                    [outbox],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let (outbox, after) = (self.outbox, w.now() + self.delay);
+        w.store()
+            .write(move |c| file_send_tx(c, outbox, after))
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Discarding a compose takes its text with it.
 pub struct Discarded {
     pub panel: i64,

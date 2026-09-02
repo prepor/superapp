@@ -9,7 +9,10 @@
 # row's own link — clears it.
 #
 # The clicks are the assertions: "problems" only resolves while the mark
-# stands, "reopen" and "retry" only while the panel lists a given-up send.
+# stands, "retry" only while the panel lists a given-up send. Reopen goes
+# by keyboard — tab walks the row's retry button, then its reopen link,
+# and enter presses it — and "subject" only resolves once the compose is
+# back.
 wait 700
 shot p0-clean
 click "Q3 infra"
@@ -26,8 +29,13 @@ shot p2-retrying
 # Six attempts with backoff: ~23 virtual minutes until the executor gives up.
 wait 1400000
 shot p3-given-up
-click "reopen"
+key tab
+wait 100
+key tab
+wait 100
+key enter
 wait 700
+click "subject"
 shot p4-reopened
 key cmd+z
 wait 700

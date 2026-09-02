@@ -300,6 +300,43 @@ mod tests {
         assert_eq!(live[0].attempts, 0);
     }
 
+    /// Undoing a retry puts the failure back — the row and the job that
+    /// stood down — rather than deleting the row as undoing a send does:
+    /// there is no compose to reopen, so a deleted row would strand the
+    /// draft.
+    #[test]
+    fn a_retry_undone_puts_the_failure_back() {
+        let w = world("");
+        w.with_fake(|f| f.clock = 200.0);
+        give_up(&w);
+        let error = outbox(&w).1.unwrap();
+        let attempts_before = w.jobs()[0].attempts;
+
+        let intent = mail::Retried {
+            outbox: 9,
+            error: error.clone(),
+            delay: 1.0,
+        };
+        intent.reapply(&w).unwrap(); // the retry itself: the same filing
+        assert_eq!(outbox(&w), ("pending".into(), None));
+        assert!(w.jobs().iter().all(|j| j.status == "obsolete"));
+        assert!(intent.blocked(&w).is_none(), "still in the window");
+
+        intent.reverse(&w).unwrap();
+        assert_eq!(outbox(&w), ("failed".into(), Some(error)));
+        let live: Vec<_> = w.jobs().into_iter().filter(|j| j.status != "obsolete").collect();
+        assert_eq!(live.len(), 1, "the old job stands again");
+        assert_eq!((live[0].status.as_str(), live[0].attempts), ("failed", attempts_before));
+        assert!(mail::draft(w.store(), 9).is_some(), "the draft is where the row finds it");
+
+        // Once the executor has the retried row, it is a send like any other.
+        intent.reapply(&w).unwrap();
+        w.with_fake(|f| f.clock += 2.0);
+        outbox_pass(&w);
+        assert_eq!(outbox(&w).0, "sending");
+        assert_eq!(intent.blocked(&w).as_deref(), Some("already sent"));
+    }
+
     /// Reopening a failed send moves the draft under the compose panel that
     /// shows it and clears the row; giving it back restores both, with the
     /// error the row carried.
