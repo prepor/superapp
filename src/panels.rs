@@ -3827,7 +3827,7 @@ impl InboxDraftRef {
 // ---------------------------------------------------------------------------
 
 /// The inbox's table: the shared engine over the thread datasource.
-type InboxTable = Table<&'static SqlSource<mail::ThreadHead>>;
+type InboxTable = Table<&'static SqlSource<mail::ThreadHead, i64>>;
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct InboxPanel {
@@ -4387,7 +4387,7 @@ impl JobPanelRef {
 // ---------------------------------------------------------------------------
 
 /// The log's table: the shared engine over the effect queue.
-type LogTable = Table<&'static SqlSource<Job>>;
+type LogTable = Table<&'static SqlSource<Job, i64>>;
 
 /// One visible row's hit, for the shell's hit table: what a script (and a
 /// finger) addresses it by, where it is, and which job it unfolds.

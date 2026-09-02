@@ -754,6 +754,8 @@ static LOG_SPEC: SqlSpec = SqlSpec {
     // queue was filed in.
     order: &[("e.id", Dir::Desc)],
     group: None,
+    // …which is the row's identity too (CR-009).
+    key: "e.id",
 };
 
 /// The effect filter's tags: what `@` offers in the log panel.
@@ -848,11 +850,12 @@ fn suggest_log(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
 }
 
 /// The effect log's datasource: what the log panel's rich table runs on.
-pub static LOG: SqlSource<Job> = SqlSource {
+pub static LOG: SqlSource<Job, i64> = SqlSource {
     spec: &LOG_SPEC,
     tags: LOG_TAGS,
     map: job_row,
-    key: |j| vec![Val::I(j.id)],
+    key: |j| j.id,
+    rank: |j| vec![Val::I(j.id)],
     suggest: suggest_log,
 };
 
