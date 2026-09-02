@@ -2277,7 +2277,7 @@ impl Stage {
                                         is_repeat: false,
                                         time: 0.0,
                                     };
-                                    let mut up = down.clone();
+                                    let mut up = down;
                                     up.modifiers = KeyModifiers::default();
                                     self.handle_key_down(cx, &down);
                                     self.handle_key_up(cx, &up);
@@ -2579,7 +2579,7 @@ impl Stage {
                     self.kick(cx);
                 }
                 _ => {
-                    self.forward_to_overlay(cx, &Event::KeyDown(k.clone()));
+                    self.forward_to_overlay(cx, &Event::KeyDown(*k));
                     self.kick(cx);
                 }
             }
@@ -2754,7 +2754,7 @@ impl Stage {
                 // Its *links* answer inside the widget, so the chord has to
                 // reach it. Only chords: the message scrolls its body on bare
                 // arrows, which are the cursor walk out here.
-                self.forward_to_panel(cx, child, &Event::KeyDown(k.clone()));
+                self.forward_to_panel(cx, child, &Event::KeyDown(*k));
             }
             // An unclaimed chord — cmd+enter included, which the inbox reads
             // as "open un-joined" — falls through to the panel below.
@@ -2763,7 +2763,7 @@ impl Stage {
         // A retained panel owns plain keys (its widgets gate on key focus)
         // — cmd chords and overlays were already handled above.
         if hosted {
-            self.forward_to_focused(cx, &Event::KeyDown(k.clone()));
+            self.forward_to_focused(cx, &Event::KeyDown(*k));
             self.kick(cx);
         }
     }
@@ -2801,7 +2801,7 @@ impl Stage {
             self.toggle_launcher(cx);
         }
         if self.hosted_focus() {
-            self.forward_to_focused(cx, &Event::KeyUp(k.clone()));
+            self.forward_to_focused(cx, &Event::KeyUp(*k));
         }
     }
 
@@ -3187,7 +3187,6 @@ impl Stage {
             });
             self.forward_to_overlay(cx, &ev);
             self.kick(cx);
-            return;
         }
     }
 
@@ -5767,6 +5766,7 @@ impl Stage {
     /// nudged — the accelerator mark (CR-003). It is the grid's own fake
     /// bold, narrowed from a run to a single glyph; the letter-tracking walk
     /// this label already does makes the position free.
+    #[allow(clippy::too_many_arguments)]
     fn draw_label_accel(
         &mut self,
         cx: &mut Cx2d,

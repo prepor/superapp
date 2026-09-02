@@ -24,6 +24,29 @@ The store lives at `~/Library/Application Support/superapp/superapp.db`
 `--db /tmp/scratch.db` for a throwaway session. See [The Data
 Substrate](./data-substrate.md).
 
+## CI
+
+`.github/workflows/ci.yml` runs the linter and that same suite on every push
+to `main` and every pull request:
+
+```sh
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+On a **macOS runner**, because macOS is the target: the apple sys crates and
+the keychain in `src/secret.rs` are cfg'd to it, and a linux job would be
+checking a graph that never ships. One job, not a lint job beside a test job
+— building the makepad graph is the whole cost of a run, and two would pay
+it twice. `--locked` makes a stale `Cargo.lock` fail loudly instead of being
+re-resolved behind the commit.
+
+Clippy is a *gate*: `-D warnings`, and the tree is clean of them. rustfmt is
+not — the layout here is hand-set (comment columns, tables that line up), so
+there is no `cargo fmt --check` step and `cargo fmt` on the whole tree is
+not a thing to run. The e2e suites stay out of CI for now; they are a local
+`--no-draw` run.
+
 ## Android build & run
 
 ```sh

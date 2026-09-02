@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes the run in flight: macOS minutes
+# bill at 10× on a private repo, and a superseded run proves nothing anyway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One job, not a lint job beside a test job: building the makepad graph *is*
+  # the cost of a run, and two jobs would pay it twice for no extra signal.
+  check:
+    name: clippy + tests
+    # macOS is the target platform — `makepad-objc-sys`/`makepad-apple-sys` and
+    # the keychain in `src/mac.rs` are cfg'd to it, so a linux runner would be
+    # checking a different dependency graph than the one that ships.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # `stable`, the same channel mise.toml pins for local work — plus the
+      # linter. No `cargo fmt --check` gate: the tree is not rustfmt-clean by
+      # choice (hand-laid tables and comment columns), and a check would be
+      # red on ~270 untouched files.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Caches the registry, the two makepad git checkouts and `target/`,
+      # keyed on the lockfile and the toolchain.
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` so a Cargo.lock left behind by an edited manifest fails
+      # here instead of being quietly re-resolved.
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The pure suite: panel mechanics, springs, store, effects, history,
+      # the mail engine — all against a `World::fake()`, no window, no
+      # network, no keychain. See docs/book/src/dev-x.md.
+      - name: tests
+        run: cargo test --locked
