@@ -64,6 +64,9 @@ pub enum BtnAct {
     Open,
     /// A files panel's `new dir`: the one-line field above the rows.
     NewDir,
+    /// A files panel's `go to`: the crumbs become a path field, with
+    /// completion; enter goes there.
+    GoTo,
     /// `copy` / `move`: **hold** the object the panel shows; nothing
     /// touches the disk until a `… here`.
     CopyHold,
@@ -108,6 +111,7 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
         // see [`head_btns_of`]; this is the full set.
         Kind::Files { .. } => &[
             ("new dir", BtnAct::NewDir),
+            ("go to", BtnAct::GoTo),
             ("copy", BtnAct::CopyHold),
             ("move", BtnAct::MoveHold),
             ("delete", BtnAct::Delete),
@@ -152,7 +156,9 @@ pub fn head_btns_of(
     object: bool,
 ) -> Vec<(&'static str, BtnAct)> {
     let mut v: Vec<(&'static str, BtnAct)> = match kind {
-        Kind::Files { .. } if !object => vec![("new dir", BtnAct::NewDir)],
+        Kind::Files { .. } if !object => {
+            vec![("new dir", BtnAct::NewDir), ("go to", BtnAct::GoTo)]
+        }
         _ => head_btns(kind).to_vec(),
     };
     if let (Kind::Files { .. }, Some(op)) = (kind, hold) {
@@ -173,6 +179,7 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
         BtnAct::TryIt => None,
         BtnAct::Open => Some('o'),
         BtnAct::NewDir => Some('n'),
+        BtnAct::GoTo => Some('g'),
         // The `p` of "copy", not the `c`: a card's path is selectable, so
         // cmd+c copies the path — the file clipboard is not the text
         // clipboard (CR-008).
@@ -273,6 +280,8 @@ pub enum FieldId {
     SetSmtp,
     /// A files panel's `new dir` field (CR-008).
     NewDir,
+    /// A files panel's `go to` path field (CR-008).
+    Path,
 }
 
 /// The fields a kind's form carries, in walk order. The widgets own the walk
@@ -289,7 +298,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
         Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
-        Kind::Files { .. } => &[FieldId::Filter, FieldId::NewDir],
+        Kind::Files { .. } => &[FieldId::Filter, FieldId::NewDir, FieldId::Path],
         _ => &[],
     }
 }
@@ -442,9 +451,9 @@ mod tests {
     fn a_files_panel_wears_its_object_verbs_only_at_the_end_of_a_chain() {
         let k = Kind::Files { dir: "~".into() };
         let root: Vec<&str> = head_btns_of(&k, None, false).iter().map(|(l, _)| *l).collect();
-        assert_eq!(root, ["new dir"]);
+        assert_eq!(root, ["new dir", "go to"]);
         let joined: Vec<&str> = head_btns_of(&k, None, true).iter().map(|(l, _)| *l).collect();
-        assert_eq!(joined, ["new dir", "copy", "move", "delete"]);
+        assert_eq!(joined, ["new dir", "go to", "copy", "move", "delete"]);
         let held = head_btns_of(&k, Some(crate::files::HoldOp::Move), false);
         assert_eq!(held.last().map(|(l, _)| *l), Some("move here"));
         let card = Kind::File { path: "~/a".into() };

@@ -12,11 +12,15 @@
 use std::rc::Rc;
 
 use crate::filter::{Ast, Op};
-use crate::richtable::{self, Datasource, Suggestion, TagDef, TagType, Values};
+use crate::richtable::{
+    self, Completion, Datasource, Suggestion, TagDef, TagType, Values, MAX_SUGGESTIONS,
+};
 use crate::store::Store;
 
 /// The root the launcher's `files` opens on.
 pub const HOME: &str = "~";
+/// The other root: the whole disk, for `go to /tmp`.
+pub const ROOT: &str = "/";
 
 /// One entry of a directory, as the files panel lists it.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,39 +117,88 @@ impl FileKind {
 
 // -- paths -------------------------------------------------------------------
 
-/// `~/Downloads` + `2026` → `~/Downloads/2026`.
+/// `~/Downloads` + `2026` → `~/Downloads/2026`; `/` + `tmp` → `/tmp`.
 #[must_use]
 pub fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
+    } else if dir == ROOT {
+        format!("/{name}")
     } else {
         format!("{dir}/{name}")
     }
 }
 
-/// The directory a path sits in; `None` at the root.
+/// The directory a path sits in; `None` at a root (`~`, `/`).
 #[must_use]
 pub fn parent(path: &str) -> Option<&str> {
-    path.rsplit_once('/').map(|(p, _)| p)
+    if path == ROOT {
+        return None;
+    }
+    path.rsplit_once('/')
+        .map(|(p, _)| if p.is_empty() { ROOT } else { p })
 }
 
-/// The last segment: the panel's title.
+/// The last segment: the panel's title. A root is its own name.
 #[must_use]
 pub fn basename(path: &str) -> &str {
+    if path == ROOT {
+        return ROOT;
+    }
     path.rsplit_once('/').map_or(path, |(_, n)| n)
 }
 
 /// The crumb line above a listing: `(label, path)` per ancestor, the
-/// directory itself last — `~ / Downloads / 2026`.
+/// directory itself last — `~ / Downloads / 2026`, or `/ tmp`.
 #[must_use]
 pub fn crumbs(dir: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut acc = String::new();
+    if dir.starts_with('/') {
+        acc = ROOT.to_string();
+        out.push((ROOT.to_string(), ROOT.to_string()));
+    }
     for seg in dir.split('/').filter(|s| !s.is_empty()) {
         acc = join(&acc, seg);
         out.push((seg.to_string(), acc.clone()));
     }
     out
+}
+
+/// A typed path as the tree spells it: `~/`-relative or absolute, no
+/// trailing slash except on a root, `~` alone for home. `None` for a
+/// spelling the browser does not read (relative, empty).
+///
+/// A second root inside the text **restarts** the path — Emacs'
+/// find-file rule: `~/Downloads//tmp` is `/tmp`, `~/Downloads/~/x` is
+/// `~/x`. The field is seeded with where the panel stands, so this is
+/// how a typed absolute path wins over the seed without clearing it.
+#[must_use]
+pub fn normalize(typed: &str) -> Option<String> {
+    let mut t = typed.trim();
+    let restart = [t.rfind("//"), t.rfind("/~")].into_iter().flatten().max();
+    if let Some(i) = restart {
+        t = &t[i + 1..];
+    }
+    if t.is_empty() || !(t.starts_with('~') || t.starts_with('/')) {
+        return None;
+    }
+    let mut segs: Vec<&str> = Vec::new();
+    let (root, rest) = if let Some(r) = t.strip_prefix('~') {
+        (HOME, r)
+    } else {
+        (ROOT, t)
+    };
+    for seg in rest.split('/').filter(|s| !s.is_empty()) {
+        match seg {
+            "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    Some(segs.iter().fold(root.to_string(), |acc, s| join(&acc, s)))
 }
 
 /// `1.2 MB`, `84 KB`, `640 B`.
@@ -261,7 +314,25 @@ const TREE: &[Fx] = &[
     Fx { path: "~/superapp/files", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
     Fx { path: "~/superapp/superapp.db", dir: false, size: 24 * MB, at: (2026, 9, 2, 7, 30) },
     Fx { path: "~/superapp/panel-context.md", dir: false, size: 3 * KB, at: (2026, 9, 1, 23, 8) },
+    // Beyond home: what `go to` reaches.
+    Fx { path: "/Applications", dir: true, size: 0, at: (2026, 8, 20, 10, 0) },
+    Fx { path: "/Users", dir: true, size: 0, at: (2026, 6, 1, 9, 0) },
+    Fx { path: "/Users/andrey", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
+    Fx { path: "/etc", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
+    Fx { path: "/etc/hosts", dir: false, size: 213, at: (2026, 7, 14, 10, 0) },
+    Fx { path: "/tmp", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
+    Fx { path: "/tmp/superapp-e2e", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
+    Fx { path: "/tmp/superapp-e2e/frames", dir: true, size: 0, at: (2026, 9, 2, 12, 41) },
+    Fx { path: "/tmp/superapp-e2e/superapp.db", dir: false, size: 2 * MB, at: (2026, 9, 2, 12, 40) },
+    Fx { path: "/tmp/notes.txt", dir: false, size: 380, at: (2026, 9, 1, 18, 5) },
+    Fx { path: "/tmp/.keep", dir: false, size: 0, at: (2026, 9, 1, 18, 5) },
 ];
+
+/// Whether the tree has this path as a directory.
+#[must_use]
+pub fn is_dir(path: &str) -> bool {
+    path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path && f.dir)
+}
 
 fn entry_of(fx: &Fx) -> Entry {
     let (y, mo, d, h, min) = fx.at;
@@ -276,7 +347,7 @@ fn entry_of(fx: &Fx) -> Entry {
 /// Whether the tree has this path — a directory or a file.
 #[must_use]
 pub fn exists(path: &str) -> bool {
-    path == HOME || TREE.iter().any(|f| f.path == path)
+    path == HOME || path == ROOT || TREE.iter().any(|f| f.path == path)
 }
 
 /// The entry at a path, if the tree has it.
@@ -310,6 +381,7 @@ pub fn text_of(path: &str) -> Option<String> {
         return None;
     }
     Some(match e.name.as_str() {
+        "hosts" => "127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1\tlocalhost".into(),
         "README.txt" => "superapp 0.1.0\n\nA personal user-space OS: one workspace, specialized panels, no windows.\n\nDrag the .app to Applications. First launch asks for nothing; add a mail account in settings.".into(),
         "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments (follow-up CR)\n- rename?".into(),
         "notes.txt" => "Lisbon, August.\n\nInvoice 0817 is for the flat; the photos are from the last evening.".into(),
@@ -325,6 +397,89 @@ pub fn text_of(path: &str) -> Option<String> {
 pub fn image_of(path: &str) -> Option<&'static [u8]> {
     let e = entry(path)?;
     (e.kind() == FileKind::Image).then_some(include_bytes!("../resources/icon_256.png"))
+}
+
+// -- the path field's completion ----------------------------------------------
+
+/// The `go to` field as a completion: the segment under the caret,
+/// matched as a prefix against the entries of the directory the segments
+/// before it name — a shell's tab, in the rich table's box. A picked
+/// directory lands with its slash, so the next offer opens at once; a
+/// root is offered when nothing is typed yet.
+pub struct PathCompletion;
+
+/// What the caret is in the middle of typing in a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCtx {
+    /// Where the segment starts: after the last `/` before the caret.
+    pub start: usize,
+    /// The directory the segments before it name; `None` before the
+    /// first slash, where a root is what completes.
+    pub dir: Option<String>,
+    /// The segment as typed up to the caret.
+    pub prefix: String,
+}
+
+impl Completion for PathCompletion {
+    type Ctx = PathCtx;
+
+    fn context(&self, text: &str, cursor: usize) -> Option<PathCtx> {
+        let mut cursor = cursor.min(text.len());
+        while !text.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let before = &text[..cursor];
+        match before.rfind('/') {
+            Some(i) => {
+                let dir = normalize(&before[..=i])?;
+                Some(PathCtx {
+                    start: i + 1,
+                    dir: Some(dir),
+                    prefix: before[i + 1..].to_string(),
+                })
+            }
+            None => Some(PathCtx {
+                start: 0,
+                dir: None,
+                prefix: before.to_string(),
+            }),
+        }
+    }
+
+    fn offer(&self, _store: &Store, ctx: &PathCtx) -> Vec<Suggestion> {
+        let Some(dir) = &ctx.dir else {
+            // Before a slash: the two roots, as far as they match.
+            return [HOME, ROOT]
+                .iter()
+                .filter(|r| r.starts_with(ctx.prefix.as_str()) || ctx.prefix.is_empty())
+                .map(|r| Suggestion::labeled(format!("{r}/").replace("//", "/"), if *r == ROOT { ROOT.to_string() } else { format!("{r}/") }))
+                .collect();
+        };
+        let prefix = ctx.prefix.to_lowercase();
+        let hidden = prefix.starts_with('.');
+        let mut out: Vec<Suggestion> = list(dir)
+            .into_iter()
+            .filter(|e| hidden || !e.hidden())
+            .filter(|e| e.name.to_lowercase().starts_with(&prefix))
+            .map(|e| {
+                let label = e.label();
+                let describe = if e.is_dir { String::new() } else { fmt_size(e.size) };
+                Suggestion {
+                    value: label.clone(),
+                    label,
+                    describe,
+                }
+            })
+            .collect();
+        out.truncate(MAX_SUGGESTIONS);
+        out
+    }
+
+    fn splice(&self, text: &str, cursor: usize, ctx: &PathCtx, pick: &Suggestion) -> (String, usize) {
+        let cursor = cursor.min(text.len()).max(ctx.start);
+        let out = format!("{}{}{}", &text[..ctx.start], pick.value, &text[cursor..]);
+        (out, ctx.start + pick.value.len())
+    }
 }
 
 // -- the datasource ----------------------------------------------------------
@@ -569,10 +724,15 @@ mod tests {
     #[test]
     fn paths_and_crumbs() {
         assert_eq!(join("~", "Downloads"), "~/Downloads");
+        assert_eq!(join("/", "tmp"), "/tmp");
         assert_eq!(parent("~/Downloads/2026"), Some("~/Downloads"));
         assert_eq!(parent("~"), None);
+        assert_eq!(parent("/tmp"), Some("/"));
+        assert_eq!(parent("/"), None);
         assert_eq!(basename("~/Downloads/2026/notes.txt"), "notes.txt");
         assert_eq!(basename("~"), "~");
+        assert_eq!(basename("/"), "/");
+        assert_eq!(basename("/tmp"), "tmp");
         assert_eq!(
             crumbs("~/Downloads/2026"),
             [
@@ -581,8 +741,76 @@ mod tests {
                 ("2026".to_string(), "~/Downloads/2026".to_string()),
             ]
         );
+        assert_eq!(
+            crumbs("/tmp/superapp-e2e"),
+            [
+                ("/".to_string(), "/".to_string()),
+                ("tmp".to_string(), "/tmp".to_string()),
+                ("superapp-e2e".to_string(), "/tmp/superapp-e2e".to_string()),
+            ]
+        );
         assert!(exists("~/Downloads/2026"));
         assert!(!exists("~/Downloads/2027"));
+        assert!(exists("/") && exists("/tmp") && is_dir("/tmp") && !is_dir("/tmp/notes.txt"));
+        assert_eq!(names(&list("/")), ["Applications/", "etc/", "tmp/", "Users/"]);
+        assert_eq!(names(&list("/tmp")), ["superapp-e2e/", ".keep", "notes.txt"]);
+    }
+
+    #[test]
+    fn a_typed_path_is_read_the_way_the_tree_spells_it() {
+        assert_eq!(normalize("~").as_deref(), Some("~"));
+        assert_eq!(normalize("~/").as_deref(), Some("~"));
+        assert_eq!(normalize("~/Downloads/").as_deref(), Some("~/Downloads"));
+        assert_eq!(normalize("/tmp/").as_deref(), Some("/tmp"));
+        assert_eq!(normalize("/").as_deref(), Some("/"));
+        assert_eq!(normalize("/tmp/../etc/./hosts").as_deref(), Some("/etc/hosts"));
+        assert_eq!(normalize("~/../.."), Some("~".into()), "a root does not climb out");
+        assert_eq!(normalize("Downloads"), None, "relative spellings are not read");
+        assert_eq!(normalize("  "), None);
+        // A second root restarts the path (find-file's rule), so a typed
+        // absolute path wins over the seeded one.
+        assert_eq!(normalize("~/Downloads//tmp/").as_deref(), Some("/tmp"));
+        assert_eq!(normalize("~/Downloads//").as_deref(), Some("/"));
+        assert_eq!(normalize("/tmp/~/Downloads").as_deref(), Some("~/Downloads"));
+        assert_eq!(normalize("/tmp/~").as_deref(), Some("~"));
+        assert_eq!(normalize("~/a//b/~/c").as_deref(), Some("~/c"));
+    }
+
+    /// The path field completes like a shell's tab: the segment under the
+    /// caret against the directory before it, directories with their
+    /// slash so the next offer opens at once, the roots before a slash.
+    #[test]
+    fn the_path_field_completes_segment_by_segment() {
+        let store = Store::open(None).unwrap();
+        let c = PathCompletion;
+        let labels = |text: &str| -> Vec<String> {
+            let ctx = c.context(text, text.len()).unwrap();
+            c.offer(&store, &ctx).into_iter().map(|s| s.label).collect()
+        };
+        assert_eq!(labels(""), ["~/", "/"]);
+        assert_eq!(labels("~"), ["~/"]);
+        assert_eq!(labels("/t"), ["tmp/"]);
+        assert_eq!(labels("/tmp/"), ["superapp-e2e/", "notes.txt"], "dot-files wait for a dot");
+        assert_eq!(labels("/tmp/."), [".keep"]);
+        assert_eq!(labels("~/Dow"), ["Downloads/"]);
+        // After the seed, a second root restarts: the offer follows.
+        assert_eq!(labels("~/Downloads//t"), ["tmp/"]);
+        assert_eq!(labels("~/Downloads/~/Pic"), ["Pictures/"]);
+        // A prefix folds case, as the filter does everywhere else.
+        assert_eq!(labels("~/Downloads/re"), ["README.txt", "report-q3.pdf"]);
+        assert_eq!(labels("~/Downloads/rep"), ["report-q3.pdf"]);
+        assert!(labels("~/nowhere/x").is_empty());
+        // A pick replaces the segment and lands the caret after it.
+        let ctx = c.context("~/Dow", 5).unwrap();
+        let pick = Suggestion::value("Downloads/");
+        assert_eq!(c.splice("~/Dow", 5, &ctx, &pick), ("~/Downloads/".into(), 12));
+        let ctx = c.context("/t", 2).unwrap();
+        assert_eq!(c.splice("/t", 2, &ctx, &Suggestion::value("tmp/")), ("/tmp/".into(), 5));
+        // The root offer lands as a root.
+        let ctx = c.context("", 0).unwrap();
+        let roots = c.offer(&store, &ctx);
+        assert_eq!(roots[1].value, "/");
+        assert_eq!(c.splice("", 0, &ctx, &roots[0]), ("~/".into(), 2));
     }
 
     #[test]

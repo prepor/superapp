@@ -284,11 +284,11 @@ mise exec -- cargo run -- --library
 mise exec -- cargo run -- --library "inbox row" message
 
 # the canvas's own suite — the fast path: mounts, steps and labels, no rendering
-MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 900
+MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 1200
 
 # …and rendered, for screenshots (the canvas is a big frame)
 MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
-  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 900
+  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 1200
 ```
 
 Under `--no-draw` a `shot` is logged and skipped rather than failed, for the

@@ -1051,6 +1051,19 @@ fn files() -> Scene<Setup> {
             ),
         )
         .about("a crumb replaces the panel with ~ in place; the filter and the cursor start over")
+        .node(
+            "go to",
+            dir("~/Downloads", "click \"Downloads\"\nwait 200\nkey cmd+g\nwait 300\ntype \"/t\"\nwait 400"),
+        )
+        .about("⌘g: the crumbs become a path field seeded with the directory; a second root restarts it (//tmp), each segment completes like a shell's tab")
+        .node(
+            "went",
+            dir(
+                "~/Downloads",
+                "click \"Downloads\"\nwait 200\nkey cmd+g\nwait 300\ntype \"/tmp/\"\nwait 300\nkey enter\nwait 500",
+            ),
+        )
+        .about("enter goes — beyond ~: the panel is /tmp now, the crumbs climb to /")
         .node("gone", dir("~/Downloads/2027", ""))
         .about("a directory that left under the panel; the crumbs still climb")
         .node("phone", dir("~/Downloads", ""))
@@ -1062,6 +1075,8 @@ fn files() -> Scene<Setup> {
         .edge("downloads", "new dir", "⌘n")
         .edge("new dir", "refused", "2026, enter")
         .edge("downloads", "holding", "⌘m")
+        .edge("downloads", "go to", "⌘g, /t")
+        .edge("go to", "went", "/tmp/, enter")
 }
 
 fn file_card() -> Scene<Setup> {

@@ -4023,6 +4023,12 @@ impl Stage {
                         }
                         return;
                     }
+                    BtnAct::GoTo => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            w.as_files_panel().open_path(cx);
+                        }
+                        return;
+                    }
                     BtnAct::CopyHold | BtnAct::MoveHold => {
                         let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
                             Some(Kind::Files { dir }) => Some(dir),
@@ -7333,6 +7339,12 @@ impl Stage {
                     let nr = w.widget(cx, ids!(newdir_input)).area().rect(cx);
                     if nr.size.x > 0.0 {
                         reg.push(("new dir name".to_string(), nr, Act::Pointer(pid)));
+                    }
+                }
+                if panel.path_open() {
+                    let pr = w.widget(cx, ids!(path_input)).area().rect(cx);
+                    if pr.size.x > 0.0 {
+                        reg.push(("path".to_string(), pr, Act::Pointer(pid)));
                     }
                 }
                 // The crumbs are dotted: each replaces the panel with an

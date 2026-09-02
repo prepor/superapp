@@ -60,6 +60,19 @@ wide, not three: the header carries five verbs, and three columns of
 - **Roots**: the launcher's `files` root opens `~`; on android, the app's
   data dir, where the crumbs also stop. A root cannot be copied, moved or
   deleted: those buttons are absent on it.
+- **Go to** (`go to`, ⌘g): the crumbs become a path field, seeded with
+  where the panel stands and a slash. Each segment completes like a
+  shell's tab — the entries of the directory the segments before it name,
+  a directory landing with its slash so the next offer opens at once, the
+  two roots `~/` and `/` before the first slash; `tab` takes the offer.
+  `enter` goes to what is typed: a directory replaces the panel in place
+  (the crumbs' own semantics), a file opens its card joined, a path that
+  does not exist is refused on the status line. `esc` puts the crumbs
+  back. This is how the browser leaves `~` — `/tmp`, `/etc` — without a
+  second root panel; `..` and `.` are read, and a relative spelling is
+  not. A second root typed after the seed **restarts** the path, Emacs'
+  find-file rule: `~/Downloads//tmp` is `/tmp` and `~/Downloads/~/x` is
+  `~/x`, so an absolute path wins over the seed without clearing it.
 
 ### The card
 

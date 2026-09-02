@@ -1492,6 +1492,22 @@ script_mod! {
             s3 := mod.widgets.SLabel { padding: 0, text: " / ", draw_text +: { color: #909090 } }
             here_lbl := mod.widgets.SLabel { padding: 0, text: "" }
         }
+        // `go to`: the crumbs as a field — the path, completed segment by
+        // segment; enter goes there, esc puts the crumbs back.
+        path_row := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            margin: Inset{bottom: 6}
+            mod.widgets.SSection { width: 82, text: "GO TO" }
+            path_input := mod.widgets.SField {
+                empty_text: "~/ or /"
+                return_key_type: ReturnKeyType.Go
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
         filter_input := mod.widgets.SField {
             width: Fill
             empty_text: "filter…  ( / )   @ for tags"
@@ -1554,6 +1570,8 @@ script_mod! {
             text: "", draw_text +: { color: #a01500 }
         }
         suggest: mod.widgets.SuggestBox {}
+        // The path field's own box, under it.
+        suggest_path: mod.widgets.SuggestBox {}
     }
 
     /** A file as a card (CR-008): name, kind and size, when it changed,
@@ -2746,6 +2764,14 @@ pub struct Suggest<C: Completion> {
     items: Vec<Suggestion>,
     sel: usize,
     dismissed: Option<C::Ctx>,
+    /// Whether the field held the keyboard at the last event the panel
+    /// saw — [`Suggest::track`]. The draw reads this rather than polling
+    /// key focus: a panels-library mount that has arrived is a picture
+    /// which hears no events, and the one global keyboard has long moved
+    /// on to the next node by the time it re-renders, so polling would
+    /// close every offer a node was meant to show. In the app the events
+    /// never stop, so this is key focus with one event of lag.
+    focused: bool,
 }
 
 impl<C: Completion> Default for Suggest<C> {
@@ -2755,11 +2781,18 @@ impl<C: Completion> Default for Suggest<C> {
             items: Vec::new(),
             sel: 0,
             dismissed: None,
+            focused: false,
         }
     }
 }
 
 impl<C: Completion> Suggest<C> {
+    /// Notes whether the field holds the keyboard now. Call it on every
+    /// event the panel handles, before anything else reads the box.
+    pub fn track(&mut self, cx: &mut Cx, field: &TextInputRef) {
+        self.focused = field.key_focus(cx);
+    }
+
     /// Whether the box is up: a context with an offer, not put away.
     pub fn open(&self) -> bool {
         self.ctx.is_some() && self.dismissed != self.ctx && !self.items.is_empty()
@@ -2820,7 +2853,7 @@ impl<C: Completion> Suggest<C> {
         field: &TextInputRef,
         view: &mut View,
     ) {
-        let ctx = if field.key_focus(cx) {
+        let ctx = if self.focused {
             c.context(&field.text(), field.cursor().index)
         } else {
             None
@@ -2960,11 +2993,12 @@ fn land(cx: &mut Cx, inputs: &[TextInputRef; 3], j: usize) {
 impl Widget for ComposePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        let to = self.view.text_input(cx, ids!(to_input));
+        self.ac.track(cx, &to);
         // The TO field's autocomplete owns the arrows, enter, tab and esc
         // while it is open (see `Suggest`); neither the field nor the tab
         // ring sees them. A pick is an edit like any typing.
         if let Event::KeyDown(k) = event {
-            let to = self.view.text_input(cx, ids!(to_input));
             let before = to.text();
             if self.ac.key(cx, &mail::Recipients, &to, k) {
                 if to.text() != before {
@@ -3337,6 +3371,7 @@ impl Widget for InboxPanel {
         let filter = self.view.text_input(cx, ids!(filter_input));
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        self.ac.track(cx, &filter);
 
         // The autocomplete owns the arrows, enter, tab and esc while it is
         // open (see `Suggest`); the field never sees them — a swallowed
@@ -4093,6 +4128,9 @@ pub struct FilesPanel {
     /// The filter's autocomplete box, drawn over the rows last.
     #[live]
     suggest: View,
+    /// The path field's box, under that field.
+    #[live]
+    suggest_path: View,
     /// The rich table over the directory the panel's params name; a
     /// replace onto another directory swaps the source.
     #[rust(Table::new(files::DirSource::new(files::HOME), files::PAGE))]
@@ -4102,6 +4140,15 @@ pub struct FilesPanel {
     sel: Option<(String, usize)>,
     #[rust]
     ac: Suggest<FilesTable>,
+    /// The path field's completion: segment by segment, like a shell.
+    #[rust]
+    pac: Suggest<files::PathCompletion>,
+    /// The `go to` field is up, in the crumbs' place.
+    #[rust]
+    path_open: bool,
+    /// The path field wants the keyboard once it has been drawn in place.
+    #[rust]
+    focus_path_pending: bool,
     /// What the panel could not do, until the next verb.
     #[rust]
     status: Option<String>,
@@ -4153,6 +4200,59 @@ impl FilesPanel {
             self.view.view(cx, ids!(newdir)).set_visible(cx, false);
         }
         self.focus_pending = false;
+        if self.path_open {
+            let input = self.view.text_input(cx, ids!(path_input));
+            if input.key_focus(cx) {
+                cx.set_key_focus(Area::Empty);
+            }
+            self.set_path_open(cx, false);
+        }
+        self.focus_path_pending = false;
+    }
+
+    /// Swaps the crumbs for the path field, or back.
+    fn set_path_open(&mut self, cx: &mut Cx, open: bool) {
+        self.path_open = open;
+        self.view.view(cx, ids!(path_row)).set_visible(cx, open);
+        self.view.view(cx, ids!(crumbs)).set_visible(cx, !open);
+    }
+
+    fn close_path(&mut self, cx: &mut Cx) {
+        self.set_path_open(cx, false);
+        self.focus_path_pending = false;
+        cx.set_key_focus(Area::Empty);
+        self.redraw(cx);
+    }
+
+    /// Enter in the path field: a directory replaces the panel in place
+    /// (the crumbs' own semantics), a file opens its card joined, and a
+    /// path the tree does not have is refused on the status line.
+    fn go_to(&mut self, cx: &mut Cx, pid: u64, typed: &str) {
+        let Some(path) = files::normalize(typed) else {
+            self.status = Some(format!("not a path: {}", typed.trim()));
+            self.redraw(cx);
+            return;
+        };
+        if files::is_dir(&path) {
+            cx.action(PanelAction::FollowLink {
+                pid,
+                target: crate::core::Kind::Files { dir: path },
+                dotted: true,
+                fresh: false,
+            });
+            self.close_path(cx);
+        } else if files::exists(&path) {
+            cx.action(PanelAction::FollowLink {
+                pid,
+                target: crate::core::Kind::File { path },
+                dotted: false,
+                fresh: false,
+            });
+            self.close_path(cx);
+        } else {
+            self.status = Some(format!("no such path: {path}"));
+            self.redraw(cx);
+        }
     }
 
     fn sync_filter(&mut self, cx: &mut Cx) {
@@ -4242,7 +4342,27 @@ impl FilesPanelRef {
         self.borrow().is_some_and(|p| {
             p.view.text_input(cx, ids!(filter_input)).key_focus(cx)
                 || p.view.text_input(cx, ids!(newdir_input)).key_focus(cx)
+                || p.view.text_input(cx, ids!(path_input)).key_focus(cx)
         })
+    }
+
+    /// The `go to` button: the crumbs become a path field, prefilled with
+    /// where the panel stands and a slash, so the offer opens on this
+    /// directory's entries at once.
+    pub fn open_path(&self, cx: &mut Cx) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        p.status = None;
+        let dir = p.table.source().dir.clone();
+        let seed = if dir == files::ROOT { dir } else { format!("{dir}/") };
+        p.view.text_input(cx, ids!(path_input)).set_text(cx, &seed);
+        p.set_path_open(cx, true);
+        p.focus_path_pending = true;
+        p.redraw(cx);
+    }
+
+    /// Whether the path field is up — its rect counts only then.
+    pub fn path_open(&self) -> bool {
+        self.borrow().is_some_and(|p| p.path_open)
     }
 
     /// The `new dir` button: raise the field and put the caret in it.
@@ -4295,18 +4415,29 @@ impl FilesPanelRef {
             .collect()
     }
 
-    /// The open autocomplete's rows, `(label, rect)`.
+    /// The open autocomplete's rows, `(label, rect)` — the filter's box
+    /// or the path field's, whichever is up.
     pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
-        self.borrow()
-            .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
+        self.borrow().map_or_else(Vec::new, |p| {
+            if p.pac.open() {
+                p.pac.hits(cx, &p.suggest_path)
+            } else {
+                p.ac.hits(cx, &p.suggest)
+            }
+        })
     }
 
-    /// Commits the `i`-th suggestion on offer.
+    /// Commits the `i`-th suggestion on offer, in whichever box is up.
     pub fn pick(&self, cx: &mut Cx, i: usize) {
         let Some(mut p) = self.borrow_mut() else { return };
         let p = &mut *p;
-        let filter = p.view.text_input(cx, ids!(filter_input));
-        p.ac.pick(cx, &p.table, &filter, i);
+        if p.pac.open() {
+            let path = p.view.text_input(cx, ids!(path_input));
+            p.pac.pick(cx, &files::PathCompletion, &path, i);
+        } else {
+            let filter = p.view.text_input(cx, ids!(filter_input));
+            p.ac.pick(cx, &p.table, &filter, i);
+        }
     }
 }
 
@@ -4314,17 +4445,44 @@ impl Widget for FilesPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let filter = self.view.text_input(cx, ids!(filter_input));
         let newdir_input = self.view.text_input(cx, ids!(newdir_input));
-        // The deferred focus of `new dir`: the row is drawn now, so the
-        // field has a place to take the keyboard at.
+        let path_input = self.view.text_input(cx, ids!(path_input));
+        // The deferred focus of `new dir` and `go to`: the row is drawn
+        // now, so the field has a place to take the keyboard at. The path
+        // field keeps its seed: the caret lands at the end, not over a
+        // selection that the first letter would replace.
         if self.focus_pending && newdir_input.area().rect(cx).size.y > 0.0 {
             self.focus_pending = false;
             focus_input(cx, &newdir_input);
         }
+        if self.focus_path_pending && path_input.area().rect(cx).size.y > 0.0 {
+            self.focus_path_pending = false;
+            path_input.set_key_focus(cx);
+            let end = path_input.text().len();
+            path_input.set_cursor(cx, Cursor { index: end, prefer_next_row: false }, false);
+        }
         let filter_focused = filter.key_focus(cx);
         let newdir_focused = newdir_input.key_focus(cx);
+        let path_focused = path_input.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        self.ac.track(cx, &filter);
+        self.pac.track(cx, &path_input);
 
         if let Event::KeyDown(k) = event {
+            // Enter in the path field goes to what is typed when that is
+            // a directory the tree has — even with the offer open on its
+            // entries; tab takes the offer, the shell's way.
+            if path_focused && k.key_code == KeyCode::ReturnKey {
+                let typed = path_input.text();
+                let is_dir = files::normalize(&typed).is_some_and(|p| files::is_dir(&p));
+                if is_dir || !self.pac.open() {
+                    self.go_to(cx, pid, &typed);
+                    return;
+                }
+            }
+            if self.pac.key(cx, &files::PathCompletion, &path_input, k) {
+                self.redraw(cx);
+                return;
+            }
             if self.ac.key(cx, &self.table, &filter, k) {
                 self.redraw(cx);
                 return;
@@ -4336,12 +4494,12 @@ impl Widget for FilesPanel {
 
         // `/` focuses the filter, as in the inbox.
         if let Event::TextInput(t) = event {
-            if !filter_focused && !newdir_focused && t.input == "/" {
+            if !filter_focused && !newdir_focused && !path_focused && t.input == "/" {
                 focus_input(cx, &filter);
             }
         }
         if let Event::KeyDown(k) = event {
-            if !filter_focused && !newdir_focused {
+            if !filter_focused && !newdir_focused && !path_focused {
                 match k.key_code {
                     // Enter *goes*: the row's target opens with focus, the
                     // solid-link rule. The walk's preview is the
@@ -4404,6 +4562,15 @@ impl Widget for FilesPanel {
             if newdir_input.escaped(actions) {
                 self.close_newdir(cx);
             }
+            // The path field: enter with no offer up goes; esc puts the
+            // crumbs back.
+            if path_input.returned(actions).is_some() {
+                let typed = path_input.text();
+                self.go_to(cx, pid, &typed);
+            }
+            if path_input.escaped(actions) {
+                self.close_path(cx);
+            }
         }
     }
 
@@ -4429,6 +4596,8 @@ impl Widget for FilesPanel {
         for (i, (slot, sep)) in slots.iter().zip(seps.iter()).enumerate() {
             let link = self.view.link(cx, *slot);
             let shown = ancestors.get(i).is_some();
+            // The disk's root is its own separator: `/ tmp`, not `/ / tmp`.
+            let sep_shown = shown && ancestors.get(i).is_some_and(|(l, _)| l != files::ROOT);
             if let Some((label, path)) = ancestors.get(i) {
                 link.set(
                     cx,
@@ -4439,7 +4608,7 @@ impl Widget for FilesPanel {
                 );
             }
             self.view.widget(cx, *slot).set_visible(cx, shown);
-            self.view.widget(cx, *sep).set_visible(cx, shown);
+            self.view.widget(cx, *sep).set_visible(cx, sep_shown);
         }
         let here = crumbs.last().map(|(l, _)| l.clone()).unwrap_or_default();
         self.view.label(cx, ids!(crumbs.here_lbl)).set_text(cx, &here);
@@ -4466,15 +4635,19 @@ impl Widget for FilesPanel {
         status_lbl.set_text(cx, status.as_deref().unwrap_or(""));
         status_lbl.set_visible(cx, status.is_some());
 
-        // Prime the hidden `new dir` row with one draw into a zero-size
-        // clipped turtle, so its field owns a real area from the first
-        // frame and never passes for the focused one (see `primed`).
+        // Prime the hidden `new dir` and `go to` rows with one draw into a
+        // zero-size clipped turtle, so their fields own a real area from
+        // the first frame and never pass for the focused one (see
+        // `primed`).
         if !self.primed {
             self.primed = true;
-            if !self.newdir_open {
-                let newdir = self.view.widget(cx, ids!(newdir));
-                newdir.set_visible(cx, true);
-                let at = cx.turtle().pos();
+            let at = cx.turtle().pos();
+            for (row, open) in [(ids!(newdir), self.newdir_open), (ids!(path_row), self.path_open)] {
+                if open {
+                    continue;
+                }
+                let w = self.view.widget(cx, row);
+                w.set_visible(cx, true);
                 cx.begin_turtle(
                     Walk::abs_rect(Rect {
                         pos: at,
@@ -4486,9 +4659,9 @@ impl Widget for FilesPanel {
                         ..Default::default()
                     },
                 );
-                newdir.draw_all(cx, scope);
+                w.draw_all(cx, scope);
                 cx.end_turtle();
-                newdir.set_visible(cx, false);
+                w.set_visible(cx, false);
             }
         }
 
@@ -4508,6 +4681,16 @@ impl Widget for FilesPanel {
         }
         self.ac
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
+        // The path field's offer, under it and over the rows.
+        let path_input = self.view.text_input(cx, ids!(path_input));
+        self.pac.draw(
+            cx,
+            scope,
+            &store,
+            &files::PathCompletion,
+            &path_input,
+            &mut self.suggest_path,
+        );
         DrawStep::done()
     }
 }
