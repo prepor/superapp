@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc};
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use makepad_widgets::text::selection::Cursor;
 use makepad_widgets::image_cache::{
-    image_size_by_data, looks_like_svg, process_async_image_load, AsyncImageLoad, ImageCacheImpl,
+    looks_like_svg, process_async_image_load, AsyncImageLoad, AsyncLoadResult, ImageCacheImpl,
 };
 use makepad_widgets::*;
 
@@ -4055,10 +4055,18 @@ impl ThreadMsgRef {
 ///
 /// Nothing here happens in the frame that first shows a picture. A letter's
 /// own `cid:` parts come off a reader thread with its own connection to the
-/// one database (CR-005 phase 0); a `data:` payload is un-base64'd on that
-/// same thread; an image on the web is an ordinary HTTP request. All three
-/// land in [`pictures_landed`], which redraws. The decode from those bytes
-/// to a texture is makepad's, on its own pool, and lands there too.
+/// database the asking panel reads (CR-005 phase 0); a `data:` payload is
+/// un-base64'd on that same thread; an image on the web is an ordinary HTTP
+/// request. All three land in [`pictures_landed`], which redraws. The decode
+/// from those bytes to a texture is makepad's, on its own pool, and lands
+/// there too.
+///
+/// The names are one flat space over every store a process has open. That
+/// is the panels library's business alone — a mount's world is its own
+/// in-memory database, and two mounts can hold different letters under the
+/// same id — and no scene of the catalogue has a `cid:` picture in it. A
+/// mount that grows one wants its store's identity in the scope
+/// `scope_cids` writes, not just the mail's.
 #[derive(Default)]
 pub struct Pictures {
     bytes: HashMap<String, Arc<[u8]>>,
@@ -4069,12 +4077,8 @@ pub struct Pictures {
     /// Jobs handed to the reader thread — a mail whose raw is being taken
     /// apart (`m{id}`), a `data:` source being un-base64'd. Asked once.
     asked: HashSet<String>,
-    /// The one writer, for the reader thread to build its own reader over
-    /// (see [`Pictures::serve`]). `None` until the shell hands it over, and
-    /// in a components-library run for good.
-    db: Option<Arc<crate::store::Db>>,
     /// The reader thread, started with the first letter that has a picture
-    /// in it. `None` when there is no database to read.
+    /// in it.
     reader: Option<mpsc::Sender<PicJob>>,
 }
 
@@ -4082,7 +4086,11 @@ pub struct Pictures {
 /// are had without the network.
 enum PicJob {
     /// Take one mail's raw apart: the `cid:` parts its HTML refers to.
-    Cid(i64),
+    /// The database comes with the job rather than being held here: a
+    /// panels-library mount boots a stage over a world of its own, and a
+    /// reader that had bound one database at startup would answer every
+    /// later panel out of whichever store happened to ask first.
+    Cid { db: Arc<crate::store::Db>, mid: i64 },
     /// Un-base64 one `data:` source, filed under `key`.
     Data { key: String, src: String },
 }
@@ -4121,20 +4129,19 @@ fn pic_key(src: &str) -> String {
 }
 
 impl Pictures {
-    /// Hands over the one writer, so the reader thread can build its own
-    /// reader across it rather than opening a second connection (CR-005
-    /// phase 0). Called once at boot; the thread itself waits for work.
-    pub fn serve(cx: &mut Cx, db: Arc<crate::store::Db>) {
-        cx.global::<Pictures>().db = Some(db);
-    }
-
-    /// The reader thread, started on first need. `None` when nobody handed
-    /// us a database — the caller does the work in the frame then, as it
-    /// always did.
+    /// The reader thread, started on first need. `None` under
+    /// `MAKEPAD=headless`, where the caller does the work in the frame — a
+    /// scripted run wants its pictures in the frame that drew them, which is
+    /// the same bargain makepad's own decode strikes under that cfg.
     fn reader(&mut self) -> Option<mpsc::Sender<PicJob>> {
+        // `cfg!` rather than `#[cfg]` so the thread and its jobs stay
+        // compiled under headless: the branch folds away either way, and
+        // code the linter can still see is code that cannot rot.
+        if cfg!(headless) {
+            return None;
+        }
         if self.reader.is_none() {
-            let db = self.db.clone()?;
-            self.reader = Some(spawn_picture_reader(db));
+            self.reader = Some(spawn_picture_reader());
         }
         self.reader.clone()
     }
@@ -4163,16 +4170,26 @@ impl Pictures {
 /// # Panics
 ///
 /// If the thread cannot be spawned.
-fn spawn_picture_reader(db: Arc<crate::store::Db>) -> mpsc::Sender<PicJob> {
+fn spawn_picture_reader() -> mpsc::Sender<PicJob> {
     let (tx, rx) = mpsc::channel::<PicJob>();
     std::thread::Builder::new()
         .name("pictures".into())
         .spawn(move || {
-            // Its own reader over the *one* writer (CR-005 phase 0).
-            let store = crate::store::Store::with_db(db).ok();
+            // A reader over whichever *one* writer the job names (CR-005
+            // phase 0), kept for as long as the jobs keep naming it — one
+            // process can have several worlds open at once (the panels
+            // library), and in every other run this opens exactly once.
+            let mut held: Option<(Arc<crate::store::Db>, crate::store::Store)> = None;
             while let Ok(job) = rx.recv() {
                 let ready = match job {
-                    PicJob::Cid(mid) => cid_parts(store.as_ref(), mid),
+                    PicJob::Cid { db, mid } => {
+                        if !held.as_ref().is_some_and(|(h, _)| Arc::ptr_eq(h, &db)) {
+                            held = crate::store::Store::with_db(db.clone())
+                                .ok()
+                                .map(|s| (db, s));
+                        }
+                        cid_parts(held.as_ref().map(|(_, s)| s), mid)
+                    }
                     PicJob::Data { key, src } => data_bytes(key, &src),
                 };
                 Cx::post_action(ready);
@@ -4238,7 +4255,7 @@ pub fn want_cid_parts(cx: &mut Cx, store: &Store, mid: i64) {
         return;
     }
     if let Some(tx) = p.reader() {
-        let _ = tx.send(PicJob::Cid(mid));
+        let _ = tx.send(PicJob::Cid { db: store.db(), mid });
         return;
     }
     let ready = cid_parts(Some(store), mid);
@@ -4340,6 +4357,87 @@ pub fn pictures_arrived(cx: &mut Cx, responses: &[NetworkResponse]) -> bool {
         }
     }
     any
+}
+
+/// The largest SVG worth parsing in the frame that draws it. An SVG has no
+/// texture and no cache: it becomes geometry on the widget's own script VM,
+/// so it cannot leave the UI thread the way a raster decode can. makepad's
+/// own ceiling is sixteen megabytes, which is a stalled frame; a picture in
+/// a letter is a logo or a diagram, and this is generous for both.
+const MAX_INLINE_SVG: usize = 64 << 10;
+
+/// Whether the picture's EXIF says it is stored on its side — orientations
+/// 5 to 8, the quarter turns, which swap width and height once decoded.
+///
+/// Read here because the header dimensions makepad reports before a decode
+/// are the *encoded* ones, while the buffer it hands back afterwards has the
+/// turn applied; the box reserved in between has to agree with the second or
+/// it snaps. JPEG only: it is where a rotation tag actually comes from (a
+/// photograph off a phone), and PNG and WebP can carry one in theory and
+/// essentially never do.
+fn exif_turns_the_picture(bytes: &[u8]) -> bool {
+    jpeg_exif(bytes)
+        .and_then(tiff_orientation)
+        .is_some_and(|o| (5..=8).contains(&o))
+}
+
+/// The TIFF block of a JPEG's `APP1 Exif` segment, if it has one. Walks the
+/// marker chain from `SOI` and stops at the first segment that is not one:
+/// EXIF is written before the scan, and reading past it means reading the
+/// entropy-coded image.
+fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
+    let mut at = bytes.strip_prefix(&[0xFF, 0xD8]).map(|_| 2)?;
+    loop {
+        // Any number of fill bytes may pad the run-up to a marker.
+        while bytes.get(at) == Some(&0xFF) && bytes.get(at + 1) == Some(&0xFF) {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&0xFF) {
+            return None;
+        }
+        let marker = *bytes.get(at + 1)?;
+        // Start of scan, or anything with no length: past the metadata.
+        if marker == 0xDA || marker == 0xD9 || (0xD0..=0xD8).contains(&marker) {
+            return None;
+        }
+        let len = u16::from_be_bytes([*bytes.get(at + 2)?, *bytes.get(at + 3)?]) as usize;
+        let body = bytes.get(at + 4..at + 2 + len.max(2))?;
+        if marker == 0xE1 {
+            if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
+                return Some(tiff);
+            }
+        }
+        at += 2 + len.max(2);
+    }
+}
+
+/// The Orientation tag (`0x0112`) of a TIFF header block, in either byte
+/// order. Only the first IFD is walked — orientation lives there.
+fn tiff_orientation(tiff: &[u8]) -> Option<u16> {
+    let big = match tiff.get(..2)? {
+        b"MM" => true,
+        b"II" => false,
+        _ => return None,
+    };
+    let u16_at = |i: usize| -> Option<u16> {
+        let b = [*tiff.get(i)?, *tiff.get(i + 1)?];
+        Some(if big { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) })
+    };
+    let u32_at = |i: usize| -> Option<u32> {
+        let b = [*tiff.get(i)?, *tiff.get(i + 1)?, *tiff.get(i + 2)?, *tiff.get(i + 3)?];
+        Some(if big { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
+    };
+    if u16_at(2)? != 42 {
+        return None;
+    }
+    let ifd = u32_at(4)? as usize;
+    let count = u16_at(ifd)? as usize;
+    (0..count).find_map(|i| {
+        let e = ifd + 2 + i * 12;
+        // A SHORT's value sits in the first two bytes of the value field,
+        // whichever end of the four the byte order puts it at.
+        (u16_at(e)? == 0x0112).then(|| u16_at(e + 8))?
+    })
 }
 
 /// How far along one picture is. Nothing here is done in the frame that
@@ -4453,10 +4551,13 @@ impl Widget for HtmlImage {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
-        match self.state {
-            Pic::Want => self.load(cx),
-            Pic::Loading => self.settle(cx),
-            _ => {}
+        // Asked again while it decodes, not once: re-asking is an early
+        // return inside makepad's cache while the job is still on the pool,
+        // and the one way back when a *finished* texture is evicted under
+        // the cache's 512-entry cap before this item next drew (which would
+        // otherwise hold the box blank for good).
+        if matches!(self.state, Pic::Want | Pic::Loading) {
+            self.load(cx);
         }
         match self.state {
             Pic::Shown => {
@@ -4530,9 +4631,17 @@ impl HtmlImage {
             return;
         }
         let Some(bytes) = p.bytes.get(&self.key).cloned() else { return };
-        // An SVG is drawn rather than decoded — no texture, so there is
-        // nothing to hand a thread and nothing to wait for.
+        // An SVG is drawn rather than decoded: it becomes geometry on the
+        // widget's own VM, which no thread can be handed, so the parse can
+        // only happen here. Hence the cap — makepad would take sixteen
+        // megabytes of it, and a document that size is a stalled frame by
+        // any other name. A picture in a letter is a logo or a diagram; one
+        // past this is alt text, said once.
         if looks_like_svg(&bytes) {
+            if bytes.len() > MAX_INLINE_SVG {
+                self.fail(cx);
+                return;
+            }
             match self.image.load_svg_from_shared_data(cx, bytes) {
                 Ok(()) => self.state = Pic::Shown,
                 Err(_) => self.fail(cx),
@@ -4540,31 +4649,35 @@ impl HtmlImage {
             return;
         }
         let key = PathBuf::from(&self.key);
-        // The header alone gives the size, so the box is right from this
-        // frame on; a header that will not read is a picture that will not
-        // decode, and saying so here saves the pool the trip.
-        let Ok((w, h)) = image_size_by_data(&bytes, &key) else {
-            self.fail(cx);
-            return;
-        };
-        self.nat = Some((w.max(1) as f64, h.max(1) as f64));
-        // The decode and its mip chain go to makepad's pool; the texture
-        // lands in its cache (see [`pictures_landed`]) and [`Self::settle`]
-        // picks it up. Under `MAKEPAD=headless` makepad decodes inline, so a
-        // scripted run still has its pictures in the frame it drew them.
-        let _ = self.image.load_image_from_data_async(cx, &key, bytes);
-        self.state = Pic::Loading;
-    }
-
-    /// Picks the finished texture out of makepad's cache. Read from the draw
-    /// rather than from the action, so an item that was scrolled out of its
-    /// list while its picture decoded still finds it on the way back.
-    fn settle(&mut self, cx: &mut Cx2d) {
-        let key = PathBuf::from(&self.key);
-        if ImageCacheImpl::load_image_from_cache(&mut self.image, cx, &key, 0) {
-            self.state = Pic::Shown;
-        } else if cx.global::<Pictures>().failed.contains(&self.key) {
-            self.state = Pic::Failed;
+        // The decode and its mip chain go to makepad's pool, keyed in its
+        // texture cache; `Loading` carries the size off the header, which is
+        // what lets the box be right before the pixels are. `Loaded` is a
+        // decode that already happened — another item's, or this frame's,
+        // since makepad decodes inline under `MAKEPAD=headless` — and the
+        // texture is on the widget by the time it says so.
+        match ImageCacheImpl::load_image_from_data_async_impl(
+            &mut self.image,
+            cx,
+            &key,
+            bytes.clone(),
+            0,
+        ) {
+            Ok(AsyncLoadResult::Loaded) => self.state = Pic::Shown,
+            Ok(AsyncLoadResult::Loading(w, h)) => {
+                let (w, h) = (w.max(1) as f64, h.max(1) as f64);
+                // The header's width and height are the *encoded* ones; a
+                // quarter-turn of EXIF orientation is applied by the decoder
+                // and not by the header, so the box has to turn with it or
+                // a portrait photograph reserves a landscape hole and snaps
+                // when the texture lands.
+                self.nat = Some(if exif_turns_the_picture(&bytes) {
+                    (h, w)
+                } else {
+                    (w, h)
+                });
+                self.state = Pic::Loading;
+            }
+            Err(_) => self.fail(cx),
         }
     }
 
@@ -5218,6 +5331,54 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         .expect("the reader thread");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "cid:m7/sketch.png@ivanov.dev");
+    }
+
+    /// A JPEG carrying one EXIF Orientation tag and nothing else: `SOI`,
+    /// then an `APP1 Exif` segment over a one-entry TIFF header block.
+    fn jpeg_oriented(o: u16, big: bool) -> Vec<u8> {
+        let u16b = |v: u16| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let u32b = |v: u32| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let mut tiff: Vec<u8> = if big { b"MM".to_vec() } else { b"II".to_vec() };
+        tiff.extend(u16b(42));
+        tiff.extend(u32b(8)); // IFD0 begins right after this header
+        tiff.extend(u16b(1)); // one entry
+        tiff.extend(u16b(0x0112)); // Orientation
+        tiff.extend(u16b(3)); // SHORT
+        tiff.extend(u32b(1)); // one of them
+        tiff.extend(u16b(o)); // …in the first two bytes of the value field
+        tiff.extend([0, 0]);
+        tiff.extend(u32b(0)); // no second IFD
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend(&tiff);
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        out.extend(((app1.len() + 2) as u16).to_be_bytes());
+        out.extend(app1);
+        out
+    }
+
+    /// A quarter turn of EXIF swaps the picture's axes on decode but not in
+    /// its header, and the box is reserved off the header — so the turn has
+    /// to be read here or a portrait photograph reserves a landscape hole.
+    #[test]
+    fn a_quarter_turn_of_exif_is_read_before_the_decode() {
+        for o in 5..=8 {
+            assert!(exif_turns_the_picture(&jpeg_oriented(o, false)), "little-endian {o}");
+            assert!(exif_turns_the_picture(&jpeg_oriented(o, true)), "big-endian {o}");
+        }
+        for o in [1, 2, 3, 4] {
+            assert!(!exif_turns_the_picture(&jpeg_oriented(o, false)), "upright {o}");
+        }
+    }
+
+    /// Nothing to read is not a turn: a JPEG with no EXIF, a PNG, a truncated
+    /// header and an empty source all keep the header's own axes.
+    #[test]
+    fn a_picture_with_no_exif_keeps_its_axes() {
+        assert!(!exif_turns_the_picture(&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2]));
+        assert!(!exif_turns_the_picture(b"\x89PNG\r\n\x1a\n"));
+        assert!(!exif_turns_the_picture(&jpeg_oriented(6, false)[..8]));
+        assert!(!exif_turns_the_picture(&[]));
     }
 
     /// A `data:` URL *is* its payload: filing it under itself would put

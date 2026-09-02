@@ -4462,12 +4462,6 @@ impl Stage {
             }
             self.solo = Some(pid);
         }
-        // The picture reader joins the one writer, as the other workers do
-        // (CR-005 phase 0). Headless has no thread: a scripted run wants its
-        // pictures in the frame that drew them, so the work stays inline —
-        // the same bargain makepad's own decode strikes under `headless`.
-        #[cfg(not(headless))]
-        crate::panels::Pictures::serve(cx, s.store.db());
         s.spawn_workers();
         s.sync();
         let virtual_time = s.virtual_time;

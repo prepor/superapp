@@ -108,3 +108,9 @@ zero frames. Trackpad pans bypass the springs (1:1, camera jump).
   hands the bytes to makepad's decode pool instead of decoding them, and the
   size comes off the image header — cheap, and enough to reserve the space
   the picture will fill while it is still decoding.
+
+  Some work genuinely cannot leave the thread: an SVG becomes geometry on the
+  widget's own script VM, so parsing it is the UI thread's or nobody's. Then
+  cap what you are willing to accept rather than letting one document decide
+  how long the frame takes — `MAX_INLINE_SVG` is 64 KiB, and past it the
+  picture is its alt text.
