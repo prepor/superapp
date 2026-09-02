@@ -4462,6 +4462,12 @@ impl Stage {
             }
             self.solo = Some(pid);
         }
+        // The picture reader joins the one writer, as the other workers do
+        // (CR-005 phase 0). Headless has no thread: a scripted run wants its
+        // pictures in the frame that drew them, so the work stays inline —
+        // the same bargain makepad's own decode strikes under `headless`.
+        #[cfg(not(headless))]
+        crate::panels::Pictures::serve(cx, s.store.db());
         s.spawn_workers();
         s.sync();
         let virtual_time = s.virtual_time;
@@ -5101,6 +5107,24 @@ impl Widget for Stage {
         if self.frozen() {
             return;
         }
+        // Images the open letters asked for (see `Pictures`): filed as they
+        // arrive, and everything redraws to place them. An HTTP reply, bytes
+        // the picture reader took out of a letter's raw, a texture makepad's
+        // decode pool finished — all three land in a `Cx` global that is no
+        // stage's property, so they are filed above the suspend gate below:
+        // each is delivered once, and a stage that let one past would strand
+        // the item waiting on it. Before the hosted content sees the same
+        // actions, so an item that asked finds its texture already cached.
+        if let Event::NetworkResponses(responses) = event {
+            if crate::panels::pictures_arrived(cx, responses) {
+                cx.redraw_all();
+            }
+        }
+        if let Event::Actions(actions) = event {
+            if crate::panels::pictures_landed(cx, actions) {
+                cx.redraw_all();
+            }
+        }
         // Under the library: the world keeps turning (timers, the store's
         // signals, a running script), the window is not this stage's.
         if self.suspended
@@ -5111,13 +5135,6 @@ impl Widget for Stage {
             && !(matches!(event, Event::NextFrame(_)) && self.e2e.is_some())
         {
             return;
-        }
-        // Images the open letters asked for (see `Pictures`): filed as they
-        // arrive, and everything redraws to place them.
-        if let Event::NetworkResponses(responses) = event {
-            if crate::panels::pictures_arrived(cx, responses) {
-                cx.redraw_all();
-            }
         }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner

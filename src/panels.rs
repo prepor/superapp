@@ -8,11 +8,14 @@
 //! store actions — so undo semantics never enter this module).
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc};
 
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use makepad_widgets::text::selection::Cursor;
-use makepad_widgets::image_cache::ImageCacheImpl;
+use makepad_widgets::image_cache::{
+    image_size_by_data, looks_like_svg, process_async_image_load, AsyncImageLoad, ImageCacheImpl,
+};
 use makepad_widgets::*;
 
 use crate::core::Seed;
@@ -4045,23 +4048,250 @@ impl ThreadMsgRef {
 // ---------------------------------------------------------------------------
 
 /// The bytes of every image an open letter or article refers to, by the
-/// source its `<img>` names — filed by whoever has them: the message panel
-/// for a letter's own `cid:` parts, the shell for an HTTP reply — and read
-/// by [`HtmlImage`] as it draws. Lives on `Cx` as a global: the items are
-/// minted by the `Html` widget from a template and can reach nothing else.
+/// name [`pic_key`] files it under — fetched, read or un-base64'd by
+/// whoever has them, and read back by [`HtmlImage`] as it draws. Lives on
+/// `Cx` as a global: the items are minted by the `Html` widget from a
+/// template and can reach nothing else.
+///
+/// Nothing here happens in the frame that first shows a picture. A letter's
+/// own `cid:` parts come off a reader thread with its own connection to the
+/// one database (CR-005 phase 0); a `data:` payload is un-base64'd on that
+/// same thread; an image on the web is an ordinary HTTP request. All three
+/// land in [`pictures_landed`], which redraws. The decode from those bytes
+/// to a texture is makepad's, on its own pool, and lands there too.
 #[derive(Default)]
 pub struct Pictures {
-    bytes: HashMap<String, Rc<[u8]>>,
+    bytes: HashMap<String, Arc<[u8]>>,
     /// Requests out on the network, by request id.
     inflight: HashMap<LiveId, String>,
     /// Sources that did not arrive or did not decode: asked once, not again.
     failed: HashSet<String>,
+    /// Jobs handed to the reader thread — a mail whose raw is being taken
+    /// apart (`m{id}`), a `data:` source being un-base64'd. Asked once.
+    asked: HashSet<String>,
+    /// The one writer, for the reader thread to build its own reader over
+    /// (see [`Pictures::serve`]). `None` until the shell hands it over, and
+    /// in a components-library run for good.
+    db: Option<Arc<crate::store::Db>>,
+    /// The reader thread, started with the first letter that has a picture
+    /// in it. `None` when there is no database to read.
+    reader: Option<mpsc::Sender<PicJob>>,
+}
+
+/// One piece of work for the reader thread — the two ways a picture's bytes
+/// are had without the network.
+enum PicJob {
+    /// Take one mail's raw apart: the `cid:` parts its HTML refers to.
+    Cid(i64),
+    /// Un-base64 one `data:` source, filed under `key`.
+    Data { key: String, src: String },
+}
+
+/// What the reader thread found, on its way back to the UI thread.
+struct PicturesReady {
+    items: Vec<(String, Arc<[u8]>)>,
+    failed: Vec<String>,
+    /// Jobs to forget having asked: the work found nothing, and the reason
+    /// may not last — a letter whose raw has not been stored yet is worth
+    /// asking about again the next time it opens.
+    retry: Vec<String>,
+}
+
+impl std::fmt::Debug for PicturesReady {
+    /// The bytes themselves are megabytes and never worth printing; what an
+    /// action log wants is which sources landed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PicturesReady")
+            .field("items", &self.items.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .field("failed", &self.failed)
+            .field("retry", &self.retry)
+            .finish()
+    }
+}
+
+/// The name a source is filed under: its own, unless it carries its bytes
+/// inside it. A `data:` URL *is* its payload — megabytes of map key, and of
+/// texture-cache path, for what sixteen hex characters name just as well.
+fn pic_key(src: &str) -> String {
+    if src.starts_with("data:") {
+        format!("data:{:016x}", LiveId::from_str(src).0)
+    } else {
+        src.to_string()
+    }
 }
 
 impl Pictures {
-    pub fn put(&mut self, src: String, bytes: Vec<u8>) {
-        self.bytes.insert(src, bytes.into());
+    /// Hands over the one writer, so the reader thread can build its own
+    /// reader across it rather than opening a second connection (CR-005
+    /// phase 0). Called once at boot; the thread itself waits for work.
+    pub fn serve(cx: &mut Cx, db: Arc<crate::store::Db>) {
+        cx.global::<Pictures>().db = Some(db);
     }
+
+    /// The reader thread, started on first need. `None` when nobody handed
+    /// us a database — the caller does the work in the frame then, as it
+    /// always did.
+    fn reader(&mut self) -> Option<mpsc::Sender<PicJob>> {
+        if self.reader.is_none() {
+            let db = self.db.clone()?;
+            self.reader = Some(spawn_picture_reader(db));
+        }
+        self.reader.clone()
+    }
+
+    /// Files what the reader thread (or, with no thread, the frame) found.
+    fn take(&mut self, ready: &PicturesReady) {
+        for (key, bytes) in &ready.items {
+            self.bytes.insert(key.clone(), bytes.clone());
+        }
+        for key in &ready.failed {
+            self.failed.insert(key.clone());
+        }
+        for key in &ready.retry {
+            self.asked.remove(key);
+        }
+    }
+}
+
+/// The reader thread: one mail's raw taken apart, one `data:` payload
+/// un-base64'd, and back to the UI thread as a [`PicturesReady`] action.
+/// Both jobs used to run inside the frame that first drew the picture — the
+/// read is SQLite I/O over a whole RFC822 message, the MIME walk decodes
+/// every part of it, and a letter with three screenshots in it made the
+/// frame that opened it visibly late.
+///
+/// # Panics
+///
+/// If the thread cannot be spawned.
+fn spawn_picture_reader(db: Arc<crate::store::Db>) -> mpsc::Sender<PicJob> {
+    let (tx, rx) = mpsc::channel::<PicJob>();
+    std::thread::Builder::new()
+        .name("pictures".into())
+        .spawn(move || {
+            // Its own reader over the *one* writer (CR-005 phase 0).
+            let store = crate::store::Store::with_db(db).ok();
+            while let Ok(job) = rx.recv() {
+                let ready = match job {
+                    PicJob::Cid(mid) => cid_parts(store.as_ref(), mid),
+                    PicJob::Data { key, src } => data_bytes(key, &src),
+                };
+                Cx::post_action(ready);
+            }
+        })
+        .expect("spawn the picture reader");
+    tx
+}
+
+/// One letter's own pictures: the `cid:` parts of its raw, under the names
+/// the narrowing wrote (see [`crate::html::scope_cids`]). Pure, so the
+/// reader thread and a frame with no thread behind it can both run it.
+fn cid_parts(store: Option<&Store>, mid: i64) -> PicturesReady {
+    let items: Vec<_> = store
+        .and_then(|s| mail::raw(s, mid))
+        .map(|raw| {
+            crate::sync::inline_images(&raw)
+                .into_iter()
+                .map(|(cid, bytes)| (format!("cid:m{mid}/{cid}"), Arc::from(bytes)))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A letter with no raw stored for it yet has nothing to take apart —
+    // and may well have it by the next time it opens, so the ask is not
+    // held against it (see `PicturesReady::retry`).
+    let retry = if items.is_empty() {
+        vec![format!("m{mid}")]
+    } else {
+        Vec::new()
+    };
+    PicturesReady {
+        items,
+        failed: Vec::new(),
+        retry,
+    }
+}
+
+/// The bytes a `data:` source carries, un-base64'd. Pure, as [`cid_parts`].
+fn data_bytes(key: String, src: &str) -> PicturesReady {
+    match src
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .and_then(|(_, b)| crate::html::base64_decode(b))
+    {
+        Some(bytes) => PicturesReady {
+            items: vec![(key, Arc::from(bytes))],
+            failed: Vec::new(),
+            retry: Vec::new(),
+        },
+        None => PicturesReady {
+            items: Vec::new(),
+            failed: vec![key],
+            retry: Vec::new(),
+        },
+    }
+}
+
+/// Asks for one letter's own pictures, once. The read and the MIME walk go
+/// to the reader thread; the parts land in [`pictures_landed`].
+pub fn want_cid_parts(cx: &mut Cx, store: &Store, mid: i64) {
+    let p = cx.global::<Pictures>();
+    if !p.asked.insert(format!("m{mid}")) {
+        return;
+    }
+    if let Some(tx) = p.reader() {
+        let _ = tx.send(PicJob::Cid(mid));
+        return;
+    }
+    let ready = cid_parts(Some(store), mid);
+    cx.global::<Pictures>().take(&ready);
+}
+
+/// Asks for the bytes a `data:` source carries, once.
+fn want_data_bytes(cx: &mut Cx, key: &str, src: &str) {
+    let p = cx.global::<Pictures>();
+    if !p.asked.insert(key.to_string()) {
+        return;
+    }
+    if let Some(tx) = p.reader() {
+        let _ = tx.send(PicJob::Data {
+            key: key.to_string(),
+            src: src.to_string(),
+        });
+        return;
+    }
+    let ready = data_bytes(key.to_string(), src);
+    cx.global::<Pictures>().take(&ready);
+}
+
+/// Files what finished off the frame: bytes the reader thread found, and
+/// textures makepad's decode pool finished. True when anything landed, so
+/// the shell redraws — a picture that arrives has to be placed, and the
+/// item that wants it may be anywhere in the tree.
+pub fn pictures_landed(cx: &mut Cx, actions: &Actions) -> bool {
+    let mut any = false;
+    for a in actions {
+        if let Some(ready) = a.downcast_ref::<PicturesReady>() {
+            cx.global::<Pictures>().take(ready);
+            any = true;
+        }
+        let Some(AsyncImageLoad { image_path, result }) = a.downcast_ref::<AsyncImageLoad>() else {
+            continue;
+        };
+        // Taken here rather than left for the item that asked: the item may
+        // be scrolled out of its list by now, and a decode nobody commits
+        // leaves the cache entry pending for good. Committing it early costs
+        // the item nothing — its own handler reads the texture back out of
+        // the cache either way.
+        let Some(result) = result.borrow_mut().take() else { continue };
+        // A picture that would not decode is given up on, so the item that
+        // asked stops holding a blank box open for it and shows its alt text.
+        if result.is_err() {
+            let key = image_path.to_string_lossy().to_string();
+            cx.global::<Pictures>().failed.insert(key);
+        }
+        process_async_image_load(cx, image_path, result);
+        any = true;
+    }
+    any
 }
 
 /// Asks the network for `src` unless it is here, on its way, or known not
@@ -4112,13 +4342,34 @@ pub fn pictures_arrived(cx: &mut Cx, responses: &[NetworkResponse]) -> bool {
     any
 }
 
+/// How far along one picture is. Nothing here is done in the frame that
+/// asks for it: the bytes come from [`Pictures`] and the decode from
+/// makepad's pool, so an item goes `Want` → `Loading` → `Shown` across at
+/// least two frames, holding its own box open in between.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Pic {
+    /// No bytes yet: asked for, or waiting on a source someone else files.
+    #[default]
+    Want,
+    /// Bytes in hand, decoding on the pool. The natural size is known (it
+    /// comes off the header), so the box is already the right one.
+    Loading,
+    /// A texture, or a drawn SVG.
+    Shown,
+    /// No source to be had, or nothing that decodes: its alt text, for good.
+    Failed,
+}
+
 /// An `<img>` in a letter or an article: the image item the `Html` widget
 /// places in its flow for the tag, sized to its own pixels or its `width`
 /// hint and never wider than the column. Its bytes come from [`Pictures`]
-/// (a `cid:` part the panel filed, an HTTP reply) or from the source itself
-/// (`data:`); until they do, or when they never will, it is its alt text.
-/// With an `href` — the link the picture sat in — a tap on it is a link
-/// click, the same action the text links raise.
+/// — a `cid:` part off a letter's raw, a `data:` payload, an HTTP reply,
+/// all of them found off the frame — and the decode from those bytes runs
+/// on makepad's pool, keyed in its texture cache so the same picture in two
+/// panels is decoded once. Until the bytes come it is its alt text; once
+/// they do it holds the box the picture will fill, so nothing reflows when
+/// the texture lands. With an `href` — the link the picture sat in — a tap
+/// on it is a link click, the same action the text links raise.
 #[derive(Script, Widget)]
 pub struct HtmlImage {
     #[uid]
@@ -4143,9 +4394,15 @@ pub struct HtmlImage {
     #[rust]
     href: String,
     #[rust]
-    loaded: bool,
+    state: Pic,
+    /// The name its bytes are filed under (see [`pic_key`]), and the key its
+    /// texture sits in makepad's cache under. Computed once.
     #[rust]
-    failed: bool,
+    key: String,
+    /// Its own pixels, off the header — known while the decode is still
+    /// running, which is what keeps the box from jumping when it lands.
+    #[rust]
+    nat: Option<(f64, f64)>,
 }
 
 impl ScriptHook for HtmlImage {
@@ -4176,7 +4433,7 @@ impl Widget for HtmlImage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         // An animated texture ticks through the image's own next-frame.
         self.image.handle_event(cx, event, scope);
-        if self.href.is_empty() || !self.loaded {
+        if self.href.is_empty() || self.state != Pic::Shown {
             return;
         }
         match event.hits(cx, self.image.area()) {
@@ -4196,73 +4453,126 @@ impl Widget for HtmlImage {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
-        if !self.loaded && !self.failed {
-            self.load(cx);
+        match self.state {
+            Pic::Want => self.load(cx),
+            Pic::Loading => self.settle(cx),
+            _ => {}
         }
-        if self.loaded {
-            let (nw, nh) = self.image.size_in_pixels(cx).unwrap_or((1, 1));
-            let (nw, nh) = (nw.max(1) as f64, nh.max(1) as f64);
-            let mut w = self.width.filter(|w| *w >= 1.0).unwrap_or(nw);
-            let avail = cx.turtle().inner_width();
-            if avail.is_finite() && avail > 1.0 {
-                w = w.min(avail);
+        match self.state {
+            Pic::Shown => {
+                let nat = self
+                    .image
+                    .size_in_pixels(cx)
+                    .map(|(w, h)| (w.max(1) as f64, h.max(1) as f64))
+                    .or(self.nat)
+                    .unwrap_or((1.0, 1.0));
+                let walk = self.box_walk(cx, nat);
+                self.image.draw_walk_image(cx, walk)
             }
-            let walk = Walk {
-                width: Size::Fixed(w),
-                height: Size::Fixed(w * nh / nw),
-                ..Walk::default()
-            };
-            return self.image.draw_walk_image(cx, walk);
+            // Bytes in hand, decoding: hold the box the picture will fill
+            // rather than lay out the alt text and reflow a frame later.
+            Pic::Loading => {
+                let walk = self.box_walk(cx, self.nat.unwrap_or((1.0, 1.0)));
+                cx.walk_turtle(walk);
+                DrawStep::done()
+            }
+            Pic::Want | Pic::Failed => {
+                if !self.alt.is_empty() {
+                    self.draw_text
+                        .draw_walk(cx, Walk::fit(), Align::default(), &self.alt);
+                }
+                DrawStep::done()
+            }
         }
-        if !self.alt.is_empty() {
-            self.draw_text
-                .draw_walk(cx, Walk::fit(), Align::default(), &self.alt);
-        }
-        DrawStep::done()
     }
 }
 
 impl HtmlImage {
     /// Shown, and a link: a tap on it goes somewhere.
     pub fn is_link(&self) -> bool {
-        self.loaded && !self.href.is_empty()
+        self.state == Pic::Shown && !self.href.is_empty()
     }
 
-    /// Finds the bytes and decodes them, once. A source that cannot be had
-    /// or read is given up on rather than asked every frame; a `cid:` part
-    /// not filed yet is waited for, since the panel files them as it draws.
-    fn load(&mut self, cx: &mut Cx2d) {
-        let bytes: Rc<[u8]> = if let Some(rest) = self.src.strip_prefix("data:") {
-            match rest.split_once(',').and_then(|(_, b)| crate::html::base64_decode(b)) {
-                Some(b) => b.into(),
-                None => {
-                    self.failed = true;
-                    return;
-                }
-            }
-        } else {
-            let p = cx.global::<Pictures>();
-            if p.failed.contains(&self.src) {
-                self.failed = true;
-                return;
-            }
-            match p.bytes.get(&self.src).cloned() {
-                Some(b) => b,
-                None => {
-                    if self.src.starts_with("http") {
-                        fetch_picture(cx, &self.src);
-                    }
-                    return;
-                }
-            }
-        };
-        match ImageCacheImpl::load_image_from_data(&mut self.image, cx, &bytes, 0) {
-            Ok(()) => self.loaded = true,
-            Err(_) => {
-                self.failed = true;
-                cx.global::<Pictures>().failed.insert(self.src.clone());
-            }
+    /// The box a picture of these pixels takes: its `width` hint or its own
+    /// width, never wider than the column, and its own aspect either way.
+    fn box_walk(&self, cx: &Cx2d, (nw, nh): (f64, f64)) -> Walk {
+        let mut w = self.width.filter(|w| *w >= 1.0).unwrap_or(nw);
+        let avail = cx.turtle().inner_width();
+        if avail.is_finite() && avail > 1.0 {
+            w = w.min(avail);
         }
+        Walk {
+            width: Size::Fixed(w),
+            height: Size::Fixed(w * nh / nw),
+            ..Walk::default()
+        }
+    }
+
+    /// Asks for the bytes and starts the decode, once they are here. A
+    /// source that cannot be had or read is given up on rather than asked
+    /// every frame; one whose bytes are still coming is simply asked again
+    /// next frame, since asking is one lookup.
+    fn load(&mut self, cx: &mut Cx2d) {
+        if self.key.is_empty() {
+            self.key = pic_key(&self.src);
+        }
+        // Where the bytes come from, if nobody has filed them yet. A `cid:`
+        // part is the letter's own and its panel asks for it (see
+        // [`want_cid_parts`]); the other two are this item's to ask for.
+        if self.src.starts_with("data:") {
+            want_data_bytes(cx, &self.key, &self.src);
+        } else if self.src.starts_with("http") {
+            fetch_picture(cx, &self.src);
+        }
+        let p = cx.global::<Pictures>();
+        if p.failed.contains(&self.key) {
+            self.state = Pic::Failed;
+            return;
+        }
+        let Some(bytes) = p.bytes.get(&self.key).cloned() else { return };
+        // An SVG is drawn rather than decoded — no texture, so there is
+        // nothing to hand a thread and nothing to wait for.
+        if looks_like_svg(&bytes) {
+            match self.image.load_svg_from_shared_data(cx, bytes) {
+                Ok(()) => self.state = Pic::Shown,
+                Err(_) => self.fail(cx),
+            }
+            return;
+        }
+        let key = PathBuf::from(&self.key);
+        // The header alone gives the size, so the box is right from this
+        // frame on; a header that will not read is a picture that will not
+        // decode, and saying so here saves the pool the trip.
+        let Ok((w, h)) = image_size_by_data(&bytes, &key) else {
+            self.fail(cx);
+            return;
+        };
+        self.nat = Some((w.max(1) as f64, h.max(1) as f64));
+        // The decode and its mip chain go to makepad's pool; the texture
+        // lands in its cache (see [`pictures_landed`]) and [`Self::settle`]
+        // picks it up. Under `MAKEPAD=headless` makepad decodes inline, so a
+        // scripted run still has its pictures in the frame it drew them.
+        let _ = self.image.load_image_from_data_async(cx, &key, bytes);
+        self.state = Pic::Loading;
+    }
+
+    /// Picks the finished texture out of makepad's cache. Read from the draw
+    /// rather than from the action, so an item that was scrolled out of its
+    /// list while its picture decoded still finds it on the way back.
+    fn settle(&mut self, cx: &mut Cx2d) {
+        let key = PathBuf::from(&self.key);
+        if ImageCacheImpl::load_image_from_cache(&mut self.image, cx, &key, 0) {
+            self.state = Pic::Shown;
+        } else if cx.global::<Pictures>().failed.contains(&self.key) {
+            self.state = Pic::Failed;
+        }
+    }
+
+    /// Gives up on this source — here and for every other item that names
+    /// it, so one letter's broken picture is decoded no more than once.
+    fn fail(&mut self, cx: &mut Cx2d) {
+        self.state = Pic::Failed;
+        cx.global::<Pictures>().failed.insert(self.key.clone());
     }
 }
 
@@ -4404,9 +4714,11 @@ impl Widget for MessagePanel {
             }
             self.scrolled_for = Some(seed);
         }
-        // A letter's own images — the `cid:` parts of its raw — are filed
-        // under its name before its rows draw: the image items look them
-        // up by the source the narrowing wrote (see `scope_cids`).
+        // A letter's own images — the `cid:` parts of its raw — are asked
+        // for as its rows open: the read and the MIME walk happen off the
+        // frame (see `want_cid_parts`) and the parts are filed under the
+        // names the narrowing wrote (see `scope_cids`), which the image
+        // items then look themselves up by.
         for t in msgs.iter() {
             let mid = t.mail.head.id;
             if !expand.open.contains(&mid)
@@ -4416,12 +4728,7 @@ impl Widget for MessagePanel {
                 continue;
             }
             self.pictured.insert(mid);
-            if let Some(raw) = mail::raw(&p.store, mid) {
-                let pics = cx.global::<Pictures>();
-                for (cid, bytes) in crate::sync::inline_images(&raw) {
-                    pics.put(format!("cid:m{mid}/{cid}"), bytes);
-                }
-            }
+            want_cid_parts(cx, &p.store, mid);
         }
         let n = msgs.len();
         let mut live: Vec<usize> = Vec::new();
@@ -4804,5 +5111,126 @@ trait LinkViewExt {
 impl LinkViewExt for View {
     fn link(&self, cx: &mut Cx, path: &[LiveId]) -> SLinkRef {
         self.widget(cx, path).as_slink()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    /// A pasted screenshot the way a letter carries one: `multipart/related`,
+    /// the HTML naming the image part by its Content-ID.
+    const RAW: &str = "From: Max Ivanov <max@ivanov.dev>\r\n\
+Subject: the sketch\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/related; boundary=\"rel\"\r\n\
+\r\n\
+--rel\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>Like so:</p><img src=\"cid:sketch.png@ivanov.dev\" alt=\"the sketch\">\r\n\
+--rel\r\n\
+Content-Type: image/png; name=\"sketch.png\"\r\n\
+Content-ID: <sketch.png@ivanov.dev>\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAASUVORK5CYII=\r\n\
+--rel--\r\n";
+
+    /// A store holding one letter, with `raw` when asked for.
+    fn store(raw: Option<&'static str>) -> Store {
+        let s = Store::open(None).expect("in-memory store");
+        s.write(move |c| {
+            c.execute(
+                "INSERT INTO account(id, label, email) VALUES(1, 't', 't@t')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO folder(id, account, name, role) VALUES(1, 1, 'Inbox', 'inbox')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO message(id, account, folder, from_email, subject, date, raw)
+                 VALUES(7, 1, 1, 'max@ivanov.dev', 'the sketch', 1.0, ?1)",
+                rusqlite::params![raw.map(str::as_bytes)],
+            )
+            .map(|_| ())
+        })
+        .expect("the letter");
+        s
+    }
+
+    /// The reader thread files a letter's own pictures under the names the
+    /// narrowing writes into its HTML — `scope_cids` prefixes every `cid:`
+    /// with the mail's own `m{id}`, and this is the other half of that pact.
+    #[test]
+    fn cid_parts_are_filed_under_the_names_the_html_refers_to() {
+        let ready = cid_parts(Some(&store(Some(RAW))), 7);
+        assert_eq!(ready.items.len(), 1);
+        assert_eq!(ready.items[0].0, "cid:m7/sketch.png@ivanov.dev");
+        assert!(ready.items[0].1.starts_with(b"\x89PNG"));
+        assert!(ready.retry.is_empty(), "found: nothing to ask again");
+        let html = crate::html::scope_cids(
+            "<img src=\"cid:sketch.png@ivanov.dev\">",
+            &format!("m{}", 7),
+        );
+        assert!(
+            html.contains(&format!("src=\"{}\"", ready.items[0].0)),
+            "the panel and the reader name the same picture: {html}"
+        );
+    }
+
+    /// A letter whose raw has not been stored yet is not held against: the
+    /// ask is forgotten, so the next open asks again.
+    #[test]
+    fn a_letter_with_no_raw_is_worth_asking_about_again() {
+        let ready = cid_parts(Some(&store(None)), 7);
+        assert!(ready.items.is_empty());
+        assert_eq!(ready.retry, vec!["m7".to_string()]);
+    }
+
+    /// A `data:` source carries its own bytes; base64 that will not read is
+    /// a picture given up on rather than one asked for every frame.
+    #[test]
+    fn data_sources_carry_their_own_bytes() {
+        let ready = data_bytes("k".into(), "data:image/png;base64,aGVsbG8=");
+        assert_eq!(ready.items.len(), 1);
+        assert_eq!(&*ready.items[0].1, b"hello");
+        assert!(ready.failed.is_empty());
+
+        let bad = data_bytes("k".into(), "data:image/png;base64,not base64!");
+        assert!(bad.items.is_empty());
+        assert_eq!(bad.failed, vec!["k".to_string()]);
+    }
+
+    /// The reader thread does its reading over the *one* writer, on a
+    /// connection of its own (CR-005 phase 0) — a second reader on a second
+    /// thread has to see the letter the UI thread just wrote.
+    #[test]
+    fn the_reader_reads_across_the_one_writer() {
+        let db = store(Some(RAW)).db();
+        let found = std::thread::spawn(move || {
+            let store = Store::with_db(db).expect("a reader over the one writer");
+            cid_parts(Some(&store), 7).items
+        })
+        .join()
+        .expect("the reader thread");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "cid:m7/sketch.png@ivanov.dev");
+    }
+
+    /// A `data:` URL *is* its payload: filing it under itself would put
+    /// megabytes of base64 in a map key and in a texture-cache path. Every
+    /// other source is short, and stays readable.
+    #[test]
+    fn a_data_source_is_filed_under_a_hash_of_itself() {
+        let long = format!("data:image/png;base64,{}", "A".repeat(4096));
+        let key = pic_key(&long);
+        assert!(key.len() < 32, "{key}");
+        assert_eq!(key, pic_key(&long), "the same picture, the same name");
+        assert_ne!(key, pic_key(&format!("{long}B")));
+        assert_eq!(pic_key("cid:m7/sketch.png"), "cid:m7/sketch.png");
+        assert_eq!(pic_key("https://x.dev/a.png"), "https://x.dev/a.png");
     }
 }

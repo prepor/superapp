@@ -87,3 +87,24 @@ zero frames. Trackpad pans bypass the springs (1:1, camera jump).
 - **Ownership.** `State` (workspace, mail flags, per-panel UI, springs, toast)
   is a `#[rust]` box on the Stage widget, taken out during draw so drawing
   methods can borrow both the draw resources and the state.
+- **Nothing heavy in a draw.** A `draw_walk` runs on the UI thread, inside
+  the frame, and — this being immediate mode — runs again on every redraw.
+  Anything that is not laying out the pixels in front of you does not belong
+  there: no I/O, no parsing, no decoding, nothing that scales with the size
+  of the data rather than the size of the view. A blob read out of SQLite, a
+  MIME walk, a base64 decode, a PNG decode: each is milliseconds, each lands
+  in one frame, and a few of them together are a visible stutter — a scroll
+  that catches, a panel that opens late. Reading rows through
+  [`Store::rows`](./data-substrate.md) is the exception the design pays for:
+  results are cached per `(query, params)` and only re-run when a generation
+  says they are stale, so the draw is a lookup.
+
+  The shape of the fix is always the same. Ask for the work off the frame,
+  once, keyed by what it is *for*; let the answer land through an action that
+  redraws; and hold the right-sized box in the meantime, so nothing reflows
+  when it arrives. The pictures in a letter (`Pictures` and `HtmlImage` in
+  `panels.rs`) are the worked example: the panel asks a reader thread for a
+  mail's `cid:` parts instead of reading and parsing its raw itself, the item
+  hands the bytes to makepad's decode pool instead of decoding them, and the
+  size comes off the image header — cheap, and enough to reserve the space
+  the picture will fill while it is still decoding.
