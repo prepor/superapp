@@ -1179,6 +1179,39 @@ script_mod! {
                 }
             }
         }
+        // The mark (CR-009): an ink bar down the row's left edge, inside
+        // the row's own inset. Shader-drawn like the dotted underline, so
+        // a mark costs no layout and the text stays on the header's
+        // columns. Two more twins rather than a flag: a quad's colour is
+        // not settable at draw time (see `OverlayRow`).
+        line_mark := mod.widgets.InboxLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                    return vec4(0.0, 0.0, 0.0, 0.0)
+                }
+            }
+        }
+        line_mark_sel := mod.widgets.InboxLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                pixel: fn() {
+                    let x = self.pos.x * self.rect_size.x
+                    if x < 3.0 {
+                        return vec4(0.078, 0.078, 0.078, 1.0)
+                    }
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
         View {
             width: Fill, height: 1
             show_bg: true
@@ -1189,6 +1222,153 @@ script_mod! {
                 }
             }
         }
+    }
+
+    // ---- marks (CR-009): the draft in the library -------------------------
+
+    /** A bordered side-effect button that wears its key: the label split
+        the way `SLink` splits it, so one character draws bold. Presentation
+        for now — the bar's clicks will resolve through the shell's hit
+        table like every other in-list control. */
+    mod.widgets.KeyBtn = set_type_default() do #(KeyBtn::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{left: 10, right: 10, top: 4, bottom: 4}
+        cursor: MouseCursor.Hand
+        show_bg: true
+        draw_bg +: {
+            color: #ffffff
+            // The 1 pt ink border, shader-drawn: a View's bg has no border
+            // of its own, and a distinct shader earns the correctly
+            // ordered draw call anyway.
+            pixel: fn() {
+                let p = self.pos * self.rect_size
+                let d = min(min(p.x, p.y), min(self.rect_size.x - p.x, self.rect_size.y - p.y))
+                if d < 1.0 {
+                    return vec4(0.078, 0.078, 0.078, 1.0)
+                }
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        pre := mod.widgets.SLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
+        }
+        key := mod.widgets.SBoldLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 8.25} }
+        }
+        post := mod.widgets.SLabel {
+            padding: 0, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
+        }
+    }
+
+    /** The verbs of the marks bar as one group: inline after the count
+        where the width allows, under it where it does not. A Fit child
+        never wraps — the turtle cannot know its width in advance — so the
+        bar decides at draw, where the width is known, and shows one of
+        two copies. */
+    mod.widgets.MarkVerbs = View {
+        width: Fit, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        spacing: 8
+        archive_btn := mod.widgets.KeyBtn {}
+        delete_btn := mod.widgets.KeyBtn {}
+        all_btn := mod.widgets.KeyBtn {}
+        clear_btn := mod.widgets.KeyBtn {}
+    }
+
+    /** The marks bar (CR-009): what a list shows while any row is marked —
+        how many of how many, how many the filter hides; then the verbs
+        that act on the marked set, `all`, `clear`. It comes with the first
+        mark and goes with the last: nothing is drawn for an empty set. The
+        verbs wear the letters their single-row twins wear (the borrowed
+        `a` and `d`, which stand down while the bar is up). */
+    mod.widgets.MarkBar = set_type_default() do #(MarkBar::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{left: 8, right: 8, top: 4, bottom: 6}
+        spacing: 6
+        line := View {
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            spacing: 8
+            count_lbl := mod.widgets.SLabel { padding: 0, width: Fit, text: "" }
+            hidden_lbl := mod.widgets.SLabel {
+                padding: 0, width: Fit, text: ""
+                draw_text +: { color: #909090 }
+            }
+            View { width: 4, height: 1 }
+            verbs_inline := mod.widgets.MarkVerbs {}
+        }
+        verbs_below := mod.widgets.MarkVerbs { visible: false }
+    }
+
+    /** The inbox with marks, as a still (CR-009's draft): the filter, the
+        marks bar, the header; then the marked rows the filter hides under
+        their own caption and a strong rule, and the rows. Static slots and
+        no store — a picture for the library, populated with fixtures. */
+    mod.widgets.InboxDraft = set_type_default() do #(InboxDraft::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+        filter_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "filter…  ( / )   @ for tags"
+        }
+        bar := mod.widgets.MarkBar {}
+        View { width: Fill, height: 6 }
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
+            View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { padding: 0, text: "FROM" }
+            }
+            mod.widgets.SSection { padding: 0, width: Fit, text: "DATE" }
+        }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
+        hidden := View {
+            width: Fill, height: Fit
+            flow: Down
+            // The caption wears the rows' inset the way the header does,
+            // so it starts where their text starts.
+            View {
+                width: Fill, height: Fit
+                padding: Inset{left: 8, right: 8, top: 6, bottom: 2}
+                mod.widgets.SSection { padding: 0, text: "MARKED · HIDDEN BY THE FILTER" }
+            }
+            h0 := mod.widgets.InboxRow {}
+            h1 := mod.widgets.InboxRow {}
+            // The strong rule closing the group. Its own pixel fn, or the
+            // quad merges into a call under the panel (CR-002's sixth
+            // defect) and never shows.
+            View {
+                width: Fill, height: 1
+                show_bg: true
+                draw_bg +: {
+                    color: #141414
+                    pixel: fn() {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                }
+            }
+        }
+        r0 := mod.widgets.InboxRow {}
+        r1 := mod.widgets.InboxRow {}
+        r2 := mod.widgets.InboxRow {}
+        r3 := mod.widgets.InboxRow {}
+        r4 := mod.widgets.InboxRow {}
+        r5 := mod.widgets.InboxRow {}
+        r6 := mod.widgets.InboxRow {}
     }
 
     /** The inbox: the filter over the header over the virtualized list —
@@ -3404,14 +3584,241 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool) {
+    /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
+    /// Exactly one of the four twins draws; only it is populated.
+    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool, marked: bool) {
         let Some(row) = self.borrow() else { return };
-        let line = row.view.widget(cx, ids!(line));
-        let line_sel = row.view.widget(cx, ids!(line_sel));
-        line.as_inbox_line().populate(cx, m);
-        line_sel.as_inbox_line().populate(cx, m);
-        line.set_visible(cx, !selected);
-        line_sel.set_visible(cx, selected);
+        let twins = [
+            (ids!(line), !selected && !marked),
+            (ids!(line_sel), selected && !marked),
+            (ids!(line_mark), !selected && marked),
+            (ids!(line_mark_sel), selected && marked),
+        ];
+        for (id, on) in twins {
+            let w = row.view.widget(cx, id);
+            if on {
+                w.as_inbox_line().populate(cx, m);
+            }
+            w.set_visible(cx, on);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marks (CR-009): the draft's widgets
+// ---------------------------------------------------------------------------
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct KeyBtn {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for KeyBtn {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl KeyBtnRef {
+    /// The label, its `accel` letter drawn bold where the label carries it.
+    pub fn set(&self, cx: &mut Cx, text: &str, accel: Option<char>) {
+        let Some(b) = self.borrow() else { return };
+        let at = accel.and_then(|c| ui::accel_idx(text, c));
+        let (pre, key, post) = match at {
+            Some(i) => {
+                let mut it = text.chars();
+                let pre: String = it.by_ref().take(i).collect();
+                let key: String = it.next().into_iter().collect();
+                (pre, key, it.collect::<String>())
+            }
+            None => (text.to_string(), String::new(), String::new()),
+        };
+        for (id, s) in [(ids!(pre), pre), (ids!(key), key), (ids!(post), post)] {
+            let l = b.view.label(cx, id);
+            l.set_text(cx, &s);
+            l.set_visible(cx, !s.is_empty());
+        }
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct MarkBar {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The width the one-line layout needs, in points: measured off the
+    /// texts at populate, held against the turtle's width at draw.
+    #[rust]
+    need: f64,
+}
+
+impl Widget for MarkBar {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // The verbs beside the count where they fit, under it where they
+        // do not — decided here, the one place the width is known.
+        let fits = self.need <= cx.turtle().inner_width();
+        self.view
+            .view(cx, ids!(line.verbs_inline))
+            .set_visible(cx, fits);
+        self.view.view(cx, ids!(verbs_below)).set_visible(cx, !fits);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl MarkBarRef {
+    /// `marked` rows in all, `hidden` of them outside the list's filter,
+    /// `total` rows under it. With every row under the filter marked,
+    /// `all` stands down.
+    pub fn populate(&self, cx: &mut Cx, marked: usize, total: usize, hidden: usize) {
+        let Some(mut b) = self.borrow_mut() else { return };
+        let shown = marked.saturating_sub(hidden);
+        let all = shown >= total;
+        let count = if hidden > 0 {
+            format!("{marked} marked")
+        } else if all {
+            format!("all {total} marked")
+        } else {
+            format!("{marked} of {total} marked")
+        };
+        let hid = if hidden > 0 {
+            format!("· {hidden} hidden by the filter")
+        } else {
+            String::new()
+        };
+        b.view.label(cx, ids!(line.count_lbl)).set_text(cx, &count);
+        let h = b.view.label(cx, ids!(line.hidden_lbl));
+        h.set_text(cx, &hid);
+        h.set_visible(cx, hidden > 0);
+        let verbs: [(&str, Option<char>, bool); 4] = [
+            ("archive", Some('a'), true),
+            ("delete", Some('d'), true),
+            ("all", Some('l'), !all),
+            ("clear", None, true),
+        ];
+        let ids = [
+            ids!(archive_btn),
+            ids!(delete_btn),
+            ids!(all_btn),
+            ids!(clear_btn),
+        ];
+        let groups: [&[LiveId]; 2] = [ids!(line.verbs_inline), ids!(verbs_below)];
+        for g in groups {
+            let group = b.view.widget(cx, g);
+            for (id, (text, accel, on)) in ids.iter().zip(verbs.iter()) {
+                let btn = group.widget(cx, *id);
+                btn.as_key_btn().set(cx, text, *accel);
+                btn.set_visible(cx, *on);
+            }
+        }
+        // What one line needs: the texts on the mono cell, the buttons
+        // with their padding, the gaps and the bar's inset.
+        let body = crate::theme::FONT_SIZE * crate::theme::MONO_ADV;
+        let label = crate::theme::LABEL_SIZE * crate::theme::MONO_ADV;
+        let text = (count.chars().count() + hid.chars().count()) as f64 * body
+            + if hidden > 0 { 8.0 } else { 0.0 };
+        let btns: f64 = verbs
+            .iter()
+            .filter(|(_, _, on)| *on)
+            .map(|(t, _, _)| t.chars().count() as f64 * label + 20.0 + 8.0)
+            .sum();
+        b.need = 16.0 + text + 8.0 + 4.0 + 8.0 + btns;
+    }
+}
+
+/// One row of the draft: the head, whether the cursor stands on it, and
+/// whether it is marked.
+pub struct DraftRow {
+    pub head: mail::ThreadHead,
+    pub cursor: bool,
+    pub marked: bool,
+}
+
+/// The bar's numbers: marked of total under the filter, and how many of
+/// the marked the filter hides.
+#[derive(Clone, Copy)]
+pub struct DraftBar {
+    pub marked: usize,
+    pub total: usize,
+    pub hidden: usize,
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct InboxDraft {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for InboxDraft {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl InboxDraftRef {
+    /// The still: the filter's text, the bar (none for an empty set), the
+    /// marked rows the filter hides, then the rows under the filter. The
+    /// slots are fixed — two hidden, seven rows — and the rest stand down.
+    pub fn populate(
+        &self,
+        cx: &mut Cx,
+        filter: &str,
+        bar: Option<DraftBar>,
+        hidden: &[mail::ThreadHead],
+        rows: &[DraftRow],
+    ) {
+        let Some(d) = self.borrow() else { return };
+        d.view
+            .text_input(cx, ids!(filter_input))
+            .set_text(cx, filter);
+        let b = d.view.widget(cx, ids!(bar));
+        if let Some(n) = bar {
+            b.as_mark_bar().populate(cx, n.marked, n.total, n.hidden);
+        }
+        b.set_visible(cx, bar.is_some());
+        d.view
+            .widget(cx, ids!(hidden))
+            .set_visible(cx, !hidden.is_empty());
+        for (i, id) in [ids!(hidden.h0), ids!(hidden.h1)].into_iter().enumerate() {
+            let w = d.view.widget(cx, id);
+            if let Some(h) = hidden.get(i) {
+                w.as_inbox_row().populate(cx, h, false, true);
+            }
+            w.set_visible(cx, hidden.get(i).is_some());
+        }
+        let slots = [
+            ids!(r0),
+            ids!(r1),
+            ids!(r2),
+            ids!(r3),
+            ids!(r4),
+            ids!(r5),
+            ids!(r6),
+        ];
+        for (i, id) in slots.into_iter().enumerate() {
+            let w = d.view.widget(cx, id);
+            if let Some(r) = rows.get(i) {
+                w.as_inbox_row().populate(cx, &r.head, r.cursor, r.marked);
+            }
+            w.set_visible(cx, rows.get(i).is_some());
+        }
     }
 }
 
@@ -3718,7 +4125,7 @@ impl Widget for InboxPanel {
                     let selected = sel == Some(m.thread);
                     let stamp = (m, selected);
                     if !existed || self.stamps.get(&idx) != Some(&stamp) {
-                        row.as_inbox_row().populate(cx, &stamp.0, selected);
+                        row.as_inbox_row().populate(cx, &stamp.0, selected, false);
                         self.stamps.insert(idx, stamp);
                     }
                     live.push(idx);

@@ -524,6 +524,7 @@ fn sender_like(store: &Store, pat: &str) -> String {
 pub fn scenes() -> Vec<Scene<Setup>> {
     vec![
         inbox_row(),
+        marks_bar(),
         thread_message(),
         overlay_row(),
         launcher(),
@@ -531,6 +532,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         effect_row(),
         link(),
         inbox(),
+        inbox_marks(),
         effect_log(),
         job(),
         message(),
@@ -547,30 +549,36 @@ pub fn scenes() -> Vec<Scene<Setup>> {
 }
 
 fn inbox_row() -> Scene<Setup> {
-    let row = |h: mail::ThreadHead, selected: bool| {
+    let row = |h: mail::ThreadHead, selected: bool, marked: bool| {
         widget(live_id!(inbox_row_tpl), move |cx, w| {
-            w.as_inbox_row().populate(cx, &h, selected);
+            w.as_inbox_row().populate(cx, &h, selected, marked);
         })
     };
     let elena = || head(&["Elena Petrova"], "Sat hike", false, 1);
     let long = "[stelaxis] CI failed on main — workflow main #4116 failed on push 00a1b2c, the full logs attached to the run";
     Scene::new("inbox row", (520.0, 56.0))
         .note("One conversation as the inbox lists it: who wrote and when, the topic on its own line.")
-        .note("Bold while any of it is unread; the wash while the cursor is on it.")
-        .node("read", row(elena(), false))
-        .node("unread", row(head(&["Elena Petrova"], "Sat hike", true, 1), false))
+        .note("Bold while any of it is unread; the wash while the cursor is on it; the bar while it is marked (CR-009).")
+        .node("read", row(elena(), false, false))
+        .node("unread", row(head(&["Elena Petrova"], "Sat hike", true, 1), false, false))
         .about("the whole row bold, not a dot")
-        .node("selected", row(elena(), true))
+        .node("selected", row(elena(), true, false))
         .about("the cursor's wash; focus stays in the list")
-        .node("conversation", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false))
+        .node("marked", row(elena(), false, true))
+        .about("the mark: an ink bar in the row's inset, no reflow")
+        .node("marked, cursor", row(head(&["Elena Petrova"], "Sat hike", true, 1), true, true))
+        .about("the wash and the bar together; bold still means unread")
+        .node("conversation", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .about("first names once there are two, then the count")
-        .node("long topic", row(head(&["GitHub"], long, false, 1), false))
+        .node("long topic", row(head(&["GitHub"], long, false, 1), false, false))
         .about("one line each, ellipsized")
-        .node("narrow", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false))
+        .node("narrow", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .sized((320.0, 56.0))
         .about("the phone's width")
         .edge("read", "unread", "a reply arrives")
         .edge("read", "selected", "↓ / click")
+        .edge("read", "marked", "space / click the gutter")
+        .edge("selected", "marked, cursor", "space")
 }
 
 fn thread_message() -> Scene<Setup> {
@@ -934,6 +942,127 @@ fn job() -> Scene<Setup> {
         .sized((520.0, 200.0))
         .about("a row the queue no longer holds — the panel says so rather than inventing one")
         .edge("retrying", "given up", "six attempts")
+}
+
+fn marks_bar() -> Scene<Setup> {
+    let bar = |marked: usize, total: usize, hidden: usize| {
+        widget(live_id!(mark_bar_tpl), move |cx, w| {
+            w.as_mark_bar().populate(cx, marked, total, hidden);
+        })
+    };
+    Scene::new("marks bar", (520.0, 40.0))
+        .note("What a list shows while any row is marked (CR-009): the count, the verbs on the marked set, all, clear.")
+        .note("Comes with the first mark, goes with the last. archive and delete wear the letters their single-row twins wear.")
+        .node("three", bar(3, 143, 0))
+        .about("of the rows under the filter")
+        .node("hidden", bar(3, 12, 1))
+        .sized((520.0, 64.0))
+        .about("a mark the filter hides is still counted, and said; the verbs drop a line")
+        .node("all", bar(143, 143, 0))
+        .about("all stands down")
+        .node("narrow", bar(3, 143, 1))
+        .sized((356.0, 64.0))
+        .about("the phone's width: the verbs wrap")
+        .edge("three", "hidden", "/ github")
+        .edge("three", "all", "⌘l / all")
+}
+
+fn inbox_marks() -> Scene<Setup> {
+    let r = |who: &[&str], topic: &str, unread: bool, n: i64, cursor: bool, marked: bool| {
+        DraftRow {
+            head: head(who, topic, unread, n),
+            cursor,
+            marked,
+        }
+    };
+    let full = || {
+        vec![
+            r(&["GitHub"], "[stelaxis] CI failed on main", true, 6, false, true),
+            r(&["Elena Petrova"], "Sat hike", false, 1, true, false),
+            r(&["me", "Elena", "Vera"], "Q3 infra", true, 4, false, true),
+            r(&["Max Weber"], "Invoice #2041", false, 1, false, false),
+            r(&["GitHub"], "[stelaxis] CI passed on main", false, 1, false, true),
+            r(&["Vera Kovac"], "Panel model notes", false, 2, false, false),
+            r(&["Fastmail"], "Your weekly digest", false, 1, false, false),
+        ]
+    };
+    let still = |filter: &'static str,
+                 bar: Option<DraftBar>,
+                 hidden: Vec<mail::ThreadHead>,
+                 rows: Vec<DraftRow>| {
+        widget(live_id!(inbox_draft_tpl), move |cx, w| {
+            w.as_inbox_draft().populate(cx, filter, bar, &hidden, &rows);
+        })
+    };
+    let three = DraftBar {
+        marked: 3,
+        total: 143,
+        hidden: 0,
+    };
+    Scene::new("inbox, marked", (520.0, 640.0))
+        .note("The inbox with marks (CR-009), as stills: the bar under the filter, the marked rows' bars, the cursor still walking.")
+        .note("Filtering never drops a mark: the marked rows the filter hides sit above the rows, under their own caption.")
+        .node(
+            "none",
+            still(
+                "",
+                None,
+                Vec::new(),
+                full()
+                    .into_iter()
+                    .map(|mut x| {
+                        x.marked = false;
+                        x
+                    })
+                    .collect(),
+            ),
+        )
+        .about("no mark, no bar: the inbox as it is")
+        .node("three", still("", Some(three), Vec::new(), full()))
+        .about("space on the cursor row marked it; the cursor walked on")
+        .node(
+            "filtered",
+            still(
+                "github",
+                Some(DraftBar {
+                    marked: 3,
+                    total: 2,
+                    hidden: 1,
+                }),
+                vec![head(&["me", "Elena", "Vera"], "Q3 infra", true, 4)],
+                vec![
+                    r(&["GitHub"], "[stelaxis] CI failed on main", true, 6, true, true),
+                    r(&["GitHub"], "[stelaxis] CI passed on main", false, 1, false, true),
+                ],
+            ),
+        )
+        .about("the mark the filter hides, kept in sight — a batch verb never acts on what cannot be seen")
+        .node(
+            "all",
+            still(
+                "",
+                Some(DraftBar {
+                    marked: 143,
+                    total: 143,
+                    hidden: 0,
+                }),
+                Vec::new(),
+                full()
+                    .into_iter()
+                    .map(|mut x| {
+                        x.marked = true;
+                        x
+                    })
+                    .collect(),
+            ),
+        )
+        .about("⌘l marked every row under the filter, not just the loaded ones")
+        .node("phone", still("", Some(three), Vec::new(), full()))
+        .sized((380.0, 720.0))
+        .about("the verbs wrap under the count")
+        .edge("none", "three", "space ×3")
+        .edge("three", "filtered", "/ github")
+        .edge("three", "all", "⌘l")
 }
 
 fn message() -> Scene<Setup> {

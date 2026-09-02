@@ -462,6 +462,8 @@ script_mod! {
                         link_tpl := mod.widgets.SLink{}
                         problem_row_tpl := mod.widgets.ProblemRow{}
                         files_row_tpl := mod.widgets.FilesRow{}
+                        mark_bar_tpl := mod.widgets.MarkBar{}
+                        inbox_draft_tpl := mod.widgets.InboxDraft{}
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
