@@ -1281,9 +1281,14 @@ script_mod! {
                 width: Fit, text: "", draw_text +: { color: #5a5a5a }
             }
         }
-        what_txt := mod.widgets.SText { margin: Inset{top: 2} }
+        // Every run here is `is_multiline`: without it a TextInput lays out
+        // on one row and neither wraps nor honours a newline — and this
+        // panel is nothing but long text (a payload is one unbroken token,
+        // which the layouter then breaks by grapheme).
+        what_txt := mod.widgets.SText { is_multiline: true, margin: Inset{top: 2} }
         err_txt := mod.widgets.SText {
             visible: false
+            is_multiline: true
             margin: Inset{top: 4}
             draw_text +: {
                 color: #a01500
@@ -1297,12 +1302,12 @@ script_mod! {
         View { width: Fill, height: 10 }
         mod.widgets.SSection { text: "JOB" }
         mod.widgets.SRule {}
-        meta_txt := mod.widgets.SText {}
+        meta_txt := mod.widgets.SText { is_multiline: true }
 
         View { width: Fill, height: 10 }
         mod.widgets.SSection { text: "PAYLOAD" }
         mod.widgets.SRule {}
-        payload_txt := mod.widgets.SText {}
+        payload_txt := mod.widgets.SText { is_multiline: true }
 
         reply_head := View {
             width: Fill, height: Fit
@@ -1311,7 +1316,7 @@ script_mod! {
             mod.widgets.SSection { text: "REPLY" }
             mod.widgets.SRule {}
         }
-        reply_txt := mod.widgets.SText {}
+        reply_txt := mod.widgets.SText { is_multiline: true }
     }
 
     // ---- the read panels ---------------------------------------------------
