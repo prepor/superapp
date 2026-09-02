@@ -36,7 +36,23 @@ shot s3-filled
 key enter
 wait 2500
 shot s4-account-error
+# The error is content, not decoration. Two claims, and only one of them is
+# provable here:
+#
+#   The WRAP is proven — s4 shows the sentence carried onto a second line
+#   instead of clipped at the panel's edge, which is what it did as a Label.
+#
+#   The SELECTABILITY is proven only as far as the harness reaches: the
+#   click resolves, so the line is a hit-addressable selectable run and not
+#   a label. The wash itself is not photographable headlessly — see the
+#   header of e2e/select.txt, whose cmd+a proof does not render one in this
+#   build either. cmd+a stays as a smoke step: it must not break.
+click "error"
+wait 200
+key cmd+a
+wait 300
+shot s5-error-selected
 click "remove"
 wait 500
-shot s5-removed
+shot s6-removed
 quit

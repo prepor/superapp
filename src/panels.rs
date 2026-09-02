@@ -751,15 +751,36 @@ script_mod! {
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
-        // The status line hangs under the address, on the same edge.
-        status_lbl := mod.widgets.SLabel {
+        // The status line hangs under the address, on the same edge —
+        // selectable and wrapping, both for the same reason: a sync error
+        // is the one line here a human needs to *act* on, to carry to a
+        // search or to read the whole of. A Label would clip it at the
+        // panel's edge and refuse the drag. (`SText` is the read-only
+        // TextInput the selectable content of CR-003 is made of.)
+        status_lbl := mod.widgets.SText {
+            width: Fill, is_multiline: true
             margin: Inset{top: 6}
-            text: "", draw_text +: { color: #909090 }
+            text: ""
+            draw_text +: {
+                color: #909090
+                color_hover: #909090
+                color_focus: #909090
+                color_down: #909090
+                color_empty: #909090
+            }
         }
-        status_err_lbl := mod.widgets.SLabel {
+        status_err_lbl := mod.widgets.SText {
             visible: false
+            width: Fill, is_multiline: true
             margin: Inset{top: 6}
-            text: "", draw_text +: { color: #a01500 }
+            text: ""
+            draw_text +: {
+                color: #a01500
+                color_hover: #a01500
+                color_focus: #a01500
+                color_down: #a01500
+                color_empty: #a01500
+            }
         }
         View { width: Fill, height: 8 }
         View {
@@ -2169,8 +2190,8 @@ impl AccountRowRef {
         );
         let status = a.status.clone().unwrap_or_else(|| "never synced".into());
         let err = status.starts_with("error");
-        let ok_lbl = row.view.label(cx, ids!(status_lbl));
-        let err_lbl = row.view.label(cx, ids!(status_err_lbl));
+        let ok_lbl = row.view.text_input(cx, ids!(status_lbl));
+        let err_lbl = row.view.text_input(cx, ids!(status_err_lbl));
         ok_lbl.set_text(cx, if err { "" } else { &status });
         ok_lbl.set_visible(cx, !err);
         err_lbl.set_text(cx, if err { &status } else { "" });

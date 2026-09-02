@@ -43,6 +43,11 @@ pub struct Provider {
     /// What we ask for: full mail access, plus the identity claim that
     /// tells us which address consented.
     pub scope: &'static str,
+    /// The one scope IMAP and SMTP actually need. Asking is not getting —
+    /// a provider drops a scope its consent screen does not carry and says
+    /// nothing — so the grant is checked against this before an account is
+    /// made of it.
+    pub mail_scope: &'static str,
     pub imap: &'static str,
     pub smtp: &'static str,
     /// The provider's own SMTP puts a copy of everything it sends into the
@@ -57,6 +62,7 @@ pub const GOOGLE: Provider = Provider {
     authorize: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
     scope: "https://mail.google.com/ openid email",
+    mail_scope: "https://mail.google.com/",
     imap: "imap.gmail.com",
     smtp: "smtp.gmail.com",
     // Gmail's SMTP saves to Sent Mail on its own, unlike a plain relay.
@@ -302,6 +308,28 @@ impl Flow {
                 ("grant_type", "authorization_code"),
             ],
         )?;
+        // Asking for a scope is not getting it. A consent screen that does
+        // not carry `https://mail.google.com/` yields a grant without it —
+        // no error, no warning, just `openid email` — and the account then
+        // fails at the first IMAP login with "AUTHENTICATION FAILED", an
+        // hour of confusion away from its cause. Catch it here, while the
+        // human is still standing at the door they must go back through.
+        let granted = r.scope.clone().unwrap_or_default();
+        if !granted
+            .split_whitespace()
+            .any(|s| s == self.provider.mail_scope)
+        {
+            return Err(format!(
+                "the grant carries no mail access — add {} to the consent \
+                 screen's scopes, then sign in again (granted: {})",
+                self.provider.mail_scope,
+                if granted.is_empty() {
+                    "nothing"
+                } else {
+                    &granted
+                }
+            ));
+        }
         let refresh = r.refresh_token.ok_or(
             "google returned no refresh token — revoke the app's access and sign in again",
         )?;
@@ -387,6 +415,38 @@ pub fn xoauth2(user: &str, token: &str) -> String {
     format!("user={user}\x01auth=Bearer {token}\x01\x01")
 }
 
+/// Google's XOAUTH2 refusal, turned into a sentence.
+///
+/// A rejected `AUTHENTICATE XOAUTH2` comes back as a JSON challenge —
+/// `{"status":"400","schemes":"Bearer","scope":"https://mail.google.com/"}` —
+/// and its `status` is the whole diagnosis, but only if you know the codes.
+/// A human reading "authentication failed" cannot tell a scope they never
+/// granted from a mailbox with IMAP switched off, and those want opposite
+/// fixes. The raw body is kept on the end, because a status not listed here
+/// is still worth seeing.
+#[must_use]
+pub fn refusal(challenge: &str) -> String {
+    #[derive(Deserialize)]
+    struct Refusal {
+        status: Option<String>,
+    }
+    let status = serde_json::from_str::<Refusal>(challenge)
+        .ok()
+        .and_then(|r| r.status);
+    let said = match status.as_deref() {
+        // Google's own three (developers.google.com/gmail/imap/xoauth2-protocol).
+        Some("400") => {
+            "the token does not carry the mail scope — add https://mail.google.com/              to the consent screen and sign in again, so the new grant includes it"
+        }
+        Some("401") => "the grant is gone — sign in with google again",
+        Some("403") => {
+            "the account allows no IMAP — turn it on in Gmail's              Forwarding and POP/IMAP settings"
+        }
+        _ => "google refused the token",
+    };
+    format!("{said} [{}]", challenge.trim())
+}
+
 // -- the wire ------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -398,6 +458,9 @@ struct TokenReply {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<f64>,
+    /// What was actually granted, which is not always what was asked.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Google's error body. Worth parsing: `invalid_grant` on a refresh is the
@@ -893,6 +956,60 @@ mod tests {
             STANDARD.encode(xoauth2("a@gmail.com", "tok")),
             "dXNlcj1hQGdtYWlsLmNvbQFhdXRoPUJlYXJlciB0b2sBAQ=="
         );
+    }
+
+    /// A grant is checked for the scope that matters before it becomes an
+    /// account. This is the failure a real sign-in hit: the consent screen
+    /// carried no `https://mail.google.com/`, Google issued `openid email`
+    /// without a word, and IMAP then said only "AUTHENTICATION FAILED".
+    #[test]
+    fn a_grant_without_mail_access_is_refused_at_the_door() {
+        let reply = |scope: &str| {
+            serde_json::from_str::<TokenReply>(&format!(
+                r#"{{"access_token":"a","refresh_token":"r","scope":"{scope}"}}"#
+            ))
+            .expect("a token reply")
+        };
+
+        let short = reply("openid https://www.googleapis.com/auth/userinfo.email");
+        let granted = short.scope.clone().unwrap_or_default();
+        assert!(!granted.split_whitespace().any(|s| s == GOOGLE.mail_scope));
+
+        let full = reply("https://mail.google.com/ openid email");
+        assert!(full
+            .scope
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|s| s == GOOGLE.mail_scope));
+
+        // A prefix is not the scope: `mail.google.com/` is exact, and a
+        // substring test would take `https://mail.google.com/readonly`.
+        let near = reply("https://mail.google.com/readonly");
+        assert!(!near
+            .scope
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|s| s == GOOGLE.mail_scope));
+    }
+
+    /// A refusal names the fix, not just the failure — the three statuses
+    /// Google documents want three different things done, and none of them
+    /// is guessable from "authentication failed".
+    #[test]
+    fn a_refusal_says_what_to_do_about_it() {
+        let scope = r#"{"status":"400","schemes":"Bearer","scope":"https://mail.google.com/"}"#;
+        let m = refusal(scope);
+        assert!(m.contains("mail scope"), "{m}");
+        assert!(m.contains("sign in again"), "{m}");
+        assert!(m.contains(scope), "the raw body is kept: {m}");
+
+        assert!(refusal(r#"{"status":"401"}"#).contains("sign in with google again"));
+        assert!(refusal(r#"{"status":"403"}"#).contains("no IMAP"));
+
+        // An unknown status, and a body that is not JSON at all, still
+        // reach the human rather than being swallowed.
+        assert!(refusal(r#"{"status":"418"}"#).contains("418"));
+        assert!(refusal("not json").contains("not json"));
     }
 
     /// The refresh token is keyed apart from the app password, so an

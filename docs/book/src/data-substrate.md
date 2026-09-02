@@ -274,6 +274,17 @@ start.
 And Gmail's SMTP files its own copy into Sent Mail, unlike a plain relay, so
 the APPEND every other account gets is skipped: one letter in Sent, not two.
 
+A grant is checked before it becomes an account: **asking for a scope is not
+getting it.** A consent screen that does not carry
+`https://mail.google.com/` yields a grant with `openid email` and nothing
+else — no error, no warning — and the account would then fail at its first
+IMAP login with a bare "AUTHENTICATION FAILED", an hour of confusion from
+its cause. The token response says what was granted, so the sign-in refuses
+there instead, while the human is still standing at the door they must go
+back through. A refusal that does arrive over IMAP is read too: Google's
+XOAUTH2 no is a JSON challenge whose status separates a missing scope from a
+mailbox with IMAP switched off, and those want opposite fixes.
+
 One thing this cannot ship: the OAuth **client registration**. Google issues
 those per developer, so superapp reads yours — `SUPERAPP_GOOGLE_CLIENT_ID`
 and `SUPERAPP_GOOGLE_CLIENT_SECRET`, or the console's downloaded JSON

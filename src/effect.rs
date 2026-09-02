@@ -2055,18 +2055,35 @@ mod imap_session {
         })
     }
 
-    /// The SASL exchange for `AUTHENTICATE XOAUTH2`. The server sends no
-    /// challenge worth reading, and the crate base64s what `process`
-    /// returns — so this is the envelope in the clear, once.
+    /// The SASL exchange for `AUTHENTICATE XOAUTH2`.
+    ///
+    /// Two challenges, not one, and they mean opposite things. The first is
+    /// empty: the server's invitation, answered with the envelope (the
+    /// crate base64s what `process` returns, so this hands it over in the
+    /// clear). Any **second** challenge is Google saying no, and it carries
+    /// the reason as base64 JSON — the protocol then wants an *empty*
+    /// response to acknowledge it, after which the server sends the tagged
+    /// `NO`. Answering that one with the envelope again, as a single-shot
+    /// authenticator does, throws the reason away and leaves the human
+    /// holding "no response [AUTHENTICATION FAILED]" — which says nothing
+    /// about a missing scope or a mailbox with IMAP switched off.
+    ///
+    /// So the refusal is kept, and [`connect`] speaks it.
     struct XOAuth2 {
         user: String,
         token: String,
+        /// What Google said when it refused, verbatim.
+        refused: std::cell::RefCell<Option<String>>,
     }
 
     impl imap::Authenticator for XOAuth2 {
         type Response = String;
-        fn process(&self, _challenge: &[u8]) -> String {
-            crate::oauth::xoauth2(&self.user, &self.token)
+        fn process(&self, challenge: &[u8]) -> String {
+            if challenge.is_empty() {
+                return crate::oauth::xoauth2(&self.user, &self.token);
+            }
+            *self.refused.borrow_mut() = Some(String::from_utf8_lossy(challenge).into_owned());
+            String::new()
         }
     }
 
@@ -2074,15 +2091,23 @@ mod imap_session {
         let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
         let session = match auth {
             Auth::Password(pass) => client.login(user, pass).map_err(|e| s(e.0))?,
-            Auth::Bearer(token) => client
-                .authenticate(
-                    "XOAUTH2",
-                    &XOAuth2 {
-                        user: user.to_string(),
-                        token: token.clone(),
-                    },
-                )
-                .map_err(|e| s(e.0))?,
+            Auth::Bearer(token) => {
+                let sasl = XOAuth2 {
+                    user: user.to_string(),
+                    token: token.clone(),
+                    refused: std::cell::RefCell::new(None),
+                };
+                match client.authenticate("XOAUTH2", &sasl) {
+                    Ok(session) => session,
+                    Err((e, _)) => {
+                        let why = sasl.refused.into_inner();
+                        return Err(match why {
+                            Some(w) => format!("{}: {}", s(e), crate::oauth::refusal(&w)),
+                            None => s(e),
+                        });
+                    }
+                }
+            }
         };
         Ok(Imap {
             session,

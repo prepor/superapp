@@ -6883,7 +6883,13 @@ impl Stage {
                                 ));
                             }
                         }
-                        // The row's selectable runs (CR-003).
+                        // The row's selectable runs (CR-003) — the status
+                        // line among them, because a sync error is the one
+                        // line here worth carrying somewhere else.
+                        let status = accounts
+                            .get(*idx)
+                            .map(|a| a.status.clone().unwrap_or_else(|| "never synced".into()));
+                        let err = status.as_deref().is_some_and(|s| s.starts_with("error"));
                         for (path, text) in [
                             (ids!(email_lbl), accounts.get(*idx).map(|a| a.email.clone())),
                             (
@@ -6895,6 +6901,8 @@ impl Stage {
                                         .unwrap_or_else(|| "local demo".into())
                                 }),
                             ),
+                            (ids!(status_lbl), status.clone().filter(|_| !err)),
+                            (ids!(status_err_lbl), status.filter(|_| err)),
                         ] {
                             let rr = item.widget.widget(cx, path).area().rect(cx);
                             if rr.size.x > 0.0 {
