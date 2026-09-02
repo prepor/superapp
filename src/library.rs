@@ -816,6 +816,8 @@ impl Library {
     fn leave(&mut self, cx: &mut Cx) {
         if let Some(i) = self.entered.take() {
             self.set_active(cx, i, false);
+            // Back to a picture: the texture is redrawn from the live state.
+            self.mounts[i].pending = true;
             cx.set_key_focus(self.area);
             self.redraw(cx);
         }
@@ -896,6 +898,11 @@ impl Library {
         let Some((i, r)) = self.entered_under(p) else {
             return false;
         };
+        if self.inline(i) {
+            // Drawn in the window: its hits are window coordinates already.
+            self.send(cx, i, event);
+            return true;
+        }
         let zoom = self.zoom();
         if let Some(ev) = remap(event, r.pos, zoom) {
             self.send(cx, i, &ev);
@@ -1142,7 +1149,7 @@ impl Library {
         let mut deferred: Vec<(f64, usize)> = Vec::new();
         let mut more_work = false;
         for i in 0..n {
-            if self.mounts[i].live.is_none() {
+            if self.mounts[i].live.is_none() || self.inline(i) {
                 continue;
             }
             let replaying = self.mount_replaying(i);
@@ -1197,10 +1204,60 @@ impl Library {
         render
     }
 
+    /// An entered stage at 1:1 is drawn straight into the window, not
+    /// through its texture: a render-to-texture pass and its composite
+    /// double the GPU work of every animated frame, and a stage worked by
+    /// hand animates on every beat. Drawn inline it costs exactly what the
+    /// app costs. The texture path stays for everything else — a picture
+    /// at any zoom, a stage in flight, a component.
+    fn inline(&self, i: usize) -> bool {
+        self.entered == Some(i)
+            && (self.zoom() - 1.0).abs() < 1e-9
+            && matches!(self.mounts[i].live, Some(Live::Stage(_)))
+    }
+
+    /// Draws an entered stage into the window at its screen rect. Its draw
+    /// list is the same one its pass used, begun under the window's pass
+    /// now, so its scoped redraws keep reaching only it.
+    fn draw_inline(&mut self, cx: &mut Cx2d, i: usize, screen: Rect) {
+        let Some(Live::Stage(stage)) = self.mounts[i].live.clone() else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let mut mp = self.mounts[i]
+            .pass
+            .take()
+            .unwrap_or_else(|| MountPass::new(cx));
+        if let (Some(mut st), Some(canvas)) = (stage.borrow_mut::<Stage>(), self.list_id) {
+            st.set_lists(mp.list.id(), canvas);
+        }
+        mp.list.begin_always(cx);
+        cx.begin_turtle(
+            Walk::abs_rect(screen),
+            Layout {
+                clip_x: true,
+                clip_y: true,
+                ..Layout::default()
+            },
+        );
+        stage.draw_all(cx, &mut Scope::empty());
+        cx.end_turtle();
+        mp.list.end(cx);
+        // The texture is stale from here on; leaving renders it afresh.
+        self.mounts[i].pending = true;
+        self.mounts[i].pass = Some(mp);
+        self.renders += 1;
+        self.mount_ms += t0.elapsed().as_secs_f64() * 1000.0;
+    }
+
     /// Shows one mount: renders its pass if the plan says so, then draws
     /// its texture — the fresh one, or the last one scaled to the current
     /// zoom. A mount with no texture yet draws nothing but its frame.
     fn draw_mount(&mut self, cx: &mut Cx2d, i: usize, screen: Rect, render: bool) {
+        if self.inline(i) {
+            self.draw_inline(cx, i, screen);
+            return;
+        }
         let visible = intersects(screen, self.vp);
         if !render && (!visible || self.mounts[i].pass.is_none()) {
             return;

@@ -282,7 +282,9 @@ texture scaled, and re-render crisp at the new level once the zoom has
 stood still, nearest the pointer first — so panning and zooming stay
 smooth however many nodes are on the canvas. Mounts render into their own
 passes at the canvas's zoom, so text is crisp at every level rather than
-scaled.
+scaled — except an entered stage at 1:1, which is drawn straight into the
+window: a texture pass and its composite would double the GPU work of
+every animated frame, and a stage worked by hand animates on every beat.
 
 - **Pan**: drag the canvas, or scroll. **Zoom**: ⌘scroll around the
   pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
