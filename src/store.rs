@@ -1690,6 +1690,7 @@ mod tests {
              ALTER TABLE server_msg DROP COLUMN forwarded;
              ALTER TABLE draft DROP COLUMN fwd_message;
              ALTER TABLE folder DROP COLUMN keywords;
+             ALTER TABLE account DROP COLUMN auth;
              DROP TABLE repl_log;
              DROP TABLE repl;",
         )

@@ -50,6 +50,11 @@ pub struct RemoteFolder {
     pub name: String,
     /// inbox | archive | sent | trash — `None` folders are not mirrored.
     pub role: Option<String>,
+    /// This is the provider's *all mail* view (`\All`), not a folder of its
+    /// own: Gmail's, where every message also lives under whatever labels
+    /// it has. A move target, never an ingest source — see
+    /// [`crate::sync::fetch_account`].
+    pub all_mail: bool,
 }
 
 /// SELECT results.
@@ -1282,6 +1287,9 @@ pub struct FakeServer {
     pub no_keywords: bool,
     /// Mail this account handed to SMTP.
     pub submitted: Vec<Outgoing>,
+    /// Folders reported with `\All` — Gmail's all-mail view, which holds
+    /// every message the account has and must never be ingested from.
+    pub all_mail: HashSet<String>,
 }
 
 impl FakeServer {
@@ -1338,11 +1346,17 @@ impl FakeServer {
     fn role_of(name: &str) -> Option<String> {
         match name {
             "INBOX" => Some("inbox".into()),
-            "Archive" => Some("archive".into()),
+            "Archive" | "[Gmail]/All Mail" => Some("archive".into()),
             "Sent" => Some("sent".into()),
             "Trash" => Some("trash".into()),
             _ => None,
         }
+    }
+
+    /// Reports this folder the way Gmail reports All Mail: the archive
+    /// role, played by a view over everything.
+    pub fn as_all_mail(&mut self, name: &str) {
+        self.all_mail.insert(name.to_string());
     }
 
     fn get(&self, name: &str) -> Result<&(u32, u32, Vec<RemoteMail>), String> {
@@ -1430,11 +1444,13 @@ impl Outside for Fake {
     fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
         let s = self.live(account)?;
         let mut names: Vec<String> = s.folders.keys().cloned().collect();
+        let all = s.all_mail.clone();
         names.sort();
         Ok(names
             .into_iter()
             .map(|n| RemoteFolder {
                 role: FakeServer::role_of(&n),
+                all_mail: all.contains(&n),
                 name: n,
             })
             .collect())
@@ -1872,7 +1888,16 @@ impl Outside for Real {
             relay = relay.authentication(vec![Mechanism::Xoauth2]);
         }
         let t = relay.build();
-        t.send(&msg).map_err(|e| s(&e))?;
+        if let Err(e) = t.send(&msg) {
+            // The same rule as `connect`: a bearer token the server refused
+            // is spent, and the sender thread holds a cache of its own — so
+            // without this, every retry of this send would re-offer the dead
+            // token until it aged out.
+            if matches!(c.auth, Auth::Bearer(_)) {
+                self.tokens.remove(&c.user);
+            }
+            return Err(s(&e));
+        }
         Ok(raw)
     }
 
@@ -1976,19 +2001,22 @@ impl Outside for Real {
 /// dropping the inbox label, leaving the message in All Mail — which is
 /// exactly what a MOVE into it does. A real `\Archive` wins where a server
 /// has one (fastmail does), and `\All` is the fallback.
-fn role_for(name: &str, attrs: &[String]) -> Option<String> {
+fn role_for(name: &str, attrs: &[String]) -> (Option<String>, bool) {
     let has = |want: &str| attrs.iter().any(|a| a == want);
-    if name.eq_ignore_ascii_case("inbox") {
-        Some("inbox".to_string())
+    let role = if name.eq_ignore_ascii_case("inbox") {
+        "inbox"
     } else if has("Archive") || has("All") {
-        Some("archive".to_string())
+        "archive"
     } else if has("Sent") {
-        Some("sent".to_string())
+        "sent"
     } else if has("Trash") {
-        Some("trash".to_string())
+        "trash"
     } else {
-        None
-    }
+        return (None, false);
+    };
+    // `\All` without a real `\Archive` beside it: the archive role is being
+    // played by an all-mail view, and the caller must not ingest from it.
+    (Some(role.to_string()), role == "archive" && !has("Archive"))
 }
 
 mod imap_session {
@@ -2091,8 +2119,10 @@ mod imap_session {
                 // these words from passing for it.
                 let attrs: Vec<String> =
                     n.attributes().iter().map(|a| format!("{a:?}")).collect();
+                let (role, all_mail) = super::role_for(n.name(), &attrs);
                 out.push(RemoteFolder {
-                    role: super::role_for(n.name(), &attrs),
+                    role,
+                    all_mail,
                     name: n.name().to_string(),
                 });
             }
@@ -2550,31 +2580,40 @@ mod tests {
     #[test]
     fn gmails_all_mail_is_the_archive() {
         let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let role = |n: &str, at: &[&str]| role_for(n, &a(at));
+        let role = |n: &str, at: &[&str]| {
+            let (r, all) = role_for(n, &a(at));
+            (r.unwrap_or_default(), all)
+        };
 
-        // Gmail's LIST, as it comes.
-        assert_eq!(role("INBOX", &["HasNoChildren"]).as_deref(), Some("inbox"));
+        // Gmail's LIST, as it comes. All Mail plays archive — and is
+        // flagged, because it is a view over everything rather than a
+        // folder, so the sync pass must not ingest from it.
+        assert_eq!(role("INBOX", &["HasNoChildren"]), ("inbox".into(), false));
         assert_eq!(
-            role("[Gmail]/All Mail", &["HasNoChildren", "All"]).as_deref(),
-            Some("archive")
+            role("[Gmail]/All Mail", &["HasNoChildren", "All"]),
+            ("archive".into(), true)
         );
         assert_eq!(
-            role("[Gmail]/Sent Mail", &["HasNoChildren", "Sent"]).as_deref(),
-            Some("sent")
+            role("[Gmail]/Sent Mail", &["HasNoChildren", "Sent"]),
+            ("sent".into(), false)
         );
         assert_eq!(
-            role("[Gmail]/Trash", &["HasNoChildren", "Trash"]).as_deref(),
-            Some("trash")
+            role("[Gmail]/Trash", &["HasNoChildren", "Trash"]),
+            ("trash".into(), false)
         );
-        assert_eq!(role("[Gmail]", &["NoSelect", "HasChildren"]), None);
+        assert_eq!(role("[Gmail]", &["NoSelect", "HasChildren"]), (String::new(), false));
 
-        // A server with a real \Archive keeps it, and it wins over \All.
-        assert_eq!(role("Archive", &["Archive"]).as_deref(), Some("archive"));
-        assert_eq!(role("Everything", &["All", "Archive"]).as_deref(), Some("archive"));
+        // A real \Archive is a folder like any other: it takes the role and
+        // it *is* ingested — and it wins over \All beside it.
+        assert_eq!(role("Archive", &["Archive"]), ("archive".into(), false));
+        assert_eq!(
+            role("Everything", &["All", "Archive"]),
+            ("archive".into(), false)
+        );
 
         // A plain folder is no role, and an extension attribute that merely
         // spells one of the words is not that role.
-        assert_eq!(role("Receipts", &["HasNoChildren"]), None);
-        assert_eq!(role("Odd", &[r#"Extension("All")"#]), None);
+        assert_eq!(role("Receipts", &["HasNoChildren"]), (String::new(), false));
+        assert_eq!(role("Odd", &[r#"Extension("All")"#]), (String::new(), false));
     }
 }

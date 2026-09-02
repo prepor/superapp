@@ -523,11 +523,27 @@ fn dechunk(body: &str) -> Option<String> {
 /// at, and hands back its query string.
 fn read_request(mut stream: TcpStream) -> Option<String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    // The request line is the whole interest, and it is the first line.
+    // The request line is the whole interest, and it is the first line —
+    // but one `read` is not one line. A segmented request would otherwise
+    // yield a truncated `code`, and the browser would already have its 200
+    // while this side waited out the consent timeout. So: read until the
+    // first CRLF, bounded by the timeout above and by a size that no
+    // legitimate redirect approaches.
+    let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).ok()?;
-    let line = String::from_utf8_lossy(&buf[..n]);
-    let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
+    let target = loop {
+        if let Some(end) = raw.windows(2).position(|w| w == b"\r\n") {
+            let line = String::from_utf8_lossy(&raw[..end]);
+            break line.split_whitespace().nth(1).unwrap_or("").to_string();
+        }
+        if raw.len() > 16 * 1024 {
+            return None; // no request line is this long
+        }
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None, // closed or timed out mid-line
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    };
 
     let page = "<!doctype html><meta charset=utf-8>\
         <title>signed in</title>\
@@ -782,6 +798,37 @@ mod tests {
             id_token_email(&format!("h.{}.s", URL_SAFE_NO_PAD.encode("{}"))),
             None
         );
+    }
+
+    /// The redirect arrives over a socket, and a socket does not promise
+    /// that one `read` is one line. Split mid-`code` — the browser would
+    /// still get its 200, and this side would otherwise carry a truncated
+    /// code to Google, or sit out the whole consent timeout.
+    #[test]
+    fn a_segmented_request_line_is_read_whole() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            c.write_all(b"GET /?state=abc&co").expect("first half");
+            c.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(50));
+            c.write_all(b"de=4%2F0Ab_c-d HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("second half");
+            let mut page = String::new();
+            let _ = c.read_to_string(&mut page);
+            page
+        });
+
+        let (sock, _) = l.accept().expect("accept");
+        let q = read_request(sock).expect("the query");
+        assert_eq!(param(&q, "code").as_deref(), Some("4/0Ab_c-d"));
+        assert_eq!(param(&q, "state").as_deref(), Some("abc"));
+
+        // And the human is left looking at a page, not a hung tab.
+        let page = client.join().expect("client");
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        assert!(page.contains("close this tab"), "{page}");
     }
 
     /// A chunked body reassembles, because `Connection: close` does not

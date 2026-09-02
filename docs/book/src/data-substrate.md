@@ -256,12 +256,23 @@ fails **honestly** — the sync stops and says `invalid_grant` rather than
 falling back to a password that was never there.
 
 Two Gmail behaviours the engine has to know about, both of them the
-provider's rather than the protocol's. Gmail advertises no `\Archive`
-mailbox — archiving there *is* dropping the inbox label, leaving the message
-in All Mail — so the special-use `\All` counts as the archive role, and a
-MOVE into it is the archive. And Gmail's SMTP files its own copy into Sent
-Mail, unlike a plain relay, so the APPEND every other account gets is
-skipped: one letter in Sent, not two.
+provider's rather than the protocol's.
+
+Gmail advertises no `\Archive` mailbox: archiving there *is* dropping the
+inbox label, leaving the message in All Mail. So the special-use `\All`
+takes the archive role and a MOVE into it is the archive — but that folder
+is a **move target only, never an ingest source**. All Mail holds every
+message the account has, inbox included, under uids of its own, and this
+store gives a message one folder; reading from it would file a second row
+for every mail already mirrored from INBOX. The cost is stated rather than
+hidden: mail archived on *another* device does not appear locally. What
+this device archives stays, because the push records the move rather than
+re-reading it. Gmail's label model is the real answer here, and it is not
+this schema's — `X-GM-MSGID` as a cross-folder identity is where that would
+start.
+
+And Gmail's SMTP files its own copy into Sent Mail, unlike a plain relay, so
+the APPEND every other account gets is skipped: one letter in Sent, not two.
 
 One thing this cannot ship: the OAuth **client registration**. Google issues
 those per developer, so superapp reads yours — `SUPERAPP_GOOGLE_CLIENT_ID`
