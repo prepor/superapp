@@ -593,6 +593,11 @@ impl Ws {
 
     /// Keeps per-column invariants: `active` clamped, and following focus.
     fn normalize(&mut self) {
+        // A column with nothing in it is a gap on the strip, never a
+        // place: whatever left it empty — a close, a move, a restore that
+        // dropped a panel this build cannot read — it goes here, so no
+        // path has to remember to prune.
+        self.columns.retain(|c| !c.panels.is_empty());
         for col in &mut self.columns {
             col.active = col.active.min(col.panels.len().saturating_sub(1));
         }
@@ -1813,6 +1818,33 @@ mod tests {
     /// Snapshot → restore is lossless for the logical state, and id minting
     /// resumes above every restored id — even for a panel that moved into a
     /// foreign workspace's range.
+    /// An empty column in a snapshot — a store restore that dropped a
+    /// panel another build wrote, keeping the column it sat in — is a gap
+    /// on the strip, one unit wide and drawn as nothing. It does not come
+    /// back: the strip has columns of panels, never places.
+    #[test]
+    fn restore_drops_empty_columns() {
+        let mut snap = WmSnap::default();
+        snap.wss[0] = WsSnap {
+            columns: vec![
+                (vec![1], false, 0),
+                (Vec::new(), false, 0),
+                (Vec::new(), true, 0),
+                (vec![2], false, 0),
+            ],
+            panels: vec![(1, Kind::Help), (2, Kind::Inbox { filter: None })],
+            joins: Vec::new(),
+            focus: Some(2),
+        };
+        let wm = Wm::restore(snap);
+        let ws = &wm.wss[0];
+        assert_eq!(ws.columns.len(), 2);
+        assert_eq!(ws.columns[0].panels, vec![1]);
+        assert_eq!(ws.columns[1].panels, vec![2]);
+        assert_eq!(ws.focus, Some(2));
+        assert!(wm.snapshot().wss[0].columns.iter().all(|(p, _, _)| !p.is_empty()));
+    }
+
     #[test]
     fn snapshot_restore_round_trips() {
         let mut wm = Wm::new();

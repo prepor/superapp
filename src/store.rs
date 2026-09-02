@@ -1504,6 +1504,10 @@ impl Store {
         for ws in &mut wss {
             ws.panels.sort_by_key(|(id, _)| *id);
             ws.joins.sort_unstable();
+            // A column whose every panel was dropped above (a kind another
+            // build wrote) would come back as an empty column — a gap on
+            // the strip that outlives the panel it held.
+            ws.columns.retain(|(panels, _, _)| !panels.is_empty());
         }
         Ok(Some(core::WmSnap {
             active: (active as usize).min(core::WS_N - 1),
