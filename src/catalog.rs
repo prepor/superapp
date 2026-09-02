@@ -201,12 +201,26 @@ struct Filed {
     error: Option<&'static str>,
 }
 
+/// The effect queue's fixtures run on the **mount's** clock, not on the mail
+/// seed's. A mount starts at [`crate::app::virtual_epoch`]; a `not_before`
+/// placed on the mail fixtures' own morning is therefore already due, and
+/// the executor would claim the row and settle it while the scene was still
+/// settling — a node that draws something different every time it is read.
+fn ago(mins: f64) -> f64 {
+    crate::app::virtual_epoch() - mins * 60.0
+}
+
+/// The same clock, forward: a backoff the mount will not reach.
+fn ahead(mins: f64) -> f64 {
+    crate::app::virtual_epoch() + mins * 60.0
+}
+
 impl Default for Filed {
     fn default() -> Self {
         Filed {
             entity: "account:1",
             idempotent: true,
-            at: at(9, 12),
+            at: ago(180.0),
             not_before: 0.0,
             status: "done",
             attempts: 1,
@@ -280,7 +294,7 @@ fn plant_queue(store: &Store) {
             uid: 118,
         },
         &Filed {
-            at: at(9, 14),
+            at: ago(178.0),
             reply: Some("119"),
             ..Filed::default()
         },
@@ -297,7 +311,7 @@ fn plant_queue(store: &Store) {
         },
         // Undo landed while it waited: revalidated, never performed.
         &Filed {
-            at: at(9, 20),
+            at: ago(172.0),
             status: "obsolete",
             ..Filed::default()
         },
@@ -312,9 +326,10 @@ fn plant_queue(store: &Store) {
             seen: false,
         },
         &Filed {
-            at: at(9, 31),
-            // Backing off: filed at 9:31, next attempt 9:36.
-            not_before: at(9, 36),
+            at: ago(161.0),
+            // Backing off: refused a moment ago, due again in five minutes —
+            // which the mount's clock never reaches, so the row stands still.
+            not_before: ahead(5.0),
             status: "pending",
             attempts: 3,
             error: Some("connection refused"),
@@ -327,7 +342,7 @@ fn plant_queue(store: &Store) {
         &Filed {
             entity: "outbox:7",
             idempotent: false,
-            at: at(9, 40),
+            at: ago(152.0),
             status: "failed",
             attempts: 6,
             error: Some("535 authentication failed"),
@@ -726,7 +741,7 @@ fn effect_row() -> Scene<Setup> {
                         status: "pending",
                         attempts: 3,
                         error: Some("connection refused"),
-                        not_before: at(9, 36),
+                        not_before: ahead(5.0),
                         ..Filed::default()
                     },
                 ),

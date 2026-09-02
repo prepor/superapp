@@ -55,38 +55,37 @@ key cmd+a
 wait 400
 shot g5-payload-selected
 
-# The walk re-aims the preview rather than opening a second panel, and the
-# list keeps the keyboard throughout.
-key down
-wait 600
-shot g6-walked
-
-# The filter is the rich table's, over the queue's own columns.
-key /
-wait 200
+# The filter is the rich table's, over the queue's own columns — reached by
+# its own field rather than by `/`, because the payload click above handed
+# the keyboard to the job panel, and a key pressed there never reaches the
+# log. (The cursor walk wants more than one job; the panels library's
+# effect-log scene plants five and walks them.)
+click "filter"
+wait 300
 type "@"
 wait 400
-shot g7-tags
+shot g6-tags
+# esc puts the offer away and the field keeps the keyboard.
 key esc
 wait 200
 key cmd+a
-# `@risky` is the jobs a crash cannot retry for you — a submission is the
-# app's one genuinely irreversible effect, so this is exactly the one row.
-type "@risky"
+type "@kind:submit"
 wait 500
 key esc
 wait 400
-shot g8-risky
+shot g7-kept
+# Still addressable: which is how the run knows the filter was typed into
+# the log's own field, and that it kept this row.
 click "submit outbox:"
 wait 500
 
-# A filter nothing answers says so rather than showing an empty page.
-key /
-wait 200
+# A filter nothing answers says so rather than showing a blank list.
+click "filter"
+wait 300
 key cmd+a
 type "@kind:move"
 wait 500
 key esc
 wait 500
-shot g9-none
+shot g8-none
 quit

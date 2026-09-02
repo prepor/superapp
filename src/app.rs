@@ -1078,6 +1078,16 @@ struct State {
     send_delay: f64,
 }
 
+/// Where a virtual clock starts: the instant a headless run and every
+/// library mount believe it is. Fixed, so a run is reproducible down to the
+/// dates it draws — and public because a fixture that plants a *deadline*
+/// (the effect queue's `not_before`) has to place it against this, not
+/// against the wall or the mail seed's own dates.
+#[must_use]
+pub fn virtual_epoch() -> f64 {
+    mail::ts(2026, 9, 1, 12, 0)
+}
+
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
 /// unfolded screen and 4×3 on the cover display (the ~600 dp compact/medium
 /// breakpoint — a fold/unfold resize crosses it). `--grid` overrides for
@@ -1115,7 +1125,7 @@ impl State {
         // Virtual time: one fixed frame clock for the springs, the e2e
         // runner and the app's own deadlines alike. It starts at a fixed
         // instant so even the dates in a screenshot are reproducible.
-        let epoch = mail::ts(2026, 9, 1, 12, 0);
+        let epoch = virtual_epoch();
         let clock = if boot.virtual_time {
             crate::effect::Clock::virtual_from(epoch)
         } else {

@@ -1286,16 +1286,24 @@ script_mod! {
         // panel is nothing but long text (a payload is one unbroken token,
         // which the layouter then breaks by grapheme).
         what_txt := mod.widgets.SText { is_multiline: true, margin: Inset{top: 2} }
-        err_txt := mod.widgets.SText {
+        // A run that comes and goes hangs on a View: `visible` is the View's
+        // property, and a TextInput neither takes it in the DSL nor honours
+        // `set_visible` — its default is "always visible", so an error line
+        // hidden that way would simply draw empty.
+        err_row := View {
             visible: false
-            is_multiline: true
-            margin: Inset{top: 4}
-            draw_text +: {
-                color: #a01500
-                color_hover: #a01500
-                color_focus: #a01500
-                color_down: #a01500
-                color_empty: #a01500
+            width: Fill, height: Fit
+            flow: Down
+            err_txt := mod.widgets.SText {
+                is_multiline: true
+                margin: Inset{top: 4}
+                draw_text +: {
+                    color: #a01500
+                    color_hover: #a01500
+                    color_focus: #a01500
+                    color_down: #a01500
+                    color_empty: #a01500
+                }
             }
         }
 
@@ -1309,14 +1317,15 @@ script_mod! {
         mod.widgets.SRule {}
         payload_txt := mod.widgets.SText { is_multiline: true }
 
-        reply_head := View {
+        reply_block := View {
+            visible: false
             width: Fill, height: Fit
             flow: Down
             View { width: Fill, height: 10 }
             mod.widgets.SSection { text: "REPLY" }
             mod.widgets.SRule {}
+            reply_txt := mod.widgets.SText { is_multiline: true }
         }
-        reply_txt := mod.widgets.SText { is_multiline: true }
     }
 
     // ---- the read panels ---------------------------------------------------
@@ -3322,7 +3331,7 @@ impl Widget for JobPanel {
             v.label(cx, ids!(status_lbl)).set_text(cx, "gone");
             v.text_input(cx, ids!(what_txt))
                 .set_text(cx, "no such row in the effect queue");
-            for path in [ids!(err_txt), ids!(reply_head), ids!(reply_txt)] {
+            for path in [ids!(err_row), ids!(reply_block)] {
                 v.widget(cx, path).set_visible(cx, false);
             }
             v.text_input(cx, ids!(meta_txt)).set_text(cx, "");
@@ -3336,16 +3345,15 @@ impl Widget for JobPanel {
         v.label(cx, ids!(status_lbl)).set_text(cx, &j.status_line());
         v.text_input(cx, ids!(what_txt))
             .set_text(cx, what.as_deref().unwrap_or(""));
-        let err = v.text_input(cx, ids!(err_txt));
-        err.set_text(cx, j.error.as_deref().unwrap_or(""));
-        err.set_visible(cx, j.error.is_some());
+        v.text_input(cx, ids!(err_txt))
+            .set_text(cx, j.error.as_deref().unwrap_or(""));
+        v.widget(cx, ids!(err_row)).set_visible(cx, j.error.is_some());
         v.text_input(cx, ids!(meta_txt)).set_text(cx, &job_meta(&j));
         v.text_input(cx, ids!(payload_txt)).set_text(cx, &j.payload);
         let reply = j.reply.as_deref().unwrap_or("");
-        v.widget(cx, ids!(reply_head)).set_visible(cx, !reply.is_empty());
-        let reply_txt = v.text_input(cx, ids!(reply_txt));
-        reply_txt.set_text(cx, reply);
-        reply_txt.set_visible(cx, !reply.is_empty());
+        v.text_input(cx, ids!(reply_txt)).set_text(cx, reply);
+        v.widget(cx, ids!(reply_block))
+            .set_visible(cx, !reply.is_empty());
 
         self.view.draw_walk(cx, scope, walk)
     }
@@ -3388,16 +3396,21 @@ impl JobPanelRef {
             return Vec::new();
         };
         let mut hits = Vec::new();
-        for (label, path) in [
-            ("job effect", ids!(what_txt)),
-            ("job error", ids!(err_txt)),
-            ("job facts", ids!(meta_txt)),
-            ("job payload", ids!(payload_txt)),
-            ("job reply", ids!(reply_txt)),
+        // `visible` is asked of the enclosing View, never of the run: a
+        // TextInput answers that question with a flat `true`.
+        for (label, fold, path) in [
+            ("job effect", None, ids!(what_txt)),
+            ("job error", Some(ids!(err_row)), ids!(err_txt)),
+            ("job facts", None, ids!(meta_txt)),
+            ("job payload", None, ids!(payload_txt)),
+            ("job reply", Some(ids!(reply_block)), ids!(reply_txt)),
         ] {
+            if fold.is_some_and(|f| !p.view.widget(cx, f).visible()) {
+                continue;
+            }
             let w = p.view.widget(cx, path);
             let r = w.area().rect(cx);
-            if r.size.x > 0.0 && w.visible() && !w.as_text_input().text().is_empty() {
+            if r.size.x > 0.0 && !w.as_text_input().text().is_empty() {
                 hits.push((label.to_string(), r));
             }
         }
@@ -3549,25 +3562,6 @@ impl EffectsPanelRef {
     }
 }
 
-/// A job that is nothing but its id — enough for [`Table::index_of`], whose
-/// rank key over this source is the id and only the id.
-fn stub_job(id: i64) -> Job {
-    Job {
-        id,
-        kind: String::new(),
-        entity: None,
-        status: String::new(),
-        reply: None,
-        error: None,
-        attempts: 0,
-        payload: String::new(),
-        idempotent: false,
-        created: 0.0,
-        updated: 0.0,
-        not_before: 0.0,
-    }
-}
-
 impl Widget for EffectsPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let filter = self.view.text_input(cx, ids!(filter_input));
@@ -3644,10 +3638,12 @@ impl Widget for EffectsPanel {
                 {
                     if *p == pid {
                         // The shell moved the cursor for us (a job opened by
-                        // click). Take the row from the table so the index
-                        // fallback stays honest.
-                        if let Some(i) = self.table.index_of(&store, &stub_job(*id)) {
-                            if let Some(j) = self.table.row(&store, i) {
+                        // click). `index_of` confirms its answer by comparing
+                        // the whole row, so it has to be handed the real one —
+                        // a stub carrying only the id ranks correctly and is
+                        // then rejected, and the cursor would never move.
+                        if let Some(j) = effect::job(&store, *id) {
+                            if let Some(i) = self.table.index_of(&store, &j) {
                                 self.sel = Some((j, i));
                                 self.redraw(cx);
                             }
