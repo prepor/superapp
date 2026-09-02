@@ -159,8 +159,8 @@ pub enum PanelAction {
     ReopenSend {
         pid: u64,
         outbox: i64,
-        /// The mail the draft replied to (0 for none).
-        re: i64,
+        /// What the draft started from — the reopened compose gets it back.
+        seed: crate::core::Seed,
         fresh: bool,
     },
 }
@@ -1730,13 +1730,13 @@ impl ProblemRowRef {
             }),
             Source::Send {
                 outbox,
-                re,
+                seed,
                 given_up: true,
                 ..
             } => Some(PanelAction::ReopenSend {
                 pid,
                 outbox: *outbox,
-                re: *re,
+                seed: *seed,
                 fresh: false,
             }),
             Source::Send { .. } | Source::Sync => None,

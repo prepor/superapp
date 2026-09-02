@@ -28,10 +28,21 @@ trap 'rm -rf "$LOGS"' EXIT
 # What a suite needs beyond the defaults, from its own header comment.
 extra_args() {
   case "$1" in
-    phone)   echo "--window 380x780 --grid 4x3" ;;  # the cover display
-    send)    echo "--send-delay 1" ;;               # a one-second undo window
-    library) echo "--library" ;;                    # the canvas, not a workspace
-    *)       echo "" ;;
+    phone)    echo "--window 380x780 --grid 4x3" ;;  # the cover display
+    send)     echo "--send-delay 1" ;;               # a one-second undo window
+    problems) echo "--send-delay 1" ;;               # the same, for its failing send
+    library)  echo "--library" ;;                    # the canvas, not a workspace
+    *)        echo "" ;;
+  esac
+}
+
+# A suite that waits out a retry backoff needs a draw budget to match: the
+# virtual clock only advances on a draw, so too small a budget leaves it
+# short of its own `quit`. Never below what $DRAWS asks for.
+suite_draws() {
+  case "$1" in
+    problems) [ "$DRAWS" -gt 100000 ] && echo "$DRAWS" || echo 100000 ;;
+    *)        echo "$DRAWS" ;;
   esac
 }
 
@@ -41,7 +52,7 @@ for f in e2e/*.txt; do
   case "$n" in sync-a | sync-b | reseed-a | reseed-b) continue ;; esac
   names+=("$n")
   # shellcheck disable=SC2046 # word-splitting is how the extra args arrive
-  "$BIN" --e2e "$f" --no-draw --draws "$DRAWS" $(extra_args "$n") \
+  "$BIN" --e2e "$f" --no-draw --draws "$(suite_draws "$n")" $(extra_args "$n") \
     >"$LOGS/$n.log" 2>&1 &
 done
 

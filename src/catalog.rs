@@ -558,7 +558,7 @@ fn problems() -> Scene<Setup> {
         source: Source::Send {
             outbox: 9,
             subject: "Re: Q3 infra".into(),
-            re: 1,
+            seed: Seed::Reply(1),
             given_up,
         },
         label: "send “Re: Q3 infra”".into(),

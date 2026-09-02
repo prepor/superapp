@@ -1259,8 +1259,10 @@ fn move_draft_tx(
     now: f64,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT OR REPLACE INTO draft(panel, account, re_message, to_addr, subject, body, updated)
-         SELECT ?2, account, re_message, to_addr, subject, body, ?3 FROM draft WHERE panel = ?1",
+        "INSERT OR REPLACE INTO draft(panel, account, re_message, fwd_message,
+                                      to_addr, subject, body, updated)
+         SELECT ?2, account, re_message, fwd_message, to_addr, subject, body, ?3
+           FROM draft WHERE panel = ?1",
         rusqlite::params![from, to, now],
     )?;
     c.execute("DELETE FROM draft WHERE panel = ?1", [from])?;
@@ -2735,6 +2737,29 @@ mod tests {
         assert_eq!(
             draft_for(&s, 7, Seed::Forward(1)).map(|d| d.body),
             Some("fyi".into())
+        );
+    }
+
+    /// Reopening a failed send re-keys the draft to a new panel, and the
+    /// seed goes with the text: a forward that failed comes back a
+    /// forward, not a blank sheet with its body in it.
+    #[test]
+    fn a_reopened_draft_keeps_what_it_forwards() {
+        let s = store();
+        let now = 1.0;
+        let text = Draft {
+            to: "x@y".into(),
+            subject: "Fwd: Q3".into(),
+            body: "fyi".into(),
+        };
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Forward(1), &text, now))
+            .unwrap();
+        s.write(move |c| reopen_send_tx(c, 7, 9, now + 1.0)).unwrap();
+        assert!(draft_for(&s, 7, Seed::Forward(1)).is_none(), "moved off 7");
+        assert_eq!(
+            draft_for(&s, 9, Seed::Forward(1)).map(|d| d.body),
+            Some("fyi".into()),
+            "the new panel has the forward, seed and all"
         );
     }
 
