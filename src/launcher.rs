@@ -60,6 +60,8 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Problems => "problems",
         Kind::Effects => "effects",
         Kind::Job { .. } => "job",
+        Kind::Files { .. } => "files",
+        Kind::File { .. } => "file",
     }
 }
 
@@ -186,6 +188,9 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
         Kind::Settings,
         Kind::Problems,
         Kind::Effects,
+        Kind::Files {
+            dir: crate::files::HOME.into(),
+        },
         Kind::Help,
         Kind::About,
     ] {
@@ -240,7 +245,7 @@ mod tests {
         let (wm, store) = world();
         let hits = search(&wm, &store, "");
         // Open help + inbox, then the unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 7);
+        assert_eq!(hits.len(), 8);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
@@ -256,8 +261,10 @@ mod tests {
         assert!(matches!(hits[4].go, Go::Open(Kind::Problems)));
         assert_eq!(hits[5].label, "effects");
         assert!(matches!(hits[5].go, Go::Open(Kind::Effects)));
-        assert_eq!(hits[6].label, "about");
-        assert!(matches!(hits[6].go, Go::Open(Kind::About)));
+        assert_eq!(hits[6].label, "~");
+        assert!(matches!(&hits[6].go, Go::Open(Kind::Files { dir }) if dir == "~"));
+        assert_eq!(hits[7].label, "about");
+        assert!(matches!(hits[7].go, Go::Open(Kind::About)));
     }
 
     /// The mark's and the menu's verb: never a second copy.

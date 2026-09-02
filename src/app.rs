@@ -142,10 +142,15 @@ pub struct Boot {
     pub primary: bool,
     /// A prefix for the script's messages — a mount's scene and node.
     pub tag: String,
-    /// Solo: come up on this one panel alone, drawn at the whole viewport,
-    /// chrome included — a panel node of the library. Otherwise the
-    /// workspace is the restored session, or the default layout.
+    /// Come up on this one panel, fresh, in place of the session. Otherwise
+    /// the workspace is the restored session, or the default layout.
     pub open: Option<Opener>,
+    /// With `open`: draw that panel alone at the whole viewport, chrome
+    /// included — a panel node of the library. Without: the panel is the
+    /// workspace's first column and the stage draws the whole strip, so
+    /// what it opens beside itself shows — a story that starts from one
+    /// panel rather than from the default session.
+    pub solo: bool,
 }
 
 /// What a solo stage opens on: the kind, resolved against the seeded
@@ -195,6 +200,7 @@ impl Boot {
             primary: true,
             tag: String::new(),
             open: None,
+            solo: false,
         }
     }
 }
@@ -434,6 +440,8 @@ script_mod! {
                         problems_tpl := mod.widgets.ProblemsPanel{}
                         effects_tpl := mod.widgets.EffectsPanel{}
                         job_tpl := mod.widgets.JobPanel{}
+                        files_tpl := mod.widgets.FilesPanel{}
+                        file_tpl := mod.widgets.FilePanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
@@ -452,6 +460,7 @@ script_mod! {
                         effect_row_tpl := mod.widgets.EffectRow{}
                         link_tpl := mod.widgets.SLink{}
                         problem_row_tpl := mod.widgets.ProblemRow{}
+                        files_row_tpl := mod.widgets.FilesRow{}
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
@@ -465,6 +474,8 @@ script_mod! {
                             effects_tpl := mod.widgets.EffectsPanel{}
                             job_tpl := mod.widgets.JobPanel{}
                         job_tpl := mod.widgets.JobPanel{}
+                            files_tpl := mod.widgets.FilesPanel{}
+                            file_tpl := mod.widgets.FilePanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         }
@@ -581,13 +592,20 @@ enum Act {
 }
 
 /// Semantic button operations on retained panels (the e2e bridge).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `Clone`, not `Copy`: [`WidgetOp::OpenRow`] carries the kind its row
+/// names, and a kind owns its params.
+#[derive(Debug, Clone, PartialEq)]
 enum WidgetOp {
     AddAccount,
     /// Press "sign in with google" on the add-account panel.
     GoogleSignIn,
     RemoveAccount(i64),
-    OpenMail(i64),
+    /// A row of a list panel was clicked — an inbox thread, a job of the
+    /// effect log, an entry of a files panel. One op, because a click on a
+    /// row means one thing everywhere: the list takes focus, its cursor
+    /// follows, and what the row names previews beside it.
+    OpenRow(Kind),
     /// The `i`-th row of a field's autocomplete (CR-006): the inbox
     /// filter's, or the compose TO field's.
     Suggest(usize),
@@ -601,9 +619,6 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
-    /// A row of the effect log: preview the job it stands for, the way a
-    /// click on an inbox row previews its mail.
-    OpenJob(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -1062,6 +1077,14 @@ struct State {
     /// the panel opens on a mail, toggled by touch, kept no further than
     /// the process. Context, like the inbox cursor — never history.
     expand: HashMap<PanelId, crate::panels::Expansion>,
+    /// The one held item `copy`/`move` carry to a `… here` (CR-008):
+    /// context, not history — never persisted, gone with the process.
+    hold: Option<crate::files::Hold>,
+    /// What a card's preview needs, in lines, by `(path, columns)`: the
+    /// measure reads the file through the outside, and `sync` re-takes
+    /// the wishes on every mutation, so it is read once and remembered.
+    /// Pruned to the cards on screen.
+    measured: HashMap<(String, usize), f64>,
     /// The device-sync driver (CR-005), when a `--bucket` is configured.
     /// `None` means replication is off and the store is a plain local one.
     repl: Option<ReplMode>,
@@ -1237,6 +1260,8 @@ impl State {
             launcher: LauncherUi::default(),
             show_also: None,
             expand: HashMap::new(),
+            hold: None,
+            measured: HashMap::new(),
             virtual_time: boot.virtual_time,
             grid: boot.grid,
             send_delay: boot.send_delay,
@@ -1319,17 +1344,87 @@ impl State {
         Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
     }
 
+    /// The rows a file card wants (CR-008): its three as the floor, more
+    /// when the preview needs them — a long text file opens tall rather
+    /// than scrolled, a tall picture is seen whole — up to the grid. The
+    /// need is measured once per path and column width, off the first 64
+    /// KB of a text file or a picture's header, and remembered.
+    fn file_rows(&mut self, path: &str) -> Option<u32> {
+        /// What the card spends on everything that is not the preview:
+        /// the name, the kind line, the date, the path, the rule and the
+        /// padding around them, in lines.
+        const CHROME_LINES: f64 = 7.0;
+
+        let (vw, vh) = self.vp();
+        let grid = self.ws.grid;
+        let gap = theme::GAP;
+        let kind = Kind::File {
+            path: path.to_string(),
+        };
+        let (gw, floor) = kind.grid();
+        let unit_w = (vw - gap) / f64::from(grid.w);
+        let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
+        let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
+        let line_h = theme::FONT_SIZE * theme::LINE_H;
+
+        let key = (path.to_string(), cols);
+        let need = match self.measured.get(&key) {
+            Some(n) => *n,
+            None => {
+                let entry = crate::files::stat_in(&self.world, path)?;
+                let need = match entry.kind() {
+                    crate::files::FileKind::Text => {
+                        let bytes = crate::files::read_in(
+                            &self.world,
+                            path,
+                            crate::files::TEXT_PREVIEW_MAX,
+                        )
+                        .ok()?;
+                        crate::files::text_lines(&String::from_utf8_lossy(&bytes), cols) as f64
+                    }
+                    crate::files::FileKind::Image => {
+                        // The header is enough for the size; the card
+                        // draws the picture at the text's width.
+                        let head = crate::files::read_in(&self.world, path, 64 * 1024).ok()?;
+                        let (w, h) = crate::files::image_size(&head)?;
+                        text_w * f64::from(h) / f64::from(w.max(1)) / line_h
+                    }
+                    _ => 0.0,
+                };
+                self.measured.insert(key, need);
+                need
+            }
+        };
+
+        let row_h = (vh - 2.0 * gap - f64::from(grid.h - 1) * gap) / f64::from(grid.h);
+        let holds = |rows: u32| {
+            let h = f64::from(rows) * row_h + f64::from(rows - 1) * gap;
+            h / line_h - CHROME_LINES
+        };
+        Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
+    }
+
     /// Measures a kind before a panel shows it. Placement consults the wish
     /// — a tall letter earns a column of its own instead of squeezing into
     /// a neighbour — and a panel about to be born has no id to hang one on,
     /// so the shell measures ahead of the mutation.
     fn wish_ahead(&mut self, kind: &Kind) {
-        if let Kind::Message { id } = kind {
-            let open = self.seed_for(*id);
-            if let Some(h) = self.message_rows(*id, &open) {
-                let (w, _) = kind.grid();
-                self.ws.wish(kind, (w, h));
+        match kind {
+            Kind::Message { id } => {
+                let open = self.seed_for(*id);
+                if let Some(h) = self.message_rows(*id, &open) {
+                    let (w, _) = kind.grid();
+                    self.ws.wish(kind, (w, h));
+                }
             }
+            Kind::File { path } => {
+                let path = path.clone();
+                if let Some(h) = self.file_rows(&path) {
+                    let (w, _) = kind.grid();
+                    self.ws.wish(kind, (w, h));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1369,22 +1464,36 @@ impl State {
         // Wishes measured from content, re-taken from scratch: a letter that
         // arrived, changed or left changes what its panel asks for. Ephemeral
         // like the grid above — measured here, never snapshotted.
-        let wishes = self
+        let kinds: Vec<(PanelId, Kind)> = self
             .ws
             .wss
             .iter()
             .flat_map(|w| w.panels.values())
-            .filter_map(|p| match &p.kind {
+            .map(|p| (p.id, p.kind.clone()))
+            .collect();
+        let mut wishes = HashMap::new();
+        let mut cards: Vec<String> = Vec::new();
+        for (pid, kind) in kinds {
+            let (w, _) = kind.grid();
+            let h = match &kind {
                 Kind::Message { id } => {
-                    let (w, _) = p.kind.grid();
                     let open =
-                        crate::panels::Expansion::for_panel(self.expand.get(&p.id), *id).open;
-                    Some((p.kind.clone(), (w, self.message_rows(*id, &open)?)))
+                        crate::panels::Expansion::for_panel(self.expand.get(&pid), *id).open;
+                    self.message_rows(*id, &open)
+                }
+                Kind::File { path } => {
+                    cards.push(path.clone());
+                    self.file_rows(path)
                 }
                 _ => None,
-            })
-            .collect();
+            };
+            if let Some(h) = h {
+                wishes.insert(kind, (w, h));
+            }
+        }
         self.ws.set_wishes(wishes);
+        // A card's measure lives as long as a panel shows the file.
+        self.measured.retain(|(path, _), _| cards.contains(path));
         // Expansion state dies with its panel.
         let live: Vec<PanelId> = self.expand.keys().copied().collect();
         for pid in live {
@@ -1488,6 +1597,20 @@ impl State {
             }
         }
         self.seen_problems = now.iter().map(crate::problems::Problem::key).collect();
+    }
+
+    /// The header buttons a panel wears right now (CR-008): its kind's,
+    /// the held item's, and — for a files panel — the object verbs only
+    /// while it is the end of a join chain: joined under a parent and
+    /// driving nothing, which is to say the thing under someone's cursor.
+    /// One door for the width, the chords, the lender and the drawing.
+    fn wears(&self, pid: PanelId) -> Vec<(&'static str, BtnAct)> {
+        let Some(kind) = self.ws.panel(pid).map(|p| p.kind.clone()) else {
+            return Vec::new();
+        };
+        let hold = self.hold.as_ref().map(|h| h.op);
+        let object = self.ws.join_parent_of(pid).is_some() && self.ws.joined_child(pid).is_none();
+        ui::head_btns_of(&kind, hold, object)
     }
 
     /// A panel's title, wherever it lives — for action labels.
@@ -1831,12 +1954,12 @@ impl CellFont {
     /// truncates against this rather than against a guessed constant — a
     /// message carrying both archive and delete needs half again what one
     /// button did.
-    fn head_btns_w(&self, kind: &Kind) -> f64 {
+    fn head_btns_w(&self, btns: &[(&'static str, BtnAct)]) -> f64 {
         // Mirrors the walk in `draw_panel_full`: the close box, then each
         // button as its label plus padding, each preceded by a gap.
         theme::BTN_H
             + 4.0
-            + ui::head_btns(kind)
+            + btns
                 .iter()
                 .map(|(label, _)| self.label_w(label.chars().count()) + 12.0 + 4.0)
                 .sum::<f64>()
@@ -2942,8 +3065,8 @@ impl Stage {
             // owns them — so an unclaimed chord falls through to it rather
             // than dying here.
             let accel = state.ws.focus.zip(key_char(k.key_code)).and_then(|(f, c)| {
-                let kind = state.ws.panels.get(&f).map(|p| p.kind.clone())?;
-                let act = ui::head_btns(&kind)
+                let act = state
+                    .wears(f)
                     .iter()
                     .find(|(_, a)| ui::btn_accel(*a) == Some(c))
                     .map(|(_, a)| *a)?;
@@ -2961,12 +3084,10 @@ impl Stage {
             // never drawn here — it stays on the message's own chrome, one
             // column over and in plain sight.
             if let Some(child) = self.lender(cx) {
-                let kind = self
-                    .state
-                    .as_deref()
-                    .and_then(|s| s.ws.panel(child).map(|p| p.kind.clone()));
-                let lent = kind.zip(key_char(k.key_code)).and_then(|(kind, c)| {
-                    ui::head_btns(&kind)
+                let lent = key_char(k.key_code).and_then(|c| {
+                    self.state
+                        .as_deref()?
+                        .wears(child)
                         .iter()
                         .find(|(_, a)| ui::btn_accel(*a) == Some(c))
                         .map(|(_, a)| *a)
@@ -3010,11 +3131,10 @@ impl Stage {
         if !state.ws.panels.contains_key(&child) {
             return None;
         }
-        let editing = self
-            .hosted
-            .get(&f)
-            .cloned()
-            .is_some_and(|w| w.as_inbox_panel().filter_focused(cx));
+        let editing = self.hosted.get(&f).cloned().is_some_and(|w| match kind {
+            Kind::Files { .. } => w.as_files_panel().field_focused(cx),
+            _ => w.as_inbox_panel().filter_focused(cx),
+        });
         (!editing).then_some(child)
     }
 
@@ -3728,7 +3848,7 @@ impl Stage {
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
-                    WidgetOp::OpenMail(id) => {
+                    WidgetOp::OpenRow(target) => {
                         // A click inside a panel focuses it, as anywhere
                         // else. The preview below keeps *whoever* holds
                         // focus — right for the walk, which must not snap
@@ -3737,17 +3857,20 @@ impl Stage {
                             state.ws.focus = Some(pid);
                         }
                         // The cursor follows what you clicked, so the wash
-                        // marks the mail on screen and the arrows carry on
-                        // from there (panel-internal: the inbox listens).
-                        cx.action(crate::panels::PanelAction::SelectMail { pid, id });
+                        // marks the row on screen and the arrows carry on
+                        // from there (panel-internal: the list listens).
+                        cx.action(crate::panels::PanelAction::Select {
+                            pid,
+                            target: target.clone(),
+                        });
                         // Clicking a row is the same move as walking onto it:
                         // it previews, and the list keeps the keyboard.
                         // `enter` is what *goes*. Cmd+click still means what
                         // it means everywhere — a fresh, un-joined panel.
                         if alt {
-                            self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), true);
+                            self.resolve_click(cx, Act::Open(pid, target), true);
                         } else {
-                            self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
+                            self.resolve_click(cx, Act::Preview(pid, target), false);
                         }
                     }
                     WidgetOp::Suggest(i) => {
@@ -3760,6 +3883,7 @@ impl Stage {
                                     w.as_compose_panel().pick(cx, pid, i);
                                 }
                                 Some(Kind::Effects) => w.as_effects_panel().pick(cx, i),
+                                Some(Kind::Files { .. }) => w.as_files_panel().pick(cx, i),
                                 _ => w.as_inbox_panel().pick(cx, i),
                             }
                         }
@@ -3791,20 +3915,6 @@ impl Stage {
                     }
                     WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
                     WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
-                    WidgetOp::OpenJob(id) => {
-                        // The inbox row's move, over the other table: the
-                        // list takes focus, the cursor follows the click,
-                        // and the job opens joined without stealing it back.
-                        if state.ws.focus != Some(pid) {
-                            state.ws.focus = Some(pid);
-                        }
-                        cx.action(crate::panels::PanelAction::SelectJob { pid, id });
-                        if alt {
-                            self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), true);
-                        } else {
-                            self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
-                        }
-                    }
                 }
                 return;
             }
@@ -3979,6 +4089,120 @@ impl Stage {
                             state.pump.kick();
                             state.toast("syncing…", false);
                         }
+                    }
+                    // The files verbs (CR-008): `open` performs, and the
+                    // hold and its `… here` are real as far as the chrome
+                    // goes — but nothing here writes yet, and the toasts
+                    // say so rather than pretending.
+                    BtnAct::Open => {
+                        // The card's path to the OS, through the outside:
+                        // the first real verb of the browser (CR-008).
+                        let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::File { path }) => Some(path),
+                            _ => None,
+                        };
+                        if let Some(display) = path {
+                            let real = crate::files::real_path(&display);
+                            let name = crate::files::basename(&display).to_string();
+                            match state.world.run(&crate::effect::OpenPath { path: &real }) {
+                                Ok(()) => state.toast(format!("opened “{name}”"), false),
+                                Err(e) => state.toast(e, true),
+                            }
+                        }
+                    }
+                    BtnAct::NewDir => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            w.as_files_panel().open_new_dir(cx);
+                        }
+                        return;
+                    }
+                    BtnAct::GoTo => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            w.as_files_panel().open_path(cx);
+                        }
+                        return;
+                    }
+                    BtnAct::CopyHold | BtnAct::MoveHold => {
+                        let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Files { dir }) => Some(dir),
+                            Some(Kind::File { path }) => Some(path),
+                            _ => None,
+                        };
+                        if let Some(path) = path {
+                            let op = if b == BtnAct::CopyHold {
+                                crate::files::HoldOp::Copy
+                            } else {
+                                crate::files::HoldOp::Move
+                            };
+                            state.toast(
+                                format!(
+                                    "{} “{}”: choose where, then {}",
+                                    op.verb(),
+                                    crate::files::basename(&path),
+                                    op.here_label()
+                                ),
+                                false,
+                            );
+                            state.hold = Some(crate::files::Hold { op, path });
+                        }
+                    }
+                    BtnAct::Here => {
+                        let dir = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Files { dir }) => Some(dir),
+                            _ => None,
+                        };
+                        if let (Some(hold), Some(dir)) = (state.hold.clone(), dir) {
+                            let name = crate::files::basename(&hold.path).to_string();
+                            let same_dir = crate::files::parent(&hold.path) == Some(dir.as_str());
+                            let into_itself = hold.path == dir || dir.starts_with(&format!("{}/", hold.path));
+                            // Clashes refuse — except a copy into its own
+                            // directory, which is the one case the
+                            // duplicate is the point.
+                            let refuse = if into_itself {
+                                Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
+                            } else if same_dir && hold.op == crate::files::HoldOp::Move {
+                                Some(format!("“{name}” is already here"))
+                            } else if !same_dir
+                                && crate::files::stat_in(&state.world, &crate::files::join(&dir, &name)).is_some()
+                            {
+                                Some(format!("“{name}” is already here"))
+                            } else {
+                                None
+                            };
+                            match refuse {
+                                Some(msg) => {
+                                    if let Some(w) = self.hosted.get(&pid) {
+                                        w.as_files_panel().set_status(cx, Some(msg.clone()));
+                                    }
+                                    state.toast(msg, true);
+                                }
+                                None => {
+                                    state.toast(
+                                        format!(
+                                            "{} “{name}” into {} — draft: the disk is untouched",
+                                            hold.op.done(),
+                                            crate::files::basename(&dir)
+                                        ),
+                                        false,
+                                    );
+                                    if hold.op == crate::files::HoldOp::Move {
+                                        state.hold = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    BtnAct::Delete
+                        if matches!(
+                            state.ws.panels.get(&pid).map(|p| &p.kind),
+                            Some(Kind::Files { .. } | Kind::File { .. })
+                        ) =>
+                    {
+                        let title = state.title_of(pid);
+                        state.toast(
+                            format!("“{title}” to the trash — draft: nothing left the disk"),
+                            false,
+                        );
                     }
                     BtnAct::Archive | BtnAct::Delete => {
                         // The button acts on the mail its panel is showing;
@@ -4221,7 +4445,10 @@ impl Stage {
                 next_marks.iter().copied().chain(std::iter::once(nid)).collect();
             state.seed_expansion(nid, &open);
             state.show_also = state.ws.joined_child(pid);
-            cx.action(crate::panels::PanelAction::SelectMail { pid, id: nid });
+            cx.action(crate::panels::PanelAction::Select {
+                pid,
+                target: Kind::Message { id: nid },
+            });
         }
         self.sync(cx);
     }
@@ -4307,7 +4534,7 @@ impl Stage {
                 // two fingers). Vertical is the panel's scroll, and keeps
                 // ties — a diagonal is a scroll, never a half-swipe.
                 let row = match act {
-                    Some(Act::WidgetOp(pid, WidgetOp::OpenMail(id))) => Some((*pid, *id)),
+                    Some(Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))) => Some((*pid, *id)),
                     _ => None,
                 };
                 self.touch.mode = match (row, act.as_ref().and_then(act_pid)) {
@@ -4530,7 +4757,7 @@ impl Stage {
     fn row_rect(&self, pid: PanelId, id: core::MailId) -> Option<Rect> {
         self.hits
             .iter()
-            .find(|h| h.act == Act::WidgetOp(pid, WidgetOp::OpenMail(id)))
+            .find(|h| h.act == Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id })))
             .map(|h| h.rect)
     }
 
@@ -4632,6 +4859,8 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Problems => Some(live_id!(problems_tpl)),
         Kind::Effects => Some(live_id!(effects_tpl)),
         Kind::Job { .. } => Some(live_id!(job_tpl)),
+        Kind::Files { .. } => Some(live_id!(files_tpl)),
+        Kind::File { .. } => Some(live_id!(file_tpl)),
     }
 }
 
@@ -4665,7 +4894,8 @@ impl Stage {
         // expired and steps past.
         let mut s = State::new(store, &boot);
         if let Some(open) = boot.open {
-            // Solo: one panel, fresh, in place of the session.
+            // One panel, fresh, in place of the session — alone at the
+            // viewport when solo, else the first column of the strip.
             let kind = open(&s.store);
             let mut ws = Wm::new();
             let pid = ws.open(kind.clone(), None, false);
@@ -4674,7 +4904,9 @@ impl Stage {
                 let open = s.seed_for(id);
                 s.seed_expansion(id, &open);
             }
-            self.solo = Some(pid);
+            if boot.solo {
+                self.solo = Some(pid);
+            }
         }
         s.spawn_workers();
         s.sync();
@@ -4944,10 +5176,14 @@ impl Stage {
                         state.world.now(),
                     );
                 }
-                crate::panels::PanelAction::OpenMail { pid, id, fresh } => {
-                    self.resolve_click(cx, Act::Open(pid, Kind::Message { id }), fresh);
+                // The list verbs, one door each whatever the list is: the
+                // inbox over threads, the effect log over jobs, a files
+                // panel over entries. The row's kind is the whole of what
+                // differs, and `Act::Open` / `Act::Preview` already take one.
+                crate::panels::PanelAction::Open { pid, target, fresh } => {
+                    self.resolve_click(cx, Act::Open(pid, target), fresh);
                 }
-                crate::panels::PanelAction::PreviewMail { pid, id } => {
+                crate::panels::PanelAction::Preview { pid, target } => {
                     // Straight through, no pacing. A preview costs ~0.2 ms —
                     // one small transaction over a handful of UI rows, on a
                     // WAL store with `synchronous=NORMAL`, coalescing into the
@@ -4956,16 +5192,10 @@ impl Stage {
                     // them would only put a delay between the cursor and what
                     // it is pointing at, and could land a stale focus restore
                     // on top of a cmd+arrow the user has since pressed.
-                    self.resolve_click(cx, Act::Preview(pid, Kind::Message { id }), false);
+                    self.resolve_click(cx, Act::Preview(pid, target), false);
                 }
-                crate::panels::PanelAction::SelectMail { .. } => {}
-                crate::panels::PanelAction::OpenJob { pid, id, fresh } => {
-                    self.resolve_click(cx, Act::Open(pid, Kind::Job { id }), fresh);
-                }
-                crate::panels::PanelAction::PreviewJob { pid, id } => {
-                    self.resolve_click(cx, Act::Preview(pid, Kind::Job { id }), false);
-                }
-                crate::panels::PanelAction::SelectJob { .. } => {}
+                // Panel-internal: the list itself listens for this one.
+                crate::panels::PanelAction::Select { .. } => {}
                 crate::panels::PanelAction::FollowLink {
                     pid,
                     target,
@@ -4982,7 +5212,10 @@ impl Stage {
                             ui::preview_kind(&k).map(|_| p)
                         });
                         if let Some(p) = driver {
-                            cx.action(crate::panels::PanelAction::SelectMail { pid: p, id: *id });
+                            cx.action(crate::panels::PanelAction::Select {
+                                pid: p,
+                                target: Kind::Message { id: *id },
+                            });
                         }
                     }
                     let act = if dotted {
@@ -5115,6 +5348,20 @@ impl Stage {
                     state.announce_problems();
                     refresh = true;
                 }
+                crate::panels::PanelAction::NewDir { pid: _, dir, name } => {
+                    // CR-008, draft: the effect and its undo arrive with
+                    // the implementation; the toast is honest about it.
+                    let Some(state) = self.state.as_deref_mut() else {
+                        continue;
+                    };
+                    state.toast(
+                        format!(
+                            "created “{name}/” in {} — draft: the disk is untouched",
+                            crate::files::basename(&dir)
+                        ),
+                        false,
+                    );
+                }
                 crate::panels::PanelAction::TryIt { pid: _ } => {
                     if let Some(state) = self.state.as_deref_mut() {
                         state.toast("side effect: nothing was opened or replaced", false);
@@ -5229,6 +5476,7 @@ impl Stage {
             let props = crate::panels::PanelProps {
                 store: state.store.clone(),
                 registry: state.world.registry_rc(),
+                world: state.world.clone(),
                 pid: *pid,
                 problems: state.problems_for(&kind),
                 kind,
@@ -5285,6 +5533,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             registry: state.world.registry_rc(),
+            world: state.world.clone(),
             pid,
             problems: state.problems_for(&kind),
             kind,
@@ -6474,7 +6723,7 @@ impl Stage {
                 bw,
                 bw,
             );
-            self.draw_header_btn(cx, br, "×", "close", focused, alpha, Act::Close(pid), hover);
+            self.draw_header_btn(cx, br, "×", "close", focused, alpha, Act::Close(pid), hover, false);
         }
     }
 
@@ -6489,6 +6738,7 @@ impl Stage {
         alpha: f64,
         act: Act,
         hover: Option<&Act>,
+        shadowed: bool,
     ) {
         let hovered = hover == Some(&act);
         // On an inverted header the button inverts back when hovered.
@@ -6507,9 +6757,12 @@ impl Stage {
         let tx = r.pos.x + (r.size.x - tw) / 2.0;
         let ty = r.pos.y + (r.size.y - self.cell.label_line()) / 2.0;
         // A side-effect button wears its key (CR-003); × is cmd+w and needs
-        // no mark of its own.
+        // no mark of its own. A key the focused driver keeps for itself
+        // is not marked here (CR-008).
         let accel = match &act {
-            Act::Btn(_, a) => ui::btn_accel(*a).and_then(|c| ui::accel_idx(label, c)),
+            Act::Btn(_, a) if !shadowed => {
+                ui::btn_accel(*a).and_then(|c| ui::accel_idx(label, c))
+            }
             _ => None,
         };
         self.draw_label_accel(cx, tx, ty, label, fg, alpha, accel);
@@ -6830,6 +7083,7 @@ impl Stage {
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
             registry: state.world.registry_rc(),
+            world: state.world.clone(),
             pid,
             kind: kind.clone().unwrap_or(Kind::About),
             expand: state.expand.get(&pid).cloned(),
@@ -7012,7 +7266,7 @@ impl Stage {
                                 reg.push((
                                     t.topic.clone(),
                                     r,
-                                    Act::WidgetOp(pid, WidgetOp::OpenMail(t.target)),
+                                    Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id: t.target })),
                                 ));
                             }
                         }
@@ -7148,7 +7402,11 @@ impl Stage {
                 // name it the same way. Touching it previews the job.
                 let panel = w.as_effects_panel();
                 for h in panel.row_hits(cx) {
-                    reg.push((h.label, h.rect, Act::WidgetOp(pid, WidgetOp::OpenJob(h.id))));
+                    reg.push((
+                        h.label,
+                        h.rect,
+                        Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Job { id: h.id })),
+                    ));
                 }
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
@@ -7170,6 +7428,66 @@ impl Stage {
                         r,
                         Act::Open(pid, Kind::Inbox { filter: Some(email.clone()) }),
                     ));
+                }
+            }
+            Some(Kind::Files { .. }) => {
+                let panel = w.as_files_panel();
+                let fr = w.widget(cx, ids!(filter_input)).area().rect(cx);
+                if fr.size.x > 0.0 {
+                    reg.push(("filter".to_string(), fr, Act::Pointer(pid)));
+                }
+                // The `new dir` field, only while it is up — a hidden
+                // widget keeps its last rect.
+                if panel.new_dir_open() {
+                    let nr = w.widget(cx, ids!(newdir_input)).area().rect(cx);
+                    if nr.size.x > 0.0 {
+                        reg.push(("new dir name".to_string(), nr, Act::Pointer(pid)));
+                    }
+                }
+                if panel.path_open() {
+                    let pr = w.widget(cx, ids!(path_input)).area().rect(cx);
+                    if pr.size.x > 0.0 {
+                        reg.push(("path".to_string(), pr, Act::Pointer(pid)));
+                    }
+                }
+                // The crumbs are dotted: each replaces the panel with an
+                // ancestor, in place.
+                for (label, r, target) in panel.crumb_hits(cx) {
+                    reg.push((label, r, Act::Replace(pid, target)));
+                }
+                // The rows: a directory previews as a column, a file as a
+                // card — the one row-click move, so the list keeps the
+                // keyboard and `enter` is what goes. Addressed by name.
+                if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
+                    for (idx, item) in list.items().iter() {
+                        let r = item.widget.area().rect(cx);
+                        if r.size.x > 0.0 {
+                            if let (Some(e), Some(target)) = (
+                                panel.row_at(&state.store, *idx),
+                                panel.target_at(&state.store, *idx),
+                            ) {
+                                reg.push((
+                                    e.label(),
+                                    r,
+                                    Act::WidgetOp(pid, WidgetOp::OpenRow(target)),
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
+                }
+            }
+            Some(Kind::File { .. }) => {
+                // The selectable runs: the path, and a text preview.
+                let pr = w.widget(cx, ids!(path_txt)).area().rect(cx);
+                if pr.size.x > 0.0 {
+                    reg.push(("path".to_string(), pr, Act::Pointer(pid)));
+                }
+                let tr = w.widget(cx, ids!(text_box.text_prev)).area().rect(cx);
+                if tr.size.x > 0.0 {
+                    reg.push(("preview".to_string(), tr, Act::Pointer(pid)));
                 }
             }
             _ => {}
@@ -7288,14 +7606,34 @@ impl Stage {
         });
 
         let hover = state.hover.clone();
-        let btns_w = self.cell.head_btns_w(&kind);
+        // What this panel wears now (CR-008): its kind's buttons, the
+        // object verbs if it is the end of a chain, the held item's
+        // button if one is held.
+        let head_btns = state.wears(pid);
+        let btns_w = self.cell.head_btns_w(&head_btns);
         self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref(), btns_w);
+
+        // The keys a focused driver keeps for itself: a borrowed mark on
+        // this panel is drawn plain while the driver shadows it, so no
+        // bold letter ever promises a chord the driver would take.
+        let shadow: Vec<char> = state
+            .ws
+            .join_parent_of(pid)
+            .filter(|p| state.ws.focus == Some(*p))
+            .filter(|p| state.ws.panel(*p).is_some_and(|q| ui::preview_kind(&q.kind).is_some()))
+            .map(|p| {
+                state
+                    .wears(p)
+                    .iter()
+                    .filter_map(|(_, a)| ui::btn_accel(*a))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Extra header actions, right to left from the close button —
         // side effects live in the chrome, never floating in content.
-        let head_btns = ui::head_btns(&kind);
         let mut bx = r.pos.x + r.size.x - 18.0 - 4.0;
-        for (label, act) in head_btns {
+        for (label, act) in &head_btns {
             let w = self.cell.label_w(label.chars().count()) + 12.0;
             bx -= w + 4.0;
             let br = rect(
@@ -7304,7 +7642,8 @@ impl Stage {
                 w,
                 theme::BTN_H,
             );
-            self.draw_header_btn(cx, br, label, label, focused, alpha, Act::Btn(pid, *act), hover.as_ref());
+            let shadowed = ui::btn_accel(*act).is_some_and(|c| shadow.contains(&c));
+            self.draw_header_btn(cx, br, label, label, focused, alpha, Act::Btn(pid, *act), hover.as_ref(), shadowed);
         }
 
         // The body: the rect the retained content draws into.

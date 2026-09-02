@@ -66,6 +66,27 @@ themselves, behind one swappable backend — the real one, an in-memory fake,
 or one that refuses everything. That last is what lets a panel be drawn in
 isolation without it quietly sending mail.
 
+## The disk
+
+The filesystem is outside by that same line — nothing the store can
+reproduce — so the [file browser](./interaction-grammar.md#files-a-directory-is-a-column-a-file-is-a-card)
+reaches it through the same backend the network does: `list_dir`, `stat`,
+`read_file` and `open_path` sit beside `now` and `clip`. A files panel is
+the one kind that reads outside the store *while drawing*, so the world
+rides its props; everything else in the app draws from rows alone.
+
+What that buys is what every backend buys: the real one reads the disk and
+hands a path to the OS (`/usr/bin/open` on macOS), the fake serves a demo
+tree — which is why the panels library draws the same directory on every
+machine — and a sealed world says *this world has no outside* on the status
+line instead of pretending. What it costs is the reactive layer: a listing
+is not a query, so nothing invalidates it when the disk moves.
+
+Paths cross that boundary in two spellings, and the mapping is one function
+each way: the panels show and persist `~/Downloads/2026`, the outside reads
+`$HOME/Downloads/2026`. A panel's params are the display form, so a session
+restored on another machine points at that machine's home.
+
 ## The reactive layer
 
 Panels read **only** through registered queries (`store.rows(Q, params)`).

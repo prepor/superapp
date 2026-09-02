@@ -1,0 +1,31 @@
+# Closing a panel takes its joined chain with it (panel model, Joins): the
+# inbox previews a thread, the thread opens a contact, and one ⌘w on the
+# inbox takes all three — the chain is context the inbox pointed at, so it
+# goes when the inbox does. ⌘z brings the whole chain back.
+#
+# The clicks are the assertions. "Elena Petrova" only resolves while the
+# message panel stands, so the walk proves the chain was built; after the
+# close the same click would fail, which is what the undo step then makes
+# resolve again.
+wait 700
+click "Sat hike"
+wait 700
+click "Elena Petrova"
+wait 900
+shot c1-chain
+# Back to the inbox — two columns left — and close it.
+key cmd+left
+wait 300
+key cmd+left
+wait 400
+key cmd+w
+wait 900
+shot c2-closed
+# The chain comes back whole: the contact link resolves again, which it
+# could not while the message panel was gone.
+key cmd+z
+wait 900
+click "Elena Petrova"
+wait 500
+shot c3-undone
+quit

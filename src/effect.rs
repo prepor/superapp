@@ -244,6 +244,18 @@ pub trait Outside {
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     fn shot(&mut self, path: &Path) -> Result<(), String>;
 
+    // The disk, read (CR-008). A files panel lists through these during
+    // draw; the fake serves the demo tree, the real one the filesystem.
+    /// One directory's entries, in the browser's order.
+    fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String>;
+    /// One path's entry, `None` when there is nothing there.
+    fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String>;
+    /// The first `max` bytes of a file.
+    fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String>;
+    /// Hand a path to the OS — whatever opens that kind of file. Nothing
+    /// is executed by us.
+    fn open_path(&mut self, path: &Path) -> Result<(), String>;
+
     /// Reach the concrete backend — how a test arranges a [`Fake`] world.
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
@@ -382,6 +394,22 @@ impl Effect for Clip<'_> {
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.clip(self.text)
+    }
+}
+
+/// Hand a path to the OS: whatever opens that kind of file (CR-008).
+pub struct OpenPath<'a> {
+    pub path: &'a Path,
+}
+
+impl Effect for OpenPath<'_> {
+    const KIND: &'static str = "open";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("open {}", self.path.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.open_path(self.path)
     }
 }
 
@@ -1267,6 +1295,18 @@ impl Outside for Deny {
     fn shot(&mut self, _p: &Path) -> Result<(), String> {
         Self::no("shot")
     }
+    fn list_dir(&mut self, _d: &Path) -> Result<Vec<crate::files::Entry>, String> {
+        Self::no("list_dir")
+    }
+    fn stat(&mut self, _p: &Path) -> Result<Option<crate::files::Entry>, String> {
+        Self::no("stat")
+    }
+    fn read_file(&mut self, _p: &Path, _max: usize) -> Result<Vec<u8>, String> {
+        Self::no("read_file")
+    }
+    fn open_path(&mut self, _p: &Path) -> Result<(), String> {
+        Self::no("open_path")
+    }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -1377,6 +1417,8 @@ pub struct Fake {
     pub clips: Vec<String>,
     pub files: HashMap<PathBuf, Vec<u8>>,
     pub shots: Vec<PathBuf>,
+    /// What `open` handed to the OS (CR-008).
+    pub opened: Vec<PathBuf>,
     /// Accounts with a live session. A verb that reaches a server without
     /// one is a bug in the pass, and this catches it.
     pub connected: HashSet<i64>,
@@ -1614,6 +1656,29 @@ impl Outside for Fake {
 
     fn shot(&mut self, path: &Path) -> Result<(), String> {
         self.shots.push(path.to_path_buf());
+        Ok(())
+    }
+
+    // The demo tree, in the panels' spelling: a fake world's disk.
+    fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
+        let d = crate::files::display_path(dir);
+        crate::files::demo::list(&d).ok_or_else(|| format!("{d}: no such directory"))
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
+        Ok(crate::files::demo::entry(&crate::files::display_path(path)))
+    }
+
+    fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
+        let d = crate::files::display_path(path);
+        let mut bytes =
+            crate::files::demo::bytes_of(&d).ok_or_else(|| format!("{d}: no such file"))?;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
+    fn open_path(&mut self, path: &Path) -> Result<(), String> {
+        self.opened.push(path.to_path_buf());
         Ok(())
     }
 
@@ -1983,6 +2048,71 @@ impl Outside for Real {
         {
             let _ = path;
             Err("no window capture on this platform".into())
+        }
+    }
+
+    fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
+        let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut out = Vec::new();
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            // A link is listed as what it points at while that exists,
+            // as itself otherwise; an entry that cannot be read at all is
+            // left out rather than failing the listing.
+            let meta = match std::fs::metadata(ent.path()).or_else(|_| ent.metadata()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            out.push(crate::files::Entry::from_metadata(&name, &meta));
+        }
+        crate::files::sort(&mut out);
+        Ok(out)
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".into());
+                Ok(Some(crate::files::Entry::from_metadata(&name, &m)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut buf = Vec::new();
+        f.take(max as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(buf)
+    }
+
+    /// macOS: `/usr/bin/open`, the same door the Finder uses — the OS
+    /// picks the viewer, and nothing runs under our name. Elsewhere there
+    /// is no opener yet (android wants a FileProvider).
+    fn open_path(&mut self, path: &Path) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/open")
+                .arg(path)
+                .status()
+                .map_err(|e| format!("open: {e}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("open refused {} ({status})", path.display()))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err("no opener on this platform".into())
         }
     }
 

@@ -1,10 +1,10 @@
 # The panels library (CR-006): the catalogue's scenes on one canvas, every
 # node live. Run with
-#   --library --e2e e2e/library.txt --no-draw --draws 600
+#   --library --e2e e2e/library.txt --no-draw --draws 3000
 # under MAKEPAD=headless (rendered: drop --no-draw, set
 # MAKEPAD_HEADLESS_DPI=1 — the canvas is a big frame). The first wait lets
 # the stage nodes replay their steps, one node at a time.
-wait 4000
+wait 26000
 shot lib-01-overview
 
 # A scene's title fits its block.

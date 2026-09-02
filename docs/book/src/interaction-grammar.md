@@ -39,12 +39,19 @@ on every step, with nothing queued between the cursor and what it points at;
 a whole run of them coalesces into a single history node, so one `cmd+z`
 takes it all back.
 
-Only a panel that *has* a cursor over a list can preview, and it previews into
-exactly one kind: the inbox into a message, the effect log into a job. The
+Only a panel that *has* a cursor over a list can preview, and what it
+previews into is **the kind its row names** — the inbox a message, the effect
+log a job, a files panel a sub-directory or a card, depending on the row. The
 pair reads as one thing, which is also why it borrows keys — see
 [Accelerators](#accelerators). What a preview *establishes* is the domain's,
-not the grammar's: opening a mail reads it, while looking at a job leaves the
-world exactly as it was.
+not the grammar's: opening a mail reads it, while looking at a job or a
+directory leaves the world exactly as it was.
+
+The three list panels say the same three things about the row under the
+cursor — open it, preview it, put the cursor on it — and the shell answers
+each the same way whatever the row is, so there is one of each verb rather
+than one per table. A click on a row is the one door too: the list takes
+focus, its cursor follows, and what the row names previews beside it.
 
 ### Threads: the row is the conversation, the panel is the whole of it
 
@@ -123,6 +130,80 @@ mirrors it the way it mirrors the workspaces: a `! 2 problems` menu that
 exists only while something stands, one item per problem, each opening
 the panel. It is plain text; AppKit draws menu titles itself, and the
 colour lives in the window.
+
+### Files: a directory is a column, a file is a card
+
+Two rules, and the rest is the grammar already described:
+
+> **A directory is a list panel. A file is a card.**
+
+A `files` panel is [the rich table](./richtable.md) over one directory,
+non-recursive: name (a directory wears a trailing `/`), size, modified;
+directories first, then names, case folded. Dot-files wait for `@hidden`.
+The filter is the inbox's grammar over other tags — `@dir`, `@hidden`,
+`@kind:` (image · text · pdf · archive · other, off the extension),
+`@size>`, `@modified>`.
+
+The walk is the preview walk, so the browser is Finder's column view for
+free: the cursor previews a sub-directory as the next column or a file as
+its card, `enter` goes, the next row replaces what was previewed, `cmd+w`
+closes a level and `cmd+←` steps back. Above the rows a crumb line —
+`~ / Downloads / 2026` — spells the way back, each ancestor a **dotted**
+link that replaces the panel in place; they are the first dotted links
+since the message walk went, and exactly what that underline is for.
+
+**`go to`** (`cmd+g`) turns the crumbs into a path field, seeded with where
+the panel stands and a slash. Each segment completes like a shell's tab —
+the entries of the directory the segments before it name, a directory
+landing with its own slash so the next offer opens at once, the two roots
+`~/` and `/` before the first slash; `tab` takes the offer, `enter` goes to
+what is typed even with the offer open, `esc` puts the crumbs back. A
+directory replaces the panel, a file opens its card joined, a path that is
+not there is refused on the status line. `.` and `..` are read; a relative
+spelling is not. A second root typed after the seed **restarts** the path
+(find-file's rule): `~/Downloads//tmp` is `/tmp`, so an absolute path wins
+without clearing the field. That is how the browser leaves `~`.
+
+The **card** is the file's name, its kind and size, when it changed, and its
+path as selectable text. Under a rule it previews what it can: the first 64
+KB of a text file, or a PNG or JPEG fit to the column — decoded by the
+bytes' own magic rather than the name, so a picture saved under the wrong
+extension still draws. Anything else, a PDF included, is the card alone, and
+**`open`** (`cmd+o`) is how you read one: the path goes to the OS, which
+picks the viewer. Nothing is executed by us. A card measures its preview and
+asks for the rows it needs, the way a long letter does — a long file opens
+tall rather than scrolled, a short one stays short.
+
+The rest of the verbs are drawn and their grammar settled, but they do not
+touch the disk yet (see [Open Questions](./open-questions.md)). What the
+grammar says: every verb acts on **the thing the panel shows** — a card's on
+its file, a files panel's on its directory — never on a row, and the list
+reaches them by borrowing, exactly as the inbox borrows `archive`. So a
+files panel wears `copy`, `move` and `delete` only while it is the **end of
+a chain**: joined under a parent and driving nothing, which is to say the
+thing under someone's cursor. A root, a list opened from the launcher, or a
+list that is itself driving a preview wears `new dir` and `go to` alone —
+`~` cannot be deleted, and a chord pressed in a list never hits the
+directory the list itself shows; it hits what the cursor is on, one column
+over, where the mark is.
+
+Where a driver and its preview share a key for the same verb — two files
+panels both wearing `new dir` — the driver's wins, and the shell draws the
+preview's shadowed mark **plain**, so no bold letter ever promises a chord
+the driver would take. Two *different* verbs on one key stay forbidden by
+test; the same verb twice is allowed exactly because the mark stays honest.
+
+Destination is named by walking there rather than by a dialog: `copy`
+(`cmd+p`) or `move` (`cmd+m`) **holds** the object, and every files panel
+then offers `copy here` or `move here` (`cmd+h`), which performs into the
+directory that panel shows. A move clears the hold, a copy keeps it. The
+hold is context, not history — `cmd+z` never takes it back, and it dies with
+the process. `new dir` (`cmd+n`) opens a one-line field above the rows;
+`enter` creates, `esc` puts it away, and a name that is taken or holds a
+separator is refused on the status line. Note `copy` wears `p`, not `c`: a
+card's path is selectable, so rule 3 leaves `cmd+c` to the text. The file
+clipboard is not the text clipboard.
+
 
 ## Keyboard
 

@@ -129,6 +129,16 @@ pub enum Kind {
         /// The `effect` row.
         id: i64,
     },
+    /// One directory as a list (CR-008).
+    Files {
+        /// The directory, in display form (`~/Downloads`).
+        dir: String,
+    },
+    /// One file as a card (CR-008).
+    File {
+        /// The file's path, in display form.
+        path: String,
+    },
 }
 
 impl Kind {
@@ -152,6 +162,10 @@ impl Kind {
             Kind::Problems => (4, 3),
             Kind::Effects => (5, 6),
             Kind::Job { .. } => (4, 3),
+            // Four wide: the header carries five verbs, and three columns
+            // of `Files → Files → File` still fill a 12-grid.
+            Kind::Files { .. } => (4, 6),
+            Kind::File { .. } => (4, 3),
         }
     }
 }
@@ -544,11 +558,19 @@ impl Ws {
 
     /// Closes a panel; focus falls to its nearest surviving neighbour.
     pub fn close(&mut self, pid: PanelId) {
+        // A join is one-way context: the child is what this panel pointed
+        // at, so it goes with it, transitively — the same reason replacing
+        // a panel closes its chain. Closing the inbox takes the message it
+        // was previewing and the contact card that message opened; what
+        // survives is what someone opened for its own sake.
+        self.close_joined_chain(pid);
         self.detach(pid);
     }
 
     /// Detaches a panel — layout, joins, focus fallback — and hands it back.
-    /// [`Ws::close`] is detach-and-drop; a workspace move re-homes the panel.
+    /// [`Ws::close`] is this plus its joined chain; a workspace move
+    /// re-homes the panel and deliberately does **not** cascade: the panel
+    /// travels, its joins stay behind and die with the lost adjacency.
     pub fn detach(&mut self, pid: PanelId) -> Option<Panel> {
         let (c, r) = self.locate(pid)?;
         self.remove_from_layout(pid);
@@ -579,6 +601,11 @@ impl Ws {
 
     /// Keeps per-column invariants: `active` clamped, and following focus.
     fn normalize(&mut self) {
+        // A column with nothing in it is a gap on the strip, never a
+        // place: whatever left it empty — a close, a move, a restore that
+        // dropped a panel this build cannot read — it goes here, so no
+        // path has to remember to prune.
+        self.columns.retain(|c| !c.panels.is_empty());
         for col in &mut self.columns {
             col.active = col.active.min(col.panels.len().saturating_sub(1));
         }
@@ -1404,6 +1431,8 @@ mod tests {
                         Kind::Problems => "problems",
                         Kind::Effects => "effects",
                         Kind::Job { .. } => "job",
+                        Kind::Files { .. } => "files",
+                        Kind::File { .. } => "file",
                     })
                     .collect()
             })
@@ -1575,6 +1604,43 @@ mod tests {
         ws.close(inbox);
         assert_eq!(ws.focus, Some(help));
         assert_eq!(kinds(&ws), [vec!["help"]]);
+    }
+
+    /// Closing a panel takes its joined chain with it, transitively — the
+    /// child is context this panel pointed at, exactly as with a replace.
+    /// A panel opened for its own sake is nobody's context and stays.
+    #[test]
+    fn close_takes_the_joined_chain() {
+        let (mut ws, help, inbox) = boot();
+        let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
+        let contact = ws.follow_open(msg, Kind::Contact { email: "e".into() }, false);
+        // …and one un-joined panel, to show what survives.
+        let about = ws.open(Kind::About, Some(contact), false);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["inbox"], vec!["msg"], vec!["contact"], vec!["about"]]);
+
+        ws.close(inbox);
+        assert_eq!(kinds(&ws), [vec!["help"], vec!["about"]]);
+        assert!(!ws.panels.contains_key(&msg) && !ws.panels.contains_key(&contact));
+        assert!(ws.panels.contains_key(&about));
+        assert!(ws.joins.is_empty());
+        // Focus falls to the panel now standing where the closed one
+        // did — the chain went with it, so that is `about`.
+        assert_eq!(ws.focus, Some(about));
+        let _ = help;
+    }
+
+    /// A workspace move is not a close: the panel travels alone and its
+    /// joins die with the lost adjacency, rather than dragging the chain.
+    #[test]
+    fn a_move_between_workspaces_leaves_the_chain_behind() {
+        let mut wm = Wm::new();
+        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
+        wm.focus = Some(inbox);
+        wm.send_focused_to(2);
+        assert!(wm.wss[2].panels.contains_key(&inbox));
+        assert!(wm.wss[0].panels.contains_key(&msg), "the child stays put");
+        assert!(wm.wss[0].joins.is_empty() && wm.wss[2].joins.is_empty());
     }
 
     /// niri's bracket binds: alone → consume into the neighbour; stacked →
@@ -1797,6 +1863,33 @@ mod tests {
     /// Snapshot → restore is lossless for the logical state, and id minting
     /// resumes above every restored id — even for a panel that moved into a
     /// foreign workspace's range.
+    /// An empty column in a snapshot — a store restore that dropped a
+    /// panel another build wrote, keeping the column it sat in — is a gap
+    /// on the strip, one unit wide and drawn as nothing. It does not come
+    /// back: the strip has columns of panels, never places.
+    #[test]
+    fn restore_drops_empty_columns() {
+        let mut snap = WmSnap::default();
+        snap.wss[0] = WsSnap {
+            columns: vec![
+                (vec![1], false, 0),
+                (Vec::new(), false, 0),
+                (Vec::new(), true, 0),
+                (vec![2], false, 0),
+            ],
+            panels: vec![(1, Kind::Help), (2, Kind::Inbox { filter: None })],
+            joins: Vec::new(),
+            focus: Some(2),
+        };
+        let wm = Wm::restore(snap);
+        let ws = &wm.wss[0];
+        assert_eq!(ws.columns.len(), 2);
+        assert_eq!(ws.columns[0].panels, vec![1]);
+        assert_eq!(ws.columns[1].panels, vec![2]);
+        assert_eq!(ws.focus, Some(2));
+        assert!(wm.snapshot().wss[0].columns.iter().all(|(p, _, _)| !p.is_empty()));
+    }
+
     #[test]
     fn snapshot_restore_round_trips() {
         let mut wm = Wm::new();

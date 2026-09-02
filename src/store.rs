@@ -1504,6 +1504,10 @@ impl Store {
         for ws in &mut wss {
             ws.panels.sort_by_key(|(id, _)| *id);
             ws.joins.sort_unstable();
+            // A column whose every panel was dropped above (a kind another
+            // build wrote) would come back as an empty column — a gap on
+            // the strip that outlives the panel it held.
+            ws.columns.retain(|(panels, _, _)| !panels.is_empty());
         }
         Ok(Some(core::WmSnap {
             active: (active as usize).min(core::WS_N - 1),
@@ -1625,6 +1629,8 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Problems => ("problems", None, None),
         Kind::Effects => ("effects", None, None),
         Kind::Job { id } => ("job", Some(*id), None),
+        Kind::Files { dir } => ("files", None, Some(dir.clone())),
+        Kind::File { path } => ("file", None, Some(path.clone())),
     }
 }
 
@@ -1650,6 +1656,8 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "problems" => Kind::Problems,
         "effects" => Kind::Effects,
         "job" => Kind::Job { id: p_int? },
+        "files" => Kind::Files { dir: p_txt? },
+        "file" => Kind::File { path: p_txt? },
         _ => return None,
     })
 }

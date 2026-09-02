@@ -195,7 +195,10 @@ The touch steps drive the same gesture state machine android uses, so
 verify the android interactions on the desktop, `e2e/workspaces.txt` walks
 the workspace grammar (switch, move-and-follow, overlay),
 `e2e/launcher.txt` walks the launcher (double-cmd, open vs go-to, the
-overlay's search row), `e2e/undo.txt` walks the undo tree (archive → undo →
+overlay's search row), `e2e/cascade.txt` walks the join's cascade (a chain
+built, its parent closed, the whole chain back on ⌘z — the contact link
+resolving is the assertion, since it can only resolve while the message
+panel stands), `e2e/undo.txt` walks the undo tree (archive → undo →
 redo, close, workspace-move). The tree itself is in memory, so `sqlite3`
 shows what the actions *wrote* — folders, flags, the effect queue — rather
 than the history; the tree is the running process's, and dies with it. And
@@ -284,11 +287,11 @@ mise exec -- cargo run -- --library
 mise exec -- cargo run -- --library "inbox row" message
 
 # the canvas's own suite — the fast path: mounts, steps and labels, no rendering
-MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 600
+MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 3000
 
 # …and rendered, for screenshots (the canvas is a big frame)
 MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
-  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 600
+  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 3000
 ```
 
 Under `--no-draw` a `shot` is logged and skipped rather than failed, for the
