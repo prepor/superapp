@@ -37,16 +37,56 @@ wait 600
 key cmd+r
 wait 700
 shot k5-reply
+
+# The message's forward link, with that reply still open, retargets the
+# joined compose in place — the next link from a parent replaces its
+# joined child — so the same panel is a forward now, and seeds again:
+# TO empty and focused, the letter in the body, the fwd: title. Typing
+# offers a recipient (which needs TO to hold the keyboard), the pick is
+# the assertion, and the title click resolves only if the retarget took.
+click "forward"
+wait 700
+shot k6-retargeted-forward
+
+# Discarded before a keystroke and taken back: the panel returns as the
+# forward it showed — its own seed, not the row the reply left — and
+# starts in TO again, which is where the typed offer lands.
 click "discard"
 wait 600
-shot k6-discarded
+key cmd+z
+wait 700
+type "kovac"
+wait 400
+click "Vera Kovac"
+wait 400
+shot k7-forward-restored
+click "fwd: [stelaxis] CI failed"
+wait 300
+click "discard"
+wait 600
+shot k8-discarded
+
+# cmd+f forwards from the list, the chord borrowed from the preview. The
+# compose comes up in TO the same way.
+key cmd+f
+wait 700
+type "kovac"
+wait 400
+click "Vera Kovac"
+wait 400
+shot k9-forward
+click "fwd: [stelaxis] CI failed"
+wait 300
+click "discard"
+wait 600
+shot k10-forward-discarded
 
 # cmd+a archives the message panel and closes it. The cursor was walking
 # with it, so the inbox carries on to the next mail and previews it (CR-005)
 # — focus lands back on the list.
 key cmd+a
 wait 700
-shot k7-archived
+shot k11-archived
 
 # Back on the inbox: cmd+s is its own accelerator (sync). It toasts rather
 # than navigating, so the inbox stays put.
@@ -54,5 +94,5 @@ key cmd+s
 wait 600
 click "Sat hike"
 wait 700
-shot k8-inbox-alive
+shot k12-inbox-alive
 quit

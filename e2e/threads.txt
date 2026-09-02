@@ -46,4 +46,10 @@ wait 700
 shot th7-undone
 click "superapp panel model"
 wait 600
+
+# A mail passed on wears the forwarded mark by its date — the $Forwarded
+# keyword, read from and pushed to the server like the read flag.
+click "invoice 2026-08"
+wait 700
+shot th8-forwarded-mark
 quit

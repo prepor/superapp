@@ -40,6 +40,53 @@ impl Default for Grid {
     }
 }
 
+/// What a compose panel starts from — part of its params, so a reply and
+/// a forward of the same mail are two different panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Seed {
+    /// Nothing prefilled: the launcher's *new mail* root.
+    Blank,
+    /// A reply: TO and SUBJECT from the mail it answers, and the send
+    /// threads to it.
+    Reply(MailId),
+    /// A forward: the mail's letter under a header block in the body,
+    /// SUBJECT from it, TO empty. A conversation of its own.
+    Forward(MailId),
+}
+
+impl Seed {
+    /// The mail a send answers — what `In-Reply-To` names. A forward is not
+    /// a reply: it carries the conversation's chain in `References` (see
+    /// [`Seed::source`]) but names no parent.
+    #[must_use]
+    pub fn in_reply_to(self) -> Option<MailId> {
+        match self {
+            Seed::Reply(id) => Some(id),
+            Seed::Blank | Seed::Forward(_) => None,
+        }
+    }
+
+    /// The mail the draft is about, either way — what a reply answers or a
+    /// forward passes on. Its chain is what the send carries in
+    /// `References`, and its account is the one to send from.
+    #[must_use]
+    pub fn source(self) -> Option<MailId> {
+        match self {
+            Seed::Reply(id) | Seed::Forward(id) => Some(id),
+            Seed::Blank => None,
+        }
+    }
+
+    /// The mail a forward passes on — marked `$Forwarded` once it has gone.
+    #[must_use]
+    pub fn forwards(self) -> Option<MailId> {
+        match self {
+            Seed::Forward(id) => Some(id),
+            Seed::Blank | Seed::Reply(_) => None,
+        }
+    }
+}
+
 /// A panel's kind, parameters included: the whole identity of what it shows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -62,10 +109,10 @@ pub enum Kind {
         /// The sender's address.
         email: String,
     },
-    /// A reply draft.
+    /// A draft: blank, a reply, or a forward.
     Compose {
-        /// The mail being replied to.
-        re: MailId,
+        /// What it starts from.
+        seed: Seed,
     },
     /// Accounts and their sync state.
     Settings,

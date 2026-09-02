@@ -27,7 +27,7 @@ use makepad_widgets::makepad_platform::event::{
 };
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
+use crate::core::{self, Dir, Kind, PanelId, Seed, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
@@ -1716,6 +1716,11 @@ pub struct Stage {
     tpl: HashMap<LiveId, ScriptObjectRef>,
     #[rust]
     hosted: HashMap<PanelId, WidgetRef>,
+    /// What each hosted widget was built and last seeded for — its
+    /// template and its kind. A panel replaced in place keeps its id and
+    /// so its widget; this is how the shell notices the kind under that
+    /// widget changed (a reply retargeted to a forward) and seeds it again.
+    hosted_for: HashMap<PanelId, (LiveId, Kind)>,
     /// A freshly created compose wants its body focused — on the next
     /// event tick, not during the draw that created it.
     #[rust]
@@ -2986,13 +2991,19 @@ impl Stage {
                 return;
             }
         }
+        // Only a row that is this panel's seed's: one left by a kind the
+        // panel had before says nothing about what it shows now.
         let drafts: Vec<(PanelId, mail::Draft)> = state
             .ws
             .wss
             .iter()
             .flat_map(|w| w.panels.iter())
-            .filter(|(_, p)| matches!(p.kind, Kind::Compose { .. }))
-            .map(|(id, _)| (*id, mail::draft(&state.store, *id as i64).unwrap_or_default()))
+            .filter_map(|(id, p)| match p.kind {
+                Kind::Compose { seed } => {
+                    mail::draft_for(&state.store, *id as i64, seed).map(|d| (*id, d))
+                }
+                _ => None,
+            })
             .collect();
         for (id, want) in &drafts {
             if let Some(w) = self.hosted.get(id) {
@@ -3545,9 +3556,9 @@ impl Stage {
                         return;
                     }
                     BtnAct::Send => {
-                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
-                            _ => None,
+                        let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { seed }) => seed,
+                            _ => Seed::Blank,
                         };
                         let d = self
                             .hosted
@@ -3572,7 +3583,7 @@ impl Stage {
                                     ws.close(pid);
                                 },
                                 move |tx| {
-                                    mail::upsert_draft_tx(tx, pid as i64, re, &d, now)?;
+                                    mail::upsert_draft_tx(tx, pid as i64, seed, &d, now)?;
                                     mail::file_send_tx(tx, pid as i64, now + delay)
                                 },
                                 vec![Box::new(mail::Sent { panel: pid as i64, delay }) as Box<dyn crate::history::Intent>],
@@ -3585,12 +3596,21 @@ impl Stage {
                     }
                     BtnAct::Discard => {
                         let label = format!("discard “{}”", state.title_of(pid));
-                        // The text goes with the panel, so undo has to carry it.
-                        let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
-                        let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
-                            _ => None,
+                        let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Compose { seed }) => seed,
+                            _ => Seed::Blank,
                         };
+                        // The text goes with the panel, so undo has to carry
+                        // it — the text the panel *shows*. The row can lag
+                        // it (a keystroke), be missing (never typed in) or
+                        // predate it (a compose retargeted in place, unedited
+                        // since); what undo puts back is what was on screen.
+                        let draft = self
+                            .hosted
+                            .get(&pid)
+                            .map(|w| w.as_compose_panel().values(cx))
+                            .or_else(|| mail::draft_for(&state.store, pid as i64, seed))
+                            .unwrap_or_else(|| mail::seed_draft(&state.store, seed));
                         state.act(
                             "close",
                             label,
@@ -3602,7 +3622,7 @@ impl Stage {
                             vec![Box::new(mail::Discarded {
                                 panel: pid as i64,
                                 draft,
-                                re,
+                                seed,
                             }) as Box<dyn crate::history::Intent>],
                         );
                     }
@@ -4483,14 +4503,14 @@ impl Stage {
                     let Some(state) = self.state.as_deref_mut() else {
                         continue;
                     };
-                    let re = match state.ws.panel(pid).map(|p| p.kind.clone()) {
-                        Some(Kind::Compose { re }) => (re != 0).then_some(re),
-                        _ => None,
+                    let seed = match state.ws.panel(pid).map(|p| p.kind.clone()) {
+                        Some(Kind::Compose { seed }) => seed,
+                        _ => Seed::Blank,
                     };
                     mail::save_draft(
                         &state.store,
                         pid as i64,
-                        re,
+                        seed,
                         &mail::Draft { to, subject, body },
                         state.world.now(),
                     );
@@ -4783,7 +4803,24 @@ impl Widget for Stage {
                         .unwrap_or_default();
                     w.as_launcher_overlay().focus_query(cx, &q);
                 } else {
-                    w.as_compose_panel().focus_body(cx);
+                    // A forward has its letter and wants a recipient; the
+                    // others have their recipient, or nothing, and start
+                    // in the body.
+                    let forward = matches!(
+                        self.state
+                            .as_deref()
+                            .and_then(|s| s.ws.panel(pid))
+                            .map(|p| &p.kind),
+                        Some(Kind::Compose {
+                            seed: Seed::Forward(_)
+                        })
+                    );
+                    let c = w.as_compose_panel();
+                    if forward {
+                        c.focus_to(cx);
+                    } else {
+                        c.focus_body(cx);
+                    }
                 }
             }
         }
@@ -5357,6 +5394,7 @@ impl Stage {
         self.hosted.retain(|pid, _| {
             *pid == OVERLAY_PID_L || *pid == OVERLAY_PID_R || state.ws.panel(*pid).is_some()
         });
+        self.hosted_for.retain(|pid, _| state.ws.panel(*pid).is_some());
 
         // Workspaces stack vertically, one viewport (and a gap) apart; the
         // slide spring carries the view between rows on a switch. Each
@@ -6162,25 +6200,38 @@ impl Stage {
     /// Draws a panel's retained content widget inside the body rect and
     /// registers its interactive children as e2e-addressable hits.
     fn draw_hosted(&mut self, cx: &mut Cx2d, state: &State, pid: PanelId, tpl: LiveId, body: Rect) {
-        let Some((w, created)) = self.hosted_widget(cx, pid, tpl) else {
+        let Some((mut w, mut created)) = self.hosted_widget(cx, pid, tpl) else {
             return;
         };
         let kind = state.ws.panel(pid).map(|p| p.kind.clone());
-        if created {
-            // A fresh compose instance seeds from its persisted draft, or
-            // from the reply header — and starts in the body.
-            if let Some(Kind::Compose { re }) = &kind {
-                let d = mail::draft(&state.store, pid as i64).unwrap_or_else(|| {
-                    let m = (*re != 0).then(|| mail::mail(&state.store, *re)).flatten();
-                    mail::Draft {
-                        to: m.as_ref().map(|m| m.head.from_email.clone()).unwrap_or_default(),
-                        subject: m
-                            .as_ref()
-                            .map(|m| format!("Re: {}", m.head.subject))
-                            .unwrap_or_default(),
-                        body: String::new(),
-                    }
-                });
+        // A panel replaced in place keeps its id, and with it the widget
+        // built for what it showed before. Another template means another
+        // widget; the same template under another kind — a reply
+        // retargeted to a forward by the next link — means seeding again,
+        // exactly as a fresh instance would. A preview re-targeting its
+        // message reads its props every draw and needs neither.
+        let before = self.hosted_for.get(&pid).cloned();
+        if !created && before.as_ref().is_some_and(|(t, _)| *t != tpl) {
+            self.hosted.remove(&pid);
+            let Some((fresh, _)) = self.hosted_widget(cx, pid, tpl) else {
+                return;
+            };
+            w = fresh;
+            created = true;
+        }
+        let reseed = created || before.is_none_or(|(_, k)| Some(&k) != kind.as_ref());
+        if let Some(k) = &kind {
+            self.hosted_for.insert(pid, (tpl, k.clone()));
+        }
+        if reseed {
+            // A compose seeds from its persisted draft — the row that is
+            // *this* seed's, never one left by the kind before it — or
+            // from the seed itself: the reply header, the forwarded
+            // letter. It starts in a field once an event tick comes
+            // (`pending_focus`).
+            if let Some(Kind::Compose { seed }) = &kind {
+                let d = mail::draft_for(&state.store, pid as i64, *seed)
+                    .unwrap_or_else(|| mail::seed_draft(&state.store, *seed));
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);
             }
@@ -6396,12 +6447,17 @@ impl Stage {
                 if r.size.x > 0.0 {
                     reg.push(("mail to".to_string(), r, Act::Pointer(pid)));
                 }
-                let r = w.widget(cx, ids!(reply_link)).area().rect(cx);
-                if r.size.x > 0.0 {
-                    let re = mail::thread(&state.store, id)
-                        .last()
-                        .map_or(id, |t| t.mail.head.id);
-                    reg.push(("reply".to_string(), r, Act::Open(pid, Kind::Compose { re })));
+                let newest = mail::thread(&state.store, id)
+                    .last()
+                    .map_or(id, |t| t.mail.head.id);
+                for (label, path, seed) in [
+                    ("forward", ids!(forward_link), Seed::Forward(newest)),
+                    ("reply", ids!(reply_link), Seed::Reply(newest)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Open(pid, Kind::Compose { seed })));
+                    }
                 }
             }
             Some(Kind::Contact { email }) => {

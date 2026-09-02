@@ -15,6 +15,7 @@ use makepad_widgets::text::selection::Cursor;
 use makepad_widgets::image_cache::ImageCacheImpl;
 use makepad_widgets::*;
 
+use crate::core::Seed;
 use crate::mail;
 use crate::richtable::{self, Completion, SqlSource, Suggestion, Table};
 use crate::store::Store;
@@ -1016,6 +1017,13 @@ script_mod! {
             }
             spacer := View { visible: false, width: Fill, height: 1 }
             View { width: 10, height: 1 }
+            // Passed on: the mark every client draws for `$Forwarded`, by
+            // the date, muted like it.
+            fwd_lbl := mod.widgets.SLabel {
+                visible: false
+                padding: 0
+                width: Fit, text: "↪ ", draw_text +: { color: #909090 }
+            }
             date_lbl := mod.widgets.SLabel {
                 padding: 0
                 width: Fit, text: "", draw_text +: { color: #909090 }
@@ -1085,7 +1093,7 @@ script_mod! {
 
     /** One mail, in its conversation (CR-007): the account it came to,
         once; every message of the thread, oldest first, open or closed;
-        reply at the foot. */
+        forward and reply at the foot. */
     mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -1121,7 +1129,9 @@ script_mod! {
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
+            spacing: 14
             View { width: Fill, height: 1 }
+            forward_link := mod.widgets.SLink {}
             reply_link := mod.widgets.SLink {}
         }
     }
@@ -1252,15 +1262,21 @@ script_mod! {
             mod.widgets.SLabel { width: Fill, text: "a control wearing a bold letter is cmd+that letter:" }
         }
         // Short lines: a panel wide enough for one long row of these was
-        // already a squeeze before delete joined the message's chrome.
+        // already a squeeze before delete joined the message's chrome, and
+        // forward took the message onto a second line.
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "  message " }
             mod.widgets.SKbd { text: "cmd+a" }
             mod.widgets.SLabel { text: "rchive " }
             mod.widgets.SKbd { text: "cmd+d" }
-            mod.widgets.SLabel { text: "elete " }
+            mod.widgets.SLabel { text: "elete" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "          " }
             mod.widgets.SKbd { text: "cmd+r" }
-            mod.widgets.SLabel { text: "eply" }
+            mod.widgets.SLabel { text: "eply " }
+            mod.widgets.SKbd { text: "cmd+f" }
+            mod.widgets.SLabel { text: "orward" }
         }
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "  inbox   " }
@@ -2070,6 +2086,18 @@ impl ComposePanel {
     }
 }
 
+/// Lands in the `j`-th compose field. The one-line fields take their text
+/// selected, as a form's do; the body keeps its caret — a letter is not a
+/// value to type over, and in a forward it is the mail being passed on,
+/// with the caret above it.
+fn land(cx: &mut Cx, inputs: &[TextInputRef; 3], j: usize) {
+    if j == 2 {
+        inputs[2].set_key_focus(cx);
+    } else {
+        focus_input(cx, &inputs[j]);
+    }
+}
+
 impl Widget for ComposePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
@@ -2102,7 +2130,7 @@ impl Widget for ComposePanel {
                     None if dir > 0 => 0,
                     None => n - 1,
                 };
-                focus_input(cx, &inputs[j as usize]);
+                land(cx, &inputs, j as usize);
             }
         }
 
@@ -2114,9 +2142,9 @@ impl Widget for ComposePanel {
                 }
             }
             if to.returned(actions).is_some() {
-                focus_input(cx, &subject);
+                land(cx, &[to.clone(), subject.clone(), body.clone()], 1);
             } else if subject.returned(actions).is_some() {
-                focus_input(cx, &body);
+                land(cx, &[to.clone(), subject.clone(), body.clone()], 2);
             }
             if to.changed(actions).is_some()
                 || subject.changed(actions).is_some()
@@ -2175,6 +2203,12 @@ impl ComposePanelRef {
     pub fn focus_body(&self, cx: &mut Cx) {
         let Some(inner) = self.borrow() else { return };
         inner.view.text_input(cx, ids!(body_input)).set_key_focus(cx);
+    }
+
+    /// Focuses TO — where a forward starts, its letter already in the body.
+    pub fn focus_to(&self, cx: &mut Cx) {
+        let Some(inner) = self.borrow() else { return };
+        inner.view.text_input(cx, ids!(to_input)).set_key_focus(cx);
     }
 
     /// The current fields as a draft (send reads through this).
@@ -2811,6 +2845,7 @@ impl ThreadMsgRef {
         pe.set_visible(cx, err);
         v.view(cx, ids!(preview_wrap)).set_visible(cx, !open);
         v.view(cx, ids!(spacer)).set_visible(cx, open);
+        v.label(cx, ids!(fwd_lbl)).set_visible(cx, m.forwarded);
         v.label(cx, ids!(date_lbl)).set_text(cx, &w.date);
 
         // The letter, while open. Both readings are written every time —
@@ -3167,26 +3202,32 @@ impl Widget for MessagePanel {
                 }
             }
         }
-        // The message panel's link accelerator (CR-003): reply is cmd+r,
-        // drawn onto the link itself. The shell forwards any cmd chord it
-        // does not own itself. Reply answers the newest mail of the
-        // thread — the conventional reply to a conversation.
+        // The message panel's link accelerators (CR-003): reply is cmd+r
+        // and forward cmd+f, each drawn onto its link. The shell forwards
+        // any cmd chord it does not own itself. Both take the newest mail
+        // of the thread — the conventional reply to a conversation, and
+        // the mail a forward of it passes on.
         if let Event::KeyDown(k) = event {
-            if !k.modifiers.logo || k.key_code != KeyCode::KeyR {
+            if !k.modifiers.logo {
                 return;
             }
+            let seed: fn(crate::core::MailId) -> Seed = match k.key_code {
+                KeyCode::KeyR => Seed::Reply,
+                KeyCode::KeyF => Seed::Forward,
+                _ => return,
+            };
             let Some(p) = scope.props.get::<PanelProps>() else {
                 return;
             };
             let crate::core::Kind::Message { id } = p.kind else {
                 return;
             };
-            let re = mail::thread(&p.store, id)
+            let newest = mail::thread(&p.store, id)
                 .last()
                 .map_or(id, |t| t.mail.head.id);
             cx.action(PanelAction::FollowLink {
                 pid: p.pid,
-                target: crate::core::Kind::Compose { re },
+                target: crate::core::Kind::Compose { seed: seed(newest) },
                 dotted: false,
                 fresh: false,
             });
@@ -3209,11 +3250,23 @@ impl Widget for MessagePanel {
                 .set_text(cx, &first.mail.to);
         }
         let newest = msgs.last().map_or(id, |t| t.mail.head.id);
+        self.view.link(cx, ids!(forward_link)).set_accel(
+            cx,
+            pid,
+            "forward",
+            crate::core::Kind::Compose {
+                seed: Seed::Forward(newest),
+            },
+            false,
+            Some(ui::ACCEL_FORWARD),
+        );
         self.view.link(cx, ids!(reply_link)).set_accel(
             cx,
             pid,
             "reply",
-            crate::core::Kind::Compose { re: newest },
+            crate::core::Kind::Compose {
+                seed: Seed::Reply(newest),
+            },
             false,
             Some(ui::ACCEL_REPLY),
         );

@@ -43,7 +43,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::session::{ConflictAction, Session};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
-use crate::core::{self, Kind, PanelId};
+use crate::core::{self, Kind, PanelId, Seed};
 
 /// The durable tables a write's session records — everything a peer device
 /// must be told about (CR-005). `repl_log` and `repl` are replication's own
@@ -405,16 +405,19 @@ pub(crate) fn backfill_threads(conn: &Connection) -> rusqlite::Result<()> {
 /// `repl_log.seq` is fed from `repl.next_local_seq`, **not** a bare rowid — a
 /// snapshot install clears `repl_log` while `repl` survives, and SQLite would
 /// otherwise reassign rowids from 1 and make a fresh row look long published.
+///
+/// Applied by presence, like v11 below: every write needs these tables, and
+/// a store whose counter another build ran past 10 turned up without them.
 const SCHEMA_V10: &str = "
-CREATE TABLE repl_log(
+CREATE TABLE IF NOT EXISTS repl_log(
   seq       INTEGER PRIMARY KEY,      -- local order, from repl.next_local_seq
   pub_seq   INTEGER,                  -- global seq at publish; NULL until then
   ts        REAL NOT NULL,
   changeset BLOB NOT NULL
 );
-CREATE INDEX idx_repl_log_pending ON repl_log(seq) WHERE pub_seq IS NULL;
+CREATE INDEX IF NOT EXISTS idx_repl_log_pending ON repl_log(seq) WHERE pub_seq IS NULL;
 
-CREATE TABLE repl(
+CREATE TABLE IF NOT EXISTS repl(
   id      INTEGER PRIMARY KEY CHECK(id = 1),
   device  TEXT NOT NULL,              -- stable per install; survives snapshots
   epoch   INTEGER NOT NULL DEFAULT 0,
@@ -423,6 +426,70 @@ CREATE TABLE repl(
   holding INTEGER NOT NULL DEFAULT 0
 );
 ";
+/// Schema v11 (forward): the mail a draft passes on, beside the one it
+/// answers — the send reads the chain off whichever is set — and the
+/// `$Forwarded` keyword on both sides of the desired/actual split, exactly
+/// as the read flag lives there: `message.forwarded` is intent (set when a
+/// forward has gone), `server_msg.forwarded` is what the server holds, and
+/// their disagreement is pushed like any other.
+///
+/// Applied by **presence**, not by the counter alone: every branch shares
+/// the one store and its one `user_version`, so a store whose counter was
+/// advanced to 11 by another build still lacks these columns — as a real
+/// one did. A column is there or it is not; `(table, column, how to add
+/// it)`, and the ladder adds what is missing.
+const SCHEMA_V11: &[(&str, &str, &str)] = &[
+    (
+        "draft",
+        "fwd_message",
+        "ALTER TABLE draft ADD COLUMN fwd_message INTEGER",
+    ),
+    (
+        "message",
+        "forwarded",
+        "ALTER TABLE message ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "server_msg",
+        "forwarded",
+        "ALTER TABLE server_msg ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0",
+    ),
+    // Whether the folder's server keeps keywords (its PERMANENTFLAGS),
+    // recorded at each SELECT; assumed until the first one says.
+    (
+        "folder",
+        "keywords",
+        "ALTER TABLE folder ADD COLUMN keywords INTEGER NOT NULL DEFAULT 1",
+    ),
+];
+
+/// Whether the store has `table` — what the table steps of the ladder go by.
+fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |_| Ok(()),
+    )
+    .map(|()| true)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+        other => Err(other),
+    })
+}
+
+/// Whether `table` has `column` — what the column steps of the ladder go
+/// by.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Rewrites `message.html` from the `raw` blob each synced mail keeps. The
 /// narrowing ([`crate::html::sanitize`]) runs at ingest, so a stored reading
 /// is only as good as the build that stored it, and a better narrowing has
@@ -718,10 +785,23 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         backfill_threads(conn)?;
         conn.pragma_update(None, "user_version", 9)?;
     }
-    if version < 10 {
+    if !has_table(conn, "repl")? || !has_table(conn, "repl_log")? {
         conn.execute_batch(SCHEMA_V10)?;
-        conn.execute("INSERT INTO repl(id, device) VALUES(1, ?1)", [device_id()])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO repl(id, device) VALUES(1, ?1)",
+            [device_id()],
+        )?;
+    }
+    if version < 10 {
         conn.pragma_update(None, "user_version", 10)?;
+    }
+    for (table, column, ddl) in SCHEMA_V11 {
+        if !has_column(conn, table, column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    if version < 11 {
+        conn.pragma_update(None, "user_version", 11)?;
     }
     // The HTML narrowing runs at ingest, so a stored reading is as good as
     // the build that wrote it. The version of the narrowing the store holds
@@ -1520,7 +1600,15 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Inbox { filter } => ("inbox", None, filter.clone()),
         Kind::Message { id } => ("message", Some(*id), None),
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
-        Kind::Compose { re } => ("compose", Some(*re), None),
+        // A blank compose keeps the `0` it always had, so a session an
+        // earlier build saved still reads.
+        Kind::Compose { seed: Seed::Blank } => ("compose", Some(0), None),
+        Kind::Compose {
+            seed: Seed::Reply(id),
+        } => ("compose", Some(*id), None),
+        Kind::Compose {
+            seed: Seed::Forward(id),
+        } => ("forward", Some(*id), None),
         Kind::Settings => ("settings", None, None),
         Kind::AddAccount => ("add_account", None, None),
     }
@@ -1534,7 +1622,15 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "inbox" => Kind::Inbox { filter: p_txt },
         "message" => Kind::Message { id: p_int? },
         "contact" => Kind::Contact { email: p_txt? },
-        "compose" => Kind::Compose { re: p_int? },
+        "compose" => Kind::Compose {
+            seed: match p_int? {
+                0 => Seed::Blank,
+                id => Seed::Reply(id),
+            },
+        },
+        "forward" => Kind::Compose {
+            seed: Seed::Forward(p_int?),
+        },
         "settings" => Kind::Settings,
         "add_account" => Kind::AddAccount,
         _ => return None,
@@ -1562,6 +1658,56 @@ mod tests {
 
     fn store() -> Store {
         Store::open(None).expect("in-memory store")
+    }
+
+    /// The table and column steps heal a store another build's counter
+    /// ran past: with `user_version` already at 11, the v10 tables and the
+    /// v11 columns gone, a run of the ladder puts them back and leaves the
+    /// counter alone — the state a real store turned up in.
+    #[test]
+    fn late_steps_go_by_presence_not_by_the_counter() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "ALTER TABLE message DROP COLUMN forwarded;
+             ALTER TABLE server_msg DROP COLUMN forwarded;
+             ALTER TABLE draft DROP COLUMN fwd_message;
+             ALTER TABLE folder DROP COLUMN keywords;
+             DROP TABLE repl_log;
+             DROP TABLE repl;",
+        )
+        .unwrap();
+        let version = || -> i64 {
+            c.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(), 11, "the counter says nothing is missing");
+        assert!(!has_column(&c, "message", "forwarded").unwrap());
+        assert!(!has_table(&c, "repl").unwrap());
+
+        migrate(&c).unwrap();
+        for (table, column, _) in SCHEMA_V11 {
+            assert!(
+                has_column(&c, table, column).unwrap(),
+                "{table}.{column} is back"
+            );
+        }
+        assert!(has_table(&c, "repl").unwrap() && has_table(&c, "repl_log").unwrap());
+        let devices: i64 = c
+            .query_row("SELECT COUNT(*) FROM repl", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(devices, 1, "the device row is back too");
+        assert_eq!(version(), 11);
+
+        // And a store that has everything is left exactly as it is.
+        let device: String = c
+            .query_row("SELECT device FROM repl", [], |r| r.get(0))
+            .unwrap();
+        migrate(&c).unwrap();
+        let same: String = c
+            .query_row("SELECT device FROM repl", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(device, same, "an existing device id is never replaced");
     }
 
     static Q_META: Q = Q {
@@ -1622,6 +1768,10 @@ mod tests {
         wm.switch(0);
         wm.toggle_tabbed(inbox); // a surviving tabbed column
         wm.follow_open(inbox, Kind::Contact { email: "v@k.io".into() }, false);
+        // The three seeds a compose has, each its own row.
+        for seed in [Seed::Blank, Seed::Reply(3), Seed::Forward(3)] {
+            wm.open(Kind::Compose { seed }, None, false);
+        }
         let snap = wm.snapshot();
         assert!(!snap.wss[0].joins.is_empty(), "a live join persists");
 

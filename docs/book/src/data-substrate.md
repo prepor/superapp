@@ -104,7 +104,7 @@ per account** — its own connection to the same file — polls every minute
 panels honestly know nothing), reconcile flags and deletions.
 
 Server effects run on a **desired/actual split**: a `message` row is the
-user's *intent* (which folder, read or not); `server_msg` is what the
+user's *intent* (which folder, read or not, passed on or not); `server_msg` is what the
 server actually holds, written only by the workers. A row whose two sides
 disagree **is** the push queue — each pass turns every disagreement into a
 job, then fetches and reconciles facts.
@@ -174,9 +174,15 @@ outbox row with `send_after = now + 10 s` and closes the panel; `cmd+z`
 inside the window cancels it — the row's deletion *is* the undo, and the
 claim (`WHERE status='pending'`) means the race between undo and the
 sender has exactly one winner. The sender wakes at the deadline and queues
-a `submit` job; the executor submits over SMTP (rustls, port 465; reply
-headers thread via `In-Reply-To`), appends the sent bytes to the account's
-Sent folder over IMAP, and records the outcome. Because both the outbox row
+a `submit` job; the executor submits over SMTP (rustls, port 465; a reply
+names its parent in `In-Reply-To` and both a reply and a forward carry the
+source's chain in `References`, so the Sent copy folds into the
+conversation when it syncs back), appends the sent bytes to the account's
+Sent folder over IMAP, and records the outcome — for a forward, that the
+mail it passed on is now *forwarded*, an intent the next push pass sets on
+the server as the `$Forwarded` keyword, the one other clients draw their
+arrow from — where the folder's `PERMANENTFLAGS` say it keeps keywords;
+elsewhere the mark stays local, neither pushed nor read back. Because both the outbox row
 and the job are durable, a mail that hit *send* and never left goes out late
 rather than never. A delivered send is physics: its claim refuses, the
 history node goes **expired**, and the walk skips it transparently.

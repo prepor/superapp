@@ -14,8 +14,8 @@ use std::rc::Rc;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{Kind, MailId};
-use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
+use crate::core::{Kind, MailId, Seed};
+use crate::effect::{Creds, Ctx, Deferred, Effect, MailFlag, Outgoing, Registry, UidSet, World};
 use crate::filter::Op;
 use crate::history::Intent;
 use crate::richtable::{
@@ -49,6 +49,9 @@ pub struct MailFull {
     pub status: Option<(String, bool)>,
     /// The receiving account's address (the TO line).
     pub to: String,
+    /// Passed on — the `$Forwarded` keyword, as the app or another client
+    /// set it. The row draws a mark by the date.
+    pub forwarded: bool,
 }
 
 /// A distinct sender: the launcher's contact entries.
@@ -122,7 +125,7 @@ static Q_ALL: Q = Q {
 static Q_MAIL: Q = Q {
     id: "mail",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email, m.html
+                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded
           FROM message m JOIN account a ON a.id = m.account
           WHERE m.id = ?1",
     describe: "one mail, both bodies included, with its account's address",
@@ -157,7 +160,7 @@ static Q_ACCOUNTS: Q = Q {
 static Q_THREAD: Q = Q {
     id: "thread",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email, m.html,
+                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded,
                  COALESCE(f.role, ''), COALESCE(m.message_id, '')
           FROM message m JOIN account a ON a.id = m.account
                          JOIN folder f ON f.id = m.folder
@@ -211,14 +214,15 @@ fn full_row(r: &rusqlite::Row) -> rusqlite::Result<MailFull> {
         html: r.get(10)?,
         status: status.map(|s| (s, err)),
         to: r.get(9)?,
+        forwarded: r.get(11)?,
     })
 }
 
 fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadMail> {
     Ok(ThreadMail {
         mail: full_row(r)?,
-        role: r.get(11)?,
-        message_id: r.get(12)?,
+        role: r.get(12)?,
+        message_id: r.get(13)?,
     })
 }
 
@@ -849,8 +853,16 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Inbox { filter: None } => "inbox".into(),
         Kind::Message { id } => thread_topic(store, *id).unwrap_or_else(|| "message".into()),
         Kind::Contact { email } => contact(store, email).0,
-        Kind::Compose { re } => mail(store, *re)
+        Kind::Compose { seed: Seed::Blank } => "new mail".into(),
+        Kind::Compose {
+            seed: Seed::Reply(id),
+        } => mail(store, *id)
             .map(|m| format!("re: {}", m.head.subject))
+            .unwrap_or_else(|| "new mail".into()),
+        Kind::Compose {
+            seed: Seed::Forward(id),
+        } => mail(store, *id)
+            .map(|m| format!("fwd: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
         Kind::AddAccount => "add account".into(),
@@ -1053,19 +1065,84 @@ pub struct Draft {
     pub body: String,
 }
 
+/// The draft a fresh compose starts from, by its seed: a reply answers
+/// its mail, a forward passes it on. Text the panel persisted wins over
+/// this — the shell asks only when there is none.
+#[must_use]
+pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
+    match seed {
+        Seed::Blank => Draft::default(),
+        Seed::Reply(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
+            to: m.head.from_email.clone(),
+            subject: format!("Re: {}", m.head.subject),
+            body: String::new(),
+        }),
+        Seed::Forward(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
+            to: String::new(),
+            subject: format!("Fwd: {}", m.head.subject),
+            body: forwarded(&m),
+        }),
+    }
+}
+
+/// A forward's body: room to write at the top, then the mail under the
+/// header block every client recognises — who wrote it, about what, when,
+/// to whom. The letter is the plain reading, which an HTML mail keeps for
+/// exactly this.
+#[must_use]
+pub fn forwarded(m: &MailFull) -> String {
+    // A sender without a name is stored under their address as the name
+    // (see [`crate::sync::parse_mail`]); written out, that is the address
+    // once, not twice.
+    let (name, email) = (&m.head.from_name, &m.head.from_email);
+    let from = if name.is_empty() || name == email {
+        email.clone()
+    } else {
+        format!("{name} <{email}>")
+    };
+    format!(
+        "\n\nBegin forwarded message:\n\nFrom: {from}\nSubject: {}\nDate: {}\nTo: {}\n\n{}",
+        m.head.subject,
+        fmt_date_long(m.head.date),
+        m.to,
+        m.body.trim_end()
+    )
+}
+
 /// Loads a panel's draft, if any (boot restore, prefill).
 pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
+    draft_row(store, panel).map(|(d, _)| d)
+}
+
+/// A panel's draft, if the row is `seed`'s own: what it answers and what
+/// it passes on must match. A panel replaced in place keeps its id, so a
+/// row a reply left is not the forward's draft — that one seeds afresh.
+pub fn draft_for(store: &Store, panel: i64, seed: Seed) -> Option<Draft> {
+    draft_row(store, panel)
+        .filter(|(_, (re, fwd))| (*re, *fwd) == (seed.in_reply_to(), seed.forwards()))
+        .map(|(d, _)| d)
+}
+
+/// What a draft row answers and what it passes on — the seed it was
+/// saved under, as `(re_message, fwd_message)`.
+type DraftSeed = (Option<MailId>, Option<MailId>);
+
+/// The row: the text, and the seed it was saved under.
+fn draft_row(store: &Store, panel: i64) -> Option<(Draft, DraftSeed)> {
     store
         .conn()
         .query_row(
-            "SELECT to_addr, subject, body FROM draft WHERE panel=?1",
+            "SELECT to_addr, subject, body, re_message, fwd_message FROM draft WHERE panel=?1",
             [panel],
             |r| {
-                Ok(Draft {
-                    to: r.get(0)?,
-                    subject: r.get(1)?,
-                    body: r.get(2)?,
-                })
+                Ok((
+                    Draft {
+                        to: r.get(0)?,
+                        subject: r.get(1)?,
+                        body: r.get(2)?,
+                    },
+                    (r.get(3)?, r.get(4)?),
+                ))
             },
         )
         .ok()
@@ -1074,21 +1151,26 @@ pub fn draft(store: &Store, panel: i64) -> Option<Draft> {
 /// Persists a compose panel's fields — plain typing upkeep, deliberately
 /// **not** an action (text editing is the future editor's local undo).
 /// The caller skips no-op saves; this just writes.
-pub fn save_draft(store: &Store, panel: i64, re: Option<MailId>, d: &Draft, now: f64) {
+pub fn save_draft(store: &Store, panel: i64, seed: Seed, d: &Draft, now: f64) {
     let d = d.clone();
-    let _ = store.write(move |c| upsert_draft_tx(c, panel, re, &d, now));
+    let _ = store.write(move |c| upsert_draft_tx(c, panel, seed, &d, now));
 }
 
 /// The transaction-level draft upsert (also part of the send action, so
-/// the recorded changeset carries the final content).
+/// the recorded changeset carries the final content). The seed's mail is
+/// recorded as what the draft answers or what it passes on — the send
+/// reads its threading headers off either — and a row a panel already has
+/// takes the seed along with the text: a compose retargeted in place is
+/// a new draft under an old id.
 pub fn upsert_draft_tx(
     c: &rusqlite::Connection,
     panel: i64,
-    re: Option<MailId>,
+    seed: Seed,
     d: &Draft,
     now: f64,
 ) -> rusqlite::Result<()> {
-    let account: Option<i64> = re
+    let account: Option<i64> = seed
+        .source()
         .and_then(|id| {
             c.query_row("SELECT account FROM message WHERE id=?1", [id], |r| r.get(0))
                 .ok()
@@ -1104,12 +1186,24 @@ pub fn upsert_draft_tx(
         })
         .or_else(|| c.query_row("SELECT id FROM account ORDER BY id LIMIT 1", [], |r| r.get(0)).ok());
     c.execute(
-        "INSERT INTO draft(panel, account, re_message, to_addr, subject, body, updated)
-         VALUES(?1,?2,?3,?4,?5,?6,?7)
+        "INSERT INTO draft(panel, account, re_message, fwd_message,
+                           to_addr, subject, body, updated)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(panel) DO UPDATE SET
+           account=excluded.account, re_message=excluded.re_message,
+           fwd_message=excluded.fwd_message,
            to_addr=excluded.to_addr, subject=excluded.subject,
            body=excluded.body, updated=excluded.updated",
-        rusqlite::params![panel, account, re, d.to, d.subject, d.body, now],
+        rusqlite::params![
+            panel,
+            account,
+            seed.in_reply_to(),
+            seed.forwards(),
+            d.to,
+            d.subject,
+            d.body,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -1238,7 +1332,7 @@ impl Effect for Seen {
 
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
-            .store_seen(self.account, &self.folder, self.uid, self.seen)
+            .store_flag(self.account, &self.folder, self.uid, MailFlag::Seen, self.seen)
     }
 }
 
@@ -1265,6 +1359,74 @@ impl Deferred for Seen {
         tx.execute(
             "UPDATE server_msg SET seen = ?1 WHERE message = ?2",
             rusqlite::params![self.seen, self.message],
+        )?;
+        Ok(())
+    }
+}
+
+/// Make the server agree that a mail was passed on — the `$Forwarded`
+/// keyword, which is what every other client draws its arrow from. The
+/// read flag's twin in every respect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forwarded {
+    pub account: i64,
+    pub message: i64,
+    pub folder: String,
+    pub uid: u32,
+    pub on: bool,
+}
+
+impl Effect for Forwarded {
+    const KIND: &'static str = "forwarded";
+    type Reply = ();
+
+    fn describe(&self) -> String {
+        format!(
+            "mark uid {} in {} {}",
+            self.uid,
+            self.folder,
+            if self.on {
+                "forwarded"
+            } else {
+                "not forwarded"
+            }
+        )
+    }
+
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.store_flag(
+            self.account,
+            &self.folder,
+            self.uid,
+            MailFlag::Forwarded,
+            self.on,
+        )
+    }
+}
+
+impl Deferred for Forwarded {
+    fn idempotent(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
+    fn still_wanted(&self, db: &Connection) -> bool {
+        db.query_row(
+            "SELECT 1 FROM message m JOIN server_msg s ON s.message = m.id
+             WHERE m.id = ?1 AND m.forwarded = ?2 AND s.forwarded != ?2",
+            rusqlite::params![self.message, self.on],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn settle(&self, tx: &Transaction, _reply: &()) -> rusqlite::Result<()> {
+        tx.execute(
+            "UPDATE server_msg SET forwarded = ?1 WHERE message = ?2",
+            rusqlite::params![self.on, self.message],
         )?;
         Ok(())
     }
@@ -1345,6 +1507,14 @@ impl Deferred for Submit {
             "UPDATE outbox SET status = 'sent', error = ?2 WHERE id = ?1",
             rusqlite::params![self.outbox, reply],
         )?;
+        // The mail a forward passed on is now forwarded — intent, which
+        // the next push pass sets on the server as `$Forwarded`. Not an
+        // action: it is a consequence of a send that has already left.
+        tx.execute(
+            "UPDATE message SET forwarded = 1
+             WHERE id = (SELECT fwd_message FROM draft WHERE panel = ?1)",
+            [self.outbox],
+        )?;
         Ok(())
     }
 }
@@ -1365,13 +1535,31 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                 COALESCE((SELECT name FROM folder WHERE account=a.id AND role='sent'), 'Sent'),
                 d.to_addr, d.subject, d.body,
                 (SELECT message_id FROM message WHERE id = d.re_message),
-                (SELECT GROUP_CONCAT(mid, ' ') FROM reference WHERE message = d.re_message)
+                (SELECT message_id FROM message
+                  WHERE id = COALESCE(d.re_message, d.fwd_message)),
+                (SELECT GROUP_CONCAT(mid, ' ') FROM reference
+                  WHERE message = COALESCE(d.re_message, d.fwd_message))
          FROM outbox o
          JOIN account a ON a.id = o.account
          JOIN draft d ON d.panel = o.id
          WHERE o.id = ?1",
         [outbox],
         |r| {
+            // The chain: what the source itself referenced, then the
+            // source — so a reply to a reply, or a forward of one, threads
+            // for whoever already has the conversation (RFC 5322).
+            let source: Option<String> = r.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty());
+            let mut references: Vec<String> = r
+                .get::<_, Option<String>>(10)?
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            if let Some(mid) = source {
+                if !references.contains(&mid) {
+                    references.push(mid);
+                }
+            }
             Ok(Outgo {
                 account: r.get(0)?,
                 email: r.get(1)?,
@@ -1382,13 +1570,8 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                     to: r.get(5)?,
                     subject: r.get(6)?,
                     body: r.get(7)?,
-                    in_reply_to: r.get(8)?,
-                    references: r
-                        .get::<_, Option<String>>(9)?
-                        .unwrap_or_default()
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect(),
+                    in_reply_to: r.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+                    references,
                 },
             })
         },
@@ -1523,7 +1706,7 @@ impl Intent for Sent {
 pub struct Discarded {
     pub panel: i64,
     pub draft: Draft,
-    pub re: Option<MailId>,
+    pub seed: Seed,
 }
 
 impl Intent for Discarded {
@@ -1531,9 +1714,9 @@ impl Intent for Discarded {
         format!("panel:{} draft discarded", self.panel)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let (now, panel, re, draft) = (w.now(), self.panel, self.re, self.draft.clone());
+        let (now, panel, seed, draft) = (w.now(), self.panel, self.seed, self.draft.clone());
         w.store()
-            .write(move |c| upsert_draft_tx(c, panel, re, &draft, now))
+            .write(move |c| upsert_draft_tx(c, panel, seed, &draft, now))
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
@@ -1680,26 +1863,27 @@ impl Effect for Fetch {
     }
 }
 
-/// Search a folder's uids — all of them, or only the unseen.
+/// Search a folder's uids — all of them, the unseen, or the forwarded.
 #[derive(Debug, Clone)]
 pub struct Uids {
     pub account: i64,
     pub folder: String,
-    pub unread_only: bool,
+    pub which: UidSet,
 }
 
 impl Effect for Uids {
     const KIND: &'static str = "uids";
     type Reply = std::collections::HashSet<u32>;
     fn describe(&self) -> String {
-        format!(
-            "search {} in {}",
-            if self.unread_only { "unseen" } else { "all" },
-            self.folder
-        )
+        let which = match self.which {
+            UidSet::All => "all",
+            UidSet::Unseen => "unseen",
+            UidSet::Forwarded => "forwarded",
+        };
+        format!("search {which} in {}", self.folder)
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
-        cx.out.uids(self.account, &self.folder, self.unread_only)
+        cx.out.uids(self.account, &self.folder, self.which)
     }
 }
 
@@ -1708,6 +1892,7 @@ impl Effect for Uids {
 pub fn register(reg: &mut Registry) {
     reg.register::<Move>();
     reg.register::<Seen>();
+    reg.register::<Forwarded>();
     reg.register::<Submit>();
 }
 
@@ -1765,6 +1950,19 @@ pub fn fmt_date(ts: f64) -> String {
     let (_, m, d) = civil_from_days(days);
     let (h, min) = (rem / 3_600, (rem % 3_600) / 60);
     format!("{} {d:02} {h:02}:{min:02}", MONTHS[(m - 1) as usize])
+}
+
+/// The date written out for a letter's own text — a forwarded header —
+/// with the year the list style leaves off: `31 Aug 2026 at 09:14`.
+#[must_use]
+pub fn fmt_date_long(ts: f64) -> String {
+    let secs = ts as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    let (h, min) = (rem / 3_600, (rem % 3_600) / 60);
+    let mut mon = MONTHS[(m - 1) as usize].to_string();
+    mon[..1].make_ascii_uppercase();
+    format!("{d} {mon} {y} at {h:02}:{min:02}")
 }
 
 // -- the demo seed -----------------------------------------------------------
@@ -2056,6 +2254,11 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         for m in &base_mails() {
             insert(m)?;
         }
+        // One mail already passed on, so the mark has somewhere to show.
+        c.execute(
+            "UPDATE message SET forwarded = 1 WHERE subject LIKE 'invoice 2026-08%'",
+            [],
+        )?;
         // The generated archive tail: the inbox genuinely overflows, so
         // in-panel scrolling has something to do.
         let senders: [(&str, &str); 4] = [
@@ -2264,6 +2467,109 @@ mod tests {
         assert_eq!(sug_acct[0].value, "me@prepor.dev");
     }
 
+    /// A fresh compose starts from its seed: a reply answers its mail, a
+    /// forward passes the letter on under the header block — and threads
+    /// to nothing, since whoever receives it was not in the conversation.
+    #[test]
+    fn a_compose_starts_from_its_seed() {
+        let s = store();
+        assert_eq!(seed_draft(&s, Seed::Blank), Draft::default());
+
+        let re = seed_draft(&s, Seed::Reply(1));
+        assert_eq!(
+            (re.to.as_str(), re.subject.as_str(), re.body.as_str()),
+            ("vera@kovac.io", "Re: Q3 infra budget draft", "")
+        );
+
+        let fwd = seed_draft(&s, Seed::Forward(1));
+        assert_eq!(fwd.to, "", "a forward wants a recipient");
+        assert_eq!(fwd.subject, "Fwd: Q3 infra budget draft");
+        assert!(
+            fwd.body.starts_with(
+                "\n\nBegin forwarded message:\n\nFrom: Vera Kovac <vera@kovac.io>\n\
+                 Subject: Q3 infra budget draft\nDate: 31 Aug 2026 at 09:14\n\
+                 To: me@prepor.dev\n\n"
+            ),
+            "{}",
+            fwd.body
+        );
+        let letter = mail(&s, 1).expect("vera").body;
+        assert!(
+            fwd.body.ends_with(letter.trim_end()),
+            "the whole letter goes"
+        );
+
+        // An HTML letter forwards as its plain reading.
+        let fwd = seed_draft(&s, Seed::Forward(2));
+        assert!(fwd.body.contains("\n\nWorkflow main #4128"), "{}", fwd.body);
+        assert!(!fwd.body.contains("<li>"), "no markup: {}", fwd.body);
+
+        // Only a reply names a parent; both carry their source's chain.
+        assert_eq!(Seed::Reply(1).in_reply_to(), Some(1));
+        assert_eq!(Seed::Forward(1).in_reply_to(), None);
+        assert_eq!(Seed::Blank.in_reply_to(), None);
+        assert_eq!(Seed::Reply(1).source(), Some(1));
+        assert_eq!(Seed::Forward(1).source(), Some(1));
+        assert_eq!(Seed::Forward(1).forwards(), Some(1));
+        assert_eq!(Seed::Reply(1).forwards(), None);
+
+        // A mail the store does not have seeds nothing.
+        assert_eq!(seed_draft(&s, Seed::Forward(9999)), Draft::default());
+        assert_eq!(fmt_date_long(ts(2026, 1, 5, 7, 3)), "5 Jan 2026 at 07:03");
+
+        // A sender stored under their address is written out once.
+        let mut bare = mail(&s, 1).expect("vera");
+        bare.head.from_name = bare.head.from_email.clone();
+        assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
+        bare.head.from_name.clear();
+        assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
+    }
+
+    /// A compose replaced in place keeps its panel id: the row its old
+    /// seed left is not the new seed's draft, and the next save takes the
+    /// seed along with the text — so the send threads and marks by what
+    /// the panel shows, not by what it showed.
+    #[test]
+    fn a_retargeted_draft_follows_its_seed() {
+        let s = store();
+        let now = 1.0;
+        let text = Draft {
+            to: "x@y".into(),
+            subject: "Re: Q3".into(),
+            body: "hi".into(),
+        };
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Reply(1), &text, now))
+            .unwrap();
+        assert!(draft_for(&s, 7, Seed::Reply(1)).is_some());
+        assert!(
+            draft_for(&s, 7, Seed::Forward(1)).is_none(),
+            "not the forward's"
+        );
+        assert!(draft_for(&s, 7, Seed::Blank).is_none());
+
+        let text = Draft {
+            to: String::new(),
+            subject: "Fwd: Q3".into(),
+            body: "fyi".into(),
+        };
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Forward(1), &text, now))
+            .unwrap();
+        let (re, fwd): (Option<i64>, Option<i64>) = s
+            .conn()
+            .query_row(
+                "SELECT re_message, fwd_message FROM draft WHERE panel = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((re, fwd), (None, Some(1)), "the row is the forward's now");
+        assert!(draft_for(&s, 7, Seed::Reply(1)).is_none());
+        assert_eq!(
+            draft_for(&s, 7, Seed::Forward(1)).map(|d| d.body),
+            Some("fyi".into())
+        );
+    }
+
     /// Archive moves a mail out of the inbox, the
     /// read flag clears once, titles resolve through the store.
     #[test]
@@ -2274,7 +2580,16 @@ mod tests {
             title(&s, &Kind::Contact { email: "vera@kovac.io".into() }),
             "Vera Kovac"
         );
-        assert_eq!(title(&s, &Kind::Compose { re: 1 }), "re: Q3 infra budget draft");
+        let compose = |seed| Kind::Compose { seed };
+        assert_eq!(title(&s, &compose(Seed::Blank)), "new mail");
+        assert_eq!(
+            title(&s, &compose(Seed::Reply(1))),
+            "re: Q3 infra budget draft"
+        );
+        assert_eq!(
+            title(&s, &compose(Seed::Forward(1))),
+            "fwd: Q3 infra budget draft"
+        );
         assert_eq!(title(&s, &Kind::Inbox { filter: Some("x".into()) }), "inbox · x");
 
         s.write(|c| mark_read_tx(c, 1)).unwrap();

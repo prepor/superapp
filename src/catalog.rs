@@ -23,7 +23,7 @@ use std::rc::Rc;
 use makepad_widgets::*;
 
 use crate::app::BootOutside;
-use crate::core::{Grid, Kind};
+use crate::core::{Grid, Kind, Seed};
 use crate::e2e::{self, Step};
 use crate::mail;
 use crate::panels::*;
@@ -158,6 +158,7 @@ fn letter(
             html: html.map(str::to_string),
             status: status.map(|(s, e)| (s.to_string(), e)),
             to: "me@prepor.dev".to_string(),
+            forwarded: false,
         },
         role: "inbox".to_string(),
         message_id: format!("fixture-{id}@prepor.dev"),
@@ -458,19 +459,34 @@ fn message() -> Scene<Setup> {
         .about("the CI thread: six runs, two failed")
         .node("single", panel(|s| Kind::Message { id: mail_like(s, "Sat hike") }, ""))
         .about("one mail is a thread of one")
+        .node("forwarded", panel(|s| Kind::Message { id: mail_like(s, "invoice 2026-08") }, ""))
+        .about("passed on: the mark by the date, off the $Forwarded keyword")
         .node("phone", panel(|s| Kind::Message { id: mail_like(s, "[stelaxis] CI") }, ""))
         .sized((380.0, 720.0))
 }
 
 fn compose() -> Scene<Setup> {
-    let reply = |script: &str| panel(|s| Kind::Compose { re: mail_like(s, "Q3 infra") }, script);
+    let reply = |script: &str| {
+        panel(
+            |s| Kind::Compose {
+                seed: Seed::Reply(mail_like(s, "Q3 infra")),
+            },
+            script,
+        )
+    };
     Scene::new("compose", (560.0, 420.0))
         .note("A reply: TO and SUBJECT from the mail it answers, the cursor in the body.")
+        .note("A forward: the letter under its header block, SUBJECT from it, the cursor in the empty TO.")
         .note("Send is a side effect with an undo window.")
         .node("reply", reply(""))
         .node("suggesting", reply("click \"to\"\nwait 200\ntype \", v\"\nwait 400"))
         .about("the TO field completes people from the mail world")
-        .node("blank", panel(|_| Kind::Compose { re: 0 }, ""))
+        .node(
+            "forward",
+            panel(|s| Kind::Compose { seed: Seed::Forward(mail_like(s, "Q3 infra")) }, ""),
+        )
+        .about("the same mail passed on: a conversation of its own")
+        .node("blank", panel(|_| Kind::Compose { seed: Seed::Blank }, ""))
         .about("from the launcher's root: nothing prefilled")
         .edge("reply", "suggesting", "type in TO")
 }
