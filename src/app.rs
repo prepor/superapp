@@ -4280,11 +4280,17 @@ impl Stage {
                             // duplicate is the point.
                             let refuse = if into_itself {
                                 Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
-                            } else if same_dir && hold.op == crate::files::HoldOp::Move {
-                                Some(format!("“{name}” is already here"))
-                            } else if !same_dir
-                                && crate::files::stat_in(&state.world, &crate::files::join(&dir, &name)).is_some()
+                            } else if (same_dir && hold.op == crate::files::HoldOp::Move)
+                                || (!same_dir
+                                    && crate::files::stat_in(
+                                        &state.world,
+                                        &crate::files::join(&dir, &name),
+                                    )
+                                    .is_some())
                             {
+                                // A move that goes nowhere, or a name the
+                                // destination already has: one sentence
+                                // covers both, so it is written once.
                                 Some(format!("“{name}” is already here"))
                             } else {
                                 None

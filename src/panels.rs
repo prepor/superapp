@@ -5005,21 +5005,20 @@ impl Widget for FilePanel {
                             files::FileKind::Image => {
                                 // The name says whether to read it; the
                                 // bytes say how to decode it.
-                                if files::image_format(&e.name).is_some() {
-                                    if let Ok(bytes) =
-                                        files::read_in(&world, &path, files::IMAGE_PREVIEW_MAX)
-                                    {
-                                        let img = img_prev.as_image();
-                                        image = match files::sniff(&bytes) {
-                                            Some(files::ImageFormat::Png) => {
-                                                img.load_png_from_data(cx, &bytes).is_ok()
-                                            }
-                                            Some(files::ImageFormat::Jpeg) => {
-                                                img.load_jpg_from_data(cx, &bytes).is_ok()
-                                            }
-                                            None => false,
-                                        };
-                                    }
+                                let bytes = files::image_format(&e.name).and_then(|_| {
+                                    files::read_in(&world, &path, files::IMAGE_PREVIEW_MAX).ok()
+                                });
+                                if let Some(bytes) = bytes {
+                                    let img = img_prev.as_image();
+                                    image = match files::sniff(&bytes) {
+                                        Some(files::ImageFormat::Png) => {
+                                            img.load_png_from_data(cx, &bytes).is_ok()
+                                        }
+                                        Some(files::ImageFormat::Jpeg) => {
+                                            img.load_jpg_from_data(cx, &bytes).is_ok()
+                                        }
+                                        None => false,
+                                    };
                                 }
                             }
                             _ => {}
