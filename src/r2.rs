@@ -107,6 +107,7 @@ pub fn creds(dir: Option<&Path>) -> Result<Creds, String> {
     let secret = env(ENV_SECRET)
         .or_else(|| file.get(2).cloned())
         .or_else(|| crate::secret::bucket_secret(dir, &key_id))
+        .and_then(clean_secret)
         .ok_or_else(|| {
             format!(
                 "no secret for {key_id} — run `superapp --r2-login`, set {ENV_SECRET}, \
@@ -118,6 +119,19 @@ pub fn creds(dir: Option<&Path>) -> Result<Creds, String> {
         secret,
         region: env(ENV_REGION).unwrap_or_else(|| R2_REGION.to_string()),
     })
+}
+
+/// A secret as the signature needs it: nothing around it, and not empty.
+///
+/// A key placed in a file by hand ends in a newline — that is what `>` and
+/// every editor do — and a newline inside the signing key is a `403
+/// SignatureDoesNotMatch` with nothing on screen to explain it. The
+/// environment and the `bucket` file are trimmed where they are read; this is
+/// the same courtesy for the platform's secret store, which hands back
+/// whatever was put in it.
+fn clean_secret(s: String) -> Option<String> {
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// A non-empty environment variable, trimmed.
@@ -169,6 +183,7 @@ pub fn check(url: &str, dir: Option<&Path>, key_id: &str) -> Result<(), String> 
     let secret = env(ENV_SECRET)
         .or_else(|| from_file(dir).get(2).cloned())
         .or_else(|| crate::secret::bucket_secret(dir, key_id))
+        .and_then(clean_secret)
         .ok_or_else(|| {
             format!(
                 "no secret for {key_id} — type it in, run `superapp --r2-login`, \
@@ -908,6 +923,20 @@ mod tests {
             String::from_utf8(config_bytes("http://127.0.0.1:9000", "")).unwrap(),
             "http://127.0.0.1:9000\n"
         );
+    }
+
+    /// A secret that came back from a store with a newline on it still
+    /// signs. Found on a real emulator: the key was right, the file was
+    /// right, and every request came back 403 with nothing to see.
+    #[test]
+    fn a_secret_is_taken_without_what_surrounds_it() {
+        assert_eq!(clean_secret("abc123\n".into()).as_deref(), Some("abc123"));
+        assert_eq!(clean_secret("  abc123  \r\n".into()).as_deref(), Some("abc123"));
+        assert_eq!(clean_secret("abc123".into()).as_deref(), Some("abc123"));
+        // Nothing but whitespace is nothing: the caller says "no secret" and
+        // names where to put one, instead of signing with the empty string.
+        assert_eq!(clean_secret("\n".into()), None);
+        assert_eq!(clean_secret(String::new()), None);
     }
 
     /// A broken bucket answers every verb with its reason — which is what
