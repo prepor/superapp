@@ -153,6 +153,29 @@ with its status, its answer and its failures. A panel can ask for its own
 (`WHERE entity = 'panel:7'`); a reply is read back through the same reactive
 query layer as anything else, so watching a job is invalidation, not polling.
 
+### The log panel
+
+What `sqlite3` shows, the app shows too: the **effects** panel is the queue
+read back, as [a rich table](./richtable.md) over the `effect` table —
+because a queue that is only legible from a shell is legible to the wrong
+person. Rows are newest first; each shows the verb, whose work it was, its
+status (and the attempt count once a job has fought), and under that **the
+sentence the effect describes itself with**. That line is not a string in
+the panel: the registry decodes the payload back into the effect and calls
+the same `describe` that names it everywhere else, so a new effect kind
+arrives in the log the day it is registered and no central table of kinds
+exists to forget it. A row a build cannot decode falls back to its payload
+rather than disappearing. Enter — or a touch — unfolds the row onto the
+JSON it was filed as and the answer the world gave back, both selectable.
+
+The filter is the table's own grammar over the queue's columns: `@failed`,
+`@live`, `@retried`, `@risky` (the work a crash cannot retry for you),
+`@kind:`, `@entity:`, `@attempts>3`, `@date:`, and bare words over the
+payload — which is where a uid or an address actually lives. Nothing in the
+panel writes: the queue is the executor's to move, and a page of it is a
+cached, reactive query like any other, so a job running redraws the rows on
+screen and nothing else.
+
 A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.

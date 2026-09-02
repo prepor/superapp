@@ -7,7 +7,7 @@
 //! as [`PanelAction`]s (global actions the shell catches and turns into
 //! store actions — so undo semantics never enter this module).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
@@ -16,6 +16,7 @@ use makepad_widgets::image_cache::ImageCacheImpl;
 use makepad_widgets::*;
 
 use crate::core::Seed;
+use crate::effect::{self, Job};
 use crate::mail;
 use crate::richtable::{self, Completion, SqlSource, Suggestion, Table};
 use crate::store::Store;
@@ -26,6 +27,11 @@ use crate::ui;
 /// `Any`, hence the `Rc` — scope wants `'static`).
 pub struct PanelProps {
     pub store: std::rc::Rc<Store>,
+    /// The effect registry, for the one thing a panel does with it: turn a
+    /// filed payload back into the sentence the effect describes itself
+    /// with (the log panel). Performing anything needs an
+    /// [`Outside`](crate::effect::Outside), which stays behind the world.
+    pub registry: std::rc::Rc<effect::Registry>,
     pub pid: u64,
     pub kind: crate::core::Kind,
     /// Which messages of its thread a message panel shows open (CR-007).
@@ -1083,6 +1089,173 @@ script_mod! {
             // minting widgets.
             reuse_items: true
             row := mod.widgets.InboxRow {}
+        }
+        // The autocomplete, drawn last and over the rows (see `SuggestBox`).
+        suggest: mod.widgets.SuggestBox {}
+    }
+
+    // ---- the effect log ----------------------------------------------------
+
+    /** One job as the log lists it: the verb and whose it was on the first
+        line, the effect's own sentence under it, and — only when there is
+        one — what went wrong, in the colour errors get.
+
+        Twin lines again (see `InboxRow`): the cursor's row is the washed
+        copy, because a quad's colour is not a runtime value. */
+    mod.widgets.EffectLine = set_type_default() do #(EffectLine::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        // The row's inset is the one source of spacing, as the inbox row's
+        // is: every label in it sheds the theme padding so the text sits
+        // 8 pt inside the row, level with the filter's own text.
+        padding: Inset{left: 8, right: 8, top: 4, bottom: 4}
+        View {
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            kind_lbl := mod.widgets.SLabel { padding: 0, width: Fit, text: "" }
+            View { width: 8, height: 1 }
+            // The entity rides a Fill View whose flow is Down, for the
+            // reason the inbox row's from label does: a Fill label on a
+            // Right flow's main axis defer-walks.
+            View {
+                width: Fill, height: Fit
+                flow: Down
+                entity_lbl := mod.widgets.SLabel {
+                    padding: 0
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                    draw_text +: { color: #909090 }
+                }
+            }
+            View { width: 10, height: 1 }
+            status_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fit, text: "", draw_text +: { color: #5a5a5a }
+            }
+            View { width: 10, height: 1 }
+            date_lbl := mod.widgets.SLabel {
+                padding: 0
+                width: Fit, text: "", draw_text +: { color: #909090 }
+            }
+        }
+        what_lbl := mod.widgets.SLabel {
+            padding: 0
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+        }
+        err_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            width: Fill, max_lines: 2, text_overflow: TextOverflow.Ellipsis
+            text: "", draw_text +: { color: #a01500 }
+        }
+    }
+
+    /** A row of the log: the line (plain or inverted), the JSON the job was
+        filed as while it is open, and the hairline under both. */
+    mod.widgets.EffectRow = set_type_default() do #(EffectRow::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        line := mod.widgets.EffectLine {}
+        line_sel := mod.widgets.EffectLine {
+            visible: false
+            show_bg: true
+            draw_bg +: {
+                color: #e7e7e7
+                // A custom pixel fn forces a distinct shader and so a
+                // distinct draw call: portal-item quads on the stock
+                // shader merge into a call that paints under the panel
+                // background — invisible.
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+        // What `sqlite3` would show, unfolded in place: the payload the
+        // effect was filed as, and the answer the world gave back. Both
+        // selectable — a payload is something you copy into a bug report.
+        detail := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Down
+            padding: Inset{left: 8, right: 8, top: 2, bottom: 8}
+            // The row itself: its id, when it was filed and last touched,
+            // and whether a crash may retry it — everything about the job
+            // that is not about the effect.
+            meta_lbl := mod.widgets.SLabel {
+                padding: 0
+                margin: Inset{bottom: 6}
+                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+                text: "", draw_text +: { color: #909090 }
+            }
+            mod.widgets.SSection { text: "PAYLOAD" }
+            payload_txt := mod.widgets.SText { margin: Inset{top: 2, bottom: 6} }
+            reply_head := mod.widgets.SSection { text: "REPLY" }
+            reply_txt := mod.widgets.SText { margin: Inset{top: 2} }
+        }
+        View {
+            width: Fill, height: 1
+            show_bg: true
+            draw_bg +: {
+                color: #dcdcdc
+                pixel: fn() {
+                    return vec4(self.color.xyz * self.color.w, self.color.w)
+                }
+            }
+        }
+    }
+
+    /** The effect log: the filter over the header over the virtualized list
+        — a rich table (CR-006) over `effect::LOG`. Read-only by
+        construction; the queue is the executor's to move. */
+    mod.widgets.EffectsPanel = set_type_default() do #(EffectsPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        filter_input := mod.widgets.SField {
+            width: Fill
+            empty_text: "filter…  ( / )   @ for tags"
+            return_key_type: ReturnKeyType.Search
+            autocapitalize: AutoCapitalize.None
+            autocorrect: AutoCorrect.Disabled
+        }
+        // Named apart from the row's own `err_lbl`: both live under this
+        // panel, and a lookup by id must not be able to find the wrong one.
+        filter_err_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            margin: Inset{left: 8, top: 4}
+            text: "", draw_text +: { color: #a01500 }
+        }
+        View { width: Fill, height: 6 }
+        // Header cells for the columns the head line actually has; the
+        // sentence under it owns no column, exactly as the inbox's subject
+        // does not.
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
+            View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { padding: 0, text: "EFFECT" }
+            }
+            mod.widgets.SSection { padding: 0, width: Fit, text: "STATUS" }
+        }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
+        // Nothing has left the process yet — said, rather than left blank.
+        // Above the list, because the list is what fills what is left.
+        empty_lbl := mod.widgets.SLabel {
+            visible: false
+            margin: Inset{left: 8, top: 10}
+            text: "", draw_text +: { color: #909090 }
+        }
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            reuse_items: true
+            row := mod.widgets.EffectRow {}
         }
         // The autocomplete, drawn last and over the rows (see `SuggestBox`).
         suggest: mod.widgets.SuggestBox {}
@@ -2931,6 +3104,498 @@ impl Widget for InboxPanel {
         }
         self.stamps.retain(|k, _| live.contains(k));
         // The filter's offer, over the rows.
+        self.ac
+            .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
+        DrawStep::done()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EffectRow
+// ---------------------------------------------------------------------------
+
+/// The sentence a job's row shows: the effect decoded from its payload and
+/// asked to describe itself, or the payload as it stands when this build
+/// cannot read the kind — so a row is never nameless, whatever wrote it.
+fn job_line(reg: &effect::Registry, j: &Job) -> String {
+    reg.describe(&j.kind, &j.payload)
+        .unwrap_or_else(|| j.payload.clone())
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct EffectLine {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl Widget for EffectLine {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl EffectLineRef {
+    pub fn populate(&self, cx: &mut Cx, j: &Job, what: &str) {
+        let Some(inner) = self.borrow() else { return };
+        inner.view.label(cx, ids!(kind_lbl)).set_text(cx, &j.kind);
+        inner
+            .view
+            .label(cx, ids!(entity_lbl))
+            .set_text(cx, j.entity.as_deref().unwrap_or(""));
+        inner
+            .view
+            .label(cx, ids!(status_lbl))
+            .set_text(cx, &j.status_line());
+        // Filed at, not last touched: the log is a record of what was asked
+        // for, in the order it was asked.
+        inner
+            .view
+            .label(cx, ids!(date_lbl))
+            .set_text(cx, &mail::fmt_date(j.created));
+        inner.view.label(cx, ids!(what_lbl)).set_text(cx, what);
+        let err = inner.view.label(cx, ids!(err_lbl));
+        err.set_text(cx, j.error.as_deref().unwrap_or(""));
+        err.set_visible(cx, j.error.is_some());
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct EffectRow {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The job this row was last populated for. The shell's hit table asks
+    /// the row itself (see [`EffectRowRef::hit`]) rather than re-deriving
+    /// the pair from the table, the way `ThreadMsg` answers for its header.
+    #[rust]
+    job: i64,
+    /// Which of the twin lines is the visible one.
+    #[rust]
+    selected: bool,
+}
+
+impl Widget for EffectRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        // Clicks resolve through the shell's registered rects, exactly as
+        // an inbox row's do — a list item's own area goes stale on any
+        // mid-gesture redraw. The row's share is the cursor.
+        if let Hit::FingerHoverIn(_) = event.hits(cx, self.view.area()) {
+            cx.set_cursor(MouseCursor::Hand);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl EffectRowRef {
+    /// The job this row stands for and the sentence it *drew* — read back
+    /// off the visible line's own label, not off what the panel meant to
+    /// put there. A row whose labels never took their text is addressable
+    /// by nothing, which is what makes the scripted click an assertion.
+    pub fn hit(&self, cx: &mut Cx) -> Option<(i64, String)> {
+        let row = self.borrow()?;
+        let drawn = if row.selected {
+            row.view.label(cx, ids!(line_sel.what_lbl)).text()
+        } else {
+            row.view.label(cx, ids!(line.what_lbl)).text()
+        };
+        (!drawn.is_empty()).then_some((row.job, drawn))
+    }
+
+    pub fn populate(
+        &self,
+        cx: &mut Cx,
+        j: &Job,
+        what: &str,
+        selected: bool,
+        open: bool,
+    ) {
+        let Some(mut row) = self.borrow_mut() else { return };
+        row.job = j.id;
+        row.selected = selected;
+        let line = row.view.widget(cx, ids!(line));
+        let line_sel = row.view.widget(cx, ids!(line_sel));
+        line.as_effect_line().populate(cx, j, what);
+        line_sel.as_effect_line().populate(cx, j, what);
+        line.set_visible(cx, !selected);
+        line_sel.set_visible(cx, selected);
+
+        row.view.view(cx, ids!(detail)).set_visible(cx, open);
+        if !open {
+            return;
+        }
+        row.view.label(cx, ids!(meta_lbl)).set_text(
+            cx,
+            &format!(
+                "#{} · filed {} · touched {} · {}",
+                j.id,
+                mail::fmt_date(j.created),
+                mail::fmt_date(j.updated),
+                if j.idempotent {
+                    "safe to repeat"
+                } else {
+                    "not safe to repeat"
+                }
+            ),
+        );
+        row.view
+            .text_input(cx, ids!(payload_txt))
+            .set_text(cx, &j.payload);
+        let reply = j.reply.as_deref().unwrap_or("");
+        row.view.widget(cx, ids!(reply_head)).set_visible(cx, !reply.is_empty());
+        let reply_txt = row.view.text_input(cx, ids!(reply_txt));
+        reply_txt.set_text(cx, reply);
+        reply_txt.set_visible(cx, !reply.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EffectsPanel
+// ---------------------------------------------------------------------------
+
+/// The log's table: the shared engine over the effect queue.
+type LogTable = Table<&'static SqlSource<Job>>;
+
+/// One visible row's hit, for the shell's hit table: what a script (and a
+/// finger) addresses it by, where it is, and which job it unfolds.
+pub struct JobHit {
+    pub id: i64,
+    pub label: String,
+    pub rect: Rect,
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct EffectsPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The autocomplete box, drawn over the rows after everything else.
+    #[live]
+    suggest: View,
+    /// The rich table over `effect::LOG`: the filter and the paging window.
+    #[rust(Table::new(&effect::LOG, effect::LOG_PAGE))]
+    table: LogTable,
+    /// The cursor: the job it stands on, and the row it sat on. The row is
+    /// the fallback — jobs arrive at the *top* of this order, so every index
+    /// below the newest shifts the moment the executor files one.
+    #[rust]
+    sel: Option<(Job, usize)>,
+    /// Which rows are unfolded. Context, not history: it lives as long as
+    /// the panel does and no longer.
+    #[rust]
+    open: BTreeSet<i64>,
+    /// What each live row was last populated with, by index.
+    #[rust]
+    stamps: HashMap<usize, (Job, String, bool, bool)>,
+    /// The filter's autocomplete: the table is its completion.
+    #[rust]
+    ac: Suggest<LogTable>,
+}
+
+impl EffectsPanel {
+    /// Hands the field's text to the table. The field is the one source of
+    /// the filter, exactly as in the inbox.
+    fn sync_filter(&mut self, cx: &mut Cx) {
+        let text = self.view.text_input(cx, ids!(filter_input)).text();
+        if self.table.set_filter(&text) {
+            self.sel = None;
+        }
+    }
+
+    /// Where the cursor stands now: the remembered row if it still holds
+    /// the job, else that job's rank (newer work landed above it), else the
+    /// row clamped into the table (the filter no longer keeps it).
+    fn cursor_index(&self, store: &Store) -> Option<usize> {
+        let (j, idx) = self.sel.as_ref()?;
+        if self.table.row(store, *idx).is_some_and(|r| r.id == j.id) {
+            return Some(*idx);
+        }
+        if let Some(i) = self.table.index_of(store, j) {
+            return Some(i);
+        }
+        let n = self.table.len(store);
+        (n > 0).then(|| (*idx).min(n - 1))
+    }
+
+    fn set_sel(&mut self, cx: &mut Cx, store: &Store, i: usize) {
+        let Some(j) = self.table.row(store, i) else { return };
+        self.sel = Some((j, i));
+        let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let visible = list
+            .borrow()
+            .is_some_and(|l| l.items().iter().any(|(idx, _)| *idx == i));
+        if !visible {
+            list.smooth_scroll_to(cx, i, 90.0, None, 0.0);
+        }
+        self.redraw(cx);
+    }
+
+    fn move_sel(&mut self, cx: &mut Cx, store: &Store, d: isize) {
+        let n = self.table.len(store);
+        if n == 0 {
+            return;
+        }
+        let i = match self.cursor_index(store) {
+            Some(i) => (i as isize + d).clamp(0, n as isize - 1) as usize,
+            None => 0,
+        };
+        self.set_sel(cx, store, i);
+    }
+}
+
+impl EffectsPanelRef {
+    /// Whether the filter owns the keyboard — the fifth accelerator rule
+    /// stands the borrowed chords down while it does.
+    pub fn filter_focused(&self, cx: &mut Cx) -> bool {
+        self.borrow()
+            .is_some_and(|p| p.view.text_input(cx, ids!(filter_input)).key_focus(cx))
+    }
+
+    /// The visible rows, as the shell's hit table wants them. The label is
+    /// read back off each row widget, so a row that drew nothing is
+    /// addressable by nothing.
+    pub fn row_hits(&self, cx: &mut Cx) -> Vec<JobHit> {
+        let Some(p) = self.borrow() else {
+            return Vec::new();
+        };
+        let list_ref = p.view.widget(cx, ids!(list)).as_portal_list();
+        let Some(list) = list_ref.borrow() else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (_, item) in list.items().iter() {
+            let rect = item.widget.area().rect(cx);
+            if rect.size.x <= 0.0 {
+                continue;
+            }
+            if let Some((id, label)) = item.widget.as_effect_row().hit(cx) {
+                hits.push(JobHit { id, label, rect });
+            }
+        }
+        hits
+    }
+
+    /// The selectable runs a row unfolds — registered so a payload can be
+    /// dragged over and copied like any other text in the app.
+    pub fn detail_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        let Some(p) = self.borrow() else {
+            return Vec::new();
+        };
+        let list_ref = p.view.widget(cx, ids!(list)).as_portal_list();
+        let Some(list) = list_ref.borrow() else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (_, item) in list.items().iter() {
+            // Gate on the fold, not on the runs inside it: a reused row
+            // (`reuse_items`) carries the area its last, open tenant drew
+            // at, so a closed row would otherwise register a payload hit
+            // over whatever now sits there.
+            let detail = item.widget.widget(cx, ids!(detail));
+            if !detail.visible() {
+                continue;
+            }
+            for (label, path) in [
+                ("effect payload", ids!(payload_txt)),
+                ("effect reply", ids!(reply_txt)),
+            ] {
+                let w = detail.widget(cx, path);
+                let r = w.area().rect(cx);
+                if r.size.x > 0.0 && w.visible() {
+                    hits.push((label.to_string(), r));
+                }
+            }
+        }
+        hits
+    }
+
+    /// Unfolds a row, or folds it back — the shell's half of a click on one.
+    pub fn toggle(&self, cx: &mut Cx, store: &Store, id: i64) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        if !p.open.remove(&id) {
+            p.open.insert(id);
+        }
+        // A touched row is also where the cursor now stands.
+        if let Some(i) = p.table.index_of(store, &stub_job(id)) {
+            if let Some(j) = p.table.row(store, i) {
+                p.sel = Some((j, i));
+            }
+        }
+        p.redraw(cx);
+    }
+
+    /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
+    /// table — a click on one is [`EffectsPanelRef::pick`].
+    pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
+        self.borrow()
+            .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
+    }
+
+    /// Commits the `i`-th suggestion on offer.
+    pub fn pick(&self, cx: &mut Cx, i: usize) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        let p = &mut *p;
+        let filter = p.view.text_input(cx, ids!(filter_input));
+        p.ac.pick(cx, &p.table, &filter, i);
+    }
+}
+
+/// A job that is nothing but its id — enough for [`Table::index_of`], whose
+/// rank key over this source is the id and only the id.
+fn stub_job(id: i64) -> Job {
+    Job {
+        id,
+        kind: String::new(),
+        entity: None,
+        status: String::new(),
+        reply: None,
+        error: None,
+        attempts: 0,
+        payload: String::new(),
+        idempotent: false,
+        created: 0.0,
+        updated: 0.0,
+        not_before: 0.0,
+    }
+}
+
+impl Widget for EffectsPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let filter_focused = filter.key_focus(cx);
+
+        // The autocomplete owns the arrows, enter, tab and esc while it is
+        // open; the field never sees them.
+        if let Event::KeyDown(k) = event {
+            if self.ac.key(cx, &self.table, &filter, k) {
+                self.redraw(cx);
+                return;
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        let Some(store) = panel_store(scope) else { return };
+
+        if let Event::TextInput(t) = event {
+            if !filter_focused && t.input == "/" {
+                focus_input(cx, &filter);
+            }
+        }
+        if let Event::KeyDown(k) = event {
+            if !filter_focused {
+                match k.key_code {
+                    // Enter unfolds what the cursor stands on, and folds it
+                    // back. There is nowhere for this panel to *go*: a job
+                    // is not a place, it is a record.
+                    KeyCode::ReturnKey => {
+                        let id = self
+                            .cursor_index(&store)
+                            .or(Some(0))
+                            .and_then(|i| self.table.row(&store, i))
+                            .map(|j| j.id);
+                        if let Some(id) = id {
+                            if !self.open.remove(&id) {
+                                self.open.insert(id);
+                            }
+                            self.redraw(cx);
+                        }
+                    }
+                    KeyCode::ArrowDown => self.move_sel(cx, &store, 1),
+                    KeyCode::ArrowUp => self.move_sel(cx, &store, -1),
+                    KeyCode::Tab => focus_input(cx, &filter),
+                    _ => {}
+                }
+            }
+        }
+        if let Event::Actions(actions) = event {
+            if filter.key_focus_lost(actions) {
+                filter.set_cursor(cx, filter.cursor(), false);
+            }
+            if filter.returned(actions).is_some() || filter.escaped(actions) {
+                cx.set_key_focus(Area::Empty);
+                if filter.returned(actions).is_some() {
+                    self.sync_filter(cx);
+                    self.set_sel(cx, &store, 0);
+                }
+                self.redraw(cx);
+            }
+            if filter.changed(actions).is_some() {
+                self.sel = None;
+                self.redraw(cx);
+            }
+            if self.view.widget(cx, ids!(list)).as_portal_list().reached_end(actions)
+                && self.table.extend(&store)
+            {
+                self.redraw(cx);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let Some(props) = scope.props.get::<PanelProps>() else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let store = props.store.clone();
+        let reg = props.registry.clone();
+        self.sync_filter(cx);
+        let filter = self.view.text_input(cx, ids!(filter_input));
+        let focused = filter.key_focus(cx);
+        let err = if focused {
+            self.table.errors_while_typing().first().map(|e| e.message.clone())
+        } else {
+            self.table.errors().first().map(|e| e.message.clone())
+        };
+        let err_lbl = self.view.label(cx, ids!(filter_err_lbl));
+        err_lbl.set_text(cx, err.as_deref().unwrap_or(""));
+        err_lbl.set_visible(cx, err.is_some());
+
+        let n = self.table.len(&store);
+        let empty = self.view.label(cx, ids!(empty_lbl));
+        empty.set_text(
+            cx,
+            if self.table.filter().trim().is_empty() {
+                "nothing has left the process yet"
+            } else {
+                "no effect under this filter"
+            },
+        );
+        empty.set_visible(cx, n == 0 && err.is_none());
+
+        let sel = self.sel.as_ref().map(|(j, _)| j.id);
+        let mut live: Vec<usize> = Vec::new();
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.as_portal_list().borrow_mut() {
+                list.set_item_range(cx, 0, n);
+                while let Some(idx) = list.next_visible_item(cx) {
+                    let Some(j) = self.table.row(&store, idx) else { continue };
+                    let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
+                    let stamp = (
+                        j.clone(),
+                        job_line(&reg, &j),
+                        sel == Some(j.id),
+                        self.open.contains(&j.id),
+                    );
+                    if !existed || self.stamps.get(&idx) != Some(&stamp) {
+                        row.as_effect_row()
+                            .populate(cx, &stamp.0, &stamp.1, stamp.2, stamp.3);
+                        self.stamps.insert(idx, stamp);
+                    }
+                    live.push(idx);
+                    row.draw_all(cx, scope);
+                }
+            }
+        }
+        self.stamps.retain(|k, _| live.contains(k));
         self.ac
             .draw(cx, scope, &store, &self.table, &filter, &mut self.suggest);
         DrawStep::done()

@@ -120,6 +120,9 @@ pub enum Kind {
     AddAccount,
     /// Standing problems: failed syncs, failed sends, an unreachable bucket.
     Problems,
+    /// The effect log: everything the app has tried on the outside world.
+    /// Its filter is typed, not a param — nothing links here with one.
+    Effects,
 }
 
 impl Kind {
@@ -141,6 +144,7 @@ impl Kind {
             Kind::Settings => (4, 3),
             Kind::AddAccount => (4, 2),
             Kind::Problems => (4, 3),
+            Kind::Effects => (5, 6),
         }
     }
 }
@@ -1391,6 +1395,7 @@ mod tests {
                         Kind::Settings => "settings",
                         Kind::AddAccount => "addaccount",
                         Kind::Problems => "problems",
+                        Kind::Effects => "effects",
                     })
                     .collect()
             })

@@ -22,7 +22,9 @@ A native prototype (Rust + Makepad, macOS) with the full panel mechanics —
 scrolling 12×6 workspace, joins with cascade-close, spring animation, the
 link/button grammar, keyboard and mouse parity — exercised by fake mail panels:
 `email/inbox`, `email/message`, `email/compose`, `contact`, plus `settings`,
-`problems`, `help` and `about`. No real data sources are wired yet.
+`problems`, `help`, `about`, and `effects` — the queue of everything the app
+has tried on the outside world, read back as a list panel. No real data
+sources are wired yet.
 
 The first, throwaway web prototype that validated the interaction model is kept
 under `web/`.

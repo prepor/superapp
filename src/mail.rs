@@ -867,6 +867,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Settings => "settings".into(),
         Kind::AddAccount => "add account".into(),
         Kind::Problems => "problems".into(),
+        Kind::Effects => "effects".into(),
     }
 }
 

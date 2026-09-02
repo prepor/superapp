@@ -432,6 +432,7 @@ script_mod! {
                         help_tpl := mod.widgets.HelpPanel{}
                         about_tpl := mod.widgets.AboutPanel{}
                         problems_tpl := mod.widgets.ProblemsPanel{}
+                        effects_tpl := mod.widgets.EffectsPanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
@@ -447,6 +448,7 @@ script_mod! {
                         overlay_row_tpl := mod.widgets.OverlayRow{}
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         account_row_tpl := mod.widgets.AccountRow{}
+                        effect_row_tpl := mod.widgets.EffectRow{}
                         link_tpl := mod.widgets.SLink{}
                         problem_row_tpl := mod.widgets.ProblemRow{}
                         stage_tpl := Stage{
@@ -459,6 +461,7 @@ script_mod! {
                             help_tpl := mod.widgets.HelpPanel{}
                             about_tpl := mod.widgets.AboutPanel{}
                             problems_tpl := mod.widgets.ProblemsPanel{}
+                            effects_tpl := mod.widgets.EffectsPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         }
@@ -591,6 +594,9 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
+    /// A row of the effect log: unfold the JSON it was filed as, or fold it
+    /// back.
+    ToggleJob(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -3526,6 +3532,7 @@ impl Stage {
                                 Some(Kind::Compose { .. }) => {
                                     w.as_compose_panel().pick(cx, pid, i);
                                 }
+                                Some(Kind::Effects) => w.as_effects_panel().pick(cx, i),
                                 _ => w.as_inbox_panel().pick(cx, i),
                             }
                         }
@@ -3557,6 +3564,22 @@ impl Stage {
                     }
                     WidgetOp::ToggleMail(id) => self.toggle_msg(cx, pid, id, false),
                     WidgetOp::ToggleQuote(id) => self.toggle_msg(cx, pid, id, true),
+                    WidgetOp::ToggleJob(id) => {
+                        // A click inside a panel focuses it, as anywhere
+                        // else; the fold itself is the panel's own state.
+                        let store = state.store.clone();
+                        let refocus = state.ws.focus != Some(pid);
+                        if refocus {
+                            state.ws.focus = Some(pid);
+                        }
+                        if let Some(w) = self.hosted.get(&pid).cloned() {
+                            w.as_effects_panel().toggle(cx, &store, id);
+                        }
+                        if refocus {
+                            self.sync(cx);
+                        }
+                        self.kick(cx);
+                    }
                 }
                 return;
             }
@@ -4375,6 +4398,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Help => Some(live_id!(help_tpl)),
         Kind::About => Some(live_id!(about_tpl)),
         Kind::Problems => Some(live_id!(problems_tpl)),
+        Kind::Effects => Some(live_id!(effects_tpl)),
     }
 }
 
@@ -4978,6 +5002,7 @@ impl Stage {
             };
             let props = crate::panels::PanelProps {
                 store: state.store.clone(),
+                registry: state.world.registry_rc(),
                 pid: *pid,
                 problems: state.problems_for(&kind),
                 kind,
@@ -5033,6 +5058,7 @@ impl Stage {
         };
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
+            registry: state.world.registry_rc(),
             pid,
             problems: state.problems_for(&kind),
             kind,
@@ -6572,6 +6598,7 @@ impl Stage {
         }
         let props = crate::panels::PanelProps {
             store: state.store.clone(),
+            registry: state.world.registry_rc(),
             pid,
             kind: kind.clone().unwrap_or(Kind::About),
             expand: state.expand.get(&pid).cloned(),
@@ -6845,6 +6872,27 @@ impl Stage {
                             crate::problems::Source::Send { .. } | crate::problems::Source::Sync => {}
                         }
                     }
+                }
+            }
+            Some(Kind::Effects) => {
+                let fr = w.widget(cx, ids!(filter_input)).area().rect(cx);
+                if fr.size.x > 0.0 {
+                    reg.push(("filter".to_string(), fr, Act::Pointer(pid)));
+                }
+                // A row is ONE target, addressed by the sentence it shows —
+                // the same string the row draws, so a script and a reader
+                // name it the same way. Touching it unfolds the JSON.
+                let panel = w.as_effects_panel();
+                for h in panel.row_hits(cx) {
+                    reg.push((h.label, h.rect, Act::WidgetOp(pid, WidgetOp::ToggleJob(h.id))));
+                }
+                // The unfolded JSON is selectable text, registered after the
+                // rows it sits inside so it wins where they overlap.
+                for (label, r) in panel.detail_hits(cx) {
+                    reg.push((label, r, Act::Pointer(pid)));
+                }
+                for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
+                    reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
             }
             Some(Kind::Contact { email }) => {

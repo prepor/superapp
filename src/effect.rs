@@ -38,7 +38,9 @@ use rusqlite::{Connection, Transaction};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::store::Store;
+use crate::filter::Op;
+use crate::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, Values};
+use crate::store::{Store, Val};
 
 // -- what the outside answers with --------------------------------------------
 
@@ -357,6 +359,11 @@ pub(crate) enum Ran {
 
 type Handler = Box<dyn Fn(&str, &mut Ctx<'_>) -> Ran>;
 
+/// Decode a filed payload back into its effect's one line of English.
+/// Fallible for the same reason a handler is: the row outlives the build
+/// that wrote it.
+type Describer = Box<dyn Fn(&str) -> Option<String>>;
+
 /// Decode-and-perform, per kind. Each domain registers its own effects, so
 /// adding one touches no central list.
 ///
@@ -366,6 +373,7 @@ type Handler = Box<dyn Fn(&str, &mut Ctx<'_>) -> Ran>;
 #[derive(Default)]
 pub struct Registry {
     handlers: HashMap<&'static str, Handler>,
+    describers: HashMap<&'static str, Describer>,
 }
 
 impl Registry {
@@ -398,6 +406,25 @@ impl Registry {
                 }
             }),
         );
+        // The same registration teaches the queue to *read* itself back:
+        // [`Effect::describe`] is the line a status UI wants, and a log
+        // viewer that had to keep its own table of kinds would be exactly
+        // the central list this registry exists to avoid.
+        self.describers.insert(
+            E::KIND,
+            Box::new(|payload| {
+                serde_json::from_str::<E>(payload).ok().map(|e| e.describe())
+            }),
+        );
+    }
+
+    /// One line of English for a filed job: the effect decoded from its
+    /// payload and asked to describe itself. `None` when this build cannot
+    /// read the kind — an unregistered domain, or a row an older version
+    /// wrote — and the caller falls back to the payload as it stands.
+    #[must_use]
+    pub fn describe(&self, kind: &str, payload: &str) -> Option<String> {
+        self.describers.get(kind).and_then(|d| d(payload))
     }
 
     /// Decodes and performs one claimed job.
@@ -419,7 +446,10 @@ impl Registry {
 
 // -- the log -------------------------------------------------------------------
 
-/// One row of the effect table, as tests and a status UI read it.
+/// One row of the effect table, as tests and the log viewer read it. The
+/// whole row, payload included: this is the only shape the queue is ever
+/// read in, and a viewer that showed less than `sqlite3` does would defeat
+/// the reason the queue lives in the store at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub id: i64,
@@ -430,6 +460,31 @@ pub struct Job {
     pub reply: Option<String>,
     pub error: Option<String>,
     pub attempts: i64,
+    /// The JSON the effect was filed as — the registry decodes it back
+    /// into one line of English ([`Registry::describe`]).
+    pub payload: String,
+    /// Whether running it twice is safe, copied onto the row at enqueue
+    /// time so the crash sweep never has to decode a payload.
+    pub idempotent: bool,
+    /// Filed at, last touched at, and the earliest the executor may claim
+    /// it (a backoff, or the send window) — unix seconds, the world's clock.
+    pub created: f64,
+    pub updated: f64,
+    pub not_before: f64,
+}
+
+impl Job {
+    /// The status as the log reads it aloud: the word, and — once a job has
+    /// been tried more than once — how many times. A count on every row
+    /// would be noise; a count on the rows that fought is the whole story.
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        if self.attempts > 1 {
+            format!("{} · {} tries", self.status, self.attempts)
+        } else {
+            self.status.clone()
+        }
+    }
 }
 
 /// How long a failed job waits before its next attempt, by attempt count —
@@ -457,14 +512,24 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         reply: r.get(4)?,
         error: r.get(5)?,
         attempts: r.get(6)?,
+        payload: r.get(7)?,
+        idempotent: r.get::<_, i64>(8)? != 0,
+        created: r.get(9)?,
+        updated: r.get(10)?,
+        not_before: r.get(11)?,
     })
 }
 
-const JOB_COLS: &str = "id, kind, entity, status, reply, error, attempts";
+/// The one column list, shared by the helpers below and by [`LOG_SPEC`] —
+/// so the table the log viewer pages through and the rows a test asserts on
+/// decode through the same [`job_row`], in the same order. Qualified,
+/// because the spec's `FROM` aliases the table.
+const JOB_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.attempts,
+                        e.payload, e.idempotent, e.created, e.updated, e.not_before";
 
 /// Every job, oldest first.
 pub fn jobs(db: &Connection) -> Vec<Job> {
-    let Ok(mut stmt) = db.prepare(&format!("SELECT {JOB_COLS} FROM effect ORDER BY id")) else {
+    let Ok(mut stmt) = db.prepare(&format!("SELECT {JOB_COLS} FROM effect e ORDER BY e.id")) else {
         return Vec::new();
     };
     stmt.query_map([], job_row)
@@ -474,9 +539,9 @@ pub fn jobs(db: &Connection) -> Vec<Job> {
 
 /// Jobs after `id` — how a test marks a point and asserts on what followed.
 pub fn jobs_since(db: &Connection, id: i64) -> Vec<Job> {
-    let Ok(mut stmt) =
-        db.prepare(&format!("SELECT {JOB_COLS} FROM effect WHERE id > ?1 ORDER BY id"))
-    else {
+    let Ok(mut stmt) = db.prepare(&format!(
+        "SELECT {JOB_COLS} FROM effect e WHERE e.id > ?1 ORDER BY e.id"
+    )) else {
         return Vec::new();
     };
     stmt.query_map([id], job_row)
@@ -487,7 +552,7 @@ pub fn jobs_since(db: &Connection, id: i64) -> Vec<Job> {
 /// One entity's jobs — what a panel shows about its own in-flight work.
 pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
     let Ok(mut stmt) = db.prepare(&format!(
-        "SELECT {JOB_COLS} FROM effect WHERE entity = ?1 ORDER BY id"
+        "SELECT {JOB_COLS} FROM effect e WHERE e.entity = ?1 ORDER BY e.id"
     )) else {
         return Vec::new();
     };
@@ -501,6 +566,158 @@ pub fn mark(db: &Connection) -> i64 {
     db.query_row("SELECT COALESCE(MAX(id), 0) FROM effect", [], |r| r.get(0))
         .unwrap_or(0)
 }
+
+// -- the log as a rich table ---------------------------------------------------
+//
+// The queue is a table like any other, so the log viewer is the rich table
+// (CR-006) over it rather than a widget of its own invention: the same
+// filter grammar, the same paging, the same reactive pages — a commit by
+// the executor invalidates exactly the pages on screen, so watching a job
+// run is invalidation and not polling.
+
+/// The statuses a row can be in, as the filter offers them.
+const STATUSES: &[(&str, &str)] = &[
+    ("pending", "pending"),
+    ("processing", "processing"),
+    ("done", "done"),
+    ("failed", "failed"),
+    ("obsolete", "obsolete"),
+];
+
+/// The effect log's fixed query: every job, newest first. Flat — a job is a
+/// row, and nothing about it is an aggregate.
+static LOG_SPEC: SqlSpec = SqlSpec {
+    id: "effect log",
+    describe: "the effect queue under the panel's filter, newest first, one page at a time",
+    select: JOB_COLS,
+    from: "effect e",
+    base: "",
+    // Bare words search what a human would type: the verb, whose it was,
+    // and what went wrong. The payload too — that is where a uid or an
+    // address actually lives.
+    text: &["e.kind", "e.entity", "e.payload", "e.error"],
+    tags: &[
+        ("failed", TagSql::Where("e.status = 'failed'")),
+        (
+            "live",
+            TagSql::Where("e.status IN ('pending', 'processing')"),
+        ),
+        ("retried", TagSql::Where("e.attempts > 1")),
+        ("risky", TagSql::Where("e.idempotent = 0")),
+        ("status", TagSql::Col("e.status")),
+        ("kind", TagSql::Col("e.kind")),
+        ("entity", TagSql::Col("e.entity")),
+        ("attempts", TagSql::Col("e.attempts")),
+        ("date", TagSql::Col("e.created")),
+    ],
+    // Total by construction: the id is unique, and it is also the order the
+    // queue was filed in.
+    order: &[("e.id", Dir::Desc)],
+    group: None,
+};
+
+/// The effect filter's tags: what `@` offers in the log panel.
+static LOG_TAGS: &[TagDef] = &[
+    TagDef {
+        name: "failed",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "gave up, waiting for a human",
+        values: Values::None,
+    },
+    TagDef {
+        name: "live",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "still queued or in flight",
+        values: Values::None,
+    },
+    TagDef {
+        name: "retried",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "took more than one attempt",
+        values: Values::None,
+    },
+    TagDef {
+        name: "risky",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "not idempotent: a crash cannot retry it",
+        values: Values::None,
+    },
+    TagDef {
+        name: "status",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "pending, processing, done, failed, obsolete",
+        values: Values::Static(STATUSES),
+    },
+    TagDef {
+        name: "kind",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "the effect's verb — move, seen, submit",
+        values: Values::Dynamic,
+    },
+    TagDef {
+        name: "entity",
+        kind: TagType::Text,
+        ops: &[Op::Eq],
+        describe: "what it belongs to — account:1, outbox:7",
+        values: Values::Dynamic,
+    },
+    TagDef {
+        name: "attempts",
+        kind: TagType::Number,
+        ops: &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte],
+        describe: "how many times it has been tried",
+        values: Values::None,
+    },
+    TagDef {
+        name: "date",
+        kind: TagType::Date,
+        ops: &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte],
+        describe: "the day it was filed, 30.08.2026",
+        values: Values::None,
+    },
+];
+
+/// Values for the log's dynamic tags, under what has been typed. Both are
+/// read off the queue itself rather than off the registry: what is *in* the
+/// table is what filtering it can find, and a kind this build no longer
+/// registers is exactly the row a human goes looking for.
+fn suggest_log(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
+    let col = match tag {
+        "kind" => "kind",
+        "entity" => "entity",
+        _ => return Vec::new(),
+    };
+    let sql = format!(
+        "SELECT DISTINCT {col} FROM effect
+          WHERE {col} IS NOT NULL AND {col} != '' ORDER BY {col}"
+    );
+    store
+        .rows_sql("effect log values", "the distinct values one effect-log tag takes", &sql, &[], |r| {
+            r.get::<_, String>(0)
+        })
+        .iter()
+        .filter(|v| v.to_lowercase().contains(typed))
+        .map(Suggestion::value)
+        .collect()
+}
+
+/// The effect log's datasource: what the log panel's rich table runs on.
+pub static LOG: SqlSource<Job> = SqlSource {
+    spec: &LOG_SPEC,
+    tags: LOG_TAGS,
+    map: job_row,
+    key: |j| vec![Val::I(j.id)],
+    suggest: suggest_log,
+};
+
+/// Rows per page of the log table.
+pub const LOG_PAGE: usize = 50;
 
 // -- the world -----------------------------------------------------------------
 
@@ -568,7 +785,10 @@ pub fn cancel_tx(tx: &Transaction, id: i64, now: f64) -> rusqlite::Result<bool> 
 pub struct World {
     store: Rc<Store>,
     outside: RefCell<Box<dyn Outside>>,
-    registry: Registry,
+    /// Shared, so a panel can hold one and name what it is looking at
+    /// ([`Registry::describe`]) — and no more than that: performing an
+    /// effect needs an [`Outside`], which stays behind this world.
+    registry: Rc<Registry>,
 }
 
 impl World {
@@ -577,7 +797,7 @@ impl World {
         World {
             store,
             outside: RefCell::new(outside),
-            registry,
+            registry: Rc::new(registry),
         }
     }
 
@@ -602,6 +822,13 @@ impl World {
     #[must_use]
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// The registry as a shared handle — what the log panel carries so it
+    /// can turn a filed payload back into a sentence.
+    #[must_use]
+    pub fn registry_rc(&self) -> Rc<Registry> {
+        self.registry.clone()
     }
 
     /// Unix seconds, from whichever backend this world has. Shorthand for
@@ -1993,5 +2220,100 @@ mod tests {
     fn secrets_never_reach_the_record() {
         let c = Creds { host: "h".into(), user: "u".into(), pass: "s3cret".into() };
         assert!(!format!("{c:?}").contains("s3cret"), "{c:?}");
+    }
+
+    // -- the log, as its viewer reads it ------------------------------------
+
+    /// The queue through the rich table, under a filter — what the log
+    /// panel does on every draw, minus the widgets.
+    fn log(w: &World, filter: &str) -> Vec<Job> {
+        let mut t = crate::richtable::Table::new(&LOG, LOG_PAGE);
+        t.set_filter(filter);
+        assert!(t.errors().is_empty(), "{filter:?}: {:?}", t.errors());
+        let n = t.len(w.store());
+        t.rows(w.store(), 0, n)
+    }
+
+    /// The log holds no rows of its own: every one is a page of the queue,
+    /// newest first, and the executor's commits show through.
+    #[test]
+    fn the_log_pages_the_queue_newest_first() {
+        let w = world();
+        w.enqueue(&Poke::ok("one")).unwrap();
+        w.enqueue(&Poke::ok("two")).unwrap();
+
+        let rows = log(&w, "");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].id > rows[1].id, "newest first");
+        assert!(rows.iter().all(|j| j.status == "pending"));
+
+        w.run_effects();
+        let rows = log(&w, "");
+        assert!(rows.iter().all(|j| j.status == "done"));
+        assert_eq!(rows[0].reply.as_deref(), Some("\"poked two\""));
+    }
+
+    /// The filter grammar over the queue's own columns — including a tag
+    /// value that carries a colon, which is how every entity is spelled.
+    #[test]
+    fn the_log_filters_by_its_own_tags() {
+        let w = world();
+        w.enqueue(&Poke::ok("one")).unwrap();
+        w.enqueue(&Poke {
+            note: "sevenxx".into(),
+            fails: true,
+            idem: false,
+            wanted: true,
+        })
+        .unwrap();
+        w.run_effects();
+
+        assert_eq!(log(&w, "@kind:poke").len(), 2);
+        assert_eq!(log(&w, "@kind:submit").len(), 0);
+
+        // `@risky` is the work a crash cannot retry for you.
+        let risky = log(&w, "@risky");
+        assert_eq!(risky.len(), 1);
+        assert_eq!(risky[0].entity.as_deref(), Some("panel:7"));
+
+        // `panel:3` is one value: a filter that stopped at the colon would
+        // read as "contains panel" and keep both rows.
+        assert_eq!(log(&w, "@entity:panel:3").len(), 1);
+
+        // Bare words search the payload, which is where the arguments are.
+        assert_eq!(log(&w, "sevenxx").len(), 1);
+
+        // The failure went back in the queue with a backoff, so it is live
+        // and has not been retried yet.
+        assert_eq!(log(&w, "@live").len(), 1);
+        assert_eq!(log(&w, "@retried").len(), 0);
+
+        // Past the backoff, the second attempt says so in one phrase.
+        w.with_fake(|f| f.clock += 60.0);
+        w.run_effects();
+        let retried = log(&w, "@retried");
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].status_line(), "pending · 2 tries");
+        assert_eq!(retried[0].error.as_deref(), Some("poke refused"));
+    }
+
+    /// The one line a row shows comes from the effect itself: the registry
+    /// decodes the payload and asks it. No central table of kinds, and no
+    /// panic on a payload this build cannot read.
+    #[test]
+    fn a_filed_payload_describes_itself() {
+        let w = world();
+        w.enqueue(&Poke::ok("hello")).unwrap();
+        let j = &w.jobs()[0];
+
+        assert_eq!(
+            w.registry().describe(&j.kind, &j.payload).as_deref(),
+            Some("poke hello")
+        );
+        assert!(
+            w.registry().describe("nosuch", &j.payload).is_none(),
+            "an unregistered kind names itself with nothing"
+        );
+        assert!(w.registry().describe("poke", "{}").is_none());
     }
 }

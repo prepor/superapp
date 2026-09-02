@@ -203,7 +203,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
             FieldId::SetSmtp,
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
-        Kind::Inbox { .. } => &[FieldId::Filter],
+        Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
         _ => &[],
     }
 }
@@ -233,6 +233,7 @@ mod tests {
             Kind::Contact {
                 email: "a@b.c".into(),
             },
+            Kind::Effects,
         ]
     }
 

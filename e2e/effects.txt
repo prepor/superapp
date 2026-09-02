@@ -1,0 +1,84 @@
+# The effect log (CR-004's queue, read): every job the app has filed on the
+# outside world — its status, the sentence the effect describes itself
+# with, and the JSON it was filed as, unfolded in place.
+#
+# Run with --send-delay 1. The demo account has no SMTP host, so a send is
+# the shortest honest way to put a real job in this queue: it is submitted,
+# it fails, and the log is where that failure is legible.
+wait 700
+
+# The launcher finds the panel under the word one actually reaches for.
+key cmd 2
+wait 400
+type "log"
+wait 400
+shot g1-launcher
+key enter
+wait 800
+# Nothing has left the process yet — said, rather than left blank.
+shot g2-empty
+key cmd+w
+wait 600
+
+# File a send against an account with nowhere to send it.
+click "Q3 infra"
+wait 600
+click "reply"
+wait 500
+type "Checking egress today."
+wait 300
+click "send"
+wait 2500
+
+# Back to the log: one job, and the server's own words under it.
+key cmd 2
+wait 300
+type "effects"
+wait 400
+key enter
+wait 900
+shot g3-log
+# A row is addressed by the sentence its effect describes itself with —
+# so a log that stopped naming its jobs fails the run, no picture needed.
+click "submit outbox:"
+wait 600
+shot g4-unfolded
+# The unfolded JSON is a selectable run like any other text in the app —
+# a payload is something one copies into a bug report. The run is
+# registered over the row it sits in, so reaching for it does not fold the
+# row back.
+click "effect payload"
+wait 300
+key cmd+a
+wait 400
+shot g5-payload-selected
+
+# The filter is the rich table's, over the queue's own columns.
+key /
+wait 200
+type "@"
+wait 400
+shot g6-tags
+key esc
+wait 200
+key cmd+a
+# `@risky` is the jobs a crash cannot retry for you — a submission is the
+# app's one genuinely irreversible effect, so this is exactly the one row.
+type "@risky"
+wait 500
+key esc
+wait 400
+shot g7-risky
+click "submit outbox:"
+wait 500
+
+# A filter nothing answers says so rather than showing an empty page.
+key /
+wait 200
+key cmd+a
+type "@kind:move"
+wait 500
+key esc
+wait 500
+shot g8-none
+quit

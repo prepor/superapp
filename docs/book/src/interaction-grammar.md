@@ -241,7 +241,9 @@ query field rises over an ink wash. One query runs over *everything that can
 be a panel*: the open panels on every workspace, the root panels, and the
 mail world — contacts by name and address, mails by subject and sender, the
 same word-by-word substring semantics as the inbox filter. Every token must
-match, so `vera q3` narrows to her budget mail.
+match, so `vera q3` narrows to her budget mail. A root also answers to the
+word one actually reaches for rather than only to its own name: the effect
+log is found by *log* and *queue* as well as by *effects*.
 
 Each hit carries one of two verbs, decided for you:
 

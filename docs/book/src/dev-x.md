@@ -220,6 +220,10 @@ the demo account cannot make raises the mark, the mark opens the panel,
 *retry* files it again, *reopen* brings the draft back and `cmd+z` takes
 that back; an account against an `.invalid` host joins the list, *sync*
 kicks it, and removing the account clears it.
+`e2e/effects.txt` (run with `--send-delay 1`) walks the effect log — the
+same failed send, seen from the other end: the empty queue, then the job it
+files, addressed by *the sentence its effect describes itself with*, which
+is how a log that stopped naming its jobs fails the run.
 
 `click` resolves the element's action directly — it proves the action, not
 the click. `mouse` sends a real press-release pair into the stage, so the

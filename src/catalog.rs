@@ -24,6 +24,7 @@ use makepad_widgets::*;
 
 use crate::app::BootOutside;
 use crate::core::{Grid, Kind, Seed};
+use crate::effect;
 use crate::e2e::{self, Step};
 use crate::mail;
 use crate::panels::*;
@@ -177,6 +178,34 @@ fn account(email: &str, host: Option<&str>, status: Option<&str>) -> mail::Accou
     }
 }
 
+/// One row of the effect queue, as the log lists it. The sentence is
+/// supplied rather than decoded: a component node has no registry, and the
+/// row draws whatever line it is handed either way.
+fn job(
+    kind: &str,
+    entity: &str,
+    status: &str,
+    attempts: i64,
+    payload: &str,
+    reply: Option<&str>,
+    error: Option<&str>,
+) -> effect::Job {
+    effect::Job {
+        id: 118,
+        kind: kind.to_string(),
+        entity: Some(entity.to_string()),
+        status: status.to_string(),
+        reply: reply.map(str::to_string),
+        error: error.map(str::to_string),
+        attempts,
+        payload: payload.to_string(),
+        idempotent: kind != "submit",
+        created: at(9, 12),
+        updated: at(9, 14),
+        not_before: 0.0,
+    }
+}
+
 fn orow(num: &str, main: &str, detail: &str, right: &str) -> OverlayRowData {
     OverlayRowData {
         num: num.to_string(),
@@ -221,6 +250,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         overlay_row(),
         launcher(),
         account_row(),
+        effect_row(),
         link(),
         inbox(),
         message(),
@@ -418,6 +448,103 @@ fn account_row() -> Scene<Setup> {
         .edge("synced", "error", "the password expires")
 }
 
+fn effect_row() -> Scene<Setup> {
+    let row = |j: effect::Job, what: &'static str, selected: bool, open: bool| {
+        widget(live_id!(effect_row_tpl), move |cx, w| {
+            w.as_effect_row().populate(cx, &j, what, selected, open);
+        })
+    };
+    let mv = |status: &str, attempts: i64, error: Option<&str>| {
+        job(
+            "move",
+            "account:1",
+            status,
+            attempts,
+            r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
+            None,
+            error,
+        )
+    };
+    let moved = "move uid 118 from INBOX to Archive";
+    Scene::new("effect row", (560.0, 60.0))
+        .note("One job of the effect queue: the verb and whose it was, then the sentence the effect describes itself with.")
+        .note("Everything the app has tried on the outside world is one of these — filed before it runs, closed after.")
+        .node("queued", row(mv("pending", 0, None), moved, false, false))
+        .about("filed, waiting its turn")
+        .node(
+            "done",
+            row(
+                job(
+                    "move",
+                    "account:1",
+                    "done",
+                    1,
+                    r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
+                    Some("119"),
+                    None,
+                ),
+                moved,
+                false,
+                false,
+            ),
+        )
+        .node(
+            "retrying",
+            row(
+                mv("pending", 3, Some("connection refused")),
+                moved,
+                false,
+                false,
+            ),
+        )
+        .sized((560.0, 76.0))
+        .about("the count appears once a job has fought; the error in the one colour errors get")
+        .node(
+            "given up",
+            row(
+                job(
+                    "submit",
+                    "outbox:7",
+                    "failed",
+                    6,
+                    r#"{"outbox":7}"#,
+                    None,
+                    Some("535 authentication failed"),
+                ),
+                "submit outbox:7",
+                false,
+                false,
+            ),
+        )
+        .sized((560.0, 76.0))
+        .about("six attempts, then it waits for a human")
+        .node("cursor", row(mv("pending", 0, None), moved, true, false))
+        .about("the cursor's wash; enter unfolds the row")
+        .node(
+            "unfolded",
+            row(
+                job(
+                    "move",
+                    "account:1",
+                    "done",
+                    1,
+                    r#"{"account":1,"message":42,"to_folder":3,"from":"INBOX","to":"Archive","uid":118}"#,
+                    Some("119"),
+                    None,
+                ),
+                moved,
+                false,
+                true,
+            ),
+        )
+        .sized((560.0, 190.0))
+        .about("what `sqlite3` would show: the payload it was filed as, the answer the world gave")
+        .edge("queued", "done", "the executor's round trip")
+        .edge("queued", "retrying", "the server said no")
+        .edge("retrying", "given up", "six attempts")
+        .edge("done", "unfolded", "enter / click")
+}
+
 fn link() -> Scene<Setup> {
     let l = |text: &'static str, dotted: bool, accel: Option<char>| {
         widget(live_id!(link_tpl), move |cx, w| {
@@ -494,10 +621,12 @@ fn compose() -> Scene<Setup> {
 
 fn small_panels() -> Scene<Setup> {
     Scene::new("small panels", (520.0, 420.0))
-        .note("Settings and its form, a sender's card, the manual, the colophon.")
+        .note("Settings and its form, the effect log, a sender's card, the manual, the colophon.")
         .node("settings", panel(|_| Kind::Settings, ""))
         .node("add account", panel(|_| Kind::AddAccount, ""))
         .about("four fields and the one button")
+        .node("effect log", panel(|_| Kind::Effects, ""))
+        .about("a sealed world files nothing, so this is the empty state — said, not left blank")
         .node("contact", panel(|s| Kind::Contact { email: sender_like(s, "Elena") }, ""))
         .sized((520.0, 260.0))
         .node("help", panel(|_| Kind::Help, ""))
