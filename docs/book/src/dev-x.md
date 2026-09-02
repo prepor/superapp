@@ -219,8 +219,12 @@ and measured cell metrics to stderr.
 
 ## Panels library
 
+In the app, **Dev → Panels Library** (⇧⌘L) puts the library up over the
+workspace and takes it down again; the workspace underneath keeps its
+store, sync and script running. From the command line:
+
 ```sh
-# every scene of the catalogue, live, on one canvas
+# open on the library — every scene of the catalogue, live, on one canvas
 mise exec -- cargo run -- --library
 
 # the scenes whose names contain these
@@ -298,7 +302,8 @@ every animated frame, and a stage worked by hand animates on every beat.
 `e2e/library.txt` drives the canvas itself: `wait`, `shot`, `click` on a
 scene's name or a node's (`scene/node`), and the canvas chords. A step
 that fails inside a node's replay is reported on stderr under the node's
-name and counts against the run.
+name and counts against the run. `e2e/library-toggle.txt` is a workspace
+suite: it presses ⇧⌘L over a running stage and back.
 
 `SUPERAPP_FRAME_LOG=1` prints every frame's draw cost (the canvas's, and
 what was spent inside mount renders, with the interval since the last

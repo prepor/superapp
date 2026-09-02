@@ -314,6 +314,10 @@ pub struct Library {
     /// Events since the last draw, by kind — what a frame answers to.
     #[rust]
     since_draw: Vec<(&'static str, u32)>,
+    /// Up over the workspace. Off, the canvas draws nothing and hears
+    /// nothing; its mounts keep their state for the next time.
+    #[rust]
+    shown: bool,
 }
 
 impl ScriptHook for Library {
@@ -472,11 +476,29 @@ enum Plan {
 impl Library {
     // -- boot ---------------------------------------------------------------
 
+    /// Puts the canvas up: the first time, it reads the catalogue and lays
+    /// one mount per node.
+    pub fn show(&mut self, cx: &mut Cx) {
+        if !self.booted {
+            self.boot(cx);
+        }
+        self.shown = true;
+        self.next_frame = cx.new_next_frame();
+        cx.set_key_focus(self.area);
+        cx.redraw_all();
+    }
+
+    /// Puts the canvas away. An entered mount is left first, so it gives
+    /// the IME back.
+    pub fn hide(&mut self, cx: &mut Cx) {
+        self.leave(cx);
+        self.shown = false;
+        cx.redraw_all();
+    }
+
     /// Reads the catalogue and lays one mount per node.
     fn boot(&mut self, cx: &mut Cx) {
-        let Some(filter) = app::library_filter() else {
-            return;
-        };
+        let filter = app::library_filter().unwrap_or(&[]);
         let mut scenes = catalog::scenes();
         if !filter.is_empty() {
             let wanted: Vec<String> = filter.iter().map(|f| f.to_lowercase()).collect();
@@ -516,9 +538,10 @@ impl Library {
             self.mounts.len()
         );
         self.scenes = Rc::new(scenes);
-        // The canvas's own script.
+        // The canvas's own script — when the window opened on the canvas;
+        // otherwise the script is the stage's suite.
         let (script, out) = app::e2e_script();
-        if let Some(path) = script {
+        if let Some(path) = script.filter(|_| app::library_filter().is_some()) {
             match std::fs::read_to_string(path)
                 .map_err(|e| e.to_string())
                 .and_then(|s| e2e::parse(&s))
@@ -1604,10 +1627,7 @@ fn event_kind(e: &Event) -> &'static str {
 
 impl Widget for Library {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
-        if matches!(event, Event::Startup) {
-            self.boot(cx);
-        }
-        if !self.booted {
+        if !self.booted || !self.shown {
             return;
         }
         let t0 = app::frame_log().then(std::time::Instant::now);
@@ -1636,7 +1656,7 @@ impl Widget for Library {
         self.renders = 0;
         let step = self.draw(cx, walk);
         if let Some(t0) = t0 {
-            if self.booted {
+            if self.booted && self.shown {
                 let since = self
                     .last_draw
                     .map_or(0.0, |t| (t0 - t).as_secs_f64() * 1000.0);
@@ -1794,7 +1814,7 @@ impl Library {
 
     fn draw(&mut self, cx: &mut Cx2d, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, Layout::default());
-        if !self.booted {
+        if !self.booted || !self.shown {
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
         }

@@ -167,7 +167,9 @@ impl Boot {
     /// The primary stage's boot, from argv. A script that fails to parse
     /// ends the process here, before a window exists to be confused by it.
     fn primary(cx: &Cx) -> Boot {
-        let steps = config().e2e.as_ref().map(|path| {
+        // Opened on the library, the script is the canvas's, not this
+        // stage's.
+        let steps = config().e2e.as_ref().filter(|_| library_filter().is_none()).map(|path| {
             match std::fs::read_to_string(path)
                 .map_err(|e| e.to_string())
                 .and_then(|s| e2e::parse(&s))
@@ -1815,6 +1817,10 @@ pub struct Stage {
     /// viewport, instead of the workspace.
     #[rust]
     solo: Option<PanelId>,
+    /// The panels library is up over this stage: it draws nothing and
+    /// hears no input, while its store, timers and script keep running.
+    #[rust]
+    suspended: bool,
 }
 
 /// Menu command id bases: workspace `k`'s items are `base + k`. Plain
@@ -1826,6 +1832,16 @@ const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
+const MENU_LIBRARY: u64 = 0x5753_0600;
+
+/// The Dev menu's intents, raised by the stage (a menu item, a chord) for
+/// the app root to act on: the library is the stage's sibling, not its
+/// child.
+#[derive(Debug, Clone)]
+pub enum DevAction {
+    /// Show the panels library over the workspace, or put it away.
+    ToggleLibrary,
+}
 
 /// The overlays are hosted like panels, so they need keys in the same map.
 /// Panel ids are workspace-tagged (`k << 32`) and allocated upward, so the
@@ -2014,7 +2030,7 @@ impl Stage {
             }
         }
         self.next_frame = cx.new_next_frame();
-        redraw_scoped(cx, self.lists, self.mount);
+        self.redraw_scoped(cx);
     }
 
     /// A mutation happened: recompute targets, animate, redraw.
@@ -2117,6 +2133,16 @@ impl Stage {
                 ],
             });
         }
+        items.push(MacosMenu::Sub {
+            name: "Dev".into(),
+            items: vec![MacosMenu::Item {
+                command: LiveId(MENU_LIBRARY),
+                key: KeyCode::Unknown,
+                shift: true,
+                enabled: true,
+                name: "Panels Library — ⇧⌘L".into(),
+            }],
+        });
         cx.update_macos_menu(MacosMenu::Main { items });
     }
 
@@ -2571,6 +2597,11 @@ impl Stage {
                 }
                 return;
             }
+            if k.key_code == KeyCode::KeyL && k.modifiers.shift {
+                // The Dev menu's chord: the panels library, over the workspace.
+                cx.action(DevAction::ToggleLibrary);
+                return;
+            }
             if k.key_code == KeyCode::KeyU {
                 state.overlay = if state.overlay == Overlay::History {
                     Overlay::None
@@ -2842,7 +2873,7 @@ impl Stage {
                 }
             }
             state.failed_seen = failures.len();
-            redraw_scoped(cx, self.lists, self.mount);
+            self.redraw_scoped(cx);
         }
         self.tick_repl(cx);
     }
@@ -4159,7 +4190,7 @@ impl Stage {
             }
         }
         self.next_frame = cx.new_next_frame();
-        redraw_scoped(cx, self.lists, self.mount);
+        self.redraw_scoped(cx);
     }
 
     /// A mount is still replaying its steps.
@@ -4248,6 +4279,41 @@ impl Stage {
             self.ime_shown = false;
             cx.hide_text_ime();
         }
+    }
+
+    /// Redraws what this stage draws into — nothing while it is suspended
+    /// under the library: a redraw of the whole window there would mark
+    /// every mount pending on every tick of the script underneath, and the
+    /// render budget would never get past the first few.
+    fn redraw_scoped(&self, cx: &mut Cx) {
+        if self.suspended {
+            return;
+        }
+        redraw_scoped(cx, self.lists, self.mount);
+    }
+
+    /// Whether the stage has come up on a world.
+    #[must_use]
+    pub fn booted(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// The panels library went up over this stage (or came down): while
+    /// up, the stage neither draws nor hears input, and gives up the IME.
+    pub fn set_suspended(&mut self, cx: &mut Cx, on: bool) {
+        if self.suspended == on {
+            return;
+        }
+        self.suspended = on;
+        if on {
+            if self.ime_shown {
+                self.ime_shown = false;
+                cx.hide_text_ime();
+            }
+        } else if self.state.is_some() {
+            self.kick(cx);
+        }
+        cx.redraw_all();
     }
 
     /// Where a mount draws: its own draw list and the canvas's, so its
@@ -4623,6 +4689,17 @@ impl Widget for Stage {
         if self.frozen() {
             return;
         }
+        // Under the library: the world keeps turning (timers, the store's
+        // signals, a running script), the window is not this stage's.
+        if self.suspended
+            && !matches!(
+                event,
+                Event::Startup | Event::Timer(_) | Event::Signal | Event::MacosMenuCommand(_)
+            )
+            && !(matches!(event, Event::NextFrame(_)) && self.e2e.is_some())
+        {
+            return;
+        }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
         // handlers instead (so the e2e paths share the exact route);
@@ -4716,7 +4793,7 @@ impl Widget for Stage {
                     self.ime_guard_tries -= 1;
                     log!("ime guard: re-issuing keyboard show");
                     cx.hide_text_ime();
-                    redraw_scoped(cx, self.lists, self.mount);
+                    self.redraw_scoped(cx);
                     if self.ime_guard_tries > 0 {
                         self.ime_guard_timer = cx.start_timeout(0.5);
                     }
@@ -4731,7 +4808,7 @@ impl Widget for Stage {
                 // carves out. The next draw picks up both.
                 let ins = e.new_geom.safe_area_insets;
                 self.insets = (ins.top, ins.right, ins.bottom, ins.left);
-                redraw_scoped(cx, self.lists, self.mount);
+                self.redraw_scoped(cx);
             }
 
             Event::TouchUpdate(e) => self.touch_update(cx, e),
@@ -4789,6 +4866,8 @@ impl Widget for Stage {
                         state.overlay = Overlay::History;
                     }
                     self.kick(cx);
+                } else if id == MENU_LIBRARY {
+                    cx.action(DevAction::ToggleLibrary);
                 }
             }
 
@@ -4844,7 +4923,7 @@ impl Widget for Stage {
                 cx.set_cursor(act.map(|(_, c)| c).unwrap_or(MouseCursor::Default));
                 if new_hover != state.hover {
                     state.hover = new_hover;
-                    redraw_scoped(cx, self.lists, self.mount);
+                    self.redraw_scoped(cx);
                 }
             }
 
@@ -5047,7 +5126,7 @@ impl Widget for Stage {
                         springs_active || toast_active || dragging || swiping
                     );
                 }
-                redraw_scoped(cx, self.lists, self.mount);
+                self.redraw_scoped(cx);
                 // Mutates the world, so it runs after the frame's own
                 // bookkeeping rather than in the middle of it.
                 self.settle_row_swipe(cx);
@@ -5066,6 +5145,10 @@ impl Widget for Stage {
                 ..self.layout
             },
         );
+        if self.suspended {
+            cx.end_turtle_with_area(&mut self.area);
+            return DrawStep::done();
+        }
         // The workspace lives inside the safe area (zero on desktop). Android
         // additionally swallows touches in the notification-shade pull zone
         // at the very top of the window (~22 dp observed on gesture nav), so
@@ -6429,6 +6512,45 @@ pub struct App {
     shaped: bool,
     #[rust]
     shape_tries: u32,
+    /// The panels library is up over the workspace (Dev → Panels Library,
+    /// ⇧⌘L; or `--library` from the start).
+    #[rust]
+    library_shown: bool,
+}
+
+impl App {
+    /// Puts the panels library up over the workspace, or away again. The
+    /// stage underneath is suspended rather than torn down — its store,
+    /// sync and script keep running — and comes up on first need: opened
+    /// on the library, the window has no workspace until asked.
+    fn show_library(&mut self, cx: &mut Cx, on: bool) {
+        self.library_shown = on;
+        let stage = self.ui.widget(cx, ids!(stage));
+        let library = self.ui.widget(cx, ids!(library));
+        if on {
+            if let Some(mut st) = stage.borrow_mut::<Stage>() {
+                st.set_suspended(cx, true);
+            }
+            if let Some(mut lib) = library.borrow_mut::<crate::library::Library>() {
+                lib.show(cx);
+            }
+        } else {
+            if let Some(mut lib) = library.borrow_mut::<crate::library::Library>() {
+                lib.hide(cx);
+            }
+            let boot = stage
+                .borrow::<Stage>()
+                .is_some_and(|st| !st.booted())
+                .then(|| Boot::primary(cx));
+            if let Some(mut st) = stage.borrow_mut::<Stage>() {
+                st.set_suspended(cx, false);
+                if let Some(boot) = boot {
+                    st.boot(cx, boot);
+                }
+            }
+        }
+        cx.redraw_all();
+    }
 }
 
 impl MatchEvent for App {
@@ -6468,6 +6590,20 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
+        match event {
+            // Opened on the library: it is up from the first frame, and the
+            // workspace stays unbooted until the toggle asks for it.
+            Event::Startup if library_filter().is_some() => self.show_library(cx, true),
+            Event::Actions(actions)
+                if actions
+                    .iter()
+                    .any(|a| a.downcast_ref::<DevAction>().is_some()) =>
+            {
+                let on = !self.library_shown;
+                self.show_library(cx, on);
+            }
+            _ => {}
+        }
         self.ui.handle_event(cx, event, &mut Scope::empty());
 
         // Enforce the window shape once the widget tree exists: at Startup the
