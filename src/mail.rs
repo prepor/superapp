@@ -896,6 +896,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Job { id } => job_title(store, *id),
         Kind::Files { dir } => crate::files::basename(dir).into(),
         Kind::File { path } => crate::files::basename(path).into(),
+        Kind::Bucket => "device sync".into(),
     }
 }
 

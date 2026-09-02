@@ -236,6 +236,7 @@ mod tests {
             epoch: 1,
             unpublished,
             device: "dev".into(),
+            note: None,
         }
     }
 

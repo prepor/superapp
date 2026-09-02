@@ -431,6 +431,7 @@ script_mod! {
                         // per panel, PortalList-style.
                         settings_tpl := mod.widgets.SettingsPanel{}
                         add_account_tpl := mod.widgets.AddAccountPanel{}
+                        bucket_tpl := mod.widgets.BucketPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
                         inbox_tpl := mod.widgets.InboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
@@ -464,6 +465,7 @@ script_mod! {
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
+                            bucket_tpl := mod.widgets.BucketPanel{}
                             compose_tpl := mod.widgets.ComposePanel{}
                             inbox_tpl := mod.widgets.InboxPanel{}
                             message_tpl := mod.widgets.MessagePanel{}
@@ -600,6 +602,8 @@ enum WidgetOp {
     AddAccount,
     /// Press "sign in with google" on the add-account panel.
     GoogleSignIn,
+    /// The device-sync form's connect button (CR-005).
+    ConnectBucket,
     RemoveAccount(i64),
     /// A row of a list panel was clicked — an inbox thread, a job of the
     /// effect log, an entry of a files panel. One op, because a click on a
@@ -1814,6 +1818,69 @@ impl State {
             None => return ReplChange::default(),
         };
         self.apply_repl(status)
+    }
+
+    /// Points this device at a bucket (CR-005): the secret to the platform's
+    /// secret store, the URL and key id to the `bucket` file beside the
+    /// store, and the replication worker restarted onto them. Answers what to
+    /// say, either way.
+    ///
+    /// This is the road android has and the command line does not — a device
+    /// with no shell and no cable is still a device that has to be given a
+    /// key.
+    fn connect_bucket(&mut self, url: &str, key_id: &str, secret: &str) -> Result<String, String> {
+        let dir = self
+            .db_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .ok_or("no store file — device sync needs one")?
+            .to_path_buf();
+        if url.is_empty() {
+            return Err("the bucket url is required".into());
+        }
+        if url.starts_with("https://") && key_id.is_empty() {
+            return Err("an https bucket needs an access key id".into());
+        }
+        if !secret.is_empty() {
+            if key_id.is_empty() {
+                return Err("a secret needs the key id it belongs to".into());
+            }
+            self.world
+                .run(&crate::effect::BucketSecret { key_id, secret })
+                .map_err(|e| format!("storing the bucket secret failed: {e}"))?;
+        }
+        self.world
+            .run(&crate::effect::WriteFile {
+                path: &crate::r2::config_path(&dir),
+                bytes: &crate::r2::config_bytes(url, key_id),
+            })
+            .map_err(|e| format!("writing the bucket file failed: {e}"))?;
+
+        // Open it before restarting anything: a missing secret should be a
+        // sentence on screen, not a worker that quietly never starts.
+        crate::r2::open(url, Some(&dir))?;
+
+        // Hand the lease back before the old worker goes — the bucket it
+        // holds it in may not be the one we are moving to.
+        if let Some(ReplMode::Threads(w)) = &self.repl {
+            w.release_blocking();
+        }
+        self.repl = None;
+        self.repl_status = crate::repl::Status {
+            role: crate::repl::Role::Detached,
+            epoch: 0,
+            unpublished: 0,
+            device: self.store.device(),
+            note: None,
+        };
+        self.repl = Self::start_repl(&self.store, self.db_path.as_deref());
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or(url);
+        Ok(format!("device sync: connecting to {host}"))
     }
 
     /// Asks to take the lease.
@@ -3873,6 +3940,16 @@ impl Stage {
                     WidgetOp::GoogleSignIn => {
                         cx.action(crate::panels::PanelAction::GoogleSignIn { pid });
                     }
+                    WidgetOp::ConnectBucket => {
+                        if let Some(w) = self.hosted.get(&pid) {
+                            if let Some(mut bp) = w.as_bucket_panel().borrow_mut() {
+                                let (url, key_id, secret) = bp.form_values(cx);
+                                cx.action(crate::panels::PanelAction::ConnectBucket {
+                                    pid, url, key_id, secret,
+                                });
+                            }
+                        }
+                    }
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
@@ -4878,6 +4955,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
         Kind::AddAccount => Some(live_id!(add_account_tpl)),
+        Kind::Bucket => Some(live_id!(bucket_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
         Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
@@ -5389,6 +5467,38 @@ impl Stage {
                         ),
                         false,
                     );
+                    refresh = true;
+                }
+                crate::panels::PanelAction::ConnectBucket {
+                    pid,
+                    url,
+                    key_id,
+                    secret,
+                } => {
+                    let done = self
+                        .state
+                        .as_deref_mut()
+                        .map(|state| state.connect_bucket(&url, &key_id, &secret));
+                    match done {
+                        // The secret is in the keychain now; a form is not a
+                        // place to keep one.
+                        Some(Ok(said)) => {
+                            if let Some(w) = self.hosted.get(&pid) {
+                                w.as_bucket_panel().clear_secret(cx);
+                            }
+                            if let Some(state) = self.state.as_deref_mut() {
+                                state.toast(said, false);
+                            }
+                        }
+                        Some(Err(why)) => {
+                            if let Some(state) = self.state.as_deref_mut() {
+                                state.toast(why, true);
+                            }
+                        }
+                        None => {}
+                    }
+                    self.tick_repl(cx);
+                    refresh = true;
                 }
                 crate::panels::PanelAction::TryIt { pid: _ } => {
                     if let Some(state) = self.state.as_deref_mut() {
@@ -7112,6 +7222,14 @@ impl Stage {
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);
             }
+            // The device-sync form seeds from what this device is already
+            // pointed at — its bucket and key id, never its secret.
+            if matches!(&kind, Some(Kind::Bucket)) {
+                let dir = state.db_path.as_deref().and_then(std::path::Path::parent);
+                let url = State::resolve_bucket(state.db_path.as_deref()).unwrap_or_default();
+                let key_id = crate::r2::configured_key_id(dir);
+                w.as_bucket_panel().prefill(cx, &url, &key_id);
+            }
             // An inbox with a baked filter param seeds its field.
             if let Some(Kind::Inbox { filter: Some(f) }) = &kind {
                 w.widget(cx, ids!(filter_input))
@@ -7153,13 +7271,14 @@ impl Stage {
         let mut reg: Vec<(String, Rect, Act)> = Vec::new();
         match &kind {
             Some(Kind::Settings) => {
-                let lr = w.widget(cx, ids!(add_link)).area().rect(cx);
-                if lr.size.x > 0.0 {
-                    reg.push((
-                        "add account".to_string(),
-                        lr,
-                        Act::Open(pid, Kind::AddAccount),
-                    ));
+                for (label, path, target) in [
+                    ("add account", ids!(add_link), Kind::AddAccount),
+                    ("device sync", ids!(bucket_link), Kind::Bucket),
+                ] {
+                    let lr = w.widget(cx, path).area().rect(cx);
+                    if lr.size.x > 0.0 {
+                        reg.push((label.to_string(), lr, Act::Open(pid, target)));
+                    }
                 }
                 let accounts = mail::accounts(&state.store);
                 if let Some(list) =
@@ -7205,6 +7324,26 @@ impl Stage {
                             }
                         }
                     }
+                }
+            }
+            Some(Kind::Bucket) => {
+                for (label, path) in [
+                    ("bucket", ids!(url_input)),
+                    ("key id", ids!(key_input)),
+                    ("secret", ids!(secret_input)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Pointer(pid)));
+                    }
+                }
+                let br = w.widget(cx, ids!(connect_btn)).area().rect(cx);
+                if br.size.x > 0.0 {
+                    reg.push((
+                        "connect".to_string(),
+                        br,
+                        Act::WidgetOp(pid, WidgetOp::ConnectBucket),
+                    ));
                 }
             }
             Some(Kind::AddAccount) => {

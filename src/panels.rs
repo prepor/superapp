@@ -138,6 +138,15 @@ pub enum PanelAction {
         /// The add-account panel that asked — where the flow reports back.
         pid: u64,
     },
+    /// The device-sync form submitted (CR-005): point this device at a
+    /// bucket. An empty secret keeps whatever key the device already holds.
+    ConnectBucket {
+        /// The bucket panel that submitted (its secret field clears).
+        pid: u64,
+        url: String,
+        key_id: String,
+        secret: String,
+    },
     /// A compose panel's fields changed — the shell persists the draft
     /// (plain upkeep, not an action).
     DraftEdited {
@@ -836,6 +845,8 @@ script_mod! {
         // heading row is not where this language puts navigation.
         View { width: Fill, height: 8 }
         add_link := mod.widgets.SLink {}
+        View { width: Fill, height: 2 }
+        bucket_link := mod.widgets.SLink {}
     }
 
     /** The add-account form, a panel of its own: the Google sign-in above,
@@ -929,6 +940,58 @@ script_mod! {
             width: Fill, height: Fit
             View { width: Fill, height: 1 }
             add_btn := mod.widgets.SBtn { text: "add account" }
+        }
+    }
+
+    /** The device-sync form (CR-005): where the bucket is, and the key that
+        opens it. The same three-field shape as the account form, because it
+        is the same act — this is how a device that has no cable and no
+        shell is given a credential. */
+    mod.widgets.BucketPanel = set_type_default() do #(BucketPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "BUCKET" }
+            url_input := mod.widgets.SField {
+                empty_text: "https://<account>.r2.cloudflarestorage.com/<bucket>"
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
+        View { width: Fill, height: 7 }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "KEY ID" }
+            key_input := mod.widgets.SField {
+                empty_text: "access key id"
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
+        View { width: Fill, height: 7 }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "SECRET" }
+            secret_input := mod.widgets.SField {
+                is_password: true
+                // Never read back, only written: an empty field on a
+                // configured device means "keep the key you already have".
+                empty_text: "secret access key"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
+        View { width: Fill, height: 12 }
+        View {
+            width: Fill, height: Fit
+            View { width: Fill, height: 1 }
+            connect_btn := mod.widgets.SBtn { text: "connect" }
         }
     }
 
@@ -2538,11 +2601,16 @@ impl Widget for SettingsPanel {
         // the one control this panel has exactly one of.
         if let Event::KeyDown(k) = event {
             if k.modifiers.logo {
-                if k.key_code == KeyCode::KeyD {
+                let target = match k.key_code {
+                    KeyCode::KeyD => Some(crate::core::Kind::AddAccount),
+                    KeyCode::KeyY => Some(crate::core::Kind::Bucket),
+                    _ => None,
+                };
+                if let Some(target) = target {
                     let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
                     cx.action(PanelAction::FollowLink {
                         pid,
-                        target: crate::core::Kind::AddAccount,
+                        target,
                         dotted: false,
                         fresh: false,
                     });
@@ -2578,6 +2646,14 @@ impl Widget for SettingsPanel {
             crate::core::Kind::AddAccount,
             false,
             Some(ui::ACCEL_ADD_ACCOUNT),
+        );
+        self.view.link(cx, ids!(bucket_link)).set_accel(
+            cx,
+            pid,
+            "device sync",
+            crate::core::Kind::Bucket,
+            false,
+            Some(ui::ACCEL_DEVICE_SYNC),
         );
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = item.as_portal_list().borrow_mut() {
@@ -2736,6 +2812,137 @@ impl Widget for AddAccountPanel {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// BucketPanel
+// ---------------------------------------------------------------------------
+
+/// The device-sync form (CR-005). `AddAccountPanel`'s sibling in every
+/// respect but one: the secret field is write-only. It is seeded blank on a
+/// configured device too, because a key that can be read back off a screen is
+/// a key that leaves by a route nobody chose.
+#[derive(Script, ScriptHook, Widget)]
+pub struct BucketPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl BucketPanel {
+    fn inputs(&self, cx: &mut Cx) -> [TextInputRef; 3] {
+        [
+            self.view.text_input(cx, ids!(url_input)),
+            self.view.text_input(cx, ids!(key_input)),
+            self.view.text_input(cx, ids!(secret_input)),
+        ]
+    }
+
+    /// The tab ring in visual order: the fields, the connect button.
+    fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
+        let mut v: Vec<RingStop> = self.inputs(cx).into_iter().map(RingStop::Input).collect();
+        v.push(RingStop::Add(self.view.button(cx, ids!(connect_btn))));
+        v
+    }
+
+    fn submit(&mut self, cx: &mut Cx, pid: u64) {
+        let (url, key_id, secret) = self.form_values(cx);
+        cx.action(PanelAction::ConnectBucket {
+            pid,
+            url,
+            key_id,
+            secret,
+        });
+    }
+
+    /// The form's current values — the e2e bridge submits through the same
+    /// `PanelAction` the button emits.
+    pub fn form_values(&mut self, cx: &mut Cx) -> (String, String, String) {
+        let [url, key, secret] = self.inputs(cx);
+        (
+            url.text().trim().to_string(),
+            key.text().trim().to_string(),
+            secret.text(),
+        )
+    }
+
+    /// Seeds the two public fields from what this device is configured with
+    /// — the shell calls it once, when the widget is built. The secret is
+    /// never seeded.
+    pub fn prefill(&mut self, cx: &mut Cx, url: &str, key_id: &str) {
+        let [u, k, _] = self.inputs(cx);
+        u.set_text(cx, url);
+        k.set_text(cx, key_id);
+    }
+
+    /// Clears the secret after a successful connect (the shell calls this):
+    /// it is in the keychain now, and a form is not a place to keep one.
+    pub fn clear_secret(&mut self, cx: &mut Cx) {
+        let [_, _, secret] = self.inputs(cx);
+        secret.set_text(cx, "");
+    }
+}
+
+impl Widget for BucketPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+
+        // Tab walks the fields and the button; enter/space press it.
+        if let Event::KeyDown(k) = event {
+            if k.key_code == KeyCode::Tab {
+                let ring = self.ring(cx);
+                tab_ring(cx, &ring, k.modifiers.shift);
+                self.redraw(cx);
+            }
+            if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+                let btn = self.view.button(cx, ids!(connect_btn));
+                if cx.has_key_focus(btn.area()) {
+                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                    self.submit(cx, pid);
+                }
+            }
+        }
+
+        if let Event::Actions(actions) = event {
+            let [url, key, secret] = self.inputs(cx);
+            // A blurred field keeps no selection (the frameworks' norm).
+            for t in [&url, &key, &secret] {
+                if t.key_focus_lost(actions) {
+                    t.set_cursor(cx, t.cursor(), false);
+                }
+            }
+            // Enter advances; past the last field it submits.
+            if url.returned(actions).is_some() {
+                focus_input(cx, &key);
+            } else if key.returned(actions).is_some() {
+                focus_input(cx, &secret);
+            } else if secret.returned(actions).is_some()
+                || self.view.button(cx, ids!(connect_btn)).clicked(actions)
+            {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                self.submit(cx, pid);
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl BucketPanelRef {
+    /// Seeds the two public fields (once, at instantiation).
+    pub fn prefill(&self, cx: &mut Cx, url: &str, key_id: &str) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        p.prefill(cx, url, key_id);
+    }
+
+    /// Clears the secret field after a successful connect.
+    pub fn clear_secret(&self, cx: &mut Cx) {
+        let Some(mut p) = self.borrow_mut() else { return };
+        p.clear_secret(cx);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Suggest — the autocomplete any field hangs under itself

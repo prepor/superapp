@@ -61,6 +61,13 @@ create-only put and `If-Match: <etag>` is the compare-and-swap. The
 single-writer property rests on the object store, which is why it can be
 model-checked rather than hoped for.
 
+A device is given its bucket the way it is given a mailbox: from a panel with
+three fields, not from a command line. The secret goes to the platform's
+secret store (never the SQLite file, never a config file); the endpoint and
+key id go to a `bucket` file beside the store; the worker restarts onto them.
+That road exists because the device most in need of it — a phone — has no
+shell to run a flag from.
+
 The role drives the UI and the write gate together. A **holder** writes;
 everyone else is read-only and sees a **locked screen** — who holds the
 lease, and a button to take it. The holder hands the lease back on sleep and

@@ -126,6 +126,34 @@ fn env(name: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
+/// The access key id this device is configured with, for a form to show —
+/// never the secret, which is write-only by design.
+#[must_use]
+pub fn configured_key_id(dir: Option<&Path>) -> String {
+    env(ENV_KEY)
+        .or_else(|| from_file(dir).get(1).cloned())
+        .unwrap_or_default()
+}
+
+/// Where the `bucket` file lives beside a store.
+#[must_use]
+pub fn config_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("bucket")
+}
+
+/// The `bucket` file's contents for a URL and key id. The secret is
+/// deliberately **not** written: the form puts it in the platform's secret
+/// store instead, which is the whole reason the form exists. A file pushed by
+/// hand may still carry one on line 3 — this is what replaces it.
+#[must_use]
+pub fn config_bytes(url: &str, key_id: &str) -> Vec<u8> {
+    let mut out = format!("{}\n", url.trim());
+    if !key_id.trim().is_empty() {
+        out.push_str(&format!("{}\n", key_id.trim()));
+    }
+    out.into_bytes()
+}
+
 /// The bucket for a URL: `https://…` is R2 (signed, over TLS), anything else
 /// is the plain `bucketd` client. One door, so the app's start-up path does
 /// not branch on transports.
@@ -755,6 +783,21 @@ mod tests {
         // Refusals, both of them spoken.
         assert!(R2::new("http://acct.r2.cloudflarestorage.com/b", creds.clone()).is_err());
         assert!(R2::new("https://acct.r2.cloudflarestorage.com", creds).is_err());
+    }
+
+    /// The file the form writes: the URL, the key id, and no secret.
+    #[test]
+    fn the_config_file_never_carries_the_secret() {
+        assert_eq!(
+            String::from_utf8(config_bytes(" https://h/b ", " AK ")).unwrap(),
+            "https://h/b\nAK\n"
+        );
+        // No key id (the local daemon needs none): one line, and nothing
+        // that could be mistaken for one.
+        assert_eq!(
+            String::from_utf8(config_bytes("http://127.0.0.1:9000", "")).unwrap(),
+            "http://127.0.0.1:9000\n"
+        );
     }
 
     /// An S3 refusal carries its reason in XML; the status line says it.

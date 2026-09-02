@@ -175,7 +175,30 @@ one key can write the whole lineage. `--r2-login` needs the key id (from the
 environment or the file); it stores only the secret. Secrets never go in the
 store — same rule as mail passwords ([`src/secret.rs`]).
 
-On android, one file carries all three, pushed into the app's files dir:
+### 4. On android: the form, not the cable
+
+A phone has no environment, no shell and no keychain command. It has the
+**device-sync panel**: settings → *device sync* (`cmd+y` where there is a
+keyboard), three fields — the bucket URL, the access key id, the secret — and
+a *connect* button.
+
+What connect does is the whole point of the panel:
+
+- the **secret** goes to the platform's secret store — the macOS keychain, or
+  a private 0600 file beside the store on android — through the effect
+  boundary, so an e2e run writes to memory and never to a human's keychain;
+- the **URL and key id** are written to the `bucket` file beside the store,
+  and *only* those two: a file that carried a secret on line 3 is rewritten
+  without it;
+- the replication worker is restarted onto the new bucket — the lease handed
+  back first — so connecting takes effect without a relaunch.
+
+The secret field is write-only: it seeds blank on a configured device, because
+a key that can be read back off a screen is a key that leaves by a route
+nobody chose. Leaving it empty on a device that already has one keeps it.
+
+The file is still the way to *prefill* a device from a host, and the only way
+to hand one a secret without typing it:
 
 ```sh
 adb shell run-as dev.prepor.superapp sh -c 'cat > files/bucket' <<EOF
@@ -186,6 +209,8 @@ EOF
 ```
 
 (Blank lines and `#` comments are skipped, so the file can carry a note.)
+Open the panel once afterwards and press connect: the secret moves into the
+secret store and the file is rewritten without it.
 
 ### What it costs, and what it says when it fails
 
@@ -216,6 +241,13 @@ the same walk fast, asserting through label resolution instead of pixels).
 `bucketd` for a scripted walk (`e2e/sync-a.txt`, `e2e/sync-b.txt`). It needs
 a headless makepad event loop that pumps frames; where that is available it
 drives the passes on the virtual clock exactly like the mail engine.
+
+`e2e/bucket.sh` proves the panel: a device with **no** `--bucket` flag and no
+pushed file is pointed at a `bucketd` from inside the app — settings, the
+`cmd+y` link, the URL typed into the form, connect — and the assertions are
+outside the app, where a screenshot cannot lie about them: a one-line `bucket`
+file beside the store, and a lineage in the daemon's directory that only a
+holder ever writes.
 
 `e2e/reseed.sh` proves a subtler thing: a *running* follower whose open
 compose panel has a peer's draft edit materialized underneath it re-seeds the

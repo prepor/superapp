@@ -9,8 +9,9 @@
 # with pictures — while rasterizing nothing, and `shot` steps are skipped.
 # A failure here is a label that did not resolve: a real one.
 #
-# The device-sync suites are not here. They need a second device and a
-# bucketd between them; e2e/sync-demo.sh and e2e/reseed.sh drive those.
+# The device-sync suites are not here. They need a bucketd — and a second
+# device, or assertions made outside the app; e2e/sync-demo.sh, e2e/reseed.sh
+# and e2e/bucket.sh drive those.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -50,7 +51,7 @@ suite_draws() {
 names=()
 for f in e2e/*.txt; do
   n=$(basename "$f" .txt)
-  case "$n" in sync-a | sync-b | reseed-a | reseed-b) continue ;; esac
+  case "$n" in sync-a | sync-b | reseed-a | reseed-b | bucket) continue ;; esac
   names+=("$n")
   # shellcheck disable=SC2046 # word-splitting is how the extra args arrive
   "$BIN" --e2e "$f" --no-draw --draws "$(suite_draws "$n")" $(extra_args "$n") \
