@@ -171,10 +171,11 @@ Each hit carries one of two verbs, decided for you:
 There is never a second copy: an open panel absorbs its would-be duplicate
 (no "force a fresh copy" variant — deliberately). The empty query is the
 pure **switcher**: every open panel, the active workspace's first, roots
-beneath. Arrows pick, `enter` goes, `esc` (or another double-cmd, or a tap
-outside) dismisses; every row is clickable. A tap only counts as a tap:
-holding cmd for a chord, cmd+clicking, or overshooting ~350 ms between taps
-never summons it.
+beneath. Arrows pick (the list is a ring: past the last hit is the first),
+`enter` goes, `esc` (or another double-cmd, or a tap outside) dismisses;
+every row is clickable. The sheet is as tall as its hits; a query nothing
+answers says *nothing matches*. A tap only counts as a tap: holding cmd for
+a chord, cmd+clicking, or overshooting ~350 ms between taps never summons it.
 
 On desktop the launcher is also in the menu bar (*Launcher — ⌘ ⌘*); on touch
 it is the search row atop the workspaces overlay — tapping it flips the

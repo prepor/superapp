@@ -39,6 +39,14 @@ impl SpringParams {
         Self::new(1600.0, 1.0, 1e-4)
     }
 
+    /// The overlay chassis' presence (`k = 1200, ζ = 1`, ~200 ms): quicker
+    /// than a panel's movement, so a palette feels summoned rather than
+    /// animated, and slow enough that its rise reads as motion.
+    #[must_use]
+    pub fn overlay() -> Self {
+        Self::new(1200.0, 1.0, 1e-3)
+    }
+
     fn beta(&self) -> f64 {
         self.damping / (2.0 * MASS)
     }

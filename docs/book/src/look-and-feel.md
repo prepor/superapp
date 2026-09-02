@@ -29,5 +29,11 @@ header row, hairline rules between rows.
 niri's spring (`k=800, ζ=1`, closed-form, ~330 ms) drives every rect and the
 camera; retargeting preserves velocity, so chained motions keep momentum.
 Panels are born slightly inset and fade in; closed panels fade out as ghosts.
-Trackpad pans are 1:1 and deliberately not springed. The shell idles at zero
-frames — springs, not timers, request the next frame.
+The modal overlays — launcher, workspaces, history — ride one *presence*
+spring (`k=1200`, ~200 ms): the ink wash, the sheet and its rows fade in
+together while the sheet rises its last few points into place, and a close
+runs the same spring back. Their widget trees render to a texture and are
+composited at the spring's alpha, which is how a real text field, caret and
+all, fades as one surface. Trackpad pans are 1:1 and deliberately not
+springed. The shell idles at zero frames — springs, not timers, request the
+next frame.

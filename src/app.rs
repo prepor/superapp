@@ -611,12 +611,21 @@ struct Anim {
     slide: Option<Spring>,
     panels: HashMap<PanelId, PanelAnim>,
     ghosts: Vec<Ghost>,
+    /// The overlay chassis' presence, 0 (away) → 1 (up): the wash, the
+    /// sheet and its contents ride it together. Retargeted by `kick`, so
+    /// every overlay change animates.
+    overlay: Option<Spring>,
 }
 
 impl Anim {
     fn camera(&mut self) -> &mut Spring {
         self.camera
             .get_or_insert_with(|| Spring::at_rest(0.0, SpringParams::movement()))
+    }
+
+    fn overlay(&mut self) -> &mut Spring {
+        self.overlay
+            .get_or_insert_with(|| Spring::at_rest(0.0, SpringParams::overlay()))
     }
 
     fn slide(&mut self) -> &mut Spring {
@@ -685,6 +694,10 @@ impl Anim {
         if let Some(s) = self.slide.as_mut() {
             s.advance(dt);
             active |= !s.is_done();
+        }
+        if let Some(o) = self.overlay.as_mut() {
+            o.advance(dt);
+            active |= !o.is_done();
         }
         for pa in self.panels.values_mut() {
             pa.advance(dt);
@@ -765,6 +778,9 @@ struct State {
     /// wall's, so a toast fades by the same amount on every run.
     toast: Option<(String, bool, f64)>,
     overlay: Overlay,
+    /// The overlay most recently up — what a close fade keeps drawing
+    /// while the chassis' presence spring runs out.
+    overlay_last: Overlay,
     launcher: LauncherUi,
     /// A panel to reveal alongside focus on the next [`State::sync`], once.
     /// A preview opens without taking focus, so nothing else would pull the
@@ -860,6 +876,7 @@ impl State {
             hover: None,
             toast: None,
             overlay: Overlay::None,
+            overlay_last: Overlay::None,
             launcher: LauncherUi::default(),
             show_also: None,
         }
@@ -1426,6 +1443,10 @@ impl Stage {
             }
         }
         if let Some(state) = self.state.as_deref_mut() {
+            // Every overlay change passes through here too: point the
+            // chassis' presence spring at where the overlay now is.
+            let up = state.overlay != Overlay::None;
+            state.anim.overlay().retarget(if up { 1.0 } else { 0.0 });
             if !state.animating {
                 state.last_frame = Some(Instant::now());
                 state.animating = true;
@@ -1874,12 +1895,17 @@ impl Stage {
                         self.launcher_go(cx, hit);
                     }
                 }
+                // The hits are a ring: past the last is the first. The
+                // draw still clamps, against a list that shrank under
+                // the query.
                 KeyCode::ArrowDown => {
-                    state.launcher.sel += 1; // clamped against the hits on draw
+                    let n = state.launcher.hits.len();
+                    state.launcher.sel = if n == 0 { 0 } else { (state.launcher.sel + 1) % n };
                     self.kick(cx);
                 }
                 KeyCode::ArrowUp => {
-                    state.launcher.sel = state.launcher.sel.saturating_sub(1);
+                    let n = state.launcher.hits.len();
+                    state.launcher.sel = if n == 0 { 0 } else { (state.launcher.sel + n - 1) % n };
                     self.kick(cx);
                 }
                 _ => {
@@ -2106,14 +2132,21 @@ impl Stage {
 
     /// Double-cmd: raise the launcher, or put it away if it is already up.
     fn toggle_launcher(&mut self, cx: &mut Cx) {
-        let Some(state) = self.state.as_deref_mut() else {
-            return;
+        let opening = {
+            let Some(state) = self.state.as_deref_mut() else {
+                return;
+            };
+            if state.overlay == Overlay::Launcher {
+                state.overlay = Overlay::None;
+                false
+            } else {
+                state.launcher = LauncherUi::default();
+                state.overlay = Overlay::Launcher;
+                true
+            }
         };
-        if state.overlay == Overlay::Launcher {
-            state.overlay = Overlay::None;
-        } else {
-            state.launcher = LauncherUi::default();
-            state.overlay = Overlay::Launcher;
+        if opening {
+            self.refocus_launcher();
         }
         self.kick(cx);
     }
@@ -2121,14 +2154,30 @@ impl Stage {
     /// Raise the launcher idempotently — tapping its own field (or the menu
     /// item twice) must not reset a typed query.
     fn open_launcher(&mut self, cx: &mut Cx) {
-        let Some(state) = self.state.as_deref_mut() else {
-            return;
+        let opening = {
+            let Some(state) = self.state.as_deref_mut() else {
+                return;
+            };
+            let opening = state.overlay != Overlay::Launcher;
+            if opening {
+                state.launcher = LauncherUi::default();
+                state.overlay = Overlay::Launcher;
+            }
+            opening
         };
-        if state.overlay != Overlay::Launcher {
-            state.launcher = LauncherUi::default();
-            state.overlay = Overlay::Launcher;
+        if opening {
+            self.refocus_launcher();
         }
         self.kick(cx);
+    }
+
+    /// A launcher summoned back while its close fade still runs finds its
+    /// widget alive, so the draw that would seed the field and take the
+    /// keyboard for a fresh one never fires. Ask for it here instead.
+    fn refocus_launcher(&mut self) {
+        if self.hosted.contains_key(&OVERLAY_PID_L) {
+            self.pending_focus = Some(OVERLAY_PID_L);
+        }
     }
 
     /// Activate a hit: go to the panel wherever it lives, or open a fresh
@@ -4327,24 +4376,31 @@ impl Stage {
         }
 
         // The modal overlays share a chassis: an ink wash that owns every
-        // hit, a tap outside the rows dismisses. On top of it, either the
-        // workspaces list or the launcher.
-        if state.overlay != Overlay::None {
-            self.hits.clear();
+        // hit (a tap outside the sheet dismisses), and the sheet on it.
+        // The wash rides the chassis' presence spring, so it fades in and
+        // out with the sheet; only a live overlay takes the tap.
+        let up = state.overlay != Overlay::None;
+        let presence = state.anim.overlay().value();
+        if up || presence > 0.0 {
+            if up {
+                self.hits.clear();
+            }
             self.draw_flat.new_draw_call(cx);
-            self.draw_flat.color = rgba_a(theme::INK, 0.30);
+            self.draw_flat.color = rgba_a(theme::INK, 0.30 * presence);
             self.draw_flat.draw_abs(cx, vp);
-            self.hits.push(HitR {
-                rect: vp,
-                act: Act::OverlayClose,
-                cursor: MouseCursor::Default,
-                label: match state.overlay {
-                    Overlay::Ws => "workspaces",
-                    Overlay::History => "history",
-                    _ => "launcher",
-                }
-                .into(),
-            });
+            if up {
+                self.hits.push(HitR {
+                    rect: vp,
+                    act: Act::OverlayClose,
+                    cursor: MouseCursor::Default,
+                    label: match state.overlay {
+                        Overlay::Ws => "workspaces",
+                        Overlay::History => "history",
+                        _ => "launcher",
+                    }
+                    .into(),
+                });
+            }
         }
 
         // The overlays are retained widgets now (CR-002 F): the shell
@@ -4539,21 +4595,36 @@ impl Stage {
     /// controls — the shell owns their clicks: real presses and scripted
     /// ones resolve through the same `Act`s the char grid used, and the
     /// widget is presentation plus (for the launcher) a real text field.
+    ///
+    /// The chassis' presence — wash, sheet, contents — rides one spring,
+    /// 0 (away) → 1 (up): an open rises in, a close fades out with the
+    /// last overlay still drawn, hit-less, until the spring has run out.
+    /// Only then does its widget go, so the next opening starts clean
+    /// (the launcher's field seeds and takes focus on the frame its
+    /// widget is created).
     fn draw_overlay(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
-        use crate::panels::{OverlayProps, OverlayRowData};
-        if state.overlay == Overlay::None {
-            // Each opening starts clean: the launcher's field seeds and
-            // takes focus only on the frame its widget is created.
+        use crate::panels::{OverlayProps, OverlayRowData, OVERLAY_ROW_H};
+        let live = state.overlay != Overlay::None;
+        state.anim.overlay().retarget(if live { 1.0 } else { 0.0 });
+        let p = state.anim.overlay().value();
+        if !state.anim.overlay().is_done() {
+            self.next_frame = cx.new_next_frame();
+        }
+        if live {
+            state.overlay_last = state.overlay;
+        } else if p <= 0.0 {
             self.hosted.remove(&OVERLAY_PID_R);
             self.hosted.remove(&OVERLAY_PID_L);
             return;
         }
-        let launcher = state.overlay == Overlay::Launcher;
+        let kind = if live { state.overlay } else { state.overlay_last };
+        let launcher = kind == Overlay::Launcher;
+        let hover = state.hover.clone();
         // Rows, plus the Act each one resolves to.
         let mut acts: Vec<Act> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         let mut rows: Vec<OverlayRowData> = Vec::new();
-        match state.overlay {
+        match kind {
             Overlay::Ws => {
                 for k in state.ws.roster() {
                     let ws = &state.ws.wss[k];
@@ -4573,6 +4644,7 @@ impl Stage {
                         num: format!("{}", k + 1),
                         main: summary,
                         current: k == state.ws.active,
+                        hovered: hover == Some(Act::WsRow(k)),
                         ..Default::default()
                     });
                     acts.push(Act::WsRow(k));
@@ -4596,6 +4668,7 @@ impl Stage {
                         },
                         current: n.id == head,
                         muted: n.state != "applied" && n.state != "expired",
+                        hovered: hover == Some(Act::HistoryRow(n.id)),
                         ..Default::default()
                     });
                     acts.push(Act::HistoryRow(n.id));
@@ -4604,6 +4677,7 @@ impl Stage {
                 rows.push(OverlayRowData {
                     main: "the beginning".into(),
                     current: head == 0,
+                    hovered: hover == Some(Act::HistoryRow(0)),
                     ..Default::default()
                 });
                 acts.push(Act::HistoryRow(0));
@@ -4627,6 +4701,7 @@ impl Stage {
                             None => "new".into(),
                         },
                         current: i == state.launcher.sel,
+                        hovered: hover == Some(Act::LauncherRow(i)),
                         ..Default::default()
                     });
                     acts.push(Act::LauncherRow(i));
@@ -4636,15 +4711,17 @@ impl Stage {
             Overlay::None => return,
         }
 
-        // A centred column, the width the char grid used. The workspaces
-        // overlay reserves its first band for the search row — the
-        // launcher's entry on glass, which the shell draws.
-        let w = (vp.size.x - 4.0 * theme::GAP).min(if launcher { 520.0 } else { 560.0 });
+        // A centred sheet, hung a little below the top edge — a palette,
+        // not a toolbar — that rises its last few points into place as it
+        // fades in, and is as tall as its rows, up to the viewport. The
+        // workspaces overlay reserves a band above it for the search row:
+        // the launcher's entry on glass, which the shell draws.
+        let w = (vp.size.x - 4.0 * theme::GAP).min(560.0);
         let x = vp.pos.x + (vp.size.x - w) / 2.0;
-        let top = vp.pos.y + 2.0 * theme::GAP;
-        let search_h = if state.overlay == Overlay::Ws { 48.0 } else { 0.0 };
-        let h = (vp.size.y - 4.0 * theme::GAP - search_h).max(80.0);
-        let r = rect(x, top + search_h, w, h);
+        let rise = (1.0 - p) * -12.0;
+        let top = vp.pos.y + (vp.size.y * 0.14).max(2.0 * theme::GAP) + rise;
+        let search_h = if kind == Overlay::Ws { 48.0 } else { 0.0 };
+        let bottom = vp.pos.y + vp.size.y - 2.0 * theme::GAP;
 
         let tpl = if launcher {
             live_id!(launcher_overlay_tpl)
@@ -4666,13 +4743,57 @@ impl Stage {
                 .as_launcher_overlay()
                 .scroll_to(cx, state.launcher.sel);
         }
+
+        // Fit height: the field and its rule (measured — the field's own
+        // Fit walk knows; a guess serves the frame it is born on, at an
+        // alpha nobody sees), the rows or the launcher's empty-state row,
+        // and the frame.
+        let field_h = if launcher {
+            let fh = widget.widget(cx, ids!(query_input)).area().rect(cx).size.y;
+            if fh > 0.0 {
+                fh + 1.0
+            } else {
+                50.0
+            }
+        } else {
+            0.0
+        };
+        let n = rows.len().max(usize::from(launcher)) as f64;
+        let h = (2.0 + field_h + n * OVERLAY_ROW_H).min((bottom - top - search_h).max(80.0));
+        let r = rect(x, top + search_h, w, h);
+
+        // The sheet: white, ink-framed, fading with the chassis. Its own
+        // draw call — the shader is the panel chrome's too, and a merged
+        // call would paint under the wash (CR-002's sixth defect).
+        self.draw_panel.new_draw_call(cx);
+        self.draw_panel.color = rgba_a(theme::BG, 1.0);
+        self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
+        self.draw_panel.border_size = 1.0;
+        self.draw_panel.alpha = p as f32;
+        self.draw_panel.draw_abs(cx, r);
+        // The workspaces overlay's search row: a card above the roster.
+        let sr = rect(x, top, w, 40.0);
+        if kind == Overlay::Ws {
+            self.draw_panel.draw_abs(cx, sr);
+            self.draw_mono.new_draw_call(cx);
+            self.set_text(Style::Muted, p);
+            self.draw_mono.draw_abs(
+                cx,
+                dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
+                "search",
+            );
+        }
+
+        // The widget, inside the frame, composited at the chassis' alpha.
         let props = OverlayProps {
             rows,
             query: state.launcher.query.clone(),
+            alpha: p as f32,
         };
         let mut scope = Scope::with_props(&props);
+        let inner = rect(r.pos.x + 1.0, r.pos.y + 1.0, r.size.x - 2.0, r.size.y - 2.0);
         cx.begin_turtle(
-            Walk::abs_rect(r),
+            Walk::abs_rect(inner),
             Layout {
                 clip_x: true,
                 clip_y: true,
@@ -4681,6 +4802,11 @@ impl Stage {
         );
         widget.draw_all(cx, &mut scope);
         cx.end_turtle();
+
+        // A closing overlay takes no clicks.
+        if !live {
+            return;
+        }
 
         // The rows that actually drew become hits, above the backdrop's
         // close-everything rect.
@@ -4713,31 +4839,13 @@ impl Stage {
                     label: "search".into(),
                 });
             }
-        } else if state.overlay == Overlay::Ws {
-            // The workspaces overlay's search row is the launcher's entry
-            // on glass: a card above the roster, drawn by the shell.
-            let sr = rect(x, top, w, 40.0);
-            {
-                self.draw_panel.new_draw_call(cx);
-                self.draw_panel.color = rgba_a(theme::BG, 1.0);
-                self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
-                self.draw_panel.border_size = 1.0;
-                self.draw_panel.alpha = 1.0;
-                self.draw_panel.draw_abs(cx, sr);
-                self.draw_mono.new_draw_call(cx);
-                self.set_text(Style::Muted, 1.0);
-                self.draw_mono.draw_abs(
-                    cx,
-                    dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
-                    "search",
-                );
-                self.hits.push(HitR {
-                    rect: sr,
-                    act: Act::LauncherOpen,
-                    cursor: MouseCursor::Hand,
-                    label: "search".into(),
-                });
-            }
+        } else if kind == Overlay::Ws {
+            self.hits.push(HitR {
+                rect: sr,
+                act: Act::LauncherOpen,
+                cursor: MouseCursor::Hand,
+                label: "search".into(),
+            });
         }
     }
 
