@@ -226,8 +226,11 @@ and measured cell metrics to stderr.
 ## Panels library
 
 In the app, **Dev → Panels Library** (⇧⌘L) puts the library up over the
-workspace and takes it down again; the workspace underneath keeps its
-store, sync and script running. From the command line:
+workspace and takes it down again — the chord works from the canvas as
+well as from the workspace; the workspace underneath keeps its store, sync
+and script running. A window opened on the library carries the Dev menu
+from the start, and the workspace boots the first time the toggle asks for
+it. From the command line:
 
 ```sh
 # open on the library — every scene of the catalogue, live, on one canvas

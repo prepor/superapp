@@ -1919,6 +1919,26 @@ fn draft_subject(store: &Store, panel: i64) -> String {
         .unwrap_or_else(|| "(no subject)".into())
 }
 
+/// The menu bar of a window opened on the library: the Dev menu alone,
+/// until the workspace boots and the stage builds the full set.
+fn dev_menu(cx: &mut Cx) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    cx.update_macos_menu(MacosMenu::Main {
+        items: vec![MacosMenu::Sub {
+            name: "Dev".into(),
+            items: vec![MacosMenu::Item {
+                command: LiveId(MENU_LIBRARY),
+                key: KeyCode::Unknown,
+                shift: true,
+                enabled: true,
+                name: "Panels Library — ⇧⌘L".into(),
+            }],
+        }],
+    });
+}
+
 /// The overlays are hosted like panels, so they need keys in the same map.
 /// Panel ids are workspace-tagged (`k << 32`) and allocated upward, so the
 /// top of the range is free forever.
@@ -6991,8 +7011,14 @@ impl AppMain for App {
         self.match_event(cx, event);
         match event {
             // Opened on the library: it is up from the first frame, and the
-            // workspace stays unbooted until the toggle asks for it.
-            Event::Startup if library_filter().is_some() => self.show_library(cx, true),
+            // workspace stays unbooted until the toggle asks for it. The
+            // menu bar gets the Dev menu now — the stage that usually builds
+            // the menus has not booted, and without it the toggle would have
+            // no item to live in.
+            Event::Startup if library_filter().is_some() => {
+                dev_menu(cx);
+                self.show_library(cx, true);
+            }
             Event::Actions(actions)
                 if actions
                     .iter()
