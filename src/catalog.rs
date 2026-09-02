@@ -968,101 +968,29 @@ fn marks_bar() -> Scene<Setup> {
 }
 
 fn inbox_marks() -> Scene<Setup> {
-    let r = |who: &[&str], topic: &str, unread: bool, n: i64, cursor: bool, marked: bool| {
-        DraftRow {
-            head: head(who, topic, unread, n),
-            cursor,
-            marked,
-        }
-    };
-    let full = || {
-        vec![
-            r(&["GitHub"], "[stelaxis] CI failed on main", true, 6, false, true),
-            r(&["Elena Petrova"], "Sat hike", false, 1, true, false),
-            r(&["me", "Elena", "Vera"], "Q3 infra", true, 4, false, true),
-            r(&["Max Weber"], "Invoice #2041", false, 1, false, false),
-            r(&["GitHub"], "[stelaxis] CI passed on main", false, 1, false, true),
-            r(&["Vera Kovac"], "Panel model notes", false, 2, false, false),
-            r(&["Fastmail"], "Your weekly digest", false, 1, false, false),
-        ]
-    };
-    let still = |filter: &'static str,
-                 bar: Option<DraftBar>,
-                 hidden: Vec<mail::ThreadHead>,
-                 rows: Vec<DraftRow>| {
-        widget(live_id!(inbox_draft_tpl), move |cx, w| {
-            w.as_inbox_draft().populate(cx, filter, bar, &hidden, &rows);
-        })
-    };
-    let three = DraftBar {
-        marked: 3,
-        total: 143,
-        hidden: 0,
-    };
+    let inbox = |script: &str| panel(|_| Kind::Inbox { filter: None }, script);
+    // The walk that marks: onto the first row, space on it, then a
+    // shift+↓ range over the two under it — three marks, the cursor left
+    // standing on the last of them.
+    let three = "click \"inbox\"\nwait 200\nkey down\nwait 300\ntype \" \"\nwait 300\nkey shift+down 2\nwait 400";
+    let filtered =
+        format!("{three}\nkey /\nwait 300\ntype \"vera\"\nwait 300\nkey enter\nwait 600");
+    let all = format!("{three}\nclick \"mark all\"\nwait 500");
     Scene::new("inbox, marked", (520.0, 640.0))
-        .note("The inbox with marks (CR-009), as stills: the bar under the filter, the marked rows' bars, the cursor still walking.")
-        .note("Filtering never drops a mark: the marked rows the filter hides sit above the rows, under their own caption.")
-        .node(
-            "none",
-            still(
-                "",
-                None,
-                Vec::new(),
-                full()
-                    .into_iter()
-                    .map(|mut x| {
-                        x.marked = false;
-                        x
-                    })
-                    .collect(),
-            ),
-        )
-        .about("no mark, no bar: the inbox as it is")
-        .node("three", still("", Some(three), Vec::new(), full()))
-        .about("space on the cursor row marked it; the cursor walked on")
-        .node(
-            "filtered",
-            still(
-                "github",
-                Some(DraftBar {
-                    marked: 3,
-                    total: 2,
-                    hidden: 1,
-                }),
-                vec![head(&["me", "Elena", "Vera"], "Q3 infra", true, 4)],
-                vec![
-                    r(&["GitHub"], "[stelaxis] CI failed on main", true, 6, true, true),
-                    r(&["GitHub"], "[stelaxis] CI passed on main", false, 1, false, true),
-                ],
-            ),
-        )
-        .about("the mark the filter hides, kept in sight — a batch verb never acts on what cannot be seen")
-        .node(
-            "all",
-            still(
-                "",
-                Some(DraftBar {
-                    marked: 143,
-                    total: 143,
-                    hidden: 0,
-                }),
-                Vec::new(),
-                full()
-                    .into_iter()
-                    .map(|mut x| {
-                        x.marked = true;
-                        x
-                    })
-                    .collect(),
-            ),
-        )
-        .about("⌘l marked every row under the filter, not just the loaded ones")
-        .node("phone", still("", Some(three), Vec::new(), full()))
+        .note("The inbox with marks (CR-009): the bar under the filter, an ink bar down every marked row, the cursor walking on.")
+        .note("Filtering never drops a mark: the ones it hides ride above the rows, under their own caption.")
+        .note("Live — space marks, shift+↓ ranges, all takes the rest; with nothing marked the list is the inbox scene's fresh.")
+        .node("three", inbox(three))
+        .about("space marked the cursor's row, shift+↓ the two under it")
+        .node("filtered", inbox(&filtered))
+        .about("the two the filter hides, kept in sight above the rows")
+        .node("all", inbox(&all))
+        .about("every row the filter shows, loaded or not; the button stands down")
+        .node("phone", inbox(three))
         .sized((380.0, 720.0))
-        .about("the verbs wrap under the count")
-        .edge("none", "three", "space ×3")
-        .edge("three", "filtered", "/ github")
-        .edge("three", "all", "⌘l")
+        .about("the phone's width: the verbs drop under the count")
+        .edge("three", "filtered", "/ vera")
+        .edge("three", "all", "⌘l / all")
 }
 
 fn message() -> Scene<Setup> {

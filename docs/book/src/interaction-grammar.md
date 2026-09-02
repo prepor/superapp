@@ -376,7 +376,10 @@ so one `cmd+z` takes back the filing and the move together;
 undoing an open makes every mail it read unread again, and none other.
 A batch verb is one node as well: archiving twelve marked conversations
 files every inbox mail of every one of them under a single `archive 12
-conversations`, and undoing it brings the rows back **marked**.
+conversations`, and undoing it brings the rows back **marked**. A batch
+carries the cursor the same way, but only when the cursor's own row went
+with it; standing on a row that stayed, the cursor does not move and
+nothing new is previewed.
 Undo also puts you back where the action happened (its workspace and focus
 revert with it). `cmd+shift+z` re-applies.
 

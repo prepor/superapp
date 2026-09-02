@@ -171,7 +171,7 @@ exit non-zero.
 ```text
 wait 600            # ms
 shot inbox          # e2e/out/inbox.png
-click "reply"       # label substring, case-insensitive
+click "reply"       # by label, case-insensitive and ranked (below)
 cmdclick "Q3"       # cmd held: fresh un-joined panel
 mouse "filter"      # the same through the shell's real mouse-down path
 key cmd+shift+left  # chords; plain letters flow as text, like real typing
@@ -267,7 +267,14 @@ the assertion to reach for; drag-select itself belongs to a real mouse or
 `e2e/cgpost.c`.
 
 Labels address links, buttons, fields (`filter`, `to`, `subject`, `body`),
-rows (by subject) and panel titles. Steps that mutate the workspace need a
+rows (by subject) and panel titles. A label is matched **ranked** rather
+than as a plain substring: a whole-label match first, then one that
+*starts* with what was asked, then one that merely contains it — the
+tightest label winning inside a rung, and the last registered on a full
+tie, so a control drawn over another takes the click exactly as it would
+from a pointer. That is what lets a row and the gutter over it coexist:
+`click "Q3 infra"` is the row, `click "mark Q3 infra"` its mark (CR-009).
+Steps that mutate the workspace need a
 `wait` after them — hits refresh on the next drawn frame. `e2e/basic.txt`
 walks the whole join/replace grammar; the first frame also logs panel count
 and measured cell metrics to stderr.

@@ -4,7 +4,8 @@ Status: **implemented** (Andrey, 2026-09-02: stelaxis's rich table had batch
 selection and batch actions before UI v2 — the same functionality for our
 rich tables, with a UI of our own). The surface was drafted in the panels
 library first — the scenes *inbox row* (its `marked` states), *marks bar*
-and *inbox, marked* — and the first two now populate the real widgets.
+and *inbox, marked* — and all three show the real thing now: two widgets
+populated from fixtures, and the inbox panel itself, live.
 
 ## Why
 
@@ -193,13 +194,15 @@ shoots it):
 - **marks bar** — `three` (of 143), `hidden` (a mark the filter hides,
   counted and said), `all` (the button stands down), `narrow` (the phone's
   width, the verbs wrapped).
-- **inbox, marked** — the inbox as stills: `none` (no mark, no bar — the
-  list as it is today), `three`, `filtered` (the hidden section over two
-  matches), `all`, `phone`.
+- **inbox, marked** — the inbox panel on a world of its own, each node a
+  few harness steps that mark rows: `three` (space, then a shift+↓ range),
+  `filtered` (`/ vera`, the two marks it hides pinned above the rows),
+  `all` (the button stands down), `phone` (the verbs wrapped). No node for
+  the unmarked list: that is the *inbox* scene's `fresh`.
 
-The stills are a composite widget with fixed slots (`InboxDraft`), no store
-behind it. It is scaffolding for this review and goes when the inbox panel
-draws the real thing.
+The stills are gone with the draft — the composite widget with fixed slots
+(`InboxDraft`) that stood in for the panel while it could not draw marks,
+and every trace of it.
 
 ## Findings
 

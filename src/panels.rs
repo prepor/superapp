@@ -1310,67 +1310,6 @@ script_mod! {
         verbs_below := mod.widgets.MarkVerbs { visible: false }
     }
 
-    /** The inbox with marks, as a still (CR-009's draft): the filter, the
-        marks bar, the header; then the marked rows the filter hides under
-        their own caption and a strong rule, and the rows. Static slots and
-        no store — a picture for the library, populated with fixtures. */
-    mod.widgets.InboxDraft = set_type_default() do #(InboxDraft::register_widget(vm)) {
-        ..mod.widgets.View
-        width: Fill, height: Fill
-        flow: Down
-        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
-        spacing: 0
-        filter_input := mod.widgets.SField {
-            width: Fill
-            empty_text: "filter…  ( / )   @ for tags"
-        }
-        bar := mod.widgets.MarkBar {}
-        View { width: Fill, height: 6 }
-        View {
-            width: Fill, height: Fit
-            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
-            View {
-                width: Fill, height: Fit
-                mod.widgets.SSection { padding: 0, text: "FROM" }
-            }
-            mod.widgets.SSection { padding: 0, width: Fit, text: "DATE" }
-        }
-        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #141414 } }
-        hidden := View {
-            width: Fill, height: Fit
-            flow: Down
-            // The caption wears the rows' inset the way the header does,
-            // so it starts where their text starts.
-            View {
-                width: Fill, height: Fit
-                padding: Inset{left: 8, right: 8, top: 6, bottom: 2}
-                mod.widgets.SSection { padding: 0, text: "MARKED · HIDDEN BY THE FILTER" }
-            }
-            h0 := mod.widgets.InboxRow {}
-            h1 := mod.widgets.InboxRow {}
-            // The strong rule closing the group. Its own pixel fn, or the
-            // quad merges into a call under the panel (CR-002's sixth
-            // defect) and never shows.
-            View {
-                width: Fill, height: 1
-                show_bg: true
-                draw_bg +: {
-                    color: #141414
-                    pixel: fn() {
-                        return vec4(self.color.xyz * self.color.w, self.color.w)
-                    }
-                }
-            }
-        }
-        r0 := mod.widgets.InboxRow {}
-        r1 := mod.widgets.InboxRow {}
-        r2 := mod.widgets.InboxRow {}
-        r3 := mod.widgets.InboxRow {}
-        r4 := mod.widgets.InboxRow {}
-        r5 := mod.widgets.InboxRow {}
-        r6 := mod.widgets.InboxRow {}
-    }
-
     /** The inbox: the filter over the header over the virtualized list —
         a rich table (CR-006) over `mail::INBOX`. */
     mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
@@ -2202,6 +2141,22 @@ script_mod! {
             mod.widgets.SLabel { text: "          arrows walk the rows" }
         }
         mod.widgets.SRow {
+            mod.widgets.SLabel { text: "          " }
+            mod.widgets.SKbd { text: "space" }
+            mod.widgets.SLabel { text: " marks  " }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SLabel { text: "+arrows a range" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SLabel { text: "  marked  " }
+            mod.widgets.SKbd { text: "cmd+a" }
+            mod.widgets.SLabel { text: "rchive " }
+            mod.widgets.SKbd { text: "cmd+d" }
+            mod.widgets.SLabel { text: "elete a" }
+            mod.widgets.SKbd { text: "cmd+l" }
+            mod.widgets.SLabel { text: "l" }
+        }
+        mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "clicking a row, or walking onto it, opens the thread beside the list without leaving it — and that preview lends the list its own keys" }
         }
         mod.widgets.SRow {
@@ -2209,7 +2164,7 @@ script_mod! {
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "esc" }
-            mod.widgets.SLabel { text: " leaves a text field" }
+            mod.widgets.SLabel { text: " leaves a text field, or clears the marks" }
         }
         mod.widgets.SRow {
             mod.widgets.SLabel { width: Fill, text: "trackpad: scroll the strip and the panels" }
@@ -3788,91 +3743,6 @@ impl MarkBarRef {
             .map(|(t, _, _)| t.chars().count() as f64 * label + 20.0 + 8.0)
             .sum();
         b.need = 16.0 + text + 8.0 + 4.0 + 8.0 + btns;
-    }
-}
-
-/// One row of the draft: the head, whether the cursor stands on it, and
-/// whether it is marked.
-pub struct DraftRow {
-    pub head: mail::ThreadHead,
-    pub cursor: bool,
-    pub marked: bool,
-}
-
-/// The bar's numbers: marked of total under the filter, and how many of
-/// the marked the filter hides.
-#[derive(Clone, Copy)]
-pub struct DraftBar {
-    pub marked: usize,
-    pub total: usize,
-    pub hidden: usize,
-}
-
-#[derive(Script, ScriptHook, Widget)]
-pub struct InboxDraft {
-    #[source]
-    source: ScriptObjectRef,
-    #[deref]
-    view: View,
-}
-
-impl Widget for InboxDraft {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.view.draw_walk(cx, scope, walk)
-    }
-}
-
-impl InboxDraftRef {
-    /// The still: the filter's text, the bar (none for an empty set), the
-    /// marked rows the filter hides, then the rows under the filter. The
-    /// slots are fixed — two hidden, seven rows — and the rest stand down.
-    pub fn populate(
-        &self,
-        cx: &mut Cx,
-        filter: &str,
-        bar: Option<DraftBar>,
-        hidden: &[mail::ThreadHead],
-        rows: &[DraftRow],
-    ) {
-        let Some(d) = self.borrow() else { return };
-        d.view
-            .text_input(cx, ids!(filter_input))
-            .set_text(cx, filter);
-        let b = d.view.widget(cx, ids!(bar));
-        if let Some(n) = bar {
-            b.as_mark_bar().populate(cx, n.marked, n.total, n.hidden);
-        }
-        b.set_visible(cx, bar.is_some());
-        d.view
-            .widget(cx, ids!(hidden))
-            .set_visible(cx, !hidden.is_empty());
-        for (i, id) in [ids!(hidden.h0), ids!(hidden.h1)].into_iter().enumerate() {
-            let w = d.view.widget(cx, id);
-            if let Some(h) = hidden.get(i) {
-                w.as_inbox_row().populate(cx, h, false, true);
-            }
-            w.set_visible(cx, hidden.get(i).is_some());
-        }
-        let slots = [
-            ids!(r0),
-            ids!(r1),
-            ids!(r2),
-            ids!(r3),
-            ids!(r4),
-            ids!(r5),
-            ids!(r6),
-        ];
-        for (i, id) in slots.into_iter().enumerate() {
-            let w = d.view.widget(cx, id);
-            if let Some(r) = rows.get(i) {
-                w.as_inbox_row().populate(cx, &r.head, r.cursor, r.marked);
-            }
-            w.set_visible(cx, rows.get(i).is_some());
-        }
     }
 }
 

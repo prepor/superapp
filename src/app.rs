@@ -463,7 +463,6 @@ script_mod! {
                         problem_row_tpl := mod.widgets.ProblemRow{}
                         files_row_tpl := mod.widgets.FilesRow{}
                         mark_bar_tpl := mod.widgets.MarkBar{}
-                        inbox_draft_tpl := mod.widgets.InboxDraft{}
                         stage_tpl := Stage{
                             settings_tpl := mod.widgets.SettingsPanel{}
                             add_account_tpl := mod.widgets.AddAccountPanel{}
@@ -5189,21 +5188,17 @@ impl Stage {
             TouchMode::Idle => {}
             _ => return,
         }
-        // A long press on a row marks it (CR-009): the phone's way in. From
-        // then on taps toggle, until the last mark is cleared.
+        // A long press on a row marks it (CR-009): the pointer has no way
+        // in, so this is the phone's. From then on taps toggle, until the
+        // last mark is cleared.
         if let Some(Act::WidgetOp(pid, WidgetOp::OpenRow(Kind::Message { id }))) =
             self.hit_at(p).map(|h| h.act.clone())
         {
             let th = self
                 .state
                 .as_deref()
-                .and_then(|s| mail::thread_of(&s.store, id))
-                .map(|th| (pid, th)),
-            Some(Act::WidgetOp(pid, WidgetOp::Mark(th))) => Some((pid, th)),
-            _ => None,
-        };
-        if let Some((pid, th)) = row {
-            if let Some(w) = self.hosted.get(&pid).cloned() {
+                .and_then(|s| mail::thread_of(&s.store, id));
+            if let (Some(th), Some(w)) = (th, self.hosted.get(&pid).cloned()) {
                 w.as_inbox_panel().toggle_mark(cx, th);
                 self.touch.mode = TouchMode::Idle;
                 self.kick(cx);
