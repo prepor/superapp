@@ -288,8 +288,9 @@ scaled.
   pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
 - **Enter** a node with a click (on it, or its name): the camera flies to
   1:1 and the keyboard and pointer go to that mount, remapped into its own
-  coordinates. Click outside it, or ⌘esc, to leave. A scene's name fits
-  its block.
+  coordinates. An entered node runs on the wall clock, like the app;
+  replays and headless runs keep the fixed frame step. Click outside it,
+  or ⌘esc, to leave. A scene's name fits its block.
 - The legend along the bottom spells all of it out.
 
 `e2e/library.txt` drives the canvas itself: `wait`, `shot`, `click` on a

@@ -4893,16 +4893,37 @@ impl Widget for Stage {
                 // FRAME_MS, and the run keeps the loop turning by asking
                 // for the next frame every time. No wall clock anywhere.
                 //
-                // A mount replaying its story fast-forwards: a pending
-                // `wait` is consumed whole, so a node reaches its shot in
+                // A mount replaying its steps fast-forwards: a pending
+                // `wait` is consumed whole, so a node reaches its state in
                 // as many frames as it has steps rather than as many as it
-                // has milliseconds. An entered mount keeps its clock moving
-                // a frame at a time, so its toasts fade and its deadlines
-                // pass; every other mount stands still at its shot.
+                // has milliseconds. An entered mount keeps its clock moving,
+                // so its toasts fade and its deadlines pass; every other
+                // mount stands still at its state.
+                //
+                // Entered in a window, a mount is worked by hand: it ticks
+                // on the wall clock like the window's own stage, so a late
+                // frame skips ahead instead of stretching every spring —
+                // on frames, a slow frame is slow motion. Replays and
+                // headless runs keep the fixed step: that is what makes
+                // them reproducible.
                 let virtual_time = self.state.as_deref().is_some_and(|s| s.virtual_time);
+                let by_hand =
+                    !cfg!(headless) && self.mount && self.active && self.e2e.is_none();
                 let ticking =
                     virtual_time && (self.e2e.is_some() || (self.mount && self.active));
                 let mut dt_ms = FRAME_MS;
+                if by_hand {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        let now = Instant::now();
+                        dt_ms = state
+                            .last_frame
+                            .map(|t| (now - t).as_secs_f64())
+                            .unwrap_or(1.0 / 60.0)
+                            .clamp(0.0, 1.0 / 20.0)
+                            * 1000.0;
+                        state.last_frame = Some(now);
+                    }
+                }
                 if ticking {
                     if self.mount && self.e2e.is_some() {
                         dt_ms = self.replay_step(cx);
