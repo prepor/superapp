@@ -302,14 +302,16 @@ it — roots left, a fan-out stacked in a column, arrows with elbows.
 A node is one of three things:
 
 - a **component** — a bare widget (an inbox row, a thread message, an
-  overlay row, the launcher sheet, an account row, a problem row, a link)
-  from the library's template, populated once with a fixture through its
-  own API.
-  No store, no clock; a texture the size of the piece.
+  overlay row, the launcher sheet, an account row, a problem row, an effect
+  row, a link) from the library's template, populated once with a fixture
+  through its own API. No store, no clock; a texture the size of the piece.
 - a **panel** — one panel widget on a world of its own (an in-memory store
   with the demo seed, a sealed `Deny` outside, virtual time), chrome
   included: the stage comes up *solo* on that panel and draws it at the
-  whole viewport. Enter it and the keys work — the walk, ⌘a, ⌘z.
+  whole viewport. Enter it and the keys work — the walk, ⌘a, ⌘z. A subject
+  the demo seed does not cover plants its own rows on the way up: the
+  effect log's scene files five real jobs, in states the executor will not
+  revisit, so the queue it shows stands still while it is read.
 - the **workspace** — the whole stage, kept for the shell's own subjects:
   joins, tabs, the phone grid.
 
@@ -321,9 +323,9 @@ within a few seconds, and stderr reports when the last node arrives.
 Components are their state from the first draw.
 
 Scenes are Rust, not a text file: fixtures are the real structs
-(`ThreadHead`, `ThreadMail`, `OverlayRowData`…) and a state is set through
-the widget's own methods, so a refactor that breaks a scene fails to
-compile rather than quietly rearranging the canvas. The catalogue's test
+(`ThreadHead`, `ThreadMail`, `OverlayRowData`, `mail::Move`…) and a state is
+set through the widget's own methods, so a refactor that breaks a scene
+fails to compile rather than quietly rearranging the canvas. The catalogue's test
 checks that every scene is a DAG with a name per state; the shape and the
 layout are pure (`src/scene.rs`), unit-tested without a window. Adding a
 state is one line in its subject's function.

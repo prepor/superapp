@@ -33,7 +33,11 @@ use crate::store::Store;
 
 /// Sets a component's state through its own API, once, when it mounts.
 pub type Populate = Rc<dyn Fn(&mut Cx, &WidgetRef)>;
-/// The kind a solo stage opens on, resolved against its seeded store.
+/// The kind a solo stage opens on, resolved against its seeded store — and
+/// the one place a node may put something *into* that store. A subject the
+/// demo seed does not cover plants its own rows here: the effect queue is
+/// written by the executor and seeded by nobody, so a log with anything in
+/// it is a log a node wrote (see [`plant_queue`]).
 pub type Open = Rc<dyn Fn(&Store) -> Kind>;
 
 /// How a node comes up.
@@ -178,6 +182,160 @@ fn account(email: &str, host: Option<&str>, status: Option<&str>) -> mail::Accou
     }
 }
 
+/// A job planted into a log node's store, as the executor would have left
+/// it. Only states the executor will not revisit are used — the terminal
+/// ones, and a `pending` still behind its backoff — so the scene is the
+/// same picture on every boot.
+struct Filed {
+    /// `action.entity`: whose work it was.
+    entity: &'static str,
+    /// Whether a crash may retry it.
+    idempotent: bool,
+    /// When it was filed, and (for a backoff) the earliest it may run.
+    at: f64,
+    not_before: f64,
+    /// pending | done | failed | obsolete.
+    status: &'static str,
+    attempts: i64,
+    reply: Option<&'static str>,
+    error: Option<&'static str>,
+}
+
+impl Default for Filed {
+    fn default() -> Self {
+        Filed {
+            entity: "account:1",
+            idempotent: true,
+            at: at(9, 12),
+            not_before: 0.0,
+            status: "done",
+            attempts: 1,
+            reply: None,
+            error: None,
+        }
+    }
+}
+
+/// Files one job into a node's store the way the executor's own row reads:
+/// the **real** effect value, its `KIND` and its `Serialize`, so a refactor
+/// of an effect moves this scene with it instead of leaving it lying. The
+/// registry decodes these payloads back on the way out, exactly as it does
+/// for a job the app filed itself.
+fn file<E: effect::Effect + serde::Serialize>(store: &Store, e: &E, f: &Filed) {
+    let payload = serde_json::to_string(e).expect("catalog: the fixture effect encodes");
+    let row = (
+        E::KIND,
+        payload,
+        f.entity,
+        f.status,
+        f.idempotent,
+        f.reply,
+        f.error,
+        f.attempts,
+        f.not_before,
+        f.at,
+    );
+    store
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO effect(kind, payload, entity, status, idempotent,
+                                    reply, error, attempts, not_before, created, updated)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                rusqlite::params![
+                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9
+                ],
+            )
+        })
+        .expect("catalog: planting a job");
+}
+
+/// The queue an effect-log node stands on: an ordinary morning of an
+/// account that syncs — two pushes that landed, an archive undone before
+/// the executor reached it, a flag still backing off after a refusal, and
+/// the one genuinely irreversible effect having given up.
+///
+/// The mails are the demo seed's, so the payloads point at rows that exist.
+fn plant_queue(store: &Store) {
+    let hike = mail_like(store, "Sat hike");
+    let q3 = mail_like(store, "Q3 infra");
+    file(
+        store,
+        &mail::Seen {
+            account: 1,
+            message: hike,
+            folder: "INBOX".into(),
+            uid: 118,
+            seen: true,
+        },
+        &Filed::default(),
+    );
+    file(
+        store,
+        &mail::Move {
+            account: 1,
+            message: hike,
+            to_folder: 2,
+            from: "INBOX".into(),
+            to: "Archive".into(),
+            uid: 118,
+        },
+        &Filed {
+            at: at(9, 14),
+            reply: Some("119"),
+            ..Filed::default()
+        },
+    );
+    file(
+        store,
+        &mail::Move {
+            account: 1,
+            message: q3,
+            to_folder: 4,
+            from: "INBOX".into(),
+            to: "Trash".into(),
+            uid: 121,
+        },
+        // Undo landed while it waited: revalidated, never performed.
+        &Filed {
+            at: at(9, 20),
+            status: "obsolete",
+            ..Filed::default()
+        },
+    );
+    file(
+        store,
+        &mail::Seen {
+            account: 1,
+            message: q3,
+            folder: "INBOX".into(),
+            uid: 121,
+            seen: false,
+        },
+        &Filed {
+            at: at(9, 31),
+            // Backing off: filed at 9:31, next attempt 9:36.
+            not_before: at(9, 36),
+            status: "pending",
+            attempts: 3,
+            error: Some("connection refused"),
+            ..Filed::default()
+        },
+    );
+    file(
+        store,
+        &mail::Submit { outbox: 7 },
+        &Filed {
+            entity: "outbox:7",
+            idempotent: false,
+            at: at(9, 40),
+            status: "failed",
+            attempts: 6,
+            error: Some("535 authentication failed"),
+            ..Filed::default()
+        },
+    );
+}
+
 /// One row of the effect queue, as the log lists it. The sentence is
 /// supplied rather than decoded: a component node has no registry, and the
 /// row draws whatever line it is handed either way.
@@ -253,6 +411,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         effect_row(),
         link(),
         inbox(),
+        effect_log(),
         message(),
         compose(),
         small_panels(),
@@ -521,6 +680,32 @@ fn effect_row() -> Scene<Setup> {
         .node("cursor", row(mv("pending", 0, None), moved, true, false))
         .about("the cursor's wash; enter unfolds the row")
         .node(
+            "undone",
+            row(mv("obsolete", 1, None), moved, false, false),
+        )
+        .about("undo landed while it waited: revalidated, never performed")
+        .node(
+            "unnamed",
+            row(
+                job(
+                    "telegram_send",
+                    "chat:88",
+                    "pending",
+                    0,
+                    r#"{"chat":88,"text":"on my way"}"#,
+                    None,
+                    None,
+                ),
+                r#"{"chat":88,"text":"on my way"}"#,
+                false,
+                false,
+            ),
+        )
+        .about("a kind this build cannot decode keeps its payload rather than vanishing")
+        .node("narrow", row(mv("pending", 3, Some("connection refused")), moved, false, false))
+        .sized((380.0, 76.0))
+        .about("the phone's width")
+        .node(
             "unfolded",
             row(
                 job(
@@ -580,6 +765,48 @@ fn inbox() -> Scene<Setup> {
         .edge("fresh", "filter error", "/ (github")
 }
 
+fn effect_log() -> Scene<Setup> {
+    // Every node plants the same morning into its own store — a mount's
+    // world is its own, so the five states stand still while it is read.
+    let log = |script: &str| {
+        panel(
+            |s| {
+                plant_queue(s);
+                Kind::Effects
+            },
+            script,
+        )
+    };
+    Scene::new("effect log", (600.0, 640.0))
+        .note("The effect queue read back: everything the app has tried on the outside world, newest first, one page at a time.")
+        .note("Live — enter a node and walk it; the rows are a rich table like the inbox's, and nothing here writes.")
+        .node("queue", log(""))
+        .about("a morning of one account: two pushes landed, one undone, one backing off, one given up")
+        .node(
+            "unfolded",
+            log("click \"submit outbox:7\"\nwait 400"),
+        )
+        .about("what `sqlite3` would show: the job, the payload it was filed as, the answer")
+        .node(
+            "failed",
+            log("click \"filter\"\nwait 200\ntype \"@failed\"\nwait 400"),
+        )
+        .about("`@failed` is the work waiting for a human")
+        .node(
+            "tags",
+            log("click \"filter\"\nwait 200\ntype \"@\"\nwait 400"),
+        )
+        .about("the filter offers the queue's own columns")
+        .node("empty", panel(|_| Kind::Effects, ""))
+        .sized((600.0, 300.0))
+        .about("nothing has left the process yet — said, rather than left blank")
+        .node("phone", log(""))
+        .sized((380.0, 720.0))
+        .edge("queue", "unfolded", "enter / click a row")
+        .edge("queue", "failed", "/ @failed")
+        .edge("queue", "tags", "/ @")
+}
+
 fn message() -> Scene<Setup> {
     Scene::new("message", (560.0, 640.0))
         .note("A conversation as a page: every message of the thread, the one it opened on and the unread ones open, the rest collapsed to their header lines.")
@@ -621,12 +848,10 @@ fn compose() -> Scene<Setup> {
 
 fn small_panels() -> Scene<Setup> {
     Scene::new("small panels", (520.0, 420.0))
-        .note("Settings and its form, the effect log, a sender's card, the manual, the colophon.")
+        .note("Settings and its form, a sender's card, the manual, the colophon.")
         .node("settings", panel(|_| Kind::Settings, ""))
         .node("add account", panel(|_| Kind::AddAccount, ""))
         .about("four fields and the one button")
-        .node("effect log", panel(|_| Kind::Effects, ""))
-        .about("a sealed world files nothing, so this is the empty state — said, not left blank")
         .node("contact", panel(|s| Kind::Contact { email: sender_like(s, "Elena") }, ""))
         .sized((520.0, 260.0))
         .node("help", panel(|_| Kind::Help, ""))
