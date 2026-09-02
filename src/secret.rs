@@ -17,7 +17,7 @@ pub fn set(dir: &Path, email: &str, pass: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         let _ = dir;
-        return std::process::Command::new("/usr/bin/security")
+        std::process::Command::new("/usr/bin/security")
             .args([
                 "add-generic-password",
                 "-U",
@@ -30,7 +30,7 @@ pub fn set(dir: &Path, email: &str, pass: &str) -> bool {
             ])
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(target_os = "macos"))]
     file_set(dir, email, pass)
@@ -49,7 +49,7 @@ pub fn get(dir: &Path, email: &str) -> Option<String> {
             return None;
         }
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return (!s.is_empty()).then_some(s);
+        (!s.is_empty()).then_some(s)
     }
     #[cfg(not(target_os = "macos"))]
     file_get(dir, email)

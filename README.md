@@ -26,9 +26,14 @@ panel; the help panel documents the rest.
 
 ```sh
 mise exec -- cargo test                        # pure core: panel mechanics, springs, e2e grammar
+mise exec -- cargo clippy --all-targets -- -D warnings   # the linter, as CI runs it
 mise exec -- cargo run -- --e2e e2e/basic.txt  # scripted run + screenshots to e2e/out (--front to watch)
+MAKEPAD=headless mise exec -- cargo build && ./e2e/run-all.sh   # every e2e suite, ~2s
 mise exec -- cargo run -- --library            # the panels library (also Dev → Panels Library, ⇧⌘L in the app)
 ```
+
+CI (macOS) runs the tests, the linter and the whole e2e battery on every
+push to `main` and every PR.
 
 ## Layout
 

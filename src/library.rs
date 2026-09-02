@@ -1171,6 +1171,9 @@ impl Library {
         let mut budget = Budget::new();
         let mut deferred: Vec<(f64, usize)> = Vec::new();
         let mut more_work = false;
+        // `i` is the mount's identity here — `deferred` carries it to the
+        // second pass, and the helpers take it — not a cursor into `render`.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             if self.mounts[i].live.is_none() || self.inline(i) {
                 continue;

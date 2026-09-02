@@ -1205,7 +1205,7 @@ impl Wm {
     pub fn restore(snap: WmSnap) -> Self {
         let mut wm = Wm::new();
         wm.active = snap.active.min(WS_N - 1);
-        let mut max_id = vec![0u64; WS_N];
+        let mut max_id = [0u64; WS_N];
         for ws in &snap.wss {
             for (id, _) in &ws.panels {
                 let k = (id >> 32) as usize;

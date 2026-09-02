@@ -24,6 +24,35 @@ The store lives at `~/Library/Application Support/superapp/superapp.db`
 `--db /tmp/scratch.db` for a throwaway session. See [The Data
 Substrate](./data-substrate.md).
 
+## CI
+
+`.github/workflows/ci.yml` runs the linter and that same suite on every push
+to `main` and every pull request:
+
+```sh
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+On a **macOS runner**, because macOS is the target: the apple sys crates and
+the keychain in `src/secret.rs` are cfg'd to it, and a linux job would be
+checking a graph that never ships. One job, not a lint job beside a test job
+— building the makepad graph is the whole cost of a run, and two would pay
+it twice. `--locked` makes a stale `Cargo.lock` fail loudly instead of being
+re-resolved behind the commit.
+
+Then the e2e battery — `e2e/run-all.sh`, every single-process suite in the
+fast `--no-draw` mode, a couple of seconds for the lot. It runs last because
+`MAKEPAD=headless` is a build-time switch, so it re-does the four crates that
+read it and leaves the earlier steps' artifacts alone until then. The
+device-sync suites stay out: they need a second device and a bucketd between
+them, and `e2e/sync-demo.sh` / `e2e/reseed.sh` drive those by hand.
+
+Clippy is a *gate*: `-D warnings`, and the tree is clean of them. rustfmt is
+not — the layout here is hand-set (comment columns, tables that line up), so
+there is no `cargo fmt --check` step and `cargo fmt` on the whole tree is
+not a thing to run.
+
 ## Android build & run
 
 ```sh
@@ -86,7 +115,10 @@ is in flight.
 ## E2E harness
 
 ```sh
-# the fast path: every suite, in parallel, no rendering
+# the whole battery, in parallel, no rendering — what CI runs
+MAKEPAD=headless mise exec -- cargo build && ./e2e/run-all.sh
+
+# one suite, the same fast path
 mise exec -- cargo run -- --e2e e2e/basic.txt --no-draw --draws 4000
 
 # validation: render and write screenshots (one run at a time)
@@ -126,9 +158,12 @@ whenever a worker thread wakes.
 not assertions — nothing diffs them against goldens. So `--no-draw` skips
 rasterization while still running the full widget draw pass, which means
 hit resolution and label matching work exactly as before at roughly **80×
-less cost** (a suite in ~1 s rather than ~30 s). That is the mode to run
-constantly, and it parallelises freely because it writes no frames. Turn
-rendering on when you want to *see* something, and run those one at a time.
+less cost** (a suite in ~1 s rather than ~30 s). A `shot` step is *skipped*
+there rather than failed, which is what makes the mode a gate: the exit code
+means every step that could run, ran. That is the mode to run constantly, and
+it parallelises freely because it writes no frames — `e2e/run-all.sh` launches
+every suite at once and reports a line each. Turn rendering on when you
+want to *see* something, and run those one at a time.
 
 Failed steps (no element matching a label, a failed capture) make the run
 exit non-zero.
@@ -189,9 +224,9 @@ click inside a panel focuses the panel.
 Two things a script cannot lean on. A `swipe` rides the list's real fling
 physics and lands where the fling says, so it is no way to *address* a
 row — walk there with `key down N`, which scroll-follows deterministically.
-And under `--no-draw` no frame is written, so every `shot` step fails and
-the run exits non-zero on those alone; read that mode for the *other*
-failures (a label that did not resolve).
+And under `--no-draw` no frame is written, so a `shot` step is skipped: that
+mode proves the *other* things (a label that did not resolve), never a
+picture.
 
 A `mouse` or `click` on a hosted **field** is trustworthy once per run.
 makepad applies a key-focus change after the event that asked for it, and
