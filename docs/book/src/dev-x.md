@@ -216,3 +216,96 @@ rows (by subject) and panel titles. Steps that mutate the workspace need a
 `wait` after them — hits refresh on the next drawn frame. `e2e/basic.txt`
 walks the whole join/replace grammar; the first frame also logs panel count
 and measured cell metrics to stderr.
+
+## Panels library
+
+In the app, **Dev → Panels Library** (⇧⌘L) puts the library up over the
+workspace and takes it down again; the workspace underneath keeps its
+store, sync and script running. From the command line:
+
+```sh
+# open on the library — every scene of the catalogue, live, on one canvas
+mise exec -- cargo run -- --library
+
+# the scenes whose names contain these
+mise exec -- cargo run -- --library "inbox row" message
+
+# the canvas's own suite — the fast path: mounts, steps and labels, no rendering
+MAKEPAD=headless mise exec -- cargo run -- --library --e2e e2e/library.txt --no-draw --draws 600
+
+# …and rendered, for screenshots (the canvas is a big frame)
+MAKEPAD=headless MAKEPAD_HEADLESS_DPI=1 MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames \
+  mise exec -- cargo run -- --library --e2e e2e/library.txt --e2e-out e2e/out --draws 600
+```
+
+Under `--no-draw` a `shot` is logged and skipped rather than failed, for the
+canvas and the workspace suites alike, so a green fast-path run means what
+it says.
+
+`--library` opens the window on an **infinite canvas** instead of the
+workspace, showing the **catalogue** (`src/catalog.rs`): one **scene** per
+subject, each the states worth a look while that subject is being worked
+on. The e2e suites are not the source — they check behaviour, one walk per
+file, and a design review wants the same thing in its variants, which fans
+out. So a scene is a DAG: **nodes** are named states, **edges** say what
+takes one to another, notes annotate both, and the layout is layered from
+it — roots left, a fan-out stacked in a column, arrows with elbows.
+
+A node is one of three things:
+
+- a **component** — a bare widget (an inbox row, a thread message, an
+  overlay row, the launcher sheet, an account row, a link) from the
+  library's template, populated once with a fixture through its own API.
+  No store, no clock; a texture the size of the piece.
+- a **panel** — one panel widget on a world of its own (an in-memory store
+  with the demo seed, a sealed `Deny` outside, virtual time), chrome
+  included: the stage comes up *solo* on that panel and draws it at the
+  whole viewport. Enter it and the keys work — the walk, ⌘a, ⌘z.
+- the **workspace** — the whole stage, kept for the shell's own subjects:
+  joins, tabs, the phone grid.
+
+A panel or workspace node may name a few steps in the harness's grammar,
+inline, that lead to its state (`key down 3`; `click "filter"` then `type
+"github"`). Those replay one node at a time (there is one keyboard), one
+step per frame, fast-forwarded through waits: the whole catalogue fills in
+within a few seconds, and stderr reports when the last node arrives.
+Components are their state from the first draw.
+
+Scenes are Rust, not a text file: fixtures are the real structs
+(`ThreadHead`, `ThreadMail`, `OverlayRowData`…) and a state is set through
+the widget's own methods, so a refactor that breaks a scene fails to
+compile rather than quietly rearranging the canvas. The catalogue's test
+checks that every scene is a DAG with a name per state; the shape and the
+layout are pure (`src/scene.rs`), unit-tested without a window. Adding a
+state is one line in its subject's function.
+
+A node that has arrived is **frozen**: a picture that hears no events and
+asks for no frames until you enter it. Rendering is budgeted per frame,
+and a zoom change re-renders nothing on the spot — nodes show their last
+texture scaled, and re-render crisp at the new level once the zoom has
+stood still, nearest the pointer first — so panning and zooming stay
+smooth however many nodes are on the canvas. Mounts render into their own
+passes at the canvas's zoom, so text is crisp at every level rather than
+scaled — except an entered stage at 1:1, which is drawn straight into the
+window: a texture pass and its composite would double the GPU work of
+every animated frame, and a stage worked by hand animates on every beat.
+
+- **Pan**: drag the canvas, or scroll. **Zoom**: ⌘scroll around the
+  pointer, ⌘= / ⌘- in steps, ⌘0 fits everything. Arrow keys pan.
+- **Enter** a node with a click (on it, or its name): the camera flies to
+  1:1 and the keyboard and pointer go to that mount, remapped into its own
+  coordinates. An entered node runs on the wall clock, like the app;
+  replays and headless runs keep the fixed frame step. Click outside it,
+  or ⌘esc, to leave. A scene's name fits its block.
+- The legend along the bottom spells all of it out.
+
+`e2e/library.txt` drives the canvas itself: `wait`, `shot`, `click` on a
+scene's name or a node's (`scene/node`), and the canvas chords. A step
+that fails inside a node's replay is reported on stderr under the node's
+name and counts against the run. `e2e/library-toggle.txt` is a workspace
+suite: it presses ⇧⌘L over a running stage and back.
+
+`SUPERAPP_FRAME_LOG=1` prints every frame's draw cost (the canvas's, and
+what was spent inside mount renders, with the interval since the last
+frame) and every event that took over a millisecond, for the library and
+the app alike — the first thing to read when a window feels slow.

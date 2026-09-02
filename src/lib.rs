@@ -22,11 +22,15 @@
 //! | [`spring`] | niri's closed-form spring (via mosaic) | no |
 //! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
 //! | [`theme`] | the look: sizes and colours | no |
+//! | [`scene`] | a subject in its named states, and the library canvas's layout | no |
 //! | [`app`] | the makepad shell: drawing, events | yes |
+//! | [`catalog`] | the scenes the panels library shows (CR-006) | yes |
+//! | [`library`] | the panels library: a canvas of live scenes (CR-006) | yes |
 //!
 //! Everything above `app` is pure and unit-tested without opening a window.
 
 pub mod app;
+pub mod catalog;
 pub mod core;
 pub mod e2e;
 pub mod effect;
@@ -34,6 +38,7 @@ pub mod filter;
 pub mod history;
 pub mod html;
 pub mod launcher;
+pub mod library;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod mail;
@@ -41,6 +46,7 @@ pub mod object;
 pub mod panels;
 pub mod repl;
 pub mod richtable;
+pub mod scene;
 pub mod secret;
 pub mod send;
 pub mod spring;

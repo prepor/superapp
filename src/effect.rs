@@ -854,9 +854,21 @@ impl World {
 /// A world that refuses. The default for a components-library mount: a
 /// panel that quietly sends mail while you look at it fails loudly instead
 /// of succeeding invisibly.
-pub struct Deny;
+#[derive(Default)]
+pub struct Deny {
+    /// The one thing a sealed world still answers: what time it is. `None`
+    /// reads as the epoch, which is what the tests expect.
+    clock: Option<Clock>,
+}
 
 impl Deny {
+    /// A sealed world on this clock — a panels-library mount, whose springs
+    /// and deadlines have to move with its frame loop.
+    #[must_use]
+    pub fn with_clock(clock: Clock) -> Deny {
+        Deny { clock: Some(clock) }
+    }
+
     fn no<T>(what: &str) -> Result<T, String> {
         Err(format!("this world has no outside ({what})"))
     }
@@ -864,7 +876,7 @@ impl Deny {
 
 impl Outside for Deny {
     fn now(&mut self) -> f64 {
-        0.0
+        self.clock.as_ref().map_or(0.0, Clock::read)
     }
     fn connect(&mut self, _a: i64, _c: &Creds) -> Result<(), String> {
         Self::no("connect")
@@ -1770,7 +1782,7 @@ mod tests {
         reg.register::<Poke>();
         let w = World::new(
             Rc::new(Store::open(None).unwrap()),
-            Box::new(Deny),
+            Box::new(Deny::default()),
             reg,
         );
         w.enqueue(&Poke::ok("nope")).unwrap();

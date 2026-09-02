@@ -9,6 +9,9 @@ edition = "2021"
 rust-version = "1.87"
 description = "Personal user-space OS: specialized panels on one scrolling workspace."
 publish = false
+# The helper binaries under src/bin (bucketd, sync-demo, reseed-edit) made a
+# plain `cargo run` ambiguous; the app is what every documented command means.
+default-run = "superapp"
 
 [lib]
 name = "superapp"
@@ -51,7 +54,7 @@ serde_json = "1"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# Two patches on top of the pin, carried on prepor/makepad@superapp-pin
+# Four patches on top of the pin, carried on prepor/makepad@superapp-pin
 # (branched at the pin; rebase them when bumping it):
 #
 #   bdb23508  TextInput hides the IME only when key focus goes to nothing —
@@ -62,18 +65,19 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 #             tap on a field clears the dismissed latch, so a re-tap on the
 #             focused field can raise the keyboard again.
 #
-# A third — MAKEPAD_PRESENT_WHEN_OCCLUDED, mosaic's patch 0003 — was
-# dropped once e2e moved to `MAKEPAD=headless`. It existed so a run that
-# deliberately sat behind the user's windows could still be photographed;
-# a headless run has no window to occlude, and makepad's own software
-# rasterizer writes the frames.
+#   99b2a58f  MAKEPAD_PRESENT_WHEN_OCCLUDED (mosaic's patch 0003): a run that
+#             deliberately sits behind the user's windows can still be
+#             photographed. Off by default. E2e moved to `MAKEPAD=headless`
+#             and no longer needs it; the branch carries it anyway.
+#   5d491eea  A trackpad pinch (NSEventTypeMagnify) arrives as a command-
+#             scroll at the pointer: the panels library's canvas zooms on it.
 #
 # A local clone at ../makepad-superapp is the working tree for them; the
 # git rev below is what actually builds, here and anywhere else.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5bf8e78fe" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "5d491eea3" }
 
 [profile.dev]
 opt-level = 1

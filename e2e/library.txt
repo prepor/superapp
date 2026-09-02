@@ -1,0 +1,26 @@
+# The panels library (CR-006): the catalogue's scenes on one canvas, every
+# node live. Run with
+#   --library --e2e e2e/library.txt --no-draw --draws 600
+# under MAKEPAD=headless (rendered: drop --no-draw, set
+# MAKEPAD_HEADLESS_DPI=1 — the canvas is a big frame). The first wait lets
+# the stage nodes replay their steps, one node at a time.
+wait 4000
+shot lib-01-overview
+
+# A scene's title fits its block.
+click "inbox row"
+wait 600
+shot lib-02-scene
+
+# A node's caption enters it: the camera flies to 1:1 and the keyboard and
+# pointer go to that mount. Nodes are addressed as scene/node.
+click "inbox/cursor"
+wait 900
+shot lib-03-entered
+
+# cmd+esc leaves; cmd+0 fits everything again.
+key cmd+esc
+key cmd+0
+wait 900
+shot lib-04-fit
+quit

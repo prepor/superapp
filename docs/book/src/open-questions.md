@@ -41,3 +41,12 @@ current state; everything else in this book is settled.
     whatever the text editor panel turns out to need. Grown by need,
     stelaxis-style: name the meaning, never the pixels. `src/ui.rs` keeps
     the rest — the accelerator rules and the chrome's `Style`/`BtnAct`.
+
+11. **The panels library's catalogue is Rust**, one function per subject,
+    and every panel or workspace node boots its own world and replays its
+    steps from the seed. Open there: whether scenes want to live beside
+    their widgets once the catalogue outgrows one file; pointer states
+    (hover, press) are fixtures today, not events the mount receives; a
+    DSL change is still a rebuild and a reopen; a state reached by hand
+    inside a node cannot be saved back as a node; and a node's pass
+    texture stays allocated at the last size it was seen at.

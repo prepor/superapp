@@ -1527,7 +1527,7 @@ impl Widget for AccountRow {
 }
 
 impl AccountRowRef {
-    fn populate(&self, cx: &mut Cx, a: &mail::Account) {
+    pub fn populate(&self, cx: &mut Cx, a: &mail::Account) {
         let Some(mut row) = self.borrow_mut() else {
             return;
         };
@@ -2190,7 +2190,7 @@ impl Widget for InboxLine {
 }
 
 impl InboxLineRef {
-    fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead) {
+    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead) {
         let Some(inner) = self.borrow() else { return };
         let from = m.who_line();
         let fp = inner.view.label(cx, ids!(from_lbl));
@@ -2238,7 +2238,7 @@ impl Widget for InboxRow {
 }
 
 impl InboxRowRef {
-    fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool) {
+    pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool) {
         let Some(row) = self.borrow() else { return };
         let line = row.view.widget(cx, ids!(line));
         let line_sel = row.view.widget(cx, ids!(line_sel));
@@ -2722,7 +2722,7 @@ impl Widget for ThreadMsg {
 }
 
 impl ThreadMsgRef {
-    fn populate(&self, cx: &mut Cx, pid: u64, t: &mail::ThreadMail, open: bool, quoted: bool) {
+    pub fn populate(&self, cx: &mut Cx, pid: u64, t: &mail::ThreadMail, open: bool, quoted: bool) {
         let Some(mut w) = self.borrow_mut() else { return };
         let m = &t.mail;
         let name = if m.head.from_name.is_empty() {
@@ -3174,7 +3174,7 @@ impl Widget for OverlayRow {
 }
 
 impl OverlayRowRef {
-    fn populate(&self, cx: &mut Cx, d: &OverlayRowData) {
+    pub fn populate(&self, cx: &mut Cx, d: &OverlayRowData) {
         let Some(row) = self.borrow() else { return };
         // Inverted while current; an undone branch stays legible but quiet.
         let (fg, dim) = if d.current {

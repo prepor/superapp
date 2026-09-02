@@ -42,22 +42,24 @@ use crate::ui::{self, trunc, BtnAct, Style};
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Under a headless build the shell runs on a **fixed frame clock**: one
-/// draw cycle is one frame of exactly this long, for both the springs and
-/// the e2e runner. Nothing reads the wall clock, so a run is reproducible
-/// whether the machine is idle or running a dozen other suites.
-#[cfg(headless)]
-const FRAME_MS: f64 = 1000.0 / 60.0;
+/// On **virtual time** — a headless build, and every panels-library mount —
+/// one draw cycle is one frame of exactly this long, for both the springs
+/// and the e2e runner. Nothing reads the wall clock, so a run is
+/// reproducible whether the machine is idle or running a dozen other
+/// suites.
+pub(crate) const FRAME_MS: f64 = 1000.0 / 60.0;
 
 /// How often the manual pump runs a sync/send round, in frames. Half a
 /// second of frame time — often enough that a script's `wait` sees the
 /// result, rare enough that a dead host is not dialled sixty times a second.
-#[cfg(headless)]
 const PUMP_EVERY: u64 = 30;
+
+/// The same cadence in seconds of virtual time, for a mount whose frames
+/// jump by a whole `wait` at once (CR-006).
+const PUMP_S: f64 = 0.5;
 
 /// The windowed e2e runner is paced by a real timer at this interval; the
 /// runner counts the same milliseconds either way.
-#[cfg(not(headless))]
 const E2E_TICK_MS: f64 = 30.0;
 
 /// Command-line configuration.
@@ -82,6 +84,119 @@ struct Config {
     /// When set, replication is on: this device joins the lineage, follows or
     /// holds the lease, and the locked screen appears when it does not write.
     bucket: Option<String>,
+    /// Open the panels library instead of the workspace (`--library
+    /// [NAME...]`): the catalogue's scenes whose names contain one of
+    /// these, or every scene when none is given. CR-006.
+    library: Option<Vec<String>>,
+    /// The headless backend's `--no-draw`: the widget pass runs, nothing is
+    /// rasterized. Read here so a `shot` knows there is nothing to keep.
+    no_draw: bool,
+}
+
+/// Whether this run rasterizes nothing (`--no-draw`).
+pub(crate) fn no_draw() -> bool {
+    config().no_draw
+}
+
+/// `SUPERAPP_FRAME_LOG=1`: every frame's draw cost, and every event that
+/// took over a millisecond, on stderr — for finding out where a window
+/// spends its time. Read once: it is on the paint path.
+pub(crate) fn frame_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUPERAPP_FRAME_LOG").is_some())
+}
+
+/// The scene names `--library` asked for (none: every scene), when it did.
+pub(crate) fn library_filter() -> Option<&'static [String]> {
+    config().library.as_deref()
+}
+
+/// The e2e script to replay, if any, and where its screenshots go.
+pub(crate) fn e2e_script() -> (Option<&'static str>, &'static str) {
+    (config().e2e.as_deref(), &config().out)
+}
+
+/// Everything a stage needs to come up (CR-006). The window's own stage
+/// builds one from argv at startup; the panels library builds one per
+/// mount from a scene's node.
+pub struct Boot {
+    /// The store's path; `None` is in memory.
+    pub db: Option<std::path::PathBuf>,
+    /// A forced unit grid.
+    pub grid: Option<core::Grid>,
+    /// The send-undo window, seconds.
+    pub send_delay: f64,
+    /// Run on the fixed frame clock. Always for a mount; for the primary
+    /// stage exactly under a headless build.
+    pub virtual_time: bool,
+    /// The outside.
+    pub outside: BootOutside,
+    /// Keep passwords in memory (e2e runs and mounts) rather than the
+    /// keychain.
+    pub secrets_in_memory: bool,
+    /// A script to replay. The primary stage runs it as a suite; a mount
+    /// replays it up to its shot and stays there.
+    pub steps: Option<Vec<e2e::Step>>,
+    /// The window's own stage: owns the menu bar, the IME, the fallback
+    /// store poll. A mount owns nothing outside its pass.
+    pub primary: bool,
+    /// A prefix for the script's messages — a mount's scene and node.
+    pub tag: String,
+    /// Solo: come up on this one panel alone, drawn at the whole viewport,
+    /// chrome included — a panel node of the library. Otherwise the
+    /// workspace is the restored session, or the default layout.
+    pub open: Option<Opener>,
+}
+
+/// What a solo stage opens on: the kind, resolved against the seeded
+/// store (a mail by its subject, a sender by name).
+pub type Opener = Box<dyn FnOnce(&Store) -> Kind>;
+
+/// Which [`crate::effect::Outside`] a booting stage gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootOutside {
+    /// The network, the keychain (or memory), the clipboard, the screen.
+    Real,
+    /// Every verb fails, loudly; the clock still runs.
+    Deny,
+    /// The in-memory mail world.
+    Fake,
+}
+
+impl Boot {
+    /// The primary stage's boot, from argv. A script that fails to parse
+    /// ends the process here, before a window exists to be confused by it.
+    fn primary(cx: &Cx) -> Boot {
+        // Opened on the library, the script is the canvas's, not this
+        // stage's.
+        let steps = config().e2e.as_ref().filter(|_| library_filter().is_none()).map(|path| {
+            match std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| e2e::parse(&s))
+            {
+                Ok(steps) => {
+                    eprintln!("e2e: {} step(s) from {path}", steps.len());
+                    steps
+                }
+                Err(e) => {
+                    eprintln!("e2e: {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        });
+        Boot {
+            db: db_path(cx),
+            grid: config().grid,
+            send_delay: config().send_delay,
+            virtual_time: cfg!(headless),
+            outside: BootOutside::Real,
+            secrets_in_memory: config().e2e.is_some(),
+            steps,
+            primary: true,
+            tag: String::new(),
+            open: None,
+        }
+    }
 }
 
 fn parse_wxh(s: &str) -> Option<(f64, f64)> {
@@ -97,9 +212,22 @@ fn config() -> &'static Config {
             send_delay: 10.0,
             ..Default::default()
         };
-        let mut args = std::env::args().skip(1);
+        let mut args = std::env::args().skip(1).peekable();
         while let Some(a) = args.next() {
             match a.as_str() {
+                // The headless backend's own flags: read (and, for the
+                // budget, skipped) here so they are not reported as unknown.
+                "--no-draw" => c.no_draw = true,
+                "--draws" => {
+                    args.next();
+                }
+                "--library" => {
+                    let mut paths = Vec::new();
+                    while let Some(p) = args.next_if(|p| !p.starts_with("--")) {
+                        paths.push(p);
+                    }
+                    c.library = Some(paths);
+                }
                 "--e2e" => c.e2e = args.next(),
                 "--e2e-out" => {
                     if let Some(o) = args.next() {
@@ -236,6 +364,49 @@ script_mod! {
         }
     }
 
+    // The panels library (CR-006). A mount renders into its own pass; this
+    // quad shows that pass's texture on the canvas, at whatever zoom.
+    set_type_default() do #(crate::library::DrawTex::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        image: texture_2d(float)
+        pixel: fn() {
+            return self.image.sample_as_bgra(self.pos)
+        }
+    }
+
+    // An arrowhead: a solid triangle pointing right, filling its quad.
+    set_type_default() do #(crate::library::DrawHead::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        color: vec4(0.078, 0.078, 0.078, 1.0)
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.move_to(0.0, 0.0)
+            sdf.line_to(self.rect_size.x, self.rect_size.y * 0.5)
+            sdf.line_to(0.0, self.rect_size.y)
+            sdf.close_path()
+            sdf.fill(self.color)
+            return sdf.result
+        }
+    }
+
+    let LibraryBase = #(crate::library::Library::register_widget(vm))
+    let Library = set_type_default() do LibraryBase{
+        width: Fill
+        height: Fill
+        draw_mono +: {
+            text_style: TextStyle{
+                font_family: FontFamily{
+                    latin := FontMember{res: file_resource("/System/Library/Fonts/Menlo.ttc") asc: 0.0 desc: 0.0}
+                    fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
+                    symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+                    emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+                }
+                line_spacing: 1.0
+            }
+            color: #141414ff
+        }
+    }
+
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
@@ -244,6 +415,9 @@ script_mod! {
                 window.inner_size: vec2(1440, 900)
                 pass.clear_color: #ffffffff
                 body +: {
+                    // Both roots fill the window; argv decides which one
+                    // boots and draws (`--library`, CR-006).
+                    flow: Overlay
                     stage := Stage{
                         // Retained content templates (CR-002): named children
                         // of a custom-drawn widget are never auto-drawn —
@@ -261,6 +435,30 @@ script_mod! {
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
+                    }
+                    library := Library{
+                        // Templates, never auto-drawn: a component node is
+                        // instantiated from its widget's, a panel or
+                        // workspace node from the stage's — exactly as
+                        // panels are from theirs.
+                        inbox_row_tpl := mod.widgets.InboxRow{}
+                        thread_msg_tpl := mod.widgets.ThreadMsg{}
+                        overlay_row_tpl := mod.widgets.OverlayRow{}
+                        launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
+                        account_row_tpl := mod.widgets.AccountRow{}
+                        link_tpl := mod.widgets.SLink{}
+                        stage_tpl := Stage{
+                            settings_tpl := mod.widgets.SettingsPanel{}
+                            add_account_tpl := mod.widgets.AddAccountPanel{}
+                            compose_tpl := mod.widgets.ComposePanel{}
+                            inbox_tpl := mod.widgets.InboxPanel{}
+                            message_tpl := mod.widgets.MessagePanel{}
+                            contact_tpl := mod.widgets.ContactPanel{}
+                            help_tpl := mod.widgets.HelpPanel{}
+                            about_tpl := mod.widgets.AboutPanel{}
+                            rows_overlay_tpl := mod.widgets.RowsOverlay{}
+                            launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
+                        }
                     }
                 }
             }
@@ -298,8 +496,26 @@ pub struct DrawFlat {
     pub color: Vec4f,
 }
 
-fn rgba_a(c: theme::Rgba, alpha: f64) -> Vec4f {
+pub(crate) fn rgba_a(c: theme::Rgba, alpha: f64) -> Vec4f {
     vec4(c[0], c[1], c[2], c[3] * alpha as f32)
+}
+
+/// Redraws what this stage draws into. The window's own stage draws into
+/// the window, so that is everything; a panels-library mount redraws only
+/// its own pass — and the canvas that composites it — so one mount's
+/// keystroke does not re-lay-out a hundred others.
+fn redraw_scoped(cx: &mut Cx, lists: Option<(DrawListId, DrawListId)>, mount: bool) {
+    match lists {
+        Some((own, canvas)) => {
+            cx.redraw_list_and_children(own);
+            cx.redraw_list(canvas);
+        }
+        // A mount the canvas has not rendered yet is pending there already;
+        // marking the whole window would make every other mount pending
+        // too, and the budget would never get past the first few.
+        None if mount => {}
+        None => cx.redraw_all(),
+    }
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -828,14 +1044,22 @@ struct State {
     /// Whether the canonical device has seeded the demo world since it began
     /// holding (seeding is a holder-only act under replication).
     seeded: bool,
+    /// The fixed frame clock (CR-006): a headless build, and every
+    /// panels-library mount. False only for a windowed primary stage — the
+    /// one place the wall clock is read.
+    virtual_time: bool,
+    /// A forced grid: `--grid`, or a scene's.
+    grid: Option<core::Grid>,
+    /// The send-undo window, seconds.
+    send_delay: f64,
 }
 
 /// The grid for a viewport. Desktop is always 12×6; android picks 8×4 on the
 /// unfolded screen and 4×3 on the cover display (the ~600 dp compact/medium
 /// breakpoint — a fold/unfold resize crosses it). `--grid` overrides for
 /// desktop previews of the phone layouts.
-fn grid_for(vp: DVec2) -> core::Grid {
-    if let Some(g) = config().grid {
+fn grid_for(vp: DVec2, forced: Option<core::Grid>) -> core::Grid {
+    if let Some(g) = forced {
         return g;
     }
     if cfg!(target_os = "android") {
@@ -850,9 +1074,10 @@ fn grid_for(vp: DVec2) -> core::Grid {
 }
 
 impl State {
-    fn new(store: Store, db_path: Option<std::path::PathBuf>) -> Self {
+    fn new(store: Store, boot: &Boot) -> Self {
         let store = std::rc::Rc::new(store);
-        let secrets = if config().e2e.is_some() {
+        let db_path = boot.db.clone();
+        let secrets = if boot.secrets_in_memory {
             crate::effect::Secrets::Memory(crate::effect::MemSecrets::new())
         } else {
             crate::effect::Secrets::Keychain(
@@ -863,16 +1088,26 @@ impl State {
                     .unwrap_or_default(),
             )
         };
-        // Headless: one fixed frame clock for the springs, the e2e runner
-        // and the app's own deadlines alike. It starts at a fixed instant
-        // so even the dates in a screenshot are reproducible.
-        #[cfg(headless)]
-        let clock = crate::effect::Clock::virtual_from(mail::ts(2026, 9, 1, 12, 0));
-        #[cfg(not(headless))]
-        let clock = crate::effect::Clock::System;
+        // Virtual time: one fixed frame clock for the springs, the e2e
+        // runner and the app's own deadlines alike. It starts at a fixed
+        // instant so even the dates in a screenshot are reproducible.
+        let epoch = mail::ts(2026, 9, 1, 12, 0);
+        let clock = if boot.virtual_time {
+            crate::effect::Clock::virtual_from(epoch)
+        } else {
+            crate::effect::Clock::System
+        };
+        let outside: Box<dyn crate::effect::Outside> = match boot.outside {
+            BootOutside::Real => Box::new(crate::effect::Real::new(secrets.clone(), clock.clone())),
+            BootOutside::Deny => Box::new(crate::effect::Deny::with_clock(clock.clone())),
+            BootOutside::Fake => Box::new(crate::effect::Fake {
+                clock: epoch,
+                ..Default::default()
+            }),
+        };
         let world = std::rc::Rc::new(crate::effect::World::new(
             store.clone(),
-            Box::new(crate::effect::Real::new(secrets.clone(), clock.clone())),
+            outside,
             mail::registry(),
         ));
         // Boot restores the last session from the store; a store that never
@@ -896,7 +1131,12 @@ impl State {
         // persist a boot layout into a store it is about to replace with the
         // holder's snapshot. The gate opens (or stays shut) when the role is
         // known.
-        let repl = Self::start_repl(&store, db_path.as_deref());
+        // Only the window's own stage replicates; a mount's world is its own.
+        let repl = if boot.primary {
+            Self::start_repl(&store, db_path.as_deref())
+        } else {
+            None
+        };
         if repl.is_some() {
             store.set_writable(false);
         }
@@ -918,12 +1158,15 @@ impl State {
             seeded: false,
             // Headless: no threads at all. The passes run inline from the
             // frame loop, so ingest, push and send land at frame
+            // Virtual time: no threads at all. The passes run inline from
+            // the frame loop, so ingest, push and send land at frame
             // boundaries instead of whenever a worker happens to wake —
             // the last thing standing between a run and reproducibility.
-            #[cfg(headless)]
-            pump: sync::Pump::Manual,
-            #[cfg(not(headless))]
-            pump: sync::Pump::threads(),
+            pump: if boot.virtual_time {
+                sync::Pump::Manual
+            } else {
+                sync::Pump::threads()
+            },
             failed_seen: 0,
             last_saved: None,
             anim: Anim::default(),
@@ -937,7 +1180,30 @@ impl State {
             launcher: LauncherUi::default(),
             show_also: None,
             expand: HashMap::new(),
+            virtual_time: boot.virtual_time,
+            grid: boot.grid,
+            send_delay: boot.send_delay,
         }
+    }
+
+    /// Moves virtual time on by `secs`. A [`crate::effect::Fake`] carries
+    /// its own clock (a test's), so a fake-world mount moves that by hand.
+    fn advance_clock(&self, secs: f64) {
+        self.clock.advance(secs);
+        self.world.outside(|o| {
+            if let Some(f) = o.as_any().downcast_mut::<crate::effect::Fake>() {
+                f.clock += secs;
+            }
+        });
+    }
+
+    /// One round of the manual pump: every account's sync pass, the
+    /// outbox, then the effect queue.
+    fn pump_round(&self) {
+        let w = self.world.clone();
+        sync::tick(&w);
+        crate::send::outbox_pass(&w);
+        w.run_effects();
     }
 
     fn opts(&self) -> core::LayoutOpts {
@@ -1039,7 +1305,7 @@ impl State {
     /// Recomputes targets after a mutation and feeds the animator. The camera
     /// follows focus here — and only here, so trackpad pans stay free.
     fn sync(&mut self) {
-        self.ws.set_grid(grid_for(self.viewport));
+        self.ws.set_grid(grid_for(self.viewport, self.grid));
         // Wishes measured from content, re-taken from scratch: a letter that
         // arrived, changed or left changes what its panel asks for. Ephemeral
         // like the grid above — measured here, never snapshotted.
@@ -1524,6 +1790,37 @@ pub struct Stage {
     ime_guard_timer: Timer,
     #[rust]
     state: Option<Box<State>>,
+    /// A panels-library mount (CR-006): booted by the canvas from a scene's
+    /// node, replays its steps, owns nothing outside its pass. The
+    /// window's own stage boots from argv and owns the menu bar.
+    #[rust]
+    mount: bool,
+    /// Whether this stage may touch the window's IME and key focus —
+    /// always for the primary, for a mount only while the canvas has
+    /// entered it.
+    #[rust]
+    active: bool,
+    /// A mount's replay reached its shot.
+    #[rust]
+    arrived: bool,
+    /// A mount's own draw list and the canvas's, for scoped redraws.
+    #[rust]
+    lists: Option<(DrawListId, DrawListId)>,
+    /// The manual pump's next due time on a mount's virtual clock.
+    #[rust]
+    pump_due: f64,
+    /// A mount's last step has not been drawn yet: the next step waits for
+    /// the draw, which the canvas schedules within its frame budget.
+    #[rust]
+    stale_hits: bool,
+    /// A panel node (CR-006): the one panel this stage draws, at the whole
+    /// viewport, instead of the workspace.
+    #[rust]
+    solo: Option<PanelId>,
+    /// The panels library is up over this stage: it draws nothing and
+    /// hears no input, while its store, timers and script keep running.
+    #[rust]
+    suspended: bool,
 }
 
 /// Menu command id bases: workspace `k`'s items are `base + k`. Plain
@@ -1535,6 +1832,16 @@ const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
+const MENU_LIBRARY: u64 = 0x5753_0600;
+
+/// The Dev menu's intents, raised by the stage (a menu item, a chord) for
+/// the app root to act on: the library is the stage's sibling, not its
+/// child.
+#[derive(Debug, Clone)]
+pub enum DevAction {
+    /// Show the panels library over the workspace, or put it away.
+    ToggleLibrary,
+}
 
 /// The overlays are hosted like panels, so they need keys in the same map.
 /// Panel ids are workspace-tagged (`k << 32`) and allocated upward, so the
@@ -1690,7 +1997,10 @@ impl Stage {
         let want_ime = launcher
             || (!cfg!(target_os = "android")
                 && self.state.as_deref().is_some_and(|s| s.ws.focus.is_some()));
-        if want_ime != self.ime_shown {
+        // A mount the canvas has not entered keeps its hands off the
+        // window's IME and key focus: a hundred of them would otherwise
+        // fight over one keyboard.
+        if self.active && want_ime != self.ime_shown {
             self.ime_shown = want_ime;
             if want_ime {
                 // With a hosted panel — or the launcher's field — the key
@@ -1720,7 +2030,7 @@ impl Stage {
             }
         }
         self.next_frame = cx.new_next_frame();
-        cx.redraw_all();
+        self.redraw_scoped(cx);
     }
 
     /// A mutation happened: recompute targets, animate, redraw.
@@ -1739,7 +2049,7 @@ impl Stage {
     /// labels document it); rebuilds happen only when the signature changes,
     /// never per keystroke.
     fn update_menu(&mut self, cx: &mut Cx) {
-        if !cfg!(target_os = "macos") {
+        if !cfg!(target_os = "macos") || self.mount {
             return;
         }
         let Some(state) = self.state.as_deref() else {
@@ -1823,6 +2133,16 @@ impl Stage {
                 ],
             });
         }
+        items.push(MacosMenu::Sub {
+            name: "Dev".into(),
+            items: vec![MacosMenu::Item {
+                command: LiveId(MENU_LIBRARY),
+                key: KeyCode::Unknown,
+                shift: true,
+                enabled: true,
+                name: "Panels Library — ⇧⌘L".into(),
+            }],
+        });
         cx.update_macos_menu(MacosMenu::Main { items });
     }
 
@@ -1848,6 +2168,28 @@ impl Stage {
         if let Some(step) = runner.next_step(dt_ms) {
             match step {
                 e2e::Step::Wait(_) => {}
+                // A mount's last step is where it stops: the state on the
+                // canvas. The runner goes with it — nothing else to do, and
+                // nothing to keep asking for frames.
+                e2e::Step::Shot(_) | e2e::Step::Quit if self.mount => {
+                    // Only the last shot is this mount's own; the ones on
+                    // the way are earlier nodes', and nothing to do.
+                    if runner.idx >= runner.steps.len() {
+                        self.arrived = true;
+                        if runner.failures > 0 {
+                            eprintln!(
+                                "library: {}reached its shot with {} failed step(s)",
+                                runner.tag, runner.failures
+                            );
+                        }
+                        return;
+                    }
+                }
+                // The fast path rasterizes nothing: a shot is logged, not
+                // failed, so a green `--no-draw` run means what it says.
+                e2e::Step::Shot(name) if config().no_draw => {
+                    eprintln!("e2e: shot {name} (skipped: --no-draw)");
+                }
                 e2e::Step::Shot(name) => {
                     let path = runner.out.join(format!("{name}.png"));
                     match world
@@ -1857,13 +2199,13 @@ impl Stage {
                     {
                         Ok(()) => eprintln!("e2e: shot {}", path.display()),
                         Err(e) => {
-                            eprintln!("e2e: FAIL shot {name}: {e}");
+                            eprintln!("{}e2e: FAIL shot {name}: {e}", runner.tag);
                             runner.failures += 1;
                         }
                     }
                     #[cfg(any())]
                     {
-                        eprintln!("e2e: FAIL shot {}: screenshots need macos", path.display());
+                        eprintln!("{}e2e: FAIL shot {}: screenshots need macos", runner.tag, path.display());
                         runner.failures += 1;
                     }
                 }
@@ -1898,7 +2240,7 @@ impl Stage {
                             self.resolve_click(cx, act, fresh);
                         }
                         None => {
-                            eprintln!("e2e: FAIL click {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL click {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -1932,7 +2274,7 @@ impl Stage {
                         }
                     }
                     None => {
-                        eprintln!("e2e: FAIL key {chord:?}: cannot parse chord");
+                        eprintln!("{}e2e: FAIL key {chord:?}: cannot parse chord", runner.tag);
                         runner.failures += 1;
                     }
                 },
@@ -1956,7 +2298,7 @@ impl Stage {
                             self.synth_drag(cx, c, dvec2(c.x + dx, c.y + dy));
                         }
                         None => {
-                            eprintln!("e2e: FAIL drag {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL drag {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2033,7 +2375,7 @@ impl Stage {
                             }
                         }
                         None => {
-                            eprintln!("e2e: FAIL swipe {label:?}: no matching element");
+                            eprintln!("{}e2e: FAIL swipe {label:?}: no matching element", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2072,7 +2414,7 @@ impl Stage {
                         eprintln!("e2e: drop");
                         self.touch_stop(cx, uid, p);
                     } else {
-                        eprintln!("e2e: FAIL drop: no gesture is being held");
+                        eprintln!("{}e2e: FAIL drop: no gesture is being held", runner.tag);
                         runner.failures += 1;
                     }
                 }
@@ -2099,7 +2441,7 @@ impl Stage {
                             self.touch_start(1, c);
                             self.long_press(cx, 1, c);
                             if !matches!(self.touch.mode, TouchMode::Drag { .. }) {
-                                eprintln!("e2e: FAIL holdmove {label:?}: header did not grab");
+                                eprintln!("{}e2e: FAIL holdmove {label:?}: header did not grab", runner.tag);
                                 runner.failures += 1;
                                 self.touch_stop(cx, 1, c);
                             } else {
@@ -2113,7 +2455,7 @@ impl Stage {
                             }
                         }
                         None => {
-                            eprintln!("e2e: FAIL holdmove {label:?}: no matching panel");
+                            eprintln!("{}e2e: FAIL holdmove {label:?}: no matching panel", runner.tag);
                             runner.failures += 1;
                         }
                     }
@@ -2253,6 +2595,11 @@ impl Stage {
                 } else {
                     self.do_undo(cx);
                 }
+                return;
+            }
+            if k.key_code == KeyCode::KeyL && k.modifiers.shift {
+                // The Dev menu's chord: the panels library, over the workspace.
+                cx.action(DevAction::ToggleLibrary);
                 return;
             }
             if k.key_code == KeyCode::KeyU {
@@ -2526,7 +2873,7 @@ impl Stage {
                 }
             }
             state.failed_seen = failures.len();
-            cx.redraw_all();
+            self.redraw_scoped(cx);
         }
         self.tick_repl(cx);
     }
@@ -3158,7 +3505,7 @@ impl Stage {
                         if d.to.is_empty() {
                             state.toast("no recipient", true);
                         } else {
-                            let delay = config().send_delay;
+                            let delay = state.send_delay;
                             let now = state.world.now();
                             let subject = if d.subject.is_empty() {
                                 "(no subject)".into()
@@ -3776,6 +4123,205 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
 }
 
 impl Stage {
+    /// Brings the stage up on a world: opens (or creates) its store, seeds
+    /// the demo mail, restores the session, starts the engine, and arms a
+    /// script if there is one. The primary stage does this at startup from
+    /// argv; the panels library does it per mount from a scene's node.
+    pub fn boot(&mut self, cx: &mut Cx, boot: Boot) {
+        if self.state.is_some() {
+            return;
+        }
+        self.mount = !boot.primary;
+        self.active = boot.primary;
+        // A mount's first step waits for its first draw; a mount with no
+        // steps is its state from the start.
+        self.stale_hits = self.mount;
+        self.arrived = self.mount && boot.steps.is_none();
+        let store = Store::open(boot.db.as_deref())
+            .unwrap_or_else(|e| panic!("store: opening {:?} failed: {e}", boot.db));
+        // Seeding is a write, so under replication it waits for this device
+        // to resolve as the holder (a follower installs the holder's
+        // snapshot instead of seeding its own). Without a bucket — and on
+        // every mount, whose world is its own — seed at boot as before.
+        if !boot.primary || config().bucket.is_none() {
+            if let Err(e) = mail::seed_if_empty(&store) {
+                eprintln!("store: seeding demo mail failed: {e}");
+            }
+        }
+        // A delivered send can no longer be undone — the walk marks it
+        // expired and steps past.
+        let mut s = State::new(store, &boot);
+        if let Some(open) = boot.open {
+            // Solo: one panel, fresh, in place of the session.
+            let kind = open(&s.store);
+            let mut ws = Wm::new();
+            let pid = ws.open(kind.clone(), None, false);
+            s.ws = ws;
+            if let Kind::Message { id } = kind {
+                let open = s.seed_for(id);
+                s.seed_expansion(id, &open);
+            }
+            self.solo = Some(pid);
+        }
+        s.failed_seen = mail::outbox_failures(&s.store).len();
+        s.spawn_workers();
+        s.sync();
+        let virtual_time = s.virtual_time;
+        self.pump_due = s.world.now() + PUMP_S;
+        self.state = Some(Box::new(s));
+        // Belt and braces under the worker signal: a coarse poll so a lost
+        // wake can never strand the UI on cached rows. Virtual time has no
+        // worker threads, so no foreign commits to poll for — and a
+        // wall-clock interval would be the last thing reading a clock the
+        // script does not control.
+        if boot.primary && !virtual_time {
+            self.poll_timer = cx.start_interval(2.0);
+        }
+        if let Some(steps) = boot.steps {
+            let out = std::path::PathBuf::from(&config().out);
+            let _ = std::fs::create_dir_all(&out);
+            let mut runner = e2e::Runner::new(steps, out);
+            runner.tag = boot.tag;
+            self.e2e = Some(runner);
+            // Windowed: a real timer paces the run. Virtual time: the draw
+            // cycle does, so ask for the first frame and keep asking.
+            if !virtual_time {
+                self.e2e_timer = cx.start_interval(E2E_TICK_MS / 1000.0);
+            }
+        }
+        self.next_frame = cx.new_next_frame();
+        self.redraw_scoped(cx);
+    }
+
+    /// A mount is still replaying its steps.
+    #[must_use]
+    pub fn replaying(&self) -> bool {
+        self.e2e.is_some()
+    }
+
+    /// Runs the manual pump for every half second of virtual time that has
+    /// passed since it last ran — however far one frame jumped.
+    fn pump_if_due(&mut self, state: &State) {
+        let now = state.world.now();
+        while now >= self.pump_due {
+            state.pump_round();
+            self.pump_due += PUMP_S;
+        }
+    }
+
+    /// One frame of a mount's replay: one step, the way the harness runs
+    /// one per tick. A pending `wait` is consumed whole, together with the
+    /// step after it, so a node needs as many frames as it has steps rather
+    /// than milliseconds. Anything a step did — the hits it changed, the
+    /// hosted widgets it created, the actions its widgets raised (the
+    /// canvas hands those back after this returns) — lands before the next
+    /// step, which waits for the draw. Answers the virtual milliseconds
+    /// advanced, for the springs.
+    fn replay_step(&mut self, cx: &mut Cx) -> f64 {
+        if self.stale_hits {
+            return 0.0;
+        }
+        let Some(r) = &mut self.e2e else {
+            return 0.0;
+        };
+        // A wait before a hit-resolving step gets a frame of its own: the
+        // harness draws throughout a wait, so the click that follows finds
+        // a panel where it settled, not where it was when the wait began.
+        // Before a key, a shot or another wait it is consumed together
+        // with that step.
+        let mut dt = r.pending_wait().max(FRAME_MS);
+        let settle = r.pending_wait() > 0.0 && r.next().is_some_and(e2e::Step::needs_hits);
+        if settle {
+            dt = r.take_wait();
+        }
+        if let Some(state) = self.state.take() {
+            state.advance_clock(dt / 1000.0);
+            self.pump_if_due(&state);
+            self.state = Some(state);
+        }
+        if !settle {
+            self.e2e_tick(cx, dt);
+        }
+        // Every replay frame ends with a draw before the next step: the
+        // clock moved, so did the springs, and a hit-resolving step must
+        // see the state after them, not whatever the budget last drew.
+        self.stale_hits = true;
+        dt
+    }
+
+    /// A mount reached its shot.
+    #[must_use]
+    pub fn arrived(&self) -> bool {
+        self.arrived
+    }
+
+    /// A mount that reached its shot and is not entered: a picture. It
+    /// gets no events, asks for no frames, and never re-runs its widget
+    /// pass until the canvas enters it — that is what keeps a hundred of
+    /// them free.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.mount && self.arrived && !self.active
+    }
+
+    /// The canvas entered (or left) this mount: it may (or may no longer)
+    /// touch the window's IME and key focus, and its clock runs (or stands
+    /// still).
+    pub fn set_active(&mut self, cx: &mut Cx, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active {
+            self.ime_shown = false;
+            self.kick(cx);
+        } else if self.ime_shown {
+            self.ime_shown = false;
+            cx.hide_text_ime();
+        }
+    }
+
+    /// Redraws what this stage draws into — nothing while it is suspended
+    /// under the library: a redraw of the whole window there would mark
+    /// every mount pending on every tick of the script underneath, and the
+    /// render budget would never get past the first few.
+    fn redraw_scoped(&self, cx: &mut Cx) {
+        if self.suspended {
+            return;
+        }
+        redraw_scoped(cx, self.lists, self.mount);
+    }
+
+    /// Whether the stage has come up on a world.
+    #[must_use]
+    pub fn booted(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// The panels library went up over this stage (or came down): while
+    /// up, the stage neither draws nor hears input, and gives up the IME.
+    pub fn set_suspended(&mut self, cx: &mut Cx, on: bool) {
+        if self.suspended == on {
+            return;
+        }
+        self.suspended = on;
+        if on {
+            if self.ime_shown {
+                self.ime_shown = false;
+                cx.hide_text_ime();
+            }
+        } else if self.state.is_some() {
+            self.kick(cx);
+        }
+        cx.redraw_all();
+    }
+
+    /// Where a mount draws: its own draw list and the canvas's, so its
+    /// redraws stay scoped.
+    pub fn set_lists(&mut self, own: DrawListId, canvas: DrawListId) {
+        self.lists = Some((own, canvas));
+    }
+
     /// The live content widget for a panel, instantiated from its kind's
     /// template on first use (mirrors PortalList::item).
     fn hosted_widget(
@@ -4139,6 +4685,21 @@ impl Stage {
 
 impl Widget for Stage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        // A frozen mount is a picture: nothing to hear, nothing to ask for.
+        if self.frozen() {
+            return;
+        }
+        // Under the library: the world keeps turning (timers, the store's
+        // signals, a running script), the window is not this stage's.
+        if self.suspended
+            && !matches!(
+                event,
+                Event::Startup | Event::Timer(_) | Event::Signal | Event::MacosMenuCommand(_)
+            )
+            && !(matches!(event, Event::NextFrame(_)) && self.e2e.is_some())
+        {
+            return;
+        }
         // Retained content (CR-002): hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
         // handlers instead (so the e2e paths share the exact route);
@@ -4198,72 +4759,14 @@ impl Widget for Stage {
         if let Event::Actions(actions) = event {
             self.handle_panel_actions(cx, actions);
         }
-        if matches!(event, Event::Startup) {
-            if self.state.is_none() {
-                let path = db_path(cx);
-                let store = Store::open(path.as_deref()).unwrap_or_else(|e| {
-                    panic!("store: opening {path:?} failed: {e}")
-                });
-                // Seeding is a write, so under replication it waits for this
-                // device to resolve as the holder (a follower installs the
-                // holder's snapshot instead of seeding its own). Without a
-                // bucket, seed at boot as before.
-                if config().bucket.is_none() {
-                    if let Err(e) = mail::seed_if_empty(&store) {
-                        eprintln!("store: seeding demo mail failed: {e}");
-                    }
-                }
-                // A delivered send can no longer be undone — the walk
-                // marks it expired and steps past.
-                let mut s = State::new(store, path);
-                s.failed_seen = mail::outbox_failures(&s.store).len();
-                s.spawn_workers();
-                s.sync();
-                self.state = Some(Box::new(s));
-                // Belt and braces under the worker signal: a coarse poll so
-                // a lost wake can never strand the UI on cached rows.
-                // Headless: no worker threads, so no foreign commits to
-                // poll for — and a wall-clock interval would be the last
-                // thing reading a clock the script does not control.
-                #[cfg(not(headless))]
-                {
-                    self.poll_timer = cx.start_interval(2.0);
-                }
-            }
-            if let Some(path) = &config().e2e {
-                match std::fs::read_to_string(path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|s| e2e::parse(&s))
-                {
-                    Ok(steps) => {
-                        let out = std::path::PathBuf::from(&config().out);
-                        let _ = std::fs::create_dir_all(&out);
-                        eprintln!("e2e: {} step(s) from {path}", steps.len());
-                        self.e2e = Some(e2e::Runner::new(steps, out));
-                        // Windowed: a real timer paces the run. Headless:
-                        // the draw cycle does, so ask for the first frame
-                        // and keep asking.
-                        #[cfg(not(headless))]
-                        {
-                            self.e2e_timer = cx.start_interval(0.03);
-                        }
-                        #[cfg(headless)]
-                        {
-                            self.next_frame = cx.new_next_frame();
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("e2e: {path}: {e}");
-                        std::process::exit(2);
-                    }
-                }
-            }
-            self.next_frame = cx.new_next_frame();
-            cx.redraw_all();
+        // The window's own stage boots from argv — unless the panels
+        // library owns the window, in which case it boots mounts instead
+        // and this stage stays empty.
+        if matches!(event, Event::Startup) && !self.mount && config().library.is_none() {
+            self.boot(cx, Boot::primary(cx));
         }
         if let Event::Timer(te) = event {
             if self.e2e_timer.0 != 0 && te.timer_id == self.e2e_timer.0 {
-                #[cfg(not(headless))]
                 self.e2e_tick(cx, E2E_TICK_MS);
             }
             if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
@@ -4290,7 +4793,7 @@ impl Widget for Stage {
                     self.ime_guard_tries -= 1;
                     log!("ime guard: re-issuing keyboard show");
                     cx.hide_text_ime();
-                    cx.redraw_all();
+                    self.redraw_scoped(cx);
                     if self.ime_guard_tries > 0 {
                         self.ime_guard_timer = cx.start_timeout(0.5);
                     }
@@ -4305,7 +4808,7 @@ impl Widget for Stage {
                 // carves out. The next draw picks up both.
                 let ins = e.new_geom.safe_area_insets;
                 self.insets = (ins.top, ins.right, ins.bottom, ins.left);
-                cx.redraw_all();
+                self.redraw_scoped(cx);
             }
 
             Event::TouchUpdate(e) => self.touch_update(cx, e),
@@ -4363,6 +4866,8 @@ impl Widget for Stage {
                         state.overlay = Overlay::History;
                     }
                     self.kick(cx);
+                } else if id == MENU_LIBRARY {
+                    cx.action(DevAction::ToggleLibrary);
                 }
             }
 
@@ -4418,7 +4923,7 @@ impl Widget for Stage {
                 cx.set_cursor(act.map(|(_, c)| c).unwrap_or(MouseCursor::Default));
                 if new_hover != state.hover {
                     state.hover = new_hover;
-                    cx.redraw_all();
+                    self.redraw_scoped(cx);
                 }
             }
 
@@ -4465,39 +4970,82 @@ impl Widget for Stage {
             }
 
             Event::NextFrame(ne) => {
-                if !ne.set.contains(&self.next_frame) {
+                // A replaying mount ticks whenever the canvas hands it a
+                // frame: the canvas decides which mount replays when, so
+                // the frame it asked for may long since have gone by.
+                if !ne.set.contains(&self.next_frame) && !(self.mount && self.e2e.is_some()) {
                     return;
                 }
-                // Headless: one draw cycle is one e2e tick of exactly
+                // Virtual time: one draw cycle is one e2e tick of exactly
                 // FRAME_MS, and the run keeps the loop turning by asking
                 // for the next frame every time. No wall clock anywhere.
-                #[cfg(headless)]
-                if self.e2e.is_some() {
-                    if let Some(state) = self.state.as_deref() {
-                        state.clock.advance(FRAME_MS / 1000.0);
-                        self.frame += 1;
-                        // The manual pump, on a fixed cadence: a sync and
-                        // send round every PUMP_EVERY frames, so the engine
-                        // advances with the script rather than beside it.
-                        if self.frame % PUMP_EVERY == 0 {
-                            let w = state.world.clone();
-                            sync::tick(&w);
-                            crate::send::outbox_pass(&w);
-                            w.run_effects();
-                        }
+                //
+                // A mount replaying its steps fast-forwards: a pending
+                // `wait` is consumed whole, so a node reaches its state in
+                // as many frames as it has steps rather than as many as it
+                // has milliseconds. An entered mount keeps its clock moving,
+                // so its toasts fade and its deadlines pass; every other
+                // mount stands still at its state.
+                //
+                // Entered in a window, a mount is worked by hand: it ticks
+                // on the wall clock like the window's own stage, so a late
+                // frame skips ahead instead of stretching every spring —
+                // on frames, a slow frame is slow motion. Replays and
+                // headless runs keep the fixed step: that is what makes
+                // them reproducible.
+                let virtual_time = self.state.as_deref().is_some_and(|s| s.virtual_time);
+                let by_hand =
+                    !cfg!(headless) && self.mount && self.active && self.e2e.is_none();
+                let ticking =
+                    virtual_time && (self.e2e.is_some() || (self.mount && self.active));
+                let mut dt_ms = FRAME_MS;
+                if by_hand {
+                    if let Some(state) = self.state.as_deref_mut() {
+                        let now = Instant::now();
+                        dt_ms = state
+                            .last_frame
+                            .map(|t| (now - t).as_secs_f64())
+                            .unwrap_or(1.0 / 60.0)
+                            .clamp(0.0, 1.0 / 20.0)
+                            * 1000.0;
+                        state.last_frame = Some(now);
                     }
-                    // Device sync advances from `e2e_tick` (the one driver
-                    // every headless path shares), so it is not repeated here.
-                    self.e2e_tick(cx, FRAME_MS);
-                    self.next_frame = cx.new_next_frame();
+                }
+                if ticking {
+                    if self.mount && self.e2e.is_some() {
+                        dt_ms = self.replay_step(cx);
+                    } else {
+                        if let Some(state) = self.state.take() {
+                            state.advance_clock(dt_ms / 1000.0);
+                            // The manual pump, on a fixed cadence: a sync
+                            // and send round every half second of virtual
+                            // time, so the engine advances with the script
+                            // rather than beside it. The primary counts
+                            // frames — the cadence every suite's
+                            // screenshots were taken on; an entered mount
+                            // counts seconds, like its replay did.
+                            if self.mount {
+                                self.pump_if_due(&state);
+                            } else {
+                                self.frame += 1;
+                                if self.frame % PUMP_EVERY == 0 {
+                                    state.pump_round();
+                                }
+                            }
+                            self.state = Some(state);
+                        }
+                        self.e2e_tick(cx, dt_ms);
+                    }
+                    if self.e2e.is_some() {
+                        self.next_frame = cx.new_next_frame();
+                    }
                 }
                 let Some(state) = self.state.as_deref_mut() else {
                     return;
                 };
-                #[cfg(headless)]
-                let dt = FRAME_MS / 1000.0;
-                #[cfg(not(headless))]
-                let dt = {
+                let dt = if virtual_time {
+                    dt_ms / 1000.0
+                } else {
                     let now = Instant::now();
                     let dt = state
                         .last_frame
@@ -4569,7 +5117,16 @@ impl Widget for Stage {
                 if springs_active || toast_active || dragging || swiping {
                     self.next_frame = cx.new_next_frame();
                 }
-                cx.redraw_all();
+                if frame_log() && self.mount {
+                    eprintln!(
+                        "mount: tick dt {:.1} ms, springs {}, toast {}, wants a frame {}",
+                        dt * 1000.0,
+                        springs_active,
+                        toast_active,
+                        springs_active || toast_active || dragging || swiping
+                    );
+                }
+                self.redraw_scoped(cx);
                 // Mutates the world, so it runs after the frame's own
                 // bookkeeping rather than in the middle of it.
                 self.settle_row_swipe(cx);
@@ -4588,6 +5145,10 @@ impl Widget for Stage {
                 ..self.layout
             },
         );
+        if self.suspended {
+            cx.end_turtle_with_area(&mut self.area);
+            return DrawStep::done();
+        }
         // The workspace lives inside the safe area (zero on desktop). Android
         // additionally swallows touches in the notification-shade pull zone
         // at the very top of the window (~22 dp observed on gesture nav), so
@@ -4660,8 +5221,21 @@ impl Widget for Stage {
         self.hits.clear();
         let mut state = self.state.take();
         if let Some(state) = state.as_deref_mut() {
-            self.draw_scene(cx, state, vp);
-            if !self.reported {
+            let t0 = frame_log().then(Instant::now);
+            match self.solo {
+                Some(pid) => self.draw_solo(cx, state, vp, pid),
+                None => self.draw_scene(cx, state, vp),
+            }
+            if let Some(t0) = t0 {
+                eprintln!(
+                    "{}: draw {:.2} ms, {} panels, {} hits",
+                    if self.mount { "mount" } else { "superapp" },
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    state.ws.panels.len(),
+                    self.hits.len()
+                );
+            }
+            if !self.reported && !self.mount {
                 self.reported = true;
                 eprintln!(
                     "superapp: first frame — {} panels, viewport {:.0}×{:.0}, cell {:.2}×{:.2}",
@@ -4674,6 +5248,8 @@ impl Widget for Stage {
             }
         }
         self.state = state;
+        // Drawn: a mount's replay may take its next step.
+        self.stale_hits = false;
 
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
@@ -4685,6 +5261,23 @@ impl Widget for Stage {
 // ---------------------------------------------------------------------------
 
 impl Stage {
+    /// A panel node (CR-006): the one panel at the whole viewport, then
+    /// the sheet over it — so the archive's toast and the launcher still
+    /// show.
+    fn draw_solo(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect, pid: PanelId) {
+        let r = rect(
+            vp.pos.x + theme::GAP,
+            vp.pos.y + theme::GAP,
+            (vp.size.x - 2.0 * theme::GAP).max(40.0),
+            (vp.size.y - 2.0 * theme::GAP).max(40.0),
+        );
+        if state.ws.panel(pid).is_some() {
+            self.draw_panel_full(cx, state, pid, r, 1.0);
+            state.store.trace_end();
+        }
+        self.draw_sheet(cx, state, vp);
+    }
+
     fn draw_scene(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
         // Retained widgets otherwise outlive their panels: a closed panel drops
         // from the workspace, but its entry here would linger — a slow leak,
@@ -4936,6 +5529,11 @@ impl Stage {
             );
         }
 
+        self.draw_sheet(cx, state, vp);
+    }
+
+    /// The modal overlays and the toast, over whatever the stage drew.
+    fn draw_sheet(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect) {
         // The modal overlays share a chassis: an ink wash that owns every
         // hit (a tap outside the sheet dismisses), and the sheet on it.
         // The wash rides the chassis' presence spring, so it fades in and
@@ -5914,6 +6512,45 @@ pub struct App {
     shaped: bool,
     #[rust]
     shape_tries: u32,
+    /// The panels library is up over the workspace (Dev → Panels Library,
+    /// ⇧⌘L; or `--library` from the start).
+    #[rust]
+    library_shown: bool,
+}
+
+impl App {
+    /// Puts the panels library up over the workspace, or away again. The
+    /// stage underneath is suspended rather than torn down — its store,
+    /// sync and script keep running — and comes up on first need: opened
+    /// on the library, the window has no workspace until asked.
+    fn show_library(&mut self, cx: &mut Cx, on: bool) {
+        self.library_shown = on;
+        let stage = self.ui.widget(cx, ids!(stage));
+        let library = self.ui.widget(cx, ids!(library));
+        if on {
+            if let Some(mut st) = stage.borrow_mut::<Stage>() {
+                st.set_suspended(cx, true);
+            }
+            if let Some(mut lib) = library.borrow_mut::<crate::library::Library>() {
+                lib.show(cx);
+            }
+        } else {
+            if let Some(mut lib) = library.borrow_mut::<crate::library::Library>() {
+                lib.hide(cx);
+            }
+            let boot = stage
+                .borrow::<Stage>()
+                .is_some_and(|st| !st.booted())
+                .then(|| Boot::primary(cx));
+            if let Some(mut st) = stage.borrow_mut::<Stage>() {
+                st.set_suspended(cx, false);
+                if let Some(boot) = boot {
+                    st.boot(cx, boot);
+                }
+            }
+        }
+        cx.redraw_all();
+    }
 }
 
 impl MatchEvent for App {
@@ -5953,6 +6590,20 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
+        match event {
+            // Opened on the library: it is up from the first frame, and the
+            // workspace stays unbooted until the toggle asks for it.
+            Event::Startup if library_filter().is_some() => self.show_library(cx, true),
+            Event::Actions(actions)
+                if actions
+                    .iter()
+                    .any(|a| a.downcast_ref::<DevAction>().is_some()) =>
+            {
+                let on = !self.library_shown;
+                self.show_library(cx, on);
+            }
+            _ => {}
+        }
         self.ui.handle_event(cx, event, &mut Scope::empty());
 
         // Enforce the window shape once the widget tree exists: at Startup the
