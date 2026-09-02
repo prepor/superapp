@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use rusqlite::Transaction;
 
-use crate::effect::{Clock, Creds, RemoteMail, Secrets, UidSet, World};
+use crate::effect::{Clock, RemoteMail, Secrets, UidSet, World};
 use crate::mail;
 
 /// How many most-recent messages a folder retains on first contact (and
@@ -55,31 +55,24 @@ pub fn sync_account(w: &World, account: i64) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// If the account has no host, no password, or the server refuses.
+/// If the account has no host, no usable secret (a keychain password, or a
+/// live OAuth grant), or the server refuses.
 pub fn connect(w: &World, account: i64) -> Result<(), String> {
-    let (email, host): (String, String) = w
+    let (email, host, auth): (String, String, String) = w
         .store()
         .conn()
         .query_row(
-            "SELECT email, COALESCE(imap_host, '') FROM account WHERE id = ?1",
+            "SELECT email, COALESCE(imap_host, ''), COALESCE(auth, '') FROM account WHERE id = ?1",
             [account],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
     if host.is_empty() {
         return Err("account has no imap host".into());
     }
-    let pass = w
-        .outside(|o| o.secret_get(&email))
-        .ok_or("no password in the keychain")?;
-    w.run(&mail::Connect {
-        account,
-        creds: Creds {
-            host,
-            user: email,
-            pass,
-        },
-    })
+    let creds =
+        w.outside(|o| mail::creds_for(o, &email, &host, auth == crate::oauth::GOOGLE.name))?;
+    w.run(&mail::Connect { account, creds })
 }
 
 /// The push pass: every message whose intent differs from the server —
@@ -260,10 +253,6 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
     let err = |e: rusqlite::Error| e.to_string();
     for rf in w.run(&mail::Folders { account })? {
         let Some(role) = rf.role.clone() else { continue };
-        let meta = w.run(&mail::Meta {
-            account,
-            folder: rf.name.clone(),
-        })?;
 
         // The folder row and what we last knew about it — a short write,
         // no network in sight. Owned copies cross to the writer thread; the
@@ -293,6 +282,26 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
                 Ok((fid, known))
             })
             .map_err(err)?;
+
+        // An all-mail view is a *move target*, not a source. Gmail's
+        // `[Gmail]/All Mail` holds every message the account has, inbox
+        // included, under different uids — and this store gives a message
+        // one folder, so ingesting from it would file a second row for
+        // every mail already mirrored from INBOX. The row above exists so
+        // archive has somewhere to move to (a MOVE into All Mail is exactly
+        // what archiving is on Gmail); the round trips stop here.
+        //
+        // The cost is stated rather than hidden: mail archived on another
+        // device does not appear locally. What this device archives stays,
+        // because the push records the move rather than re-reading it.
+        if rf.all_mail {
+            continue;
+        }
+
+        let meta = w.run(&mail::Meta {
+            account,
+            folder: rf.name.clone(),
+        })?;
 
         let floor = u32::max(1, meta.uidnext.saturating_sub(FETCH_CAP));
         // The server renumbered (or this is first contact): local copies of
@@ -1003,6 +1012,27 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         w
     }
 
+    /// The same world, signed in with Google instead: no password anywhere,
+    /// an OAuth grant, and the account row that says so.
+    fn google_world() -> World {
+        let w = World::fake(mail::registry());
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO account(label, email, imap_host, smtp_host, auth)
+                     VALUES('g','g@gmail.com','imap.gmail.com','smtp.gmail.com','google')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        w.with_fake(|f| {
+            f.grant("g@gmail.com", "ya29.token");
+            f.server(1).folder("INBOX", 7);
+        });
+        w
+    }
+
     fn inbox_rows(w: &World) -> Vec<(String, bool)> {
         let db = w.store().conn();
         let mut stmt = db
@@ -1440,5 +1470,94 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         w.store().write(|tx| crate::store::backfill_html(tx)).unwrap();
         assert!(html_of().expect("backfilled").contains("<b>reading</b>"));
     }
-}
 
+    /// A Gmail account syncs on a bearer token: the session opens with the
+    /// grant's access token, and no password is ever consulted.
+    #[test]
+    fn a_google_account_syncs_on_a_bearer_token() {
+        let w = google_world();
+        w.with_fake(|f| f.server(1).deliver("INBOX", true, RAW));
+        settle(&w);
+        assert_eq!(inbox_rows(&w), vec![("Budget v2".to_string(), true)]);
+
+        // The creds the session actually opened with.
+        let creds = w
+            .outside(|o| mail::creds_for(o, "g@gmail.com", "imap.gmail.com", true).expect("creds"));
+        assert_eq!(creds.auth, crate::effect::Auth::Bearer("ya29.token".into()));
+        assert!(!format!("{creds:?}").contains("ya29"), "{creds:?}");
+    }
+
+    /// Gmail's All Mail holds every message the account has, inbox
+    /// included, under its own uids — so ingesting from it would file a
+    /// second row for every mail already mirrored from INBOX. It is the
+    /// archive role (a MOVE into it *is* archiving on Gmail) and nothing
+    /// more: the folder row exists, and the fetch stops there.
+    #[test]
+    fn gmails_all_mail_is_a_move_target_not_a_source() {
+        let w = google_world();
+        w.with_fake(|f| {
+            f.server(1).folder("[Gmail]/All Mail", 7);
+            f.server(1).as_all_mail("[Gmail]/All Mail");
+            // The same letter, as Gmail shows it: in the inbox, and in All
+            // Mail under a uid of its own.
+            f.server(1).deliver("INBOX", true, RAW);
+            f.server(1).deliver("[Gmail]/All Mail", true, RAW);
+        });
+        settle(&w);
+
+        // One letter, once — and it is the inbox's.
+        assert_eq!(inbox_rows(&w), vec![("Budget v2".to_string(), true)]);
+        let n: i64 = w
+            .store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "All Mail must not file a second copy");
+
+        // But archive has somewhere to go: the folder row is there with the
+        // role, which is what the triage's EXISTS guard looks for.
+        let (name, role): (String, String) = w
+            .store()
+            .conn()
+            .query_row(
+                "SELECT name, role FROM folder WHERE account = 1 AND role = 'archive'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("an archive folder");
+        assert_eq!((name.as_str(), role.as_str()), ("[Gmail]/All Mail", "archive"));
+
+        // A second pass does not change its mind.
+        settle(&w);
+        let n: i64 = w
+            .store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// A grant the human revoked at Google fails honestly rather than
+    /// falling back to a password that does not exist.
+    #[test]
+    fn a_revoked_grant_stops_the_sync_and_says_so() {
+        let w = google_world();
+        w.with_fake(|f| f.revoke("g@gmail.com"));
+        let e = sync_account(&w, 1).unwrap_err();
+        assert!(e.contains("invalid_grant"), "{e}");
+        assert!(inbox_rows(&w).is_empty());
+    }
+
+    /// The mechanism is the account row's, not a guess: a password account
+    /// still logs in with its password, and asking the same world for a
+    /// bearer token for it fails.
+    #[test]
+    fn the_account_row_picks_the_mechanism() {
+        let w = world();
+        let pass =
+            w.outside(|o| mail::creds_for(o, "t@t", "imap.t", false).expect("password creds"));
+        assert_eq!(pass.auth, crate::effect::Auth::Password("pw".into()));
+        let e = w.outside(|o| mail::creds_for(o, "t@t", "imap.t", true).unwrap_err());
+        assert!(e.contains("no grant"), "{e}");
+    }
+}

@@ -426,12 +426,15 @@ CREATE TABLE IF NOT EXISTS repl(
   holding INTEGER NOT NULL DEFAULT 0
 );
 ";
-/// Schema v11 (forward): the mail a draft passes on, beside the one it
-/// answers — the send reads the chain off whichever is set — and the
-/// `$Forwarded` keyword on both sides of the desired/actual split, exactly
-/// as the read flag lives there: `message.forwarded` is intent (set when a
-/// forward has gone), `server_msg.forwarded` is what the server holds, and
-/// their disagreement is pushed like any other.
+/// Schema v11: the mail a draft passes on, beside the one it answers — the
+/// send reads the chain off whichever is set — the `$Forwarded` keyword on
+/// both sides of the desired/actual split, exactly as the read flag lives
+/// there (`message.forwarded` is intent, `server_msg.forwarded` is what the
+/// server holds, and their disagreement is pushed like any other), and how
+/// an account authenticates.
+///
+/// Two branches landed columns under this one number, which is exactly the
+/// case the mechanism below exists for.
 ///
 /// Applied by **presence**, not by the counter alone: every branch shares
 /// the one store and its one `user_version`, so a store whose counter was
@@ -461,6 +464,14 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
         "keywords",
         "ALTER TABLE folder ADD COLUMN keywords INTEGER NOT NULL DEFAULT 1",
     ),
+    // How an account authenticates: NULL and 'password' both mean an app
+    // password in the keychain — every row written before this — and
+    // 'google' means an OAuth grant, whose refresh token lives under its
+    // own keychain key (`crate::oauth::refresh_key`) and whose access token
+    // is never written down at all. A column rather than a table because it
+    // is one word per account, and because the *secret* — the part a second
+    // row would be about — is exactly what must not be in the store.
+    ("account", "auth", "ALTER TABLE account ADD COLUMN auth TEXT"),
 ];
 
 /// Whether the store has `table` — what the table steps of the ladder go by.
@@ -1679,6 +1690,7 @@ mod tests {
              ALTER TABLE server_msg DROP COLUMN forwarded;
              ALTER TABLE draft DROP COLUMN fwd_message;
              ALTER TABLE folder DROP COLUMN keywords;
+             ALTER TABLE account DROP COLUMN auth;
              DROP TABLE repl_log;
              DROP TABLE repl;",
         )

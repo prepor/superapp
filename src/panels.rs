@@ -126,6 +126,13 @@ pub enum PanelAction {
         smtp: String,
     },
     RemoveAccount(i64),
+    /// Sign in to Gmail: the shell opens the browser, waits for the
+    /// loopback redirect on a thread of its own, and adds the account when
+    /// it lands (see [`crate::oauth`]).
+    GoogleSignIn {
+        /// The add-account panel that asked — where the flow reports back.
+        pid: u64,
+    },
     /// A compose panel's fields changed — the shell persists the draft
     /// (plain upkeep, not an action).
     DraftEdited {
@@ -744,15 +751,36 @@ script_mod! {
             View { width: Fill, height: 1 }
             remove_btn := mod.widgets.SBtn { text: "remove" }
         }
-        // The status line hangs under the address, on the same edge.
-        status_lbl := mod.widgets.SLabel {
+        // The status line hangs under the address, on the same edge —
+        // selectable and wrapping, both for the same reason: a sync error
+        // is the one line here a human needs to *act* on, to carry to a
+        // search or to read the whole of. A Label would clip it at the
+        // panel's edge and refuse the drag. (`SText` is the read-only
+        // TextInput the selectable content of CR-003 is made of.)
+        status_lbl := mod.widgets.SText {
+            width: Fill, is_multiline: true
             margin: Inset{top: 6}
-            text: "", draw_text +: { color: #909090 }
+            text: ""
+            draw_text +: {
+                color: #909090
+                color_hover: #909090
+                color_focus: #909090
+                color_down: #909090
+                color_empty: #909090
+            }
         }
-        status_err_lbl := mod.widgets.SLabel {
+        status_err_lbl := mod.widgets.SText {
             visible: false
+            width: Fill, is_multiline: true
             margin: Inset{top: 6}
-            text: "", draw_text +: { color: #a01500 }
+            text: ""
+            draw_text +: {
+                color: #a01500
+                color_hover: #a01500
+                color_focus: #a01500
+                color_down: #a01500
+                color_empty: #a01500
+            }
         }
         View { width: Fill, height: 8 }
         View {
@@ -795,14 +823,50 @@ script_mod! {
         add_link := mod.widgets.SLink {}
     }
 
-    /** The add-account form, a panel of its own: four labelled fields and
-        the one button, top-aligned in a compact panel. */
+    /** The add-account form, a panel of its own: the Google sign-in above,
+        then four labelled fields and the one button, top-aligned in a
+        compact panel.
+
+        Google first because it is one press against four fields — and
+        because a Gmail address typed into the form below cannot work at
+        all: Google stopped accepting passwords on IMAP. */
     mod.widgets.AddAccountPanel = set_type_default() do #(AddAccountPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "GOOGLE" }
+            google_btn := mod.widgets.SBtn { text: "sign in with google" }
+        }
+        // The one line the flow speaks through: what it is waiting for,
+        // who signed in, or why it could not. Hidden until it has
+        // something to say — an empty line would still take its height.
+        // The 82-wide spacer is the same one the section labels are, so the
+        // line starts where the fields below it do rather than at a margin
+        // guessed to match.
+        View { width: Fill, height: 5 }
+        View {
+            width: Fill, height: Fit
+            View { width: 82, height: 1 }
+            google_lbl := mod.widgets.SLabel {
+                visible: false
+                width: Fill
+                text: "", draw_text +: { color: #909090 }
+            }
+            google_err_lbl := mod.widgets.SLabel {
+                visible: false
+                width: Fill
+                text: "", draw_text +: { color: #a01500 }
+            }
+        }
+        View { width: Fill, height: 12 }
+        View { width: Fill, height: 1, show_bg: true, draw_bg +: { color: #dcdcdc
+            pixel: fn() { return vec4(self.color.xyz * self.color.w, self.color.w) } } }
+        View { width: Fill, height: 12 }
 
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
@@ -2126,8 +2190,8 @@ impl AccountRowRef {
         );
         let status = a.status.clone().unwrap_or_else(|| "never synced".into());
         let err = status.starts_with("error");
-        let ok_lbl = row.view.label(cx, ids!(status_lbl));
-        let err_lbl = row.view.label(cx, ids!(status_err_lbl));
+        let ok_lbl = row.view.text_input(cx, ids!(status_lbl));
+        let err_lbl = row.view.text_input(cx, ids!(status_err_lbl));
         ok_lbl.set_text(cx, if err { "" } else { &status });
         ok_lbl.set_visible(cx, !err);
         err_lbl.set_text(cx, if err { &status } else { "" });
@@ -2323,11 +2387,35 @@ impl AddAccountPanel {
         ]
     }
 
-    /// The tab ring in visual order: the fields, the add button.
+    /// The tab ring in visual order: the Google button, the fields, the
+    /// add button.
     fn ring(&self, cx: &mut Cx) -> Vec<RingStop> {
-        let mut v: Vec<RingStop> = self.inputs(cx).into_iter().map(RingStop::Input).collect();
+        let mut v = vec![RingStop::Add(self.view.button(cx, ids!(google_btn)))];
+        v.extend(self.inputs(cx).into_iter().map(RingStop::Input));
         v.push(RingStop::Add(self.view.button(cx, ids!(add_btn))));
         v
+    }
+
+    /// What the Google flow has to say, if anything. The shell owns the
+    /// flow and pokes the line in at each step, the way it pokes the form
+    /// clear — a retained widget keeps it until the next word.
+    pub fn set_google(&mut self, cx: &mut Cx, line: &str, err: bool) {
+        for (id, mine) in [(ids!(google_lbl), !err), (ids!(google_err_lbl), err)] {
+            let l = self.view.label(cx, id);
+            l.set_text(cx, if mine { line } else { "" });
+            l.set_visible(cx, mine && !line.is_empty());
+        }
+        self.redraw(cx);
+    }
+
+    /// The Google line as drawn: what the e2e bridge reads back, and `None`
+    /// while the flow has said nothing.
+    pub fn google_line(&self, cx: &mut Cx) -> Option<String> {
+        [ids!(google_lbl), ids!(google_err_lbl)]
+            .into_iter()
+            .map(|id| self.view.label(cx, id))
+            .find(|l| l.visible())
+            .map(|l| l.text())
     }
 
     fn submit(&mut self, cx: &mut Cx, pid: u64) {
@@ -2373,10 +2461,12 @@ impl Widget for AddAccountPanel {
                 self.redraw(cx);
             }
             if matches!(k.key_code, KeyCode::ReturnKey | KeyCode::Space) {
-                let add = self.view.button(cx, ids!(add_btn));
-                if cx.has_key_focus(add.area()) {
-                    let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                if cx.has_key_focus(self.view.button(cx, ids!(add_btn)).area()) {
                     self.submit(cx, pid);
+                }
+                if cx.has_key_focus(self.view.button(cx, ids!(google_btn)).area()) {
+                    cx.action(PanelAction::GoogleSignIn { pid });
                 }
             }
         }
@@ -2402,6 +2492,10 @@ impl Widget for AddAccountPanel {
             {
                 let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
                 self.submit(cx, pid);
+            }
+            if self.view.button(cx, ids!(google_btn)).clicked(actions) {
+                let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+                cx.action(PanelAction::GoogleSignIn { pid });
             }
         }
     }

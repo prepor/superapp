@@ -584,6 +584,8 @@ enum Act {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WidgetOp {
     AddAccount,
+    /// Press "sign in with google" on the add-account panel.
+    GoogleSignIn,
     RemoveAccount(i64),
     OpenMail(i64),
     /// The `i`-th row of a field's autocomplete (CR-006): the inbox
@@ -1076,6 +1078,20 @@ struct State {
     grid: Option<core::Grid>,
     /// The send-undo window, seconds.
     send_delay: f64,
+    /// A Gmail sign-in waiting on the browser, if one is out.
+    signin: Option<SignIn>,
+}
+
+/// A Gmail sign-in in flight. The consent takes as long as a human takes,
+/// so the flow's blocking half lives on a thread of its own and drops its
+/// answer here; the shell picks it up on the next UI signal, and creates
+/// the account on the thread that owns the store — the same one the manual
+/// form writes on.
+struct SignIn {
+    /// The panel that asked, and where the status line goes.
+    pid: PanelId,
+    /// `None` until the thread is done.
+    slot: std::sync::Arc<std::sync::Mutex<Option<Result<crate::oauth::Signed, String>>>>,
 }
 
 /// Where a virtual clock starts: the instant a headless run and every
@@ -1196,6 +1212,7 @@ impl State {
                 device: String::new(),
             },
             seeded: false,
+            signin: None,
             // Headless: no threads at all. The passes run inline from the
             // frame loop, so ingest, push and send land at frame
             // Virtual time: no threads at all. The passes run inline from
@@ -1707,6 +1724,51 @@ impl State {
             }
             None => {}
         }
+    }
+
+    /// The account already holding this address, if any. Two rows for one
+    /// mailbox would mean two workers fetching the same mail into the same
+    /// store — and for a Gmail sign-in, an existing row is not an error but
+    /// the ordinary case: signing in again is how a grant is renewed.
+    fn account_for(&self, email: &str) -> Option<mail::Account> {
+        mail::accounts(&self.store)
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(email))
+            .cloned()
+    }
+
+    /// Files the account row as an undoable action and claims the intent.
+    /// The new row's id comes back from `act` (the write runs on the
+    /// store's writer thread), so the claim needs no shared cell.
+    ///
+    /// Both doors come through here — the password form and the end of a
+    /// Gmail sign-in — because what differs between them is one word.
+    fn add_account(&mut self, email: &str, imap: &str, smtp: &str, auth: &str) -> i64 {
+        let (e, i, sm, au) = (
+            email.to_string(),
+            imap.to_string(),
+            smtp.to_string(),
+            auth.to_string(),
+        );
+        let id = self
+            .act(
+                "account",
+                format!("add account {email}"),
+                None,
+                |_| {},
+                move |tx| mail::add_account_tx(tx, &e, &i, &sm, &au),
+                Vec::new(),
+            )
+            .unwrap_or(0);
+        self.history.claim(Box::new(mail::AccountAdded {
+            id,
+            email: email.to_string(),
+            imap: imap.to_string(),
+            smtp: smtp.to_string(),
+            auth: auth.to_string(),
+        }));
+        self.spawn_workers();
+        id
     }
 
     fn spawn_workers(&mut self) {
@@ -3097,6 +3159,153 @@ impl Stage {
         self.tick_repl(cx);
     }
 
+    /// Opens the browser on Google's consent page and puts the flow's
+    /// blocking half on a thread.
+    ///
+    /// The split is forced and it is the right one: binding the loopback
+    /// listener and minting the PKCE pair are instant and must happen
+    /// before the browser opens (a redirect to a closed port is lost), and
+    /// waiting for a human is not something the UI thread may do.
+    fn start_google_signin(&mut self, cx: &mut Cx, pid: PanelId) {
+        // A script never leaves for a browser: the consent round trip needs
+        // Google and a human, and a suite that opened Safari would be
+        // neither headless nor reproducible. What a script *can* prove is
+        // everything up to that door, so the refusal speaks on the same
+        // line a real failure would.
+        if config().e2e.is_some() {
+            self.say_google(cx, pid, "sign-in needs a real run, not a script", true);
+            return;
+        }
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        // One at a time. A second press would orphan the first listener and
+        // burn the consent it is still waiting for.
+        if state.signin.is_some() {
+            self.say_google(cx, pid, "a sign-in is already waiting", false);
+            return;
+        }
+        // Where the client registration lives: beside the store, which is
+        // also where the keychain fallback writes.
+        let dir = state
+            .db_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf);
+        let started = dir
+            .ok_or_else(|| "no store file — accounts need one".to_string())
+            .and_then(|d| crate::oauth::Client::load(&d))
+            .and_then(|c| crate::oauth::Flow::start(c, crate::oauth::GOOGLE));
+        let flow = match started {
+            Ok(f) => f,
+            Err(e) => {
+                self.say_google(cx, pid, &e, true);
+                return;
+            }
+        };
+
+        let url = flow.url();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (into, clock) = (slot.clone(), state.clock.clone());
+        if let Err(e) = std::thread::Builder::new()
+            .name("google-signin".into())
+            .spawn(move || {
+                let r = flow.wait(clock.read());
+                if let Ok(mut g) = into.lock() {
+                    *g = Some(r);
+                }
+                SignalToUI::set_ui_signal();
+            })
+        {
+            self.say_google(cx, pid, &format!("could not start the sign-in: {e}"), true);
+            return;
+        }
+        state.signin = Some(SignIn { pid, slot });
+        cx.open_url(&url, OpenUrlInPlace::No);
+        self.say_google(cx, pid, "waiting for google in the browser…", false);
+    }
+
+    /// Picks up a finished sign-in: the grant goes to the keychain and the
+    /// account row is written here, on the thread that owns the store.
+    fn tick_signin(&mut self, cx: &mut Cx) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let Some(sign) = state.signin.as_ref() else {
+            return;
+        };
+        let pid = sign.pid;
+        let Some(done) = sign.slot.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        state.signin = None;
+
+        let (line, err) = match done {
+            Err(e) => (e, true),
+            Ok(signed) => {
+                // The refresh token is the account; the access token the
+                // flow also came back with is deliberately dropped, since
+                // the session that needs one lives on a worker thread with
+                // a cache of its own.
+                let kept = state
+                    .world
+                    .run(&crate::effect::SecretSet {
+                        email: &crate::oauth::refresh_key(&signed.email),
+                        pass: &signed.refresh,
+                    })
+                    .is_ok();
+                let g = crate::oauth::GOOGLE;
+                match (kept, state.account_for(&signed.email)) {
+                    (false, _) => ("storing the google grant failed".to_string(), true),
+                    // Signing in again is how an expired or revoked grant is
+                    // renewed, and by here the new refresh token is already
+                    // in the keychain — so this is the success it looks
+                    // like, not a duplicate. The worker picks the new token
+                    // up on its next connect.
+                    (true, Some(a)) if a.auth.as_deref() == Some(g.name) => {
+                        state.pump.kick();
+                        state.toast(format!("{} signed in again", signed.email), false);
+                        (format!("signed in again as {}", signed.email), false)
+                    }
+                    // The same address already here with a password. Its
+                    // hosts are that other provider's, so this cannot just
+                    // flip a column — and removing the row to re-add it
+                    // would take its mail with it. The human decides.
+                    (true, Some(_)) => (
+                        format!(
+                            "{} is already a password account — remove it first to \
+                             sign in with google",
+                            signed.email
+                        ),
+                        true,
+                    ),
+                    (true, None) => {
+                        state.add_account(&signed.email, g.imap, g.smtp, g.name);
+                        state.toast(format!("{} added — syncing", signed.email), false);
+                        (format!("signed in as {}", signed.email), false)
+                    }
+                }
+            }
+        };
+        self.say_google(cx, pid, &line, err);
+        cx.redraw_all();
+    }
+
+    /// Puts one line on the add-account panel's Google row. Also a toast
+    /// when it is a failure: the panel may not be on screen any more.
+    fn say_google(&mut self, cx: &mut Cx, pid: PanelId, line: &str, err: bool) {
+        if err {
+            if let Some(state) = self.state.as_deref_mut() {
+                state.toast(line.to_string(), true);
+            }
+        }
+        if let Some(w) = self.hosted.get(&pid) {
+            if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
+                ap.set_google(cx, line, err);
+            }
+        }
+    }
+
     /// Runs (production: reads) one device-sync pass and reacts: on a role
     /// change, announce it, reload the layout (an install or materialize may
     /// have replaced rows), and redraw so the locked screen appears or clears.
@@ -3512,6 +3721,9 @@ impl Stage {
                                 });
                             }
                         }
+                    }
+                    WidgetOp::GoogleSignIn => {
+                        cx.action(crate::panels::PanelAction::GoogleSignIn { pid });
                     }
                     WidgetOp::RemoveAccount(id) => {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
@@ -4216,7 +4428,9 @@ impl Stage {
                         // Standalone widgets own their taps (the mouse
                         // rule): resolving the semantic op here too would
                         // double-fire.
-                        Act::WidgetOp(pid, WidgetOp::AddAccount) => Act::Pointer(pid),
+                        Act::WidgetOp(pid, WidgetOp::AddAccount | WidgetOp::GoogleSignIn) => {
+                            Act::Pointer(pid)
+                        }
                         a => a,
                     };
                     self.resolve_click(cx, act, false);
@@ -4681,6 +4895,8 @@ impl Stage {
                         state.toast("address, password and imap host are required", true);
                     } else if state.db_path.is_none() {
                         state.toast("no store file — accounts need one", true);
+                    } else if state.account_for(&email).is_some() {
+                        state.toast(format!("{email} is already an account"), true);
                     } else {
                         let stored = state
                             .world
@@ -4692,27 +4908,7 @@ impl Stage {
                         if !stored {
                             state.toast("storing the password failed", true);
                         } else {
-                            // The new row's id comes back from `act` (the
-                            // write runs on the store's writer thread), so
-                            // the claim needs no shared cell.
-                            let (e, i, sm) = (email.clone(), imap.clone(), smtp.clone());
-                            let added = state
-                                .act(
-                                    "account",
-                                    format!("add account {email}"),
-                                    None,
-                                    |_| {},
-                                    move |tx| mail::add_account_tx(tx, &e, &i, &sm),
-                                    Vec::new(),
-                                )
-                                .unwrap_or(0);
-                            state.history.claim(Box::new(mail::AccountAdded {
-                                id: added,
-                                email: email.clone(),
-                                imap: imap.clone(),
-                                smtp: smtp.clone(),
-                            }));
-                            state.spawn_workers();
+                            state.add_account(&email, &imap, &smtp, crate::oauth::PASSWORD);
                             state.toast("account added — syncing", false);
                             if let Some(w) = self.hosted.get(&pid) {
                                 if let Some(mut ap) = w.as_add_account_panel().borrow_mut() {
@@ -4721,6 +4917,10 @@ impl Stage {
                             }
                         }
                     }
+                    refresh = true;
+                }
+                crate::panels::PanelAction::GoogleSignIn { pid } => {
+                    self.start_google_signin(cx, pid);
                     refresh = true;
                 }
                 crate::panels::PanelAction::DraftEdited {
@@ -5258,7 +5458,10 @@ impl Widget for Stage {
             // A sync worker committed. The platform already consumed the
             // ui-signal flag before delivering this event (macos.rs checks
             // and clears it itself) — so never re-check it here, just poll.
-            Event::Signal => self.poll_store(cx),
+            Event::Signal => {
+                self.tick_signin(cx);
+                self.poll_store(cx);
+            }
 
             // Device-sync lease lifecycle (CR-005): hand the lease back when
             // this device steps away, so the other can take over without an
@@ -5395,7 +5598,9 @@ impl Widget for Stage {
                     // button) keep their native path — resolving those here
                     // as well would double-fire.
                     let act = match act {
-                        Act::WidgetOp(pid, WidgetOp::AddAccount) => Act::Pointer(pid),
+                        Act::WidgetOp(pid, WidgetOp::AddAccount | WidgetOp::GoogleSignIn) => {
+                            Act::Pointer(pid)
+                        }
                         a => a,
                     };
                     self.resolve_click(cx, act, fresh);
@@ -6678,7 +6883,13 @@ impl Stage {
                                 ));
                             }
                         }
-                        // The row's selectable runs (CR-003).
+                        // The row's selectable runs (CR-003) — the status
+                        // line among them, because a sync error is the one
+                        // line here worth carrying somewhere else.
+                        let status = accounts
+                            .get(*idx)
+                            .map(|a| a.status.clone().unwrap_or_else(|| "never synced".into()));
+                        let err = status.as_deref().is_some_and(|s| s.starts_with("error"));
                         for (path, text) in [
                             (ids!(email_lbl), accounts.get(*idx).map(|a| a.email.clone())),
                             (
@@ -6690,6 +6901,8 @@ impl Stage {
                                         .unwrap_or_else(|| "local demo".into())
                                 }),
                             ),
+                            (ids!(status_lbl), status.clone().filter(|_| !err)),
+                            (ids!(status_err_lbl), status.filter(|_| err)),
                         ] {
                             let rr = item.widget.widget(cx, path).area().rect(cx);
                             if rr.size.x > 0.0 {
@@ -6720,6 +6933,31 @@ impl Stage {
                         add_r,
                         Act::WidgetOp(pid, WidgetOp::AddAccount),
                     ));
+                }
+                let g_r = w.widget(cx, ids!(google_btn)).area().rect(cx);
+                if g_r.size.x > 0.0 {
+                    reg.push((
+                        "sign in with google".to_string(),
+                        g_r,
+                        Act::WidgetOp(pid, WidgetOp::GoogleSignIn),
+                    ));
+                }
+                // Whatever the flow last said, so a script can assert on it
+                // instead of on a screenshot.
+                let google_line = w
+                    .as_add_account_panel()
+                    .borrow_mut()
+                    .and_then(|ap| ap.google_line(cx));
+                if let Some(line) = google_line.filter(|l| !l.is_empty()) {
+                    // Only one of the two lines is ever visible, so whichever
+                    // has a rect is the one being drawn.
+                    let r = [ids!(google_lbl), ids!(google_err_lbl)]
+                        .into_iter()
+                        .map(|id| w.widget(cx, id).area().rect(cx))
+                        .find(|r| r.size.x > 0.0);
+                    if let Some(r) = r {
+                        reg.push((line, r, Act::Pointer(pid)));
+                    }
                 }
             }
             Some(Kind::Compose { .. }) => {

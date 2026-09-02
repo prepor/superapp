@@ -38,6 +38,12 @@ directly:
   android without ceremony. All engine logic runs against an `Outside`
   backend, so the whole sync/reconcile machinery is unit-tested against an
   in-memory fake server, keychain and clock.
+- **Gmail sign-in adds no HTTP client.** OAuth needs two POSTs to Google's
+  token endpoint, and that is written on `rustls-connector` — the TLS layer
+  `imap`'s rustls feature already pulls in. `ring` (rustls' own crypto)
+  carries PKCE's SHA-256 and its randomness, and `base64` is the XOAUTH2
+  envelope. All three were already in the graph; promoting them to direct
+  dependencies costs nothing to compile and is honest about what is used.
 - The **macOS menu bar** is makepad's own `MacosMenu` API
   (`cx.update_macos_menu`, clicks arrive as `Event::MacosMenuCommand`); the
   workspace menus rebuild only when the roster or the active space changes.

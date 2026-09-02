@@ -152,9 +152,9 @@ static Q_ME: Q = Q {
 
 static Q_ACCOUNTS: Q = Q {
     id: "accounts",
-    sql: "SELECT id, label, email, imap_host, smtp_host, status, synced
+    sql: "SELECT id, label, email, imap_host, smtp_host, status, synced, auth
           FROM account ORDER BY id",
-    describe: "every account with its connection config and sync status",
+    describe: "every account with its connection config, auth and sync status",
 };
 
 static Q_THREAD: Q = Q {
@@ -467,6 +467,9 @@ pub struct Account {
     pub smtp_host: Option<String>,
     pub status: Option<String>,
     pub synced: Option<f64>,
+    /// How it authenticates: `NULL`/`password` for an app password,
+    /// `google` for an OAuth grant. See [`crate::oauth`].
+    pub auth: Option<String>,
 }
 
 fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
@@ -478,6 +481,7 @@ fn account_row(r: &rusqlite::Row) -> rusqlite::Result<Account> {
         smtp_host: r.get(4)?,
         status: r.get(5)?,
         synced: r.get(6)?,
+        auth: r.get(7)?,
     })
 }
 
@@ -486,17 +490,19 @@ pub fn accounts(store: &Store) -> Rc<Vec<Account>> {
     store.rows(&Q_ACCOUNTS, &[], account_row)
 }
 
-/// Creates an account (the add-account form's action). Folders arrive with the
-/// first sync; the password goes to the keychain, never here.
+/// Creates an account (the add-account form's action, and the end of a
+/// Gmail sign-in). Folders arrive with the first sync; the secret — a
+/// password or a refresh token — goes to the keychain, never here.
 pub fn add_account_tx(
     c: &rusqlite::Connection,
     email: &str,
     imap_host: &str,
     smtp_host: &str,
+    auth: &str,
 ) -> rusqlite::Result<i64> {
     c.execute(
-        "INSERT INTO account(label, email, imap_host, smtp_host) VALUES(?1,?1,?2,?3)",
-        rusqlite::params![email, imap_host, smtp_host],
+        "INSERT INTO account(label, email, imap_host, smtp_host, auth) VALUES(?1,?1,?2,?3,?4)",
+        rusqlite::params![email, imap_host, smtp_host, auth],
     )?;
     Ok(c.last_insert_rowid())
 }
@@ -1520,24 +1526,24 @@ impl Effect for Submit {
 
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         let d = load_outgoing(cx.db, self.outbox)?;
-        let pass = cx
-            .out
-            .secret_get(&d.email)
-            .ok_or("no password in the keychain")?;
-        let smtp = Creds {
-            host: d.smtp,
-            user: d.email.clone(),
-            pass: pass.clone(),
-        };
+        let smtp = creds_for(cx.out, &d.email, &d.smtp, d.oauth)?;
         let raw = cx.out.submit(&smtp, &d.mail)?;
+        // Gmail's SMTP files its own copy into Sent Mail, so appending one
+        // would leave the human looking at the same letter twice. The
+        // account's provider is what knows; a plain relay files nothing.
+        if d.oauth && crate::oauth::GOOGLE.files_sent_itself {
+            return Ok(None);
+        }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
             return Ok(Some("no imap host to file to Sent".into()));
         }
+        // The same secret reaches both servers, so the token is not minted
+        // twice — `Creds` is cheap, and the backend's cache is the point.
         let imap = Creds {
             host: d.imap,
             user: d.email,
-            pass,
+            auth: smtp.auth,
         };
         let filed = cx
             .out
@@ -1593,6 +1599,8 @@ struct Outgo {
     smtp: String,
     imap: String,
     sent: String,
+    /// The account authenticates with a bearer token, not a password.
+    oauth: bool,
     mail: Outgoing,
 }
 
@@ -1605,7 +1613,8 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                 (SELECT message_id FROM message
                   WHERE id = COALESCE(d.re_message, d.fwd_message)),
                 (SELECT GROUP_CONCAT(mid, ' ') FROM reference
-                  WHERE message = COALESCE(d.re_message, d.fwd_message))
+                  WHERE message = COALESCE(d.re_message, d.fwd_message)),
+                COALESCE(a.auth, '')
          FROM outbox o
          JOIN account a ON a.id = o.account
          JOIN draft d ON d.panel = o.id
@@ -1633,6 +1642,7 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                 smtp: r.get(2)?,
                 imap: r.get(3)?,
                 sent: r.get(4)?,
+                oauth: r.get::<_, String>(11)? == crate::oauth::GOOGLE.name,
                 mail: Outgoing {
                     to: r.get(5)?,
                     subject: r.get(6)?,
@@ -1651,6 +1661,34 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
             Ok(d)
         }
     })
+}
+
+/// The credentials one account's session opens with.
+///
+/// The account row's `auth` picks the mechanism, and the two secrets live
+/// in different places for different lengths of time: an app password is
+/// read straight out of the keychain, while a Gmail account's bearer token
+/// is minted (or recalled from the process cache) by the backend. Both
+/// sites that open a session — the sync worker and [`Submit`] — come
+/// through here, so neither can drift.
+///
+/// # Errors
+///
+/// If the keychain has no password, or the OAuth grant is gone.
+pub fn creds_for(
+    out: &mut dyn crate::effect::Outside,
+    email: &str,
+    host: &str,
+    oauth: bool,
+) -> Result<Creds, String> {
+    if oauth {
+        Ok(Creds::bearer(host, email, out.access_token(email)?))
+    } else {
+        let pass = out
+            .secret_get(email)
+            .ok_or("no password in the keychain")?;
+        Ok(Creds::password(host, email, pass))
+    }
 }
 
 // -- the mail domain's intents ------------------------------------------------
@@ -1925,6 +1963,9 @@ pub struct AccountAdded {
     pub email: String,
     pub imap: String,
     pub smtp: String,
+    /// The `account.auth` word, so a redo restores a Gmail account as a
+    /// Gmail account rather than as one asking for a password.
+    pub auth: String,
 }
 
 impl Intent for AccountAdded {
@@ -1938,14 +1979,19 @@ impl Intent for AccountAdded {
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let (id, email, imap, smtp) =
-            (self.id, self.email.clone(), self.imap.clone(), self.smtp.clone());
+        let (id, email, imap, smtp, auth) = (
+            self.id,
+            self.email.clone(),
+            self.imap.clone(),
+            self.smtp.clone(),
+            self.auth.clone(),
+        );
         w.store()
             .write(move |c| {
                 c.execute(
-                    "INSERT INTO account(id, label, email, imap_host, smtp_host)
-                     VALUES(?1, ?2, ?2, ?3, ?4)",
-                    rusqlite::params![id, email, imap, smtp],
+                    "INSERT INTO account(id, label, email, imap_host, smtp_host, auth)
+                     VALUES(?1, ?2, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, email, imap, smtp, auth],
                 )
                 .map(|_| ())
             })

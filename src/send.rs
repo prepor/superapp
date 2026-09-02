@@ -415,4 +415,58 @@ mod tests {
             "nobody double-sent"
         );
     }
+
+    /// A Gmail account sends on its bearer token: the submission carries
+    /// the grant, not a password — and there is no password to carry.
+    #[test]
+    fn a_google_account_sends_on_its_token() {
+        let w = World::fake(mail::registry());
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO account(label, email, imap_host, smtp_host, auth)
+                     VALUES('g','g@gmail.com','imap.gmail.com','smtp.gmail.com','google')",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO draft(panel, account, to_addr, subject, body)
+                     VALUES(9, 1, 'x@y', 'Hi', 'Body')",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO outbox(id, account, send_after) VALUES(9, 1, 100.0)",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        w.with_fake(|f| {
+            f.grant("g@gmail.com", "ya29.token");
+            f.clock = 200.0;
+        });
+
+        assert_eq!(outbox_pass(&w), 1);
+        assert_eq!(w.run_effects(), 1);
+        assert_eq!(outbox(&w).0, "sent");
+        let sent = w.with_fake(|f| f.server(1).submitted.clone());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].to, "x@y");
+
+        // And it is filed exactly once: Gmail's SMTP puts its own copy in
+        // Sent Mail, so the APPEND every other account gets is skipped —
+        // one letter, not two.
+        assert!(
+            w.with_fake(|f| !f.server(1).folders.contains_key("Sent")),
+            "gmail's sent copy is the server's, not ours"
+        );
+        assert_eq!(w.jobs()[0].status, "done");
+
+        // Revoke the grant and the next send fails where it should: at
+        // the token, before anything leaves.
+        w.with_fake(|f| f.revoke("g@gmail.com"));
+        let e = w
+            .outside(|o| mail::creds_for(o, "g@gmail.com", "smtp.gmail.com", true))
+            .unwrap_err();
+        assert!(e.contains("invalid_grant"), "{e}");
+    }
 }

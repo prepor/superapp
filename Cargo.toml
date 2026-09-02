@@ -59,6 +59,16 @@ rusqlite = { version = "0.40", features = ["bundled", "hooks", "session"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Gmail sign-in (see `src/oauth.rs`). Three crates that were already in the
+# graph, promoted to direct deps rather than pulled in: `rustls-connector` is
+# what `imap`'s rustls-tls feature already uses, and it is the whole HTTP
+# client here — one POST to Google's token endpoint does not earn `reqwest`.
+# `ring` comes with rustls and carries PKCE's SHA-256 and its randomness;
+# `base64` is XOAUTH2's envelope and the id_token's.
+base64 = "0.22"
+ring = "0.17"
+rustls-connector = "0.19"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

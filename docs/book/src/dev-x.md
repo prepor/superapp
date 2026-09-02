@@ -201,10 +201,14 @@ shows what the actions *wrote* — folders, flags, the effect queue — rather
 than the history; the tree is the running process's, and dies with it. And
 `e2e/settings.txt` walks the accounts flow (add against an `.invalid` host
 — the worker fails fast and locally, and its error lands on the status
-line through the real signal path — then remove), `e2e/send.txt` walks the
-send window (run with `--send-delay 1`: cancel inside the window, an
-honest no-smtp failure, cmd+z reopening the draft), and `e2e/history.txt`
-walks the history overlay (travel back, to the beginning, and forward).
+line through the real signal path — then remove), `e2e/oauth.txt` presses
+*sign in with google* and reads back the line the shell answers with (a run
+never leaves for a browser, so the flow refuses itself; what a script can
+prove is the button, the action and the status line, and the rest lives in
+`oauth`'s unit tests), `e2e/send.txt` walks the send window (run with
+`--send-delay 1`: cancel inside the window, an honest no-smtp failure,
+cmd+z reopening the draft), and `e2e/history.txt` walks the history
+overlay (travel back, to the beginning, and forward).
 `e2e/keys.txt` drives every panel accelerator, asserting through label
 resolution — a walk that lands on the wrong mail fails the run, no picture
 needed — `e2e/select.txt` covers selectable content, `e2e/height.txt`

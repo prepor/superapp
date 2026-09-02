@@ -97,7 +97,8 @@ client's job, and superapp *is* the client).
 Real accounts are **fastmail-style**: IMAP over rustls (port 993) with an
 app password; the *settings* panel (a launcher root) lists accounts with
 their live sync status and links to the *add account* panel, which holds the
-form. One **worker thread
+form. A **Gmail** account is the same engine with a different proof of
+identity — see below. One **worker thread
 per account** — its own connection to the same file — polls every minute
 (and on *refresh*): mirror the special-use folders, fetch what is new
 (each folder retains the newest **200** messages; below that window the
@@ -224,6 +225,84 @@ A *failed* send stays cancellable — the error toasts, `cmd+z` reopens the
 draft, and it stands in the problems panel with *retry* and *reopen* until
 it goes out or is taken back. The launcher's *new mail* root opens a blank compose.
 
+## Signing in to Gmail
+
+Google stopped accepting passwords on IMAP, so a Gmail account proves
+itself with a **bearer token** instead: SASL `XOAUTH2`, the same envelope
+on both IMAP and SMTP. Everything above this line is unchanged — the same
+worker, the same passes, the same desired/actual split. The account row
+carries one extra word (`account.auth`), and the two sites that open a
+session ask one function which mechanism that word means.
+
+Getting a token is the **installed application** flow (RFC 8252), and it
+never goes through this app's own UI: pressing *sign in with google* on the
+add-account panel binds a loopback listener on `127.0.0.1`, opens the
+system browser on Google's consent page with a PKCE challenge, and waits
+for the redirect to come back to that port. No embedded webview, and no
+Google password ever typed into superapp.
+
+Three secrets, three lifetimes, and that is the whole design:
+
+| | lives | kept where |
+|---|---|---|
+| authorization code | seconds | never leaves `src/oauth.rs` |
+| refresh token | until revoked | the keychain, under `oauth:<address>` |
+| access token | an hour | process memory, refreshed on demand |
+
+The refresh token is what the account *is*; the access token is minted from
+it by the backend that owns the process and is deliberately never written
+down. A grant the human revokes at Google fails at the next refresh, and it
+fails **honestly** — the sync stops and says `invalid_grant` rather than
+falling back to a password that was never there.
+
+Two Gmail behaviours the engine has to know about, both of them the
+provider's rather than the protocol's.
+
+Gmail advertises no `\Archive` mailbox: archiving there *is* dropping the
+inbox label, leaving the message in All Mail. So the special-use `\All`
+takes the archive role and a MOVE into it is the archive — but that folder
+is a **move target only, never an ingest source**. All Mail holds every
+message the account has, inbox included, under uids of its own, and this
+store gives a message one folder; reading from it would file a second row
+for every mail already mirrored from INBOX. The cost is stated rather than
+hidden: mail archived on *another* device does not appear locally. What
+this device archives stays, because the push records the move rather than
+re-reading it. Gmail's label model is the real answer here, and it is not
+this schema's — `X-GM-MSGID` as a cross-folder identity is where that would
+start.
+
+And Gmail's SMTP files its own copy into Sent Mail, unlike a plain relay, so
+the APPEND every other account gets is skipped: one letter in Sent, not two.
+
+A grant is checked before it becomes an account: **asking for a scope is not
+getting it.** A consent screen that does not carry
+`https://mail.google.com/` yields a grant with `openid email` and nothing
+else — no error, no warning — and the account would then fail at its first
+IMAP login with a bare "AUTHENTICATION FAILED", an hour of confusion from
+its cause. The token response says what was granted, so the sign-in refuses
+there instead, while the human is still standing at the door they must go
+back through. A refusal that does arrive over IMAP is read too: Google's
+XOAUTH2 no is a JSON challenge whose status separates a missing scope from a
+mailbox with IMAP switched off, and those want opposite fixes.
+
+One thing this cannot ship: the OAuth **client registration**. Google issues
+those per developer, so superapp reads yours — `SUPERAPP_GOOGLE_CLIENT_ID`
+and `SUPERAPP_GOOGLE_CLIENT_SECRET`, or the console's downloaded JSON
+dropped verbatim at `google-oauth.json` beside the store. It must be a
+**Desktop app** client: the redirect is a loopback port the OS picks per
+sign-in, and a Web client only accepts redirect URIs registered in advance,
+port and all — so one is refused by name here rather than as a
+`redirect_uri_mismatch` in the browser three steps later. Without any
+registration, the panel says so instead of pretending.
+
+The consent round trip is the one thing e2e cannot script — it wants Google
+and a human — so a run refuses it and puts that refusal on the panel's own
+status line, which is what `e2e/oauth.txt` asserts. Everything up to that
+door is unit-tested: PKCE against RFC 7636's worked vector, the consent
+URL's parameters, the `id_token` read that names the address, the XOAUTH2
+envelope byte for byte, and a bearer-token sync and send against the fake
+world.
+
 ## What stays out of the file
 
 - **Ephemeral physics**: spring positions, in-flight gestures, the caret
@@ -238,7 +317,8 @@ it goes out or is taken back. The launcher's *new mail* root opens a blank compo
   Grammar](./interaction-grammar.md).
 - **Secrets**: the macOS keychain (android: an app-private file until a
   Keystore binding exists), never this file — it is meant to be handed to
-  agents someday.
+  agents someday. An app password and an OAuth refresh token live side by
+  side there under different keys.
 
 ## Session persistence
 
