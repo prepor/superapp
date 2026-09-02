@@ -53,10 +53,16 @@ of them is unread. Filing the row files every inbox mail of the thread in
 one undo node. A reply arriving later puts the thread back by itself.
 
 A message panel shows the thread its mail belongs to, oldest first, the
-account it came to once at the top and `reply` at the foot — a reply to the
-conversation, which is a reply to its newest mail. **Each message is one
-row, open or closed.** Closed, the row is the sender, the first line they
-wrote in grey (or the status line, red when it is an error) and the date.
+account it came to once at the top and `forward` and `reply` at the foot —
+both on the conversation's newest mail. A **reply** answers it: TO and
+SUBJECT prefilled, the cursor in the body, and the send threads to it. A
+**forward** passes it on: the letter sits in the body under a header block
+(who wrote it, about what, when, to whom), SUBJECT is prefilled and TO is
+empty, so the cursor lands there. A forward carries no threading headers —
+whoever receives it was not in this conversation, so for them it starts
+one. **Each message is one row, open or closed.** Closed, the row is the
+sender, the first line they wrote in grey (or the status line, red when it
+is an error) and the date.
 Open, the same row is the sender as a contact link and the date, with the
 letter unfolded under it; its quoted tail — the message above, usually —
 sits folded behind `› quoted`. Touching a closed row opens it in place;
@@ -122,9 +128,10 @@ typing; control keys (enter, arrows, backspace) are routed as key events.
 
 **A control carries its own key, drawn into its label.** One character of a
 button or link is **bold**, and `cmd`+that letter fires it: `archive` is
-`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, the inbox's `sync` is
-`cmd+s`, settings' `add account` is `cmd+d`. Nothing to memorise and no help
-panel to consult — the shortcut is a property of the thing it fires.
+`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, `forward` is `cmd+f`, the
+inbox's `sync` is `cmd+s`, settings' `add account` is `cmd+d`. Nothing to
+memorise and no help panel to consult — the shortcut is a property of the
+thing it fires.
 
 This is the one place bold does a second job, so the rule is sharp:
 
@@ -155,9 +162,9 @@ by discipline:
 
 A [preview](#preview-the-one-open-that-does-not-go) and the list driving it
 are one working surface, so they pool their accelerators: with a thread
-previewed, `cmd+a` archives it, `cmd+d` deletes it and `cmd+r` replies — all
-without leaving the list. The driver's own keys win first (`cmd+s` still
-syncs the inbox), and the preview lends what is left.
+previewed, `cmd+a` archives it, `cmd+d` deletes it, `cmd+r` replies and
+`cmd+f` forwards — all without leaving the list. The driver's own keys win
+first (`cmd+s` still syncs the inbox), and the preview lends what is left.
 
 The mark stays honest because it never moves: it is drawn on the message
 panel's own chrome, one column over and in plain sight. Nothing is ever bold

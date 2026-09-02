@@ -9,7 +9,7 @@
 //! rss, kb), each contributes its entries here and this becomes the global
 //! search.
 
-use crate::core::{Kind, PanelId, Wm, WS_N};
+use crate::core::{Kind, PanelId, Seed, Wm, WS_N};
 use crate::mail;
 use crate::store::Store;
 
@@ -167,7 +167,7 @@ pub fn search(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
 
     for kind in [
         Kind::Inbox { filter: None },
-        Kind::Compose { re: 0 },
+        Kind::Compose { seed: Seed::Blank },
         Kind::Settings,
         Kind::Help,
         Kind::About,
@@ -224,7 +224,10 @@ mod tests {
         assert!(matches!(hits[0].go, Go::Focus(_)));
         assert!(matches!(hits[1].go, Go::Focus(_)));
         assert_eq!(hits[2].label, "new mail");
-        assert!(matches!(hits[2].go, Go::Open(Kind::Compose { re: 0 })));
+        assert!(matches!(
+            hits[2].go,
+            Go::Open(Kind::Compose { seed: Seed::Blank })
+        ));
         assert_eq!(hits[3].label, "settings");
         assert!(matches!(hits[3].go, Go::Open(Kind::Settings)));
         assert_eq!(hits[4].label, "about");

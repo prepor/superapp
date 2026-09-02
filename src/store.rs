@@ -43,7 +43,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::session::{ConflictAction, Session};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
-use crate::core::{self, Kind, PanelId};
+use crate::core::{self, Kind, PanelId, Seed};
 
 /// The durable tables a write's session records — everything a peer device
 /// must be told about (CR-005). `repl_log` and `repl` are replication's own
@@ -1520,7 +1520,15 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Inbox { filter } => ("inbox", None, filter.clone()),
         Kind::Message { id } => ("message", Some(*id), None),
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
-        Kind::Compose { re } => ("compose", Some(*re), None),
+        // A blank compose keeps the `0` it always had, so a session an
+        // earlier build saved still reads.
+        Kind::Compose { seed: Seed::Blank } => ("compose", Some(0), None),
+        Kind::Compose {
+            seed: Seed::Reply(id),
+        } => ("compose", Some(*id), None),
+        Kind::Compose {
+            seed: Seed::Forward(id),
+        } => ("forward", Some(*id), None),
         Kind::Settings => ("settings", None, None),
         Kind::AddAccount => ("add_account", None, None),
     }
@@ -1534,7 +1542,15 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "inbox" => Kind::Inbox { filter: p_txt },
         "message" => Kind::Message { id: p_int? },
         "contact" => Kind::Contact { email: p_txt? },
-        "compose" => Kind::Compose { re: p_int? },
+        "compose" => Kind::Compose {
+            seed: match p_int? {
+                0 => Seed::Blank,
+                id => Seed::Reply(id),
+            },
+        },
+        "forward" => Kind::Compose {
+            seed: Seed::Forward(p_int?),
+        },
         "settings" => Kind::Settings,
         "add_account" => Kind::AddAccount,
         _ => return None,
@@ -1622,6 +1638,10 @@ mod tests {
         wm.switch(0);
         wm.toggle_tabbed(inbox); // a surviving tabbed column
         wm.follow_open(inbox, Kind::Contact { email: "v@k.io".into() }, false);
+        // The three seeds a compose has, each its own row.
+        for seed in [Seed::Blank, Seed::Reply(3), Seed::Forward(3)] {
+            wm.open(Kind::Compose { seed }, None, false);
+        }
         let snap = wm.snapshot();
         assert!(!snap.wss[0].joins.is_empty(), "a live join persists");
 

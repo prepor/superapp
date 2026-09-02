@@ -41,12 +41,29 @@ click "discard"
 wait 600
 shot k6-discarded
 
+# cmd+f forwards the same mail. Its letter is already in the body under
+# the header block, so the compose comes up in TO: typing offers a
+# recipient straight away, and the pick is the assertion. The title names
+# the mail it passes on — the title click resolves only if it does.
+key cmd+f
+wait 700
+type "kovac"
+wait 400
+click "Vera Kovac"
+wait 400
+shot k7-forward
+click "fwd: [stelaxis] CI failed"
+wait 300
+click "discard"
+wait 600
+shot k8-forward-discarded
+
 # cmd+a archives the message panel and closes it. The cursor was walking
 # with it, so the inbox carries on to the next mail and previews it (CR-005)
 # — focus lands back on the list.
 key cmd+a
 wait 700
-shot k7-archived
+shot k9-archived
 
 # Back on the inbox: cmd+s is its own accelerator (sync). It toasts rather
 # than navigating, so the inbox stays put.
@@ -54,5 +71,5 @@ key cmd+s
 wait 600
 click "Sat hike"
 wait 700
-shot k8-inbox-alive
+shot k10-inbox-alive
 quit

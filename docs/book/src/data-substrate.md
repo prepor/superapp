@@ -174,9 +174,10 @@ outbox row with `send_after = now + 10 s` and closes the panel; `cmd+z`
 inside the window cancels it — the row's deletion *is* the undo, and the
 claim (`WHERE status='pending'`) means the race between undo and the
 sender has exactly one winner. The sender wakes at the deadline and queues
-a `submit` job; the executor submits over SMTP (rustls, port 465; reply
-headers thread via `In-Reply-To`), appends the sent bytes to the account's
-Sent folder over IMAP, and records the outcome. Because both the outbox row
+a `submit` job; the executor submits over SMTP (rustls, port 465; a reply
+threads via `In-Reply-To` and `References`, a forward carries neither — it
+starts a conversation), appends the sent bytes to the account's Sent folder
+over IMAP, and records the outcome. Because both the outbox row
 and the job are durable, a mail that hit *send* and never left goes out late
 rather than never. A delivered send is physics: its claim refuses, the
 history node goes **expired**, and the walk skips it transparently.

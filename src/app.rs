@@ -27,7 +27,7 @@ use makepad_widgets::makepad_platform::event::{
 };
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, PanelId, Wm, Ws, WS_N};
+use crate::core::{self, Dir, Kind, PanelId, Seed, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
@@ -3547,7 +3547,7 @@ impl Stage {
                     }
                     BtnAct::Send => {
                         let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                            Some(Kind::Compose { seed }) => seed.in_reply_to(),
                             _ => None,
                         };
                         let d = self
@@ -3589,7 +3589,7 @@ impl Stage {
                         // The text goes with the panel, so undo has to carry it.
                         let draft = mail::draft(&state.store, pid as i64).unwrap_or_default();
                         let re = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                            Some(Kind::Compose { seed }) => seed.in_reply_to(),
                             _ => None,
                         };
                         state.act(
@@ -4485,7 +4485,7 @@ impl Stage {
                         continue;
                     };
                     let re = match state.ws.panel(pid).map(|p| p.kind.clone()) {
-                        Some(Kind::Compose { re }) => (re != 0).then_some(re),
+                        Some(Kind::Compose { seed }) => seed.in_reply_to(),
                         _ => None,
                     };
                     mail::save_draft(
@@ -4784,7 +4784,24 @@ impl Widget for Stage {
                         .unwrap_or_default();
                     w.as_launcher_overlay().focus_query(cx, &q);
                 } else {
-                    w.as_compose_panel().focus_body(cx);
+                    // A forward has its letter and wants a recipient; the
+                    // others have their recipient, or nothing, and start
+                    // in the body.
+                    let forward = matches!(
+                        self.state
+                            .as_deref()
+                            .and_then(|s| s.ws.panel(pid))
+                            .map(|p| &p.kind),
+                        Some(Kind::Compose {
+                            seed: Seed::Forward(_)
+                        })
+                    );
+                    let c = w.as_compose_panel();
+                    if forward {
+                        c.focus_to(cx);
+                    } else {
+                        c.focus_body(cx);
+                    }
                 }
             }
         }
@@ -6166,19 +6183,11 @@ impl Stage {
         let kind = state.ws.panel(pid).map(|p| p.kind.clone());
         if created {
             // A fresh compose instance seeds from its persisted draft, or
-            // from the reply header — and starts in the body.
-            if let Some(Kind::Compose { re }) = &kind {
-                let d = mail::draft(&state.store, pid as i64).unwrap_or_else(|| {
-                    let m = (*re != 0).then(|| mail::mail(&state.store, *re)).flatten();
-                    mail::Draft {
-                        to: m.as_ref().map(|m| m.head.from_email.clone()).unwrap_or_default(),
-                        subject: m
-                            .as_ref()
-                            .map(|m| format!("Re: {}", m.head.subject))
-                            .unwrap_or_default(),
-                        body: String::new(),
-                    }
-                });
+            // from its seed — the reply header, the forwarded letter — and
+            // starts in a field once an event tick comes (`pending_focus`).
+            if let Some(Kind::Compose { seed }) = &kind {
+                let d = mail::draft(&state.store, pid as i64)
+                    .unwrap_or_else(|| mail::seed_draft(&state.store, *seed));
                 w.as_compose_panel().prefill(cx, &d.to, &d.subject, &d.body);
                 self.pending_focus = Some(pid);
             }
@@ -6394,12 +6403,17 @@ impl Stage {
                 if r.size.x > 0.0 {
                     reg.push(("mail to".to_string(), r, Act::Pointer(pid)));
                 }
-                let r = w.widget(cx, ids!(reply_link)).area().rect(cx);
-                if r.size.x > 0.0 {
-                    let re = mail::thread(&state.store, id)
-                        .last()
-                        .map_or(id, |t| t.mail.head.id);
-                    reg.push(("reply".to_string(), r, Act::Open(pid, Kind::Compose { re })));
+                let newest = mail::thread(&state.store, id)
+                    .last()
+                    .map_or(id, |t| t.mail.head.id);
+                for (label, path, seed) in [
+                    ("forward", ids!(forward_link), Seed::Forward(newest)),
+                    ("reply", ids!(reply_link), Seed::Reply(newest)),
+                ] {
+                    let r = w.widget(cx, path).area().rect(cx);
+                    if r.size.x > 0.0 {
+                        reg.push((label.to_string(), r, Act::Open(pid, Kind::Compose { seed })));
+                    }
                 }
             }
             Some(Kind::Contact { email }) => {

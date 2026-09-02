@@ -23,7 +23,7 @@ use std::rc::Rc;
 use makepad_widgets::*;
 
 use crate::app::BootOutside;
-use crate::core::{Grid, Kind};
+use crate::core::{Grid, Kind, Seed};
 use crate::e2e::{self, Step};
 use crate::mail;
 use crate::panels::*;
@@ -463,14 +463,27 @@ fn message() -> Scene<Setup> {
 }
 
 fn compose() -> Scene<Setup> {
-    let reply = |script: &str| panel(|s| Kind::Compose { re: mail_like(s, "Q3 infra") }, script);
+    let reply = |script: &str| {
+        panel(
+            |s| Kind::Compose {
+                seed: Seed::Reply(mail_like(s, "Q3 infra")),
+            },
+            script,
+        )
+    };
     Scene::new("compose", (560.0, 420.0))
         .note("A reply: TO and SUBJECT from the mail it answers, the cursor in the body.")
+        .note("A forward: the letter under its header block, SUBJECT from it, the cursor in the empty TO.")
         .note("Send is a side effect with an undo window.")
         .node("reply", reply(""))
         .node("suggesting", reply("click \"to\"\nwait 200\ntype \", v\"\nwait 400"))
         .about("the TO field completes people from the mail world")
-        .node("blank", panel(|_| Kind::Compose { re: 0 }, ""))
+        .node(
+            "forward",
+            panel(|s| Kind::Compose { seed: Seed::Forward(mail_like(s, "Q3 infra")) }, ""),
+        )
+        .about("the same mail passed on: a conversation of its own")
+        .node("blank", panel(|_| Kind::Compose { seed: Seed::Blank }, ""))
         .about("from the launcher's root: nothing prefilled")
         .edge("reply", "suggesting", "type in TO")
 }

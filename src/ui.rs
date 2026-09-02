@@ -109,6 +109,9 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
 /// The message panel's link key: reply, visible on the link itself.
 pub const ACCEL_REPLY: char = 'r';
 
+/// The message panel's other link: forward, on its own first letter.
+pub const ACCEL_FORWARD: char = 'f';
+
 /// Settings' link to the add-account form. The `d` of "add" rather than the
 /// `a`: the account rows are selectable text, so `cmd+a` belongs to them —
 /// the same courtesy an editable field gets, for the same reason.
@@ -140,6 +143,7 @@ pub fn accels(kind: &Kind) -> Vec<(char, &'static str)> {
         .collect();
     if matches!(kind, Kind::Message { .. }) {
         v.push((ACCEL_REPLY, "reply"));
+        v.push((ACCEL_FORWARD, "forward"));
     }
     if matches!(kind, Kind::Settings) {
         v.push((ACCEL_ADD_ACCOUNT, "add account"));
@@ -207,6 +211,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Seed;
 
     /// Every kind an accelerator could live on.
     fn every_kind() -> Vec<Kind> {
@@ -217,7 +222,13 @@ mod tests {
             Kind::About,
             Kind::Inbox { filter: None },
             Kind::Message { id: 1 },
-            Kind::Compose { re: 0 },
+            Kind::Compose { seed: Seed::Blank },
+            Kind::Compose {
+                seed: Seed::Reply(1),
+            },
+            Kind::Compose {
+                seed: Seed::Forward(1),
+            },
             Kind::Contact {
                 email: "a@b.c".into(),
             },
@@ -305,7 +316,11 @@ mod tests {
                 );
             }
         }
-        for (label, c) in [("reply", ACCEL_REPLY), ("add account", ACCEL_ADD_ACCOUNT)] {
+        for (label, c) in [
+            ("reply", ACCEL_REPLY),
+            ("forward", ACCEL_FORWARD),
+            ("add account", ACCEL_ADD_ACCOUNT),
+        ] {
             assert!(accel_idx(label, c).is_some(), "“{label}” cannot show {c}");
         }
     }

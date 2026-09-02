@@ -14,7 +14,7 @@ use std::rc::Rc;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{Kind, MailId};
+use crate::core::{Kind, MailId, Seed};
 use crate::effect::{Creds, Ctx, Deferred, Effect, Outgoing, Registry, World};
 use crate::filter::Op;
 use crate::history::Intent;
@@ -849,8 +849,16 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Inbox { filter: None } => "inbox".into(),
         Kind::Message { id } => thread_topic(store, *id).unwrap_or_else(|| "message".into()),
         Kind::Contact { email } => contact(store, email).0,
-        Kind::Compose { re } => mail(store, *re)
+        Kind::Compose { seed: Seed::Blank } => "new mail".into(),
+        Kind::Compose {
+            seed: Seed::Reply(id),
+        } => mail(store, *id)
             .map(|m| format!("re: {}", m.head.subject))
+            .unwrap_or_else(|| "new mail".into()),
+        Kind::Compose {
+            seed: Seed::Forward(id),
+        } => mail(store, *id)
+            .map(|m| format!("fwd: {}", m.head.subject))
             .unwrap_or_else(|| "new mail".into()),
         Kind::Settings => "settings".into(),
         Kind::AddAccount => "add account".into(),
@@ -1051,6 +1059,46 @@ pub struct Draft {
     pub to: String,
     pub subject: String,
     pub body: String,
+}
+
+/// The draft a fresh compose starts from, by its seed: a reply answers
+/// its mail, a forward passes it on. Text the panel persisted wins over
+/// this — the shell asks only when there is none.
+#[must_use]
+pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
+    match seed {
+        Seed::Blank => Draft::default(),
+        Seed::Reply(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
+            to: m.head.from_email.clone(),
+            subject: format!("Re: {}", m.head.subject),
+            body: String::new(),
+        }),
+        Seed::Forward(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
+            to: String::new(),
+            subject: format!("Fwd: {}", m.head.subject),
+            body: forwarded(&m),
+        }),
+    }
+}
+
+/// A forward's body: room to write at the top, then the mail under the
+/// header block every client recognises — who wrote it, about what, when,
+/// to whom. The letter is the plain reading, which an HTML mail keeps for
+/// exactly this.
+#[must_use]
+pub fn forwarded(m: &MailFull) -> String {
+    let from = if m.head.from_name.is_empty() {
+        m.head.from_email.clone()
+    } else {
+        format!("{} <{}>", m.head.from_name, m.head.from_email)
+    };
+    format!(
+        "\n\nBegin forwarded message:\n\nFrom: {from}\nSubject: {}\nDate: {}\nTo: {}\n\n{}",
+        m.head.subject,
+        fmt_date_long(m.head.date),
+        m.to,
+        m.body.trim_end()
+    )
 }
 
 /// Loads a panel's draft, if any (boot restore, prefill).
@@ -1767,6 +1815,19 @@ pub fn fmt_date(ts: f64) -> String {
     format!("{} {d:02} {h:02}:{min:02}", MONTHS[(m - 1) as usize])
 }
 
+/// The date written out for a letter's own text — a forwarded header —
+/// with the year the list style leaves off: `31 Aug 2026 at 09:14`.
+#[must_use]
+pub fn fmt_date_long(ts: f64) -> String {
+    let secs = ts as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    let (h, min) = (rem / 3_600, (rem % 3_600) / 60);
+    let mut mon = MONTHS[(m - 1) as usize].to_string();
+    mon[..1].make_ascii_uppercase();
+    format!("{d} {mon} {y} at {h:02}:{min:02}")
+}
+
 // -- the demo seed -----------------------------------------------------------
 
 struct SeedMail<'a> {
@@ -2264,6 +2325,53 @@ mod tests {
         assert_eq!(sug_acct[0].value, "me@prepor.dev");
     }
 
+    /// A fresh compose starts from its seed: a reply answers its mail, a
+    /// forward passes the letter on under the header block — and threads
+    /// to nothing, since whoever receives it was not in the conversation.
+    #[test]
+    fn a_compose_starts_from_its_seed() {
+        let s = store();
+        assert_eq!(seed_draft(&s, Seed::Blank), Draft::default());
+
+        let re = seed_draft(&s, Seed::Reply(1));
+        assert_eq!(
+            (re.to.as_str(), re.subject.as_str(), re.body.as_str()),
+            ("vera@kovac.io", "Re: Q3 infra budget draft", "")
+        );
+
+        let fwd = seed_draft(&s, Seed::Forward(1));
+        assert_eq!(fwd.to, "", "a forward wants a recipient");
+        assert_eq!(fwd.subject, "Fwd: Q3 infra budget draft");
+        assert!(
+            fwd.body.starts_with(
+                "\n\nBegin forwarded message:\n\nFrom: Vera Kovac <vera@kovac.io>\n\
+                 Subject: Q3 infra budget draft\nDate: 31 Aug 2026 at 09:14\n\
+                 To: me@prepor.dev\n\n"
+            ),
+            "{}",
+            fwd.body
+        );
+        let letter = mail(&s, 1).expect("vera").body;
+        assert!(
+            fwd.body.ends_with(letter.trim_end()),
+            "the whole letter goes"
+        );
+
+        // An HTML letter forwards as its plain reading.
+        let fwd = seed_draft(&s, Seed::Forward(2));
+        assert!(fwd.body.contains("\n\nWorkflow main #4128"), "{}", fwd.body);
+        assert!(!fwd.body.contains("<li>"), "no markup: {}", fwd.body);
+
+        // Only a reply threads.
+        assert_eq!(Seed::Reply(1).in_reply_to(), Some(1));
+        assert_eq!(Seed::Forward(1).in_reply_to(), None);
+        assert_eq!(Seed::Blank.in_reply_to(), None);
+
+        // A mail the store does not have seeds nothing.
+        assert_eq!(seed_draft(&s, Seed::Forward(9999)), Draft::default());
+        assert_eq!(fmt_date_long(ts(2026, 1, 5, 7, 3)), "5 Jan 2026 at 07:03");
+    }
+
     /// Archive moves a mail out of the inbox, the
     /// read flag clears once, titles resolve through the store.
     #[test]
@@ -2274,7 +2382,16 @@ mod tests {
             title(&s, &Kind::Contact { email: "vera@kovac.io".into() }),
             "Vera Kovac"
         );
-        assert_eq!(title(&s, &Kind::Compose { re: 1 }), "re: Q3 infra budget draft");
+        let compose = |seed| Kind::Compose { seed };
+        assert_eq!(title(&s, &compose(Seed::Blank)), "new mail");
+        assert_eq!(
+            title(&s, &compose(Seed::Reply(1))),
+            "re: Q3 infra budget draft"
+        );
+        assert_eq!(
+            title(&s, &compose(Seed::Forward(1))),
+            "fwd: Q3 infra budget draft"
+        );
         assert_eq!(title(&s, &Kind::Inbox { filter: Some("x".into()) }), "inbox · x");
 
         s.write(|c| mark_read_tx(c, 1)).unwrap();
