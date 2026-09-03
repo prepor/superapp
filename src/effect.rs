@@ -113,6 +113,32 @@ pub struct Outgoing {
     /// other side too. Absent on payloads filed before CR-007.
     #[serde(default)]
     pub references: Vec<String>,
+    /// What it carries (CR-010) — read off the disk by [`crate::mail::Submit`]
+    /// as it goes out, never stored: this value is built at submit time, and
+    /// a payload holding a file's bytes would be both stale and enormous.
+    #[serde(default, skip)]
+    pub attachments: Vec<Part>,
+}
+
+/// One part of a mail on its way out: what compose attached, with the bytes
+/// it will actually carry.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Part {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for Part {
+    /// The bytes are megabytes and never worth printing — an outgoing mail
+    /// gets logged, and a log is for reading.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Part")
+            .field("name", &self.name)
+            .field("mime", &self.mime)
+            .field("size", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// How a session proves who it is. Two mechanisms, and the account row's
@@ -1720,7 +1746,27 @@ impl Outside for Fake {
             let refs: Vec<String> = m.references.iter().map(|r| format!("<{r}>")).collect();
             raw += &format!("References: {}\r\n", refs.join(" "));
         }
-        raw += &format!("\r\n{}", m.body);
+        if m.attachments.is_empty() {
+            raw += &format!("\r\n{}", m.body);
+        } else {
+            // The same envelope the real transport writes (see [`rfc822`]),
+            // by hand: what is filed to Sent has to carry the parts, or a
+            // sent mail that syncs back would lose them on the way home.
+            raw += "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"fake\"\r\n\r\n";
+            raw += &format!(
+                "--fake\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+                m.body
+            );
+            for p in &m.attachments {
+                raw += &format!(
+                    "--fake\r\nContent-Type: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                    p.mime,
+                    p.name,
+                    crate::html::base64_encode(&p.bytes)
+                );
+            }
+            raw += "--fake--\r\n";
+        }
         // Whichever account owns this address; the first server otherwise.
         let acct = *self.servers.keys().next().unwrap_or(&1);
         self.server(acct).submitted.push(m.clone());
@@ -1775,8 +1821,14 @@ impl Outside for Fake {
         demo_stat(path)
     }
 
+    /// What was written here, if anything was — a fake disk is writable,
+    /// which is what lets a test say *this file changed since* — and the
+    /// demo tree otherwise.
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
-        demo_read(path, max)
+        match self.files.get(path) {
+            Some(b) => Ok(b[..b.len().min(max)].to_vec()),
+            None => demo_read(path, max),
+        }
     }
 
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
@@ -1820,7 +1872,22 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
     if !refs.is_empty() {
         b = b.header(header::References::from(refs.join(" ")));
     }
-    b.body(m.body.clone()).map_err(|e| s(&e))
+    if m.attachments.is_empty() {
+        return b.body(m.body.clone()).map_err(|e| s(&e));
+    }
+    // With parts it is a `multipart/mixed`: the letter first, then each
+    // file as its own `Content-Disposition: attachment`. A type lettre
+    // will not parse falls back to the one every reader accepts rather
+    // than failing the send over a label.
+    use lettre::message::{Attachment, MultiPart, SinglePart};
+    let mut mp = MultiPart::mixed().singlepart(SinglePart::plain(m.body.clone()));
+    for p in &m.attachments {
+        let ctype = header::ContentType::parse(&p.mime)
+            .or_else(|_| header::ContentType::parse("application/octet-stream"))
+            .map_err(|e| s(&e))?;
+        mp = mp.singlepart(Attachment::new(p.name.clone()).body(p.bytes.clone(), ctype));
+    }
+    b.multipart(mp).map_err(|e| s(&e))
 }
 
 // -- Real ----------------------------------------------------------------------
@@ -2592,6 +2659,7 @@ mod tests {
             body: "hi".into(),
             in_reply_to: Some("p@b.c".into()),
             references: vec!["r@b.c".into(), "p@b.c".into()],
+            attachments: Vec::new(),
         };
         let raw = out(&reply);
         assert!(raw.contains("In-Reply-To: <p@b.c>\r\n"), "{raw}");
@@ -2619,6 +2687,72 @@ mod tests {
             !raw.contains("In-Reply-To") && !raw.contains("References"),
             "{raw}"
         );
+    }
+
+    /// A mail that carries something goes out as a `multipart/mixed`: the
+    /// letter first, then each part with its name and its type — and the
+    /// round trip through the parser gets the same parts back, which is the
+    /// only assertion that means anything (CR-010).
+    #[test]
+    fn a_mail_that_carries_something_goes_out_as_multipart() {
+        let plain = Outgoing {
+            to: "a@b.c".into(),
+            subject: "here it is".into(),
+            body: "the numbers".into(),
+            in_reply_to: None,
+            references: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let bare = String::from_utf8(rfc822("me@b.c", &plain).unwrap().formatted()).unwrap();
+        assert!(!bare.contains("multipart"), "nothing to carry, nothing to wrap");
+
+        let carrying = Outgoing {
+            attachments: vec![
+                Part {
+                    name: "q3.csv".into(),
+                    mime: "text/csv".into(),
+                    bytes: b"line,aug\ncdn,640\n".to_vec(),
+                },
+                Part {
+                    name: "sketch.png".into(),
+                    mime: "image/png".into(),
+                    bytes: vec![0x89, b'P', b'N', b'G', 1, 2, 3],
+                },
+            ],
+            ..plain
+        };
+        let raw = rfc822("me@b.c", &carrying).unwrap().formatted();
+        let p = crate::sync::parse_mail(&raw);
+        assert_eq!(p.body, "the numbers");
+        let got: Vec<(String, String, u64)> = p
+            .attachments
+            .iter()
+            .map(|a| (a.name.clone(), a.mime.clone(), a.size))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("q3.csv".to_string(), "text/csv".to_string(), 17),
+                ("sketch.png".to_string(), "image/png".to_string(), 7),
+            ]
+        );
+        // …and the bytes come back by part index, which is what the card
+        // reads them with.
+        assert_eq!(
+            crate::sync::part_bytes(&raw, p.attachments[1].at).as_deref(),
+            Some(&[0x89, b'P', b'N', b'G', 1, 2, 3][..])
+        );
+        // A type nothing can parse does not fail the send: the part goes
+        // out labelled as the bytes it is.
+        let odd = Outgoing {
+            attachments: vec![Part {
+                name: "x".into(),
+                mime: "not a media type".into(),
+                bytes: b"x".to_vec(),
+            }],
+            ..carrying
+        };
+        assert!(rfc822("me@b.c", &odd).is_ok());
     }
 
     /// The row exists, `pending`, *before* anything is performed — and the

@@ -18,6 +18,7 @@
 #![allow(missing_docs)]
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use makepad_widgets::*;
@@ -454,6 +455,10 @@ script_mod! {
                         job_tpl := mod.widgets.JobPanel{}
                         files_tpl := mod.widgets.FilesPanel{}
                         file_tpl := mod.widgets.FilePanel{}
+                        // One part of a letter draws on the *same* widget
+                        // as a file on the disk (CR-010): a second
+                        // instance of it, never a second card.
+                        attachment_tpl := mod.widgets.FilePanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved id rather than a panel.
                         rows_overlay_tpl := mod.widgets.RowsOverlay{}
@@ -490,6 +495,7 @@ script_mod! {
                         job_tpl := mod.widgets.JobPanel{}
                             files_tpl := mod.widgets.FilesPanel{}
                             file_tpl := mod.widgets.FilePanel{}
+                            attachment_tpl := mod.widgets.FilePanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         }
@@ -1413,7 +1419,15 @@ impl State {
         let unit_w = (vw - gap) / f64::from(grid.w);
         let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
         let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
-        let need = mail::thread_lines(&msgs, open, cols) as f64;
+        // Which of them carry something: one line each, listed under the
+        // reading (CR-010). A cached query a message, and only the open
+        // ones can cost anything.
+        let carries: BTreeSet<core::MailId> = msgs
+            .iter()
+            .map(|t| t.mail.head.id)
+            .filter(|id| open.contains(id) && !mail::attachments(&self.store, *id).is_empty())
+            .collect();
+        let need = mail::thread_lines(&msgs, open, &carries, cols) as f64;
 
         // ...against how many lines a panel of `rows` rows has room for.
         let line_h = theme::FONT_SIZE * theme::LINE_H;
@@ -2770,7 +2784,21 @@ impl Stage {
                             self.resolve_click(cx, act, fresh);
                         }
                         None => {
-                            eprintln!("{}e2e: FAIL click {label:?}: no matching element", runner.tag);
+                            // What *was* on offer, so a failing suite says
+                            // which label to have asked for. Deduped in
+                            // draw order: a workspace holds a few dozen,
+                            // and a panel wears each verb once.
+                            let mut on_offer: Vec<&str> = Vec::new();
+                            for h in &self.hits {
+                                if !on_offer.contains(&h.label.as_str()) {
+                                    on_offer.push(&h.label);
+                                }
+                            }
+                            eprintln!(
+                                "{}e2e: FAIL click {label:?}: no matching element — on offer: {}",
+                                runner.tag,
+                                on_offer.join(" · ")
+                            );
                             runner.failures += 1;
                         }
                     }
@@ -4360,18 +4388,130 @@ impl Stage {
                     // say so rather than pretending.
                     BtnAct::Open => {
                         // The card's path to the OS, through the outside:
-                        // the first real verb of the browser (CR-008).
-                        let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::File { path }) => Some(path),
+                        // the first real verb of the browser (CR-008). A
+                        // part of a letter has no path, so it is written to
+                        // the app's scratch directory first and *that* is
+                        // handed over (CR-010) — one extra step, and then
+                        // it is a file like any other, browsable with the
+                        // panel that browses files.
+                        let real = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::File { path }) => Some(Ok(crate::files::real_path(&path))),
+                            Some(Kind::Attachment { mail, at }) => {
+                                Some(Self::write_out(state, mail, at))
+                            }
                             _ => None,
                         };
-                        if let Some(display) = path {
-                            let real = crate::files::real_path(&display);
-                            let name = crate::files::basename(&display).to_string();
-                            match state.world.run(&crate::effect::OpenPath { path: &real }) {
-                                Ok(()) => state.toast(format!("opened “{name}”"), false),
-                                Err(e) => state.toast(e, true),
+                        match real {
+                            Some(Ok(real)) => {
+                                let name = real
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                match state.world.run(&crate::effect::OpenPath { path: &real }) {
+                                    Ok(()) => state.toast(format!("opened “{name}”"), false),
+                                    Err(e) => state.toast(e, true),
+                                }
                             }
+                            Some(Err(e)) => state.toast(e, true),
+                            None => {}
+                        }
+                    }
+                    BtnAct::Attach => {
+                        // The hold's other destination (CR-010): what a
+                        // files panel is carrying becomes what this draft
+                        // will. An action, so ⌘z takes it back off.
+                        // Which install is picking them: a path is a file
+                        // on this machine and these rows replicate (CR-010).
+                        let device = crate::store::this_device(state.store.conn());
+                        let files: Vec<mail::DraftFile> = state
+                            .hold
+                            .iter()
+                            .flat_map(|h| h.paths.iter())
+                            .filter_map(|path| {
+                                let e = crate::files::stat_in(&state.world, path)?;
+                                (!e.is_dir).then(|| mail::DraftFile {
+                                    id: 0,
+                                    path: path.clone(),
+                                    name: e.name.clone(),
+                                    size: e.size,
+                                    device: device.clone(),
+                                })
+                            })
+                            .collect();
+                        let (ok, refused): (Vec<_>, Vec<_>) = files
+                            .into_iter()
+                            .partition(|f| f.size <= crate::files::ATTACH_MAX);
+                        if ok.is_empty() {
+                            // Nothing could be carried, and the refusal is
+                            // the word — a files panel's `… here` says why
+                            // the same way.
+                            let why = if refused.is_empty() {
+                                "nothing to attach — a letter carries files".to_string()
+                            } else {
+                                format!(
+                                    "too big to carry: {} (the limit is {})",
+                                    refused
+                                        .iter()
+                                        .map(|f| f.name.clone())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    crate::files::fmt_size(crate::files::ATTACH_MAX)
+                                )
+                            };
+                            state.toast(why, true);
+                        } else {
+                            // What this attach actually *adds*: a path the
+                            // draft already carries is not the action's to
+                            // take away again on undo.
+                            let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                                Some(Kind::Compose { seed }) => seed,
+                                _ => Seed::Blank,
+                            };
+                            let held = mail::draft_files_for(&state.store, pid as i64, seed);
+                            let (ok, again): (Vec<_>, Vec<_>) = ok
+                                .into_iter()
+                                .partition(|f| !held.iter().any(|h| h.path == f.path));
+                            if ok.is_empty() {
+                                let what = if again.len() == 1 {
+                                    format!("“{}”", again[0].name)
+                                } else {
+                                    crate::files::plural(again.len())
+                                };
+                                state.toast(format!("already carrying {what}"), false);
+                                self.sync(cx);
+                                return;
+                            }
+                            let what = if ok.len() == 1 {
+                                format!("“{}”", ok[0].name)
+                            } else {
+                                crate::files::plural(ok.len())
+                            };
+                            let now = state.world.now();
+                            let carried = ok.clone();
+                            state.act(
+                                "attach",
+                                format!("attach {what}"),
+                                Some(format!("draft:{pid}")),
+                                |_ws| {},
+                                move |tx| {
+                                    mail::attach_files_tx(tx, pid as i64, &carried, now).map(|_| ())
+                                },
+                                vec![Box::new(mail::Attached {
+                                    panel: pid as i64,
+                                    files: ok,
+                                }) as Box<dyn crate::history::Intent>],
+                            );
+                            // A `move` cannot mean "and take it off the
+                            // disk" here — the letter carries a copy — so
+                            // the hold stands whichever verb made it, and
+                            // a second compose can be given the same file
+                            // without walking to it again.
+                            let but = if refused.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {} too big", refused.len())
+                            };
+                            state.toast(format!("carrying {what}{but}"), !refused.is_empty());
                         }
                     }
                     BtnAct::NewDir => {
@@ -4580,6 +4720,9 @@ impl Stage {
                             .map(|w| w.as_compose_panel().values(cx))
                             .or_else(|| mail::draft_for(&state.store, pid as i64, seed))
                             .unwrap_or_else(|| mail::seed_draft(&state.store, seed));
+                        // What it was going to carry goes with it, and comes
+                        // back with it (CR-010) — this seed's, as the text is.
+                        let files = mail::draft_files_for(&state.store, pid as i64, seed).to_vec();
                         state.act(
                             "close",
                             label,
@@ -4592,6 +4735,7 @@ impl Stage {
                                 panel: pid as i64,
                                 draft,
                                 seed,
+                                files,
                             }) as Box<dyn crate::history::Intent>],
                         );
                     }
@@ -4601,6 +4745,23 @@ impl Stage {
             // Handled above — they return before reaching this match.
             Act::WsRow(_) | Act::LauncherOpen | Act::LauncherRow(_) | Act::HistoryRow(_) | Act::OverlayClose | Act::Pointer(_) | Act::WidgetOp(..) | Act::Acquire | Act::Problems | Act::Noop => {}
         }
+    }
+
+    /// Writes one part of a letter out to the app's scratch directory and
+    /// answers with where it landed (CR-010). The read and the MIME walk
+    /// happen here, on a click rather than in a draw, which is the one
+    /// place they are affordable — and the write goes through the outside
+    /// like every other thing that leaves the process.
+    fn write_out(state: &State, mail: core::MailId, at: u32) -> Result<PathBuf, String> {
+        let a = mail::attachment(&state.store, mail, at).ok_or("that part is no longer here")?;
+        let bytes = mail::part(&state.store, &a)
+            .ok_or_else(|| format!("“{}” is not in the letter any more", a.name))?;
+        let path = crate::files::scratch(a.message, a.at, &a.name);
+        state.world.run(&crate::effect::WriteFile {
+            path: &path,
+            bytes: &bytes,
+        })?;
+        Ok(path)
     }
 
     /// Opens or closes one message of the thread a panel shows (CR-007),
@@ -5453,6 +5614,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::Job { .. } => Some(live_id!(job_tpl)),
         Kind::Files { .. } => Some(live_id!(files_tpl)),
         Kind::File { .. } => Some(live_id!(file_tpl)),
+        Kind::Attachment { .. } => Some(live_id!(attachment_tpl)),
     }
 }
 
@@ -7902,6 +8064,22 @@ impl Stage {
                         reg.push((label.to_string(), r, Act::Pointer(pid)));
                     }
                 }
+                // The files it will carry (CR-010): each a link to the card
+                // over it, so what is about to leave can be looked at.
+                let seed = match &kind {
+                    Some(Kind::Compose { seed }) => *seed,
+                    _ => Seed::Blank,
+                };
+                let files = mail::draft_files_for(&state.store, pid as i64, seed);
+                for (r, f) in w.as_compose_panel().carry_hits(cx).into_iter().zip(files.iter()) {
+                    if r.size.x > 0.0 {
+                        reg.push((
+                            f.label(),
+                            r,
+                            Act::Open(pid, Kind::File { path: f.path.clone() }),
+                        ));
+                    }
+                }
                 // The TO field's autocomplete rows, registered after the
                 // fields they cover: `hit_at` searches back to front, so
                 // the box wins where they overlap.
@@ -7998,6 +8176,11 @@ impl Stage {
                     }
                     if let Some(r) = h.html {
                         reg.push(("mail html".to_string(), r, Act::Pointer(pid)));
+                    }
+                    // The parts the letter carries (CR-010), addressed the
+                    // way the link reads them: `name · size`.
+                    for (label, r, at) in h.atts.clone() {
+                        reg.push((label, r, Act::Open(pid, Kind::Attachment { mail: h.id, at })));
                     }
                 }
                 let r = w.widget(cx, ids!(to_lbl)).area().rect(cx);
@@ -8164,8 +8347,10 @@ impl Stage {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::MarkVerb(verb))));
                 }
             }
-            Some(Kind::File { .. }) => {
-                // The selectable runs: the path, and a text preview.
+            // One card, two sources (CR-010): the same runs either way —
+            // the line under the name (a path, or a media type) and a text
+            // preview.
+            Some(Kind::File { .. } | Kind::Attachment { .. }) => {
                 let pr = w.widget(cx, ids!(path_txt)).area().rect(cx);
                 if pr.size.x > 0.0 {
                     reg.push(("path".to_string(), pr, Act::Pointer(pid)));

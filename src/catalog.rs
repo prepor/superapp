@@ -540,6 +540,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         files_row(),
         files(),
         file_card(),
+        attachment_card(),
         files_walk(),
         small_panels(),
         problems(),
@@ -584,8 +585,22 @@ fn inbox_row() -> Scene<Setup> {
 fn thread_message() -> Scene<Setup> {
     let msg = |t: mail::ThreadMail, open: bool, quoted: bool| {
         widget(live_id!(thread_msg_tpl), move |cx, w| {
-            w.as_thread_msg().populate(cx, 0, &t, open, quoted);
+            w.as_thread_msg().populate(cx, 0, &t, open, quoted, &[]);
         })
+    };
+    // What a letter carries, drawn under it (CR-010).
+    let carrying = |t: mail::ThreadMail, atts: Vec<mail::Attachment>| {
+        widget(live_id!(thread_msg_tpl), move |cx, w| {
+            w.as_thread_msg().populate(cx, 0, &t, true, false, &atts);
+        })
+    };
+    let part = |at: u32, name: &str, size: u64| mail::Attachment {
+        message: 1,
+        at,
+        name: name.to_string(),
+        mime: crate::files::mime_of(name).to_string(),
+        size,
+        cid: String::new(),
     };
     let from = ("Elena Petrova", "elena@prepor.dev");
     let plain = "Thanks — the logs point at the cache step.\n\nI will retry with the cache off and report back tomorrow.";
@@ -620,6 +635,18 @@ fn thread_message() -> Scene<Setup> {
         )
         .sized((640.0, 44.0))
         .about("the status line, in the one colour errors get")
+        .node(
+            "carries",
+            carrying(
+                letter(5, from, "Re: Q3 infra", plain, None, None),
+                vec![
+                    part(1, "q3-budget.csv", 4 * 1024 + 210),
+                    part(2, "invoice-2026-08.pdf", 96 * 1024),
+                ],
+            ),
+        )
+        .sized((640.0, 200.0))
+        .about("its parts under it, each a link to the card over it")
         .edge("collapsed", "open", "click the header")
         .edge("quote folded", "quote unfolded", "click the fold")
 }
@@ -1184,6 +1211,37 @@ fn file_card() -> Scene<Setup> {
         .sized((520.0, 300.0))
         .about("⌘p holds a copy; the toast says where to go next")
         .edge("other", "held", "⌘p")
+}
+
+/// The same card, over a letter's own bytes (CR-010). The demo seed gives
+/// two of its letters a real multipart raw, so the id is looked up rather
+/// than invented — a fixture would prove nothing about the walk that makes
+/// these rows.
+fn attachment_card() -> Scene<Setup> {
+    let card = |name: &'static str| {
+        panel_fake(
+            move |store| {
+                let (mail, at) = store
+                    .conn()
+                    .query_row(
+                        "SELECT message, part FROM attachment WHERE name = ?1",
+                        [name],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32)),
+                    )
+                    .unwrap_or((0, 0));
+                Kind::Attachment { mail, at }
+            },
+            "",
+        )
+    };
+    Scene::new("attachment card", (520.0, 340.0))
+        .note("One part of a letter, on the file browser's own card: the same four lines and the same preview, over the mail's bytes rather than a path.")
+        .note("Where a file card shows its path, a part shows its media type — it has no path until `open` writes it out.")
+        .node("text", card("q3-budget.csv"))
+        .about("the part read back out of the letter, previewed as text")
+        .node("other", card("invoice-2026-08.pdf"))
+        .sized((520.0, 220.0))
+        .about("no preview: open writes it out and hands it to the OS")
 }
 
 fn files_walk() -> Scene<Setup> {

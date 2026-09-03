@@ -18,7 +18,7 @@ use makepad_widgets::image_cache::{
 };
 use makepad_widgets::*;
 
-use crate::core::Seed;
+use crate::core::{Kind, Seed};
 use crate::effect::{self, Job};
 use crate::mail;
 use crate::richtable::{self, Completion, Datasource, Marks, SqlSource, Suggestion, Table};
@@ -1092,6 +1092,29 @@ script_mod! {
             mod.widgets.SSection { width: 82, text: "SUBJECT" }
             subject_input := mod.widgets.SField {}
         }
+        // What the draft will carry (CR-010), while it carries anything:
+        // one link a file, opening the card over it — so what is about to
+        // leave can be looked at before it does.
+        carries := View {
+            visible: false
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "CARRIES" }
+            files := View {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                spacing: 14
+                f0 := mod.widgets.SLink { visible: false }
+                f1 := mod.widgets.SLink { visible: false }
+                f2 := mod.widgets.SLink { visible: false }
+                f3 := mod.widgets.SLink { visible: false }
+                f4 := mod.widgets.SLink { visible: false }
+                more_lbl := mod.widgets.SLabel {
+                    visible: false
+                    width: Fit, text: "", draw_text +: { color: #909090 }
+                }
+            }
+        }
         View { width: Fill, height: 2 }
         body_input := mod.widgets.SField {
             width: Fill, height: Fill
@@ -1999,6 +2022,25 @@ script_mod! {
                 width: Fill, height: Fit
                 visible: false
                 quote_body := mod.widgets.SHtml {}
+            }
+            /* What the letter carries (CR-010): one link a part, opening
+               the card over it. Five slots and a count for the rest — a
+               message row may not grow without bound. */
+            atts := View {
+                visible: false
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                spacing: 14
+                padding: Inset{top: 2}
+                a0 := mod.widgets.SLink { visible: false }
+                a1 := mod.widgets.SLink { visible: false }
+                a2 := mod.widgets.SLink { visible: false }
+                a3 := mod.widgets.SLink { visible: false }
+                a4 := mod.widgets.SLink { visible: false }
+                more_lbl := mod.widgets.SLabel {
+                    visible: false
+                    width: Fit, text: "", draw_text +: { color: #909090 }
+                }
             }
         }
         View {
@@ -3510,6 +3552,14 @@ impl Widget for ComposePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // Its *own* seed's files: a compose retargeted in place keeps its
+        // id, and the files a reply left are not the forward's (CR-010).
+        if let Some((store, pid, seed)) = scope.props.get::<PanelProps>().and_then(|p| {
+            let Kind::Compose { seed } = p.kind else { return None };
+            Some((p.store.clone(), p.pid, seed))
+        }) {
+            self.carries(cx, &mail::draft_files_for(&store, pid as i64, seed), pid);
+        }
         self.view.draw_walk_all(cx, scope, walk);
         // The TO field's offer, over the subject and the body.
         if let Some(store) = panel_store(scope) {
@@ -3521,12 +3571,62 @@ impl Widget for ComposePanel {
     }
 }
 
+/// The files a compose lists by name, the way a message row lists its parts.
+const CARRY_LINKS: [LiveId; 5] = [
+    live_id!(f0),
+    live_id!(f1),
+    live_id!(f2),
+    live_id!(f3),
+    live_id!(f4),
+];
+
+impl ComposePanel {
+    /// The `CARRIES` line: one link a file, opening its card. Written every
+    /// draw — the list is a cached query, so this is a lookup, and an
+    /// attach must show up in the frame that made it.
+    fn carries(&mut self, cx: &mut Cx2d, files: &[mail::DraftFile], pid: u64) {
+        let v = &self.view;
+        v.view(cx, ids!(carries)).set_visible(cx, !files.is_empty());
+        for (i, slot) in CARRY_LINKS.iter().enumerate() {
+            let link = v.link(cx, &[live_id!(carries), live_id!(files), *slot]);
+            match files.get(i) {
+                Some(f) => {
+                    let target = crate::core::Kind::File { path: f.path.clone() };
+                    link.set(cx, pid, &f.label(), target, false);
+                    link.set_visible(cx, true);
+                }
+                None => link.set_visible(cx, false),
+            }
+        }
+        let rest = files.len().saturating_sub(CARRY_LINKS.len());
+        let more = v.label(cx, ids!(carries.files.more_lbl));
+        more.set_text(cx, &format!("+{rest} more"));
+        more.set_visible(cx, rest > 0);
+    }
+}
+
 impl ComposePanelRef {
     /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
     /// table — a click on one is [`ComposePanelRef::pick`].
     pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
         self.borrow()
             .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
+    }
+
+    /// The `CARRIES` links' rects, in slot order, for the shell's hit
+    /// table — the panel knows where they are, the shell knows what they
+    /// name (CR-010).
+    pub fn carry_hits(&self, cx: &mut Cx) -> Vec<Rect> {
+        let Some(p) = self.borrow() else { return Vec::new() };
+        CARRY_LINKS
+            .iter()
+            .map(|slot| {
+                p.view
+                    .widget(cx, &[live_id!(carries), live_id!(files), *slot])
+                    .area()
+                    .rect(cx)
+            })
+            .collect()
     }
 
     /// Commits the `i`-th address on offer in the TO field; the draft
@@ -5974,15 +6074,25 @@ impl Widget for FilesPanel {
     }
 }
 
+/// The card (CR-008) — and, on the same widget, the card over one part of a
+/// letter (CR-010). Which side the content comes from is the only
+/// difference: a path is `stat`ed and read through the outside, a part is
+/// described by its row and its bytes come off the picture reader's thread.
+/// Everything past that — the kind word, the size, which preview to attempt
+/// — is [`files`]' own, so the two cannot drift apart.
 #[derive(Script, ScriptHook, Widget)]
 pub struct FilePanel {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
-    /// The path the card was last filled for, so a preview is decoded once.
+    /// What the card was last filled for, so a preview is decoded once.
     #[rust]
-    shown: Option<String>,
+    shown: Option<crate::core::Kind>,
+    /// Whether that fill is still waiting on bytes that had not landed —
+    /// the one reason to fill the same card twice.
+    #[rust]
+    waiting: bool,
 }
 
 impl Widget for FilePanel {
@@ -5991,81 +6101,126 @@ impl Widget for FilePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let (path, world) = match scope.props.get::<PanelProps>() {
-            Some(p) => match &p.kind {
-                crate::core::Kind::File { path } => (Some(path.clone()), Some(p.world.clone())),
-                _ => (None, None),
-            },
-            None => (None, None),
+        let props = scope
+            .props
+            .get::<PanelProps>()
+            .map(|p| (p.kind.clone(), p.world.clone(), p.store.clone()));
+        let Some((kind, world, store)) = props else {
+            return self.view.draw_walk(cx, scope, walk);
         };
-        if let (Some(path), Some(world)) = (path, world) {
-            if self.shown.as_deref() != Some(path.as_str()) {
-                let v = &self.view;
-                v.label(cx, ids!(name_lbl)).set_text(cx, files::basename(&path));
-                v.text_input(cx, ids!(path_txt)).set_text(cx, &path);
-                let text_prev = v.text_input(cx, ids!(text_box.text_prev));
-                let text_box = v.view(cx, ids!(text_box));
-                let img_prev = v.widget(cx, ids!(img_box.img_prev));
-                let img_box = v.view(cx, ids!(img_box));
-                let none_lbl = v.label(cx, ids!(none_lbl));
-                match files::stat_in(&world, &path) {
-                    Some(e) => {
-                        v.label(cx, ids!(kind_lbl)).set_text(
-                            cx,
-                            &format!("{} · {}", e.kind().word(), files::fmt_size(e.size)),
-                        );
-                        v.label(cx, ids!(when_lbl))
-                            .set_text(cx, &format!("modified {}", mail::fmt_date(e.modified)));
-                        // The preview: the first 64 KB of a text file in the
-                        // app's one face; a PNG or a JPEG decoded at up to
-                        // 20 MB; anything else is the card alone.
-                        let (mut text, mut image) = (None, false);
-                        match e.kind() {
-                            files::FileKind::Text => {
-                                if let Ok(bytes) =
-                                    files::read_in(&world, &path, files::TEXT_PREVIEW_MAX)
-                                {
-                                    text = Some(String::from_utf8_lossy(&bytes).into_owned());
-                                }
-                            }
-                            files::FileKind::Image => {
-                                // The name says whether to read it; the
-                                // bytes say how to decode it.
-                                let bytes = files::image_format(&e.name).and_then(|_| {
-                                    files::read_in(&world, &path, files::IMAGE_PREVIEW_MAX).ok()
-                                });
-                                if let Some(bytes) = bytes {
-                                    let img = img_prev.as_image();
-                                    image = match files::sniff(&bytes) {
-                                        Some(files::ImageFormat::Png) => {
-                                            img.load_png_from_data(cx, &bytes).is_ok()
-                                        }
-                                        Some(files::ImageFormat::Jpeg) => {
-                                            img.load_jpg_from_data(cx, &bytes).is_ok()
-                                        }
-                                        None => false,
-                                    };
-                                }
-                            }
-                            _ => {}
-                        }
-                        text_prev.set_text(cx, text.as_deref().unwrap_or(""));
-                        text_box.set_visible(cx, text.is_some());
-                        img_box.set_visible(cx, image);
-                        none_lbl.set_visible(cx, text.is_none() && !image);
-                    }
-                    None => {
-                        v.label(cx, ids!(kind_lbl)).set_text(cx, "gone");
-                        v.label(cx, ids!(when_lbl)).set_text(cx, "");
-                        text_box.set_visible(cx, false);
-                        img_box.set_visible(cx, false);
-                        none_lbl.set_visible(cx, false);
-                    }
+        if self.shown.as_ref() != Some(&kind) || self.waiting {
+            self.waiting = false;
+            match &kind {
+                crate::core::Kind::File { path } => {
+                    let card = files::disk_card(&world, path);
+                    let preview = card.as_ref().map_or(files::Preview::None, |c| {
+                        files::preview_of(c.kind, &c.name, |max| {
+                            files::read_in(&world, path, max).ok()
+                        })
+                    });
+                    self.fill(cx, card.as_ref(), &preview, files::basename(path), path);
                 }
-                self.shown = Some(path);
+                crate::core::Kind::Attachment { mail, at } => {
+                    self.fill_part(cx, &store, *mail, *at);
+                }
+                _ => {}
             }
+            self.shown = Some(kind);
         }
         self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl FilePanel {
+    /// The card over one part of a letter. The description is a row, so it
+    /// is there at once; the bytes are asked for off the frame, and until
+    /// they land the card is the description with the preview still coming.
+    fn fill_part(&mut self, cx: &mut Cx2d, store: &Store, mail: crate::core::MailId, at: u32) {
+        let Some(a) = mail::attachment(store, mail, at) else {
+            self.fill(cx, None, &files::Preview::None, "attachment", "");
+            return;
+        };
+        let letter = mail::mail(store, a.message);
+        let from = letter
+            .as_ref()
+            .map(|m| {
+                if m.head.from_name.is_empty() {
+                    m.head.from_email.clone()
+                } else {
+                    m.head.from_name.clone()
+                }
+            })
+            .unwrap_or_default();
+        let card = a.card(&from, letter.map_or(0.0, |m| m.head.date));
+        // Only a preview worth having is worth reading a whole letter for:
+        // `preview_of` asks for bytes exactly when the kind wants them, so
+        // a card over a 4 MB PDF costs nothing but its row.
+        let mut waiting = false;
+        let preview = files::preview_of(card.kind, &card.name, |max| {
+            match want_part(cx, store, mail, at) {
+                PartBytes::Here(b) => Some(b.iter().take(max).copied().collect()),
+                PartBytes::Coming => {
+                    waiting = true;
+                    None
+                }
+                PartBytes::Gone => None,
+            }
+        });
+        self.waiting = waiting;
+        self.fill(cx, Some(&card), &preview, &card.name, &card.detail);
+    }
+
+    /// Writes one card into the widget tree: the four lines, then whichever
+    /// preview there is.
+    fn fill(
+        &mut self,
+        cx: &mut Cx2d,
+        card: Option<&files::Card>,
+        preview: &files::Preview,
+        name: &str,
+        detail: &str,
+    ) {
+        let v = &self.view;
+        v.label(cx, ids!(name_lbl)).set_text(cx, name);
+        v.text_input(cx, ids!(path_txt)).set_text(cx, detail);
+        let text_prev = v.text_input(cx, ids!(text_box.text_prev));
+        let text_box = v.view(cx, ids!(text_box));
+        let img_prev = v.widget(cx, ids!(img_box.img_prev));
+        let img_box = v.view(cx, ids!(img_box));
+        let none_lbl = v.label(cx, ids!(none_lbl));
+        let Some(card) = card else {
+            // Gone from the disk, or a row whose letter has left.
+            v.label(cx, ids!(kind_lbl)).set_text(cx, "gone");
+            v.label(cx, ids!(when_lbl)).set_text(cx, "");
+            text_box.set_visible(cx, false);
+            img_box.set_visible(cx, false);
+            none_lbl.set_visible(cx, false);
+            return;
+        };
+        v.label(cx, ids!(kind_lbl)).set_text(cx, &card.kind_line());
+        v.label(cx, ids!(when_lbl)).set_text(cx, &card.when);
+        // The preview: the first 64 KB of a text file in the app's one
+        // face; a PNG or a JPEG decoded at up to 20 MB; anything else is
+        // the card alone.
+        let (mut text, mut image) = (None, false);
+        match preview {
+            files::Preview::Text(t) => text = Some(t.clone()),
+            files::Preview::Image(bytes) => {
+                let img = img_prev.as_image();
+                image = match files::sniff(bytes) {
+                    Some(files::ImageFormat::Png) => img.load_png_from_data(cx, bytes).is_ok(),
+                    Some(files::ImageFormat::Jpeg) => img.load_jpg_from_data(cx, bytes).is_ok(),
+                    None => false,
+                };
+            }
+            files::Preview::None => {}
+        }
+        text_prev.set_text(cx, text.as_deref().unwrap_or(""));
+        text_box.set_visible(cx, text.is_some());
+        img_box.set_visible(cx, image);
+        // Still coming is not the same as never: the line only claims
+        // there is nothing to show once the answer is in.
+        none_lbl.set_visible(cx, !self.waiting && text.is_none() && !image);
     }
 }
 
@@ -6208,7 +6363,24 @@ pub struct MsgHit {
     pub quote: Option<Rect>,
     pub text: Option<Rect>,
     pub html: Option<Rect>,
+    /// The parts the open row lists (CR-010): `(label, rect, part)` — each
+    /// a link to the card over it.
+    pub atts: Vec<(String, Rect, u32)>,
 }
+
+/// How many parts one open message lists by name. Past this the line says
+/// how many more there are: a row is a row, and a letter with thirty
+/// attachments must not push the next message off the panel.
+const ATT_SLOTS: usize = 5;
+
+/// The slots the DSL lays out for them.
+const ATT_LINKS: [LiveId; ATT_SLOTS] = [
+    live_id!(a0),
+    live_id!(a1),
+    live_id!(a2),
+    live_id!(a3),
+    live_id!(a4),
+];
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct ThreadMsg {
@@ -6234,6 +6406,9 @@ pub struct ThreadMsg {
     date: String,
     #[rust]
     preview: String,
+    /// The parts this row lists while open: `(label, part)`, in slot order.
+    #[rust]
+    atts: Vec<(String, u32)>,
 }
 
 impl Widget for ThreadMsg {
@@ -6253,7 +6428,15 @@ impl Widget for ThreadMsg {
 }
 
 impl ThreadMsgRef {
-    pub fn populate(&self, cx: &mut Cx, pid: u64, t: &mail::ThreadMail, open: bool, quoted: bool) {
+    pub fn populate(
+        &self,
+        cx: &mut Cx,
+        pid: u64,
+        t: &mail::ThreadMail,
+        open: bool,
+        quoted: bool,
+        atts: &[mail::Attachment],
+    ) {
         let Some(mut w) = self.borrow_mut() else { return };
         let m = &t.mail;
         let name = if m.head.from_name.is_empty() {
@@ -6292,6 +6475,8 @@ impl ThreadMsgRef {
         };
         w.preview = preview.clone();
         w.has_quote = quote.is_some();
+        w.atts = atts.iter().take(ATT_SLOTS).map(|a| (a.label(), a.at)).collect();
+        let listed = w.atts.clone();
         let v = &w.view;
 
         // The header row: name, preview and date closed; the link and the
@@ -6362,6 +6547,27 @@ impl ThreadMsgRef {
         );
         v.view(cx, ids!(quote_text)).set_visible(cx, show_quote && !is_html);
         v.view(cx, ids!(quote_html)).set_visible(cx, show_quote && is_html);
+
+        // What the letter carries (CR-010), under its reading: one link a
+        // part, each opening the card over it — a solid link, so it opens
+        // joined to the right like anything else the panel names.
+        let shown = if open { listed.clone() } else { Vec::new() };
+        v.view(cx, ids!(atts)).set_visible(cx, !shown.is_empty());
+        for (i, slot) in ATT_LINKS.iter().enumerate() {
+            let link = v.link(cx, &[live_id!(atts), *slot]);
+            match shown.get(i) {
+                Some((label, at)) => {
+                    let target = crate::core::Kind::Attachment { mail: m.head.id, at: *at };
+                    link.set(cx, pid, label, target, false);
+                    link.set_visible(cx, true);
+                }
+                None => link.set_visible(cx, false),
+            }
+        }
+        let rest = atts.len().saturating_sub(ATT_SLOTS);
+        let more = v.label(cx, ids!(atts.more_lbl));
+        more.set_text(cx, &format!("+{rest} more"));
+        more.set_visible(cx, !shown.is_empty() && rest > 0);
     }
 
     /// The row's touchable parts, for the shell's hit table. Rects of
@@ -6387,6 +6593,17 @@ impl ThreadMsgRef {
             quote: if open && w.has_quote && !w.quoted { rect(ids!(quote_fold)) } else { None },
             text: if open && !w.is_html { rect(ids!(body_lbl)) } else { None },
             html: if open && w.is_html { rect(ids!(body_html)) } else { None },
+            atts: if open {
+                w.atts
+                    .iter()
+                    .zip(ATT_LINKS.iter())
+                    .filter_map(|((label, at), slot)| {
+                        rect(&[live_id!(atts), *slot]).map(|r| (label.clone(), r, *at))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -6441,6 +6658,12 @@ enum PicJob {
     Cid { db: Arc<crate::store::Db>, mid: i64 },
     /// Un-base64 one `data:` source, filed under `key`.
     Data { key: String, src: String },
+    /// Read one part of a letter back out of its raw (CR-010), for the card
+    /// that shows it. The same read and the same MIME walk as `Cid`, asked
+    /// for by row rather than by mail — and off the frame for the same
+    /// reason: an attachment is exactly the megabyte-sized blob the rule
+    /// about draws exists for.
+    Part { db: Arc<crate::store::Db>, mail: i64, at: u32 },
 }
 
 /// What the reader thread found, on its way back to the UI thread.
@@ -6528,16 +6751,21 @@ fn spawn_picture_reader() -> mpsc::Sender<PicJob> {
             // process can have several worlds open at once (the panels
             // library), and in every other run this opens exactly once.
             let mut held: Option<(Arc<crate::store::Db>, crate::store::Store)> = None;
+            // Whichever *one* writer the job names, kept for as long as the
+            // jobs keep naming it.
+            fn hold(
+                held: &mut Option<(Arc<crate::store::Db>, crate::store::Store)>,
+                db: Arc<crate::store::Db>,
+            ) -> Option<&crate::store::Store> {
+                if !held.as_ref().is_some_and(|(h, _)| Arc::ptr_eq(h, &db)) {
+                    *held = crate::store::Store::with_db(db.clone()).ok().map(|s| (db, s));
+                }
+                held.as_ref().map(|(_, s)| s)
+            }
             while let Ok(job) = rx.recv() {
                 let ready = match job {
-                    PicJob::Cid { db, mid } => {
-                        if !held.as_ref().is_some_and(|(h, _)| Arc::ptr_eq(h, &db)) {
-                            held = crate::store::Store::with_db(db.clone())
-                                .ok()
-                                .map(|s| (db, s));
-                        }
-                        cid_parts(held.as_ref().map(|(_, s)| s), mid)
-                    }
+                    PicJob::Cid { db, mid } => cid_parts(hold(&mut held, db), mid),
+                    PicJob::Part { db, mail, at } => letter_part(hold(&mut held, db), mail, at),
                     PicJob::Data { key, src } => data_bytes(key, &src),
                 };
                 Cx::post_action(ready);
@@ -6572,6 +6800,82 @@ fn cid_parts(store: Option<&Store>, mid: i64) -> PicturesReady {
         items,
         failed: Vec::new(),
         retry,
+    }
+}
+
+/// The name one part of a letter is filed under (CR-010) — the same flat
+/// space a picture's source lives in, since both are "bytes a panel needs
+/// and must not read in its own frame".
+fn part_key(mail: i64, at: u32) -> String {
+    format!("part:{mail}/{at}")
+}
+
+/// One part of a letter, by its row. Pure, as [`cid_parts`] — but a part
+/// that cannot be had lands in `failed`, not in `retry`: the row only
+/// exists because this device walked the letter's raw, so a raw that no
+/// longer yields it is an answer, not a delay, and asking again every
+/// frame would be a spin.
+fn letter_part(store: Option<&Store>, mail: i64, at: u32) -> PicturesReady {
+    let key = part_key(mail, at);
+    let bytes = store
+        .and_then(|s| mail::attachment(s, mail, at).map(|a| (s, a)))
+        .and_then(|(s, a)| mail::part(s, &a));
+    match bytes {
+        // Cut to the preview's own ceiling before it is *kept*: this cache
+        // outlives the card, and a card only ever draws the first
+        // `IMAGE_PREVIEW_MAX` of a part anyway. What `open` hands to the OS
+        // does not come through here — it reads the whole part and writes it
+        // out (see `Stage::write_out`).
+        Some(b) => PicturesReady {
+            items: vec![(key, Arc::from(&b[..b.len().min(files::IMAGE_PREVIEW_MAX)]))],
+            failed: Vec::new(),
+            retry: Vec::new(),
+        },
+        None => PicturesReady {
+            items: Vec::new(),
+            failed: vec![key],
+            retry: Vec::new(),
+        },
+    }
+}
+
+/// What asking for a part's bytes answers.
+pub enum PartBytes {
+    Here(Arc<[u8]>),
+    /// The reader has it and has not answered yet — hold the card open.
+    Coming,
+    /// It cannot be had: the letter no longer yields that part. Said once,
+    /// so the card can stop waiting and say so.
+    Gone,
+}
+
+/// Asks for one part's bytes, once, and answers with them when they are
+/// here. The card calls this every draw: asking is one lookup, and the
+/// answer arrives through [`pictures_landed`], which redraws.
+pub fn want_part(cx: &mut Cx, store: &Store, mail: i64, at: u32) -> PartBytes {
+    let key = part_key(mail, at);
+    let p = cx.global::<Pictures>();
+    if let Some(b) = p.bytes.get(&key) {
+        return PartBytes::Here(b.clone());
+    }
+    if p.failed.contains(&key) {
+        return PartBytes::Gone;
+    }
+    if !p.asked.insert(key.clone()) {
+        return PartBytes::Coming;
+    }
+    if let Some(tx) = p.reader() {
+        let _ = tx.send(PicJob::Part { db: store.db(), mail, at });
+        return PartBytes::Coming;
+    }
+    // No reader thread (headless): the run wants its bytes in the frame
+    // that asked, which is the bargain the whole module strikes there.
+    let ready = letter_part(Some(store), mail, at);
+    let p = cx.global::<Pictures>();
+    p.take(&ready);
+    match p.bytes.get(&key) {
+        Some(b) => PartBytes::Here(b.clone()),
+        None => PartBytes::Gone,
     }
 }
 
@@ -7044,7 +7348,7 @@ impl HtmlImage {
 /// What a live thread row was last populated with: which mail, open or
 /// not, quote unfolded or not, and enough of the mail to notice it changed
 /// under the row (a body that arrived, a status that landed).
-type MsgStamp = (i64, bool, bool, usize, Option<usize>, Option<(String, bool)>, bool);
+type MsgStamp = (i64, bool, bool, usize, Option<usize>, Option<(String, bool)>, bool, usize);
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct MessagePanel {
@@ -7135,7 +7439,10 @@ impl Widget for MessagePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let pid = p.pid;
-        let msgs = mail::thread(&p.store, id);
+        // Cloned out of the props: the row loop below hands `scope` on to
+        // each item, so nothing may still be borrowing it by then.
+        let store = p.store.clone();
+        let msgs = mail::thread(&store, id);
         let expand = Expansion::for_panel(p.expand.as_ref(), id);
         if let Some(first) = msgs.first() {
             self.view
@@ -7189,7 +7496,7 @@ impl Widget for MessagePanel {
                 continue;
             }
             self.pictured.insert(mid);
-            want_cid_parts(cx, &p.store, mid);
+            want_cid_parts(cx, &store, mid);
         }
         let n = msgs.len();
         let mut live: Vec<usize> = Vec::new();
@@ -7202,6 +7509,10 @@ impl Widget for MessagePanel {
                     let mid = t.mail.head.id;
                     let open = expand.open.contains(&mid);
                     let quoted = expand.quotes.contains(&mid);
+                    // The parts are a cached query, so asking per row is a
+                    // lookup; the count in the stamp is what notices a
+                    // letter that gained them since it was last drawn.
+                    let atts = mail::attachments(&store, mid);
                     let stamp: MsgStamp = (
                         mid,
                         open,
@@ -7210,9 +7521,10 @@ impl Widget for MessagePanel {
                         t.mail.html.as_ref().map(String::len),
                         t.mail.status.clone(),
                         t.mail.head.unread,
+                        atts.len(),
                     );
                     if !existed || self.stamps.get(&idx) != Some(&stamp) {
-                        row.as_thread_msg().populate(cx, pid, t, open, quoted);
+                        row.as_thread_msg().populate(cx, pid, t, open, quoted, &atts);
                         self.stamps.insert(idx, stamp);
                     }
                     live.push(idx);

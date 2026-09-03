@@ -32,6 +32,10 @@ pub const ROOT: &str = "/";
 pub const TEXT_PREVIEW_MAX: usize = 64 * 1024;
 /// How much of an image the card decodes.
 pub const IMAGE_PREVIEW_MAX: usize = 20 * 1024 * 1024;
+/// How big a file compose will carry out as a part (CR-010). Past this the
+/// attach refuses on the panel's status line rather than building a mail no
+/// server will take.
+pub const ATTACH_MAX: u64 = 25 * 1024 * 1024;
 
 /// One entry of a directory, as the files panel lists it.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +143,36 @@ impl FileKind {
             FileKind::Archive => "archive",
             FileKind::Other => "other",
         }
+    }
+}
+
+/// The media type a name claims. What a part compose carries out is
+/// labelled with, and what a card shows when the kind word says little —
+/// a short table over the kinds this app actually meets, and
+/// `application/octet-stream` for everything else, which is the honest
+/// answer rather than a guess.
+#[must_use]
+pub fn mime_of(name: &str) -> &'static str {
+    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") => "image/heic",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("zip") => "application/zip",
+        Some("gz" | "tgz") => "application/gzip",
+        Some("tar") => "application/x-tar",
+        Some("txt" | "log") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("html") => "text/html",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("yaml" | "yml") => "application/yaml",
+        Some("rs" | "toml" | "tla" | "cfg" | "sh") => "text/plain",
+        _ => "application/octet-stream",
     }
 }
 
@@ -406,6 +440,107 @@ pub fn read_in(world: &World, path: &str, max: usize) -> Result<Vec<u8>, String>
     world.outside(|o| o.read_file(&real_path(path), max))
 }
 
+// -- the card ------------------------------------------------------------------
+
+/// What a card draws, whichever side it came from: a file on the disk
+/// (CR-008) or a part of a letter (CR-010). The panel reads this and
+/// nothing else, so one widget serves both — which is the whole reason
+/// attachments were cheap to build once the browser existed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    /// The big line: the file's name, the part's filename.
+    pub name: String,
+    pub kind: FileKind,
+    pub size: u64,
+    /// The muted line: when a file last changed, who a part came with.
+    pub when: String,
+    /// The selectable line under it: the path, or the part's media type.
+    pub detail: String,
+}
+
+impl Card {
+    /// The line beside the name: what it is and how big — `pdf · 96 KB`.
+    #[must_use]
+    pub fn kind_line(&self) -> String {
+        format!("{} · {}", self.kind.word(), fmt_size(self.size))
+    }
+}
+
+/// The card a path makes; `None` when the disk no longer has it.
+#[must_use]
+pub fn disk_card(world: &World, path: &str) -> Option<Card> {
+    let e = stat_in(world, path)?;
+    Some(Card {
+        name: e.name.clone(),
+        kind: e.kind(),
+        size: e.size,
+        when: format!("modified {}", crate::mail::fmt_date(e.modified)),
+        detail: path.to_string(),
+    })
+}
+
+/// What a card shows under the rule: a text file's reading, a picture's
+/// bytes, or nothing at all.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Preview {
+    Text(String),
+    Image(Vec<u8>),
+    None,
+}
+
+/// The preview a card of this kind wants, read through `read` — which is
+/// handed the cap and answers `None` when the bytes cannot be had (yet).
+/// The kind decides *whether* to read at all: a 38 MB disk image is never
+/// pulled into a panel to be told it is not a picture.
+pub fn preview_of(
+    kind: FileKind,
+    name: &str,
+    read: impl FnOnce(usize) -> Option<Vec<u8>>,
+) -> Preview {
+    match kind {
+        FileKind::Text => match read(TEXT_PREVIEW_MAX) {
+            Some(b) => Preview::Text(String::from_utf8_lossy(&b).into_owned()),
+            None => Preview::None,
+        },
+        // The name says whether to read it; the bytes say how to decode it.
+        FileKind::Image if image_format(name).is_some() => match read(IMAGE_PREVIEW_MAX) {
+            Some(b) => Preview::Image(b),
+            None => Preview::None,
+        },
+        _ => Preview::None,
+    }
+}
+
+/// Where a letter's part lands when it is opened (CR-010): the app's own
+/// scratch directory, **a folder per part**, so nothing can be overwritten
+/// by anything — not another letter's part, and not this letter's second
+/// `image.png`, which is a shape mail actually arrives in. The folder
+/// carries the disambiguation so the file keeps the name the sender gave
+/// it, which is the name the viewer will put in its title bar. An ordinary
+/// directory either way, so a files panel can walk to it afterwards.
+#[must_use]
+pub fn scratch(mail: i64, at: u32, name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("superapp-parts")
+        .join(format!("mail-{mail}"))
+        .join(format!("part-{at}"))
+        // A part's filename comes off the wire: the last segment of it is
+        // all that may reach the disk, and never `..`.
+        .join(safe_name(name))
+}
+
+/// A filename from outside as a single, harmless segment: no separators, no
+/// climbing, never empty.
+#[must_use]
+pub fn safe_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if last.is_empty() || last == "." || last == ".." {
+        "part".to_string()
+    } else {
+        last.to_string()
+    }
+}
+
 // -- the held item -----------------------------------------------------------
 
 /// What `copy` and `move` hold, until a `… here` performs it.
@@ -622,7 +757,7 @@ pub mod demo {
         Some(match e.name.as_str() {
             "hosts" => "127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1\tlocalhost".into(),
             "README.txt" => "superapp 0.1.0\n\nA personal user-space OS: one workspace, specialized panels, no windows.\n\nDrag the .app to Applications. First launch asks for nothing; add a mail account in settings.".into(),
-            "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments (follow-up CR)\n- rename?".into(),
+            "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments: save a part where I choose\n- rename?".into(),
             "notes.txt" => "Lisbon, August.\n\nInvoice 0817 is for the flat; the photos are from the last evening.".into(),
             "notes.md" => "# notes\n\n- a directory is a list panel\n- a file is a card\n- enter goes, the cursor previews\n\nThe join is the only relation.".into(),
             "panel-context.md" => "# panel: files ~/Downloads\n\nfilter: @kind:image\nentries: 8 (1 shown)\nlisted: 0.4 s ago".into(),
@@ -1154,6 +1289,80 @@ mod tests {
         assert!(demo::text_of("~/Downloads/report-q3.pdf").is_none());
         assert!(demo::bytes_of("~/Downloads/2026/photo-lisbon.jpg").is_some_and(|b| !b.is_empty()));
         assert!(demo::bytes_of("~/Downloads/nope.txt").is_none());
+    }
+
+    /// The card and its preview are the two sides' one vocabulary
+    /// (CR-010): the kind decides whether the bytes are worth reading at
+    /// all, and a source that cannot answer yet is a card with no preview
+    /// rather than a card that says there is none.
+    #[test]
+    fn one_card_serves_the_disk_and_a_letter() {
+        let w = World::fake(crate::effect::Registry::new());
+        let card = disk_card(&w, "~/Downloads/README.txt").unwrap();
+        assert_eq!(card.name, "README.txt");
+        assert_eq!(card.kind_line(), "text · 640 B");
+        assert_eq!(card.when, "modified aug 12 16:45");
+        assert_eq!(card.detail, "~/Downloads/README.txt");
+        assert_eq!(disk_card(&w, "~/Downloads/gone"), None);
+
+        // Text is read; a picture is read by its name and decoded by its
+        // bytes; everything else is never read at all — which is the point,
+        // since the alternative is pulling 38 MB into a panel to be told it
+        // is a disk image.
+        let asked = std::cell::Cell::new(0);
+        let read = |max: usize| {
+            asked.set(asked.get() + 1);
+            read_in(&w, "~/Downloads/README.txt", max).ok()
+        };
+        assert!(matches!(
+            preview_of(FileKind::Text, "README.txt", read),
+            Preview::Text(t) if t.starts_with("superapp 0.1.0")
+        ));
+        assert_eq!(asked.get(), 1);
+        let never = |_: usize| -> Option<Vec<u8>> { panic!("read for a kind with no preview") };
+        assert_eq!(preview_of(FileKind::Pdf, "a.pdf", never), Preview::None);
+        assert_eq!(preview_of(FileKind::Archive, "a.zip", never), Preview::None);
+        assert_eq!(preview_of(FileKind::Dir, "d", never), Preview::None);
+        // A `.gif` is an image the card cannot decode: not read either.
+        assert_eq!(preview_of(FileKind::Image, "a.gif", never), Preview::None);
+        // Bytes still on their way: no preview, and nothing decided.
+        assert_eq!(preview_of(FileKind::Text, "a.txt", |_| None), Preview::None);
+        let icon = include_bytes!("../resources/icon_256.png").to_vec();
+        assert_eq!(
+            preview_of(FileKind::Image, "a.png", |_| Some(icon.clone())),
+            Preview::Image(icon)
+        );
+    }
+
+    /// A name off the wire reaches the disk as one harmless segment, under
+    /// the app's own scratch directory and never anywhere else (CR-010).
+    #[test]
+    fn a_parts_name_cannot_climb_out_of_the_scratch_directory() {
+        let root = std::env::temp_dir().join("superapp-parts").join("mail-7");
+        let p2 = root.join("part-2");
+        assert_eq!(scratch(7, 2, "invoice.pdf"), p2.join("invoice.pdf"));
+        assert_eq!(scratch(7, 2, "../../etc/passwd"), p2.join("passwd"));
+        assert_eq!(scratch(7, 2, "a/b/c.txt"), p2.join("c.txt"));
+        assert_eq!(scratch(7, 2, ".."), p2.join("part"));
+        assert_eq!(scratch(7, 2, "  "), p2.join("part"));
+        assert_eq!(safe_name("C:\\Windows\\x.dll"), "x.dll");
+        // Two parts of one letter under one name land apart, which is the
+        // whole reason the part is in the path: mail really does carry two
+        // `image.png`s.
+        assert_ne!(scratch(7, 2, "image.png"), scratch(7, 3, "image.png"));
+        assert_ne!(scratch(7, 2, "image.png"), scratch(8, 2, "image.png"));
+    }
+
+    /// What an outgoing part is labelled with, and what a card falls back
+    /// to: a short table, and the honest answer past it.
+    #[test]
+    fn a_name_claims_a_media_type() {
+        assert_eq!(mime_of("q3.CSV"), "text/csv");
+        assert_eq!(mime_of("report-q3.pdf"), "application/pdf");
+        assert_eq!(mime_of("photo.jpeg"), "image/jpeg");
+        assert_eq!(mime_of("logs.tar.gz"), "application/gzip");
+        assert_eq!(mime_of("superapp.db"), "application/octet-stream");
+        assert_eq!(mime_of("noextension"), "application/octet-stream");
     }
 
     /// The fake outside serves the demo tree through the same verbs the

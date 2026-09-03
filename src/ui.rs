@@ -74,6 +74,10 @@ pub enum BtnAct {
     /// `copy here` / `move here`: perform the held item into the
     /// directory this files panel shows.
     Here,
+    /// A compose panel's `attach` (CR-010): the held files become parts of
+    /// the draft. The destination half of the hold grammar, exactly as
+    /// `… here` is — a compose *is* a destination for a file.
+    Attach,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +126,10 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
             ("move", BtnAct::MoveHold),
             ("delete", BtnAct::Delete),
         ],
+        // A part of a letter is a card over bytes nobody owns a path to
+        // (CR-010): `open` writes it out and hands it to the OS, and the
+        // three verbs that act on a place on the disk have no place to act.
+        Kind::Attachment { .. } => &[("open", BtnAct::Open)],
         _ => &[],
     }
 }
@@ -170,6 +178,15 @@ pub fn head_btns_of(
     if let (Kind::Files { .. }, Some(op)) = (kind, hold) {
         v.push(hold_btn(op));
     }
+    // The other destination for a held file (CR-010). A compose wears
+    // `attach` only while something is held, exactly as a files panel wears
+    // `… here` — the verb names what will happen to what you are carrying,
+    // and with empty hands there is nothing to name. Either hold does: you
+    // are attaching a copy of the file either way, so a `move` is read as
+    // the `copy` it can only be.
+    if matches!(kind, Kind::Compose { .. }) && hold.is_some() {
+        v.push(("attach", BtnAct::Attach));
+    }
     v
 }
 
@@ -192,6 +209,11 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
         BtnAct::CopyHold => Some('p'),
         BtnAct::MoveHold => Some('m'),
         BtnAct::Here => Some('h'),
+        // The `h` of "attach", not the `a`: a compose edits text, so `cmd+a`
+        // is select-all — the same courtesy `copy` gets its `p` for. It is
+        // also the letter `… here` wears, which is the point: both are the
+        // hold's destination verb.
+        BtnAct::Attach => Some('h'),
     }
 }
 
@@ -492,6 +514,7 @@ mod tests {
             Kind::File {
                 path: "~/notes.md".into(),
             },
+            Kind::Attachment { mail: 1, at: 2 },
         ]
     }
 
@@ -519,6 +542,42 @@ mod tests {
             let marked = head_btns_of(&k, Some(op), true, true);
             let labels: Vec<&str> = marked.iter().map(|(l, _)| *l).collect();
             assert_eq!(labels, ["new dir", "go to", op.here_label()]);
+        }
+    }
+
+    /// The hold's other destination (CR-010): a compose wears `attach` only
+    /// while something is held, and the union still obeys every rule — in
+    /// particular it must not claim a text chord, because a compose is
+    /// nothing but fields.
+    #[test]
+    fn a_held_file_gives_compose_its_attach() {
+        let k = Kind::Compose { seed: Seed::Blank };
+        let bare: Vec<&str> = head_btns_of(&k, None, false, false).iter().map(|(l, _)| *l).collect();
+        assert_eq!(bare, ["send", "discard"], "empty hands, nothing to attach");
+        for op in [crate::files::HoldOp::Copy, crate::files::HoldOp::Move] {
+            let held = head_btns_of(&k, Some(op), false, false);
+            let labels: Vec<&str> = held.iter().map(|(l, _)| *l).collect();
+            assert_eq!(labels, ["send", "discard", "attach"]);
+            let mut seen = Vec::new();
+            for (label, act) in &held {
+                let c = btn_accel(*act).expect("every compose button has a chord");
+                assert!(!RESERVED.contains(&c), "{label}: cmd+{c} is the workspace's");
+                assert!(!TEXT_CHORDS.contains(&c), "{label}: cmd+{c} belongs to the fields");
+                assert!(!seen.contains(&c), "{label}: cmd+{c} twice");
+                assert!(accel_idx(label, c).is_some(), "“{label}” cannot show its key {c}");
+                seen.push(c);
+            }
+        }
+        // Nothing else grows a verb from a hold: a card is not a destination.
+        for k in every_kind() {
+            if matches!(k, Kind::Files { .. } | Kind::Compose { .. }) {
+                continue;
+            }
+            assert_eq!(
+                head_btns_of(&k, Some(crate::files::HoldOp::Copy), true, false).len(),
+                head_btns(&k).len(),
+                "{k:?} grew a button from a hold"
+            );
         }
     }
 

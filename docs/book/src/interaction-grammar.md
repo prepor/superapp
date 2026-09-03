@@ -105,6 +105,69 @@ A preview needs somewhere to *be*. Where the pair cannot share the screen —
 a phone grid, where each panel is the whole of it — the open simply goes, as
 any other open would; a preview nobody can see is worse than no preview.
 
+### Attachments: a part of a letter is a card
+
+An open message lists **what its letter carries** under the reading: one
+link a part, `name · size`, and past five of them a count of the rest. A
+part the reading already draws — the pasted screenshot a
+`multipart/related` wraps around a `cid:` image — is not listed: it is
+visible one line up, and a picture under a picture of itself is noise.
+
+Following a link opens **a card**, joined to the right. It is the *same*
+card [a file on the disk](#files-a-directory-is-a-column-a-file-is-a-card)
+draws, over the mail's own bytes: the name, `text · 140 B`, and under the
+rule the preview — a text part read as text, a PNG or a JPEG decoded, and
+nothing at all for the rest, decided by the same rules a file card decides
+by. Two differences, both because a part is not a place on the disk. Where
+a file card shows its **path**, a part shows its **media type**; and where
+a file card's muted line says when the file changed, a part's says which
+letter it came with (`with Vera Kovac, aug 31 09:14`) — a part has no life
+of its own.
+
+The verbs follow from that too. A card over a file wears `open`, `copy`,
+`move` and `delete`; a part wears **`open` alone** (`cmd+o`), because the
+other three act on a place and a part has none. `open` writes the part into
+the app's own scratch directory — a folder per *part*, since one letter
+really does arrive carrying two `image.png`s, and the folder takes the
+disambiguation so the file keeps the name the sender gave it — and hands
+*that* to the OS. From there it is an ordinary file, and the browser can
+walk to it.
+
+The bytes stay in the letter. What a mail carries is stored once, in the
+`raw` this app already keeps for every synced message; the rows behind the
+links are a **description** derived from it, and a card asks a reader
+thread for the bytes rather than reading a megabyte inside its own frame
+(the same machinery a letter's pictures come through — see
+[Architecture](./architecture.md#frame-loop)). That is also the one place a
+part's card is poorer than a file's: a file card *measures* its preview and
+opens as tall as it needs, and a part's bytes are not there to measure when
+the wish is taken, so it opens at its three rows and a long part is cut
+off at the bottom. The message row it hangs off does grow by the line its
+parts are listed on.
+
+**Compose carries files the same way, in reverse.** A draft's files are
+named by *walking to them*, not by a dialog — the destination grammar the
+file browser already has, read the other way round. `copy` (`cmd+p`) on a
+file card holds it; a compose panel then wears **`attach`** (`cmd+h`), the
+same key `copy here` wears, because both are the held thing's destination
+verb. With empty hands a compose wears `send` and `discard` and nothing
+else: a verb that names what will happen to what you are carrying has
+nothing to name.
+
+What it will carry shows as a `CARRIES` line above the body, each file a
+link to its own card — so what is about to leave can be looked at before it
+does. An attach is an **action**, so `cmd+z` takes it back off and
+`cmd+shift+z` puts it on — and it takes off only what it *put* on, so
+attaching a file the draft already carries changes nothing and undoes
+nothing. The draft holds the file's *path*, not a copy of it, so what goes
+out is the file as it stands when the send leaves; a file that has moved by
+then, or grown past the limit, fails the send by name in the problems panel
+rather than going out empty or truncated. A directory refuses (a letter
+carries files), and so does anything past 25 MB. And because a draft
+replicates while a path does not mean the same file on two machines, a send
+from a device other than the one that picked the file refuses too, and says
+to attach it again there.
+
 ## Problems
 
 A toast is an **event**; a problem is a **condition**. When something in

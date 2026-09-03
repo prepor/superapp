@@ -521,6 +521,9 @@ fn ingest_message(
     // Which conversation it belongs to (CR-007) — decided here, in the same
     // transaction, so no draw ever sees an unthreaded mail.
     mail::thread_tx(tx, account, id, &p.message_id, &p.references)?;
+    // …and what it carries (CR-010), in the same transaction for the same
+    // reason: a letter is never listed without its parts.
+    mail::attach_tx(tx, id, &p.attachments)?;
     Ok(())
 }
 
@@ -543,6 +546,78 @@ pub struct ParsedMail {
     pub references: Vec<String>,
     /// The subject with its reply/forward prefixes stripped.
     pub topic: String,
+    /// The parts the letter carries beside its readings (CR-010) — what
+    /// the message panel lists and a card opens. The bytes stay in `raw`;
+    /// only the description is stored.
+    pub attachments: Vec<Part>,
+}
+
+/// One part of a letter, as a row describes it (CR-010). The bytes are not
+/// here: they live in the `raw` the store already keeps, and [`part_bytes`]
+/// reads them back by `at` — which is what keeps a mailbox one copy of
+/// itself rather than two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    /// Which part of the parsed message it is — the index [`part_bytes`]
+    /// reads back by.
+    pub at: u32,
+    /// What to call it: the `filename`, else the `name`, else a made-up
+    /// one — a part with no name is still a part.
+    pub name: String,
+    pub mime: String,
+    /// Bytes, decoded — what the card and the list show.
+    pub size: u64,
+    /// Its Content-ID, brackets off, for a part the reading refers to.
+    pub cid: String,
+}
+
+/// The parts of `raw` a row would describe — the same walk [`parse_mail`]
+/// does, so a stored row and a fresh read cannot disagree. `html` is the
+/// letter's reading: a part it already draws inline is not also an
+/// attachment, or a pasted screenshot would be listed under the picture of
+/// itself.
+#[must_use]
+fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
+    use mail_parser::MimeHeaders;
+    let mut out = Vec::new();
+    for at in msg.attachments.iter().copied() {
+        let Some(p) = msg.parts.get(at as usize) else { continue };
+        let cid = norm_id(p.content_id().unwrap_or_default());
+        // Drawn in the letter already: the `multipart/related` a composer
+        // writes around a pasted screenshot (see `inline_images`).
+        if !cid.is_empty() && html.is_some_and(|h| h.contains(&format!("cid:{cid}"))) {
+            continue;
+        }
+        let mime = p
+            .content_type()
+            .map(|t| match t.subtype() {
+                Some(sub) => format!("{}/{sub}", t.ctype()),
+                None => t.ctype().to_string(),
+            })
+            .unwrap_or_else(|| "application/octet-stream".into());
+        let name = p
+            .attachment_name()
+            .map(crate::files::safe_name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("part-{}", out.len() + 1));
+        out.push(Part {
+            at,
+            name,
+            mime,
+            size: p.contents().len() as u64,
+            cid,
+        });
+    }
+    out
+}
+
+/// One part's bytes, decoded, out of the letter it arrived in. `None` when
+/// the raw no longer parses or no longer has that part — a row from a
+/// build whose walk numbered them differently, or a mail refetched.
+#[must_use]
+pub fn part_bytes(raw: &[u8], at: u32) -> Option<Vec<u8>> {
+    let msg = mail_parser::MessageParser::default().parse(raw)?;
+    Some(msg.parts.get(at as usize)?.contents().to_vec())
 }
 
 /// The images a letter carries inside itself — its parts with a Content-ID
@@ -608,6 +683,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             message_id: String::new(),
             references: Vec::new(),
             topic: "(unparseable message)".into(),
+            attachments: Vec::new(),
         };
     };
     let (from_name, from_email) = msg
@@ -647,6 +723,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             references.push(id);
         }
     }
+    let attachments = parts_of(&msg, html.as_deref());
     ParsedMail {
         from_name,
         from_email,
@@ -660,6 +737,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
         html,
         message_id: norm_id(msg.message_id().unwrap_or_default()),
         references,
+        attachments,
     }
 }
 
@@ -991,6 +1069,56 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         assert_eq!(imgs[0].0, "sketch.png@ivanov.dev");
         assert!(imgs[0].1.starts_with(b"\x89PNG"));
         assert!(inline_images(RAW_ALT.as_bytes()).is_empty(), "no cid parts, no images");
+        // …and it is *not* listed as an attachment (CR-010): the reading
+        // already draws it, and a picture under a picture of itself is
+        // noise. `mail-parser` calls it one, so this is our own rule.
+        assert!(p.attachments.is_empty(), "{:?}", p.attachments);
+    }
+
+    /// A letter that carries files: one row a part, named, typed and
+    /// sized, and the bytes read back out of the raw by part index — no
+    /// second copy of an attachment anywhere (CR-010).
+    #[test]
+    fn a_letter_lists_what_it_carries() {
+        const RAW_ATT: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
+Subject: numbers\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"mix\"\r\n\
+\r\n\
+--mix\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Attached.\r\n\
+--mix\r\n\
+Content-Type: text/csv\r\n\
+Content-Disposition: attachment; filename=\"q3.csv\"\r\n\
+\r\n\
+line,aug\r\n\
+--mix\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"../../etc/passwd\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+JVBERi0xLjQK\r\n\
+--mix--\r\n";
+        let p = parse_mail(RAW_ATT.as_bytes());
+        assert_eq!(p.body, "Attached.");
+        let seen: Vec<(&str, &str)> = p
+            .attachments
+            .iter()
+            .map(|a| (a.name.as_str(), a.mime.as_str()))
+            .collect();
+        // A filename off the wire reaches the disk as one segment, never
+        // as a path: `safe_name` is applied here, not at the write.
+        assert_eq!(seen, [("q3.csv", "text/csv"), ("passwd", "application/pdf")]);
+        assert_eq!(
+            part_bytes(RAW_ATT.as_bytes(), p.attachments[0].at).as_deref(),
+            Some(&b"line,aug"[..])
+        );
+        assert!(part_bytes(RAW_ATT.as_bytes(), p.attachments[1].at)
+            .is_some_and(|b| b.starts_with(b"%PDF")));
+        assert_eq!(part_bytes(RAW_ATT.as_bytes(), 99), None, "a part that is not there");
+        assert!(parse_mail(RAW.as_bytes()).attachments.is_empty());
     }
 
     /// An isolated world with one real-looking account and an empty inbox.

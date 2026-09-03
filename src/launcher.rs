@@ -50,6 +50,7 @@ fn kind_word(kind: &Kind) -> &'static str {
         Kind::Job { .. } => "job",
         Kind::Files { .. } => "files",
         Kind::File { .. } => "file",
+        Kind::Attachment { .. } => "attachment",
         Kind::Bucket => "device sync",
     }
 }
