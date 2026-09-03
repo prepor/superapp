@@ -489,6 +489,12 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
     // is one word per account, and because the *secret* — the part a second
     // row would be about — is exactly what must not be in the store.
     ("account", "auth", "ALTER TABLE account ADD COLUMN auth TEXT"),
+    // CR-010: which install picked a draft's file (see [`SCHEMA_V12`]).
+    (
+        "draft_attachment",
+        "device",
+        "ALTER TABLE draft_attachment ADD COLUMN device TEXT NOT NULL DEFAULT ''",
+    ),
 ];
 
 /// Schema v12 (CR-010): what a letter carries, and what a draft will.
@@ -514,7 +520,11 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
 /// `draft_attachment` is the other direction and is not derived at all: a
 /// compose panel's own list of files to carry out, keyed by panel like the
 /// draft it belongs to, holding the *path* rather than the bytes — the file
-/// stays where it is until the send reads it.
+/// stays where it is until the send reads it. It replicates with the draft,
+/// so the other device shows the same letter; it also records **which
+/// install picked the file**, because `~/Downloads/report-q3.pdf` is a
+/// different file over there, and the send refuses rather than guessing
+/// (see [`crate::mail::load_outgoing`]).
 ///
 /// Applied by presence, like v10: the one store is shared by many builds.
 const SCHEMA_V12: &str = "
@@ -535,12 +545,13 @@ CREATE TABLE IF NOT EXISTS attachment_scan(
 );
 
 CREATE TABLE IF NOT EXISTS draft_attachment(
-  id    INTEGER PRIMARY KEY,
-  panel INTEGER NOT NULL,
-  path  TEXT NOT NULL,
-  name  TEXT NOT NULL,
-  size  INTEGER NOT NULL DEFAULT 0,
-  added REAL NOT NULL DEFAULT 0
+  id     INTEGER PRIMARY KEY,
+  panel  INTEGER NOT NULL,
+  path   TEXT NOT NULL,
+  name   TEXT NOT NULL,
+  size   INTEGER NOT NULL DEFAULT 0,
+  added  REAL NOT NULL DEFAULT 0,
+  device TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_draft_attachment_panel ON draft_attachment(panel, id);
 ";
@@ -568,6 +579,22 @@ pub fn attach_version() -> i64 {
 /// its scan row too — nothing to walk is an answer, and it should be given
 /// once.
 pub(crate) fn backfill_attachments(conn: &Connection) -> rusqlite::Result<()> {
+    // Rows whose letter is gone go first, and not only for tidiness:
+    // SQLite hands a fresh `message` the lowest free rowid, so a stale
+    // `attachment_scan` row would tell the walk below that a letter it has
+    // never seen was already walked — and stale `attachment` rows would be
+    // listed under it. A mail deleted by an applied changeset reaches here
+    // and nowhere else, which is why the prune lives in the pass rather
+    // than only beside each delete.
+    for t in ["attachment", "attachment_scan"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {t} WHERE NOT EXISTS
+                   (SELECT 1 FROM message m WHERE m.id = {t}.message)"
+            ),
+            [],
+        )?;
+    }
     let rows: Vec<(i64, Option<Vec<u8>>)> = conn
         .prepare(
             "SELECT m.id, m.raw FROM message m
@@ -922,16 +949,16 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 10 {
         conn.pragma_update(None, "user_version", 10)?;
     }
+    // The tables first, so the column ladder below can speak about them:
+    // `has_column` on a table that is not there yet answers no, and the
+    // ALTER that followed would fail rather than wait for the next open.
+    if !has_table(conn, "attachment")? || !has_table(conn, "draft_attachment")? {
+        conn.execute_batch(SCHEMA_V12)?;
+    }
     for (table, column, ddl) in SCHEMA_V11 {
         if !has_column(conn, table, column)? {
             conn.execute(ddl, [])?;
         }
-    }
-    if version < 11 {
-        conn.pragma_update(None, "user_version", 11)?;
-    }
-    if !has_table(conn, "attachment")? || !has_table(conn, "draft_attachment")? {
-        conn.execute_batch(SCHEMA_V12)?;
     }
     if version < 12 {
         conn.pragma_update(None, "user_version", 12)?;
@@ -1028,6 +1055,15 @@ AFTER UPDATE OF subject, from_name, from_email, body ON message BEGIN
   VALUES(new.id, new.subject, new.from_name, new.from_email, new.body);
 END;
 ";
+
+/// This install's device id — the one `repl` holds. Empty when the row is
+/// not there yet, which is only true before the first migration has run.
+/// A draft's files record it: a path is a file on one machine (CR-010).
+#[must_use]
+pub fn this_device(conn: &Connection) -> String {
+    conn.query_row("SELECT device FROM repl WHERE id = 1", [], |r| r.get(0))
+        .unwrap_or_default()
+}
 
 /// A stable per-install device id (CR-005): two devices must never share one,
 /// or they publish under the same name and corrupt `state.acked`. No `rand`
@@ -1841,7 +1877,8 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Job { id } => ("job", Some(*id), None),
         Kind::Files { dir } => ("files", None, Some(dir.clone())),
         Kind::File { path } => ("file", None, Some(path.clone())),
-        Kind::Attachment { id } => ("attachment", Some(*id), None),
+        // `(mail, at)`, not a row id: see [`Kind::Attachment`].
+        Kind::Attachment { mail, at } => ("attachment", Some(*mail), Some(at.to_string())),
         Kind::Bucket => ("bucket", None, None),
     }
 }
@@ -1870,7 +1907,10 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "job" => Kind::Job { id: p_int? },
         "files" => Kind::Files { dir: p_txt? },
         "file" => Kind::File { path: p_txt? },
-        "attachment" => Kind::Attachment { id: p_int? },
+        "attachment" => Kind::Attachment {
+            mail: p_int?,
+            at: p_txt?.parse().ok()?,
+        },
         "bucket" => Kind::Bucket,
         _ => return None,
     })

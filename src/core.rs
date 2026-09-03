@@ -141,9 +141,17 @@ pub enum Kind {
     },
     /// One part of a letter as a card (CR-010) — the same card a file
     /// draws, over the mail's own bytes rather than the disk's.
+    ///
+    /// Named by the letter and the part's place in it, never by the
+    /// `attachment` row's id: those rows are **derived** and local to a
+    /// device, while a panel is replicated — an id would point at another
+    /// device's letter entirely. `(mail, at)` comes out of the same walk
+    /// on both, off a `raw` they both have.
     Attachment {
-        /// The `attachment` row.
-        id: i64,
+        /// Which letter.
+        mail: MailId,
+        /// Which part of it (see `crate::sync::part_bytes`).
+        at: u32,
     },
     /// The device-sync form: where a device is pointed at its bucket, and
     /// where the key that opens it is typed in rather than pushed over a

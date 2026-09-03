@@ -18,7 +18,7 @@ use makepad_widgets::image_cache::{
 };
 use makepad_widgets::*;
 
-use crate::core::Seed;
+use crate::core::{Kind, Seed};
 use crate::effect::{self, Job};
 use crate::mail;
 use crate::richtable::{self, Completion, Datasource, Marks, SqlSource, Suggestion, Table};
@@ -3552,12 +3552,13 @@ impl Widget for ComposePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some((store, pid)) = scope
-            .props
-            .get::<PanelProps>()
-            .map(|p| (p.store.clone(), p.pid))
-        {
-            self.carries(cx, &mail::draft_files(&store, pid as i64), pid);
+        // Its *own* seed's files: a compose retargeted in place keeps its
+        // id, and the files a reply left are not the forward's (CR-010).
+        if let Some((store, pid, seed)) = scope.props.get::<PanelProps>().and_then(|p| {
+            let Kind::Compose { seed } = p.kind else { return None };
+            Some((p.store.clone(), p.pid, seed))
+        }) {
+            self.carries(cx, &mail::draft_files_for(&store, pid as i64, seed), pid);
         }
         self.view.draw_walk_all(cx, scope, walk);
         // The TO field's offer, over the subject and the body.
@@ -6119,7 +6120,9 @@ impl Widget for FilePanel {
                     });
                     self.fill(cx, card.as_ref(), &preview, files::basename(path), path);
                 }
-                crate::core::Kind::Attachment { id } => self.fill_part(cx, &store, *id),
+                crate::core::Kind::Attachment { mail, at } => {
+                    self.fill_part(cx, &store, *mail, *at);
+                }
                 _ => {}
             }
             self.shown = Some(kind);
@@ -6132,8 +6135,8 @@ impl FilePanel {
     /// The card over one part of a letter. The description is a row, so it
     /// is there at once; the bytes are asked for off the frame, and until
     /// they land the card is the description with the preview still coming.
-    fn fill_part(&mut self, cx: &mut Cx2d, store: &Store, id: i64) {
-        let Some(a) = mail::attachment(store, id) else {
+    fn fill_part(&mut self, cx: &mut Cx2d, store: &Store, mail: crate::core::MailId, at: u32) {
+        let Some(a) = mail::attachment(store, mail, at) else {
             self.fill(cx, None, &files::Preview::None, "attachment", "");
             return;
         };
@@ -6154,7 +6157,7 @@ impl FilePanel {
         // a card over a 4 MB PDF costs nothing but its row.
         let mut waiting = false;
         let preview = files::preview_of(card.kind, &card.name, |max| {
-            match want_part(cx, store, id) {
+            match want_part(cx, store, mail, at) {
                 PartBytes::Here(b) => Some(b.iter().take(max).copied().collect()),
                 PartBytes::Coming => {
                     waiting = true;
@@ -6360,9 +6363,9 @@ pub struct MsgHit {
     pub quote: Option<Rect>,
     pub text: Option<Rect>,
     pub html: Option<Rect>,
-    /// The parts the open row lists (CR-010): `(label, rect, row)` — each a
-    /// link to the card over it.
-    pub atts: Vec<(String, Rect, i64)>,
+    /// The parts the open row lists (CR-010): `(label, rect, part)` — each
+    /// a link to the card over it.
+    pub atts: Vec<(String, Rect, u32)>,
 }
 
 /// How many parts one open message lists by name. Past this the line says
@@ -6403,9 +6406,9 @@ pub struct ThreadMsg {
     date: String,
     #[rust]
     preview: String,
-    /// The parts this row lists while open: `(label, row)`, in slot order.
+    /// The parts this row lists while open: `(label, part)`, in slot order.
     #[rust]
-    atts: Vec<(String, i64)>,
+    atts: Vec<(String, u32)>,
 }
 
 impl Widget for ThreadMsg {
@@ -6472,7 +6475,7 @@ impl ThreadMsgRef {
         };
         w.preview = preview.clone();
         w.has_quote = quote.is_some();
-        w.atts = atts.iter().take(ATT_SLOTS).map(|a| (a.label(), a.id)).collect();
+        w.atts = atts.iter().take(ATT_SLOTS).map(|a| (a.label(), a.at)).collect();
         let listed = w.atts.clone();
         let v = &w.view;
 
@@ -6553,8 +6556,9 @@ impl ThreadMsgRef {
         for (i, slot) in ATT_LINKS.iter().enumerate() {
             let link = v.link(cx, &[live_id!(atts), *slot]);
             match shown.get(i) {
-                Some((label, id)) => {
-                    link.set(cx, pid, label, crate::core::Kind::Attachment { id: *id }, false);
+                Some((label, at)) => {
+                    let target = crate::core::Kind::Attachment { mail: m.head.id, at: *at };
+                    link.set(cx, pid, label, target, false);
                     link.set_visible(cx, true);
                 }
                 None => link.set_visible(cx, false),
@@ -6593,8 +6597,8 @@ impl ThreadMsgRef {
                 w.atts
                     .iter()
                     .zip(ATT_LINKS.iter())
-                    .filter_map(|((label, id), slot)| {
-                        rect(&[live_id!(atts), *slot]).map(|r| (label.clone(), r, *id))
+                    .filter_map(|((label, at), slot)| {
+                        rect(&[live_id!(atts), *slot]).map(|r| (label.clone(), r, *at))
                     })
                     .collect()
             } else {
@@ -6659,7 +6663,7 @@ enum PicJob {
     /// for by row rather than by mail — and off the frame for the same
     /// reason: an attachment is exactly the megabyte-sized blob the rule
     /// about draws exists for.
-    Part { db: Arc<crate::store::Db>, id: i64 },
+    Part { db: Arc<crate::store::Db>, mail: i64, at: u32 },
 }
 
 /// What the reader thread found, on its way back to the UI thread.
@@ -6761,7 +6765,7 @@ fn spawn_picture_reader() -> mpsc::Sender<PicJob> {
             while let Ok(job) = rx.recv() {
                 let ready = match job {
                     PicJob::Cid { db, mid } => cid_parts(hold(&mut held, db), mid),
-                    PicJob::Part { db, id } => letter_part(hold(&mut held, db), id),
+                    PicJob::Part { db, mail, at } => letter_part(hold(&mut held, db), mail, at),
                     PicJob::Data { key, src } => data_bytes(key, &src),
                 };
                 Cx::post_action(ready);
@@ -6802,8 +6806,8 @@ fn cid_parts(store: Option<&Store>, mid: i64) -> PicturesReady {
 /// The name one part of a letter is filed under (CR-010) — the same flat
 /// space a picture's source lives in, since both are "bytes a panel needs
 /// and must not read in its own frame".
-fn part_key(id: i64) -> String {
-    format!("part:{id}")
+fn part_key(mail: i64, at: u32) -> String {
+    format!("part:{mail}/{at}")
 }
 
 /// One part of a letter, by its row. Pure, as [`cid_parts`] — but a part
@@ -6811,14 +6815,19 @@ fn part_key(id: i64) -> String {
 /// exists because this device walked the letter's raw, so a raw that no
 /// longer yields it is an answer, not a delay, and asking again every
 /// frame would be a spin.
-fn letter_part(store: Option<&Store>, id: i64) -> PicturesReady {
-    let key = part_key(id);
+fn letter_part(store: Option<&Store>, mail: i64, at: u32) -> PicturesReady {
+    let key = part_key(mail, at);
     let bytes = store
-        .and_then(|s| mail::attachment(s, id).map(|a| (s, a)))
+        .and_then(|s| mail::attachment(s, mail, at).map(|a| (s, a)))
         .and_then(|(s, a)| mail::part(s, &a));
     match bytes {
+        // Cut to the preview's own ceiling before it is *kept*: this cache
+        // outlives the card, and a card only ever draws the first
+        // `IMAGE_PREVIEW_MAX` of a part anyway. What `open` hands to the OS
+        // does not come through here — it reads the whole part and writes it
+        // out (see `Stage::write_out`).
         Some(b) => PicturesReady {
-            items: vec![(key, Arc::from(b))],
+            items: vec![(key, Arc::from(&b[..b.len().min(files::IMAGE_PREVIEW_MAX)]))],
             failed: Vec::new(),
             retry: Vec::new(),
         },
@@ -6843,8 +6852,8 @@ pub enum PartBytes {
 /// Asks for one part's bytes, once, and answers with them when they are
 /// here. The card calls this every draw: asking is one lookup, and the
 /// answer arrives through [`pictures_landed`], which redraws.
-pub fn want_part(cx: &mut Cx, store: &Store, id: i64) -> PartBytes {
-    let key = part_key(id);
+pub fn want_part(cx: &mut Cx, store: &Store, mail: i64, at: u32) -> PartBytes {
+    let key = part_key(mail, at);
     let p = cx.global::<Pictures>();
     if let Some(b) = p.bytes.get(&key) {
         return PartBytes::Here(b.clone());
@@ -6856,12 +6865,12 @@ pub fn want_part(cx: &mut Cx, store: &Store, id: i64) -> PartBytes {
         return PartBytes::Coming;
     }
     if let Some(tx) = p.reader() {
-        let _ = tx.send(PicJob::Part { db: store.db(), id });
+        let _ = tx.send(PicJob::Part { db: store.db(), mail, at });
         return PartBytes::Coming;
     }
     // No reader thread (headless): the run wants its bytes in the frame
     // that asked, which is the bargain the whole module strikes there.
-    let ready = letter_part(Some(store), id);
+    let ready = letter_part(Some(store), mail, at);
     let p = cx.global::<Pictures>();
     p.take(&ready);
     match p.bytes.get(&key) {

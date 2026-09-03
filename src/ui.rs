@@ -514,7 +514,7 @@ mod tests {
             Kind::File {
                 path: "~/notes.md".into(),
             },
-            Kind::Attachment { id: 1 },
+            Kind::Attachment { mail: 1, at: 2 },
         ]
     }
 

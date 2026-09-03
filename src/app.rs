@@ -4396,7 +4396,9 @@ impl Stage {
                         // panel that browses files.
                         let real = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
                             Some(Kind::File { path }) => Some(Ok(crate::files::real_path(&path))),
-                            Some(Kind::Attachment { id }) => Some(Self::write_out(state, id)),
+                            Some(Kind::Attachment { mail, at }) => {
+                                Some(Self::write_out(state, mail, at))
+                            }
                             _ => None,
                         };
                         match real {
@@ -4418,6 +4420,9 @@ impl Stage {
                         // The hold's other destination (CR-010): what a
                         // files panel is carrying becomes what this draft
                         // will. An action, so ⌘z takes it back off.
+                        // Which install is picking them: a path is a file
+                        // on this machine and these rows replicate (CR-010).
+                        let device = crate::store::this_device(state.store.conn());
                         let files: Vec<mail::DraftFile> = state
                             .hold
                             .iter()
@@ -4429,6 +4434,7 @@ impl Stage {
                                     path: path.clone(),
                                     name: e.name.clone(),
                                     size: e.size,
+                                    device: device.clone(),
                                 })
                             })
                             .collect();
@@ -4454,6 +4460,27 @@ impl Stage {
                             };
                             state.toast(why, true);
                         } else {
+                            // What this attach actually *adds*: a path the
+                            // draft already carries is not the action's to
+                            // take away again on undo.
+                            let seed = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                                Some(Kind::Compose { seed }) => seed,
+                                _ => Seed::Blank,
+                            };
+                            let held = mail::draft_files_for(&state.store, pid as i64, seed);
+                            let (ok, again): (Vec<_>, Vec<_>) = ok
+                                .into_iter()
+                                .partition(|f| !held.iter().any(|h| h.path == f.path));
+                            if ok.is_empty() {
+                                let what = if again.len() == 1 {
+                                    format!("“{}”", again[0].name)
+                                } else {
+                                    crate::files::plural(again.len())
+                                };
+                                state.toast(format!("already carrying {what}"), false);
+                                self.sync(cx);
+                                return;
+                            }
                             let what = if ok.len() == 1 {
                                 format!("“{}”", ok[0].name)
                             } else {
@@ -4466,7 +4493,9 @@ impl Stage {
                                 format!("attach {what}"),
                                 Some(format!("draft:{pid}")),
                                 |_ws| {},
-                                move |tx| mail::attach_files_tx(tx, pid as i64, &carried, now),
+                                move |tx| {
+                                    mail::attach_files_tx(tx, pid as i64, &carried, now).map(|_| ())
+                                },
                                 vec![Box::new(mail::Attached {
                                     panel: pid as i64,
                                     files: ok,
@@ -4692,8 +4721,8 @@ impl Stage {
                             .or_else(|| mail::draft_for(&state.store, pid as i64, seed))
                             .unwrap_or_else(|| mail::seed_draft(&state.store, seed));
                         // What it was going to carry goes with it, and comes
-                        // back with it (CR-010).
-                        let files = mail::draft_files(&state.store, pid as i64).to_vec();
+                        // back with it (CR-010) — this seed's, as the text is.
+                        let files = mail::draft_files_for(&state.store, pid as i64, seed).to_vec();
                         state.act(
                             "close",
                             label,
@@ -4723,11 +4752,11 @@ impl Stage {
     /// happen here, on a click rather than in a draw, which is the one
     /// place they are affordable — and the write goes through the outside
     /// like every other thing that leaves the process.
-    fn write_out(state: &State, id: i64) -> Result<PathBuf, String> {
-        let a = mail::attachment(&state.store, id).ok_or("that part is no longer here")?;
+    fn write_out(state: &State, mail: core::MailId, at: u32) -> Result<PathBuf, String> {
+        let a = mail::attachment(&state.store, mail, at).ok_or("that part is no longer here")?;
         let bytes = mail::part(&state.store, &a)
             .ok_or_else(|| format!("“{}” is not in the letter any more", a.name))?;
-        let path = crate::files::scratch(a.message, &a.name);
+        let path = crate::files::scratch(a.message, a.at, &a.name);
         state.world.run(&crate::effect::WriteFile {
             path: &path,
             bytes: &bytes,
@@ -8037,7 +8066,11 @@ impl Stage {
                 }
                 // The files it will carry (CR-010): each a link to the card
                 // over it, so what is about to leave can be looked at.
-                let files = mail::draft_files(&state.store, pid as i64);
+                let seed = match &kind {
+                    Some(Kind::Compose { seed }) => *seed,
+                    _ => Seed::Blank,
+                };
+                let files = mail::draft_files_for(&state.store, pid as i64, seed);
                 for (r, f) in w.as_compose_panel().carry_hits(cx).into_iter().zip(files.iter()) {
                     if r.size.x > 0.0 {
                         reg.push((
@@ -8146,8 +8179,8 @@ impl Stage {
                     }
                     // The parts the letter carries (CR-010), addressed the
                     // way the link reads them: `name · size`.
-                    for (label, r, id) in h.atts {
-                        reg.push((label, r, Act::Open(pid, Kind::Attachment { id })));
+                    for (label, r, at) in h.atts.clone() {
+                        reg.push((label, r, Act::Open(pid, Kind::Attachment { mail: h.id, at })));
                     }
                 }
                 let r = w.widget(cx, ids!(to_lbl)).area().rect(cx);

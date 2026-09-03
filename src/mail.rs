@@ -677,6 +677,15 @@ pub fn remove_account_tx(c: &rusqlite::Connection, id: i64, now: f64) -> rusqlit
          WHERE entity=?1 AND status IN ('pending','processing')",
         rusqlite::params![format!("account:{id}"), now],
     )?;
+    // What was derived from its letters goes with them (CR-010): a
+    // `message` rowid is reused, and a scan row left behind would tell the
+    // next letter to take that id that it had already been walked.
+    for t in ["attachment", "attachment_scan"] {
+        c.execute(
+            &format!("DELETE FROM {t} WHERE message IN (SELECT id FROM message WHERE account=?1)"),
+            [id],
+        )?;
+    }
     c.execute("DELETE FROM message WHERE account=?1", [id])?;
     c.execute("DELETE FROM folder WHERE account=?1", [id])?;
     c.execute("DELETE FROM account WHERE id=?1", [id])?;
@@ -1084,8 +1093,8 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Job { id } => job_title(store, *id),
         Kind::Files { dir } => crate::files::basename(dir).into(),
         Kind::File { path } => crate::files::basename(path).into(),
-        Kind::Attachment { id } => {
-            attachment(store, *id).map_or_else(|| "attachment".into(), |a| a.name)
+        Kind::Attachment { mail, at } => {
+            attachment(store, *mail, *at).map_or_else(|| "attachment".into(), |a| a.name)
         }
         Kind::Bucket => "device sync".into(),
     }
@@ -1098,7 +1107,6 @@ pub fn title(store: &Store, kind: &Kind) -> String {
 /// them back out of the letter when a card asks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attachment {
-    pub id: i64,
     pub message: MailId,
     /// Which part of the letter it is (see [`crate::sync::part_bytes`]).
     pub at: u32,
@@ -1132,27 +1140,26 @@ impl Attachment {
 
 static Q_ATTACHMENTS: Q = Q {
     id: "attachments",
-    sql: "SELECT id, message, part, name, mime, size, cid
-          FROM attachment WHERE message = ?1 ORDER BY id",
+    sql: "SELECT message, part, name, mime, size, cid
+          FROM attachment WHERE message = ?1 ORDER BY part",
     describe: "the parts one letter carries, in the order they arrived",
 };
 
 static Q_ATTACHMENT: Q = Q {
     id: "attachment",
-    sql: "SELECT id, message, part, name, mime, size, cid
-          FROM attachment WHERE id = ?1",
-    describe: "one part of a letter, by its row",
+    sql: "SELECT message, part, name, mime, size, cid
+          FROM attachment WHERE message = ?1 AND part = ?2",
+    describe: "one part of a letter, by the letter and its place in it",
 };
 
 fn attachment_row(r: &rusqlite::Row) -> rusqlite::Result<Attachment> {
     Ok(Attachment {
-        id: r.get(0)?,
-        message: r.get(1)?,
-        at: r.get::<_, i64>(2)? as u32,
-        name: r.get(3)?,
-        mime: r.get(4)?,
-        size: r.get::<_, i64>(5)? as u64,
-        cid: r.get(6)?,
+        message: r.get(0)?,
+        at: r.get::<_, i64>(1)? as u32,
+        name: r.get(2)?,
+        mime: r.get(3)?,
+        size: r.get::<_, i64>(4)? as u64,
+        cid: r.get(5)?,
     })
 }
 
@@ -1161,10 +1168,16 @@ pub fn attachments(store: &Store, id: MailId) -> Rc<Vec<Attachment>> {
     store.rows(&Q_ATTACHMENTS, &[Val::I(id)], attachment_row)
 }
 
-/// One part, by its row.
-pub fn attachment(store: &Store, id: i64) -> Option<Attachment> {
+/// One part, by the letter and its place in it — the identity a
+/// [`Kind::Attachment`] persists, since the row's own id is derived and
+/// local to a device.
+pub fn attachment(store: &Store, mail: MailId, at: u32) -> Option<Attachment> {
     store
-        .rows(&Q_ATTACHMENT, &[Val::I(id)], attachment_row)
+        .rows(
+            &Q_ATTACHMENT,
+            &[Val::I(mail), Val::I(i64::from(at))],
+            attachment_row,
+        )
         .first()
         .cloned()
 }
@@ -1244,6 +1257,9 @@ pub struct DraftFile {
     pub path: String,
     pub name: String,
     pub size: u64,
+    /// Which install attached it (`repl.device`). A path is only a file on
+    /// the machine it was picked on, and these rows replicate.
+    pub device: String,
 }
 
 impl DraftFile {
@@ -1256,45 +1272,80 @@ impl DraftFile {
 
 static Q_DRAFT_FILES: Q = Q {
     id: "draft files",
-    sql: "SELECT id, path, name, size FROM draft_attachment
+    sql: "SELECT id, path, name, size, device FROM draft_attachment
           WHERE panel = ?1 ORDER BY id",
     describe: "the files one compose panel will carry out, in the order they were attached",
 };
 
-/// What a compose panel will carry out.
-pub fn draft_files(store: &Store, panel: i64) -> Rc<Vec<DraftFile>> {
-    store.rows(&Q_DRAFT_FILES, &[Val::I(panel)], |r| {
-        Ok(DraftFile {
-            id: r.get(0)?,
-            path: r.get(1)?,
-            name: r.get(2)?,
-            size: r.get::<_, i64>(3)? as u64,
-        })
+fn draft_file_row(r: &rusqlite::Row) -> rusqlite::Result<DraftFile> {
+    Ok(DraftFile {
+        id: r.get(0)?,
+        path: r.get(1)?,
+        name: r.get(2)?,
+        size: r.get::<_, i64>(3)? as u64,
+        device: r.get(4)?,
     })
 }
 
-/// Attaches a set of paths to a draft. Reversed by [`Attached`]: the rows
-/// are matched back by path, since a redo mints fresh ids.
+/// What a compose panel will carry out, whatever it is showing now. Callers
+/// that draw or send want [`draft_files_for`], which holds the rows to the
+/// same seed rule the text is held to.
+pub fn draft_files(store: &Store, panel: i64) -> Rc<Vec<DraftFile>> {
+    store.rows(&Q_DRAFT_FILES, &[Val::I(panel)], draft_file_row)
+}
+
+/// A panel's files, if they are `seed`'s own — the rule [`draft_for`] holds
+/// the text to (CR-010). A compose retargeted in place keeps its id, so the
+/// files a reply left are not the forward's, and a draft row whose seed
+/// disagrees hides them until [`upsert_draft_tx`] clears them for good. A
+/// panel with no draft row yet has nothing to disagree: `attach` on a blank
+/// compose writes the files before the first keystroke writes the text.
+pub fn draft_files_for(store: &Store, panel: i64, seed: Seed) -> Rc<Vec<DraftFile>> {
+    match draft_row(store, panel) {
+        Some((_, (re, fwd))) if (re, fwd) != (seed.in_reply_to(), seed.forwards()) => {
+            Rc::new(Vec::new())
+        }
+        _ => draft_files(store, panel),
+    }
+}
+
+/// Attaches a set of paths to a draft, and answers with the ones it
+/// actually added — what [`Attached`] must give back, and no more: a path
+/// the draft already carried was not this action's to take away.
+///
+/// `device` is this install's id. The rows replicate, but a path does not
+/// mean the same file on two machines, so the send refuses one attached
+/// somewhere else rather than carrying out whatever sits at that path here
+/// (see [`load_outgoing`]).
 pub fn attach_files_tx(
     c: &rusqlite::Connection,
     panel: i64,
     files: &[DraftFile],
     now: f64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<DraftFile>> {
+    let mut added = Vec::new();
     for f in files {
-        // The same file twice is one attachment: a second `attach` of a
-        // held set that overlaps is not two copies in the envelope.
+        // The same file twice is one attachment, in the place it already
+        // has: a second `attach` of an overlapping set is not two copies
+        // in the envelope, and not a reordering either.
+        let held: bool = c
+            .query_row(
+                "SELECT 1 FROM draft_attachment WHERE panel = ?1 AND path = ?2",
+                rusqlite::params![panel, f.path],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if held {
+            continue;
+        }
         c.execute(
-            "DELETE FROM draft_attachment WHERE panel = ?1 AND path = ?2",
-            rusqlite::params![panel, f.path],
+            "INSERT INTO draft_attachment(panel, path, name, size, added, device)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![panel, f.path, f.name, f.size as i64, now, f.device],
         )?;
-        c.execute(
-            "INSERT INTO draft_attachment(panel, path, name, size, added)
-             VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![panel, f.path, f.name, f.size as i64, now],
-        )?;
+        added.push(f.clone());
     }
-    Ok(())
+    Ok(added)
 }
 
 /// Takes them off again — undo's half of an attach.
@@ -1674,6 +1725,20 @@ pub fn upsert_draft_tx(
             .ok()
         })
         .or_else(|| c.query_row("SELECT id FROM account ORDER BY id LIMIT 1", [], |r| r.get(0)).ok());
+    // A compose retargeted in place is a new draft under an old id, and
+    // the files the old one named are not this one's to carry (CR-010) —
+    // the same rule `draft_for` holds the text to, applied where the seed
+    // actually changes.
+    let was: Option<DraftSeed> = c
+        .query_row(
+            "SELECT re_message, fwd_message FROM draft WHERE panel = ?1",
+            [panel],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    if was.is_some_and(|s| s != (seed.in_reply_to(), seed.forwards())) {
+        discard_draft_files_tx(c, panel)?;
+    }
     c.execute(
         "INSERT INTO draft(panel, account, re_message, fwd_message,
                            to_addr, subject, body, updated)
@@ -1999,11 +2064,33 @@ impl Effect for Submit {
         // attached (CR-010): what leaves is the file as it stands, and a
         // file that has since gone fails the send instead of sending a
         // stale copy of it.
+        let here = crate::store::this_device(cx.db);
         for f in &d.files {
+            // A path is a file on the machine it was picked on. These rows
+            // replicate, so `~/Downloads/report-q3.pdf` over here is some
+            // other file or none — refuse rather than carry out whatever
+            // happens to sit there.
+            if !f.device.is_empty() && !here.is_empty() && f.device != here {
+                return Err(format!(
+                    "“{}” was attached on another device — attach it again here",
+                    f.name
+                ));
+            }
+            // One byte past the cap is asked for, so a file that grew since
+            // it was attached is *refused* rather than quietly truncated to
+            // the limit and sent under its own name.
+            let cap = crate::files::ATTACH_MAX as usize;
             let bytes = cx
                 .out
-                .read_file(&crate::files::real_path(&f.path), crate::files::ATTACH_MAX as usize)
+                .read_file(&crate::files::real_path(&f.path), cap + 1)
                 .map_err(|e| format!("cannot attach “{}”: {e}", f.name))?;
+            if bytes.len() > cap {
+                return Err(format!(
+                    "“{}” is past {} now — attach it again or send it another way",
+                    f.name,
+                    crate::files::fmt_size(crate::files::ATTACH_MAX)
+                ));
+            }
             d.mail.attachments.push(crate::effect::Part {
                 name: f.name.clone(),
                 mime: crate::files::mime_of(&f.name).to_string(),
@@ -2093,18 +2180,11 @@ struct Outgo {
 
 fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
     let files: Vec<DraftFile> = db
-        .prepare("SELECT id, path, name, size FROM draft_attachment WHERE panel = ?1 ORDER BY id")
-        .and_then(|mut s| {
-            s.query_map([outbox], |r| {
-                Ok(DraftFile {
-                    id: r.get(0)?,
-                    path: r.get(1)?,
-                    name: r.get(2)?,
-                    size: r.get::<_, i64>(3)? as u64,
-                })
-            })
-            .and_then(|it| it.collect())
-        })
+        .prepare(
+            "SELECT id, path, name, size, device FROM draft_attachment
+             WHERE panel = ?1 ORDER BY id",
+        )
+        .and_then(|mut s| s.query_map([outbox], draft_file_row).and_then(|it| it.collect()))
         .map_err(|e| format!("outbox:{outbox} cannot read its attachments: {e}"))?;
     db.query_row(
         "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
@@ -2438,8 +2518,10 @@ impl Intent for Retried {
 /// back is taking those paths off again — matched by path rather than by
 /// row id, which a redo mints afresh.
 pub struct Attached {
-    pub panel: i64,
+    /// What the action **added** — never a path the draft already carried,
+    /// which was not this action's to take away.
     pub files: Vec<DraftFile>,
+    pub panel: i64,
 }
 
 impl Intent for Attached {
@@ -2458,7 +2540,7 @@ impl Intent for Attached {
     fn reapply(&self, w: &World) -> Result<(), String> {
         let (panel, files, now) = (self.panel, self.files.clone(), w.now());
         w.store()
-            .write(move |c| attach_files_tx(c, panel, &files, now))
+            .write(move |c| attach_files_tx(c, panel, &files, now).map(|_| ()))
             .map_err(|e| e.to_string())
     }
 }
@@ -2482,7 +2564,7 @@ impl Intent for Discarded {
         w.store()
             .write(move |c| {
                 upsert_draft_tx(c, panel, seed, &draft, now)?;
-                attach_files_tx(c, panel, &files, now)
+                attach_files_tx(c, panel, &files, now).map(|_| ())
             })
             .map_err(|e| e.to_string())
     }
@@ -3222,20 +3304,65 @@ mod tests {
             crate::files::FileKind::Pdf
         );
         assert!(attachments(&s, 3).is_empty(), "the rest carry nothing");
-        assert_eq!(title(&s, &Kind::Attachment { id: budget[0].id }), "q3-budget.csv");
-        assert_eq!(title(&s, &Kind::Attachment { id: 9999 }), "attachment");
+        let (mail, at) = (budget[0].message, budget[0].at);
+        assert_eq!(title(&s, &Kind::Attachment { mail, at }), "q3-budget.csv");
+        assert_eq!(title(&s, &Kind::Attachment { mail, at: 99 }), "attachment");
+        assert_eq!(attachment(&s, mail, at).as_ref(), Some(&budget[0]));
+        assert_eq!(attachment(&s, mail, 99), None);
 
-        // A re-derive — a newer walk, or a peer's snapshot landing — keeps
-        // the row's id: a `Kind::Attachment` panel persists that id, and
-        // handing it to a different letter's part is exactly what must not
-        // happen. Parts the letter no longer has still go.
-        let (mail, was) = (budget[0].message, budget[0].id);
+        // A panel is named `(mail, at)` and never by the row's id, because
+        // these rows are derived and local while a panel replicates — an id
+        // would name another device's letter. A re-derive is therefore a
+        // no-op for identity, and a part the letter no longer has still
+        // goes.
         let raw = raw(&s, mail).expect("the seeded raw");
         let parts = crate::sync::parse_mail(&raw).attachments;
         s.write(move |c| attach_tx(c, mail, &parts)).unwrap();
-        assert_eq!(attachments(&s, mail)[0].id, was, "the same part, the same row");
+        assert_eq!(attachment(&s, mail, at).map(|a| a.name), Some("q3-budget.csv".into()));
         s.write(move |c| attach_tx(c, mail, &[])).unwrap();
         assert!(attachments(&s, mail).is_empty(), "a part that left, left");
+    }
+
+    /// The derived rows are keyed by a `message` rowid, and SQLite hands a
+    /// fresh row the lowest free one — so a letter that goes must take its
+    /// parts *and* its scan row, or the next letter to take that id is
+    /// listed with someone else's attachments and never walked for its own.
+    #[test]
+    fn a_letter_that_goes_takes_its_derived_rows_with_it() {
+        let s = store();
+        let carrying = corpus(&s)
+            .iter()
+            .find(|m| m.subject == "Q3 infra budget draft")
+            .map(|m| m.id)
+            .expect("the seeded letter");
+        let rows = |t: &str| -> i64 {
+            s.conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(rows("attachment") > 0 && rows("attachment_scan") > 0);
+        let now = 1.0;
+        s.write(move |c| remove_account_tx(c, 1, now)).unwrap();
+        assert_eq!((rows("attachment"), rows("attachment_scan")), (0, 0));
+        assert!(attachments(&s, carrying).is_empty());
+
+        // …and the sweep catches what a delete somewhere else missed — a
+        // letter removed by an applied changeset runs no code of ours.
+        s.write(move |c| {
+            c.execute(
+                "INSERT INTO attachment(message, part, name, mime, size, cid)
+                 VALUES(4242, 0, 'ghost.pdf', 'application/pdf', 1, '')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO attachment_scan(message, version) VALUES(4242, 1)",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+        s.write(|c| crate::store::backfill_attachments(c)).unwrap();
+        assert_eq!((rows("attachment"), rows("attachment_scan")), (0, 0));
     }
 
     /// A draft holds the *paths* it will carry (CR-010): attaching the same
@@ -3249,6 +3376,7 @@ mod tests {
             path: path.to_string(),
             name: crate::files::basename(path).to_string(),
             size,
+            device: "this".into(),
         };
         let names = |panel: i64| -> Vec<String> {
             draft_files(&s, panel).iter().map(|f| f.name.clone()).collect()
@@ -3257,18 +3385,47 @@ mod tests {
             file("~/Downloads/report-q3.pdf", 96 * 1024),
             file("~/Downloads/2026/notes.txt", 1124),
         ];
-        s.write(move |c| attach_files_tx(c, 7, &two, 1.0)).unwrap();
+        let added = s.write(move |c| attach_files_tx(c, 7, &two, 1.0)).unwrap();
         assert_eq!(names(7), ["report-q3.pdf", "notes.txt"]);
+        assert_eq!(added.len(), 2, "both were new");
         assert_eq!(draft_files(&s, 7)[0].label(), "report-q3.pdf · 96 KB");
-        // The same file again is the same part, in its original place —
-        // never two copies in one envelope.
+        // The same file again is the same part, in the place it already
+        // has — never two copies in one envelope, and never a reordering.
+        // It is not *added*, either, so undoing that attach cannot take
+        // away an attachment it did not make.
         let again = vec![file("~/Downloads/report-q3.pdf", 96 * 1024)];
-        s.write(move |c| attach_files_tx(c, 7, &again, 2.0)).unwrap();
-        assert_eq!(names(7), ["notes.txt", "report-q3.pdf"]);
+        let added = s.write(move |c| attach_files_tx(c, 7, &again, 2.0)).unwrap();
+        assert_eq!(names(7), ["report-q3.pdf", "notes.txt"]);
+        assert!(added.is_empty(), "nothing was added, so nothing is undone");
         // Undo's half.
         s.write(|c| detach_files_tx(c, 7, &["~/Downloads/2026/notes.txt".to_string()]))
             .unwrap();
         assert_eq!(names(7), ["report-q3.pdf"]);
+        // A compose retargeted in place keeps its id, and the files a reply
+        // left are not the forward's: the seed rule the text is held to,
+        // held here too — hidden at once, and cleared when the retargeted
+        // draft is next written.
+        let d = Draft::default();
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Reply(1), &d, 4.0)).unwrap();
+        assert_eq!(draft_files_for(&s, 7, Seed::Reply(1)).len(), 1);
+        assert!(draft_files_for(&s, 7, Seed::Forward(1)).is_empty(), "not the forward's");
+        assert!(draft_files_for(&s, 7, Seed::Blank).is_empty());
+        let d = Draft::default();
+        s.write(move |c| upsert_draft_tx(c, 7, Seed::Forward(1), &d, 5.0)).unwrap();
+        assert!(names(7).is_empty(), "the retarget cleared them for good");
+        // A panel with no draft row yet has nothing to disagree: `attach`
+        // on a blank compose lands before the first keystroke does.
+        let one = vec![file("~/notes.md", 2 * 1024)];
+        s.write(move |c| attach_files_tx(c, 8, &one, 6.0)).unwrap();
+        assert_eq!(draft_files_for(&s, 8, Seed::Blank).len(), 1);
+        s.write(|c| discard_draft_files_tx(c, 8)).unwrap();
+        let two = vec![
+            file("~/Downloads/report-q3.pdf", 96 * 1024),
+            file("~/Downloads/2026/notes.txt", 1124),
+        ];
+        s.write(move |c| attach_files_tx(c, 7, &two, 7.0)).unwrap();
+        s.write(|c| detach_files_tx(c, 7, &["~/Downloads/2026/notes.txt".to_string()]))
+            .unwrap();
         // A reopened send takes them along; a discard takes them with it.
         s.write(|c| move_draft_tx(c, 7, 42, 3.0)).unwrap();
         assert!(names(7).is_empty());
@@ -3288,12 +3445,14 @@ mod tests {
                 path: "~/Downloads/report-q3.pdf".into(),
                 name: "report-q3.pdf".into(),
                 size: 96 * 1024,
+                device: "this".into(),
             },
             DraftFile {
                 id: 0,
                 path: "~/notes.md".into(),
                 name: "notes.md".into(),
                 size: 2 * 1024,
+                device: "this".into(),
             },
         ];
         let names = || -> Vec<String> {

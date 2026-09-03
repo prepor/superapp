@@ -177,11 +177,25 @@ its `raw` is one nobody has walked, and this is what notices. Neither table
 replicates — every device derives its own from the `raw` it already has,
 which is also what stops two devices fighting over one id sequence.
 
+Which is exactly why a card panel is named `(mail, part)` and never by the
+row's id: `panel` *does* replicate, and an id minted over here means
+another letter over there. `(mail, part)` comes out of the same walk on both
+devices, off a `raw` they both have. The rows also go when their letter
+does — removing an account takes them, and the pass sweeps any whose message
+is gone before it walks, because a `message` rowid is reused and a scan row
+left behind would tell the walk that the next letter to take that id had
+already been done.
+
 The other direction is not derived at all: `draft_attachment` is a compose
 panel's own list, keyed by panel like the draft beside it, holding each
 file's **path**. The bytes are read at submit time, through the outside —
-what leaves is the file as it stands, and a file that has moved fails the
-send by name.
+what leaves is the file as it stands, and a file that has moved, or grown
+past the cap since, fails the send by name rather than going out truncated.
+It replicates with the draft, so the other device shows the same letter; but
+a path is only a file on the machine it was picked on, so the row records
+**which install picked it** and a send from anywhere else refuses. And it is
+held to the draft's seed like the text is: a compose retargeted in place
+keeps its id, and the files a reply left are not the forward's.
 
 And because `server_msg` lives outside the undo world, undoing an
 already-pushed archive needs no compensation machinery at all — intent

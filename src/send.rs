@@ -314,6 +314,83 @@ mod tests {
         );
     }
 
+    /// Two ways a draft's file is not the file it was, and both refuse
+    /// rather than send something wrong under its name (CR-010): one
+    /// attached on another device — the rows replicate, a path does not —
+    /// and one that has grown past the cap since, which a capped read
+    /// would otherwise truncate and send as itself.
+    #[test]
+    fn a_file_that_is_not_what_it_was_refuses_rather_than_going_out() {
+        let attach = |w: &World, device: &str| {
+            let device = device.to_string();
+            w.store()
+                .write(move |c| {
+                    c.execute("DELETE FROM draft_attachment", [])?;
+                    c.execute(
+                        "INSERT INTO draft_attachment(panel, path, name, size, added, device)
+                         VALUES(9, '~/Downloads/README.txt', 'README.txt', 640, 0, ?1)",
+                        [device],
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+        };
+        // File it again the way a retry does — the submit that failed last
+        // time stands down, or the pass fails the fresh filing on sight.
+        let give_up = |w: &World| {
+            w.store().write(|c| mail::file_send_tx(c, 9, 0.0)).unwrap();
+            outbox_pass(w);
+            for _ in 0..8 {
+                w.with_fake(|f| f.clock += 3600.0);
+                w.run_effects();
+            }
+            w.jobs().last().and_then(|j| j.error.clone()).unwrap_or_default()
+        };
+
+        let w = world("smtp.t");
+        w.with_fake(|f| f.clock = 200.0);
+        attach(&w, "some-other-install");
+        let e = give_up(&w);
+        assert!(e.contains("attached on another device"), "{e}");
+        assert!(w.with_fake(|f| f.server(1).submitted.is_empty()), "nothing left");
+
+        // The same path, picked here, goes out.
+        let here = crate::store::this_device(w.store().conn());
+        assert!(!here.is_empty(), "a store knows which install it is");
+        attach(&w, &here);
+        let e = give_up(&w);
+        assert!(e.is_empty() || !e.contains("another device"), "{e}");
+        assert_eq!(w.with_fake(|f| f.server(1).submitted.len()), 1, "this one left");
+        assert_eq!(outbox(&w).0, "sent");
+
+        // …and a file that has grown past the cap since it was attached is
+        // refused by name. A capped read would have handed back exactly the
+        // cap and sent a truncated file under the sender's own name.
+        let big = crate::files::real_path("~/Downloads/huge.bin");
+        w.with_fake(|f| {
+            f.files
+                .insert(big, vec![0u8; crate::files::ATTACH_MAX as usize + 1]);
+        });
+        w.store()
+            .write(move |c| {
+                c.execute("DELETE FROM draft_attachment", [])?;
+                c.execute(
+                    "INSERT INTO draft_attachment(panel, path, name, size, added, device)
+                     VALUES(9, '~/Downloads/huge.bin', 'huge.bin', 10, 0, '')",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let e = give_up(&w);
+        assert!(e.contains("“huge.bin” is past 25 MB now"), "{e}");
+        assert_eq!(
+            w.with_fake(|f| f.server(1).submitted.len()),
+            1,
+            "the truncated letter never left"
+        );
+    }
+
     /// Undo inside the window deletes the pending row, so the pass never
     /// claims it and the mail never leaves.
     #[test]

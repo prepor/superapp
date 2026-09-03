@@ -1821,8 +1821,14 @@ impl Outside for Fake {
         demo_stat(path)
     }
 
+    /// What was written here, if anything was — a fake disk is writable,
+    /// which is what lets a test say *this file changed since* — and the
+    /// demo tree otherwise.
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
-        demo_read(path, max)
+        match self.files.get(path) {
+            Some(b) => Ok(b[..b.len().min(max)].to_vec()),
+            None => demo_read(path, max),
+        }
     }
 
     fn open_path(&mut self, path: &Path) -> Result<(), String> {

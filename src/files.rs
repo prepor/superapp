@@ -512,14 +512,18 @@ pub fn preview_of(
 }
 
 /// Where a letter's part lands when it is opened (CR-010): the app's own
-/// scratch directory, a folder per mail, so two letters cannot collide over
-/// a name — and it is an ordinary directory, so a files panel can walk to
-/// it afterwards.
+/// scratch directory, **a folder per part**, so nothing can be overwritten
+/// by anything — not another letter's part, and not this letter's second
+/// `image.png`, which is a shape mail actually arrives in. The folder
+/// carries the disambiguation so the file keeps the name the sender gave
+/// it, which is the name the viewer will put in its title bar. An ordinary
+/// directory either way, so a files panel can walk to it afterwards.
 #[must_use]
-pub fn scratch(mail: i64, name: &str) -> PathBuf {
+pub fn scratch(mail: i64, at: u32, name: &str) -> PathBuf {
     std::env::temp_dir()
         .join("superapp-parts")
         .join(format!("mail-{mail}"))
+        .join(format!("part-{at}"))
         // A part's filename comes off the wire: the last segment of it is
         // all that may reach the disk, and never `..`.
         .join(safe_name(name))
@@ -1335,12 +1339,18 @@ mod tests {
     #[test]
     fn a_parts_name_cannot_climb_out_of_the_scratch_directory() {
         let root = std::env::temp_dir().join("superapp-parts").join("mail-7");
-        assert_eq!(scratch(7, "invoice.pdf"), root.join("invoice.pdf"));
-        assert_eq!(scratch(7, "../../etc/passwd"), root.join("passwd"));
-        assert_eq!(scratch(7, "a/b/c.txt"), root.join("c.txt"));
-        assert_eq!(scratch(7, ".."), root.join("part"));
-        assert_eq!(scratch(7, "  "), root.join("part"));
+        let p2 = root.join("part-2");
+        assert_eq!(scratch(7, 2, "invoice.pdf"), p2.join("invoice.pdf"));
+        assert_eq!(scratch(7, 2, "../../etc/passwd"), p2.join("passwd"));
+        assert_eq!(scratch(7, 2, "a/b/c.txt"), p2.join("c.txt"));
+        assert_eq!(scratch(7, 2, ".."), p2.join("part"));
+        assert_eq!(scratch(7, 2, "  "), p2.join("part"));
         assert_eq!(safe_name("C:\\Windows\\x.dll"), "x.dll");
+        // Two parts of one letter under one name land apart, which is the
+        // whole reason the part is in the path: mail really does carry two
+        // `image.png`s.
+        assert_ne!(scratch(7, 2, "image.png"), scratch(7, 3, "image.png"));
+        assert_ne!(scratch(7, 2, "image.png"), scratch(8, 2, "image.png"));
     }
 
     /// What an outgoing part is labelled with, and what a card falls back

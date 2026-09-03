@@ -127,9 +127,11 @@ of its own.
 The verbs follow from that too. A card over a file wears `open`, `copy`,
 `move` and `delete`; a part wears **`open` alone** (`cmd+o`), because the
 other three act on a place and a part has none. `open` writes the part into
-the app's own scratch directory — a folder per letter, so two letters
-cannot collide over a name — and hands *that* to the OS. From there it is
-an ordinary file, and the browser can walk to it.
+the app's own scratch directory — a folder per *part*, since one letter
+really does arrive carrying two `image.png`s, and the folder takes the
+disambiguation so the file keeps the name the sender gave it — and hands
+*that* to the OS. From there it is an ordinary file, and the browser can
+walk to it.
 
 The bytes stay in the letter. What a mail carries is stored once, in the
 `raw` this app already keeps for every synced message; the rows behind the
@@ -155,11 +157,16 @@ nothing to name.
 What it will carry shows as a `CARRIES` line above the body, each file a
 link to its own card — so what is about to leave can be looked at before it
 does. An attach is an **action**, so `cmd+z` takes it back off and
-`cmd+shift+z` puts it on; and the draft holds the file's *path*, not a copy
-of it, so what goes out is the file as it stands when the send leaves. A
-file that has moved by then fails the send by name, in the problems panel,
-rather than going out empty. A directory refuses (a letter carries files),
-and so does anything past 25 MB.
+`cmd+shift+z` puts it on — and it takes off only what it *put* on, so
+attaching a file the draft already carries changes nothing and undoes
+nothing. The draft holds the file's *path*, not a copy of it, so what goes
+out is the file as it stands when the send leaves; a file that has moved by
+then, or grown past the limit, fails the send by name in the problems panel
+rather than going out empty or truncated. A directory refuses (a letter
+carries files), and so does anything past 25 MB. And because a draft
+replicates while a path does not mean the same file on two machines, a send
+from a device other than the one that picked the file refuses too, and says
+to attach it again there.
 
 ## Problems
 

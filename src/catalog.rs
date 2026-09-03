@@ -594,10 +594,9 @@ fn thread_message() -> Scene<Setup> {
             w.as_thread_msg().populate(cx, 0, &t, true, false, &atts);
         })
     };
-    let part = |id: i64, name: &str, size: u64| mail::Attachment {
-        id,
+    let part = |at: u32, name: &str, size: u64| mail::Attachment {
         message: 1,
-        at: id as u32,
+        at,
         name: name.to_string(),
         mime: crate::files::mime_of(name).to_string(),
         size,
@@ -1222,15 +1221,15 @@ fn attachment_card() -> Scene<Setup> {
     let card = |name: &'static str| {
         panel_fake(
             move |store| {
-                let id = store
+                let (mail, at) = store
                     .conn()
                     .query_row(
-                        "SELECT id FROM attachment WHERE name = ?1",
+                        "SELECT message, part FROM attachment WHERE name = ?1",
                         [name],
-                        |r| r.get::<_, i64>(0),
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32)),
                     )
-                    .unwrap_or(0);
-                Kind::Attachment { id }
+                    .unwrap_or((0, 0));
+                Kind::Attachment { mail, at }
             },
             "",
         )
