@@ -936,11 +936,16 @@ impl<D: Datasource> Table<D> {
     }
 
     /// Points the table at another source of the same shape — a mailbox
-    /// panel replaced in place, inbox → archive. The typed filter stands:
-    /// it belongs to the panel, not to the rows. It is read again all the
-    /// same, because what a tag means (and whether the new source has it)
-    /// is the source's business, and the window starts over — a page
-    /// offset into the old rows names nothing here.
+    /// panel replaced in place, inbox → archive. The filter text is carried
+    /// over and read again, because what a tag means (and whether the new
+    /// source has it at all) is the source's business; the window starts
+    /// over, since a page offset into the old rows names nothing here.
+    ///
+    /// Carrying it over is not a promise that it survives: a table's filter
+    /// belongs to whatever owns the field above it, and a panel whose kind
+    /// changed reseeds that field from the new kind's params on the same
+    /// frame. This only keeps a caller with no field of its own from losing
+    /// one it never got the chance to re-supply.
     pub fn retarget(&mut self, ds: D) {
         self.ds = ds;
         let text = std::mem::take(&mut self.text);

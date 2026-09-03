@@ -4237,9 +4237,16 @@ impl MailboxPanel {
 
     /// Points the table at the folder the panel's kind names. A replace in
     /// place (inbox → archive) keeps the widget, so this is where the swap
-    /// happens: the source changes, the typed filter stands — it is the
-    /// panel's, not the folder's — and the cursor and the marks go, since a
-    /// thread anchor means a row in one mailbox and nothing in another.
+    /// would happen: the source changes, and the cursor and the marks go —
+    /// a thread anchor means a row in one mailbox and nothing in another.
+    /// The filter comes from the field, which the shell reseeds from the new
+    /// kind's params in the same breath (see `Stage::draw_panel_hosted`).
+    ///
+    /// No link produces such a replacement today: every solid or dotted
+    /// target that is a mailbox names the inbox, and the launcher opens
+    /// fresh panels. This is here because the widget is genuinely reused
+    /// across kinds, and a list left pointing at another folder's rows
+    /// would be a silent lie rather than a visible bug.
     fn sync_role(&mut self, scope: &Scope) {
         let role = Self::role_of(scope);
         if role == self.role {
