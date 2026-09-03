@@ -168,13 +168,16 @@ pub enum Kind {
     AddAccount,
     /// Standing problems: failed syncs, failed sends, an unreachable bucket.
     Problems,
-    /// The effect log: everything the app has tried on the outside world.
-    /// Its filter is typed, not a param — nothing links here with one.
+    /// The effect log: everything the app has tried on the outside world —
+    /// the queue and the in-memory ring both. Its filter is typed, not a
+    /// param — nothing links here with one.
     Effects,
-    /// One job of that queue, in full — what the log previews into, the way
-    /// the inbox previews a message.
+    /// One effect of that log, in full — what the log previews into, the
+    /// way the inbox previews a message.
     Job {
-        /// The `effect` row.
+        /// The `effect` row — or, negated, an in-memory effect's place in
+        /// the ring (CR-004). A ring id survives a restart as a panel
+        /// param, but the ring does not, so the panel then says so.
         id: i64,
     },
     /// One directory as a list (CR-008).

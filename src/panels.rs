@@ -1524,8 +1524,10 @@ script_mod! {
     }
 
     /** The effect log: the filter over the header over the virtualized list
-        — a rich table (CR-006) over `effect::LOG`. Read-only by
-        construction; the queue is the executor's to move. */
+        — a rich table (CR-006) over `effect::LOG`, which is the queue and
+        the in-memory ring joined in SQL, so one list holds everything that
+        left the process. Read-only by construction; the queue is the
+        executor's to move and the ring is the past's. */
     mod.widgets.EffectsPanel = set_type_default() do #(EffectsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -1579,12 +1581,16 @@ script_mod! {
         suggest: mod.widgets.SuggestBox {}
     }
 
-    /** One job of the queue, in full — what the log previews into. The
+    /** One effect of the log, in full — what the log previews into. The
         sentence the effect describes itself with reads as the subject, then
         what went wrong if anything did, then the row as `sqlite3` would
         show it: the job's own facts, the payload it was filed as, and the
         answer the world gave back. Everything below the subject is a
-        selectable run; a payload is something one copies into a report. */
+        selectable run; a payload is something one copies into a report.
+
+        An in-memory effect has fewer of those, and the sections it has no
+        answer for are absent rather than empty: no payload was ever
+        written, and no reply was ever kept. */
     mod.widgets.JobPanel = set_type_default() do #(JobPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -1643,10 +1649,14 @@ script_mod! {
         mod.widgets.SRule {}
         meta_txt := mod.widgets.SText { is_multiline: true }
 
-        View { width: Fill, height: 10 }
-        mod.widgets.SSection { text: "PAYLOAD" }
-        mod.widgets.SRule {}
-        payload_txt := mod.widgets.SText { is_multiline: true }
+        payload_block := View {
+            width: Fill, height: Fit
+            flow: Down
+            View { width: Fill, height: 10 }
+            mod.widgets.SSection { text: "PAYLOAD" }
+            mod.widgets.SRule {}
+            payload_txt := mod.widgets.SText { is_multiline: true }
+        }
 
         reply_block := View {
             visible: false
@@ -4731,7 +4741,12 @@ impl Widget for MailboxPanel {
 /// asked to describe itself, or the payload as it stands when this build
 /// cannot read the kind — so a row is never nameless, whatever wrote it.
 fn job_line(reg: &effect::Registry, j: &Job) -> String {
-    reg.describe(&j.kind, &j.payload)
+    // A ring row carries its own sentence: it never had a payload for the
+    // registry to decode, which is what made it in-memory in the first
+    // place (CR-004).
+    j.what
+        .clone()
+        .or_else(|| reg.describe(&j.kind, &j.payload))
         .unwrap_or_else(|| j.payload.clone())
 }
 
@@ -4869,15 +4884,24 @@ impl Widget for JobPanel {
         let what = job.as_ref().map(|j| job_line(&props.registry, j));
         let v = &self.view;
 
-        // A job the queue no longer holds — this build cannot invent one, so
-        // the panel says what it is looking at and nothing else.
+        // An effect the log no longer holds — this build cannot invent one,
+        // so the panel says what it is looking at and nothing else. A
+        // negative id is one the ring dropped (or a session restored onto a
+        // ring that no longer exists), which is a different sentence.
         let Some(j) = job else {
-            v.label(cx, ids!(kind_lbl)).set_text(cx, &format!("job #{id}"));
+            let (title, why) = if id < 0 {
+                (
+                    "an effect kept in memory".to_string(),
+                    "the ring no longer holds it: it ran in this process, or in one that has since gone",
+                )
+            } else {
+                (format!("job #{id}"), "no such row in the effect queue")
+            };
+            v.label(cx, ids!(kind_lbl)).set_text(cx, &title);
             v.label(cx, ids!(entity_lbl)).set_text(cx, "");
             v.label(cx, ids!(status_lbl)).set_text(cx, "gone");
-            v.text_input(cx, ids!(what_txt))
-                .set_text(cx, "no such row in the effect queue");
-            for path in [ids!(err_row), ids!(reply_block)] {
+            v.text_input(cx, ids!(what_txt)).set_text(cx, why);
+            for path in [ids!(err_row), ids!(payload_block), ids!(reply_block)] {
                 v.widget(cx, path).set_visible(cx, false);
             }
             v.text_input(cx, ids!(meta_txt)).set_text(cx, "");
@@ -4896,6 +4920,8 @@ impl Widget for JobPanel {
         v.widget(cx, ids!(err_row)).set_visible(cx, j.error.is_some());
         v.text_input(cx, ids!(meta_txt)).set_text(cx, &job_meta(&j));
         v.text_input(cx, ids!(payload_txt)).set_text(cx, &j.payload);
+        v.widget(cx, ids!(payload_block))
+            .set_visible(cx, !j.payload.is_empty());
         let reply = j.reply.as_deref().unwrap_or("");
         v.text_input(cx, ids!(reply_txt)).set_text(cx, reply);
         v.widget(cx, ids!(reply_block))
@@ -4907,7 +4933,19 @@ impl Widget for JobPanel {
 
 /// The job's own facts, as its panel lists them: what the row says about
 /// itself once the effect has had its say.
+///
+/// A ring row says fewer, and says why: it has no id anyone could look up,
+/// no attempts anyone counted, and no promise about repeating, because
+/// nothing was ever going to repeat it.
 fn job_meta(j: &Job) -> String {
+    if j.transient() {
+        return [
+            "kept in memory · never filed".to_string(),
+            format!("ran {}", mail::fmt_date(j.created)),
+            "this session only: a restart forgets it".to_string(),
+        ]
+        .join("\n");
+    }
     let mut lines = vec![
         format!("#{}", j.id),
         format!("filed {}", mail::fmt_date(j.created)),
@@ -4948,7 +4986,7 @@ impl JobPanelRef {
             ("job effect", None, ids!(what_txt)),
             ("job error", Some(ids!(err_row)), ids!(err_txt)),
             ("job facts", None, ids!(meta_txt)),
-            ("job payload", None, ids!(payload_txt)),
+            ("job payload", Some(ids!(payload_block)), ids!(payload_txt)),
             ("job reply", Some(ids!(reply_block)), ids!(reply_txt)),
         ] {
             if fold.is_some_and(|f| !p.view.widget(cx, f).visible()) {

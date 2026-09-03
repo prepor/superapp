@@ -302,10 +302,27 @@ fn file<E: effect::Effect + serde::Serialize>(store: &Store, e: &E, f: &Filed) {
         .expect("catalog: planting a job");
 }
 
+/// Files one in-memory effect into a node's ring, the way [`file`] files a
+/// job into its queue — from the real effect value, so its `KIND` and its
+/// own `describe` are what the scene shows.
+fn keep<E: effect::Effect>(store: &Store, e: &E, at: f64, error: Option<&str>) {
+    store.mem().record(effect::MemEffect {
+        seq: store.mem().next_seq(),
+        kind: E::KIND,
+        entity: e.entity(),
+        what: e.describe(),
+        error: error.map(str::to_string),
+        at,
+    });
+}
+
 /// The queue an effect-log node stands on: an ordinary morning of an
 /// account that syncs — two pushes that landed, an archive undone before
 /// the executor reached it, a flag still backing off after a refusal, and
-/// the one genuinely irreversible effect having given up.
+/// the one genuinely irreversible effect having given up. Then the two the
+/// queue never saw: the session those pushes went through, and the read
+/// that found nothing new. Nobody files those, and the ring is the only
+/// place they exist (CR-004).
 ///
 /// The mails are the demo seed's, so the payloads point at rows that exist.
 fn plant_queue(store: &Store) {
@@ -388,6 +405,25 @@ fn plant_queue(store: &Store) {
             ..Filed::default()
         },
     );
+    keep(
+        store,
+        &mail::Connect {
+            account: 1,
+            creds: effect::Creds::password("imap.fastmail.com", "elena@fastmail.com", ""),
+        },
+        ago(181.0),
+        None,
+    );
+    keep(
+        store,
+        &mail::Fetch {
+            account: 1,
+            folder: "INBOX".into(),
+            from: 122,
+        },
+        ago(155.0),
+        None,
+    );
 }
 
 /// One row of the effect queue as the log lists it, taken **from the effect
@@ -410,8 +446,38 @@ fn shown<E: effect::Effect + serde::Serialize>(e: &E, f: &Filed) -> (effect::Job
         created: f.at,
         updated: f.at + 120.0,
         not_before: f.not_before,
+        what: None,
     };
     (job, e.describe())
+}
+
+/// The same row for an effect that was never filed — one out of the ring
+/// (CR-004). A negative id is what says so, and it is the whole difference:
+/// no payload to decode, no attempts to count, no idempotence to promise,
+/// and the sentence carried on the row rather than derived from JSON.
+fn kept<E: effect::Effect>(
+    e: &E,
+    seq: i64,
+    at: f64,
+    error: Option<&'static str>,
+) -> (effect::Job, String) {
+    let what = e.describe();
+    let job = effect::Job {
+        id: -seq,
+        kind: E::KIND.to_string(),
+        entity: e.entity(),
+        status: if error.is_some() { "failed" } else { "done" }.to_string(),
+        reply: None,
+        error: error.map(str::to_string),
+        attempts: 1,
+        payload: String::new(),
+        idempotent: false,
+        created: at,
+        updated: at,
+        not_before: 0.0,
+        what: Some(what.clone()),
+    };
+    (job, what)
 }
 
 /// A job whose kind this build has no handler for — a row an older version
@@ -431,6 +497,7 @@ fn stranger(kind: &str, payload: &str, f: &Filed) -> (effect::Job, String) {
         created: f.at,
         updated: f.at + 120.0,
         not_before: f.not_before,
+        what: None,
     };
     (job, payload.to_string())
 }
@@ -869,6 +936,40 @@ fn effect_row() -> Scene<Setup> {
             ),
         )
         .about("a kind this build cannot decode keeps its payload rather than vanishing")
+        .node(
+            "in memory",
+            row(
+                kept(
+                    &mail::Fetch {
+                        account: 1,
+                        folder: "INBOX".into(),
+                        from: 118,
+                    },
+                    12,
+                    ago(2.0),
+                    None,
+                ),
+                false,
+            ),
+        )
+        .about("an effect nobody files: it ran at the call, and the ring is the only place it exists")
+        .node(
+            "in memory, refused",
+            row(
+                kept(
+                    &mail::Connect {
+                        account: 1,
+                        creds: effect::Creds::password("imap.fastmail.com", "elena@fastmail.com", ""),
+                    },
+                    13,
+                    ago(2.0),
+                    Some("connection refused"),
+                ),
+                false,
+            ),
+        )
+        .sized((560.0, 76.0))
+        .about("which is exactly why the ring exists — before it, this line lived as long as the string it returned")
         .node("narrow", row(shown(&a_move(), &queued()), false))
         .sized((380.0, 60.0))
         .about("the phone's width")

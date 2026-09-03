@@ -7,7 +7,7 @@ the layout is, and a shell that owns *how it gets there*.
 |---|---|---|
 | `src/core.rs` | panel/column/join state machine + scene targets | no |
 | `src/store.rs` | the one SQLite file + the reactive query layer | no |
-| `src/effect.rs` | the boundary: what leaves the process, the job queue, and the log's datasource | no |
+| `src/effect.rs` | the boundary: what leaves the process, the job queue, the in-memory ring, and the log's datasource | no |
 | `src/history.rs` | the in-memory tree of actions and their claims | no |
 | `src/filter.rs` | the rich table's filter grammar and completion context | no |
 | `src/richtable.rs` | the rich table: datasources, the SQL builder, paging | no |

@@ -18,7 +18,10 @@
 //!   read — a stale entry re-runs lazily on next access. Dependencies are
 //!   captured **automatically** by SQLite's authorizer at prepare time, so
 //!   provenance is complete by construction (that trace is the future panel
-//!   context);
+//!   context). The one thing an authorizer cannot see is rows that were
+//!   never in the database — the effect ring the log joins in
+//!   ([`Store::rows_sql_deps`], [`Store::poll_mem`]) — so a query that
+//!   reads those names that dependency itself;
 //! - the logical [`core::Wm`] state persists wholesale ([`Store::save_wm`])
 //!   and boot restores it — ephemeral physics (springs, cameras) stay in
 //!   memory.
@@ -133,6 +136,10 @@ pub struct Store {
     redraw: Cell<bool>,
     /// Last seen `PRAGMA data_version` (foreign-commit detector).
     data_version: Cell<i64>,
+    /// Last seen [`crate::effect::MemLog`] version — the same detector for
+    /// the one "table" no commit hook can report, because it is not in the
+    /// database at all.
+    mem_version: Cell<u64>,
     /// Per-panel query traces: which queries the panel's last draw touched
     /// — its data provenance, and the panel context an agent receives.
     traces: RefCell<HashMap<u64, Vec<TraceEntry>>>,
@@ -731,6 +738,11 @@ pub struct Db {
     /// this `false` (CR-005): its ordinary writes fail read-only at the gate,
     /// while the replication [`Db::raw`] and [`Db::apply`] paths still run.
     writable: Arc<AtomicBool>,
+    /// The last few in-memory effects (CR-004). Not in the database and
+    /// never on disk — it lives here because this is the one handle every
+    /// thread's [`Store`] already shares, so the UI's log sees what a sync
+    /// worker reached for. Every reader is taught to query it at open.
+    mem: Arc<crate::effect::MemLog>,
 }
 
 impl Db {
@@ -768,6 +780,7 @@ impl Db {
             jobs,
             target,
             writable: Arc::new(AtomicBool::new(true)),
+            mem: Arc::new(crate::effect::MemLog::new()),
         }))
     }
 
@@ -784,9 +797,20 @@ impl Db {
         self.writable.load(Ordering::Acquire)
     }
 
-    /// A fresh read-only connection to the same database.
+    /// A fresh read-only connection to the same database, taught the one
+    /// function that reads the in-memory effect ring. Nothing is written to
+    /// serve it — the rows are handed to SQLite on the spot — which is what
+    /// lets a `query_only` connection join a ring that lives in RAM.
     fn reader(&self) -> rusqlite::Result<Connection> {
-        open_reader(&self.target)
+        let conn = open_reader(&self.target)?;
+        self.mem.install(&conn)?;
+        Ok(conn)
+    }
+
+    /// The in-memory effect ring this process keeps (CR-004).
+    #[must_use]
+    pub fn mem(&self) -> &Arc<crate::effect::MemLog> {
+        &self.mem
     }
 
     /// Submits a write and blocks for its value plus the tables it touched
@@ -1192,6 +1216,7 @@ impl Store {
             cache: RefCell::default(),
             redraw: Cell::new(false),
             data_version: Cell::new(-1),
+            mem_version: Cell::new(0),
             traces: RefCell::default(),
             active_trace: Cell::new(None),
         })
@@ -1202,6 +1227,36 @@ impl Store {
     #[must_use]
     pub fn db(&self) -> Arc<Db> {
         self.db.clone()
+    }
+
+    /// This process's in-memory effect ring (CR-004) — shared with every
+    /// other [`Store`] over the same [`Db`], which is how the log shows a
+    /// worker's connects beside the UI's.
+    #[must_use]
+    pub fn mem(&self) -> &Arc<crate::effect::MemLog> {
+        self.db.mem()
+    }
+
+    /// Whether the effect ring has moved since this reader last looked, and
+    /// if so, stales the queries that read it.
+    ///
+    /// The ring is memory, so `PRAGMA data_version` cannot see it and the
+    /// authorizer cannot report it: its generation is bumped by name
+    /// instead ([`crate::effect::MEM_TABLE`], which the log's spec declares
+    /// as a dependency). The world calls this the moment it records; other
+    /// threads pick it up on the next poll.
+    pub fn poll_mem(&self) -> bool {
+        let v = self.db.mem().version();
+        if v == self.mem_version.replace(v) {
+            return false;
+        }
+        *self
+            .generations
+            .borrow_mut()
+            .entry(crate::effect::MEM_TABLE.to_string())
+            .or_insert(0) += 1;
+        self.redraw.set(true);
+        true
     }
 
     /// Runs one mutation as one transaction through the single writer; on
@@ -1249,12 +1304,15 @@ impl Store {
     /// every table's generation bumps, every cached query re-runs; at this
     /// scale that costs microseconds. Returns whether anything changed.
     pub fn poll_external(&self) -> bool {
+        // The ring moves under its own version, and a worker's effects are
+        // exactly the kind that arrive without a commit to notice.
+        let mem = self.poll_mem();
         let v: i64 = self
             .conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))
             .unwrap_or(0);
         if v == self.data_version.replace(v) {
-            return false;
+            return mem;
         }
         let mut gens = self.generations.borrow_mut();
         for g in gens.values_mut() {
@@ -1270,8 +1328,13 @@ impl Store {
     }
 
     /// The tables a query reads, captured by the authorizer at first
-    /// prepare. This is dependency tracking *and* provenance in one.
-    fn deps_for(&self, id: &str, sql: &str) -> Rc<Vec<String>> {
+    /// prepare, plus any the caller declares. This is dependency tracking
+    /// *and* provenance in one.
+    ///
+    /// `also` is the escape hatch, and the only one: rows a table-valued
+    /// function hands over (the effect ring) are read from memory, so no
+    /// authorizer will ever report them and the query has to say so itself.
+    fn deps_for(&self, id: &str, sql: &str, also: &[&str]) -> Rc<Vec<String>> {
         if let Some(d) = self.deps.borrow().get(sql) {
             return d.clone();
         }
@@ -1290,7 +1353,12 @@ impl Store {
         if let Err(e) = prepared {
             eprintln!("store: preparing {id} failed: {e}");
         }
-        let tables: Vec<String> = seen.lock().expect("dep set").iter().cloned().collect();
+        let mut tables: Vec<String> = seen.lock().expect("dep set").iter().cloned().collect();
+        for t in also {
+            if !tables.iter().any(|x| x == t) {
+                tables.push((*t).to_string());
+            }
+        }
         let rc = Rc::new(tables);
         self.deps.borrow_mut().insert(sql.to_string(), rc.clone());
         rc
@@ -1328,9 +1396,26 @@ impl Store {
         params: &[Val],
         map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
     ) -> Rc<Vec<T>> {
+        self.rows_sql_deps(id, describe, sql, params, &[], map)
+    }
+
+    /// [`Store::rows_sql`] for a query that reads something the authorizer
+    /// cannot see, and so has to name that dependency itself: the effect
+    /// log's union reads the in-memory ring through a function, and rows
+    /// out of memory are invisible to SQLite's read-set. Everything else
+    /// about it is the same query, the same cache, the same trace.
+    pub fn rows_sql_deps<T: 'static>(
+        &self,
+        id: &'static str,
+        describe: &'static str,
+        sql: &str,
+        params: &[Val],
+        also: &[&str],
+        map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Rc<Vec<T>> {
         let pkey = fmt_params(params);
         let key = (sql.to_string(), pkey.clone());
-        let deps = self.deps_for(id, sql);
+        let deps = self.deps_for(id, sql, also);
         let cached: Option<Rc<Vec<T>>> = self.cache.borrow().get(&key).and_then(|c| {
             let fresh = c
                 .deps
@@ -2016,7 +2101,7 @@ mod tests {
     fn queries_cache_and_invalidate_by_table_generation() {
         let s = store();
         assert!(s.rows(&Q_META, &[], probe).is_empty());
-        assert_eq!(*s.deps_for(Q_META.id, Q_META.sql), vec!["meta".to_string()]);
+        assert_eq!(*s.deps_for(Q_META.id, Q_META.sql, &[]), vec!["meta".to_string()]);
 
         s.write(|c| {
             c.execute("INSERT INTO meta(key, value) VALUES('probe', 7)", [])

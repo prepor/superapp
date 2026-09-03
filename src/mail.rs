@@ -353,6 +353,7 @@ macro_rules! mailbox_spec {
             order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
             group: Some("m.thread"),
             key: "thread",
+            deps: &[],
         }
     };
 }
@@ -2030,6 +2031,10 @@ impl Effect for Move {
         format!("move uid {} from {} to {}", self.uid, self.from, self.to)
     }
 
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.move_uid(self.account, &self.from, &self.to, self.uid)
     }
@@ -2040,10 +2045,6 @@ impl Deferred for Move {
     /// catches the common case first.
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2090,6 +2091,10 @@ impl Effect for Seen {
         )
     }
 
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
             .store_flag(self.account, &self.folder, self.uid, MailFlag::Seen, self.seen)
@@ -2099,10 +2104,6 @@ impl Effect for Seen {
 impl Deferred for Seen {
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2153,6 +2154,10 @@ impl Effect for Forwarded {
         )
     }
 
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.store_flag(
             self.account,
@@ -2167,10 +2172,6 @@ impl Effect for Forwarded {
 impl Deferred for Forwarded {
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2209,6 +2210,10 @@ impl Effect for Submit {
 
     fn describe(&self) -> String {
         format!("submit outbox:{}", self.outbox)
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("outbox:{}", self.outbox))
     }
 
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
@@ -2283,10 +2288,6 @@ impl Deferred for Submit {
     /// must ask a human rather than guess.
     fn idempotent(&self) -> bool {
         false
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("outbox:{}", self.outbox))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2815,6 +2816,9 @@ impl Effect for Connect {
     fn describe(&self) -> String {
         format!("connect to {} as {}", self.creds.host, self.creds.user)
     }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.connect(self.account, &self.creds)
     }
@@ -2831,6 +2835,9 @@ impl Effect for Folders {
     type Reply = Vec<crate::effect::RemoteFolder>;
     fn describe(&self) -> String {
         "list folders".into()
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.folders(self.account)
@@ -2850,6 +2857,9 @@ impl Effect for Meta {
     fn describe(&self) -> String {
         format!("select {}", self.folder)
     }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.folder_meta(self.account, &self.folder)
     }
@@ -2868,6 +2878,9 @@ impl Effect for Fetch {
     type Reply = Vec<crate::effect::RemoteMail>;
     fn describe(&self) -> String {
         format!("fetch {} from uid {}", self.folder, self.from)
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.fetch(self.account, &self.folder, self.from)
@@ -2892,6 +2905,9 @@ impl Effect for Uids {
             UidSet::Forwarded => "forwarded",
         };
         format!("search {which} in {}", self.folder)
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.uids(self.account, &self.folder, self.which)

@@ -394,6 +394,12 @@ pub struct SqlSpec {
     /// page names it — an alias of `select` under a group, since the page
     /// is read off the grouped subquery.
     pub key: &'static str,
+    /// Tables this query reads that SQLite's authorizer cannot report, so
+    /// that the store still knows when to re-run it. Empty for every table
+    /// whose `from` is honest SQL; the effect log's is not — one arm of its
+    /// union comes out of memory through a function, and rows that were
+    /// never in the database are invisible to a read-set.
+    pub deps: &'static [&'static str],
 }
 
 /// Built SQL and its parameters.
@@ -833,11 +839,12 @@ where
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
         let q = self.spec.count(self.tags, ast);
         let n = store
-            .rows_sql(
+            .rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
                 &q.params,
+                self.spec.deps,
                 |r| r.get::<_, i64>(0),
             )
             .first()
@@ -848,14 +855,26 @@ where
 
     fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<R>> {
         let q = self.spec.page(self.tags, ast, offset, limit);
-        store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
+        store.rows_sql_deps(
+            self.spec.id,
+            self.spec.describe,
+            &q.sql,
+            &q.params,
+            self.spec.deps,
+            self.map,
+        )
     }
 
     fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<K>> {
         let q = self.spec.keys(self.tags, ast);
-        let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
-            r.get::<_, K>(0)
-        });
+        let rows = store.rows_sql_deps(
+            self.spec.id,
+            self.spec.describe,
+            &q.sql,
+            &q.params,
+            self.spec.deps,
+            |r| r.get::<_, K>(0),
+        );
         Some(rows.as_ref().clone())
     }
 
@@ -864,9 +883,14 @@ where
         for chunk in keys.chunks(KEYS_PER_QUERY) {
             let mut q = self.spec.present(self.tags, ast, chunk.len());
             q.params.extend(chunk.iter().cloned().map(Into::into));
-            let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
-                r.get::<_, K>(0)
-            });
+            let rows = store.rows_sql_deps(
+                self.spec.id,
+                self.spec.describe,
+                &q.sql,
+                &q.params,
+                self.spec.deps,
+                |r| r.get::<_, K>(0),
+            );
             out.extend(rows.iter().cloned());
         }
         out
@@ -876,7 +900,14 @@ where
         let mut q = self.spec.by_key();
         q.params.push(key.clone().into());
         store
-            .rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
+            .rows_sql_deps(
+                self.spec.id,
+                self.spec.describe,
+                &q.sql,
+                &q.params,
+                self.spec.deps,
+                self.map,
+            )
             .first()
             .cloned()
     }
@@ -884,11 +915,12 @@ where
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &R) -> Option<usize> {
         let q = self.spec.rank(self.tags, ast, &(self.rank)(row));
         store
-            .rows_sql(
+            .rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
                 &q.params,
+                self.spec.deps,
                 |r| r.get::<_, i64>(0),
             )
             .first()
@@ -1298,6 +1330,7 @@ mod tests {
         order: &[("n", Dir::Desc), ("id", Dir::Asc)],
         group: None,
         key: "id",
+        deps: &[],
     };
 
     static TAGS: &[TagDef] = &[
@@ -1345,6 +1378,7 @@ mod tests {
         order: &[("last", Dir::Desc), ("g", Dir::Desc)],
         group: Some("i.ok"),
         key: "g",
+        deps: &[],
     };
 
     #[derive(Debug, Clone, PartialEq)]

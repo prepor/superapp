@@ -1,6 +1,8 @@
-# The effect log (CR-004's queue, read): every job the app has filed on the
-# outside world — its status, the sentence the effect describes itself
-# with, and the JSON it was filed as, unfolded in place.
+# The effect log (CR-004, read): everything that has left the process —
+# every job the app filed on the outside world, its status, the sentence
+# the effect describes itself with and the JSON it was filed as unfolded in
+# place, and beside those the in-memory effects nobody files, joined in
+# from the ring.
 #
 # Run with --send-delay 1. The demo account has no SMTP host, so a send is
 # the shortest honest way to put a real job in this queue: it is submitted,
@@ -15,7 +17,10 @@ wait 400
 shot g1-launcher
 key enter
 wait 800
-# Nothing has left the process yet — said, rather than left blank.
+# Nothing has left the process yet — said, rather than left blank. (In a
+# run that takes pictures the runner's own `shot` has already left it, and
+# the ring shows that: a screenshot is an effect like any other. The gate
+# runs `--no-draw`, which takes none.)
 shot g2-empty
 key cmd+w
 wait 600
@@ -88,4 +93,29 @@ wait 500
 key esc
 wait 500
 shot g8-none
+
+# The other half of the log: the effects nobody files. cmd+i copies this
+# panel's own context, which is a clipboard write — it leaves the process,
+# so the ring keeps it and the log shows it beside the queue, under the
+# same filter grammar. No row was written for it, which is what `@memory`
+# asks about.
+key cmd+i
+wait 600
+click "filter"
+wait 300
+key cmd+a
+type "@memory"
+wait 500
+key esc
+wait 600
+shot g9-in-memory
+# Addressable by its own sentence, like any other row — and it previews
+# into the same job panel, which says where it lives instead of showing a
+# payload it never had.
+click "copy panel context"
+wait 700
+shot g10-in-memory-previewed
+click "job facts"
+wait 400
+shot g11-in-memory-facts
 quit
