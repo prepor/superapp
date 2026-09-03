@@ -371,6 +371,13 @@ The clock is the one exception, and deliberately: `World::now()` is asked
 several times a frame, and a ring of clock readings would have room for
 nothing a human meant to do.
 
+A ring id is meaningful only inside the process that made it — it counts
+from one again on the next run, and the `panel` table replicates to a
+device whose ring is its own — so a job panel on one is **not persisted as
+one**: it is saved as the effect log it was previewed from. Restoring it as
+a job panel would aim it at whatever effect held that number next, which is
+the one thing a dangling reference must not do.
+
 A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.
 Account add/remove are undoable actions like everything else.

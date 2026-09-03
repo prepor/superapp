@@ -560,7 +560,13 @@ impl SqlSpec {
             }
             Ast::Not(inner) => {
                 let e = self.expr(tags, inner, params)?;
-                Some(format!("NOT ({e})"))
+                // `COALESCE`, because a bare `NOT` is not a complement in
+                // SQL: a column with no answer makes the inner expression
+                // NULL, and `NOT NULL` is NULL — so the rows a tag says
+                // nothing about would fall out of *both* halves of it.
+                // `@not:risky` means every row that is not risky, and an
+                // effect nobody was going to retry is one of them.
+                Some(format!("NOT COALESCE(({e}), 0)"))
             }
             Ast::And(v) | Ast::Or(v) => {
                 let joiner = if matches!(ast, Ast::And(_)) {
@@ -1557,7 +1563,13 @@ mod tests {
     fn builds_every_filter_shape() {
         let w = |s: &str| SPEC.where_clause(TAGS, a(s).as_ref());
         assert_eq!(w("@ok"), (" WHERE id > 0 AND (ok = 1)".into(), vec![]));
-        assert_eq!(w("@not:ok"), (" WHERE id > 0 AND NOT ((ok = 1))".into(), vec![]));
+        // `COALESCE`, so a negation is the complement even where the tag's
+        // column has no answer — `NOT NULL` is NULL, and those rows would
+        // otherwise fall out of both halves of the tag.
+        assert_eq!(
+            w("@not:ok"),
+            (" WHERE id > 0 AND NOT COALESCE(((ok = 1)), 0)".into(), vec![])
+        );
         assert_eq!(
             w("@name:Al"),
             (" WHERE id > 0 AND name LIKE ? ESCAPE '\\'".into(), vec![Val::S("%Al%".into())])
@@ -1565,7 +1577,7 @@ mod tests {
         assert_eq!(
             w("@not:name:al"),
             (
-                " WHERE id > 0 AND NOT (name LIKE ? ESCAPE '\\')".into(),
+                " WHERE id > 0 AND NOT COALESCE((name LIKE ? ESCAPE '\\'), 0)".into(),
                 vec![Val::S("%al%".into())]
             )
         );

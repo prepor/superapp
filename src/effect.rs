@@ -3827,9 +3827,23 @@ mod tests {
         // The sentence is searchable: it is all a row with no payload has.
         assert_eq!(log(&w, "a note").len(), 1);
         // Nobody was going to retry it, so it is not "risky" — the column
-        // is `NULL` rather than a plausible zero.
+        // is `NULL` rather than a plausible zero. And "not risky" is the
+        // complement of that, so it keeps the ring row rather than losing
+        // it to `NOT NULL`.
         assert_eq!(log(&w, "@risky").len(), 0);
+        assert_eq!(log(&w, "@not:risky").len(), 2);
         assert_eq!(log(&w, "@live").len(), 1);
+
+        // …and the title a tab strip shows reads the log, so a ring row
+        // wears its verb instead of a number nothing answers to.
+        assert_eq!(
+            crate::mail::title(w.store(), &crate::core::Kind::Job { id: rows[0].id }),
+            "clip"
+        );
+        assert_eq!(
+            crate::mail::title(w.store(), &crate::core::Kind::Job { id: -9999 }),
+            "effect · gone"
+        );
     }
 
     /// What the outside refused is the whole reason the ring exists: before

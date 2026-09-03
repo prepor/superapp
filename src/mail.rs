@@ -1180,18 +1180,18 @@ pub fn reading_lines(m: &MailFull, cols: usize) -> usize {
 /// is drawn on every frame of a tab strip, and the sentence lives one panel
 /// over anyway.
 fn job_title(store: &Store, id: i64) -> String {
-    store
-        .conn()
-        .query_row(
-            "SELECT kind, entity FROM effect WHERE id = ?1",
-            [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        )
-        .map(|(kind, entity)| match entity {
-            Some(e) if !e.is_empty() => format!("{kind} · {e}"),
-            _ => kind,
-        })
-        .unwrap_or_else(|_| format!("job #{id}"))
+    // Through the log, not the queue: a negative id is an effect the ring
+    // kept, and it wears its verb in a tab strip exactly as a filed job does.
+    match crate::effect::job(store, id) {
+        Some(j) => match j.entity {
+            Some(e) if !e.is_empty() => format!("{} · {e}", j.kind),
+            _ => j.kind,
+        },
+        // A ring id nothing answers to is not a row anyone can go and find,
+        // so it does not get a row's spelling.
+        None if id < 0 => "effect · gone".into(),
+        None => format!("job #{id}"),
+    }
 }
 
 /// The panel's display title for a kind — what headers, tab strips, the

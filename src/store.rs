@@ -1959,6 +1959,14 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::AddAccount => ("add_account", None, None),
         Kind::Problems => ("problems", None, None),
         Kind::Effects => ("effects", None, None),
+        // A panel on an effect the ring kept belongs to *this* process: the
+        // ring is memory, its ids start over on the next run, and the panel
+        // row replicates to a device whose ring is its own. Persisting the
+        // id would restore that panel onto whatever effect holds the number
+        // next — the one failure a dangling reference must not have. It is
+        // saved as the log it was previewed from instead, which is the one
+        // place the effect could still be looked for.
+        Kind::Job { id } if *id < 0 => ("effects", None, None),
         Kind::Job { id } => ("job", Some(*id), None),
         Kind::Files { dir } => ("files", None, Some(dir.clone())),
         Kind::File { path } => ("file", None, Some(path.clone())),
@@ -2184,6 +2192,10 @@ mod tests {
             Kind::Settings,
             Kind::AddAccount,
             Kind::Problems,
+            Kind::Effects,
+            Kind::Job { id: 7 },
+            Kind::Files { dir: "~/Downloads".into() },
+            Kind::File { path: "~/Downloads/a.pdf".into() },
             Kind::Bucket,
         ]
         .into_iter()
@@ -2198,6 +2210,18 @@ mod tests {
         }
         // A row this build cannot read is skipped, not guessed at.
         assert_eq!(kind_from("from_the_future", None, None), None);
+    }
+
+    /// The one kind that deliberately does **not** come back as itself: a
+    /// panel on an effect the in-memory ring kept. Its id counts from one
+    /// again on the next run and means something else on another device, so
+    /// restoring it as a job panel would aim it at an unrelated effect. It
+    /// is saved as the log it came from.
+    #[test]
+    fn a_panel_on_a_kept_effect_restores_as_the_log() {
+        let (name, p_int, p_txt) = kind_cols(&Kind::Job { id: -3 });
+        assert_eq!((name, p_int), ("effects", None));
+        assert_eq!(kind_from(name, p_int, p_txt), Some(Kind::Effects));
     }
 
     /// The reader really is read-only: a write attempted on it fails at the

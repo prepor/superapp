@@ -68,6 +68,10 @@ value a typed tag cannot read (`@date>yesterday`). A tag being typed at
 the end of the line is not wrong yet, so its error waits until the caret
 leaves. A date is written `dd.mm.yyyy` and is a **span**: `@date>D` means
 after that day, `@date:D` on it, `@date:"30.08.2026 09:14"` that minute.
+`@not:` is a **complement**, not a bare SQL `NOT`: a column with no answer
+makes the inner expression NULL, and `NOT NULL` is NULL, so those rows
+would otherwise fall out of both halves of a tag — `@not:risky` has to keep
+the effects nobody was ever going to retry.
 
 A mailbox's tags: `@unread`, `@html`, `@from:` (senders, dynamic),
 `@subject:`, `@date`, `@account:` (dynamic) — one table for all four lists,
