@@ -2031,6 +2031,10 @@ impl Effect for Move {
         format!("move uid {} from {} to {}", self.uid, self.from, self.to)
     }
 
+    fn writes(&self) -> bool {
+        true
+    }
+
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
     }
@@ -2089,6 +2093,10 @@ impl Effect for Seen {
             self.folder,
             if self.seen { "seen" } else { "unseen" }
         )
+    }
+
+    fn writes(&self) -> bool {
+        true
     }
 
     fn entity(&self) -> Option<String> {
@@ -2154,6 +2162,10 @@ impl Effect for Forwarded {
         )
     }
 
+    fn writes(&self) -> bool {
+        true
+    }
+
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
     }
@@ -2210,6 +2222,10 @@ impl Effect for Submit {
 
     fn describe(&self) -> String {
         format!("submit outbox:{}", self.outbox)
+    }
+
+    fn writes(&self) -> bool {
+        true
     }
 
     fn entity(&self) -> Option<String> {
@@ -2816,6 +2832,11 @@ impl Effect for Connect {
     fn describe(&self) -> String {
         format!("connect to {} as {}", self.creds.host, self.creds.user)
     }
+    /// A session is what makes the rest possible; nothing out there is
+    /// different for having opened one.
+    fn writes(&self) -> bool {
+        false
+    }
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
     }
@@ -2835,6 +2856,9 @@ impl Effect for Folders {
     type Reply = Vec<crate::effect::RemoteFolder>;
     fn describe(&self) -> String {
         "list folders".into()
+    }
+    fn writes(&self) -> bool {
+        false
     }
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
@@ -2857,6 +2881,9 @@ impl Effect for Meta {
     fn describe(&self) -> String {
         format!("select {}", self.folder)
     }
+    fn writes(&self) -> bool {
+        false
+    }
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
     }
@@ -2878,6 +2905,9 @@ impl Effect for Fetch {
     type Reply = Vec<crate::effect::RemoteMail>;
     fn describe(&self) -> String {
         format!("fetch {} from uid {}", self.folder, self.from)
+    }
+    fn writes(&self) -> bool {
+        false
     }
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))
@@ -2905,6 +2935,9 @@ impl Effect for Uids {
             UidSet::Forwarded => "forwarded",
         };
         format!("search {which} in {}", self.folder)
+    }
+    fn writes(&self) -> bool {
+        false
     }
     fn entity(&self) -> Option<String> {
         Some(format!("account:{}", self.account))

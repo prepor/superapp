@@ -4938,11 +4938,17 @@ impl Widget for JobPanel {
 /// no attempts anyone counted, and no promise about repeating, because
 /// nothing was ever going to repeat it.
 fn job_meta(j: &Job) -> String {
+    let reach = if j.writes {
+        "changed something out there"
+    } else {
+        "only asked: nothing out there is different"
+    };
     if j.transient() {
         return [
-            "kept in memory · never filed".to_string(),
-            format!("ran {}", mail::fmt_date(j.created)),
-            "this session only: a restart forgets it".to_string(),
+            "kept in memory · never filed",
+            &format!("ran {}", mail::fmt_date(j.created)),
+            reach,
+            "this session only: a restart forgets it",
         ]
         .join("\n");
     }
@@ -4950,6 +4956,7 @@ fn job_meta(j: &Job) -> String {
         format!("#{}", j.id),
         format!("filed {}", mail::fmt_date(j.created)),
         format!("last touched {}", mail::fmt_date(j.updated)),
+        reach.to_string(),
         format!(
             "{} attempt{}",
             j.attempts,
@@ -5040,13 +5047,25 @@ pub struct EffectsPanel {
     /// The filter's autocomplete: the table is its completion.
     #[rust]
     ac: Suggest<LogTable>,
+    /// Whether the default filter has been typed in yet. Once, on the first
+    /// draw — after that the field is the operator's, including empty.
+    #[rust]
+    primed: bool,
 }
 
 impl EffectsPanel {
     /// Hands the field's text to the table. The field is the one source of
-    /// the filter, exactly as in the inbox.
+    /// the filter, exactly as in the inbox — which is why the panel's
+    /// default ([`effect::LOG_DEFAULT`]) is *typed into it* on the first
+    /// draw rather than folded into the query: what narrows the list is on
+    /// screen, and one `cmd+a` clears it.
     fn sync_filter(&mut self, cx: &mut Cx) {
-        let text = self.view.text_input(cx, ids!(filter_input)).text();
+        let field = self.view.text_input(cx, ids!(filter_input));
+        if !self.primed {
+            self.primed = true;
+            field.set_text(cx, effect::LOG_DEFAULT);
+        }
+        let text = field.text();
         if self.table.set_filter(&text) {
             self.sel = None;
         }
@@ -5279,10 +5298,14 @@ impl Widget for EffectsPanel {
         let empty = self.view.label(cx, ids!(empty_lbl));
         empty.set_text(
             cx,
-            if self.table.filter().trim().is_empty() {
-                "nothing has left the process yet"
-            } else {
-                "no effect under this filter"
+            match self.table.filter().trim() {
+                "" => "nothing has left the process yet",
+                // The default is not a filter the operator typed, so an
+                // empty list under it is not a failed search — it is the
+                // ordinary state of an app that has not changed anything
+                // out there yet.
+                f if f == effect::LOG_DEFAULT => "nothing has been changed out there yet",
+                _ => "no effect under this filter",
             },
         );
         empty.set_visible(cx, n == 0 && err.is_none());

@@ -79,7 +79,9 @@ the lease is **stranded**: read-only, recovery by hand, never a silent merge.
 Effects are values that describe themselves in one line and know how to do
 themselves, behind one swappable backend — the real one, an in-memory fake,
 or one that refuses everything. That last is what lets a panel be drawn in
-isolation without it quietly sending mail.
+isolation without it quietly sending mail. Each also says whether it
+**changed** the world or only asked it something; that is what the effects
+panel opens narrowed to.
 
 ## The disk
 
@@ -316,13 +318,33 @@ finishes on screen. A preview costs the world nothing here: looking at a
 record establishes no fact, which is the one way this pair differs from the
 inbox's.
 
-The filter is the table's own grammar over the log's columns: `@failed`,
-`@live`, `@retried`, `@risky` (the work a crash cannot retry for you),
-`@memory` / `@filed`, `@kind:`, `@entity:`, `@attempts>3`, `@date:`, and
-bare words over the payload — which is where a uid or an address actually
-lives. Nothing in the panel writes: the queue is the executor's to move,
-and a page of it is a cached, reactive query like any other, so a job
-running redraws the rows on screen and nothing else.
+The filter is the table's own grammar over the log's columns: `@wrote` /
+`@read`, `@failed`, `@live`, `@retried`, `@risky` (the work a crash cannot
+retry for you), `@memory` / `@filed`, `@kind:`, `@entity:`, `@attempts>3`,
+`@date:`, and bare words over the payload — which is where a uid or an
+address actually lives. Nothing in the panel writes: the queue is the
+executor's to move, and a page of it is a cached, reactive query like any
+other, so a job running redraws the rows on screen and nothing else.
+
+The panel **opens on `@wrote`**. A sync pass asks the outside a dozen
+questions for every answer it acts on — connect, select, search, fetch, and
+again next minute — so an unfiltered log is mostly the app clearing its
+throat, and what a human came for (what was *changed* out there, and
+whether it worked) is buried under it. Every effect answers
+`Effect::writes` for itself: a `MOVE`, a `STORE`, a send, a file written, a
+password filed changed the world; a `FETCH`, a `SEARCH`, a listing, the
+clock, a password recalled did not — and neither did a connect, which makes
+the rest possible and nothing more. There is no default on that method: a
+new effect that guessed would either bury the panel or vanish from it, and
+neither failure announces itself, so the compiler asks. The answer is
+copied onto the row at enqueue time exactly as `idempotent` is, so
+filtering never decodes a payload — and it is on the row rather than
+derived from the kind, so a queue written by a build whose effects this one
+no longer has still filters.
+
+The default is **typed into the field**, not folded into the query. What
+narrows the list is on screen and one `cmd+a` clears it: a default, not a
+rule about what the panel can show.
 
 ### The ring: the effects that were never rows
 

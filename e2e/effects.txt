@@ -4,6 +4,10 @@
 # place, and beside those the in-memory effects nobody files, joined in
 # from the ring.
 #
+# It opens narrowed to `@wrote`, typed into its own field: a sync pass asks
+# the outside a dozen questions for every answer it acts on, so the reads
+# are on request rather than by default.
+#
 # Run with --send-delay 1. The demo account has no SMTP host, so a send is
 # the shortest honest way to put a real job in this queue: it is submitted,
 # it fails, and the log is where that failure is legible.
@@ -17,10 +21,11 @@ wait 400
 shot g1-launcher
 key enter
 wait 800
-# Nothing has left the process yet — said, rather than left blank. (In a
-# run that takes pictures the runner's own `shot` has already left it, and
-# the ring shows that: a screenshot is an effect like any other. The gate
-# runs `--no-draw`, which takes none.)
+# Nothing has been changed out there yet — said, rather than left blank,
+# and said under the default the field is holding. (In a run that takes
+# pictures the runner's own `shot` has already changed something: a
+# screenshot is an effect like any other, and a write. The gate runs
+# `--no-draw`, which takes none.)
 shot g2-empty
 key cmd+w
 wait 600
@@ -60,7 +65,7 @@ key cmd+a
 wait 400
 shot g5-payload-selected
 
-# The filter is the rich table's, over the queue's own columns — reached by
+# The filter is the rich table's, over the log's own columns — reached by
 # its own field rather than by `/`, because the payload click above handed
 # the keyboard to the job panel, and a key pressed there never reaches the
 # log. (The cursor walk wants more than one job; the panels library's
@@ -98,7 +103,8 @@ shot g8-none
 # panel's own context, which is a clipboard write — it leaves the process,
 # so the ring keeps it and the log shows it beside the queue, under the
 # same filter grammar. No row was written for it, which is what `@memory`
-# asks about.
+# asks about. It is a *write*, so the panel's own default would have kept
+# it; asking for the ring alone is what this narrows to.
 key cmd+i
 wait 600
 click "filter"
@@ -118,4 +124,20 @@ shot g10-in-memory-previewed
 click "job facts"
 wait 400
 shot g11-in-memory-facts
+
+# And the default is a default, not a rule: cleared, the log is everything,
+# the reads a sync makes included. This account never reaches a server, so
+# there are none to show here — the panels library's effect-log scene has
+# the pair — but the clipboard write is still on the list, which is how the
+# run knows the field was cleared and the list widened rather than changed.
+click "filter"
+wait 300
+key cmd+a
+key backspace
+wait 500
+key esc
+wait 600
+shot g12-everything
+click "copy panel context"
+wait 600
 quit

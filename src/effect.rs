@@ -345,6 +345,18 @@ pub trait Effect: Sized {
     /// One line of English — the row's description, the label in a status
     /// UI, and what an assertion failure prints. Never carries a secret.
     fn describe(&self) -> String;
+    /// Did the world change because of this, or was it only asked
+    /// something? A `MOVE`, a `STORE`, a send, a file written, a password
+    /// filed: those changed it. A `FETCH`, a `SEARCH`, a folder listing,
+    /// the clock, a password recalled: those did not — and neither did a
+    /// connect, which is what makes the rest possible and nothing more.
+    ///
+    /// No default, on purpose. A sync pass asks the outside a dozen
+    /// questions for every answer it acts on, so the log is mostly reads,
+    /// and the panel opens on `@wrote` for exactly that reason — a new
+    /// effect that guessed here would either bury the panel or vanish from
+    /// it, and neither failure announces itself. The compiler asks instead.
+    fn writes(&self) -> bool;
     /// What this belongs to, in the `action.entity` vocabulary —
     /// `account:2`, `outbox:7`. A deferred effect files it on its row so a
     /// panel can query its own work; an in-memory one hands it to the ring
@@ -403,6 +415,9 @@ impl Effect for Now {
     fn describe(&self) -> String {
         "read the clock".into()
     }
+    fn writes(&self) -> bool {
+        false
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<f64, String> {
         Ok(cx.out.now())
     }
@@ -416,6 +431,9 @@ impl Effect for SecretGet<'_> {
     type Reply = Option<String>;
     fn describe(&self) -> String {
         format!("read the password for {}", self.0)
+    }
+    fn writes(&self) -> bool {
+        false
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         Ok(cx.out.secret_get(self.0))
@@ -433,6 +451,9 @@ impl Effect for SecretSet<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("store the password for {}", self.email)
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
@@ -453,6 +474,9 @@ impl Effect for BucketSecret<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("store the bucket secret for {}", self.key_id)
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
@@ -475,6 +499,9 @@ impl Effect for Clip<'_> {
     fn describe(&self) -> String {
         format!("copy {} ({} bytes)", self.what, self.text.len())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.clip(self.text)
     }
@@ -490,6 +517,11 @@ impl Effect for OpenPath<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("open {}", self.path.display())
+    }
+    /// Nothing of ours changes; something out there starts, which is more
+    /// than a question.
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.open_path(self.path)
@@ -507,6 +539,9 @@ impl Effect for MakeDir<'_> {
     fn describe(&self) -> String {
         format!("make the directory {}", self.path.display())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.make_dir(self.path)
     }
@@ -523,6 +558,9 @@ impl Effect for CopyPath<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("copy {} to {}", self.from.display(), self.to.display())
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.copy_path(self.from, self.to)
@@ -542,6 +580,9 @@ impl Effect for MovePath<'_> {
     fn describe(&self) -> String {
         format!("move {} to {}", self.from.display(), self.to.display())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.move_path(self.from, self.to)
     }
@@ -558,6 +599,9 @@ impl Effect for Trash<'_> {
     type Reply = PathBuf;
     fn describe(&self) -> String {
         format!("move {} to the trash", self.path.display())
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<PathBuf, String> {
         cx.out.trash(self.path)
@@ -576,6 +620,9 @@ impl Effect for WriteFile<'_> {
     fn describe(&self) -> String {
         format!("write {} ({} bytes)", self.path.display(), self.bytes.len())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.write_file(self.path, self.bytes)
     }
@@ -589,6 +636,9 @@ impl Effect for Shot<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("capture {}", self.0.display())
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.shot(self.0)
@@ -628,6 +678,8 @@ pub struct MemEffect {
     pub seq: i64,
     pub kind: &'static str,
     pub entity: Option<String>,
+    /// [`Effect::writes`] — the one question the panel opens on.
+    pub writes: bool,
     /// [`Effect::describe`], taken at the call. Never carries a secret.
     pub what: String,
     /// What the outside said, when it refused.
@@ -877,6 +929,10 @@ pub struct Job {
     /// a ring row's [`MemEffect::what`]. `None` on a filed job, whose
     /// sentence the registry decodes ([`Registry::describe`]).
     pub what: Option<String>,
+    /// Whether the world changed for it ([`Effect::writes`]). What the
+    /// panel opens narrowed to, because a sync pass asks a dozen questions
+    /// for every answer it acts on.
+    pub writes: bool,
 }
 
 impl Job {
@@ -977,6 +1033,7 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         updated: r.get(10)?,
         not_before: r.get(11)?,
         what: r.get(12)?,
+        writes: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -985,13 +1042,15 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
 /// decode through the same [`job_row`], in the same order. Qualified,
 /// because the spec's `FROM` aliases the table.
 const JOB_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.attempts,
-                        e.payload, e.idempotent, e.created, e.updated, e.not_before, e.what";
+                        e.payload, e.idempotent, e.created, e.updated, e.not_before,
+                        e.what, e.writes";
 
 /// The same, read straight off `effect` — the helpers below want the queue
 /// and only the queue, so the sentence column a ring row would fill is a
 /// literal `NULL` and [`job_row`] decodes both shapes.
 const QUEUE_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.attempts,
-                          e.payload, e.idempotent, e.created, e.updated, e.not_before, NULL";
+                          e.payload, e.idempotent, e.created, e.updated, e.not_before,
+                          NULL, e.writes";
 
 /// What the log selects from: the queue, and the ring of effects that never
 /// became rows. One `UNION ALL` rather than two lists stitched together in
@@ -1012,7 +1071,7 @@ const QUEUE_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.
 /// reader at open by [`MemLog::install`].
 const LOG_FROM: &str = "(SELECT id, kind, entity, status, reply, error, attempts,
                                 payload, idempotent, created, updated, not_before,
-                                NULL AS what
+                                NULL AS what, writes
                            FROM effect
                           UNION ALL
                          SELECT -json_extract(r.value, '$.seq'),
@@ -1026,7 +1085,8 @@ const LOG_FROM: &str = "(SELECT id, kind, entity, status, reply, error, attempts
                                 json_extract(r.value, '$.at'),
                                 json_extract(r.value, '$.at'),
                                 0,
-                                json_extract(r.value, '$.what')
+                                json_extract(r.value, '$.what'),
+                                json_extract(r.value, '$.writes')
                            FROM json_each(mem_effects()) r) e";
 
 /// The dependency [`LOG_FROM`] has that no authorizer can see: the rows
@@ -1142,6 +1202,8 @@ static LOG_SPEC: SqlSpec = SqlSpec {
         ("risky", TagSql::Where("e.idempotent = 0")),
         ("memory", TagSql::Where("e.id < 0")),
         ("filed", TagSql::Where("e.id > 0")),
+        ("wrote", TagSql::Where("e.writes = 1")),
+        ("read", TagSql::Where("e.writes = 0")),
         ("status", TagSql::Col("e.status")),
         ("kind", TagSql::Col("e.kind")),
         ("entity", TagSql::Col("e.entity")),
@@ -1186,6 +1248,20 @@ static LOG_TAGS: &[TagDef] = &[
         kind: TagType::Bool,
         ops: &[],
         describe: "not idempotent: a crash cannot retry it",
+        values: Values::None,
+    },
+    TagDef {
+        name: "wrote",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "changed something out there — what the panel opens on",
+        values: Values::None,
+    },
+    TagDef {
+        name: "read",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "only asked: a fetch, a search, a folder listing, a connect",
         values: Values::None,
     },
     TagDef {
@@ -1282,6 +1358,17 @@ pub static LOG: SqlSource<Job, i64> = SqlSource {
 /// Rows per page of the log table.
 pub const LOG_PAGE: usize = 50;
 
+/// What the log panel opens with in its filter field.
+///
+/// A sync pass asks the outside a dozen questions for every answer it acts
+/// on — connect, select, search, fetch, and again next minute — so an
+/// unfiltered log is mostly the app clearing its throat, and what a human
+/// came to see (what was *changed* out there, and whether it worked) is
+/// buried. It is typed into the field rather than folded into the query, so
+/// it is visible, and clearing it is one gesture: this is a default, not a
+/// rule about what the panel can show.
+pub const LOG_DEFAULT: &str = "@wrote";
+
 // -- the world -----------------------------------------------------------------
 
 fn json_err(e: serde_json::Error) -> rusqlite::Error {
@@ -1298,6 +1385,10 @@ pub struct Enqueue {
     payload: String,
     entity: Option<String>,
     idempotent: bool,
+    /// [`Effect::writes`], copied onto the row for the same reason
+    /// `idempotent` is: the log filters on it, and asking would mean
+    /// decoding every payload on the page.
+    writes: bool,
     not_before: f64,
     now: f64,
 }
@@ -1310,14 +1401,15 @@ impl Enqueue {
     /// If the insert fails.
     pub fn insert(&self, tx: &Transaction) -> rusqlite::Result<i64> {
         tx.execute(
-            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+            "INSERT INTO effect(kind, payload, entity, status, idempotent, writes,
                                 attempts, not_before, created, updated)
-             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
+             VALUES(?1, ?2, ?3, 'pending', ?4, ?5, 0, ?6, ?7, ?7)",
             rusqlite::params![
                 self.kind,
                 self.payload,
                 self.entity,
                 self.idempotent,
+                self.writes,
                 self.not_before,
                 self.now
             ],
@@ -1462,6 +1554,7 @@ impl World {
             seq,
             kind: E::KIND,
             entity: e.entity(),
+            writes: e.writes(),
             what: e.describe(),
             error: ran.as_ref().err().cloned(),
             at,
@@ -1503,10 +1596,18 @@ impl World {
         let payload = serde_json::to_string(e).map_err(json_err)?;
         let now = self.now();
         tx.execute(
-            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+            "INSERT INTO effect(kind, payload, entity, status, idempotent, writes,
                                 attempts, not_before, created, updated)
-             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
-            rusqlite::params![E::KIND, payload, e.entity(), e.idempotent(), not_before, now],
+             VALUES(?1, ?2, ?3, 'pending', ?4, ?5, 0, ?6, ?7, ?7)",
+            rusqlite::params![
+                E::KIND,
+                payload,
+                e.entity(),
+                e.idempotent(),
+                e.writes(),
+                not_before,
+                now
+            ],
         )?;
         Ok(tx.last_insert_rowid())
     }
@@ -1541,6 +1642,7 @@ impl World {
             payload: serde_json::to_string(e).map_err(json_err)?,
             entity: e.entity(),
             idempotent: e.idempotent(),
+            writes: e.writes(),
             not_before,
             now: self.now(),
         })
@@ -3374,6 +3476,9 @@ mod tests {
         fn describe(&self) -> String {
             format!("poke {}", self.note)
         }
+        fn writes(&self) -> bool {
+            true
+        }
         fn entity(&self) -> Option<String> {
             Some(match self.acct {
                 Some(a) => format!("account:{a}"),
@@ -3870,6 +3975,54 @@ mod tests {
         let j = job(w.store(), rows[0].id).expect("the ring row reads back by id");
         assert_eq!(j, rows[0]);
         assert!(j.payload.is_empty(), "there was never a payload to keep");
+    }
+
+    /// The log tells apart what changed the world from what only asked it,
+    /// on both sides of the union — and the panel opens on the first,
+    /// because a sync pass asks a dozen questions for every answer.
+    #[test]
+    fn the_log_tells_a_write_from_a_read() {
+        let w = world();
+        w.enqueue(&Poke::ok("filed")).unwrap(); // a poke reaches the clipboard
+        // Each on its own instant, so "newest first" is not a tie.
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&Clip { text: "x", what: "a note" }).unwrap();
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&SecretGet("elena@fastmail.com")).unwrap();
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&Now).unwrap();
+
+        assert_eq!(log(&w, "").len(), 4, "everything, unfiltered");
+        let wrote = log(&w, LOG_DEFAULT);
+        assert_eq!(wrote.len(), 2, "the job and the clipboard write");
+        assert!(wrote.iter().all(|j| j.writes));
+        assert_eq!(wrote[0].kind, "clip");
+        assert_eq!(wrote[1].kind, "poke");
+
+        let read = log(&w, "@read");
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().all(|j| !j.writes));
+        // Both halves are total: a row is one or the other, never neither.
+        assert_eq!(log(&w, "@not:wrote").len(), 2);
+
+        // The ring's reads join the queue's writes under one filter, so
+        // `@wrote @memory` is the in-memory half of what was changed.
+        assert_eq!(log(&w, "@wrote @memory").len(), 1);
+        assert_eq!(log(&w, "@wrote @filed").len(), 1);
+    }
+
+    /// The column is on the row, not derived from the kind: the log filters
+    /// a queue written by a build whose effects this one may not have.
+    #[test]
+    fn the_queue_keeps_what_an_effect_was() {
+        let w = world();
+        w.enqueue(&Poke::ok("filed")).unwrap();
+        let filed: i64 = w
+            .store()
+            .conn()
+            .query_row("SELECT writes FROM effect", [], |r| r.get(0))
+            .expect("the column is written at enqueue");
+        assert_eq!(filed, 1);
     }
 
     /// The pages that read the ring go stale when it moves. There is no

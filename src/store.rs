@@ -347,6 +347,7 @@ CREATE TABLE effect(
   entity     TEXT,
   status     TEXT NOT NULL DEFAULT 'pending',
   idempotent INTEGER NOT NULL DEFAULT 0,
+  writes     INTEGER NOT NULL DEFAULT 1,
   reply      TEXT CHECK (reply IS NULL OR json_valid(reply)),
   error      TEXT,
   attempts   INTEGER NOT NULL DEFAULT 0,
@@ -501,6 +502,16 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
         "draft_attachment",
         "device",
         "ALTER TABLE draft_attachment ADD COLUMN device TEXT NOT NULL DEFAULT ''",
+    ),
+    // Whether the effect changed the world or only asked it something
+    // ([`crate::effect::Effect::writes`]), copied onto the row at enqueue
+    // time so the log never has to decode a payload to filter on it. The
+    // default is what every row written before this was: every effect the
+    // queue has ever held changes something out there.
+    (
+        "effect",
+        "writes",
+        "ALTER TABLE effect ADD COLUMN writes INTEGER NOT NULL DEFAULT 1",
     ),
 ];
 

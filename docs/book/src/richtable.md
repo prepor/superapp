@@ -222,7 +222,7 @@ line and the paging loop are the inbox panel's, and the next list kind
 lifts them as they are.
 
 The effect log (`effect::LOG`) is what that costs, measured: a flat spec,
-eleven tags, a row decoder shared with the queue's own helpers, and a panel
+thirteen tags, a row decoder shared with the queue's own helpers, and a panel
 that lifted the inbox's filter, error line and paging loop unchanged. It
 carries no aggregate and no group key — so it is also the plain case the
 inbox's grouping is the exception to.
