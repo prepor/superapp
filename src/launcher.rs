@@ -23,7 +23,7 @@
 //! arrive. The order never shuffles — a source owns its band of the list —
 //! so nothing a person is reaching for moves under their hand.
 
-use crate::core::{Kind, PanelId, Seed, Wm, WS_N};
+use crate::core::{Kind, PanelId, Role, Seed, Wm, WS_N};
 use crate::mail;
 use crate::search::{self, Answer, Engine, Go, Hit};
 use crate::store::Store;
@@ -34,12 +34,12 @@ use crate::store::Store;
 const MAX_HITS: usize = 200;
 
 /// A kind's one-word class, part of every haystack — "inbox" finds the inbox,
-/// "draft" the composes.
+/// "spam" the spam folder, "draft" the composes.
 fn kind_word(kind: &Kind) -> &'static str {
     match kind {
         Kind::Help => "help",
         Kind::About => "about",
-        Kind::Inbox { .. } => "inbox",
+        Kind::Mailbox { role, .. } => role.as_str(),
         Kind::Message { .. } => "mail",
         Kind::Contact { .. } => "contact",
         Kind::Compose { .. } => "draft",
@@ -92,10 +92,14 @@ pub fn locate(wm: &Wm, kind: &Kind) -> Go {
     }
 }
 
-/// The roots every launcher offers, whether or not they are open.
-fn roots() -> [Kind; 8] {
+/// The roots every launcher offers, whether or not they are open. The four
+/// mailboxes lead: the inbox first, then where mail goes when it leaves it.
+fn roots() -> [Kind; 11] {
     [
-        Kind::Inbox { filter: None },
+        Kind::Mailbox { role: Role::Inbox, filter: None },
+        Kind::Mailbox { role: Role::Archive, filter: None },
+        Kind::Mailbox { role: Role::Sent, filter: None },
+        Kind::Mailbox { role: Role::Spam, filter: None },
         Kind::Compose { seed: Seed::Blank },
         Kind::Settings,
         Kind::Problems,
@@ -369,7 +373,7 @@ mod tests {
         mail::seed_if_empty(&store).expect("seed");
         let mut wm = Wm::new();
         wm.open(Kind::Help, None, false);
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         wm.focus = Some(inbox);
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(mail::Provider)];
         (wm, store, Search::new(Engine::inline(providers)))
@@ -400,26 +404,35 @@ mod tests {
         let (wm, store, mut s) = world();
         let hits = hits(&wm, &store, &mut s, "");
         // Open help + inbox, then the unopened roots; no mails, no people.
-        assert_eq!(hits.len(), 8);
+        // The inbox is open, so it is a *go to*; its three sibling
+        // mailboxes are not, and follow the roots' own order.
+        assert_eq!(hits.len(), 11);
         assert_eq!(hits[0].label, "help");
         assert_eq!(hits[1].label, "inbox");
         assert!(matches!(hits[0].go, Go::Focus(_)));
         assert!(matches!(hits[1].go, Go::Focus(_)));
-        assert_eq!(hits[2].label, "new mail");
+        for (i, role) in [(2, Role::Archive), (3, Role::Sent), (4, Role::Spam)] {
+            assert_eq!(hits[i].label, role.as_str());
+            assert!(matches!(
+                &hits[i].go,
+                Go::Open(Kind::Mailbox { role: r, filter: None }) if *r == role
+            ));
+        }
+        assert_eq!(hits[5].label, "new mail");
         assert!(matches!(
-            hits[2].go,
+            hits[5].go,
             Go::Open(Kind::Compose { seed: Seed::Blank })
         ));
-        assert_eq!(hits[3].label, "settings");
-        assert!(matches!(hits[3].go, Go::Open(Kind::Settings)));
-        assert_eq!(hits[4].label, "problems");
-        assert!(matches!(hits[4].go, Go::Open(Kind::Problems)));
-        assert_eq!(hits[5].label, "effects");
-        assert!(matches!(hits[5].go, Go::Open(Kind::Effects)));
-        assert_eq!(hits[6].label, "~");
-        assert!(matches!(&hits[6].go, Go::Open(Kind::Files { dir }) if dir == "~"));
-        assert_eq!(hits[7].label, "about");
-        assert!(matches!(hits[7].go, Go::Open(Kind::About)));
+        assert_eq!(hits[6].label, "settings");
+        assert!(matches!(hits[6].go, Go::Open(Kind::Settings)));
+        assert_eq!(hits[7].label, "problems");
+        assert!(matches!(hits[7].go, Go::Open(Kind::Problems)));
+        assert_eq!(hits[8].label, "effects");
+        assert!(matches!(hits[8].go, Go::Open(Kind::Effects)));
+        assert_eq!(hits[9].label, "~");
+        assert!(matches!(&hits[9].go, Go::Open(Kind::Files { dir }) if dir == "~"));
+        assert_eq!(hits[10].label, "about");
+        assert!(matches!(hits[10].go, Go::Open(Kind::About)));
     }
 
     /// The mark's and the menu's verb: never a second copy.

@@ -15,7 +15,7 @@ shot lib-02-scene
 
 # A node's caption enters it: the camera flies to 1:1 and the keyboard and
 # pointer go to that mount. Nodes are addressed as scene/node.
-click "inbox/cursor"
+click "mailbox/cursor"
 wait 900
 shot lib-03-entered
 

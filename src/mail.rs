@@ -3,7 +3,8 @@
 //!
 //! Everything panels show comes through the registered [`Q`] queries — that
 //! is the reactive contract (see [`crate::store`]) and, later, the panel
-//! context an agent receives. The inbox is a rich table over [`THREADS`]: its
+//! context an agent receives. A mailbox — inbox, archive, sent, spam — is a
+//! rich table over the [`threads`] source of its folder role: its
 //! filter is the shared grammar ([`crate::filter`]), whose bare text is one
 //! substring over sender + subject — the shell's original semantics; the
 //! launcher's word-AND lives in [`crate::launcher`].
@@ -14,7 +15,7 @@ use std::rc::Rc;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{Kind, MailId, Seed};
+use crate::core::{Kind, MailId, Role, Seed};
 use crate::effect::{Creds, Ctx, Deferred, Effect, MailFlag, Outgoing, Registry, UidSet, World};
 use crate::filter::Op;
 use crate::history::Intent;
@@ -24,7 +25,7 @@ use crate::richtable::{
 };
 use crate::store::{Q, Store, Val};
 
-/// One list row: what the inbox and the launcher show.
+/// One list row: what a mailbox and the launcher show.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailHead {
     pub id: MailId,
@@ -61,24 +62,26 @@ pub struct Sender {
     pub name: String,
 }
 
-/// One inbox row (CR-007): a conversation, as far as the inbox is
-/// concerned — every message of it counts, and it is a row while at least
-/// one of them sits in the inbox.
+/// One row of a mailbox (CR-007): a conversation, as far as *that folder*
+/// is concerned — every message of it counts towards what the row shows,
+/// and it is a row while at least one of them sits in the folder. So one
+/// conversation can be a row in two mailboxes at once, the same length and
+/// the same participants in both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadHead {
     /// The anchor: the lowest member's id. The row's identity.
     pub thread: i64,
-    /// The mail the row opens: the oldest unread inbox message, else the
-    /// newest one.
+    /// The mail the row opens: the folder's oldest unread message of the
+    /// conversation, else its newest one.
     pub target: MailId,
     /// Who wrote in it, newest speaker first, `me` for the account's own
     /// address — first names once there are two of them.
     pub who: Vec<String>,
     /// Its subject, reply prefixes stripped, from the oldest message.
     pub topic: String,
-    /// The latest inbox message's date: the order.
+    /// The date of the folder's latest message of it: the order.
     pub last: f64,
-    /// Any inbox message unread.
+    /// Any of the folder's messages of it unread.
     pub unread: bool,
     /// How many messages the whole conversation has, trash left out.
     pub n: i64,
@@ -101,7 +104,8 @@ impl ThreadHead {
 #[derive(Debug, Clone)]
 pub struct ThreadMail {
     pub mail: MailFull,
-    /// The role of the folder it sits in: `inbox`, `archive`, `sent`.
+    /// The role of the folder it sits in: `inbox`, `archive`, `sent`,
+    /// `spam`.
     pub role: String,
     pub message_id: String,
 }
@@ -133,11 +137,19 @@ static Q_MAIL: Q = Q {
     describe: "one mail, both bodies included, with its account's address",
 };
 
+/// Distinct senders on one side of the spam line — `?1` picks which.
+///
+/// Two lists rather than one, because a spammer is not a correspondent: the
+/// launcher's contacts and a compose's TO may never offer one, and the spam
+/// list's own `@from:` may offer nothing else. The join is what tells them
+/// apart, and `folder` is a handful of rows.
 static Q_SENDERS: Q = Q {
     id: "senders",
-    sql: "SELECT from_email, from_name, MAX(date) AS last
-          FROM message GROUP BY from_email ORDER BY last DESC",
-    describe: "distinct senders, most recently heard from first",
+    sql: "SELECT m.from_email, m.from_name, MAX(m.date) AS last
+          FROM message m JOIN folder f ON f.id = m.folder
+          WHERE (COALESCE(f.role, '') = 'spam') = ?1
+          GROUP BY m.from_email ORDER BY last DESC",
+    describe: "distinct senders on one side of the spam line, most recently heard from first",
 };
 
 static Q_CONTACT: Q = Q {
@@ -241,7 +253,7 @@ fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadMail> {
     })
 }
 
-/// Decodes one grouped row of [`THREADS_SPEC`]: the participants arrive
+/// Decodes one grouped row of a mailbox spec: the participants arrive
 /// newest speaker first, one per sender, separated by the unit separator
 /// (a name may carry a comma; none carries that).
 fn thread_head_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadHead> {
@@ -283,20 +295,34 @@ pub fn inbox(store: &Store) -> Rc<Vec<MailHead>> {
     store.rows(&Q_INBOX, &[], head_row)
 }
 
-/// The inbox as a rich table (CR-006) of **threads** (CR-007): the fixed
+/// A mailbox as a rich table (CR-006) of **threads** (CR-007): the fixed
 /// parts of its query, which the builder completes with the filter, the
-/// page and the rank. The rows are inbox messages grouped by conversation;
-/// what a row shows is aggregates over them, or over the whole conversation
-/// (participants, count, topic — trash left out), read by subquery. The
-/// account join is for `@account:` and for `me`.
-static THREADS_SPEC: SqlSpec = SqlSpec {
-    id: "inbox table",
-    describe: "the inbox as conversations under the panel's filter, latest first, one page at a time",
-    select: "m.thread AS thread,
+/// page and the rank. The rows are the folder's messages grouped by
+/// conversation; what a row shows is aggregates over them, or over the
+/// whole conversation (participants, count, topic — trash left out), read
+/// by subquery. The account join is for `@account:` and for `me`.
+///
+/// The role is a literal rather than a bound parameter: a [`SqlSpec`] is
+/// static text, which is what lets the same builder, the same rank and the
+/// same page cache serve four lists without a string being formatted per
+/// keystroke. `concat!` writes the four out at compile time.
+macro_rules! mailbox_spec {
+    ($role:literal) => {
+        SqlSpec {
+            id: concat!($role, " table"),
+            describe: concat!(
+                "the ",
+                $role,
+                " as conversations under the panel's filter, latest first, one page at a time"
+            ),
+            select: concat!(
+                "m.thread AS thread,
              MAX(m.date) AS last,
              MAX(m.unread) AS unread,
              (SELECT t.id FROM message t JOIN folder tf ON tf.id = t.folder
-               WHERE t.thread = m.thread AND tf.role = 'inbox'
+               WHERE t.thread = m.thread AND tf.role = '",
+                $role,
+                "'
                ORDER BY t.unread DESC,
                         CASE WHEN t.unread THEN t.date ELSE -t.date END, t.id
                LIMIT 1) AS target,
@@ -311,28 +337,48 @@ static THREADS_SPEC: SqlSpec = SqlSpec {
                WHERE t.thread = m.thread ORDER BY t.date, t.id LIMIT 1) AS topic,
              (SELECT COUNT(DISTINCT COALESCE(NULLIF(t.message_id, ''), 'id:' || t.id))
                FROM message t JOIN folder tf ON tf.id = t.folder
-               WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS n",
-    from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
-    base: "f.role = 'inbox'",
-    text: &["m.from_name", "m.from_email", "m.subject"],
-    tags: &[
-        ("unread", TagSql::Where("m.unread = 1")),
-        ("html", TagSql::Where("m.html IS NOT NULL")),
-        ("from", TagSql::Col("(m.from_name || ' ' || m.from_email)")),
-        ("subject", TagSql::Col("m.subject")),
-        ("date", TagSql::Col("m.date")),
-        ("account", TagSql::Col("a.email")),
-    ],
-    order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
-    group: Some("m.thread"),
-    key: "thread",
-};
+               WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS n"
+            ),
+            from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
+            base: concat!("f.role = '", $role, "'"),
+            text: &["m.from_name", "m.from_email", "m.subject"],
+            tags: &[
+                ("unread", TagSql::Where("m.unread = 1")),
+                ("html", TagSql::Where("m.html IS NOT NULL")),
+                ("from", TagSql::Col("(m.from_name || ' ' || m.from_email)")),
+                ("subject", TagSql::Col("m.subject")),
+                ("date", TagSql::Col("m.date")),
+                ("account", TagSql::Col("a.email")),
+            ],
+            order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
+            group: Some("m.thread"),
+            key: "thread",
+        }
+    };
+}
+
+static INBOX_SPEC: SqlSpec = mailbox_spec!("inbox");
+static ARCHIVE_SPEC: SqlSpec = mailbox_spec!("archive");
+static SENT_SPEC: SqlSpec = mailbox_spec!("sent");
+static SPAM_SPEC: SqlSpec = mailbox_spec!("spam");
+
+/// The spec one role's list runs on.
+fn spec_of(role: Role) -> &'static SqlSpec {
+    match role {
+        Role::Inbox => &INBOX_SPEC,
+        Role::Archive => &ARCHIVE_SPEC,
+        Role::Sent => &SENT_SPEC,
+        Role::Spam => &SPAM_SPEC,
+    }
+}
 
 const DATE_OPS: &[Op] = &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte];
 
-/// The inbox filter's tags: what `@` offers. Each reads against the inbox
-/// messages, and a conversation matches when any of them does.
-static INBOX_TAGS: &[TagDef] = &[
+/// A mailbox filter's tags: what `@` offers. Each reads against the
+/// folder's messages, and a conversation matches when any of them does.
+/// One table for all four lists — the grammar of a mail list does not
+/// change with the folder it is over.
+static MAILBOX_TAGS: &[TagDef] = &[
     TagDef {
         name: "unread",
         kind: TagType::Bool,
@@ -377,12 +423,15 @@ static INBOX_TAGS: &[TagDef] = &[
     },
 ];
 
-/// Values for the inbox's dynamic tags, under what has been typed: senders
+/// Values for a mailbox's dynamic tags, under what has been typed: senders
 /// (most recently heard from first, by name or address) and accounts. Each
 /// is one cached query; the match is a substring, so `kov` finds Vera.
-fn suggest_inbox(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
+///
+/// `spam` picks which side of the line the senders come from — a list
+/// completes against the people who wrote *to it*.
+fn suggest_mailbox(store: &Store, spam: bool, tag: &str, typed: &str) -> Vec<Suggestion> {
     match tag {
-        "from" => senders(store)
+        "from" => (if spam { spam_senders(store) } else { senders(store) })
             .iter()
             .filter(|s| {
                 s.name.to_lowercase().contains(typed) || s.email.to_lowercase().contains(typed)
@@ -404,27 +453,68 @@ fn suggest_inbox(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
     }
 }
 
-/// The inbox's datasource: what the inbox panel's rich table runs on.
-pub static THREADS: SqlSource<ThreadHead, i64> = SqlSource {
-    spec: &THREADS_SPEC,
-    tags: INBOX_TAGS,
-    map: thread_head_row,
-    key: |t| t.thread,
-    rank: |t| vec![Val::F(t.last), Val::I(t.thread)],
-    suggest: suggest_inbox,
-};
+/// The `@from:` completion of a list over correspondents, and of the one
+/// over spam. Named functions rather than a role passed along: the field
+/// is a plain `fn` pointer, and these are the only two answers.
+fn suggest_correspondents(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
+    suggest_mailbox(store, false, tag, typed)
+}
 
-/// Rows per page of the inbox table — what one scroll's worth of draws
+fn suggest_spam(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
+    suggest_mailbox(store, true, tag, typed)
+}
+
+/// One role's datasource: what that mailbox panel's rich table runs on.
+/// Four values of one shape — everything but the spec is shared, because
+/// a row of the sent folder is decoded, keyed and ranked exactly like a row
+/// of the inbox.
+macro_rules! mailbox_source {
+    ($spec:expr, $suggest:expr) => {
+        SqlSource {
+            spec: $spec,
+            tags: MAILBOX_TAGS,
+            map: thread_head_row,
+            key: |t| t.thread,
+            rank: |t| vec![Val::F(t.last), Val::I(t.thread)],
+            suggest: $suggest,
+        }
+    };
+}
+
+static INBOX: SqlSource<ThreadHead, i64> = mailbox_source!(&INBOX_SPEC, suggest_correspondents);
+static ARCHIVE: SqlSource<ThreadHead, i64> = mailbox_source!(&ARCHIVE_SPEC, suggest_correspondents);
+static SENT: SqlSource<ThreadHead, i64> = mailbox_source!(&SENT_SPEC, suggest_correspondents);
+static SPAM: SqlSource<ThreadHead, i64> = mailbox_source!(&SPAM_SPEC, suggest_spam);
+
+/// The datasource a mailbox panel of this role pages through.
+#[must_use]
+pub fn threads(role: Role) -> &'static SqlSource<ThreadHead, i64> {
+    match role {
+        Role::Inbox => &INBOX,
+        Role::Archive => &ARCHIVE,
+        Role::Sent => &SENT,
+        Role::Spam => &SPAM,
+    }
+}
+
+/// Rows per page of a mailbox table — what one scroll's worth of draws
 /// fetches; the count is separate, so this is a batch size, not a limit.
-pub const INBOX_PAGE: usize = 50;
+pub const MAILBOX_PAGE: usize = 50;
 
-/// The whole inbox under a filter, materialized — for tests and the odd
-/// one-shot read; panels page through [`THREADS`] instead.
-pub fn inbox_filtered(store: &Store, filter: &str) -> Vec<ThreadHead> {
-    let mut t = Table::new(&THREADS, INBOX_PAGE);
+/// One whole mailbox under a filter, materialized — for tests and the odd
+/// one-shot read; panels page through [`threads`] instead.
+pub fn mailbox_filtered(store: &Store, role: Role, filter: &str) -> Vec<ThreadHead> {
+    let mut t = Table::new(threads(role), MAILBOX_PAGE);
     t.set_filter(filter);
     let n = t.len(store);
     t.rows(store, 0, n)
+}
+
+/// The inbox under a filter — [`mailbox_filtered`] on the role every test
+/// that predates the other three means.
+#[cfg(test)]
+fn inbox_filtered(store: &Store, filter: &str) -> Vec<ThreadHead> {
+    mailbox_filtered(store, Role::Inbox, filter)
 }
 
 /// Every mail, archived included, headers only, in one flat scan.
@@ -453,9 +543,17 @@ pub fn raw(store: &Store, id: MailId) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// Distinct senders, most recent first.
+/// The people who have written, most recent first — spam left out, so
+/// nothing the app offers to write to or to open a card for came out of
+/// the junk folder.
 pub fn senders(store: &Store) -> Rc<Vec<Sender>> {
-    store.rows(&Q_SENDERS, &[], sender_row)
+    store.rows(&Q_SENDERS, &[Val::I(0)], sender_row)
+}
+
+/// The senders of the spam folder — what the spam list's own `@from:`
+/// completes against, and the one place they are offered.
+fn spam_senders(store: &Store) -> Rc<Vec<Sender>> {
+    store.rows(&Q_SENDERS, &[Val::I(1)], sender_row)
 }
 
 // -- the launcher's mail provider --------------------------------------------
@@ -850,30 +948,61 @@ pub fn folder_of(store: &Store, id: MailId) -> i64 {
         .unwrap_or(0)
 }
 
-/// Which of a conversation's mails sit in the inbox — what filing it moves.
-pub fn thread_inbox(store: &Store, id: MailId) -> Vec<MailId> {
+/// Which folder role a mail sits under — `inbox`, `archive`, `sent`,
+/// `spam`, `trash` — or `None` for a mail whose folder plays none.
+#[must_use]
+pub fn role_of(store: &Store, id: MailId) -> Option<Role> {
+    store
+        .conn()
+        .query_row(
+            "SELECT f.role FROM message m JOIN folder f ON f.id = m.folder WHERE m.id = ?1",
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| Role::named(&r))
+}
+
+/// Which of a conversation's mails share this one's folder role — what
+/// filing the row moves.
+///
+/// The row is the thread, and the mailbox it was read in decides which of
+/// its mails the verb takes: archiving from the inbox takes the inbox
+/// copies, deleting from the archive takes the archived ones. That mailbox
+/// is not passed in — it is what the mail under the cursor is already
+/// filed as, which is the same answer and cannot disagree with the list.
+/// A mail in no listed role (a trashed one, reached from a reader) is
+/// alone: the set is just itself.
+#[must_use]
+pub fn thread_siblings(store: &Store, id: MailId) -> Vec<MailId> {
+    let Some(role) = role_of(store, id) else {
+        return vec![id];
+    };
     store
         .rows(&Q_THREAD_MEMBERS, &[Val::I(id)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?))
         })
         .iter()
-        .filter(|(_, role)| role == "inbox")
+        .filter(|(_, r)| r == role.as_str())
         .map(|(id, _)| *id)
         .collect()
 }
 
-/// The inbox row a mail's conversation makes — the same aggregates the
-/// table shows, for one thread — or `None` while none of it is in the inbox.
-pub fn thread_head(store: &Store, id: MailId) -> Option<ThreadHead> {
+/// The row a mail's conversation makes in a mailbox of this role — the same
+/// aggregates the table shows, for one thread — or `None` while none of it
+/// sits in that folder.
+pub fn thread_head(store: &Store, role: Role, id: MailId) -> Option<ThreadHead> {
+    let spec = spec_of(role);
     let sql = format!(
         "SELECT {} FROM {} WHERE {} AND m.thread = (SELECT thread FROM message WHERE id = ?1)
          GROUP BY m.thread",
-        THREADS_SPEC.select, THREADS_SPEC.from, THREADS_SPEC.base
+        spec.select, spec.from, spec.base
     );
     store
         .rows_sql(
             "thread head",
-            "one conversation's inbox row",
+            "one conversation's row in a mailbox",
             &sql,
             &[Val::I(id)],
             thread_head_row,
@@ -1071,8 +1200,8 @@ pub fn title(store: &Store, kind: &Kind) -> String {
     match kind {
         Kind::Help => "help".into(),
         Kind::About => "about".into(),
-        Kind::Inbox { filter: Some(f) } => format!("inbox · {f}"),
-        Kind::Inbox { filter: None } => "inbox".into(),
+        Kind::Mailbox { role, filter: Some(f) } => format!("{} · {f}", role.as_str()),
+        Kind::Mailbox { role, filter: None } => role.as_str().into(),
         Kind::Message { id } => thread_topic(store, *id).unwrap_or_else(|| "message".into()),
         Kind::Contact { email } => contact(store, email).0,
         Kind::Compose { seed: Seed::Blank } => "new mail".into(),
@@ -1388,17 +1517,22 @@ pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()
     Ok(())
 }
 
-/// Moves a mail out of the inbox into one of its account's role folders.
-/// Intent only — the push pass makes the server agree (see [`mark_read_tx`]),
-/// and it is generic over the move, so trash rides the same path archive
-/// already proved.
+/// Moves a mail into one of its account's role folders. Intent only — the
+/// push pass makes the server agree (see [`mark_read_tx`]) — and it is
+/// generic over the move, so trash rides the same path archive already
+/// proved.
 ///
 /// The `EXISTS` guard is load-bearing: an account whose server advertises no
 /// such folder (see [`crate::sync`]'s role detection) would otherwise get a
 /// `NULL` from the subquery, and a mail with a null folder falls out of the
-/// inbox query *and* out of the push set's join — vanishing silently, with
-/// nothing to sync it back. Returns whether the mail actually moved, so the
-/// caller can say so.
+/// mailbox queries *and* out of the push set's join — vanishing silently,
+/// with nothing to sync it back.
+///
+/// The second guard is the honest no-op: filing a mail into the folder it
+/// already sits in changes nothing, so it must *say* it changed nothing —
+/// otherwise archiving from the archive would record an undo node and push
+/// the server a MOVE onto itself. Returns whether the mail actually moved,
+/// so the caller can say so.
 fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Result<bool> {
     let n = c.execute(
         "UPDATE message SET folder =
@@ -1406,7 +1540,9 @@ fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Result
             WHERE f.account = message.account AND f.role = ?2)
          WHERE id = ?1
            AND EXISTS (SELECT 1 FROM folder f
-                       WHERE f.account = message.account AND f.role = ?2)",
+                       WHERE f.account = message.account AND f.role = ?2)
+           AND folder IS NOT (SELECT f.id FROM folder f
+                              WHERE f.account = message.account AND f.role = ?2)",
         rusqlite::params![id, role],
     )?;
     Ok(n > 0)
@@ -1431,6 +1567,24 @@ pub fn can_file(store: &Store, id: MailId, role: &str) -> bool {
         .conn()
         .query_row(
             "SELECT 1 FROM message m JOIN folder f ON f.account = m.account
+             WHERE m.id = ?1 AND f.role = ?2",
+            rusqlite::params![id, role],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+}
+
+/// Whether this mail is in that folder already — the triage's other
+/// pre-flight, and the other thing worth saying instead of recording an
+/// action that moves nothing. Reachable from a message panel's `archive`
+/// on a mail read out of the archive: the button is about the mail, and
+/// the mail is where it is.
+#[must_use]
+pub fn already_filed(store: &Store, id: MailId, role: &str) -> bool {
+    store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM message m JOIN folder f ON f.id = m.folder
              WHERE m.id = ?1 AND f.role = ?2",
             rusqlite::params![id, role],
             |_| Ok(true),
@@ -2836,7 +2990,7 @@ struct SeedMail<'a> {
     /// seed exercises the real path rather than a tidied version of it.
     html: Option<&'a str>,
     status: Option<(&'a str, bool)>,
-    /// The folder's role: `inbox`, `archive` or `sent`.
+    /// The folder's role: `inbox`, `archive`, `sent` or `spam`.
     folder: &'a str,
     /// Message-ID and what it references — the threading headers (CR-007);
     /// empty for a mail that stands alone.
@@ -3092,6 +3246,53 @@ fn thread_mails() -> Vec<SeedMail<'static>> {
     ]
 }
 
+/// What the spam folder holds — the demo world's junk, so the panel that
+/// shows it has something to show and the filter something to sift. None of
+/// it threads with anything: that is rather the point of it.
+fn spam_mails() -> Vec<SeedMail<'static>> {
+    vec![
+        SeedMail {
+            from_name: "Crypto Rewards",
+            from_email: "no-reply@crypt0-rewards.biz",
+            subject: "Your 4.2 BTC withdrawal is PENDING — confirm in 24h",
+            date: ts(2026, 8, 30, 3, 41),
+            unread: true,
+            body: "Dear valued member,\n\nOur system shows an unclaimed balance of 4.2 BTC on your account. Confirm your wallet within 24 hours or the funds return to the pool.\n\nThis message was sent to you because you are a winner.",
+            html: None,
+            status: None,
+            folder: "spam",
+            mid: "",
+            refs: &[],
+        },
+        SeedMail {
+            from_name: "IT Helpdesk",
+            from_email: "security@acount-verify.info",
+            subject: "Mailbox quota exceeded — re-validate your password",
+            date: ts(2026, 8, 29, 22, 8),
+            unread: true,
+            body: "Your mailbox has reached 99.8% of its quota and outgoing mail will be blocked.\n\nRe-validate your credentials on the portal below to restore full service. Failure to act will result in permanent deactivation.",
+            html: None,
+            status: None,
+            folder: "spam",
+            mid: "",
+            refs: &[],
+        },
+        SeedMail {
+            from_name: "Conference Board",
+            from_email: "invites@global-summits.co",
+            subject: "Invitation: keynote speaker, 14th Global Innovation Summit",
+            date: ts(2026, 8, 26, 11, 20),
+            unread: false,
+            body: "Distinguished Professor,\n\nFollowing your remarkable contributions, the organising committee invites you to deliver a keynote at our summit in Dubai.\n\nRegistration fee of $1,890 applies to all speakers.",
+            html: None,
+            status: None,
+            folder: "spam",
+            mid: "",
+            refs: &[],
+        },
+    ]
+}
+
 /// The five earlier runs of the CI workflow the GitHub mail continues —
 /// `(run, day, hour, minute, failed)` — archived, so the inbox rows stay
 /// where they were; the thread they make is six long. None of them names
@@ -3132,10 +3333,12 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         let inbox = folder("Inbox", "inbox")?;
         let archive = folder("Archive", "archive")?;
         let sent = folder("Sent", "sent")?;
+        let spam = folder("Spam", "spam")?;
         folder("Trash", "trash")?;
         let folder_of = |role: &str| match role {
             "archive" => archive,
             "sent" => sent,
+            "spam" => spam,
             _ => inbox,
         };
 
@@ -3219,6 +3422,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
             })?;
         }
         for m in &thread_mails() {
+            insert(m)?;
+        }
+        for m in &spam_mails() {
             insert(m)?;
         }
         for (run, day, hour, minute, failed) in CI_RUNS {
@@ -3595,7 +3801,7 @@ mod tests {
         assert!(inbox_filtered(&s, "@account:me@prepor.dev").len() == 69);
         // The table pages: the whole inbox is more than one page, and the
         // rank query finds any row without a walk.
-        let mut t = Table::new(&THREADS, INBOX_PAGE);
+        let mut t = Table::new(threads(Role::Inbox), MAILBOX_PAGE);
         assert_eq!(t.len(&s), 69);
         let last = t.row(&s, 68).expect("the oldest");
         assert_eq!(t.index_of(&s, &last), Some(68));
@@ -3603,8 +3809,8 @@ mod tests {
         assert_eq!(t.len(&s), 61);
         assert_eq!(t.index_of(&s, &last), Some(60));
         let (sug_from, sug_acct) = (
-            (THREADS.suggest)(&s, "from", "kov"),
-            (THREADS.suggest)(&s, "account", ""),
+            (threads(Role::Inbox).suggest)(&s, "from", "kov"),
+            (threads(Role::Inbox).suggest)(&s, "account", ""),
         );
         assert_eq!(sug_from[0].label, "Vera Kovac");
         assert_eq!(sug_from[0].value, "vera@kovac.io");
@@ -3781,7 +3987,7 @@ mod tests {
     #[test]
     fn threads_answer_for_a_marked_set() {
         let s = store();
-        let mut t = Table::new(&THREADS, INBOX_PAGE);
+        let mut t = Table::new(threads(Role::Inbox), MAILBOX_PAGE);
         let all = t.keys(&s).expect("the inbox can list its threads");
         assert_eq!(all.len(), 69, "every conversation, not just a page of them");
         assert_eq!(
@@ -3808,13 +4014,13 @@ mod tests {
         // same aggregates the one-thread read does.
         let head = t.by_key(&s, &other).expect("the hidden mark's row");
         assert_eq!(head.thread, other);
-        assert_eq!(Some(head.clone()), thread_head(&s, head.target));
+        assert_eq!(Some(head.clone()), thread_head(&s, Role::Inbox, head.target));
         assert_eq!(t.by_key(&s, &-1), None, "no such thread");
 
         // The inbox knows inbox threads: filed away, the row is gone —
         // and so is the key from `keys`.
         t.set_filter("");
-        for id in thread_inbox(&s, head.target) {
+        for id in thread_siblings(&s, head.target) {
             assert!(s.write(move |c| archive_tx(c, id)).unwrap());
         }
         assert_eq!(t.by_key(&s, &other), None);
@@ -3842,16 +4048,42 @@ mod tests {
             title(&s, &compose(Seed::Forward(1))),
             "fwd: Q3 infra budget draft"
         );
-        assert_eq!(title(&s, &Kind::Inbox { filter: Some("x".into()) }), "inbox · x");
+        let filtered = Kind::Mailbox { role: Role::Inbox, filter: Some("x".into()) };
+        assert_eq!(title(&s, &filtered), "inbox · x");
+        // A mailbox is titled what its folder is.
+        for role in crate::core::ROLES {
+            let k = Kind::Mailbox { role, filter: None };
+            assert_eq!(title(&s, &k), role.as_str());
+        }
 
         s.write(|c| mark_read_tx(c, 1)).unwrap();
         assert!(!inbox(&s)[0].unread);
         assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "archive moved it");
         assert_eq!(inbox(&s).len(), 69);
         assert_ne!(inbox(&s)[0].id, 1);
-        assert_eq!(corpus(&s).len(), 76, "archived mail stays in the corpus");
+        assert_eq!(corpus(&s).len(), 79, "archived mail stays in the corpus");
         let (name, n) = contact(&s, "vera@kovac.io");
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
+    }
+
+    /// Filing a mail into the folder it already sits in moves nothing, and
+    /// says so — otherwise `archive` on a mail read out of the archive (the
+    /// button is about the mail, so it is still there) would record an undo
+    /// node and push the server a MOVE onto itself.
+    #[test]
+    fn filing_a_mail_where_it_already_is_moves_nothing() {
+        let s = store();
+        assert!(!already_filed(&s, 1, "archive"));
+        assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "the first move lands");
+        assert_eq!(role_of(&s, 1), Some(Role::Archive));
+
+        assert!(already_filed(&s, 1, "archive"));
+        assert!(can_file(&s, 1, "archive"), "the folder is there all the same");
+        assert!(!s.write(|c| archive_tx(c, 1)).unwrap(), "the second moves nothing");
+        assert_eq!(role_of(&s, 1), Some(Role::Archive));
+        // And out of the archive is still a move.
+        assert!(s.write(|c| delete_tx(c, 1)).unwrap());
+        assert_eq!(role_of(&s, 1), None, "trash plays no mailbox role");
     }
 
     /// Delete is archive's twin on the trash folder, and both refuse to move
@@ -3864,7 +4096,7 @@ mod tests {
         assert!(s.write(|c| delete_tx(c, 2)).unwrap(), "delete moved it");
         assert_eq!(inbox(&s).len(), 69);
         assert!(!inbox(&s).iter().any(|m| m.id == 2));
-        assert_eq!(corpus(&s).len(), 76, "deleted mail stays in the corpus");
+        assert_eq!(corpus(&s).len(), 79, "deleted mail stays in the corpus");
 
         // An account without the folder: the mail must stay exactly where it
         // is. A fresh store, because the folder can only be dropped while
@@ -4011,6 +4243,47 @@ mod tests {
         assert_eq!(thread(&s, c1).len(), 2);
     }
 
+    /// Four lists over one store: each shows the conversations its folder
+    /// holds, and nothing another folder holds. The aggregates on a row
+    /// still cover the *whole* conversation, whichever list it is read
+    /// in — the GitHub thread is six mails long from the inbox and from
+    /// the archive alike, and only the mail the row opens differs.
+    #[test]
+    fn each_mailbox_lists_its_own_folder() {
+        let s = store();
+        let n = |role| mailbox_filtered(&s, role, "").len();
+        assert_eq!(n(Role::Inbox), 69);
+        // The five CI runs are one conversation; the archive has no other.
+        assert_eq!(n(Role::Archive), 1);
+        assert_eq!(n(Role::Sent), 1);
+        assert_eq!(n(Role::Spam), 3);
+
+        // The same conversation, read in two mailboxes: one row each, the
+        // same participants and count, a different mail to open.
+        let inbox = thread_head(&s, Role::Inbox, 2).expect("the inbox row");
+        let archived = thread_head(&s, Role::Archive, 2).expect("the archive row");
+        assert_eq!((inbox.thread, inbox.n), (archived.thread, archived.n));
+        assert_eq!(inbox.n, 6);
+        assert_eq!(inbox.target, 2, "the unread inbox mail");
+        assert_ne!(archived.target, 2, "an archived one");
+        // And a mailbox it is not in has no row for it at all.
+        assert_eq!(thread_head(&s, Role::Spam, 2), None);
+
+        // The filter is the same grammar over each: the spam list sifts
+        // its own rows and knows nothing of the inbox's.
+        assert_eq!(mailbox_filtered(&s, Role::Spam, "@unread").len(), 2);
+        assert_eq!(mailbox_filtered(&s, Role::Spam, "vera").len(), 0);
+        assert_eq!(mailbox_filtered(&s, Role::Sent, "panel model")[0].who, ["Max", "me"]);
+
+        // `@from:` completes against the senders of the list it is on: the
+        // spam one offers spammers, and no other list offers them.
+        let spam = (threads(Role::Spam).suggest)(&s, "from", "crypt");
+        assert_eq!(spam.len(), 1);
+        assert_eq!(spam[0].value, "no-reply@crypt0-rewards.biz");
+        assert!((threads(Role::Inbox).suggest)(&s, "from", "crypt").is_empty());
+        assert!(senders(&s).iter().all(|x| !x.email.contains("crypt0")));
+    }
+
     /// The demo world threads: Max's two replies and my note make one
     /// conversation of three, and the GitHub mail continues five archived
     /// runs. The inbox row shows the whole conversation; the walk opens
@@ -4025,19 +4298,22 @@ mod tests {
             "oldest first, my sent note included"
         );
         assert_eq!(max[0].role, "sent");
-        let row = thread_head(&s, 3).expect("in the inbox");
+        let row = thread_head(&s, Role::Inbox, 3).expect("in the inbox");
         assert_eq!(row.who, vec!["Max", "me"]);
         assert_eq!(row.who_line(), "Max, me · 3");
         assert_eq!(row.topic, "superapp panel model");
         assert_eq!(row.target, 71, "newest inbox mail: none unread");
         assert!(!row.unread);
-        assert_eq!(thread_inbox(&s, 70), vec![3, 71]);
+        // My own note is in Sent: its siblings there are itself alone,
+        // while the conversation's inbox copies are Max's two replies.
+        assert_eq!(thread_siblings(&s, 70), vec![70]);
+        assert_eq!(thread_siblings(&s, 3), vec![3, 71]);
 
         let gh = thread(&s, 2);
         assert_eq!(gh.len(), 6);
         assert_eq!(gh[5].mail.head.id, 2, "the inbox mail is the newest");
         assert_eq!(gh[0].mail.status.as_ref().map(|s| s.1), Some(true), "one red run");
-        let row = thread_head(&s, 2).expect("in the inbox");
+        let row = thread_head(&s, Role::Inbox, 2).expect("in the inbox");
         assert_eq!(row.who, vec!["GitHub"], "one participant keeps the full name");
         assert_eq!(row.who_line(), "GitHub · 6");
         assert_eq!(row.target, 2, "the unread one");

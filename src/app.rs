@@ -28,7 +28,7 @@ use makepad_widgets::makepad_platform::event::{
 };
 use makepad_widgets::makepad_platform::ime::TextInputConfig;
 
-use crate::core::{self, Dir, Kind, PanelId, Seed, Wm, Ws, WS_N};
+use crate::core::{self, Dir, Kind, PanelId, Role, Seed, Wm, Ws, WS_N};
 use crate::e2e;
 use crate::launcher;
 use crate::mail;
@@ -445,7 +445,7 @@ script_mod! {
                         add_account_tpl := mod.widgets.AddAccountPanel{}
                         bucket_tpl := mod.widgets.BucketPanel{}
                         compose_tpl := mod.widgets.ComposePanel{}
-                        inbox_tpl := mod.widgets.InboxPanel{}
+                        mailbox_tpl := mod.widgets.MailboxPanel{}
                         message_tpl := mod.widgets.MessagePanel{}
                         contact_tpl := mod.widgets.ContactPanel{}
                         help_tpl := mod.widgets.HelpPanel{}
@@ -469,7 +469,7 @@ script_mod! {
                         // instantiated from its widget's, a panel or
                         // workspace node from the stage's — exactly as
                         // panels are from theirs.
-                        inbox_row_tpl := mod.widgets.InboxRow{}
+                        mailbox_row_tpl := mod.widgets.MailboxRow{}
                         thread_msg_tpl := mod.widgets.ThreadMsg{}
                         overlay_row_tpl := mod.widgets.OverlayRow{}
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
@@ -484,7 +484,7 @@ script_mod! {
                             add_account_tpl := mod.widgets.AddAccountPanel{}
                             bucket_tpl := mod.widgets.BucketPanel{}
                             compose_tpl := mod.widgets.ComposePanel{}
-                            inbox_tpl := mod.widgets.InboxPanel{}
+                            mailbox_tpl := mod.widgets.MailboxPanel{}
                             message_tpl := mod.widgets.MessagePanel{}
                             contact_tpl := mod.widgets.ContactPanel{}
                             help_tpl := mod.widgets.HelpPanel{}
@@ -826,7 +826,7 @@ struct TouchNav {
 /// How far across a row the curtain must be drawn for a lift to commit.
 const SWIPE_COMMIT: f64 = 0.35;
 
-/// A swiped inbox row and the curtain wiping across it (CR-005). The row
+/// A swiped mail row and the curtain wiping across it (CR-005). The row
 /// itself never moves: an ink panel carrying the action's name is drawn in
 /// from the edge the finger travels away from, which is also the edge that
 /// action's button sits on in a message header. Past [`SWIPE_COMMIT`] the
@@ -835,10 +835,10 @@ const SWIPE_COMMIT: f64 = 0.35;
 ///
 /// It lives on the [`Stage`] rather than in [`TouchMode`] because a committed
 /// swipe outlives its finger: the curtain finishes covering the row, and only
-/// then does the mail leave the inbox.
+/// then does the mail leave its folder.
 #[derive(Debug)]
 struct RowSwipe {
-    /// The inbox the row belongs to.
+    /// The mailbox the row belongs to.
     pid: PanelId,
     /// The mail under the finger.
     id: core::MailId,
@@ -851,12 +851,29 @@ struct RowSwipe {
     /// Set on a committing lift: `true` deletes, `false` archives. The action
     /// fires when the spring lands.
     commit: Option<bool>,
+    /// Whether this list's rows can be archived at all — the inbox's, and
+    /// no other mailbox's ([`ui::mark_verbs`] says the same about its bar).
+    /// A gesture is a verb like any other: where the verb does not exist
+    /// the curtain never appears and the lift does nothing.
+    archives: bool,
 }
 
 impl RowSwipe {
+    /// Which way the finger has gone, as a verb: `Some(true)` deletes,
+    /// `Some(false)` archives, `None` where that way means nothing here.
+    fn verb(&self) -> Option<bool> {
+        match self.x.value() {
+            x if x > 0.0 => Some(true),
+            x if x < 0.0 => self.archives.then_some(false),
+            _ => None,
+        }
+    }
+
     /// Whether the curtain is far enough across to fire on lift.
     fn armed(&self) -> bool {
-        self.slot.size.x > 0.0 && self.x.value().abs() >= self.slot.size.x * SWIPE_COMMIT
+        self.verb().is_some()
+            && self.slot.size.x > 0.0
+            && self.x.value().abs() >= self.slot.size.x * SWIPE_COMMIT
     }
 }
 
@@ -1273,7 +1290,7 @@ impl State {
             Ok(None) => {
                 let mut ws = Wm::new();
                 ws.open(Kind::Help, None, false);
-                let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+                let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
                 ws.focus = Some(inbox);
                 ws
             }
@@ -3276,11 +3293,16 @@ impl Stage {
             // never drawn here — it stays on the message's own chrome, one
             // column over and in plain sight.
             if let Some(child) = self.lender(cx) {
+                // …but only what this driver would do to a set of its own
+                // rows: a sent list's bar wears no `archive`, so neither
+                // does its borrow (`ui::lends`). The child's own button is
+                // untouched — it is the mail's, one column over.
                 let lent = key_char(k.key_code).and_then(|c| {
                     self.wears(child)
                         .iter()
                         .find(|(_, a)| ui::btn_accel(*a) == Some(c))
                         .map(|(_, a)| *a)
+                        .filter(|a| kind.as_ref().is_some_and(|k| ui::lends(k, *a)))
                 });
                 if let Some(act) = lent {
                     self.resolve_click(cx, Act::Btn(child, act), false);
@@ -3309,7 +3331,7 @@ impl Stage {
     /// asked: a ref of the wrong kind borrows nothing and says no.
     fn marked(&self, pid: PanelId) -> bool {
         self.hosted.get(&pid).is_some_and(|w| {
-            w.as_inbox_panel().has_marks() || w.as_files_panel().has_marks()
+            w.as_mailbox_panel().has_marks() || w.as_files_panel().has_marks()
         })
     }
 
@@ -3319,7 +3341,7 @@ impl Stage {
     /// is select-all and nothing else.
     fn field_focused(&self, cx: &mut Cx, pid: PanelId) -> bool {
         self.hosted.get(&pid).is_some_and(|w| {
-            w.as_inbox_panel().filter_focused(cx) || w.as_files_panel().field_focused(cx)
+            w.as_mailbox_panel().filter_focused(cx) || w.as_files_panel().field_focused(cx)
         })
     }
 
@@ -4176,7 +4198,7 @@ impl Stage {
                                 }
                                 Some(Kind::Effects) => w.as_effects_panel().pick(cx, i),
                                 Some(Kind::Files { .. }) => w.as_files_panel().pick(cx, i),
-                                _ => w.as_inbox_panel().pick(cx, i),
+                                _ => w.as_mailbox_panel().pick(cx, i),
                             }
                         }
                         self.kick(cx);
@@ -4793,8 +4815,8 @@ impl Stage {
         self.sync(cx);
     }
 
-    /// Files a set of inbox mails: the pipeline both triage paths share —
-    /// a row's own verb ([`Stage::triage`]) and the marks bar's, over a set.
+    /// Files a set of mails: the pipeline both triage paths share — a row's
+    /// own verb ([`Stage::triage`]) and the marks bar's, over a set.
     ///
     /// `next` is the mail the cursor should land on once these are gone and
     /// the panel doing the walking: its preview opens inside the same node,
@@ -4844,9 +4866,9 @@ impl Stage {
                 label,
                 None,
                 move |ws| {
-                    // The threads left the inbox, so their readers have
-                    // nothing left to read — on whichever workspace they
-                    // were opened.
+                    // The threads left the folder they were read in, so
+                    // their readers have nothing left to read — on
+                    // whichever workspace they were opened.
                     for r in readers {
                         ws.close_anywhere(r);
                     }
@@ -4908,14 +4930,14 @@ impl Stage {
         true
     }
 
-    /// Files a thread out of the inbox — archive or delete — from wherever
-    /// the intent came: a message panel's header button, the chord an inbox
-    /// borrowed from its preview, or an android row swipe. One door, so the
-    /// undo node, the toast and the closing of the thread's readers are the
-    /// same story every time. The row is the thread (CR-007), so every
-    /// inbox mail of the conversation goes together — one intent each, one
-    /// node — and the mail itself with them if it sits elsewhere (a reader
-    /// on an archived mail).
+    /// Files a thread away — archive or delete — from wherever the intent
+    /// came: a message panel's header button, the chord a mail list borrowed
+    /// from its preview, or an android row swipe. One door, so the undo
+    /// node, the toast and the closing of the thread's readers are the same
+    /// story every time. The row is the thread (CR-007), so every mail of
+    /// the conversation that shares this one's folder goes together — one
+    /// intent each, one node ([`mail::thread_siblings`]), which is what
+    /// makes the verb mean the same thing in every mailbox.
     fn triage(&mut self, cx: &mut Cx, id: core::MailId, delete: bool) {
         // Decided first, while the row is still in the list to have one.
         let next = self.successor_of(id);
@@ -4927,16 +4949,23 @@ impl Stage {
         } else {
             ("archive", "archived", "archive")
         };
-        // Ask before acting: without the folder the move is a no-op, and an
-        // action that changes nothing records no node — so the user would
-        // get silence rather than an answer.
+        // Ask before acting: without the folder the move is a no-op, and so
+        // is filing a mail into the folder it is already in — a mail read
+        // out of the archive still wears the archive button, because the
+        // button is about the mail. An action that changes nothing records
+        // no node, so the user would get silence rather than an answer.
         if !mail::can_file(&state.store, id, role) {
             state.toast(format!("this account has no {role} folder"), true);
             self.kick(cx);
             return;
         }
+        if mail::already_filed(&state.store, id, role) {
+            state.toast(format!("already in the {role}"), true);
+            self.kick(cx);
+            return;
+        }
         let topic = mail::thread_topic(&state.store, id).unwrap_or_default();
-        let mut ids = mail::thread_inbox(&state.store, id);
+        let mut ids = mail::thread_siblings(&state.store, id);
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -4977,14 +5006,14 @@ impl Stage {
                     if files {
                         w.as_files_panel().mark_all(cx, &store);
                     } else {
-                        w.as_inbox_panel().mark_all(cx, &store);
+                        w.as_mailbox_panel().mark_all(cx, &store);
                     }
                 }
                 self.kick(cx);
             }
             ui::MarkVerb::Clear => {
                 if let Some(w) = self.hosted.get(&pid).cloned() {
-                    w.as_inbox_panel().clear_marks(cx);
+                    w.as_mailbox_panel().clear_marks(cx);
                     w.as_files_panel().clear_marks(cx);
                 }
                 self.kick(cx);
@@ -5045,16 +5074,17 @@ impl Stage {
     }
 
     /// The batch verb (CR-009): [`Stage::triage`] over a list's marked set.
-    /// Every inbox mail of every marked thread, one `Filed` intent each,
-    /// **one node** — so one ⌘z takes the whole batch back, and puts the
-    /// marks back with it. A thread whose account has no such folder is
-    /// skipped rather than failing the batch, and stays marked: the marks
-    /// after a verb are exactly what it could not do. The cursor carries to
-    /// the nearest row that stayed, previewing as the walk does, in the same
-    /// node; readers of the filed threads close, as for one row.
+    /// Every mail of every marked thread that sits in the list's own folder,
+    /// one `Filed` intent each, **one node** — so one ⌘z takes the whole
+    /// batch back, and puts the marks back with it. A thread whose account
+    /// has no such folder is skipped rather than failing the batch, and
+    /// stays marked: the marks after a verb are exactly what it could not
+    /// do. The cursor carries to the nearest row that stayed, previewing as
+    /// the walk does, in the same node; readers of the filed threads close,
+    /// as for one row.
     fn triage_marked(&mut self, cx: &mut Cx, pid: PanelId, delete: bool) {
         let Some(w) = self.hosted.get(&pid).cloned() else { return };
-        let panel = w.as_inbox_panel();
+        let panel = w.as_mailbox_panel();
         let threads = panel.marks();
         if threads.is_empty() {
             return;
@@ -5064,21 +5094,30 @@ impl Stage {
         } else {
             ("archive", "archived", "archive")
         };
+        // Which mailbox these marks are rows of: the anchors are keys of
+        // *this* list's source, and nothing else can resolve them.
+        let from = match self.state.as_deref().and_then(|s| s.ws.panel(pid)) {
+            Some(p) => match p.kind {
+                Kind::Mailbox { role, .. } => role,
+                _ => return,
+            },
+            None => return,
+        };
         let Some(store) = self.state.as_deref().map(|s| s.store.clone()) else {
             return;
         };
-        // The pre-flight, per thread: its inbox mails, and whether its
-        // account has the folder.
+        // The pre-flight, per thread: its mails in this folder, and whether
+        // its account has the one they are going to.
         let mut filed: Vec<i64> = Vec::new();
         let mut skipped = 0usize;
         let mut ids: Vec<core::MailId> = Vec::new();
         for th in &threads {
-            // A thread that left the inbox under its mark — a sync filed it,
+            // A thread that left the list under its mark — a sync filed it,
             // another device did — is not *skipped*: there is nothing left to
             // file, and the next draw drops its mark with it.
-            let head = crate::richtable::Datasource::by_key(&mail::THREADS, &store, th);
+            let head = crate::richtable::Datasource::by_key(mail::threads(from), &store, th);
             let Some(head) = head else { continue };
-            let mails = mail::thread_inbox(&store, head.target);
+            let mails = mail::thread_siblings(&store, head.target);
             if mails.is_empty() {
                 continue;
             }
@@ -5145,7 +5184,7 @@ impl Stage {
     fn restore_marks(&mut self, cx: &mut Cx, (marks, undone): (Vec<(PanelId, Vec<i64>)>, bool)) {
         for (pid, keys) in marks {
             let Some(w) = self.hosted.get(&pid).cloned() else { continue };
-            let panel = w.as_inbox_panel();
+            let panel = w.as_mailbox_panel();
             if undone {
                 panel.add_marks(cx, &keys);
             } else {
@@ -5154,32 +5193,43 @@ impl Stage {
         }
     }
 
-    /// Where an inbox cursor standing on `id` should land once it is filed
-    /// away: the next row down, or the one above if it was the last. `None`
-    /// when no inbox is pointing at this mail — a header button pressed on a
-    /// message nobody is walking towards moves no cursor.
+    /// Where a mail list's cursor standing on `id` should land once it is
+    /// filed away: the next row down, or the one above if it was the last.
+    /// `None` when no mailbox is pointing at this mail — a header button
+    /// pressed on a message nobody is walking towards moves no cursor.
+    ///
+    /// **Only a list over the mail's own folder** may answer. A conversation
+    /// is a row in every mailbox that holds one of its mails, so an archive
+    /// list and an inbox list can both have this thread under their cursor —
+    /// and the neighbour the wrong one offers is a row of another folder,
+    /// which the filing would then open and mark read. Among lists that do
+    /// share the folder the focused one wins, and the panel id orders the
+    /// rest: `panels` is a map, and an arbitrary winner would move a
+    /// different cursor from one run to the next.
     fn successor_of(&mut self, id: core::MailId) -> Option<(PanelId, core::MailId)> {
-        let inboxes: Vec<PanelId> = self
-            .state
-            .as_deref()?
+        let store = self.state.as_deref()?.store.clone();
+        let role = mail::role_of(&store, id)?;
+        let state = self.state.as_deref()?;
+        let focus = state.ws.focus;
+        let mut lists: Vec<PanelId> = state
             .ws
             .panels
             .iter()
-            .filter(|(_, p)| matches!(p.kind, Kind::Inbox { .. }))
+            .filter(|(_, p)| matches!(p.kind, Kind::Mailbox { role: r, .. } if r == role))
             .map(|(pid, _)| *pid)
             .collect();
-        let store = self.state.as_deref()?.store.clone();
+        lists.sort_by_key(|pid| (Some(*pid) != focus, *pid));
         let th = mail::thread_of(&store, id)?;
-        let pid = inboxes.into_iter().find(|pid| {
+        let pid = lists.into_iter().find(|pid| {
             self.hosted
                 .get(pid)
-                .and_then(|w| w.as_inbox_panel().selected_thread())
+                .and_then(|w| w.as_mailbox_panel().selected_thread())
                 == Some(th)
         })?;
         // The rows as that panel has them — its own filter included: the
         // panel's table answers, exactly as it does for hit registration.
         let w = self.hosted.get(&pid)?.clone();
-        w.as_inbox_panel()
+        w.as_mailbox_panel()
             .neighbour_of(&store, id)
             .map(|next| (pid, next))
     }
@@ -5246,6 +5296,7 @@ impl Stage {
                             slot: self.row_rect(pid, id).unwrap_or_default(),
                             x: Spring::at_rest(0.0, SpringParams::movement()),
                             commit: None,
+                            archives: self.list_archives(pid),
                         });
                         TouchMode::RowSwipe { uid }
                     }
@@ -5379,13 +5430,13 @@ impl Stage {
             TouchMode::RowSwipe { uid: u } if u == uid => {
                 self.touch.mode = TouchMode::Idle;
                 if let Some(rs) = self.row_swipe.as_mut() {
-                    if rs.armed() {
+                    if let Some(delete) = rs.armed().then(|| rs.verb()).flatten() {
                         // Committed: the curtain runs on to cover the row,
                         // and the mail is filed when it lands — so the row is
-                        // gone from view before it is gone from the inbox.
+                        // gone from view before it is gone from its folder.
                         let w = rs.slot.size.x;
-                        rs.commit = Some(rs.x.value() > 0.0);
-                        rs.x.retarget(if rs.x.value() > 0.0 { w } else { -w });
+                        rs.commit = Some(delete);
+                        rs.x.retarget(if delete { w } else { -w });
                     } else {
                         rs.x.retarget(0.0);
                     }
@@ -5461,7 +5512,17 @@ impl Stage {
         }
     }
 
-    /// The rect an inbox row was last drawn at, from the hits registered for
+    /// Whether a swipe on this list's rows may archive — the same question
+    /// its marks bar answers, asked of the same table, so a gesture and a
+    /// button can never offer different verbs.
+    fn list_archives(&self, pid: PanelId) -> bool {
+        self.state
+            .as_deref()
+            .and_then(|s| s.ws.panel(pid))
+            .is_some_and(|p| ui::mark_verbs(&p.kind).contains(&ui::MarkVerb::Archive))
+    }
+
+    /// The rect a mail row was last drawn at, from the hits registered for
     /// that draw. The curtain needs somewhere to be, and this is the same
     /// geometry a tap on the row would resolve against.
     fn row_rect(&self, pid: PanelId, id: core::MailId) -> Option<Rect> {
@@ -5476,7 +5537,7 @@ impl Stage {
     fn toggle_mark(&self, cx: &mut Cx, pid: PanelId, row: MarkRow) {
         let Some(w) = self.hosted.get(&pid) else { return };
         match row {
-            MarkRow::Thread(th) => w.as_inbox_panel().toggle_mark(cx, th),
+            MarkRow::Thread(th) => w.as_mailbox_panel().toggle_mark(cx, th),
             MarkRow::Entry(name) => w.as_files_panel().toggle_mark(cx, name),
         }
     }
@@ -5604,7 +5665,7 @@ fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
         Kind::AddAccount => Some(live_id!(add_account_tpl)),
         Kind::Bucket => Some(live_id!(bucket_tpl)),
         Kind::Compose { .. } => Some(live_id!(compose_tpl)),
-        Kind::Inbox { .. } => Some(live_id!(inbox_tpl)),
+        Kind::Mailbox { .. } => Some(live_id!(mailbox_tpl)),
         Kind::Message { .. } => Some(live_id!(message_tpl)),
         Kind::Contact { .. } => Some(live_id!(contact_tpl)),
         Kind::Help => Some(live_id!(help_tpl)),
@@ -7891,11 +7952,16 @@ impl Stage {
                 let key_id = crate::r2::configured_key_id(dir);
                 w.as_bucket_panel().prefill(cx, &url, &key_id);
             }
-            // An inbox with a baked filter param seeds its field.
-            if let Some(Kind::Inbox { filter: Some(f) }) = &kind {
+            // A mailbox seeds its field from its baked filter param — and
+            // clears it where there is none. This runs on a *reseed*, so
+            // the field may still hold the param of the kind this panel
+            // showed before (a contact's `messages from …` replaced by
+            // another mailbox); the typed filter is not a param and never
+            // reaches here.
+            if let Some(Kind::Mailbox { filter, .. }) = &kind {
                 w.widget(cx, ids!(filter_input))
                     .as_text_input()
-                    .set_text(cx, f);
+                    .set_text(cx, filter.as_deref().unwrap_or(""));
             }
         }
         let props = crate::panels::PanelProps {
@@ -7921,7 +7987,7 @@ impl Stage {
         w.draw_all(cx, &mut scope);
         // Inside the panel's own clipped turtle, so a curtain over a row at
         // the edge of the list is cut off with everything else.
-        if matches!(kind, Some(Kind::Inbox { .. })) {
+        if matches!(kind, Some(Kind::Mailbox { .. })) {
             self.draw_row_swipe(cx, &w, pid);
         }
         cx.end_turtle();
@@ -8088,7 +8154,7 @@ impl Stage {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
             }
-            Some(Kind::Inbox { .. }) => {
+            Some(Kind::Mailbox { .. }) => {
                 let fr = w.widget(cx, ids!(filter_input)).area().rect(cx);
                 if fr.size.x > 0.0 {
                     reg.push(("filter".to_string(), fr, Act::Pointer(pid)));
@@ -8100,7 +8166,7 @@ impl Stage {
                 // anywhere on either line opens it. Splitting it (a select
                 // band beside an open band) made the from name and the date
                 // look dead — a row means its mail, whichever line you hit.
-                let panel = w.as_inbox_panel();
+                let panel = w.as_mailbox_panel();
                 let swiping = self.row_swipe.as_ref().filter(|rs| rs.pid == pid).map(|rs| rs.id);
                 if let Some(list) = w.widget(cx, ids!(list)).as_portal_list().borrow() {
                     for (idx, item) in list.items().iter() {
@@ -8290,7 +8356,13 @@ impl Stage {
                     reg.push((
                         format!("messages from {first}"),
                         r,
-                        Act::Open(pid, Kind::Inbox { filter: Some(email.clone()) }),
+                        Act::Open(
+                            pid,
+                            Kind::Mailbox {
+                                role: core::Role::Inbox,
+                                filter: Some(email.clone()),
+                            },
+                        ),
                     ));
                 }
             }
@@ -8394,7 +8466,9 @@ impl Stage {
             return;
         };
         let (dx, armed, slot) = (rs.x.value(), rs.armed(), rs.slot);
-        if slot.size.x <= 0.0 || dx.abs() < 0.5 {
+        // A verb this list does not have draws no curtain: the finger
+        // slides and nothing is promised.
+        if slot.size.x <= 0.0 || dx.abs() < 0.5 || rs.verb().is_none() {
             return;
         }
         // Clip to the list: a row scrolled half under the pinned header has a
@@ -8483,18 +8557,22 @@ impl Stage {
         let btns_w = self.cell.head_btns_w(&head_btns);
         self.draw_chrome(cx, r, &title, focused, alpha, Some(pid), hover.as_ref(), btns_w);
 
-        // The keys a focused driver keeps for itself: a borrowed mark on
-        // this panel is drawn plain while the driver shadows it, so no
-        // bold letter ever promises a chord the driver would take.
+        // The keys a focused driver keeps to itself, and the ones it will
+        // not take at all: a mark on this panel is drawn plain for either,
+        // so no bold letter ever promises a chord the driver would swallow
+        // — or one it refuses to lend (`ui::lends`), which from here would
+        // do nothing.
         let shadow: Vec<char> = state
             .ws
             .join_parent_of(pid)
             .filter(|p| state.ws.focus == Some(*p))
-            .filter(|p| state.ws.panel(*p).is_some_and(|q| ui::preview_kind(&q.kind).is_some()))
-            .map(|p| {
+            .and_then(|p| state.ws.panel(p).map(|q| (p, q.kind.clone())))
+            .filter(|(_, k)| ui::preview_kind(k).is_some())
+            .map(|(p, k)| {
                 state
                     .wears(p, self.marked(p))
                     .iter()
+                    .chain(head_btns.iter().filter(|(_, a)| !ui::lends(&k, *a)))
                     .filter_map(|(_, a)| ui::btn_accel(*a))
                     .collect()
             })

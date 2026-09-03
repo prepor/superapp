@@ -23,7 +23,7 @@ use std::rc::Rc;
 use makepad_widgets::*;
 
 use crate::app::BootOutside;
-use crate::core::{Grid, Kind, Seed};
+use crate::core::{Grid, Kind, Role, Seed};
 use crate::effect;
 use crate::e2e::{self, Step};
 use crate::files;
@@ -531,7 +531,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         account_row(),
         effect_row(),
         link(),
-        inbox(),
+        mailbox(),
         inbox_marks(),
         effect_log(),
         job(),
@@ -551,8 +551,8 @@ pub fn scenes() -> Vec<Scene<Setup>> {
 
 fn inbox_row() -> Scene<Setup> {
     let row = |h: mail::ThreadHead, selected: bool, marked: bool| {
-        widget(live_id!(inbox_row_tpl), move |cx, w| {
-            w.as_inbox_row().populate(cx, &h, selected, marked);
+        widget(live_id!(mailbox_row_tpl), move |cx, w| {
+            w.as_mailbox_row().populate(cx, &h, selected, marked);
         })
     };
     let elena = || head(&["Elena Petrova"], "Sat hike", false, 1);
@@ -895,10 +895,12 @@ fn link() -> Scene<Setup> {
         .about("⌘r — the letter drawn bold")
 }
 
-fn inbox() -> Scene<Setup> {
-    let inbox = |script: &str| panel(|_| Kind::Inbox { filter: None }, script);
-    Scene::new("inbox", (520.0, 640.0))
+fn mailbox() -> Scene<Setup> {
+    let inbox = |script: &str| panel(|_| Kind::Mailbox { role: Role::Inbox, filter: None }, script);
+    let over = |role: Role| panel(move |_| Kind::Mailbox { role, filter: None }, "");
+    Scene::new("mailbox", (520.0, 640.0))
         .note("The mail list: a rich table over the conversations, the filter above it.")
+        .note("One panel over four folders — the inbox, the archive, sent, spam. Same rows, same walk, same grammar in the filter; only the folder the query starts from changes.")
         .note("Live — enter a node and walk it; ⌘a archives, ⌘z takes it back.")
         .node("fresh", inbox(""))
         .node("cursor", inbox("click \"inbox\"\nwait 200\nkey down 3\nwait 400"))
@@ -906,11 +908,19 @@ fn inbox() -> Scene<Setup> {
         .node("filtered", inbox("click \"filter\"\nwait 200\ntype \"github\"\nwait 400"))
         .node("filter error", inbox("click \"filter\"\nwait 200\ntype \"(github\"\nwait 400"))
         .about("what the filter could not read, under the field")
+        .node("archive", over(Role::Archive))
+        .about("what was filed away — the rows a conversation still makes there")
+        .node("sent", over(Role::Sent))
+        .about("my own letters; the participants read “me”")
+        .node("spam", over(Role::Spam))
+        .about("no archive verb on the bar: the mail is already out of the inbox")
         .node("phone", inbox(""))
         .sized((380.0, 720.0))
         .edge("fresh", "cursor", "↓ ×3")
         .edge("fresh", "filtered", "/ github")
         .edge("fresh", "filter error", "/ (github")
+        .edge("fresh", "archive", "⌘a / sync")
+        .edge("fresh", "sent", "send")
 }
 
 fn effect_log() -> Scene<Setup> {
@@ -978,7 +988,7 @@ fn marks_bar() -> Scene<Setup> {
                 .populate(cx, crate::ui::mark_verbs(&kind), marked, total, hidden);
         })
     };
-    let inbox = move |m, t, h| bar(Kind::Inbox { filter: None }, m, t, h);
+    let inbox = move |m, t, h| bar(Kind::Mailbox { role: Role::Inbox, filter: None }, m, t, h);
     let files = move |m, t, h| bar(Kind::Files { dir: files::HOME.into() }, m, t, h);
     Scene::new("marks bar", (520.0, 40.0))
         .note("What a list shows while any row is marked (CR-009): the count, the verbs on the marked set, all, clear.")
@@ -1000,7 +1010,7 @@ fn marks_bar() -> Scene<Setup> {
 }
 
 fn inbox_marks() -> Scene<Setup> {
-    let inbox = |script: &str| panel(|_| Kind::Inbox { filter: None }, script);
+    let inbox = |script: &str| panel(|_| Kind::Mailbox { role: Role::Inbox, filter: None }, script);
     // The walk that marks: onto the first row, space on it, then a
     // shift+↓ range over the two under it — three marks, the cursor left
     // standing on the last of them.
@@ -1394,7 +1404,7 @@ fn problems() -> Scene<Setup> {
         .about("retry files it again; reopen brings the draft back")
         .node("device sync", row(sync))
         .about("fixed by the network coming back")
-        .node("mark", seeded(Kind::Inbox { filter: None }))
+        .node("mark", seeded(Kind::Mailbox { role: Role::Inbox, filter: None }))
         .sized((520.0, 640.0))
         .about("bottom-right, static, red — the toast's corner, on any panel")
         .node("panel", seeded(Kind::Problems))

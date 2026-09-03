@@ -18,7 +18,7 @@ use makepad_widgets::image_cache::{
 };
 use makepad_widgets::*;
 
-use crate::core::{Kind, Seed};
+use crate::core::{Kind, Role, Seed};
 use crate::effect::{self, Job};
 use crate::mail;
 use crate::richtable::{self, Completion, Datasource, Marks, SqlSource, Suggestion, Table};
@@ -1001,7 +1001,7 @@ script_mod! {
     // ---- autocomplete ------------------------------------------------------
 
     /** One autocomplete row: the pick, then what it means, muted. Twin
-        lines again (see `InboxRow`): the highlighted one is inverted, and
+        lines again (see `MailboxRow`): the highlighted one is inverted, and
         a quad's colour is not a runtime value. */
     mod.widgets.SuggestLine = View {
         width: Fill, height: Fit
@@ -1128,7 +1128,7 @@ script_mod! {
         suggest: mod.widgets.SuggestBox {}
     }
 
-    // ---- inbox -------------------------------------------------------------
+    // ---- the mailboxes -----------------------------------------------------
 
     /** One mail row, two lines: the columns line (from · date), then the
         subject alone on the richtable's *extra line* — full-width row
@@ -1140,7 +1140,7 @@ script_mod! {
     // ancestor inside a PortalList item never paint (Fill defers, and a
     // deferred overlay walk never resolves) — so the selection wash is a
     // twin line with its own bg, toggled like the bold pairs.
-    mod.widgets.InboxLine = set_type_default() do #(InboxLine::register_widget(vm)) {
+    mod.widgets.MailboxLine = set_type_default() do #(MailboxLine::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
@@ -1183,12 +1183,12 @@ script_mod! {
         }
     }
 
-    mod.widgets.InboxRow = set_type_default() do #(InboxRow::register_widget(vm)) {
+    mod.widgets.MailboxRow = set_type_default() do #(MailboxRow::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fit
         flow: Down
-        line := mod.widgets.InboxLine {}
-        line_sel := mod.widgets.InboxLine {
+        line := mod.widgets.MailboxLine {}
+        line_sel := mod.widgets.MailboxLine {
             visible: false
             show_bg: true
             draw_bg +: {
@@ -1207,7 +1207,7 @@ script_mod! {
         // a mark costs no layout and the text stays on the header's
         // columns. Two more twins rather than a flag: a quad's colour is
         // not settable at draw time (see `OverlayRow`).
-        line_mark := mod.widgets.InboxLine {
+        line_mark := mod.widgets.MailboxLine {
             visible: false
             show_bg: true
             draw_bg +: {
@@ -1221,7 +1221,7 @@ script_mod! {
                 }
             }
         }
-        line_mark_sel := mod.widgets.InboxLine {
+        line_mark_sel := mod.widgets.MailboxLine {
             visible: false
             show_bg: true
             draw_bg +: {
@@ -1351,9 +1351,10 @@ script_mod! {
         }
         verbs_below := mod.widgets.MarkVerbs { visible: false }
     }
-    /** The inbox: the filter over the header over the virtualized list —
-        a rich table (CR-006) over `mail::INBOX`. */
-    mod.widgets.InboxPanel = set_type_default() do #(InboxPanel::register_widget(vm)) {
+    /** A mailbox — the inbox, the archive, sent, spam: the filter over the
+        header over the virtualized list, a rich table (CR-006) over the
+        `mail::threads` source of the role its kind names. */
+    mod.widgets.MailboxPanel = set_type_default() do #(MailboxPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
@@ -1400,7 +1401,7 @@ script_mod! {
             // in, rather than built again: a long list scrolls without
             // minting widgets.
             reuse_items: true
-            row := mod.widgets.InboxRow {}
+            row := mod.widgets.MailboxRow {}
             // The marks the filter hides ride above the rows (CR-009): a
             // caption, the rows themselves, and a strong rule closing the
             // group. The caption wears the rows' inset the way the header
@@ -1437,7 +1438,7 @@ script_mod! {
         line, the effect's own sentence under it, and — only when there is
         one — what went wrong, in the colour errors get.
 
-        Twin lines again (see `InboxRow`): the cursor's row is the washed
+        Twin lines again (see `MailboxRow`): the cursor's row is the washed
         copy, because a quad's colour is not a runtime value. */
     mod.widgets.EffectLine = set_type_default() do #(EffectLine::register_widget(vm)) {
         ..mod.widgets.View
@@ -1711,7 +1712,7 @@ script_mod! {
             }
         }
         // The mark (CR-009): an ink bar down the row's left edge, inside
-        // the row's own inset — an inbox row's, exactly (see `InboxRow`
+        // the row's own inset — an inbox row's, exactly (see `MailboxRow`
         // for why it is a twin rather than a flag).
         line_mark := mod.widgets.FilesLine {
             visible: false
@@ -2246,7 +2247,7 @@ script_mod! {
             mod.widgets.SLabel { text: "orward" }
         }
         mod.widgets.SRow {
-            mod.widgets.SLabel { text: "  inbox   " }
+            mod.widgets.SLabel { text: "  mailbox " }
             mod.widgets.SKbd { text: "cmd+s" }
             mod.widgets.SLabel { text: "ync  " }
             mod.widgets.SKbd { text: "enter" }
@@ -3680,18 +3681,18 @@ impl ComposePanelRef {
 
 
 // ---------------------------------------------------------------------------
-// InboxRow
+// MailboxRow
 // ---------------------------------------------------------------------------
 
 #[derive(Script, ScriptHook, Widget)]
-pub struct InboxLine {
+pub struct MailboxLine {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
 }
 
-impl Widget for InboxLine {
+impl Widget for MailboxLine {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
     }
@@ -3701,7 +3702,7 @@ impl Widget for InboxLine {
     }
 }
 
-impl InboxLineRef {
+impl MailboxLineRef {
     pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead) {
         let Some(inner) = self.borrow() else { return };
         let from = m.who_line();
@@ -3725,14 +3726,14 @@ impl InboxLineRef {
 }
 
 #[derive(Script, ScriptHook, Widget)]
-pub struct InboxRow {
+pub struct MailboxRow {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
 }
 
-impl Widget for InboxRow {
+impl Widget for MailboxRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
         // Clicks resolve through the shell's registered rects — a list
@@ -3749,7 +3750,7 @@ impl Widget for InboxRow {
     }
 }
 
-impl InboxRowRef {
+impl MailboxRowRef {
     /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
     /// Exactly one of the four twins draws; only it is populated.
     pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool, marked: bool) {
@@ -3763,7 +3764,7 @@ impl InboxRowRef {
         for (id, on) in twins {
             let w = row.view.widget(cx, id);
             if on {
-                w.as_inbox_line().populate(cx, m);
+                w.as_mailbox_line().populate(cx, m);
             }
             w.set_visible(cx, on);
         }
@@ -4171,18 +4172,19 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// InboxPanel
+// MailboxPanel
 // ---------------------------------------------------------------------------
 
-/// The inbox's table: the shared engine over the thread datasource.
-type InboxTable = Table<&'static SqlSource<mail::ThreadHead, i64>>;
+/// A mailbox's table: the shared engine over one folder role's thread
+/// datasource ([`mail::threads`]).
+type MailboxTable = Table<&'static SqlSource<mail::ThreadHead, i64>>;
 
 /// Its marks (CR-009): thread anchors, so a mark survives the filter, the
 /// paging and a sync landing underneath.
-type InboxMarks = PanelMarks<&'static SqlSource<mail::ThreadHead, i64>>;
+type MailboxMarks = PanelMarks<&'static SqlSource<mail::ThreadHead, i64>>;
 
 #[derive(Script, ScriptHook, Widget)]
-pub struct InboxPanel {
+pub struct MailboxPanel {
     #[source]
     source: ScriptObjectRef,
     #[deref]
@@ -4192,12 +4194,19 @@ pub struct InboxPanel {
     suggest: View,
     /// The rich table (CR-006): the filter and the paging window. It holds
     /// no rows — every row a draw needs is a page lookup in the store.
-    #[rust(Table::new(&mail::THREADS, mail::INBOX_PAGE))]
-    table: InboxTable,
+    /// Starts on the inbox and is pointed at its panel's own role by the
+    /// first draw (see [`MailboxPanel::sync_role`]).
+    #[rust(Table::new(mail::threads(Role::Inbox), mail::MAILBOX_PAGE))]
+    table: MailboxTable,
+    /// Which folder this list is over. Read off the panel's kind each
+    /// draw: a panel replaced in place keeps its widget, so inbox → sent
+    /// arrives here as a change of props and nothing else.
+    #[rust(Role::Inbox)]
+    role: Role,
     /// The cursor: which mail, and the row it sat on. The index is the
-    /// fallback — a mail archived out from under the cursor is no longer in
+    /// fallback — a mail filed out from under the cursor is no longer in
     /// the table, and without it the walk would resolve to nothing and snap
-    /// back to the top of the inbox instead of carrying on where it stood.
+    /// back to the top of the list instead of carrying on where it stood.
     #[rust]
     sel: Option<(i64, usize)>,
     /// The marks (CR-009): the threads picked out for a batch verb, the
@@ -4205,16 +4214,41 @@ pub struct InboxPanel {
     /// held beside the table by every list that has marks. Context, not
     /// history: gone with the process.
     #[rust]
-    marks: InboxMarks,
+    marks: MailboxMarks,
     /// The filter's autocomplete: the table is its completion — tag
     /// names, then a tag's values.
     #[rust]
-    ac: Suggest<InboxTable>,
+    ac: Suggest<MailboxTable>,
 }
 
-impl InboxPanel {
+impl MailboxPanel {
     fn store(scope: &Scope) -> Option<std::rc::Rc<Store>> {
         panel_store(scope)
+    }
+
+    /// The role this panel's kind names, or the inbox for a scope that
+    /// carries no kind (the catalogue's bare-widget mounts).
+    fn role_of(scope: &Scope) -> Role {
+        match scope.props.get::<PanelProps>().map(|p| &p.kind) {
+            Some(crate::core::Kind::Mailbox { role, .. }) => *role,
+            _ => Role::Inbox,
+        }
+    }
+
+    /// Points the table at the folder the panel's kind names. A replace in
+    /// place (inbox → archive) keeps the widget, so this is where the swap
+    /// happens: the source changes, the typed filter stands — it is the
+    /// panel's, not the folder's — and the cursor and the marks go, since a
+    /// thread anchor means a row in one mailbox and nothing in another.
+    fn sync_role(&mut self, scope: &Scope) {
+        let role = Self::role_of(scope);
+        if role == self.role {
+            return;
+        }
+        self.role = role;
+        self.table.retarget(mail::threads(role));
+        self.sel = None;
+        let _ = self.marks.clear();
     }
 
     /// Hands the field's text to the table. The field is the one source of
@@ -4259,7 +4293,7 @@ impl InboxPanel {
                 return Some(i);
             }
         }
-        let head = mail::thread_head(store, th)?;
+        let head = mail::thread_head(store, self.role, th)?;
         self.table.index_of(store, &head)
     }
 
@@ -4322,7 +4356,7 @@ impl InboxPanel {
     }
 }
 
-impl InboxPanelRef {
+impl MailboxPanelRef {
     /// The thread under the cursor, if any — the shell asks so it can carry
     /// the cursor forward when that thread is filed away.
     pub fn selected_thread(&self) -> Option<i64> {
@@ -4449,7 +4483,7 @@ impl InboxPanelRef {
     }
 
     /// The open autocomplete's rows, `(label, rect)`, for the shell's hit
-    /// table — a click on one is [`InboxPanelRef::pick`].
+    /// table — a click on one is [`MailboxPanelRef::pick`].
     pub fn suggestion_hits(&self, cx: &mut Cx) -> Vec<(String, Rect)> {
         self.borrow()
             .map_or_else(Vec::new, |p| p.ac.hits(cx, &p.suggest))
@@ -4464,8 +4498,9 @@ impl InboxPanelRef {
     }
 }
 
-impl Widget for InboxPanel {
+impl Widget for MailboxPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.sync_role(scope);
         let filter = self.view.text_input(cx, ids!(filter_input));
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
@@ -4551,7 +4586,7 @@ impl Widget for InboxPanel {
                             self.redraw(cx);
                         }
                     }
-                    // The inbox's one-stop tab ring: the filter.
+                    // A mailbox's one-stop tab ring: the filter.
                     KeyCode::Tab => focus_input(cx, &filter),
                     _ => {}
                 }
@@ -4575,7 +4610,7 @@ impl Widget for InboxPanel {
                 self.redraw(cx);
             }
             // The end of the list came on screen: a source without a count
-            // loads its next page here (the inbox counts, so this is its
+            // loads its next page here (a mailbox counts, so this is its
             // no-op — the seam is what a remote table will use).
             if self.view.widget(cx, ids!(list)).as_portal_list().reached_end(actions)
                 && self.table.extend(&store)
@@ -4614,6 +4649,7 @@ impl Widget for InboxPanel {
         let Some(store) = Self::store(scope) else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        self.sync_role(scope);
         self.sync_filter(cx);
         let filter = self.view.text_input(cx, ids!(filter_input));
         let focused = filter.key_focus(cx);
@@ -4631,7 +4667,7 @@ impl Widget for InboxPanel {
         let sel = self.sel.map(|(th, _)| th);
         let n = self.table.len(&store);
         // The marks (CR-009): what the filter shows and what it hides, read
-        // fresh by key each draw. A mark whose thread left the inbox
+        // fresh by key each draw. A mark whose thread left this folder
         // altogether goes with it — the bar counts rows that exist.
         self.marks.sync(&store, &self.table);
         let verbs = scope
@@ -4665,7 +4701,7 @@ impl Widget for InboxPanel {
                     let (row, existed) = list.item_with_existed(cx, idx, live_id!(row));
                     let selected = sel == Some(m.thread);
                     if self.marks.stamp(idx, &m, selected, marked, existed) {
-                        row.as_inbox_row().populate(cx, &m, selected, marked);
+                        row.as_mailbox_row().populate(cx, &m, selected, marked);
                     }
                     live.push(idx);
                     row.draw_all(cx, scope);
@@ -7584,7 +7620,8 @@ impl Widget for ContactPanel {
                     cx,
                     p.pid,
                     &format!("messages from {first}"),
-                    crate::core::Kind::Inbox {
+                    crate::core::Kind::Mailbox {
+                        role: crate::core::Role::Inbox,
                         filter: Some(email.clone()),
                     },
                     false,

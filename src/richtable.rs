@@ -935,6 +935,18 @@ impl<D: Datasource> Table<D> {
         &self.ds
     }
 
+    /// Points the table at another source of the same shape — a mailbox
+    /// panel replaced in place, inbox → archive. The typed filter stands:
+    /// it belongs to the panel, not to the rows. It is read again all the
+    /// same, because what a tag means (and whether the new source has it)
+    /// is the source's business, and the window starts over — a page
+    /// offset into the old rows names nothing here.
+    pub fn retarget(&mut self, ds: D) {
+        self.ds = ds;
+        let text = std::mem::take(&mut self.text);
+        self.set_filter(&text);
+    }
+
     #[must_use]
     pub fn page_size(&self) -> usize {
         self.page_size

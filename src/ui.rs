@@ -6,7 +6,7 @@
 //! [`crate::panels`]; what stays here is the vocabulary both the shell's own
 //! chrome and those widgets have to agree on.
 
-use crate::core::Kind;
+use crate::core::{Kind, Role};
 use crate::theme;
 
 // ---------------------------------------------------------------------------
@@ -100,8 +100,8 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
     match kind {
         // "sync" rather than "refresh": the button kicks the IMAP workers, it
         // does not reload a view. The truer word also frees `r` for the mail
-        // the inbox is previewing to lend back its `reply` (CR-005).
-        Kind::Inbox { .. } => &[("sync", BtnAct::Refresh)],
+        // the list is previewing to lend back its `reply` (CR-005).
+        Kind::Mailbox { .. } => &[("sync", BtnAct::Refresh)],
         // Drawn right to left from the close button, so this reads
         // "delete archive ×" — the destructive one furthest from the corner,
         // the same order compose puts discard and send in.
@@ -266,12 +266,17 @@ pub const MARK_VERBS: &[MarkVerb] = &[
 #[must_use]
 pub fn mark_verbs(kind: &Kind) -> &'static [MarkVerb] {
     match kind {
-        Kind::Inbox { .. } => &[
+        // Only the inbox archives: everywhere else the mail is already out
+        // of it, and a bar may not wear a verb that would do nothing (or,
+        // from Sent, something nobody asked for). Delete is the one move
+        // every mailbox has — the trash is where mail goes from anywhere.
+        Kind::Mailbox { role: Role::Inbox, .. } => &[
             MarkVerb::Archive,
             MarkVerb::Delete,
             MarkVerb::All,
             MarkVerb::Clear,
         ],
+        Kind::Mailbox { .. } => &[MarkVerb::Delete, MarkVerb::All, MarkVerb::Clear],
         Kind::Files { .. } => &[
             MarkVerb::Copy,
             MarkVerb::Move,
@@ -345,7 +350,7 @@ impl MarkVerb {
 #[must_use]
 pub fn preview_kind(kind: &Kind) -> Option<Kind> {
     match kind {
-        Kind::Inbox { .. } => Some(Kind::Message { id: 0 }),
+        Kind::Mailbox { .. } => Some(Kind::Message { id: 0 }),
         Kind::Effects => Some(Kind::Job { id: 0 }),
         // A files list previews into the kind its row names — a directory
         // as a column, a file as a card (CR-008). The placeholder is the
@@ -354,6 +359,43 @@ pub fn preview_kind(kind: &Kind) -> Option<Kind> {
             path: String::new(),
         }),
         _ => None,
+    }
+}
+
+/// The bar verb a chrome button is the single-row twin of, if any. `archive`
+/// on a message and `archive` on a marked set are one verb over one row and
+/// over many — which is why they wear the same letter, and why a list may
+/// not offer one without the other.
+#[must_use]
+fn mark_verb_of(act: BtnAct) -> Option<MarkVerb> {
+    match act {
+        BtnAct::Archive => Some(MarkVerb::Archive),
+        BtnAct::Delete => Some(MarkVerb::Delete),
+        BtnAct::CopyHold => Some(MarkVerb::Copy),
+        BtnAct::MoveHold => Some(MarkVerb::Move),
+        _ => None,
+    }
+}
+
+/// Whether a list driving a preview **lends** that button's chord (CR-005's
+/// fifth letter). A verb the driver's own marks bar does not wear is not
+/// lent: `archive` borrowed from a sent list's preview would mean, one row
+/// at a time, exactly what its bar refuses to do to a set — and one surface
+/// per answer is the whole point of the bar and the borrow wearing the same
+/// letter. Anything the bar has no opinion about — a message's `reply`, a
+/// card's `open` — is lent as before, and a driver with no bar of its own
+/// lends everything.
+///
+/// A withheld chord is withheld from the *drawing* too: the preview draws
+/// that letter plain (see the shadow in `draw_panel_full`), so no bold mark
+/// promises a chord nobody would answer. The button itself is untouched —
+/// it is the mail's, and pressing it still archives.
+#[must_use]
+pub fn lends(driver: &Kind, act: BtnAct) -> bool {
+    let verbs = mark_verbs(driver);
+    match mark_verb_of(act) {
+        Some(v) if !verbs.is_empty() => verbs.contains(&v),
+        _ => true,
     }
 }
 
@@ -467,7 +509,7 @@ pub fn field_order(kind: &Kind) -> &'static [FieldId] {
             FieldId::SetBucketSecret,
         ],
         Kind::Compose { .. } => &[FieldId::To, FieldId::Subject, FieldId::Body],
-        Kind::Inbox { .. } | Kind::Effects => &[FieldId::Filter],
+        Kind::Mailbox { .. } | Kind::Effects => &[FieldId::Filter],
         Kind::Files { .. } => &[FieldId::Filter, FieldId::NewDir, FieldId::Path],
         _ => &[],
     }
@@ -487,16 +529,16 @@ mod tests {
             .collect()
     }
 
-    /// Every kind an accelerator could live on.
+    /// Every kind an accelerator could live on — every mailbox role
+    /// included: four lists share one chrome, and the rules hold on each.
     fn every_kind() -> Vec<Kind> {
-        vec![
+        let mut v = vec![
             Kind::Settings,
             Kind::AddAccount,
             Kind::Problems,
             Kind::Bucket,
             Kind::Help,
             Kind::About,
-            Kind::Inbox { filter: None },
             Kind::Message { id: 1 },
             Kind::Compose { seed: Seed::Blank },
             Kind::Compose {
@@ -515,7 +557,9 @@ mod tests {
                 path: "~/notes.md".into(),
             },
             Kind::Attachment { mail: 1, at: 2 },
-        ]
+        ];
+        v.extend(crate::core::ROLES.map(|role| Kind::Mailbox { role, filter: None }));
+        v
     }
 
     /// A files panel holding something shows one more button; the union
@@ -746,7 +790,7 @@ mod tests {
     fn a_bar_wears_verbs_the_table_knows() {
         for k in every_kind() {
             let verbs = mark_verbs(&k);
-            let list = matches!(k, Kind::Inbox { .. } | Kind::Files { .. });
+            let list = matches!(k, Kind::Mailbox { .. } | Kind::Files { .. });
             assert_eq!(!verbs.is_empty(), list, "{k:?}: only a list has a bar");
             let mut seen = Vec::new();
             for v in verbs {
@@ -764,6 +808,48 @@ mod tests {
         }
     }
 
+    /// What a driver lends its preview (CR-005's fifth letter) is exactly
+    /// what its own bar would do to a set: the inbox lends `archive` and
+    /// `delete`, every other mailbox lends `delete` alone — so `cmd+a` from
+    /// a sent list does not quietly file the conversation the bar and the
+    /// swipe both refuse to. What the bar has no opinion about is lent by
+    /// everyone.
+    #[test]
+    fn a_list_lends_only_what_its_bar_would_do() {
+        let inbox = Kind::Mailbox { role: Role::Inbox, filter: None };
+        assert!(lends(&inbox, BtnAct::Archive));
+        assert!(lends(&inbox, BtnAct::Delete));
+        for role in [Role::Archive, Role::Sent, Role::Spam] {
+            let list = Kind::Mailbox { role, filter: None };
+            assert!(!lends(&list, BtnAct::Archive), "{role:?} lends no archive");
+            assert!(lends(&list, BtnAct::Delete));
+        }
+        // A files list's own three are all on its bar, and a verb no bar
+        // knows is nobody's to withhold.
+        let files = Kind::Files { dir: "~".into() };
+        for act in [BtnAct::CopyHold, BtnAct::MoveHold, BtnAct::Delete] {
+            assert!(lends(&files, act));
+        }
+        for list in [&inbox, &files] {
+            assert!(lends(list, BtnAct::Open), "a card's open is no bar's verb");
+            assert!(lends(list, BtnAct::Refresh));
+        }
+        // A driver with no bar of its own lends everything it previews.
+        assert!(lends(&Kind::Effects, BtnAct::Delete));
+
+        // Every button a mailbox's preview wears is either lent or one the
+        // bar deliberately dropped — nothing falls between the two.
+        for role in crate::core::ROLES {
+            let list = Kind::Mailbox { role, filter: None };
+            let child = preview_kind(&list).unwrap();
+            for (label, act) in head_btns(&child) {
+                let bar = mark_verbs(&list);
+                let dropped = mark_verb_of(*act).is_some_and(|v| !bar.contains(&v));
+                assert_eq!(!lends(&list, *act), dropped, "{role:?}: “{label}”");
+            }
+        }
+    }
+
     /// The marks bar's verbs (CR-009): a list with marks wears the letters
     /// its own rows' verbs wear — the inbox `a`, `d`, `l`, a files panel
     /// `p`, `m`, `d`, `l` — which is the point (a batch is the row's verb
@@ -772,30 +858,48 @@ mod tests {
     /// collides with them.
     #[test]
     fn a_marked_list_takes_its_verbs_and_the_preview_stands_down() {
-        let inbox = Kind::Inbox { filter: None };
-        let bare = accels(&inbox, false);
-        let marked = accels(&inbox, true);
-        assert!(bare.iter().all(|(c, _)| !"adl".contains(*c)));
-        for verb in mark_verbs(&inbox) {
-            let Some(c) = verb.accel() else { continue };
-            assert!(marked.contains(&(c, verb.label())), "the bar wears {c}");
-            assert!(MarkVerb::from_accel(mark_verbs(&inbox), c) == Some(*verb));
+        for role in crate::core::ROLES {
+            let list = Kind::Mailbox { role, filter: None };
+            let bare = accels(&list, false);
+            let marked = accels(&list, true);
+            assert!(bare.iter().all(|(c, _)| !"adl".contains(*c)));
+            for verb in mark_verbs(&list) {
+                let Some(c) = verb.accel() else { continue };
+                assert!(marked.contains(&(c, verb.label())), "the bar wears {c}");
+                assert!(MarkVerb::from_accel(mark_verbs(&list), c) == Some(*verb));
+            }
+            assert_eq!(MarkVerb::from_accel(mark_verbs(&list), 'z'), None);
+            assert_eq!(
+                MarkVerb::from_accel(mark_verbs(&list), 'p'),
+                None,
+                "no copy on a mail list"
+            );
+            // The bar's `a` is a text chord on a kind with a field. Like the
+            // borrowed `a` it stands down while the filter holds the keyboard
+            // (the shell's guard), so select-all in a live filter never
+            // archives; no other text chord is claimed.
+            for (c, what) in &marked {
+                assert!(!TEXT_CHORDS.contains(c) || *c == 'a', "cmd+{c} ({what}) is a text chord");
+            }
+            // The preview's own a and d are exactly the bar's: lent while the
+            // set is empty, stood down while it is not.
+            let lent = accels(&preview_kind(&list).unwrap(), false);
+            for (c, _) in &marked {
+                let shared = lent.iter().any(|(l, _)| l == c);
+                assert!(
+                    shared || *c == 'l' || *c == 's',
+                    "cmd+{c} is neither lent nor the bar's own"
+                );
+            }
         }
-        assert_eq!(MarkVerb::from_accel(mark_verbs(&inbox), 'z'), None);
-        assert_eq!(MarkVerb::from_accel(mark_verbs(&inbox), 'p'), None, "no copy on a mail list");
-        // The bar's `a` is a text chord on a kind with a field. Like the
-        // borrowed `a` it stands down while the filter holds the keyboard
-        // (the shell's guard), so select-all in a live filter never
-        // archives; no other text chord is claimed.
-        for (c, what) in &marked {
-            assert!(!TEXT_CHORDS.contains(c) || *c == 'a', "cmd+{c} ({what}) is a text chord");
-        }
-        // The preview's own a and d are exactly the bar's: lent while the
-        // set is empty, stood down while it is not.
-        let lent = accels(&preview_kind(&inbox).unwrap(), false);
-        for (c, _) in &marked {
-            let shared = lent.iter().any(|(l, _)| l == c);
-            assert!(shared || *c == 'l' || *c == 's', "cmd+{c} is neither lent nor the bar's own");
+        // Only the inbox offers the move out of it; the other three offer
+        // the one move they all have.
+        let inbox = Kind::Mailbox { role: Role::Inbox, filter: None };
+        assert!(mark_verbs(&inbox).contains(&MarkVerb::Archive));
+        for role in [Role::Archive, Role::Sent, Role::Spam] {
+            let k = Kind::Mailbox { role, filter: None };
+            assert!(!mark_verbs(&k).contains(&MarkVerb::Archive), "{role:?} does not archive");
+            assert!(mark_verbs(&k).contains(&MarkVerb::Delete));
         }
         // A files panel's are its own object verbs, one column over: the
         // set takes p, m and d, and the header hands them over rather than
@@ -815,7 +919,7 @@ mod tests {
         assert!(marked.iter().all(|(c, _)| !TEXT_CHORDS.contains(c)));
         // Only a list has marks: the flag changes nothing else.
         for k in every_kind() {
-            if !matches!(k, Kind::Inbox { .. } | Kind::Files { .. }) {
+            if !matches!(k, Kind::Mailbox { .. } | Kind::Files { .. }) {
                 assert_eq!(accels(&k, true), accels(&k, false));
             }
         }

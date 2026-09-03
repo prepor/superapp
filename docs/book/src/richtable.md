@@ -34,10 +34,14 @@ A source may declare a **group key**, and then a row is a group: the
 columns are aggregates over its members, the page reads off the grouped
 subquery, and the filter becomes a membership test — a group matches when
 **any** member matches, and its aggregates always cover the whole group.
-The inbox is such a source: its rows are threads, grouped by
-`message.thread` over the inbox messages, so `@from:vera` finds the
-conversations Vera wrote in and still shows everyone in them, and `@unread`
-finds the ones with unread mail.
+A mailbox is such a source: its rows are threads, grouped by
+`message.thread` over the messages of one folder role, so `@from:vera` finds
+the conversations Vera wrote in and still shows everyone in them, and
+`@unread` finds the ones with unread mail. There are four of them — inbox,
+archive, sent, spam — written out at compile time by a macro over the role's
+name, because a `SqlSpec` is `static` text: that is what lets one builder,
+one rank and one page cache serve four lists without a string being
+formatted per keystroke.
 The **SQL builder** completes that with the filter's `WHERE`, the page and
 the rank. A built query goes through the store's cache, dependency capture
 and trace exactly like a `static` one (`Store::rows_sql`), so a page is
@@ -65,9 +69,12 @@ the end of the line is not wrong yet, so its error waits until the caret
 leaves. A date is written `dd.mm.yyyy` and is a **span**: `@date>D` means
 after that day, `@date:D` on it, `@date:"30.08.2026 09:14"` that minute.
 
-The inbox's tags: `@unread`, `@html`, `@from:` (senders, dynamic),
-`@subject:`, `@date`, `@account:` (dynamic). Each reads against the inbox
-messages; a thread matches when any of them does.
+A mailbox's tags: `@unread`, `@html`, `@from:` (senders, dynamic),
+`@subject:`, `@date`, `@account:` (dynamic) — one table for all four lists,
+because the grammar of a mail list does not change with the folder it is
+over. Each reads against that folder's messages; a thread matches when any
+of them does. `@from:` completes against the senders of the list it is on:
+the spam one offers spammers, and it is the only place they are offered.
 
 ## Autocomplete
 

@@ -1858,7 +1858,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
     match kind {
         Kind::Help => ("help", None, None),
         Kind::About => ("about", None, None),
-        Kind::Inbox { filter } => ("inbox", None, filter.clone()),
+        Kind::Mailbox { role, filter } => (role.as_str(), None, filter.clone()),
         Kind::Message { id } => ("message", Some(*id), None),
         Kind::Contact { email } => ("contact", None, Some(email.clone())),
         // A blank compose keeps the `0` it always had, so a session an
@@ -1888,7 +1888,10 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
     Some(match kind {
         "help" => Kind::Help,
         "about" => Kind::About,
-        "inbox" => Kind::Inbox { filter: p_txt },
+        "inbox" | "archive" | "sent" | "spam" => Kind::Mailbox {
+            role: core::Role::named(kind)?,
+            filter: p_txt,
+        },
         "message" => Kind::Message { id: p_int? },
         "contact" => Kind::Contact { email: p_txt? },
         "compose" => Kind::Compose {
@@ -1919,7 +1922,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Kind, Wm};
+    use crate::core::{Kind, Role, Wm};
 
     /// The narrowing's version is kept with the store: a fresh store holds
     /// the build's, so nothing is redone at its next open, and a store from
@@ -2049,7 +2052,7 @@ mod tests {
         assert!(s.load_wm().unwrap().is_none(), "fresh store: no session");
 
         let mut wm = Wm::new();
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let _msg = wm.follow_open(inbox, Kind::Message { id: 3 }, false);
         wm.send_focused_to(4); // the message re-homes to ws 5
         wm.switch(0);
@@ -2078,11 +2081,16 @@ mod tests {
     /// of loss no one reports as a bug.
     #[test]
     fn every_kind_round_trips_through_its_row() {
+        let mailboxes = crate::core::ROLES
+            .map(|role| Kind::Mailbox { role, filter: None })
+            .into_iter()
+            .chain(crate::core::ROLES.map(|role| Kind::Mailbox {
+                role,
+                filter: Some("unread".into()),
+            }));
         for kind in [
             Kind::Help,
             Kind::About,
-            Kind::Inbox { filter: None },
-            Kind::Inbox { filter: Some("unread".into()) },
             Kind::Message { id: 7 },
             Kind::Contact { email: "v@k.io".into() },
             Kind::Compose { seed: crate::core::Seed::Blank },
@@ -2092,7 +2100,10 @@ mod tests {
             Kind::AddAccount,
             Kind::Problems,
             Kind::Bucket,
-        ] {
+        ]
+        .into_iter()
+        .chain(mailboxes)
+        {
             let (name, p_int, p_txt) = kind_cols(&kind);
             assert_eq!(
                 kind_from(name, p_int, p_txt).as_ref(),
