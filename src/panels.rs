@@ -5173,6 +5173,11 @@ impl Widget for EffectsPanel {
         let filter = self.view.text_input(cx, ids!(filter_input));
         let filter_focused = filter.key_focus(cx);
         let pid = scope.props.get::<PanelProps>().map_or(0, |p| p.pid);
+        // The box draws on what the last event saw, not on what the draw
+        // polls (see `Suggest::track`). Without this the offer never opens
+        // here at all — the one thing the inbox and the files panel had
+        // that this one did not.
+        self.ac.track(cx, &filter);
 
         // The autocomplete owns the arrows, enter, tab and esc while it is
         // open; the field never sees them.

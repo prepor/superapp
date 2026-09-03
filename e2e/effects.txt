@@ -65,17 +65,38 @@ key cmd+a
 wait 400
 shot g5-payload-selected
 
-# The filter is the rich table's, over the log's own columns — reached by
-# its own field rather than by `/`, because the payload click above handed
-# the keyboard to the job panel, and a key pressed there never reaches the
-# log. (The cursor walk wants more than one job; the panels library's
-# effect-log scene plants five and walks them.)
-click "filter"
+# The filter is the rich table's, over the log's own columns. A row is
+# what the keyboard comes back to first: the payload click above handed it
+# to the job panel, and the inbox one column over wears a filter field of
+# its own, so `click "filter"` alone would not say whose. Touching the log's
+# own row does, and `/` from there is unambiguous. (The cursor walk wants
+# more than one job; the panels library's effect-log scene plants five and
+# walks them.)
+click "submit outbox:"
+wait 400
+key /
 wait 300
+key cmd+a
 type "@"
 wait 400
 shot g6-tags
-# esc puts the offer away and the field keeps the keyboard.
+# The offer is *clicked*, not photographed: a box that never opened has no
+# such row, and the run fails there rather than in a picture nobody reads.
+# `@wrote` is the one the panel opened on, so taking it changes nothing —
+# which is the point: the row afterwards proves the pick landed.
+click "@wrote"
+wait 500
+click "submit outbox:"
+wait 500
+# esc puts the offer away and the field keeps the keyboard — which is what
+# the typing after it proves.
+click "submit outbox:"
+wait 400
+key /
+wait 300
+key cmd+a
+type "@"
+wait 400
 key esc
 wait 200
 key cmd+a
@@ -89,16 +110,6 @@ shot g7-kept
 click "submit outbox:"
 wait 500
 
-# A filter nothing answers says so rather than showing a blank list.
-click "filter"
-wait 300
-key cmd+a
-type "@kind:move"
-wait 500
-key esc
-wait 500
-shot g8-none
-
 # The other half of the log: the effects nobody files. cmd+i copies this
 # panel's own context, which is a clipboard write — it leaves the process,
 # so the ring keeps it and the log shows it beside the queue, under the
@@ -107,37 +118,51 @@ shot g8-none
 # it; asking for the ring alone is what this narrows to.
 key cmd+i
 wait 600
-click "filter"
+click "submit outbox:"
+wait 400
+key /
 wait 300
 key cmd+a
 type "@memory"
 wait 500
 key esc
 wait 600
-shot g9-in-memory
+shot g8-in-memory
 # Addressable by its own sentence, like any other row — and it previews
 # into the same job panel, which says where it lives instead of showing a
 # payload it never had.
 click "copy panel context"
 wait 700
-shot g10-in-memory-previewed
+shot g9-in-memory-previewed
 click "job facts"
 wait 400
-shot g11-in-memory-facts
+shot g10-in-memory-facts
 
 # And the default is a default, not a rule: cleared, the log is everything,
 # the reads a sync makes included. This account never reaches a server, so
 # there are none to show here — the panels library's effect-log scene has
 # the pair — but the clipboard write is still on the list, which is how the
 # run knows the field was cleared and the list widened rather than changed.
-click "filter"
+click "copy panel context"
+wait 400
+key /
 wait 300
 key cmd+a
 key backspace
 wait 500
 key esc
 wait 600
-shot g12-everything
+shot g11-everything
 click "copy panel context"
 wait 600
+
+# A filter nothing answers says so rather than showing a blank list.
+key /
+wait 300
+key cmd+a
+type "@kind:move"
+wait 500
+key esc
+wait 500
+shot g12-none
 quit
