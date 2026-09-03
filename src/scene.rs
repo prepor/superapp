@@ -1,20 +1,8 @@
-//! Scenes: a subject in its named states, and the library canvas's layout.
+//! Scene graph types and Panels Library layout.
 //!
-//! A **scene** is one subject — a component, a panel, the workspace — in
-//! the states worth looking at while it is being worked on: an inbox row
-//! read, unread, selected; a thread message collapsed, open, its quote
-//! unfolded. The states are **nodes**; an **edge** names what takes one to
-//! another; notes annotate both. The edges make a DAG, not a line: a
-//! design review fans out — the same thing in its variants — where a
-//! behaviour suite walks, which is why the library is not a reading of
-//! the e2e scripts. Those check behaviour; this shows states.
-//!
-//! Scenes are authored in Rust ([`crate::catalog`]): fixtures are the real
-//! structs and a state is set through the widget's own methods, so a
-//! refactor that breaks a scene fails to compile rather than quietly
-//! rearranging the canvas. This module holds the shape and the layout
-//! only, generic over the setup payload — std-only, unit-tested without a
-//! window.
+//! Nodes are named visual states. Edges describe the action between states.
+//! [`crate::catalog`] supplies real fixtures; this module only stores and lays
+//! out the graph and does not depend on Makepad.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -222,7 +210,6 @@ const ARROW_Y_MAX: f64 = 28.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeBox {
     pub node: usize,
-    /// The mount.
     pub rect: Rect,
     /// Top-left of the caption block (name, then the note) above the mount.
     pub caption: (f64, f64),

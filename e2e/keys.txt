@@ -1,4 +1,4 @@
-# CR-003 — the accelerators, driven by their chords.
+# Keyboard shortcuts, driven by their chords.
 #
 # Assertions here are the clicks: every `click` names something that must
 # exist by then, and a label that does not resolve is a failure. So a walk
@@ -7,7 +7,7 @@
 wait 900
 
 # Open the newest mail (id 1). A row click is a preview, so the list keeps
-# the keyboard and the arrows keep walking it (CR-005).
+# the keyboard and the arrows keep walking it.
 click "Q3 infra"
 wait 700
 shot k1-message
@@ -82,8 +82,8 @@ wait 600
 shot k10-forward-discarded
 
 # cmd+a archives the message panel and closes it. The cursor was walking
-# with it, so the inbox carries on to the next mail and previews it (CR-005)
-# — focus lands back on the list.
+# with it, so the inbox carries on to the next mail and previews it. Focus
+# lands back on the list.
 key cmd+a
 wait 700
 shot k11-archived

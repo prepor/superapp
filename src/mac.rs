@@ -1,6 +1,5 @@
-//! macOS platform bits makepad does not expose (ported from mosaic's `mac.rs`):
-//! screen geometry for the borderless window, activation, and window-layer
-//! screenshots for the verification loop.
+//! macOS helpers not exposed by Makepad: screen geometry, activation, trash,
+//! and window screenshots.
 
 #![allow(unsafe_code)]
 #![allow(unexpected_cfgs)]
@@ -64,9 +63,8 @@ pub fn window_number() -> i64 {
     }
 }
 
-/// Puts every window of ours behind all normal windows, click-through, and
-/// never key — an e2e run must not take the screen from whoever is using the
-/// machine (mosaic REVIEW S47).
+/// Puts every app window behind normal windows and ignores clicks and keys.
+/// This keeps an end-to-end run from interrupting the person using the Mac.
 pub fn configure_background_window() {
     unsafe {
         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];

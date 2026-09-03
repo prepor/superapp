@@ -1,6 +1,6 @@
 ------------------------------- MODULE Lease -------------------------------
 (***************************************************************************)
-(* CR-005 device sync: two devices, one store, a leased single writer.     *)
+(* Device sync: two devices, one store, and one writer at a time.          *)
 (*                                                                         *)
 (* The bucket holds one `state` object — epoch, holder, released, seq —    *)
 (* advanced ONLY by compare-and-swap on its version (the HTTP ETag).       *)

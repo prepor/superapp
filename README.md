@@ -43,5 +43,3 @@ push to `main` and every PR.
   size and platform from one drawing)
 - `docs/book/` — the book
 - `e2e/` — e2e scripts (`out/` is generated)
-- `web/` — the first, throwaway web prototype that validated the model (not
-  maintained)

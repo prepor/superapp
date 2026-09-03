@@ -1,13 +1,8 @@
-//! The mail domain over the store: typed queries, titles, the demo seed,
-//! and the local mutations (read flags, archive).
+//! Mail data, queries, demo records, local changes, and effect definitions.
 //!
-//! Everything panels show comes through the registered [`Q`] queries — that
-//! is the reactive contract (see [`crate::store`]) and, later, the panel
-//! context an agent receives. A mailbox — inbox, archive, sent, spam — is a
-//! rich table over the [`threads`] source of its folder role: its
-//! filter is the shared grammar ([`crate::filter`]), whose bare text is one
-//! substring over sender + subject — the shell's original semantics; the
-//! launcher's word-AND lives in [`crate::launcher`].
+//! Mailbox panels use the shared rich table and filter syntax. All panel reads
+//! go through registered [`Q`] queries so caching and panel context stay
+//! accurate.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -62,7 +57,7 @@ pub struct Sender {
     pub name: String,
 }
 
-/// One row of a mailbox (CR-007): a conversation, as far as *that folder*
+/// One row of a mailbox: a conversation, as far as *that folder*
 /// is concerned — every message of it counts towards what the row shows,
 /// and it is a row while at least one of them sits in the folder. So one
 /// conversation can be a row in two mailboxes at once, the same length and
@@ -295,7 +290,7 @@ pub fn inbox(store: &Store) -> Rc<Vec<MailHead>> {
     store.rows(&Q_INBOX, &[], head_row)
 }
 
-/// A mailbox as a rich table (CR-006) of **threads** (CR-007): the fixed
+/// A mailbox as a rich table of **threads**: the fixed
 /// parts of its query, which the builder completes with the filter, the
 /// page and the rank. The rows are the folder's messages grouped by
 /// conversation; what a row shows is aggregates over them, or over the
@@ -605,7 +600,7 @@ pub fn fts_match(query: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// The mail world as a search source (CR-006): the people who wrote, then
+/// The mail world as a search source: the people who wrote, then
 /// the letters, best match first.
 ///
 /// Runs on its own thread with its own reader. Two rules it keeps:
@@ -776,7 +771,7 @@ pub fn remove_account_tx(c: &rusqlite::Connection, id: i64, now: f64) -> rusqlit
          WHERE entity=?1 AND status IN ('pending','processing')",
         rusqlite::params![format!("account:{id}"), now],
     )?;
-    // What was derived from its letters goes with them (CR-010): a
+    // What was derived from its letters goes with them: a
     // `message` rowid is reused, and a scan row left behind would tell the
     // next letter to take that id that it had already been walked.
     for t in ["attachment", "attachment_scan"] {
@@ -800,7 +795,7 @@ pub fn me(store: &Store) -> String {
         .unwrap_or_default()
 }
 
-// -- threads (CR-007) ---------------------------------------------------------
+// -- threads ---------------------------------------------------------
 
 /// The subject with its reply and forward prefixes stripped — what a
 /// conversation is called, whichever of its mails you read it off.
@@ -1126,7 +1121,7 @@ fn wrapped_lines(text: &str, cols: usize) -> usize {
 /// message is its one row, which with its inset stands half a line taller
 /// than a line of text; an open one is that row, its own text (the quote
 /// folded), the status line if it has one, the line its parts are listed
-/// on if it carries any (CR-010), and the spacing and rule around them —
+/// on if it carries any, and the spacing and rule around them —
 /// about four lines beyond the text. An estimate, like the chrome
 /// allowance it feeds: the wish only has to land on the right grid row.
 ///
@@ -1230,7 +1225,7 @@ pub fn title(store: &Store, kind: &Kind) -> String {
     }
 }
 
-// -- what a letter carries (CR-010) -------------------------------------------
+// -- what a letter carries -------------------------------------------
 
 /// One part of a letter, as the panels see it: the row [`crate::sync`]
 /// derived from the mail's `raw`. The bytes are not here — [`part`] reads
@@ -1254,8 +1249,7 @@ impl Attachment {
         format!("{} · {}", self.name, crate::files::fmt_size(self.size))
     }
 
-    /// The card this part draws as — the same card a file on the disk
-    /// draws (CR-008's, reused whole), so one widget serves both.
+    /// Builds the same card used for a file on disk.
     #[must_use]
     pub fn card(&self, from: &str, date: f64) -> crate::files::Card {
         crate::files::Card {
@@ -1373,7 +1367,7 @@ pub fn mark_scanned_tx(c: &rusqlite::Connection, message: MailId) -> rusqlite::R
     Ok(())
 }
 
-// -- what a draft will carry (CR-010) ------------------------------------------
+// -- what a draft will carry ------------------------------------------
 
 /// One file a compose panel will carry out. The **path**, not the bytes: an
 /// attach costs a `stat`, the file stays where it is, and the send is what
@@ -1425,7 +1419,7 @@ pub fn draft_files(store: &Store, panel: i64) -> Rc<Vec<DraftFile>> {
 }
 
 /// A panel's files, if they are `seed`'s own — the rule [`draft_for`] holds
-/// the text to (CR-010). A compose retargeted in place keeps its id, so the
+/// the text to. A compose retargeted in place keeps its id, so the
 /// files a reply left are not the forward's, and a draft row whose seed
 /// disagrees hides them until [`upsert_draft_tx`] clears them for good. A
 /// panel with no draft row yet has nothing to disagree: `attach` on a blank
@@ -1596,7 +1590,7 @@ pub fn already_filed(store: &Store, id: MailId, role: &str) -> bool {
 // -- recipients: what the compose panel's TO field completes -----------------
 
 /// The compose panel's TO field as a completion — the rich table's box
-/// (CR-006) over the mail world rather than the filter grammar. The token
+/// over the mail world rather than the filter grammar. The token
 /// under the caret, comma-separated from its neighbours, is matched as a
 /// substring against every sender the store has heard from, by name or
 /// address: the `@from:` offer, landing in a different field. A pick lands
@@ -1881,7 +1875,7 @@ pub fn upsert_draft_tx(
         })
         .or_else(|| c.query_row("SELECT id FROM account ORDER BY id LIMIT 1", [], |r| r.get(0)).ok());
     // A compose retargeted in place is a new draft under an old id, and
-    // the files the old one named are not this one's to carry (CR-010) —
+    // the files the old one named are not this one's to carry —
     // the same rule `draft_for` holds the text to, applied where the seed
     // actually changes.
     let was: Option<DraftSeed> = c
@@ -1974,7 +1968,7 @@ fn move_draft_tx(
         rusqlite::params![from, to, now],
     )?;
     c.execute("DELETE FROM draft WHERE panel = ?1", [from])?;
-    // What it was going to carry moves with it (CR-010) — a reopened send
+    // What it was going to carry moves with it — a reopened send
     // keeps its attachments, or the letter that goes out the second time is
     // not the letter that failed.
     c.execute(
@@ -2009,7 +2003,7 @@ pub fn outbox_failures(store: &Store) -> Vec<(i64, String)> {
 // and cancellable by undo while it is still `pending`. Every one of them
 // revalidates before the round trip — if undo landed while the job waited,
 // it goes `obsolete` rather than pushing stale intent at the server. That is
-// what keeps CR-001 phase 4's property: undo costs no server traffic.
+// this makes undo cost no server traffic.
 
 /// Make the server agree about which folder a mail lives in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2236,7 +2230,7 @@ impl Effect for Submit {
         let mut d = load_outgoing(cx.db, self.outbox)?;
         // The files the draft named are read *now*, through the outside,
         // rather than having been copied into the store when they were
-        // attached (CR-010): what leaves is the file as it stands, and a
+        // attached: what leaves is the file as it stands, and a
         // file that has since gone fails the send instead of sending a
         // stale copy of it.
         let here = crate::store::this_device(cx.db);
@@ -2344,7 +2338,7 @@ struct Outgo {
     /// The account authenticates with a bearer token, not a password.
     oauth: bool,
     mail: Outgoing,
-    /// What the draft named to carry out (CR-010) — paths; the bytes are
+    /// What the draft named to carry out — paths; the bytes are
     /// read at the last moment, in [`Submit::perform`].
     files: Vec<DraftFile>,
 }
@@ -2478,7 +2472,7 @@ impl Intent for MarkRead {
 }
 
 /// Filing moves a mail out of the folder it was in — archive or trash, the
-/// same move to a different role (CR-005). Reversing is a plain intent flip
+/// same move to a different role. Reversing is a plain intent flip
 /// — the push pass re-converges, so nothing compensates.
 pub struct Filed {
     pub mail: MailId,
@@ -2685,7 +2679,7 @@ impl Intent for Retried {
     }
 }
 
-/// Attaching files to a draft (CR-010). The draft holds paths, so giving it
+/// Attaching files to a draft. The draft holds paths, so giving it
 /// back is taking those paths off again — matched by path rather than by
 /// row id, which a redo mints afresh.
 pub struct Attached {
@@ -3041,13 +3035,13 @@ struct SeedMail<'a> {
     status: Option<(&'a str, bool)>,
     /// The folder's role: `inbox`, `archive`, `sent` or `spam`.
     folder: &'a str,
-    /// Message-ID and what it references — the threading headers (CR-007);
+    /// Message-ID and what it references — the threading headers;
     /// empty for a mail that stands alone.
     mid: &'a str,
     refs: &'a [&'a str],
 }
 
-/// The demo letters that carry something (CR-010), by subject. A seeded
+/// The demo letters that carry something, by subject. A seeded
 /// mail normally has no `raw` at all; these two get one — built as a real
 /// `multipart/mixed` and walked by the ingest path's own parser — so the
 /// message row, the card and the browser meet real MIME rather than a
@@ -3260,7 +3254,7 @@ fn base_mails() -> Vec<SeedMail<'static>> {
     ]
 }
 
-/// The demo world's conversations (CR-007), appended after the filler so
+/// The demo world's conversations, appended after the filler so
 /// the first nine ids stay what every suite expects: the note Max was
 /// replying to (mine, in Sent) and his second reply, which folds into his
 /// first one's inbox row.
@@ -3422,7 +3416,7 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         };
         for m in &base_mails() {
             let id = insert(m)?;
-            // The two that carry something (CR-010): the letter they would
+            // The two that carry something: the letter they would
             // have arrived as goes into `raw`, and the parts come back out
             // of it through the ingest path's own walk — so the demo world
             // proves the real one rather than standing in for it.
@@ -3513,7 +3507,7 @@ mod tests {
         s
     }
 
-    /// The demo world's two letters that carry something (CR-010): the
+    /// The demo world's two letters that carry something: the
     /// rows come off a real `multipart/mixed` raw, the bytes come back out
     /// of it, and the card the panel draws is the file browser's own.
     #[test]
@@ -3620,7 +3614,7 @@ mod tests {
         assert_eq!((rows("attachment"), rows("attachment_scan")), (0, 0));
     }
 
-    /// A draft holds the *paths* it will carry (CR-010): attaching the same
+    /// A draft holds the *paths* it will carry: attaching the same
     /// file twice is one part, detaching takes it off, and the whole thing
     /// goes with the draft when it is discarded.
     #[test]
@@ -3830,7 +3824,7 @@ mod tests {
 
     /// Bare text keeps the shell's original semantics — one substring,
     /// sender + subject — and the tags reach the same rows, which are
-    /// conversations now (CR-007): a thread matches when any of its inbox
+    /// conversations now: a thread matches when any of its inbox
     /// mails does, so Max's second reply, dated the 31st, brings his
     /// thread into `@date>=31.08.2026`.
     #[test]
@@ -4028,7 +4022,7 @@ mod tests {
         );
     }
 
-    /// The marks' three questions on the inbox (CR-009), which are one
+    /// The marks' three questions on the inbox, which are one
     /// query each on the thread source: every thread the filter matches
     /// (what `mark all` marks), which of a marked set it still shows, and
     /// the row for a thread it hides — read fresh by its key, base
@@ -4417,7 +4411,7 @@ mod tests {
         let none: BTreeSet<MailId> = BTreeSet::new();
         let t = thread(&s, 71);
         assert_eq!(thread_lines(&t, &open, &none, 1000), 8, "1.5 + 1.5 + (4 + 1)");
-        // A letter that carries something is a line taller open (CR-010),
+        // A letter that carries something is a line taller open,
         // and not a pixel taller closed.
         assert_eq!(thread_lines(&t, &open, &open, 1000), 9);
         let shut: BTreeSet<MailId> = BTreeSet::new();

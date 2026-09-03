@@ -1,4 +1,4 @@
-# The effect log (CR-004, read): everything that has left the process —
+# The effect log: everything that has left the process —
 # every job the app filed on the outside world, its status, the sentence
 # the effect describes itself with and the JSON it was filed as unfolded in
 # place, and beside those the in-memory effects nobody files, joined in

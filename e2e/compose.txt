@@ -1,7 +1,6 @@
-# The compose panel's TO field completes addresses — CR-006's box over the
-# mail world rather than the filter grammar: the senders the store has
-# heard from, by name or address. A row that does not resolve fails the
-# run, so "Elena was offered" is checked by the click, not by a reader.
+# The compose panel's TO field suggests names and addresses from the mail
+# store. A row that does not resolve fails the run, so the click checks that
+# Elena was offered.
 wait 700
 
 # A blank compose from the launcher's root; it starts in the body.

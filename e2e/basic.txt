@@ -3,7 +3,7 @@ wait 900
 shot 01-boot
 
 # A mail row: the message opens to the right, joined (bridge). It is a
-# preview, so the inbox keeps focus — its header stays inverted (CR-005).
+# preview, so the inbox keeps focus and its header stays inverted.
 click "Q3 infra"
 wait 700
 shot 02-message-joined

@@ -1,4 +1,4 @@
-# CR-007 — threads: the row is the conversation, the panel is the whole of
+# Threads: the row is the conversation, the panel is the whole of
 # it.
 #
 # Assertions are the clicks: a closed message is addressed by its sender

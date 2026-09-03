@@ -1,27 +1,8 @@
-//! The launcher: one question, several sources, one list.
+//! Combines open panels, roots, and search providers into the launcher list.
 //!
-//! Results come in two verbs. A hit that is already open somewhere is a
-//! **go to** ([`Go::Focus`] — switch workspace, focus it); anything else is
-//! an **open** ([`Go::Open`] — a fresh un-joined column on the active
-//! workspace). Which of the two a row gets is decided *here*, on the merge,
-//! against the live windows — a [`crate::search::Provider`] answering on a
-//! worker thread has no business knowing what is on screen, and says only
-//! what it found.
-//!
-//! The list is made of two halves that behave nothing alike:
-//!
-//! - **The windows** — the open panels and the roots. Answered on the spot,
-//!   in [`windows`], because double-cmd is a switcher first and it must be
-//!   there before the key comes back up. It reads the layout and a handful
-//!   of panel titles; there is no version of this worth waiting for.
-//! - **The providers** — mail today ([`crate::mail::Provider`], over the
-//!   FTS5 index), files and chats tomorrow. Asked through
-//!   [`crate::search::Engine`], answered on their own threads, merged in
-//!   underneath as they land. Nothing about them touches a frame.
-//!
-//! So the list grows: the switcher rows are there instantly, the found rows
-//! arrive. The order never shuffles — a source owns its band of the list —
-//! so nothing a person is reaching for moves under their hand.
+//! Open results become [`Go::Focus`]; other results become [`Go::Open`]. Open
+//! panels and roots are available immediately. Provider results arrive later
+//! through [`crate::search::Engine`] without reordering earlier source groups.
 
 use crate::core::{Kind, PanelId, Role, Seed, Wm, WS_N};
 use crate::mail;

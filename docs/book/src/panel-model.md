@@ -2,114 +2,88 @@
 
 ## Workspaces
 
-Above the strip sit **nine numbered workspaces** (niri/hyprland's model):
-each is a full workspace — its own columns, focus and camera, restored
-exactly on return — and an empty one is just an empty slot, no creation or
-teardown. They stack **vertically**: a switch slides the view down or up a
-viewport (the same springs as everything else), so workspace 3 is a *place
-below workspace 2*, not a scene cut. Moving a panel to another workspace
-re-homes it as its own trailing column there and **follows it** (niri's
-default); its joins stay behind and die with the lost adjacency, and focus
-in the old workspace falls to a neighbour exactly as on close.
+There are nine numbered workspaces. Each keeps its own columns, focus, and
+camera position. Empty workspaces are always available and need no setup.
+
+Workspaces form a vertical stack. Switching workspace animates up or down by
+one screen. Moving a panel to another workspace puts it in a new last column
+and follows it there. Joins to panels left behind are removed. Focus in the old
+workspace moves to a nearby panel.
 
 ## Grid and columns
 
-The viewport is a **unit grid** with 8 pt gaps — **12×6 on desktop, 8×4 on the
-unfolded phone screen, 4×3 on a cover display** (the shell switches at the
-~600 dp breakpoint when a fold/unfold resize crosses it, and the springs
-animate the relayout). Every kind requests grid units (inbox 4×6, message 4×3,
-contact 3×2, compose 4×4, settings 4×3, problems 4×3, help 4×6, about 3×2,
-effects 5×6, job 4×3, files 4×6, file 4×3, attachment 4×3); a request larger
-than the active
-grid **clamps to it**
-— which is why a phone shows the inbox full-screen with no phone-specific
-layout code. Requests are honoured
-**literally** while a column's requests fit: a 3-row panel in an otherwise
-empty column leaves the remaining rows empty. A column asked to hold *more*
-than the grid (consume/expel deliberately over-fill) ignores the requests and
-**distributes its height evenly** instead. A column is as wide as its widest
-panel. Columns line up left to right on an infinite strip; the workspace
-scrolls horizontally when they overflow the viewport (niri's scrolling model).
+The screen is divided into grid units with 8 pt gaps:
 
-A kind's request is a **floor, not the whole story**. Where the length of what
-a panel shows is knowable, the shell measures it and asks for more — today the
-message panel does: a letter that does not fit its three rows asks for as many
-as it needs, up to the whole column, so a long mail *opens tall* rather than
-opening scrolled, while a one-liner stays short. A thread measures as its
-open messages plus a line for each closed one, so opening an old message in
-place grows the panel, and closing it shrinks it back. The measurement is re-taken
-every time the shell recomputes targets, so a body that arrives after its
-panel opened grows the panel when it lands, and nothing about it is persisted
-— like the camera and the grid, it is re-derived. Downstream a measured wish
-is treated exactly like a constant one: the grid clamps it, placement consults
-it (a tall letter no longer fits under a neighbour, so it earns a column of
-its own), and an over-filled column still splits evenly.
+- desktop: 12×6;
+- unfolded phone: 8×4;
+- cover screen: 4×3.
 
-## Column operations and tabs (niri's)
+The shell switches phone grids when the width crosses about 600 dp. Animation
+moves panels to the new layout.
 
-- `cmd+[` / `cmd+]` — **consume-or-expel**: a lone panel is consumed into the
-  neighbouring column on that side; a stacked panel is expelled into a fresh
-  column there.
-- `cmd+,` — consume the first panel of the column to the right into the
-  bottom of the focused column; `cmd+.` — expel the focused column's bottom
-  panel out to the right.
-- `cmd+t` — **tabbed display**: the column shows only its active panel at
-  full height, under a strip of title segments (active inverted). Click a
-  segment, or move focus up/down, to switch tabs; the panel crossfades.
-  A tabbed column remembers its active tab while unfocused, and left/right
-  focus enters it on that tab.
+Each panel kind requests a width and height. A request is limited to the active
+grid, so an inbox fills the 4×3 cover screen without a separate phone layout.
+If a column's requested heights fit, unused space stays empty. If they do not
+fit, the panels share the column height evenly. A column is as wide as its
+widest panel. Columns continue to the right and the workspace scrolls when they
+do not fit on screen.
 
-The camera follows focus — the minimal scroll that keeps the focused panel
-fully visible with one gap of margin — and pans 1:1 under a horizontal
-trackpad scroll. A touch pan is free while the fingers are down and
-magnetises on release to the nearest column alignment. A panel opened
-*without* taking focus (a
-[preview](./interaction-grammar.md#preview-the-one-open-that-does-not-go))
-asks to be revealed as well, once, and loses to focus when both cannot fit.
+Some panels request more height when their content needs it. A long message can
+grow up to the full column, while a short message stays at its default height.
+A conversation counts the full height of open messages and one line for each
+closed message. The shell recalculates this after content arrives. The size is
+not saved.
+
+## Column actions and tabs
+
+- `cmd+[` and `cmd+]` move a lone panel into the neighboring column, or move a
+  stacked panel into a new column on that side.
+- `cmd+,` moves the first panel from the right column to the bottom of the
+  focused column.
+- `cmd+.` moves the bottom panel of the focused column into a new column on the
+  right.
+- `cmd+t` switches a column between stacked and tabbed display. A tabbed column
+  shows one panel at full height. Click a tab or move focus up and down to
+  choose the visible panel.
+
+The camera moves just enough to keep the focused panel visible with one gap of
+margin. Trackpad movement follows the input directly. Touch movement is free
+while fingers are down, then aligns to the nearest column after release.
+
+A [preview](./interaction-grammar.md#preview-the-one-open-that-does-not-go) also
+asks to be visible once. Focus wins if both the focused panel and preview
+cannot fit.
 
 ## Placement
 
-A new panel opens *to the right* of the panel that spawned it: into the
-neighbouring column if its rows fit there, otherwise into a fresh column
-inserted immediately right. A joined child always lands immediately right of
-its parent (a join only lives there); an un-joined open respects an existing
-joined pair and inserts after it rather than splitting it.
+A new panel opens to the right of its parent. It uses the next column when its
+requested height fits there; otherwise it gets a new column. A joined child is
+always directly to the right of its parent. An unrelated panel never splits an
+existing joined pair.
 
 ## Joins
 
-- A solid link opens its target **joined** to the panel the link lives in.
-- The next solid link in that parent **replaces** the joined child in place.
-- **Replacing or closing a panel closes its joined chain** — the chain to
-  its right is context this panel pointed at, so it goes when the panel
-  does: replace, because the content it was derived from just changed
-  (open a contact for mail A, click mail B: the stale contact goes with
-  it); close, because nothing is left for it to be context *of*. A panel
-  opened for its own sake — cmd+click, a launcher hit — is nobody's
-  context and stays. Undo restores the whole chain, as it restores any
-  close.
-- A join is alive **only while the child sits in the column immediately right
-  of its parent**. Any move or insert that breaks that adjacency breaks the
-  join, visibly: the ═ bridge between the pair is the only indicator, always
-  drawn for a live join.
-- Alt (click or enter) always opens a fresh, un-joined panel.
-- A **preview** is the same joined open with focus left behind, so a list's
-  cursor can drive the panel beside it. It is raised to its column's shown
-  tab explicitly — the usual rule promotes whatever holds focus, and a
-  preview holds none. Where the pair cannot share the screen it keeps focus
-  after all, and is an ordinary open.
+- A normal link opens its target joined to the current panel.
+- The next normal link from the same parent replaces that joined child.
+- Replacing or closing a panel also closes all joined descendants to its
+  right. Undo restores the whole closed group.
+- A join only exists while its child is in the next column. Moving either panel
+  away removes the join. A ═ bridge shows each live join.
+- `cmd+click` or `cmd+enter` opens a separate panel with no join.
+- A preview is a joined open that leaves focus in the parent. In a tabbed
+  column, the preview becomes the visible tab. If the parent and preview cannot
+  share the screen, the preview takes focus instead.
 
-## Focus, movement, closing
+## Focus, movement, and closing
 
-Focus is a single panel; its header inverts. Focus moves with the workspace
-modifier (up/down walk the column; left/right pick the nearest panel by
-vertical centre in the neighbouring column, judged on target geometry).
-Moving a panel swaps within its column, merges into a neighbour column, swaps
-whole columns when it travels alone, and expels into a fresh column at the
-edges. Closing a panel takes its joined chain with it (above), drops focus
-to its nearest surviving neighbour and removes empty columns. A workspace
-move is not a close: the panel travels alone, and its joins stay behind to
-die with the lost adjacency.
+Exactly one panel has focus, shown by its inverted header. With the workspace
+modifier, up and down move through a column; left and right choose the closest
+panel by vertical position in the neighboring column.
 
-Implementation: all of the above is `src/core.rs` — std-only, no rendering,
-unit-tested (the web prototype's whole smoke scenario is transcribed as a
-test).
+Moving a panel can reorder its column, join another column, swap a whole column,
+or create a new edge column. Closing removes the panel and its joined
+descendants, moves focus to the nearest remaining panel, and removes empty
+columns. Moving a panel to another workspace is not a close, but it still
+breaks joins with panels that stay behind.
+
+These rules are implemented and unit-tested in `src/core.rs`.

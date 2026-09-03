@@ -1,15 +1,8 @@
-//! The send pipeline: a compose panel's **draft** persists in the store;
-//! *send* is an undoable action that files an **outbox** row with a deadline
-//! (`send_after = now + delay`). This pass claims due rows —
-//! `WHERE status='pending'`, so the race against undo has exactly one winner
-//! — and files a [`mail::Submit`] job. The executor is what actually speaks
-//! SMTP, appends to Sent, and records the outcome.
+//! Moves due outbox rows into durable send jobs.
 //!
-//! The split matters on a crash: the outbox row and the job are both
-//! durable, so a mail hit `send` and never left goes out late rather than
-//! never. And because `Submit` declares itself **not idempotent**, a job
-//! caught mid-flight by a crash is failed rather than retried — nobody
-//! double-sends on a guess.
+//! Claiming a pending row decides the race with undo. The executor performs
+//! SMTP and Sent-folder work. Submit jobs are not repeated after an uncertain
+//! crash outcome, which avoids sending the same message twice.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -36,9 +29,8 @@ pub fn outbox_pass(w: &World) -> usize {
 
     let mut claimed = 0;
     for id in due {
-        // The submit job is encoded outside the write — the payload and the
-        // clock need the `World`, which cannot cross to the writer thread
-        // (CR-005 phase 0).
+        // Encode before the write because `World` cannot cross to the writer
+        // thread.
         let Ok(job) = w.prepare(&mail::Submit { outbox: id }) else {
             continue;
         };
@@ -94,7 +86,7 @@ impl Sender {
 
 /// The sender thread: sleep until the next deadline (or a kick), claim what
 /// is due, run the queue, notify the UI. It builds its own [`World`] — its
-/// own reader over the shared writer (CR-005 phase 0), its own `Real`
+/// own reader over the shared writer, its own `Real`
 /// outside.
 ///
 /// # Panics
@@ -110,7 +102,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("sender".into())
         .spawn(move || {
-            // Its own reader over the *one* writer (CR-005 phase 0).
+            // Its own reader over the *one* writer.
             let Ok(store) = crate::store::Store::with_db(db) else {
                 return;
             };
@@ -257,7 +249,7 @@ mod tests {
         assert_eq!(w.run_effects_in(Scope::Account(1)), 1);
     }
 
-    /// A draft that carries files (CR-010) reads them **at submit time**,
+    /// A draft that carries files reads them **at submit time**,
     /// through the outside — so what goes out is the file as it stands,
     /// and a file that is no longer there fails the send rather than
     /// sending nothing under its name.
@@ -315,7 +307,7 @@ mod tests {
     }
 
     /// Two ways a draft's file is not the file it was, and both refuse
-    /// rather than send something wrong under its name (CR-010): one
+    /// rather than send something wrong under its name: one
     /// attached on another device — the rows replicate, a path does not —
     /// and one that has grown past the cap since, which a capped read
     /// would otherwise truncate and send as itself.

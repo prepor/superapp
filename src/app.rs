@@ -1,19 +1,18 @@
-//! The makepad shell: window, shaders, drawing, events, animation.
+//! Makepad shell for windows, drawing, input, and animation.
 //!
-//! This is the only module that knows makepad exists. It owns no layout rules —
-//! [`crate::core`] emits discrete targets and this module springs towards them
-//! (mosaic's division of labour).
+//! [`crate::core`] calculates target layouts. This module draws them and
+//! animates current positions toward those targets.
 //!
 //! # Frame loop
 //!
 //! ```text
-//! Event::{Key,Mouse}* ──▶ mutate Ws ──▶ ws.scene() ──▶ Anim::apply ──▶ redraw
+//! Event::{Key,Mouse}* ──▶ update Ws ──▶ ws.scene() ──▶ Anim::apply ──▶ redraw
 //! Event::NextFrame ─────▶ Anim::advance(dt) ──▶ redraw while anything moves
 //! ```
 //!
-//! The scene is pulled only after a mutation, never per frame. Panel content is
-//! laid out on a monospace character grid; bodies draw inside clipped turtles,
-//! so scrolling is pixel-smooth and clipping is exact.
+//! The scene is recalculated only after a state change, not on every frame.
+//! Panel content uses a monospace character grid. Panel bodies are clipped so
+//! scrolling stays smooth and content does not draw outside them.
 
 #![allow(missing_docs)]
 
@@ -57,7 +56,7 @@ pub(crate) const FRAME_MS: f64 = 1000.0 / 60.0;
 const PUMP_EVERY: u64 = 30;
 
 /// The same cadence in seconds of virtual time, for a mount whose frames
-/// jump by a whole `wait` at once (CR-006).
+/// jump by a whole `wait` at once.
 const PUMP_S: f64 = 0.5;
 
 /// The windowed e2e runner is paced by a real timer at this interval; the
@@ -67,31 +66,25 @@ const E2E_TICK_MS: f64 = 30.0;
 /// Command-line configuration.
 #[derive(Debug, Default)]
 struct Config {
-    /// Path of an e2e script to replay.
     e2e: Option<String>,
-    /// Screenshot directory for e2e runs.
     out: String,
-    /// Keep the window frontmost even during an e2e run.
     front: bool,
-    /// Force a grid (`--grid 4x3`): preview a phone layout on desktop.
     grid: Option<core::Grid>,
-    /// Force the window size (`--window 380x840`): preview a phone screen.
     window: Option<(f64, f64)>,
     /// Override the store's path (`--db PATH`). E2e runs default to a fresh
     /// temp file; normal runs to the platform data dir.
     db: Option<String>,
-    /// The send-undo window in seconds (`--send-delay 1` for e2e).
     send_delay: f64,
     /// The device-sync bucket base URL (`--bucket http://127.0.0.1:9000`).
-    /// When set, replication is on: this device joins the lineage, follows or
-    /// holds the lease, and the locked screen appears when it does not write.
+    /// Setting it enables device sync. The screen locks while another device
+    /// has permission to write.
     bucket: Option<String>,
     /// Open the panels library instead of the workspace (`--library
     /// [NAME...]`): the catalogue's scenes whose names contain one of
-    /// these, or every scene when none is given. CR-006.
+    /// these, or every scene when none is given.
     library: Option<Vec<String>>,
-    /// The headless backend's `--no-draw`: the widget pass runs, nothing is
-    /// rasterized. Read here so a `shot` knows there is nothing to keep.
+    /// `--no-draw` runs widgets without creating an image. This tells `shot`
+    /// that there is nothing to save.
     no_draw: bool,
     /// `--demo-disk`: the file browser reads the demo tree instead of this
     /// machine's disk. What `~` holds is the one thing about a run that is
@@ -123,7 +116,7 @@ pub(crate) fn e2e_script() -> (Option<&'static str>, &'static str) {
     (config().e2e.as_deref(), &config().out)
 }
 
-/// Everything a stage needs to come up (CR-006). The window's own stage
+/// Everything a stage needs to come up. The window's own stage
 /// builds one from argv at startup; the panels library builds one per
 /// mount from a scene's node.
 pub struct Boot {
@@ -390,7 +383,7 @@ script_mod! {
         }
     }
 
-    // The panels library (CR-006). A mount renders into its own pass; this
+    // The panels library. A mount renders into its own pass; this
     // quad shows that pass's texture on the canvas, at whatever zoom.
     set_type_default() do #(crate::library::DrawTex::script_shader(vm)){
         ..mod.draw.DrawQuad
@@ -442,10 +435,10 @@ script_mod! {
                 pass.clear_color: #ffffffff
                 body +: {
                     // Both roots fill the window; argv decides which one
-                    // boots and draws (`--library`, CR-006).
+                    // boots and draws (`--library`).
                     flow: Overlay
                     stage := Stage{
-                        // Retained content templates (CR-002): named children
+                        // Retained content templates: named children
                         // of a custom-drawn widget are never auto-drawn —
                         // they are collected as templates and instantiated
                         // per panel, PortalList-style.
@@ -464,7 +457,7 @@ script_mod! {
                         files_tpl := mod.widgets.FilesPanel{}
                         file_tpl := mod.widgets.FilePanel{}
                         // One part of a letter draws on the *same* widget
-                        // as a file on the disk (CR-010): a second
+                        // as a file on the disk: a second
                         // instance of it, never a second card.
                         attachment_tpl := mod.widgets.FilePanel{}
                         // The modal overlays are hosted the same way, keyed
@@ -587,7 +580,7 @@ enum Act {
     Open(PanelId, Kind),
     Replace(PanelId, Kind),
     /// A list panel's cursor landed on a row: open its detail joined
-    /// **without taking focus** (CR-005). The list keeps the keyboard, so
+    /// **without taking focus**. The list keeps the keyboard, so
     /// the walk carries on. Carries the kind, not an id — the inbox previews
     /// a message and the effect log a job, through the one door.
     Preview(PanelId, Kind),
@@ -604,13 +597,13 @@ enum Act {
     HistoryRow(i64),
     /// The overlay's backdrop: tapping outside the rows dismisses it.
     OverlayClose,
-    /// A retained widget's interactive child (CR-002): the e2e bridge
+    /// A retained widget's interactive child: the e2e bridge
     /// synthesizes pointer events at its rect; a real click just focuses.
     Pointer(PanelId),
-    /// A retained widget's *button*, semantically (CR-002): e2e resolves it
+    /// A retained widget's *button*, semantically: e2e resolves it
     /// to the same PanelAction the button's own click emits.
     WidgetOp(PanelId, WidgetOp),
-    /// The locked screen's button: take the device-sync lease (CR-005).
+    /// The locked screen's button: take the device-sync lease.
     Acquire,
     /// The problems mark in the toast's corner: go to the problems panel
     /// where it is open, or open it — the launcher's verb.
@@ -628,7 +621,7 @@ enum WidgetOp {
     AddAccount,
     /// Press "sign in with google" on the add-account panel.
     GoogleSignIn,
-    /// The device-sync form's connect button (CR-005).
+    /// The device-sync form's connect button.
     ConnectBucket,
     RemoveAccount(i64),
     /// A row of a list panel was clicked — an inbox thread, a job of the
@@ -636,10 +629,10 @@ enum WidgetOp {
     /// row means one thing everywhere: the list takes focus, its cursor
     /// follows, and what the row names previews beside it.
     OpenRow(Kind),
-    /// The `i`-th row of a field's autocomplete (CR-006): the inbox
+    /// The `i`-th row of a field's autocomplete: the inbox
     /// filter's, or the compose TO field's.
     Suggest(usize),
-    /// A thread row's header (CR-007): open the message, or close it.
+    /// A thread row's header: open the message, or close it.
     ToggleMail(i64),
     /// A message's quoted tail: unfold it, or fold it back.
     ToggleQuote(i64),
@@ -649,7 +642,7 @@ enum WidgetOp {
     RetrySend(i64),
     /// A problems row's *reopen* link: the failed send back as a draft.
     ReopenSend(i64),
-    /// Toggle a row's mark (CR-009). Touch only: a long press raises it,
+    /// Toggle a row's mark. Touch only: a long press raises it,
     /// and a tap while any mark stands. The bar in the row's inset is an
     /// indicator, not a control.
     Mark(MarkRow),
@@ -657,7 +650,7 @@ enum WidgetOp {
     MarkVerb(ui::MarkVerb),
 }
 
-/// What identifies the row a mark is on, per list (CR-009) — the way
+/// What identifies the row a mark is on, per list — the way
 /// [`WidgetOp::OpenRow`] carries the kind its row names: the inbox's
 /// thread anchor, a files panel's entry name.
 #[derive(Debug, Clone, PartialEq)]
@@ -684,7 +677,7 @@ struct HitR {
 ///
 /// The last two terms are what keep a control drawn over another — the
 /// marks bar's `archive marked` beside a message panel's own `archive`
-/// (CR-009) — from shadowing the label it carries whole.
+/// — from shadowing the label it carries whole.
 fn label_rank(h: &HitR, label: &str, needle: &str) -> Option<(u8, u8, usize)> {
     let rung = if h.label.eq_ignore_ascii_case(label) {
         0
@@ -834,7 +827,7 @@ struct TouchNav {
 /// How far across a row the curtain must be drawn for a lift to commit.
 const SWIPE_COMMIT: f64 = 0.35;
 
-/// A swiped mail row and the curtain wiping across it (CR-005). The row
+/// A swiped mail row and the curtain wiping across it. The row
 /// itself never moves: an ink panel carrying the action's name is drawn in
 /// from the edge the finger travels away from, which is also the edge that
 /// action's button sits on in a message header. Past [`SWIPE_COMMIT`] the
@@ -1114,11 +1107,11 @@ struct ReplChange {
 
 struct State {
     ws: Wm,
-    /// Everything that leaves the process, plus the clock (CR-004). Holds
+    /// Everything that leaves the process, plus the clock. Holds
     /// the same `Rc<Store>` as the field below, so the two cannot diverge —
     /// `store` stays for the hundred read sites that only want the store.
     world: std::rc::Rc<crate::effect::World>,
-    /// The action tree (CR-004). In memory, so it dies with the process:
+    /// The action tree. In memory, so it dies with the process:
     /// a restart loses undo, but never loses work — the rows every action
     /// wrote are durable, and the passes read those, never this.
     history: crate::history::History,
@@ -1126,7 +1119,7 @@ struct State {
     /// The store's file path — sync workers open their own connections to
     /// it (`None` = in-memory: no workers).
     db_path: Option<std::path::PathBuf>,
-    /// Who runs the passes (CR-004): threads in production, inline in a
+    /// Who runs the passes: threads in production, inline in a
     /// headless world.
     pump: sync::Pump,
     /// Where passwords live. An e2e run keeps them in memory, so a suite
@@ -1163,11 +1156,11 @@ struct State {
     /// viewport change and worker poll, and a standing rule here would fight
     /// the user's own pans.
     show_also: Option<PanelId>,
-    /// Which messages each message panel shows open (CR-007): seeded when
+    /// Which messages each message panel shows open: seeded when
     /// the panel opens on a mail, toggled by touch, kept no further than
     /// the process. Context, like the inbox cursor — never history.
     expand: HashMap<PanelId, crate::panels::Expansion>,
-    /// The one held item `copy`/`move` carry to a `… here` (CR-008):
+    /// The one held item `copy`/`move` carry to a `… here`:
     /// context, not history — never persisted, gone with the process.
     hold: Option<crate::files::Hold>,
     /// What a card's preview needs, in lines, by `(path, columns)`: the
@@ -1175,7 +1168,7 @@ struct State {
     /// the wishes on every mutation, so it is read once and remembered.
     /// Pruned to the cards on screen.
     measured: HashMap<(String, usize), f64>,
-    /// The device-sync driver (CR-005), when a `--bucket` is configured.
+    /// The device-sync driver, when a `--bucket` is configured.
     /// `None` means replication is off and the store is a plain local one.
     repl: Option<ReplMode>,
     /// The lease status the worker last reported — drives the locked screen.
@@ -1183,7 +1176,7 @@ struct State {
     /// Whether the canonical device has seeded the demo world since it began
     /// holding (seeding is a holder-only act under replication).
     seeded: bool,
-    /// The fixed frame clock (CR-006): a headless build, and every
+    /// The fixed frame clock: a headless build, and every
     /// panels-library mount. False only for a windowed primary stage — the
     /// one place the wall clock is read.
     virtual_time: bool,
@@ -1450,7 +1443,7 @@ impl State {
         let text_w = unit_w * f64::from(gw.min(grid.w)) - gap - 2.0 * theme::PAD_X;
         let cols = (text_w / (theme::FONT_SIZE * theme::MONO_ADV)).max(1.0) as usize;
         // Which of them carry something: one line each, listed under the
-        // reading (CR-010). A cached query a message, and only the open
+        // reading. A cached query a message, and only the open
         // ones can cost anything.
         let carries: BTreeSet<core::MailId> = msgs
             .iter()
@@ -1469,7 +1462,7 @@ impl State {
         Some((floor..=grid.h).find(|&r| holds(r) >= need).unwrap_or(grid.h))
     }
 
-    /// The rows a file card wants (CR-008): its three as the floor, more
+    /// The rows a file card wants: its three as the floor, more
     /// when the preview needs them — a long text file opens tall rather
     /// than scrolled, a tall picture is seen whole — up to the grid. The
     /// need is measured once per path and column width, off the first 64
@@ -1553,7 +1546,7 @@ impl State {
         }
     }
 
-    /// What a panel opening on `id` shows open (CR-007): the mail itself
+    /// What a panel opening on `id` shows open: the mail itself
     /// and every unread mail of its thread — read *before* the open marks
     /// them, which is why the shell seeds rather than the widget.
     fn seed_for(&self, id: core::MailId) -> BTreeSet<core::MailId> {
@@ -1724,11 +1717,11 @@ impl State {
         self.seen_problems = now.iter().map(crate::problems::Problem::key).collect();
     }
 
-    /// The header buttons a panel wears right now (CR-008): its kind's,
+    /// The header buttons a panel wears right now: its kind's,
     /// the held item's, and — for a files panel — the object verbs only
     /// while it is the end of a join chain (joined under a parent and
     /// driving nothing, which is to say the thing under someone's cursor)
-    /// and no row of it is marked (CR-009).
+    /// and no row of it is marked.
     /// One door for the width, the chords, the lender and the drawing.
     fn wears(&self, pid: PanelId, marked: bool) -> Vec<(&'static str, BtnAct)> {
         let Some(kind) = self.ws.panel(pid).map(|p| p.kind.clone()) else {
@@ -1747,7 +1740,7 @@ impl State {
             .unwrap_or_else(|| "panel".into())
     }
 
-    /// Whether this device may write at all (CR-005): a follower's store
+    /// Whether this device may write at all: a follower's store
     /// refuses, and a verb that reaches the disk has to ask *before* it
     /// acts — the disk would take the write even where the store will not.
     fn writable(&self) -> bool {
@@ -1759,8 +1752,8 @@ impl State {
     /// layout before and after, plus whatever the action claimed of the
     /// world. Nav-only actions carry no claims and undo for free off the
     /// snapshot.
-    /// The `data` closure runs on the store's writer thread (CR-005 phase
-    /// 0), so it must own what it touches — `Send + 'static`. Its value is
+    /// The `data` closure runs on the store's writer thread, so it must own
+    /// what it touches — `Send + 'static`. Its value is
     /// returned, which is how an action learns a freshly minted row id
     /// without a shared cell.
     fn act<R: Send + 'static>(
@@ -1774,7 +1767,7 @@ impl State {
     ) -> Option<R> {
         // Under replication, a follower does not write — the gate would refuse
         // it anyway, but returning here keeps the in-memory `Wm` from drifting
-        // ahead of a store that never took the change (CR-005).
+        // ahead of a store that never took the change.
         if !self.writable() {
             self.toast("read-only — acquire the lease to write", true);
             return None;
@@ -1868,7 +1861,7 @@ impl State {
     /// for removed accounts retire themselves.
     /// Starts the device-sync worker when a `--bucket` is configured; `None`
     /// leaves the store a plain local one. The worker polls the bucket, drives
-    /// the lease, and reports status the UI reads each signal (CR-005).
+    /// the lease, and reports status the UI reads each signal.
     /// Resolves the device-sync bucket URL from the three sources that let
     /// each platform configure it: the `--bucket` flag (desktop), the
     /// `SUPERAPP_BUCKET` environment variable, and a `bucket` file beside the
@@ -1924,7 +1917,7 @@ impl State {
         }
     }
 
-    // -- device sync, mode-agnostic (CR-005) --------------------------------
+    // -- device sync, mode-agnostic --------------------------------
 
     /// Reconciles the reported status: caches it, seeds the demo world the
     /// first time this device holds (a holder-only act), and answers what
@@ -1965,7 +1958,7 @@ impl State {
         self.apply_repl(status)
     }
 
-    /// Points this device at a bucket (CR-005): the secret to the platform's
+    /// Points this device at a bucket: the secret to the platform's
     /// secret store, the URL and key id to the `bucket` file beside the
     /// store, and the replication worker restarted onto them. Answers what to
     /// say, either way.
@@ -2223,7 +2216,7 @@ pub struct Stage {
     #[layout]
     layout: Layout,
 
-    /// Retained content templates by DSL name (CR-002) and the live
+    /// Retained content templates by DSL name and the live
     /// instance per panel id — the PortalList pattern at panel scale.
     #[rust]
     tpl: HashMap<LiveId, ScriptObjectRef>,
@@ -2266,7 +2259,7 @@ pub struct Stage {
     kb_h: f64,
     #[rust]
     touch: TouchNav,
-    /// A row mid-swipe, and the curtain over it (CR-005). Outlives the finger:
+    /// A row mid-swipe, and the curtain over it. Outlives the finger:
     /// a committed swipe keeps animating until the curtain has covered the row.
     #[rust]
     row_swipe: Option<RowSwipe>,
@@ -2309,7 +2302,7 @@ pub struct Stage {
     ime_guard_timer: Timer,
     #[rust]
     state: Option<Box<State>>,
-    /// A panels-library mount (CR-006): booted by the canvas from a scene's
+    /// A panels-library mount: booted by the canvas from a scene's
     /// node, replays its steps, owns nothing outside its pass. The
     /// window's own stage boots from argv and owns the menu bar.
     #[rust]
@@ -2332,7 +2325,7 @@ pub struct Stage {
     /// the draw, which the canvas schedules within its frame budget.
     #[rust]
     stale_hits: bool,
-    /// A panel node (CR-006): the one panel this stage draws, at the whole
+    /// A panel node: the one panel this stage draws, at the whole
     /// viewport, instead of the workspace.
     #[rust]
     solo: Option<PanelId>,
@@ -2540,13 +2533,10 @@ fn parse_chord(s: &str) -> Option<ChordExec> {
 
 impl Stage {
     fn kick(&mut self, cx: &mut Cx) {
-        // makepad only routes keys to the system IME — which is what emits
-        // TextInput events — while the IME is shown. On macOS letter keys
-        // (j/k/r, "/", field typing) all arrive that way, so the IME stays on
-        // whenever a panel has focus (mosaic's model: "typing only flows
-        // after show_text_ime"). On android show_text_ime raises the
-        // on-screen keyboard, which every retained panel's TextInputs now do
-        // for themselves — so the shell only asks for the launcher's field.
+        // Makepad emits TextInput events only while the system input method is
+        // enabled. Keep it enabled for focused panels on macOS. On Android,
+        // fields manage the on-screen keyboard themselves, so the shell only
+        // enables it for the launcher.
         // Every focus transition passes through kick().
         let launcher = self
             .state
@@ -3130,7 +3120,7 @@ impl Stage {
         // The launcher owns the keyboard while it is up: arrows pick the
         // hit, enter goes, esc closes. Everything else — the query's own
         // editing, caret, selection — belongs to its `SField` now, so it is
-        // forwarded rather than re-implemented (CR-002 F).
+        // forwarded rather than re-implemented.
         if state.overlay == Overlay::Launcher {
             match k.key_code {
                 KeyCode::Escape => {
@@ -3170,7 +3160,7 @@ impl Stage {
             self.kick(cx);
             return;
         }
-        // Cmd is the workspace modifier (niri's Mod; mosaic's choice too).
+        // Cmd is the workspace modifier.
         if k.modifiers.logo {
             let num = match k.key_code {
                 KeyCode::Key1 => Some(0),
@@ -3192,8 +3182,8 @@ impl Stage {
                 }
                 return;
             }
-            // Arrows only — the vim walk went with CR-003, which also frees
-            // h/j/k/l for panel accelerators.
+            // Only arrows move the selection. Plain letters remain available
+            // for panel shortcuts.
             let dir = match k.key_code {
                 KeyCode::ArrowLeft => Some(Dir::Left),
                 KeyCode::ArrowRight => Some(Dir::Right),
@@ -3288,8 +3278,8 @@ impl Stage {
                     _ => {}
                 }
             }
-            // Past the reserved set the chord belongs to the focused panel
-            // (CR-003). Chrome buttons resolve here, because the chrome is
+            // Past the reserved set, the shortcut belongs to the focused
+            // panel. Chrome buttons resolve here because the chrome is
             // the shell's; links resolve inside the panel widget, which
             // owns them — so an unclaimed chord falls through to it rather
             // than dying here.
@@ -3307,7 +3297,7 @@ impl Stage {
                 self.resolve_click(cx, Act::Btn(f, act), false);
                 return;
             }
-            // The marks bar's verbs (CR-009): while the focused list has
+            // The marks bar's verbs: while the focused list has
             // marks it wears its rows' own verbs on the set, and the keys
             // its chrome or its preview would answer to stand down (see
             // `wears` and `lender`).
@@ -3328,7 +3318,7 @@ impl Stage {
                 return;
             }
             // Nothing on this panel wanted it. A panel that drives a preview
-            // now **borrows** its preview's keys (CR-005): the pair reads as
+            // now **borrows** its preview's keys: the pair reads as
             // one thing, so archive, delete and reply work from the list
             // without first walking focus into the mail. The borrowed mark is
             // never drawn here — it stays on the message's own chrome, one
@@ -3366,7 +3356,7 @@ impl Stage {
         }
     }
 
-    /// Whether the list this panel hosts has marked rows (CR-009): its bar
+    /// Whether the list this panel hosts has marked rows: its bar
     /// is up, so the verbs it wears there take the chords its own chrome —
     /// or its preview — would otherwise answer to. Both list widgets are
     /// asked: a ref of the wrong kind borrows nothing and says no.
@@ -3415,7 +3405,7 @@ impl Stage {
             return None;
         }
         // …and while the list has marks: its bar wears the very letters the
-        // preview would lend, on the set (CR-009).
+        // preview would lend, on the set.
         (!self.field_focused(cx, f) && !self.marked(f)).then_some(child)
     }
 
@@ -3495,9 +3485,8 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // A walk gives claims back, and a claim can be a file — which a
-        // follower's disk would take even though its store would not
-        // (CR-005). The gate belongs on the walk, not only on the action.
+        // Undo can change files, so a read-only follower must stop before
+        // walking history.
         if !state.writable() {
             state.toast("read-only — acquire the lease to write", true);
             return;
@@ -3520,8 +3509,7 @@ impl Stage {
             }
             None => state.toast("nothing to undo", false),
         }
-        // A walk may have moved something on the disk back or forward
-        // (CR-008), and nothing watches it: the listings are told.
+        // Undo may have changed the disk; refresh listings explicitly.
         self.refresh_files(cx);
         if let Some(m) = marks {
             self.restore_marks(cx, m);
@@ -3535,9 +3523,8 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        // A walk gives claims back, and a claim can be a file — which a
-        // follower's disk would take even though its store would not
-        // (CR-005). The gate belongs on the walk, not only on the action.
+        // Redo can change files, so a read-only follower must stop before
+        // walking history.
         if !state.writable() {
             state.toast("read-only — acquire the lease to write", true);
             return;
@@ -3560,8 +3547,7 @@ impl Stage {
             }
             None => state.toast("nothing to redo", false),
         }
-        // A walk may have moved something on the disk back or forward
-        // (CR-008), and nothing watches it: the listings are told.
+        // Redo may have changed the disk; refresh listings explicitly.
         self.refresh_files(cx);
         if let Some(m) = marks {
             self.restore_marks(cx, m);
@@ -3814,7 +3800,7 @@ impl Stage {
     /// device cannot type at all — and its compose auto-focuses its body on
     /// open (`pending_focus`) yet sits behind the lock showing a peer's stale
     /// draft — so there the re-seed always runs. Idempotent: rows equal to the
-    /// widget are left alone (single-writer, CR-005).
+    /// widget are left alone; the store has only one writer.
     fn reseed_composes(&mut self, cx: &mut Cx) {
         let Some(state) = self.state.as_deref() else {
             return;
@@ -3965,7 +3951,7 @@ impl Stage {
             search::Go::Open(kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
-                // Opening a mail reads its whole thread (CR-007): every
+                // Opening a mail reads its whole thread: every
                 // unread mail of it is marked, one intent each, and the
                 // panel opens with exactly those unfolded.
                 let marks: Vec<core::MailId> =
@@ -4217,7 +4203,7 @@ impl Stage {
                         cx.action(crate::panels::PanelAction::RemoveAccount(id));
                     }
                     WidgetOp::Mark(row) => {
-                        // Touch's way in (CR-009): a long press marks, and
+                        // Touch's way in: a long press marks, and
                         // while any mark stands a tap toggles rather than
                         // opens. Nothing on the pointer raises this — the
                         // bar in the row's inset is an indicator, not a
@@ -4320,7 +4306,7 @@ impl Stage {
             Act::Open(pid, kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
-                // Opening a mail reads its whole thread (CR-007): every
+                // Opening a mail reads its whole thread: every
                 // unread mail of it is marked, one intent each, and the
                 // panel opens with exactly those unfolded.
                 let marks: Vec<core::MailId> =
@@ -4356,7 +4342,7 @@ impl Stage {
                 // Replacing with another mail is the same "read" walk as a
                 // preview — it coalesces per panel.
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
-                // Opening a mail reads its whole thread (CR-007): every
+                // Opening a mail reads its whole thread: every
                 // unread mail of it is marked, one intent each, and the
                 // panel opens with exactly those unfolded.
                 let marks: Vec<core::MailId> =
@@ -4397,7 +4383,7 @@ impl Stage {
                 self.sync(cx);
             }
             Act::Preview(pid, kind) => {
-                // The cursor walk's own open (CR-005). Same door as a solid
+                // The cursor walk's own open. Same door as a solid
                 // link — join semantics, mark read, undoable — minus the one
                 // thing that would end the walk: it never takes focus. So it
                 // is a "read", coalescing per driver panel.
@@ -4473,17 +4459,17 @@ impl Stage {
                             state.toast("syncing…", false);
                         }
                     }
-                    // The files verbs (CR-008). Every one reaches the
+                    // The files verbs. Every one reaches the
                     // disk through the outside, and every one that writes
                     // is an undoable action whose reversal asks the disk
                     // rather than trusting it — `here` and `delete_paths`
                     // below.
                     BtnAct::Open => {
                         // The card's path to the OS, through the outside:
-                        // the first real verb of the browser (CR-008). A
+                        // the first real verb of the browser. A
                         // part of a letter has no path, so it is written to
                         // the app's scratch directory first and *that* is
-                        // handed over (CR-010) — one extra step, and then
+                        // handed over — one extra step, and then
                         // it is a file like any other, browsable with the
                         // panel that browses files.
                         let real = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
@@ -4509,11 +4495,11 @@ impl Stage {
                         }
                     }
                     BtnAct::Attach => {
-                        // The hold's other destination (CR-010): what a
+                        // The hold's other destination: what a
                         // files panel is carrying becomes what this draft
                         // will. An action, so ⌘z takes it back off.
                         // Which install is picking them: a path is a file
-                        // on this machine and these rows replicate (CR-010).
+                        // on this machine and these rows replicate.
                         let device = crate::store::this_device(state.store.conn());
                         let files: Vec<mail::DraftFile> = state
                             .hold
@@ -4733,7 +4719,7 @@ impl Stage {
                             .or_else(|| mail::draft_for(&state.store, pid as i64, seed))
                             .unwrap_or_else(|| mail::seed_draft(&state.store, seed));
                         // What it was going to carry goes with it, and comes
-                        // back with it (CR-010) — this seed's, as the text is.
+                        // back with it — this seed's, as the text is.
                         let files = mail::draft_files_for(&state.store, pid as i64, seed).to_vec();
                         state.act(
                             "close",
@@ -4760,7 +4746,7 @@ impl Stage {
     }
 
     /// Writes one part of a letter out to the app's scratch directory and
-    /// answers with where it landed (CR-010). The read and the MIME walk
+    /// answers with where it landed. The read and the MIME walk
     /// happen here, on a click rather than in a draw, which is the one
     /// place they are affordable — and the write goes through the outside
     /// like every other thing that leaves the process.
@@ -4776,7 +4762,7 @@ impl Stage {
         Ok(path)
     }
 
-    /// Opens or closes one message of the thread a panel shows (CR-007),
+    /// Opens or closes one message of the thread a panel shows,
     /// or unfolds and folds its quoted tail. Panel context, like the inbox
     /// cursor: no action, no history node — and a touch inside the panel
     /// focuses it, as anywhere else.
@@ -4811,7 +4797,7 @@ impl Stage {
     /// `next` is the mail the cursor should land on once these are gone and
     /// the panel doing the walking: its preview opens inside the same node,
     /// so one ⌘z takes the filing and the move together. Answers whether the
-    /// action was recorded — a read-only follower's write is refused (CR-005)
+    /// action was recorded — a read-only follower's write is refused
     /// and then nothing happened to report.
     fn file_mails(
         &mut self,
@@ -4924,7 +4910,7 @@ impl Stage {
     /// came: a message panel's header button, the chord a mail list borrowed
     /// from its preview, or an android row swipe. One door, so the undo
     /// node, the toast and the closing of the thread's readers are the same
-    /// story every time. The row is the thread (CR-007), so every mail of
+    /// story every time. The row is the thread, so every mail of
     /// the conversation that shares this one's folder goes together — one
     /// intent each, one node ([`mail::thread_siblings`]), which is what
     /// makes the verb mean the same thing in every mailbox.
@@ -4975,7 +4961,7 @@ impl Stage {
         self.sync(cx);
     }
 
-    /// One of the marks bar's verbs (CR-009), from its button or its
+    /// One of the marks bar's verbs, from its button or its
     /// chord. `all` and `clear` mean the same on any list; the rest are
     /// the list's own row verbs, over its set.
     fn mark_verb(&mut self, cx: &mut Cx, pid: PanelId, verb: ui::MarkVerb) {
@@ -5012,7 +4998,7 @@ impl Stage {
     }
 
     /// `new dir`: the one directory the field named, in the directory the
-    /// panel shows (CR-008). Undo trashes it while it is still empty — a
+    /// panel shows. Undo trashes it while it is still empty — a
     /// directory somebody has since put something in is a reversal that
     /// has expired, and the walk says so rather than taking the contents
     /// with it.
@@ -5060,7 +5046,7 @@ impl Stage {
     }
 
     /// Asked after a disk verb has written and before its node is
-    /// recorded: whether the lease turned over in between (CR-005). If it
+    /// recorded: whether the lease turned over in between. If it
     /// did, the claim is given straight back — a change with no node
     /// behind it is a change nobody can undo — and the sentence says both
     /// what happened and what became of it.
@@ -5076,7 +5062,7 @@ impl Stage {
     }
 
     /// `copy here` / `move here`: the held set performed into the directory
-    /// this files panel shows (CR-008, CR-009).
+    /// this files panel shows.
     ///
     /// The plan is made first, against the disk as it is right now — the
     /// hold may have waited while another program moved things, and nothing
@@ -5237,7 +5223,7 @@ impl Stage {
     }
 
     /// `delete`, from a panel's own verb or the marks bar: to the trash,
-    /// never `rm` (CR-008). One node for the whole set, so one ⌘z puts all
+    /// never `rm`. One node for the whole set, so one ⌘z puts all
     /// of it back — and the reversal expires honestly, on a trash that was
     /// emptied or a name something else has taken since.
     fn delete_paths(&mut self, cx: &mut Cx, pid: PanelId, paths: Vec<String>) {
@@ -5403,7 +5389,7 @@ impl Stage {
         }
     }
 
-    /// `copy` / `move` on a files panel's marked set (CR-009): the hold is
+    /// `copy` / `move` on a files panel's marked set: the hold is
     /// a set of paths, and every files panel then offers `… here`. The
     /// marks stand — nothing has been consumed, and the destination is
     /// still to be walked to.
@@ -5434,7 +5420,7 @@ impl Stage {
         self.kick(cx);
     }
 
-    /// `delete` on a files panel's marked set (CR-009): the same door the
+    /// `delete` on a files panel's marked set: the same door the
     /// panel's own verb uses, over every marked name. The rows go with the
     /// paths, so the marks go with the rows — and undo brings all three
     /// back together.
@@ -5453,7 +5439,7 @@ impl Stage {
         self.delete_paths(cx, pid, paths);
     }
 
-    /// The batch verb (CR-009): [`Stage::triage`] over a list's marked set.
+    /// The batch verb: [`Stage::triage`] over a list's marked set.
     /// Every mail of every marked thread that sits in the list's own folder,
     /// one `Filed` intent each, **one node** — so one ⌘z takes the whole
     /// batch back, and puts the marks back with it. A thread whose account
@@ -5532,7 +5518,7 @@ impl Stage {
         let (n_threads, n_mails) = (filed.len(), ids.len());
         let noun = if n_threads == 1 { "conversation" } else { "conversations" };
         if !self.file_mails(cx, &ids, next, delete, format!("{verb} {n_threads} {noun}")) {
-            // A read-only follower (CR-005) never got its node: the marks are
+            // A read-only follower never got its node: the marks are
             // still what they were, and nothing was filed to say otherwise.
             return;
         }
@@ -5561,7 +5547,7 @@ impl Stage {
         self.sync(cx);
     }
 
-    /// Puts back, or takes again, the marks a node consumed (CR-009): the
+    /// Puts back, or takes again, the marks a node consumed: the
     /// context that rides an undo or a redo.
     fn restore_marks(
         &mut self,
@@ -5686,7 +5672,7 @@ impl Stage {
                 if t.x.abs() < TOUCH_SLOP && t.y.abs() < TOUCH_SLOP {
                     return;
                 }
-                // Sideways on a mail row is triage (CR-005); sideways
+                // Sideways on a mail row is triage; sideways
                 // anywhere else still means nothing (the workspace pans on
                 // two fingers). Vertical is the panel's scroll, and keeps
                 // ties — a diagonal is a scroll, never a half-swipe.
@@ -5721,8 +5707,7 @@ impl Stage {
             TouchMode::Scroll { uid: u, pid: _ } if *u == uid => {
                 // Retained content scrolls itself: the drag becomes a
                 // Scroll event for the widget under the finger, so its own
-                // PortalList / ScrollBars clamp it (CR-002 F — the char
-                // grid's scroll offset no longer draws anything).
+                // PortalList and ScrollBars clamp it.
                 let ev = Event::Scroll(ScrollEvent {
                     window_id: CxWindowPool::id_zero(),
                     scroll: dvec2(0.0, -d.y),
@@ -5817,7 +5802,7 @@ impl Stage {
                             Act::Pointer(pid)
                         }
                         // While a list has marks, a tap on a row toggles its
-                        // mark rather than opening it (CR-009); the last
+                        // mark rather than opening it; the last
                         // mark cleared gives the tap back.
                         Act::WidgetOp(pid, WidgetOp::OpenRow(target)) if self.marked(pid) => {
                             match self.mark_row(&target) {
@@ -5939,7 +5924,7 @@ impl Stage {
     }
 
     /// Marks the row this panel has, or unmarks it: the one door touch
-    /// has (CR-009), whichever list the row belongs to.
+    /// has, whichever list the row belongs to.
     fn toggle_mark(&self, cx: &mut Cx, pid: PanelId, row: MarkRow) {
         let Some(w) = self.hosted.get(&pid) else { return };
         match row {
@@ -5948,7 +5933,7 @@ impl Stage {
         }
     }
 
-    /// What a mark on the row that opens `target` holds (CR-009): the
+    /// What a mark on the row that opens `target` holds: the
     /// inbox's thread anchor, a files panel's entry name — the row's own
     /// identity, read off the kind the row names.
     fn mark_row(&self, target: &Kind) -> Option<MarkRow> {
@@ -5975,7 +5960,7 @@ impl Stage {
             TouchMode::Idle => {}
             _ => return,
         }
-        // A long press on a row marks it (CR-009): the pointer has no way
+        // A long press on a row marks it: the pointer has no way
         // in, so this is the phone's. From then on taps toggle, until the
         // last mark is cleared.
         if let Some(Act::WidgetOp(pid, WidgetOp::OpenRow(target))) =
@@ -6064,7 +6049,7 @@ impl ScriptHook for Stage {
     }
 }
 
-/// Which kinds draw as retained widget trees (CR-002; grows per phase).
+/// Returns the retained widget template for a panel kind.
 fn hosted_tpl(kind: &Kind) -> Option<LiveId> {
     match kind {
         Kind::Settings => Some(live_id!(settings_tpl)),
@@ -6695,8 +6680,8 @@ impl Stage {
     }
 
     /// Whether the focused panel's content is a retained widget tree — keys
-    /// and text then belong to it rather than to the shell. Every kind is
-    /// hosted since CR-002 F, so this is "something is focused" in practice.
+    /// and text then belong to it rather than to the shell. Every current
+    /// panel kind is hosted, so this is effectively "a panel is focused."
     fn hosted_focus(&self) -> bool {
         self.state
             .as_deref()
@@ -6823,7 +6808,7 @@ impl Widget for Stage {
         {
             return;
         }
-        // Retained content (CR-002): hosted widgets see every event through
+        // Retained content: hosted widgets see every event through
         // their own system. Key/text events are forwarded by the inner
         // handlers instead (so the e2e paths share the exact route);
         // everything else — pointers, actions, frames — passes through here.
@@ -6969,7 +6954,7 @@ impl Widget for Stage {
                 self.collect_search(cx);
             }
 
-            // Device-sync lease lifecycle (CR-005): hand the lease back when
+            // Device-sync lease lifecycle: hand the lease back when
             // this device steps away, so the other can take over without an
             // override; re-poll when it returns. On android these are the
             // activity's stop/start; on macOS the app-terminate path below
@@ -7370,7 +7355,7 @@ impl Widget for Stage {
                 if width > 0.0 && line > 0.0 {
                     self.cell = CellFont {
                         adv: width,
-                        // The web prototype's 1.5 line-height, on this grid.
+                        // Leave extra space between lines.
                         line_h: (line * 1.28).ceil(),
                         natural: line,
                         dpi,
@@ -7422,7 +7407,7 @@ impl Widget for Stage {
 // ---------------------------------------------------------------------------
 
 impl Stage {
-    /// A panel node (CR-006): the one panel at the whole viewport, then
+    /// A panel node: the one panel at the whole viewport, then
     /// the sheet over it — so the archive's toast and the launcher still
     /// show.
     fn draw_solo(&mut self, cx: &mut Cx2d, state: &mut State, vp: Rect, pid: PanelId) {
@@ -7760,13 +7745,11 @@ impl Stage {
             }
         }
 
-        // The overlays are retained widgets now (CR-002 F): the shell
-        // supplies their rows and owns their clicks, exactly as it does for
-        // a panel's in-list controls.
+        // The shell supplies overlay rows and handles their clicks.
         self.draw_overlay(cx, state, vp);
 
 
-        // The device-sync locked screen (CR-005): when a bucket is configured
+        // The device-sync locked screen: when a bucket is configured
         // and this device does not hold the lease, a full-window modal owns
         // every hit and offers to take the lease. Drawn under the toast so an
         // "acquiring…" message still shows.
@@ -7890,8 +7873,7 @@ impl Stage {
         self.draw_mono.color = rgba_a(st.color(), alpha);
     }
 
-    /// An uppercase tracked label (the stelaxis register style). Returns its
-    /// drawn width.
+    /// Draws an uppercase label with extra letter spacing and returns its width.
     fn draw_label(
         &mut self,
         cx: &mut Cx2d,
@@ -7905,7 +7887,7 @@ impl Stage {
     }
 
     /// As [`Self::draw_label`], but the character at `accel` is drawn twice,
-    /// nudged — the accelerator mark (CR-003). It is the grid's own fake
+    /// nudged — the accelerator mark. It is the grid's own fake
     /// bold, narrowed from a run to a single glyph; the letter-tracking walk
     /// this label already does makes the position free.
     #[allow(clippy::too_many_arguments)]
@@ -8024,9 +8006,9 @@ impl Stage {
         let tw = self.cell.label_w(label.chars().count());
         let tx = r.pos.x + (r.size.x - tw) / 2.0;
         let ty = r.pos.y + (r.size.y - self.cell.label_line()) / 2.0;
-        // A side-effect button wears its key (CR-003); × is cmd+w and needs
+        // A side-effect button wears its key; × is cmd+w and needs
         // no mark of its own. A key the focused driver keeps for itself
-        // is not marked here (CR-008).
+        // is not marked here.
         let accel = match &act {
             Act::Btn(_, a) if !shadowed => {
                 ui::btn_accel(*a).and_then(|c| ui::accel_idx(label, c))
@@ -8214,9 +8196,8 @@ impl Stage {
         let h = (2.0 + field_h + n * OVERLAY_ROW_H).min((bottom - top - search_h).max(80.0));
         let r = rect(x, top + search_h, w, h);
 
-        // The sheet: white, ink-framed, fading with the chassis. Its own
-        // draw call — the shader is the panel chrome's too, and a merged
-        // call would paint under the wash (CR-002's sixth defect).
+        // Keep the sheet in its own draw call. A merged call would paint it
+        // below the background wash.
         self.draw_panel.new_draw_call(cx);
         self.draw_panel.color = rgba_a(theme::BG, 1.0);
         self.draw_panel.border_color = rgba_a(theme::INK, 1.0);
@@ -8417,7 +8398,7 @@ impl Stage {
                                 ));
                             }
                         }
-                        // The row's selectable runs (CR-003) — the status
+                        // The row's selectable runs — the status
                         // line among them, because a sync error is the one
                         // line here worth carrying somewhere else.
                         let status = accounts
@@ -8525,7 +8506,7 @@ impl Stage {
                         reg.push((label.to_string(), r, Act::Pointer(pid)));
                     }
                 }
-                // The files it will carry (CR-010): each a link to the card
+                // The files it will carry: each a link to the card
                 // over it, so what is about to leave can be looked at.
                 let seed = match &kind {
                     Some(Kind::Compose { seed }) => *seed,
@@ -8594,14 +8575,14 @@ impl Stage {
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
-                // The marks bar's verbs (CR-009), while the bar is up.
+                // The marks bar's verbs, while the bar is up.
                 for (label, r, verb) in panel.verb_hits(cx) {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::MarkVerb(verb))));
                 }
             }
             Some(Kind::Message { id }) => {
                 let id = *id;
-                // The thread's rows (CR-007). A closed row is one target,
+                // The thread's rows. A closed row is one target,
                 // addressed by its sender and the line it previews:
                 // touching it opens the message in place. An open one is
                 // the same row, addressed by sender and date: touching it
@@ -8638,7 +8619,7 @@ impl Stage {
                     if let Some(r) = h.html {
                         reg.push(("mail html".to_string(), r, Act::Pointer(pid)));
                     }
-                    // The parts the letter carries (CR-010), addressed the
+                    // The parts the letter carries, addressed the
                     // way the link reads them: `name · size`.
                     for (label, r, at) in h.atts.clone() {
                         reg.push((label, r, Act::Open(pid, Kind::Attachment { mail: h.id, at })));
@@ -8809,12 +8790,12 @@ impl Stage {
                 for (i, (label, r)) in panel.suggestion_hits(cx).into_iter().enumerate() {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::Suggest(i))));
                 }
-                // The marks bar's verbs (CR-009), while the bar is up.
+                // The marks bar's verbs, while the bar is up.
                 for (label, r, verb) in panel.verb_hits(cx) {
                     reg.push((label, r, Act::WidgetOp(pid, WidgetOp::MarkVerb(verb))));
                 }
             }
-            // One card, two sources (CR-010): the same runs either way —
+            // One card, two sources: the same runs either way —
             // the line under the name (a path, or a media type) and a text
             // preview. That line carries its own text as its label, the
             // way a row and a status line do, so a suite can address the
@@ -8836,7 +8817,7 @@ impl Stage {
         for (label, r, act) in reg {
             // The hand promises a click does something. Text keeps that
             // promise honest: the fields and the read-only selectable runs
-            // (CR-003) answer to the drag, not the click, so they take the
+            // answer to the drag, not the click, so they take the
             // beam — which is also the only hint that they can be copied.
             let cursor = match act {
                 Act::Pointer(_) => MouseCursor::Text,
@@ -8851,7 +8832,7 @@ impl Stage {
         }
     }
 
-    /// The swipe curtain (CR-005): an ink panel wiping across the row under
+    /// The swipe curtain: an ink panel wiping across the row under
     /// the finger, carrying the name of what a lift would do.
     ///
     /// It enters from the edge the finger travels *away* from, which is the
@@ -8949,7 +8930,7 @@ impl Stage {
         });
 
         let hover = state.hover.clone();
-        // What this panel wears now (CR-008): its kind's buttons, the
+        // What this panel wears now: its kind's buttons, the
         // object verbs if it is the end of a chain, the held item's
         // button if one is held.
         let head_btns = state.wears(pid, self.marked(pid));
@@ -9003,9 +8984,8 @@ impl Stage {
         if body.size.y < 4.0 {
             return;
         }
-        // All content is retained now (CR-002 F): every kind has a widget
-        // template, so a panel body is a widget tree. Chrome above still
-        // fades; the content pops — the pilot's accepted trade.
+        // Every panel body is a retained widget tree. The chrome fades, but
+        // content appears immediately.
         if let Some(tpl) = hosted_tpl(&kind) {
             self.draw_hosted(cx, state, pid, tpl, body);
         }
@@ -9069,8 +9049,8 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
-        // A borderless window over the display's visible frame (menu bar and
-        // Dock stay) — mosaic's shape, deliberately NOT a fullscreen Space.
+        // A borderless window fills the usable display while leaving the menu
+        // bar and Dock visible. It is not a macOS full-screen Space.
         // Android has no window to shape: the surface is the screen.
         #[cfg(target_os = "macos")]
         {
@@ -9126,9 +9106,8 @@ impl AppMain for App {
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
 
-        // Enforce the window shape once the widget tree exists: at Startup the
-        // script has not instantiated it, so the configure call above no-ops
-        // (mosaic spike B, TASK 2 — same workaround).
+        // Try again after startup because the window may not exist during the
+        // first configure call.
         #[cfg(target_os = "macos")]
         if !self.shaped && self.shape_tries < 240 {
             if let Event::NextFrame(_) | Event::Draw(_) = event {

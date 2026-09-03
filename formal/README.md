@@ -1,4 +1,4 @@
-# A formal model of device sync (CR-005)
+# A formal model of device sync
 
 `Lease.tla` is a TLA+ model of the lease protocol in `src/repl.rs`: one
 `state` object in the bucket advanced only by compare-and-swap on its
@@ -66,7 +66,7 @@ Checked exhaustively within the bounds, for the protocol as implemented:
    so its pending epoch-1 frame **survives**.
 4. `a` polls and publishes that frame under epoch 3 — after `b`'s tenure.
 
-CR-005's design calls for stranded recovery to be export-and-reset,
+The design calls for stranded recovery to be export-and-reset,
 *discarding* local divergent writes. The code only resets when replaying the
 peer's frames hits a SQLite row conflict; divergent writes that touch other
 rows survive and are published late. Row-level non-conflict is not semantic

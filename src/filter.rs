@@ -1,7 +1,4 @@
-//! The filter grammar every rich table speaks (see [`crate::richtable`]),
-//! ported from stelaxis's `FilterParser`: one line of text → an [`Ast`],
-//! plus the completion context under a caret — what the autocomplete is
-//! about to offer, and how a pick splices back into the line.
+//! Parses rich-table filters and finds autocomplete suggestions at the cursor.
 //!
 //! # Syntax
 //!
@@ -16,28 +13,21 @@
 //! | `@a @b` | `@unread vera` | implicit AND |
 //! | `text` | `budget draft` | free text, one substring |
 //!
-//! The parser never fails outright: what it cannot read becomes an
-//! [`ParseError`] and the rest of the line still filters. Positions are
-//! character indices into the trimmed input; the completion context works
-//! in **byte** offsets, because that is what a text field's caret is.
+//! Invalid parts become [`ParseError`] values while the rest of the filter
+//! still works. Parsed positions count characters. Autocomplete positions
+//! count bytes to match the text field API.
 
 /// A comparison operator on a tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// `@tag:value`
     Eq,
-    /// `@tag>value`
     Gt,
-    /// `@tag>=value`
     Gte,
-    /// `@tag<value`
     Lt,
-    /// `@tag<=value`
     Lte,
 }
 
 impl Op {
-    /// How the operator is spelled in the grammar.
     #[must_use]
     pub fn symbol(self) -> &'static str {
         match self {
@@ -56,7 +46,6 @@ pub enum Ast {
     /// Free text: one case-insensitive substring over the table's text
     /// columns.
     Text(String),
-    /// A boolean tag.
     Tag(String),
     /// A tag compared with a value.
     Op {
@@ -65,11 +54,8 @@ pub enum Ast {
         op: Op,
         value: String,
     },
-    /// `@not:…`
     Not(Box<Ast>),
-    /// Every member must hold.
     And(Vec<Ast>),
-    /// Any member holds.
     Or(Vec<Ast>),
 }
 
@@ -109,8 +95,7 @@ pub struct Parsed {
     pub errors: Vec<ParseError>,
 }
 
-/// Parses a filter line. Lenient: partial results plus errors, never a
-/// refusal.
+/// Parses the valid parts of a filter and returns errors for the rest.
 #[must_use]
 pub fn parse(input: &str) -> Parsed {
     let input = input.trim();
@@ -243,8 +228,7 @@ impl Lexer<'_> {
         }
     }
 
-    /// Reads a tag name. A char that is neither a tag char nor a delimiter
-    /// (`:><() `) is swallowed, exactly as the original does.
+    /// Reads a tag name. An unexpected character ends the name and is skipped.
     fn tag_content(&mut self) -> String {
         let mut acc = String::new();
         while let Some(ch) = self.peek(0) {
@@ -507,7 +491,7 @@ fn branches_to_ast(branches: Vec<Vec<Ast>>) -> Option<Ast> {
 // Completion context
 // ---------------------------------------------------------------------------
 
-/// What the caret is in the middle of typing, if it is something the
+/// What the cursor is in the middle of typing, if it is something the
 /// autocomplete can finish. Offsets are byte indices into the line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Context {
@@ -539,11 +523,9 @@ impl Context {
     }
 }
 
-/// Classifies the caret: walk back to the start of the space/paren-bounded
-/// token, take its *first* `@` as the tag marker (a later one, as in an
-/// address value, is part of the value), and read what follows. `None`
-/// when completion would only be noise — plain text, or just past `@not:`
-/// or `@or`.
+/// Finds the item under the cursor. The first `@` starts the tag; later ones,
+/// such as the one in an email address, belong to its value. Plain text,
+/// `@not:`, and `@or` have no suggestions.
 #[must_use]
 pub fn context(text: &str, cursor: usize) -> Option<Context> {
     let mut cursor = cursor.min(text.len());
@@ -603,9 +585,8 @@ pub fn context(text: &str, cursor: usize) -> Option<Context> {
     })
 }
 
-/// Splices a picked tag over the `@token` under the caret: `@name:` when
-/// the tag takes a value (the value list opens right behind it), `@name `
-/// for a boolean. Returns the new line and where the caret lands.
+/// Replaces the partial tag under the cursor. Adds `:` when the tag needs a
+/// value and a space when it does not. Returns the new line and cursor.
 #[must_use]
 pub fn insert_tag(
     text: &str,
@@ -621,9 +602,8 @@ pub fn insert_tag(
     (out, start + inserted.len())
 }
 
-/// Splices a picked value over the partial typed after the operator,
-/// quoting it if the grammar would otherwise split it, with a separating
-/// space when it lands at the end of the line.
+/// Replaces the partial value under the cursor. Quotes values that contain
+/// spaces or parentheses and adds a trailing space at the end of the line.
 #[must_use]
 pub fn insert_value(text: &str, cursor: usize, start: usize, value: &str) -> (String, usize) {
     let cursor = cursor.min(text.len()).max(start);

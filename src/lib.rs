@@ -1,37 +1,8 @@
-//! superapp — a personal "user space OS".
+//! Superapp puts focused panels on scrolling tiled workspaces.
 //!
-//! No apps, no windows: specialized panels (kind + params) on one horizontally
-//! scrolling 12×6 workspace, niri-style. See `docs/book` for the whole model.
-//!
-//! | module | role | depends on makepad |
-//! |---|---|---|
-//! | [`core`] | pure panel/column/join state machine | no |
-//! | [`store`] | the one SQLite file + the reactive query layer | no |
-//! | [`effect`] | the boundary: what leaves the process, and the job queue | no |
-//! | [`history`] | the in-memory tree of actions and their claims | no |
-//! | [`html`] | narrowing HTML from outside — mail, feed articles — to what a panel draws | no |
-//! | [`filter`] | the rich table's filter grammar and completion context | no |
-//! | [`richtable`] | the rich table: datasources, the SQL builder, paging | no |
-//! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
-//! | [`files`] | the file browser's domain: listings, the card, the held item, the verbs that write | no |
-//! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
-//! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
-//! | [`repl`] | device sync: the changeset log, the lease, the passes | no |
-//! | [`object`] | the sync transport: object store (memory, HTTP) + `state` | no |
-//! | [`r2`] | the same transport against a real bucket: TLS + SigV4 | no |
-//! | [`secret`] | passwords: keychain (macOS) / private file | no |
-//! | [`oauth`] | Gmail sign-in: the browser flow, and XOAUTH2's tokens | no |
-//! | [`launcher`] | the launcher's search over panels + mail world | no |
-//! | [`problems`] | standing problems, derived from the rows that carry them | no |
-//! | [`spring`] | niri's closed-form spring (via mosaic) | no |
-//! | [`ui`] | the shared vocabulary: text styles, accelerators | no |
-//! | [`theme`] | the look: sizes and colours | no |
-//! | [`scene`] | a subject in its named states, and the library canvas's layout | no |
-//! | [`app`] | the makepad shell: drawing, events | yes |
-//! | [`catalog`] | the scenes the panels library shows (CR-006) | yes |
-//! | [`library`] | the panels library: a canvas of live scenes (CR-006) | yes |
-//!
-//! Everything above `app` is pure and unit-tested without opening a window.
+//! Most modules contain product logic and do not depend on Makepad. [`app`],
+//! [`panels`], [`catalog`], and [`library`] contain the native interface. See
+//! `docs/book` for the product and architecture guide.
 
 pub mod app;
 pub mod catalog;

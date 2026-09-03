@@ -1,19 +1,9 @@
-//! Pure panel/column/join state machine + layout targets. No rendering, no I/O,
-//! no makepad — mirrors mosaic's `wm-core` division of labour: this module owns
-//! *what* the layout is; the shell owns *how it gets there* (springs).
+//! Panel, column, join, and workspace state with no rendering or I/O.
 //!
-//! The model is the one the web prototype (`web/`) validated:
-//! - a **panel** is kind + params and requests grid units on the workspace
-//!   grid (12×6 on desktop; the android shell switches 8×4 ⇄ 4×3 with the
-//!   fold); requests clamp to the active grid, and heights are honoured
-//!   literally — unused rows stay empty. The kind's request is a floor: the
-//!   shell measures what a panel is about to show and may ask for more
-//!   ([`Ws::wishes`] — a long letter opens tall);
-//! - solid links **open joined**, dotted links **replace in place**, buttons
-//!   are side effects (links live in panel content, i.e. the shell);
-//! - a **join** is alive only while the child sits in the column immediately
-//!   right of its parent; the next open from the parent replaces the joined
-//!   child; **replacing a panel closes its joined chain**.
+//! This module calculates target layouts. The Makepad shell animates toward
+//! them. Panel sizes use grid units and are limited by the active screen grid.
+//! A join exists only while its child remains in the next column. Replacing a
+//! panel closes its joined descendants.
 
 use std::collections::HashMap;
 
@@ -28,9 +18,7 @@ pub type PanelId = u64;
 /// phone as little as 4×3 — and may switch at runtime (fold/unfold).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
-    /// Unit columns across the viewport.
     pub w: u32,
-    /// Unit rows down the viewport.
     pub h: u32,
 }
 
@@ -135,31 +123,23 @@ impl Role {
 /// A panel's kind, parameters included: the whole identity of what it shows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// The legend + keys panel.
     Help,
-    /// One line about the prototype.
     About,
     /// A mail list over one folder role, optionally pre-filtered (a
     /// contact's address).
     Mailbox {
-        /// Which folder's mail: inbox, archive, sent, spam.
         role: Role,
-        /// Substring filter baked into the panel's params (not the typed one).
+        /// Initial filter from the panel parameters, separate from user input.
         filter: Option<String>,
     },
-    /// One mail.
     Message {
-        /// Which mail.
         id: MailId,
     },
-    /// A sender's card.
     Contact {
-        /// The sender's address.
         email: String,
     },
     /// A draft: blank, a reply, or a forward.
     Compose {
-        /// What it starts from.
         seed: Seed,
     },
     /// Accounts and their sync state.
@@ -176,21 +156,19 @@ pub enum Kind {
     /// way the inbox previews a message.
     Job {
         /// The `effect` row — or, negated, an in-memory effect's place in
-        /// the ring (CR-004). A ring id survives a restart as a panel
+        /// the ring. A ring id survives a restart as a panel
         /// param, but the ring does not, so the panel then says so.
         id: i64,
     },
-    /// One directory as a list (CR-008).
+    /// One directory as a list.
     Files {
-        /// The directory, in display form (`~/Downloads`).
         dir: String,
     },
-    /// One file as a card (CR-008).
+    /// One file as a card.
     File {
-        /// The file's path, in display form.
         path: String,
     },
-    /// One part of a letter as a card (CR-010) — the same card a file
+    /// One part of a letter as a card — the same card a file
     /// draws, over the mail's own bytes rather than the disk's.
     ///
     /// Named by the letter and the part's place in it, never by the
@@ -199,14 +177,12 @@ pub enum Kind {
     /// device's letter entirely. `(mail, at)` comes out of the same walk
     /// on both, off a `raw` they both have.
     Attachment {
-        /// Which letter.
         mail: MailId,
-        /// Which part of it (see `crate::sync::part_bytes`).
         at: u32,
     },
     /// The device-sync form: where a device is pointed at its bucket, and
     /// where the key that opens it is typed in rather than pushed over a
-    /// cable (CR-005). Settings links here.
+    /// cable. Settings links here.
     Bucket,
 }
 
@@ -243,7 +219,6 @@ impl Kind {
 /// One panel.
 #[derive(Debug, Clone)]
 pub struct Panel {
-    /// Identity.
     pub id: PanelId,
     /// What it shows. Replacement swaps this in place, keeping the id.
     pub kind: Kind,
@@ -252,7 +227,6 @@ pub struct Panel {
 /// One column: panel ids, top to bottom, plus its display mode.
 #[derive(Debug, Clone, Default)]
 pub struct Column {
-    /// Panels, top to bottom.
     pub panels: Vec<PanelId>,
     /// niri-style tabbed display: only the active panel shows, full height,
     /// under a tab strip.
@@ -274,36 +248,26 @@ impl Column {
 /// A focus/move direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
-    /// Left.
     Left,
-    /// Right.
     Right,
-    /// Up.
     Up,
-    /// Down.
     Down,
 }
 
 /// A rectangle in strip coordinates, logical points.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rect {
-    /// Left edge.
     pub x: f64,
-    /// Top edge.
     pub y: f64,
-    /// Width.
     pub w: f64,
-    /// Height.
     pub h: f64,
 }
 
 impl Rect {
-    /// Right edge.
     #[must_use]
     pub fn right(&self) -> f64 {
         self.x + self.w
     }
-    /// Bottom edge.
     #[must_use]
     pub fn bottom(&self) -> f64 {
         self.y + self.h
@@ -661,7 +625,7 @@ impl Ws {
 
     /// Raises `pid` to be its column's shown tab. [`Ws::normalize`] does this
     /// for the *focused* panel only, so a panel opened without focus — a
-    /// preview (CR-005) — would otherwise land as a hidden tab and draw at
+    /// preview — would otherwise land as a hidden tab and draw at
     /// alpha 0.
     pub fn activate(&mut self, pid: PanelId) {
         if let Some((c, r)) = self.locate(pid) {

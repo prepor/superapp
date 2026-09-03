@@ -1,4 +1,4 @@
-# CR-009 — marks: batch selection and batch actions on the inbox.
+# Marks: batch selection and batch actions on the inbox.
 #
 # Assertions are the clicks: `mark <topic>` is a row's gutter, the bar's
 # buttons are `archive marked` · `delete marked` · `mark all` · `clear

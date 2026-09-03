@@ -1,12 +1,7 @@
-//! Standing problems: background conditions that are wrong *right now* — an
-//! account whose last sync failed, a send the sender gave up on, a device
-//! sync that cannot reach its bucket. A toast announces the arrival; this is
-//! what remains once it has faded.
+//! Current sync and send problems derived from existing state.
 //!
-//! Nothing here is stored. The list is **derived** from rows that already
-//! exist (the account's status line, the failed outbox rows, the cached
-//! lease status), so it can never disagree with them and there is nothing to
-//! clear: fix the condition and the problem is gone.
+//! Problems are not stored separately. Fixing the source condition removes the
+//! matching row.
 
 use std::rc::Rc;
 

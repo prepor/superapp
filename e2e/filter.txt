@@ -1,4 +1,4 @@
-# CR-006 — the rich table's filter: tags, the autocomplete, values on
+# The rich table's filter: tags, autocomplete, values on
 # demand, and a list that pages as it scrolls.
 #
 # Assertions are the clicks: a row that does not resolve fails the run, so

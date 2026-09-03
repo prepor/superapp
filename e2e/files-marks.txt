@@ -1,4 +1,4 @@
-# CR-009 — marks in a files panel: the same set, the same bar and the same
+# Marks in a files panel: the same set, the same bar and the same
 # hidden group over a directory instead of the inbox.
 #
 # Run with `--demo-disk`: the browser then walks the demo tree the panels
@@ -8,7 +8,7 @@
 # · `mark all` · `clear marks` are the bar's, and each resolves only while
 # it is drawn.
 #
-# The verbs are real (CR-008), so every one that writes is followed by the
+# The actions are real, so every write is followed by the
 # ⌘z that puts the fixture back — which is an assertion of its own.
 wait 900
 

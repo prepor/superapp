@@ -1,21 +1,8 @@
-//! R2: the bucket, for real.
+//! Cloudflare R2 implementation of the device-sync object store.
 //!
-//! [`crate::object`] states the contract device sync needs — get, create-only
-//! put, compare-and-swap — and ships two backends that speak it over a plain
-//! socket: an in-process map, and a client for the local `bucketd` daemon.
-//! This is the third: **Cloudflare R2** over its S3 API. Same wire, plus the
-//! two things a local demo could do without — TLS, and AWS **SigV4** request
-//! signing.
-//!
-//! The compare-and-swap is not emulated. R2 implements S3's conditional
-//! writes, so `If-None-Match: *` *is* the create-only put and `If-Match:
-//! <etag>` *is* the compare-and-swap, each answered `412` when its
-//! precondition loses. The single-writer property the lease rests on — and
-//! that `formal/Lease.tla` checks — therefore rests on the object store
-//! itself, not on anything this client does.
-//!
-//! Nothing above this module knows R2 exists: [`open`] answers an
-//! `Arc<dyn Object>` from a URL, `https://` signing and `http://` not.
+//! Requests use TLS and AWS SigV4. S3 conditional writes provide create-only
+//! and compare-and-swap behavior. [`open`] selects this implementation for an
+//! HTTPS bucket URL.
 
 use std::net::TcpStream;
 use std::path::Path;

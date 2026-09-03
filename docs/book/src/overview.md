@@ -1,36 +1,31 @@
 # Overview
 
-Superapp is a personal "user space OS": one application that absorbs as much of
-daily computing as possible — email, messaging, RSS, calendar, knowledge base,
-text editing, agent orchestration — without splitting it into apps and windows.
+Superapp is my personal project, built for one user: me. It puts my everyday
+work in one application instead of many separate apps and windows. The
+long-term scope includes mail, messages, feeds, calendars, notes, editing, and
+agent tools.
 
-The bet: applications are the wrong unit. What a person actually works with is
-*views of their own data* — a list of messages, one thread, a draft, a note.
-Superapp makes that the primitive: every view is a **panel**, specialized on a
-single function, and every panel lives on one scrolling tiled workspace. The
-seams between "apps" disappear; a mail thread, the sender's contact card and a
-reply draft are three panels standing next to each other, joined.
+The main unit is a **panel**: a focused view such as a mail list, a thread, a
+draft, or a contact. Panels share one scrolling tiled workspace. Related panels
+can stay next to each other, so a mail thread, its sender, and a reply can form
+one working group.
 
-Because panels are small and single-purpose, they compose: the same [rich table](./richtable.md)
-that lists mail will list feed items and calendar events; the same link grammar
-navigates everything. Consistency is a hard requirement, not a style: from
-looking at any element you must know what it does.
+Panels reuse the same controls and navigation rules. For example, the
+[rich table](./richtable.md) used for mail can also support future feeds and
+calendar events. The same kind of control should behave the same everywhere.
 
 ## What exists today
 
-A native prototype (Rust + Makepad, macOS) with the full panel mechanics —
-scrolling 12×6 workspace, joins with cascade-close, spring animation, the
-link/button grammar, keyboard and mouse parity — exercised by fake mail panels:
-`email/mailbox` (inbox, archive, sent, spam), `email/message`, `email/compose`,
-`contact`, plus `settings`, `problems`, `help`, `about`, and `effects` with the
-`job` it previews into — the queue of the outside work worth retrying, read
-back as a list panel and its detail. Mail talks to a real IMAP account; the
-**file browser** (`files` and the `file` card) reads and writes the real disk,
-which is the first thing here that is not the app's own data at all — and
-the two meet at
-[attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card),
-where a part of a letter draws on the browser's own card and a file held in the
-browser becomes what a draft carries out.
+The current native prototype is written in Rust with Makepad. It runs on macOS
+and also has an Android build. It includes:
 
-The first, throwaway web prototype that validated the interaction model is kept
-under `web/`.
+- nine scrolling workspaces with tiled panels, joins, tabs, animation, and
+  keyboard, mouse, and touch controls;
+- mailboxes for inbox, archive, sent, and spam; conversation, compose, and
+  contact panels; and real IMAP and SMTP support;
+- settings, problems, help, and about panels;
+- an Effects panel that combines queued jobs with recent in-memory effects,
+  plus a panel for one queued job;
+- a file browser that reads and writes the real disk; and
+- [attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card),
+  which use the same file card for mail parts and files on disk.

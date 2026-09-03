@@ -1,21 +1,8 @@
-//! Replication: the wire format and the local drain (CR-005 phase 1).
+//! Device-sync data format, write permission, and sync work.
 //!
-//! Every write to the store is captured as a SQLite **session changeset** and
-//! queued in `repl_log` (see [`crate::store`]). This module is what carries
-//! those frames from one store to another. Phase 1 stops at the *local* half:
-//! no bucket, no lease, no network — just "drain one store's log into
-//! another and prove they converge." Phase 2 puts the same frames through an
-//! object store.
-//!
-//! A batch is **framed, not merged** — each transaction stays its own frame —
-//! for fault isolation: a failed apply names the transaction that broke it
-//! instead of an opaque blob. That is also why the frame keeps its local
-//! sequence: the header can later place it in the global order.
-//!
-//! The apply path ([`crate::store::Store::apply_frame`]) records **nothing**:
-//! a follower that re-captured what it applied would republish every frame
-//! forever. The convergence test at the bottom proves both properties — the
-//! rows land, and applying them writes no new frame back into the log.
+//! Every local transaction becomes a recorded change in `repl_log`. Batches
+//! keep transactions separate so an error can identify the one that failed.
+//! Applying a change from another device does not record it again.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -38,7 +25,7 @@ pub struct Frame {
     pub changeset: Vec<u8>,
 }
 
-/// The batch wire format's version byte — every object CR-005 writes carries
+/// Batch wire-format version. Every device-sync object carries
 /// one, and an unknown value refuses rather than guesses.
 const BATCH_V: u8 = 1;
 
@@ -131,7 +118,7 @@ pub fn drain(from: &Store, into: &Store) -> Result<usize, String> {
 }
 
 
-// -- the lease and the sync passes (CR-005 phases 2–3) ------------------------
+// -- lease and sync passes ----------------------------------------------------
 
 /// Where this device stands relative to the lease, as the UI shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -318,7 +305,7 @@ fn poll_from(store: &Store, obj: &dyn Object, may_bootstrap: bool) -> Result<Rol
         };
     };
 
-    // A schema the lineage does not share refuses the lease (CR-005): a
+    // A schema the lineage does not share refuses the lease: a
     // changeset naming an unknown table is skipped, not refused, so this
     // check is the only thing standing between drift and quiet loss.
     if state.schema != schema_of(store) {
@@ -578,17 +565,12 @@ pub fn acquire(store: &Store, obj: &dyn Object) -> Result<Status, String> {
         if store.epoch() == 0 {
             install(store, obj, &state)?;
         }
-        // Catch up to the head. Frames captured under a lease the lineage has
-        // since moved past — another device held it in between — are
-        // divergent by definition: the export-and-reset the design calls for
-        // discards them by resetting to the snapshot baseline and replaying.
-        // Unconditionally, not only when replaying the peer's frames happens
-        // to conflict row by row: row-level non-conflict is not semantic
-        // non-conflict, and a surviving frame would be published under a
-        // later epoch, after writes it never saw (`formal/Lease.tla`,
-        // `NoStaleWrite`). A replay that conflicts for any other reason
-        // resets the same way. (Minus the dated backup copy — a gap, CR-005
-        // phase 5.)
+        // Catch up first. If this device has unpublished changes from an older
+        // write lease, discard them and reinstall the shared snapshot. Another
+        // device has written since then without seeing those changes, so they
+        // must not enter the newer history. See `NoStaleWrite` in
+        // `formal/Lease.tla`. Any other replay conflict resets the same way.
+        // A dated backup is not implemented yet.
         let superseded = store.epoch() < state.epoch && store.unpublished() > 0;
         if superseded || materialize(store, obj, &state).is_err() {
             install(store, obj, &state)?;

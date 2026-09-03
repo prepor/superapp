@@ -1,22 +1,9 @@
-//! The catalogue: what the panels library shows (CR-006).
+//! Scene definitions for the Panels Library.
 //!
-//! One function per subject, each a [`Scene`] of the states worth a look
-//! while that subject is being worked on. A node comes up one of three
-//! ways:
-//!
-//! - a **component**: a bare widget from the library's template, populated
-//!   through its own API with a fixture — no store, no clock, a texture
-//!   the size of the piece;
-//! - a **panel**: one panel widget on a world of its own (an in-memory
-//!   store with the demo seed, a sealed outside, virtual time), chrome
-//!   included, so entering it gives the keys, the archive, the undo;
-//! - the **workspace**: the whole stage, kept for the shell's own subjects
-//!   — joins, tabs, the phone grid.
-//!
-//! A panel or workspace node may name a few steps in the harness's grammar
-//! that lead to its state; a component's state is its fixture. Fixtures
-//! are the real structs and states use the widgets' own methods, so a
-//! refactor that breaks a scene fails to compile.
+//! A node contains a component fixture, an isolated panel, or a workspace.
+//! Panel and workspace nodes may replay end-to-end steps to reach a state.
+//! Fixtures use real Rust types and widget APIs, so incompatible changes fail
+//! at compile time.
 
 use std::rc::Rc;
 
@@ -326,7 +313,7 @@ fn keep<E: effect::Effect>(store: &Store, e: &E, at: f64, error: Option<&str>) {
 /// the one genuinely irreversible effect having given up. Then the two the
 /// queue never saw: the session those pushes went through, and the read
 /// that found nothing new. Nobody files those, and the ring is the only
-/// place they exist (CR-004).
+/// place they exist.
 ///
 /// The mails are the demo seed's, so the payloads point at rows that exist.
 fn plant_queue(store: &Store) {
@@ -467,8 +454,8 @@ fn shown<E: effect::Effect + serde::Serialize>(e: &E, f: &Filed) -> (effect::Job
     (job, e.describe())
 }
 
-/// The same row for an effect that was never filed — one out of the ring
-/// (CR-004). A negative id is what says so, and it is the whole difference:
+/// Builds a row for an effect kept only in memory. A negative ID marks its
+/// source:
 /// no payload to decode, no attempts to count, no idempotence to promise,
 /// and the sentence carried on the row rather than derived from JSON.
 fn kept<E: effect::Effect>(
@@ -647,20 +634,20 @@ fn inbox_row() -> Scene<Setup> {
     let long = "[stelaxis] CI failed on main — workflow main #4116 failed on push 00a1b2c, the full logs attached to the run";
     Scene::new("inbox row", (520.0, 56.0))
         .note("One conversation as the inbox lists it: who wrote and when, the topic on its own line.")
-        .note("Bold while any of it is unread; the wash while the cursor is on it; the bar while it is marked (CR-009).")
+        .note("Unread rows are bold. The cursor adds a grey background. Marked rows have a dark bar.")
         .node("read", row(elena(), false, false))
         .node("unread", row(head(&["Elena Petrova"], "Sat hike", true, 1), false, false))
         .about("the whole row bold, not a dot")
         .node("selected", row(elena(), true, false))
-        .about("the cursor's wash; focus stays in the list")
+        .about("grey background under the cursor; focus stays in the list")
         .node("marked", row(elena(), false, true))
-        .about("the mark: an ink bar in the row's inset, no reflow")
+        .about("a dark bar marks the row without changing its size")
         .node("marked, cursor", row(head(&["Elena Petrova"], "Sat hike", true, 1), true, true))
-        .about("the wash and the bar together; bold still means unread")
+        .about("cursor background and mark together; bold still means unread")
         .node("conversation", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .about("first names once there are two, then the count")
         .node("long topic", row(head(&["GitHub"], long, false, 1), false, false))
-        .about("one line each, ellipsized")
+        .about("one line each, shortened to fit")
         .node("narrow", row(head(&["me", "Elena", "Vera"], "Q3 infra", true, 4), false, false))
         .sized((320.0, 56.0))
         .about("the phone's width")
@@ -676,7 +663,7 @@ fn thread_message() -> Scene<Setup> {
             w.as_thread_msg().populate(cx, 0, &t, open, quoted, &[]);
         })
     };
-    // What a letter carries, drawn under it (CR-010).
+    // What a letter carries, drawn under it.
     let carrying = |t: mail::ThreadMail, atts: Vec<mail::Attachment>| {
         widget(live_id!(thread_msg_tpl), move |cx, w| {
             w.as_thread_msg().populate(cx, 0, &t, true, false, &atts);
@@ -1121,20 +1108,20 @@ fn marks_bar() -> Scene<Setup> {
     let inbox = move |m, t, h| bar(Kind::Mailbox { role: Role::Inbox, filter: None }, m, t, h);
     let files = move |m, t, h| bar(Kind::Files { dir: files::HOME.into() }, m, t, h);
     Scene::new("marks bar", (520.0, 40.0))
-        .note("What a list shows while any row is marked (CR-009): the count, the verbs on the marked set, all, clear.")
-        .note("Comes with the first mark, goes with the last. Every verb wears the letter its single-row twin wears.")
+        .note("Shown when rows are marked: the count, available actions, select all, and clear.")
+        .note("Appears with the first mark and closes with the last. Shortcuts match the single-row actions.")
         .node("three", inbox(3, 143, 0))
         .about("of the rows under the filter")
         .node("hidden", inbox(3, 12, 1))
         .sized((520.0, 64.0))
-        .about("a mark the filter hides is still counted, and said; the verbs drop a line")
+        .about("hidden marks are still counted; actions move to a new line")
         .node("all", inbox(143, 143, 0))
-        .about("all stands down")
+        .about("select all is disabled")
         .node("narrow", inbox(3, 143, 1))
         .sized((356.0, 64.0))
-        .about("the phone's width: the verbs wrap")
+        .about("actions wrap at phone width")
         .node("files", files(2, 8, 0))
-        .about("a files panel's own row verbs, on the set: copy ⌘p, move ⌘m, delete ⌘d")
+        .about("file actions for the marked rows: copy ⌘p, move ⌘m, delete ⌘d")
         .edge("three", "hidden", "/ github")
         .edge("three", "all", "⌘l / all")
 }
@@ -1149,18 +1136,18 @@ fn inbox_marks() -> Scene<Setup> {
         format!("{three}\nkey /\nwait 300\ntype \"vera\"\nwait 300\nkey enter\nwait 600");
     let all = format!("{three}\nclick \"mark all\"\nwait 500");
     Scene::new("inbox, marked", (520.0, 640.0))
-        .note("The inbox with marks (CR-009): the bar under the filter, an ink bar down every marked row, the cursor walking on.")
-        .note("Filtering never drops a mark: the ones it hides ride above the rows, under their own caption.")
+        .note("The inbox with marked rows: actions under the filter, a dark bar on each mark, and a separate cursor.")
+        .note("Filtering keeps marks. Hidden marks are listed above the visible rows.")
         .note("Live — space marks, shift+↓ ranges, all takes the rest; with nothing marked the list is the inbox scene's fresh.")
         .node("three", inbox(three))
         .about("space marked the cursor's row, shift+↓ the two under it")
         .node("filtered", inbox(&filtered))
         .about("the two the filter hides, kept in sight above the rows")
         .node("all", inbox(&all))
-        .about("every row the filter shows, loaded or not; the button stands down")
+        .about("every matching row, loaded or not; select all is disabled")
         .node("phone", inbox(three))
         .sized((380.0, 720.0))
-        .about("the phone's width: the verbs drop under the count")
+        .about("at phone width, actions move below the count")
         .edge("three", "filtered", "/ vera")
         .edge("three", "all", "⌘l / all")
 }
@@ -1246,11 +1233,11 @@ fn files_row() -> Scene<Setup> {
                 false,
             ),
         )
-        .about("one line, ellipsized; the columns hold")
+        .about("one line, shortened to fit; columns keep their width")
         .node("marked", marked(entry("report-q3.pdf", false, 1_258_291), false))
-        .about("the mark (CR-009): an ink bar in the row's inset, no reflow")
+        .about("a dark bar marks the row without changing its size")
         .node("marked, cursor", marked(entry("report-q3.pdf", false, 1_258_291), true))
-        .about("both at once: the wash under the bar")
+        .about("cursor background and mark together")
         .edge("file", "selected", "↓ / click")
         .edge("file", "marked", "space")
         .edge("selected", "marked, cursor", "space")
@@ -1259,7 +1246,7 @@ fn files_row() -> Scene<Setup> {
 fn files() -> Scene<Setup> {
     let dir = |d: &'static str, script: &str| panel_fake(move |_| Kind::Files { dir: d.into() }, script);
     Scene::new("files", (520.0, 640.0))
-        .note("A directory as a column: the crumbs, the filter, the rows; every header verb acts on the directory shown.")
+        .note("A directory as a column: path, filter, and rows. Header actions apply to the open directory.")
         .note("Live — enter a node: arrows walk, enter goes, / filters, ⌘n asks for a name, ⌘p and ⌘m hold.")
         .node("home", dir(files::HOME, ""))
         .about("the launcher's root; dot-files out")
@@ -1353,7 +1340,7 @@ fn file_card() -> Scene<Setup> {
         .edge("other", "held", "⌘p")
 }
 
-/// The same card, over a letter's own bytes (CR-010). The demo seed gives
+/// The same card, over a letter's own bytes. The demo seed gives
 /// two of its letters a real multipart raw, so the id is looked up rather
 /// than invented — a fixture would prove nothing about the walk that makes
 /// these rows.

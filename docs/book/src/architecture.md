@@ -1,118 +1,96 @@
 # Architecture
 
-Mosaic's division of labour, adopted wholesale: a pure core that owns *what*
-the layout is, and a shell that owns *how it gets there*.
+The application has two main parts:
 
-| module | role | depends on makepad |
-|---|---|---|
-| `src/core.rs` | panel/column/join state machine + scene targets | no |
-| `src/store.rs` | the one SQLite file + the reactive query layer | no |
-| `src/effect.rs` | the boundary: what leaves the process, the job queue, the in-memory ring, and the log's datasource | no |
-| `src/history.rs` | the in-memory tree of actions and their claims | no |
-| `src/filter.rs` | the rich table's filter grammar and completion context | no |
-| `src/richtable.rs` | the rich table: datasources, the SQL builder, paging | no |
-| `src/mail.rs` | the mail domain: queries, titles, seed, attachments, effects, intents | no |
-| `src/files.rs` | the file browser's domain: paths, listings, the card (a file's *and* a letter's part's), the path completion, the verbs that write and their intents | no |
-| `src/html.rs` | narrowing HTML from outside — mail, feed articles — to what a panel draws | no |
-| `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |
-| `src/send.rs` | drafts → outbox → SMTP, with the undo window | no |
-| `src/repl.rs` | device sync: the log, the lease, and the sync passes | no |
-| `src/object.rs` | the sync transport: object store (memory, HTTP) + `state` | no |
-| `src/secret.rs` | passwords: keychain (macOS) / private file | no |
-| `src/oauth.rs` | Gmail sign-in: the browser flow, and XOAUTH2's tokens | no |
-| `src/launcher.rs` | the launcher's search over panels + mail world | no |
-| `src/problems.rs` | standing problems, derived from the rows that carry them | no |
-| `src/spring.rs` | niri's closed-form spring (via mosaic) | no |
-| `src/ui.rs` | the semantic content vocabulary: lines, fields, forms | no |
-| `src/theme.rs` | the look: sizes and colours | no |
-| `src/e2e.rs` | e2e script grammar + runner state | no |
-| `src/scene.rs` | a subject in its named states, and the library canvas's layout | no |
-| `src/mac.rs` | screen geometry, activation, window screenshots | no (apple-sys) |
-| `src/panels.rs` | retained panel widgets | yes |
-| `src/app.rs` | the makepad shell: drawing, events, animation | yes |
-| `src/catalog.rs` | the scenes the panels library shows | yes |
-| `src/library.rs` | the panels library: a canvas of live scenes | yes |
+- a core that decides what the workspace contains and where panels belong;
+- a Makepad shell that draws the result, handles input, and animates changes.
 
-Everything above `panels` is std-only and unit-tested without opening a
+Most modules do not depend on Makepad and can be tested without opening a
 window.
 
-## The world
+| Module | Purpose | Uses Makepad |
+|---|---|---|
+| `core.rs` | Panels, columns, joins, workspaces, and target layout | No |
+| `store.rs` | SQLite storage and cached queries | No |
+| `effect.rs` | Work outside the database, queued jobs, and the Effects source | No |
+| `history.rs` | Undo and redo history | No |
+| `filter.rs` | Filter parsing and completion context | No |
+| `richtable.rs` | Table data sources, SQL building, pages, and marks | No |
+| `mail.rs` | Mail queries, data, actions, and attachments | No |
+| `files.rs` | File listings, file cards, path completion, and file actions | No |
+| `html.rs` | Safe, limited HTML used by message bodies | No |
+| `sync.rs` | Receiving and updating mail through IMAP | No |
+| `send.rs` | Drafts, the outbox, SMTP, and the undo delay | No |
+| `repl.rs` | Device-sync log, lease, and sync passes | No |
+| `object.rs` | In-memory and HTTP object storage used by device sync | No |
+| `r2.rs` | Signed requests to an R2 bucket | No |
+| `secret.rs` | Keychain or private-file storage for passwords and keys | No |
+| `oauth.rs` | Gmail browser sign-in and token handling | No |
+| `launcher.rs` | Launcher search | No |
+| `problems.rs` | Current sync, send, and device-sync problems | No |
+| `spring.rs` | Animation calculations | No |
+| `ui.rs` | Shared content types such as lines, fields, and buttons | No |
+| `theme.rs` | Sizes and colours | No |
+| `e2e.rs` | End-to-end script parser and runner | No |
+| `scene.rs` | Panel-library scenes and their layout | No |
+| `mac.rs` | macOS screen, window, and screenshot helpers | No |
+| `panels.rs` | Panel widgets | Yes |
+| `app.rs` | The Makepad shell | Yes |
+| `catalog.rs` | Scenes shown in the Panels Library | Yes |
+| `library.rs` | The Panels Library canvas | Yes |
 
-`World` is the one handle to everything outside the pure core: the store,
-the outside (`Real` / `Fake` / `Deny`), the effect registry. It is a value
-you construct, never a global — the UI thread owns one, and each
-worker thread builds its own. That is what lets a whole app instance exist
-in memory, which is what makes tests isolated and parallel. See [The Data
-Substrate](./data-substrate.md).
+## World
+
+`World` holds the database, access to the operating system and network, and the
+effect registry. It is passed into the code instead of stored globally. The UI
+thread and each worker have their own handle. Tests can replace the real world
+with an isolated in-memory one. See [Data and Effects](./data-substrate.md).
 
 ## Stages and mounts
 
-The shell's widget is the `Stage`: the workspace, its springs, its hits,
-its script runner. It comes up on a `Boot` — a store path or memory, a
-grid, the send window, whether time is virtual, which outside — and the
-window's own stage builds its boot from argv. The panels library builds
-one per panel or workspace node of a scene instead and **mounts** the
-stage on the canvas — solo on the one panel the node names, or the whole
-workspace: each mount renders into its own pass at the canvas's zoom,
-replays the node's steps on virtual time, and owns nothing outside that
-pass — no menu bar, the IME only while entered, redraws scoped to its own
-draw list, and the actions its widgets raise captured and handed back to
-it alone. A component node mounts a bare widget the same way, with no
-stage at all. See [Developer Experience](./dev-x.md#panels-library).
+`Stage` is the main workspace widget. It owns the workspace, animation, hit
+areas, and end-to-end runner. A `Boot` value supplies its database, grid,
+send-delay setting, clock, and access to the outside world.
+
+The application window has one stage. The Panels Library creates smaller
+stages, called mounts, for its examples. A mount can show one panel or a whole
+workspace. It draws into its own surface and receives only its own events.
+Simple component examples mount a widget without a stage. See
+[Developer Experience](./dev-x.md#panels-library).
 
 ## Frame loop
 
-```text
-Event::{Key,Mouse}* ──▶ mutate Ws ──▶ ensure_focus_visible ──▶ ws.scene()
-                                              │
-                                              ▼
-                            Anim::apply (retarget / spawn / ghost)
-Event::NextFrame ──▶ Anim::advance(dt) ──▶ redraw while anything moves
-```
+Input changes the workspace model. The model then produces target panel and
+camera positions. Animation moves the current positions toward those targets
+and requests frames only while something is moving. Trackpad movement updates
+the camera directly.
 
-The scene is pulled only after a mutation, never per frame; the shell idles at
-zero frames. Trackpad pans bypass the springs (1:1, camera jump).
+The model is read again after a change, not on every animation frame. This lets
+the application stop drawing while idle.
 
-## Shell internals
+## Drawing and input
 
-- **Char grid.** The mono face is measured once per display scale
-  (`prepare_single_line_run`); panel content is a list of styled lines whose
-  segments (text, links, buttons, key-caps, fields) advance on that grid.
-  Bodies draw inside clipped, absolutely-positioned turtles, so scrolling is
-  pixel-smooth and clipping exact.
-- **Hit testing.** Drawing records `(rect, action, cursor)` for every
-  interactive segment; a click resolves the topmost record. Immediate-mode UI:
-  the hit list is one frame old at worst, only during animation.
-- **Text input.** makepad emits `TextInput` only while the system IME is shown
-  (`show_text_ime`); the shell mirrors field focus into IME visibility.
-  Letters reach panels as text; control keys as `KeyDown`.
-- **Ownership.** `State` (workspace, mail flags, per-panel UI, springs, toast)
-  is a `#[rust]` box on the Stage widget, taken out during draw so drawing
-  methods can borrow both the draw resources and the state.
-- **Nothing heavy in a draw.** A `draw_walk` runs on the UI thread, inside
-  the frame, and — this being immediate mode — runs again on every redraw.
-  Anything that is not laying out the pixels in front of you does not belong
-  there: no I/O, no parsing, no decoding, nothing that scales with the size
-  of the data rather than the size of the view. A blob read out of SQLite, a
-  MIME walk, a base64 decode, a PNG decode: each is milliseconds, each lands
-  in one frame, and a few of them together are a visible stutter — a scroll
-  that catches, a panel that opens late. Reading rows through
-  [`Store::rows`](./data-substrate.md) is the exception the design pays for:
-  results are cached per `(query, params)` and only re-run when a generation
-  says they are stale, so the draw is a lookup.
+- The shell measures the monospace font once for each display scale. Panel
+  content uses this character grid, while scrolling remains pixel-smooth.
+- Drawing records a rectangle and action for each control. A click uses the
+  topmost matching rectangle from the latest frame.
+- Focused fields use the system input method. Text arrives as text input;
+  shortcuts arrive as key events.
+- `State` holds the workspace and UI state for a stage. Drawing temporarily
+  takes this state out of the widget so both can be borrowed safely.
 
-  The shape of the fix is always the same. Ask for the work off the frame,
-  once, keyed by what it is *for*; let the answer land through an action that
-  redraws; and hold the right-sized box in the meantime, so nothing reflows
-  when it arrives. The pictures in a letter (`Pictures` and `HtmlImage` in
-  `panels.rs`) are the worked example: the panel asks a reader thread for a
-  mail's `cid:` parts instead of reading and parsing its raw itself, the item
-  hands the bytes to makepad's decode pool instead of decoding them, and the
-  size comes off the image header — cheap, and enough to reserve the space
-  the picture will fill while it is still decoding.
+## Keep expensive work out of drawing
 
-  Some work genuinely cannot leave the thread: an SVG becomes geometry on the
-  widget's own script VM, so parsing it is the UI thread's or nobody's. Then
-  cap what you are willing to accept rather than letting one document decide
-  how long the frame takes — `MAX_INLINE_SVG` is 64 KiB, and past it the
-  picture is its alt text.
+Drawing runs on the UI thread and may run many times during an animation. It
+must not perform file or network access, parse large messages, or decode large
+images. Database reads are allowed through `Store::rows` because results are
+cached and invalidated only when their source tables change.
+
+Longer work runs on a worker. The panel keeps a stable placeholder, then
+updates and redraws when the result arrives. Message images follow this rule:
+a reader thread loads mail parts, Makepad's decode pool decodes them, and the
+image header provides enough information to reserve their final size.
+
+Some Makepad work, such as turning SVG into drawing commands, must stay on the
+UI thread. Such input is limited instead. Inline SVG is capped by
+`MAX_INLINE_SVG` at 64 KiB; larger images use their alternative text.

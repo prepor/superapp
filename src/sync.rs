@@ -1,24 +1,8 @@
-//! The IMAP sync engine: one worker thread per account, each with its own
-//! [`World`] over its own **reader** on the one store — writes go to the
-//! shared single writer (CR-005 phase 0), and the UI notices a worker's
-//! commit via `data_version` (see [`crate::store::Store::poll_external`]).
+//! IMAP sync with one worker per account.
 //!
-//! Sync is **ingest**, not action: nothing here is undoable, and nothing
-//! here fights the user. Local intent (`message`) and server fact
-//! (`server_msg`) are separate columns, and their disagreement *is* the push
-//! queue.
-//!
-//! Two rules this module exists to obey (CR-004):
-//!
-//! - **The push pass does not talk to the server.** It materializes each
-//!   disagreement as a [`mail::Move`], [`mail::Seen`] or
-//!   [`mail::Forwarded`] job and lets the
-//!   executor perform it. Every job revalidates first, so a disagreement
-//!   that undo removes before the executor reaches it is never pushed at
-//!   all — undo still costs zero server traffic.
-//! - **No effect runs inside a transaction.** The fetch pass gathers
-//!   everything it needs over the network first, then commits once. It used
-//!   to hold `BEGIN IMMEDIATE` across three round trips per folder.
+//! `message` records the user's chosen state; `server_msg` records the server's
+//! state. Differences become queued jobs, which check again before running.
+//! Network work always finishes before a database transaction begins.
 
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -140,7 +124,7 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
         if p.moving {
             // The job is encoded *outside* the write: the payload and the
             // clock read need the `World`, which cannot travel to the writer
-            // thread (CR-005 phase 0). The `in_flight` guard stays inside the
+            // thread. The `in_flight` guard stays inside the
             // transaction, so the claim is still atomic.
             let job = w
                 .prepare(&mail::Move {
@@ -256,7 +240,7 @@ fn fetch_account(w: &World, account: i64) -> Result<(), String> {
 
         // The folder row and what we last knew about it — a short write,
         // no network in sight. Owned copies cross to the writer thread; the
-        // originals stay for the round trips below (CR-005 phase 0).
+        // originals stay for the round trips below.
         let name = rf.name.clone();
         let (fid, known): (i64, (Option<i64>, Option<i64>)) = w
             .store()
@@ -518,10 +502,10 @@ fn ingest_message(
          VALUES(?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![id, folder, m.uid, !m.unread, m.forwarded],
     )?;
-    // Which conversation it belongs to (CR-007) — decided here, in the same
+    // Which conversation it belongs to — decided here, in the same
     // transaction, so no draw ever sees an unthreaded mail.
     mail::thread_tx(tx, account, id, &p.message_id, &p.references)?;
-    // …and what it carries (CR-010), in the same transaction for the same
+    // …and what it carries, in the same transaction for the same
     // reason: a letter is never listed without its parts.
     mail::attach_tx(tx, id, &p.attachments)?;
     Ok(())
@@ -539,20 +523,20 @@ pub struct ParsedMail {
     /// or when the narrowing left nothing worth showing.
     pub html: Option<String>,
     /// The Message-ID header, angle brackets off — move adoption, and the
-    /// identity threading walks (CR-007).
+    /// identity threading walks.
     pub message_id: String,
     /// `References` ∪ `In-Reply-To`, brackets off, header order, deduped:
     /// every conversation this mail claims to belong to.
     pub references: Vec<String>,
     /// The subject with its reply/forward prefixes stripped.
     pub topic: String,
-    /// The parts the letter carries beside its readings (CR-010) — what
+    /// The parts the letter carries beside its readings — what
     /// the message panel lists and a card opens. The bytes stay in `raw`;
     /// only the description is stored.
     pub attachments: Vec<Part>,
 }
 
-/// One part of a letter, as a row describes it (CR-010). The bytes are not
+/// One part of a letter, as a row describes it. The bytes are not
 /// here: they live in the `raw` the store already keeps, and [`part_bytes`]
 /// reads them back by `at` — which is what keeps a mailbox one copy of
 /// itself rather than two.
@@ -776,7 +760,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name(format!("sync-{account}"))
         .spawn(move || {
-            // The worker joins the *one* writer (CR-005 phase 0) — its own
+            // The worker joins the *one* writer — its own
             // reader over the shared `Db`, never a second writable connection.
             let Ok(store) = crate::store::Store::with_db(db) else {
                 return;
@@ -1069,7 +1053,7 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         assert_eq!(imgs[0].0, "sketch.png@ivanov.dev");
         assert!(imgs[0].1.starts_with(b"\x89PNG"));
         assert!(inline_images(RAW_ALT.as_bytes()).is_empty(), "no cid parts, no images");
-        // …and it is *not* listed as an attachment (CR-010): the reading
+        // …and it is *not* listed as an attachment: the reading
         // already draws it, and a picture under a picture of itself is
         // noise. `mail-parser` calls it one, so this is our own rule.
         assert!(p.attachments.is_empty(), "{:?}", p.attachments);
@@ -1077,7 +1061,7 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
 
     /// A letter that carries files: one row a part, named, typed and
     /// sized, and the bytes read back out of the raw by part index — no
-    /// second copy of an attachment anywhere (CR-010).
+    /// second copy of an attachment anywhere.
     #[test]
     fn a_letter_lists_what_it_carries() {
         const RAW_ATT: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
@@ -1268,8 +1252,8 @@ JVBERi0xLjQK\r\n\
         assert_eq!(w.jobs().len(), before, "convergence is quiet");
     }
 
-    /// The property phase 4 bought and CR-004 keeps: intent reverted before
-    /// the executor runs costs the server *nothing*. No job, no round trip.
+    /// Reverting intent before the executor runs creates no job and makes no
+    /// server request.
     #[test]
     fn intent_reverted_before_the_pass_never_reaches_the_server() {
         let w = world();

@@ -1,19 +1,11 @@
-//! Object storage: the transport CR-005's replication rides on.
+//! Object storage used by device sync.
 //!
-//! One small interface — get, conditional-create, compare-and-swap — is all
-//! the lease and the log need. The `state` object is the only mutable one and
-//! is advanced with a CAS on its ETag: the write that moves the log *is* the
-//! check that we still hold the lease. Batches and snapshots are immutable and
-//! written create-only.
+//! The interface can read, create a missing object, or replace an object only
+//! when its version still matches. The `state` object records which device may
+//! write and the latest batch. Batches and snapshots never change after upload.
 //!
-//! Three backends ship: [`MemBucket`] (in-process, for tests), [`HttpBucket`]
-//! (a plain-HTTP client for the local `bucketd` daemon), and [`crate::r2`]
-//! (Cloudflare R2 over its S3 API — the same wire, with TLS and request
-//! signing). The last two share the HTTP framing here; only the stream and
-//! the headers differ. ETags are opaque per-key version tokens — the client
-//! never interprets them, only round-trips them — so a backend is free to use
-//! a counter (what `MemBucket` does), a content hash (what `bucketd` and S3
-//! do), or anything else.
+//! [`MemBucket`] is used in tests, [`HttpBucket`] talks to the local `bucketd`,
+//! and [`crate::r2`] talks to Cloudflare R2. ETags identify object versions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -55,7 +47,7 @@ pub struct Snapshot {
     pub hash: String,
 }
 
-/// The current wire version for every object CR-005 writes.
+/// Current wire version for device-sync objects.
 pub const WIRE_V: u32 = 1;
 
 /// The one mutable object's key.

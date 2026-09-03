@@ -1,547 +1,282 @@
-# The Data Substrate
+# Data and Effects
 
-One SQLite file holds **all** durable data — the mail *and* the UI: which
-panels are open, where, joined to what, focused on which workspace. `sqlite3
-"~/Library/Application Support/superapp/superapp.db"` shows your session as
-rows; that inspectability is a feature, not a debugging aid. The design is
-rel.systems' idioms brought in-process: single writer, WAL, hook-driven
-change capture, and side effects as rows.
+One SQLite file stores mail and UI state that must survive a restart. This
+includes open panels, their positions and joins, focus, drafts, and mail state.
+The file can be opened with `sqlite3`.
 
-## Three write paths
+## Writing data
 
-1. **Actions** — user intent. The only path UI code mutates through.
-2. **Ingest** — sync results: not undoable, same store, same invalidation.
-3. **Effects** — what reaches the outside world, as rows in one queue
-   (below).
+There are three reasons to change stored data:
 
-All go through one `write(tx)` seam: one mutation, one transaction.
+1. **Actions** record a user's choice and can usually be undone.
+2. **Import** records facts received during sync and cannot be undone.
+3. **Jobs** record work that must happen outside the database and may need a
+   retry.
 
-## The line: what is an effect
+All three use one `write` entry point and one transaction per change.
 
-> **An effect is anything whose result the store cannot reproduce.**
+The process has one writable database connection on its own thread. UI, sync,
+and send code ask that thread to make changes and wait for the result. All other
+connections are read-only, so an accidental write fails instead of conflicting
+with another write.
 
-The store is the app's memory — replaying its transactions replays the app —
-so SQLite is emphatically *not* an effect. A socket, the keychain, the
-clipboard, a file beside the store, the screen and the clock are. The
-corollary is the one that shapes everything below: **archiving a mail is not
-an effect; pushing the archive is.**
+## Effects
 
-## One writer, and the replication log
+An effect is work whose result cannot be recreated from the database. Network
+requests, keychain access, clipboard access, the clock, and file operations are
+effects. A database change is not.
 
-There is exactly **one writable connection**, private to a dedicated writer
-thread. Every mutation in the process — from the UI, from a sync worker, from
-the sender — is a closure submitted to that thread and awaited; the closure
-runs on the writer, so it owns what it touches rather than borrowing UI
-state. Every *other* connection is a `query_only` reader, so a write that
-tries to skip the gate fails with `SQLITE_READONLY` loudly in a test rather
-than racing silently in production. That single door is what device sync
-needs (CR-005): a write nobody captured would be divergence no changeset can
-reconstruct.
+For example, marking a message as archived changes its desired state in SQLite.
+Moving it on the IMAP server is the effect that later makes the server match.
 
-Inside the gate, a SQLite **session** over the durable tables records what
-each transaction wrote as a changeset and queues it in `repl_log`, in the
-same transaction. That log is a queue that drains and prunes, not a table
-anything migrates through.
+Effects can describe themselves and run in one of three modes:
 
-Those frames reach the other device through an **object store** — three
-verbs, get and create-only and compare-and-swap — with a lease so only one
-device writes at a time. A single `state` object fuses the lease with the
-head pointer, so the compare-and-swap that advances the log *is* the check
-that this device still holds the lease. One device bootstraps the lineage
-(uploads a snapshot, writes the first `state`); the other installs that
-snapshot to gain a common ancestry, then applies each published batch
-forward.
+- `Real` uses the operating system and network;
+- `Fake` uses isolated in-memory test data;
+- `Deny` refuses every effect, which keeps component examples safe.
 
-The transport is chosen by the URL: a small local `bucketd` daemon for a demo
-with no cloud account, or **Cloudflare R2** over its S3 API for real (TLS and
-signed requests, and nothing else different — see
-`docs/device-sync-demo.md`). The compare-and-swap is not emulated on top of
-either: R2 implements S3's conditional writes, so `If-None-Match: *` is the
-create-only put and `If-Match: <etag>` is the compare-and-swap. The
-single-writer property rests on the object store, which is why it can be
-model-checked rather than hoped for.
+Each effect also states whether it changes the outside world or only reads it.
+The Effects panel can filter on that distinction.
 
-A device is given its bucket the way it is given a mailbox: from a panel with
-three fields, not from a command line. The secret goes to the platform's
-secret store (never the SQLite file, never a config file); the endpoint and
-key id go to a `bucket` file beside the store; the worker restarts onto them.
-That road exists because the device most in need of it — a phone — has no
-shell to run a flag from.
+### Queued jobs
 
-The role drives the UI and the write gate together. A **holder** writes;
-everyone else is read-only and sees a **locked screen** — who holds the
-lease, and a button to take it. The holder hands the lease back on sleep and
-on close, so the other device can acquire it without an override; taking it
-from a live holder is an override, worded as the risk it is (that device may
-hold work it never published). A device overridden while it thought it held
-the lease is **stranded**: read-only, recovery by hand, never a silent merge.
+Effects that need retries are saved in the `effect` table. A worker claims a
+pending row, checks that it is still needed, performs the work outside a
+transaction, and records the result. Checking again prevents an old job from
+running after the user has already reversed the action.
 
-Effects are values that describe themselves in one line and know how to do
-themselves, behind one swappable backend — the real one, an in-memory fake,
-or one that refuses everything. That last is what lets a panel be drawn in
-isolation without it quietly sending mail. Each also says whether it
-**changed** the world or only asked it something; that is what the effects
-panel opens narrowed to.
+Workers claim only jobs they can run. An account's sync worker owns its IMAP
+session and claims jobs for that account. The sender claims work that does not
+need such a session.
 
-## The disk
+Failed jobs retry with increasing delays. After six attempts they stop and wait
+for the user. Each job says whether it is safe to repeat after a crash. Safe jobs
+return to the queue; other jobs fail with `interrupted; outcome unknown` so a
+send or other one-time action is not repeated by guesswork.
 
-The filesystem is outside by that same line — nothing the store can
-reproduce — so the [file browser](./interaction-grammar.md#files-a-directory-is-a-column-a-file-is-a-card)
-reaches it through the same backend the network does: `list_dir`, `stat`,
-`read_file` and `open_path` sit beside `now` and `clip`, and so do the four
-that write — `make_dir`, `copy_path`, `move_path` and `trash`. A files
-panel is the one kind that reads outside the store *while drawing*, so the
-world rides its props; everything else in the app draws from rows alone.
+Payloads and replies are JSON text, so the queue remains readable with
+`sqlite3`. Panels observe job results through the same cached-query system used
+for all other database data.
 
-The write verbs are performed inline, where the click is, the way `clip`
-and `open` are — not filed as jobs. They are effects because the store
-cannot reproduce them, not because anyone would retry them: a copy that
-refuses has to say so in the same breath as the click, and an action whose
-undo is recorded the moment it happens can never race a queue. The costs
-are both open questions: the wait for a large tree, and a delete that
-leaves no row in [the log panel](#the-log-panel). There is no
-`remove` among them on purpose: `trash` answers *where it put it*, which is
-what makes a delete an ordinary move to undo, and it is the only way this
-app takes a path away — the reversal of a copy uses it too.
+### Recent in-memory effects
 
-A destination is claimed by the kernel, never by a check: a copy makes its
-file with `O_EXCL` and then writes **through that descriptor** — reopening
-the name would give a racer room to unlink the empty file and leave one of
-their own to be truncated — a directory with `create_dir`, and a move
-renames with macOS' `renamex_np` and `RENAME_EXCL`. Plain `rename` and
-`fs::copy` replace what they find, and a check before them is a window
-another program can write into: the sentence on the status line is worth a
-check, but not the file. Two more refusals are the same carefulness: a
-destination inside its own source, asked of the *resolved* paths so an
-alias in the middle cannot make a copy feed itself its own output; and
-anything that is not a file, a directory or a link, because opening a FIFO
-blocks until somebody writes to it and these verbs run on the frame of the
-click.
+Effects that need an immediate answer are not queued. The process keeps the
+latest 200 of them in a memory-only ring. It records the kind, owner, short
+description, and any error. Clock reads are excluded because they happen many
+times per frame.
 
-A copy that fails partway takes back what it had already made — and only
-that: the claim on the destination is also the record of whose it is, so a
-failure that never got the name leaves whatever is standing there alone.
-This is the one thing the app *removes* rather than trashes, and it is the
-narrow case that earns it: a tree this process made, that no panel ever
-listed and no one ever had, is not a deletion, and filling somebody's trash
-with failed attempts would be the ruder of the two. The far side of a
-cross-volume move goes the same way when the source will not move: a move
-either happened or it did not.
+The Effects panel combines the database queue and this ring with `UNION ALL`.
+Memory rows use negative IDs, database rows use positive IDs, and both are
+ordered by time. `@memory` and `@filed` select the two sources.
 
-What that buys is what every backend buys: the real one reads and writes
-the disk, hands a path to the OS (`/usr/bin/open` on macOS) and trashes
-through `NSFileManager`'s own door — the right trash for the volume, the
-Put Back the Finder offers — the fake serves a demo tree, which is why the
-panels library draws the same directory on every machine, and a sealed
-world says *this world has no outside* on the status line instead of
-pretending. The demo tree takes the writes too, so an e2e run under
-`--demo-disk` proves the verbs against a fixture rather than against
-somebody's home. What it costs is the reactive layer: a listing is not a
-query, so nothing invalidates it when the disk moves — a verb that wrote
-tells the panels itself.
+SQLite reads the ring through a registered `mem_effects()` function. Because
+SQLite cannot discover this in-memory source, the Effects table source
+declares it explicitly. A ring version invalidates cached pages when a worker
+adds an entry.
 
-Paths cross that boundary in two spellings, and the mapping is one function
-each way: the panels show and persist `~/Downloads/2026`, the outside reads
-`$HOME/Downloads/2026`. A panel's params are the display form, so a session
-restored on another machine points at that machine's home.
+Memory IDs are valid only for the current process. If a job panel points to a
+memory row, session saving records the parent Effects panel instead. This avoids
+opening an unrelated row with the same ID after restart.
 
-## The reactive layer
+### Effects and job panels
 
-Panels read **only** through registered queries (`store.rows(Q, params)`).
-Each result is cached per `(query, params)` and stamped with the
-**generation** of every table it read; a commit bumps its touched tables'
-generations (SQLite's `update_hook` reports them), and stale results re-run
-lazily on next draw. Dependencies are not declared — they are **captured by
-SQLite's authorizer** at prepare time, so the dependency set is complete by
-construction.
+The **Effects** panel is a [rich table](./richtable.md) of queued and in-memory
+effects, newest first. Each row shows its kind, owner, status, attempts when
+relevant, and the description supplied by the effect. If this build cannot
+decode an old job, the raw payload is shown instead.
 
-That same trace **is the panel context**: every panel's draw runs inside a
-trace, so its provenance — which queries, which parameters, how many rows —
-exists as a side effect of how drawing works, never by declaration.
-**`cmd+i`** serializes the focused panel's context (identity, params, the
-traced queries with their SQL) to the clipboard and to `panel-context.md`
-beside the store — ready to hand to an agent; the agent hookup itself is
-future work. The trace is honest to a fault: it records what a draw
-actually read, not what the panel is nominally about. This is what "data
-centric" means mechanically.
+The panel starts with `@wrote` in its visible filter field. This hides frequent
+reads such as connect, search, and fetch while keeping them one edit away. Other
+filters include `@read`, `@failed`, `@live`, `@retried`, `@risky`, `@memory`,
+`@filed`, `@kind:`, `@entity:`, `@attempts`, and `@date`.
 
-At personal-mail scale, re-run-on-invalidate is microseconds; rel.systems'
-incremental Z-set engine remains the documented upgrade path if a view ever
-outgrows it (its SPJ class deliberately excludes the `ORDER BY`/aggregate
-queries panels actually use — in the daemon model that compute is the
-client's job, and superapp *is* the client).
+Opening a queued row shows a **job** panel with its description, error, times,
+attempt count, retry safety, payload, and result. The panel updates when the job
+changes. Memory rows have no durable job details and remain in the Effects
+list.
 
-## The mail engine
+## Device sync
 
-Real accounts are **fastmail-style**: IMAP over rustls (port 993) with an
-app password; the *settings* panel (a launcher root) lists accounts with
-their live sync status and links to the *add account* panel, which holds the
-form. A **Gmail** account is the same engine with a different proof of
-identity — see below. One **worker thread
-per account** — its own connection to the same file — polls every minute
-(and on *refresh*): mirror the special-use folders, fetch what is new
-(each folder retains the newest **200** messages; below that window the
-panels honestly know nothing), reconcile flags and deletions.
+SQLite's session extension records each transaction over durable tables as a
+changeset in `repl_log`. The changeset and log row are written in the same
+transaction.
 
-A folder's **role** comes from its RFC 6154 special-use attribute:
-`inbox`, `archive` (`\Archive`, or `\All` — see Gmail below), `sent`,
-`spam` (`\Junk`, spelled the way every client and every server that is not
-the RFC spells it) and `trash`. A folder with no such attribute is not
-mirrored at all. Four of those five roles have a panel — the mailboxes; the
-fifth is where `delete` puts things.
+Devices exchange snapshots and changesets through a small object-store
+interface: read, create-only write, and compare-and-swap. A single `state`
+object contains both the current lease and log head. Updating the head therefore
+also proves that the device still owns the lease.
 
-Server effects run on a **desired/actual split**: a `message` row is the
-user's *intent* (which folder, read or not, passed on or not); `server_msg` is what the
-server actually holds, written only by the workers. A row whose two sides
-disagree **is** the push queue — each pass turns every disagreement into a
-job, then fetches and reconciles facts.
-Reconciliation never fights the user: divergent intent is pushed over the
-server, never clobbered by it (deletion is the one place the server wins).
+The first device uploads a snapshot and creates `state`. Another device installs
+that snapshot, then applies later batches. The transport is chosen by URL:
+local demos use `bucketd`; real sync uses Cloudflare R2 through its S3 API.
+Conditional S3 writes implement create-only and compare-and-swap operations.
 
-**Threads** are decided at ingest, in the transaction that stores the mail.
-`message.thread` is the id of the conversation's lowest member — an anchor,
-not a root; no row is the parent of another, and what a thread *has* is a
-`GROUP BY` at read time. A `reference` table keeps one row per id in a
-mail's `References` and `In-Reply-To`, and threading is the union of three
-lookups over the account: mails my references name, mails whose
-references name me (the parent arrived late — Sent syncs after Inbox, or it
-is below the window), and mails whose references share an id with mine
-(two GitHub comments under an issue mail that never arrived). Whatever they
-find merges into one anchor; nothing found, and the mail anchors itself. No
-subject heuristic. A reply of yours carries the parent's whole `References`
-chain, so it threads for the other side too. A mail present twice in an
-account — your reply, in Sent and back through a list — is one message to
-the panel.
-**What a letter carries** is derived, not stored twice. An `attachment` row
-per part holds only the description a link and
-[a card](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card)
-need — name, media type, size, the Content-ID an inline part wears — plus
-the part's index into the parsed message; the bytes stay in the `raw` every
-synced mail already keeps, and a card reads them back through that index on
-a thread of its own. So the rows are versioned by the *walk* that made them
-rather than by the schema counter (the argument the search index makes, and
-for the same reason), and an `attachment_scan` row per mail says which walk
-that was. A table rather than one `meta` key because the question is per
-mail: a letter that arrives through **replication** ran no ingest code, so
-its `raw` is one nobody has walked, and this is what notices. Neither table
-replicates — every device derives its own from the `raw` it already has,
-which is also what stops two devices fighting over one id sequence.
+Device-sync settings are entered in the Settings panel. The endpoint and key ID
+are stored in a `bucket` file beside the database. The secret key goes to the
+platform secret store.
 
-Which is exactly why a card panel is named `(mail, part)` and never by the
-row's id: `panel` *does* replicate, and an id minted over here means
-another letter over there. `(mail, part)` comes out of the same walk on both
-devices, off a `raw` they both have. The rows also go when their letter
-does — removing an account takes them, and the pass sweeps any whose message
-is gone before it walks, because a `message` rowid is reused and a scan row
-left behind would tell the walk that the next letter to take that id had
-already been done.
+Only the lease holder may write. Other devices show a lock screen with the
+holder and an option to take the lease. The holder releases it on sleep or
+close. Taking a lease from a live device may discard changes that it has not
+published, so the UI warns about that risk. A device that loses its lease while
+writing becomes read-only and requires manual recovery.
 
-The other direction is not derived at all: `draft_attachment` is a compose
-panel's own list, keyed by panel like the draft beside it, holding each
-file's **path**. The bytes are read at submit time, through the outside —
-what leaves is the file as it stands, and a file that has moved, or grown
-past the cap since, fails the send by name rather than going out truncated.
-It replicates with the draft, so the other device shows the same letter; but
-a path is only a file on the machine it was picked on, so the row records
-**which install picked it** and a send from anywhere else refuses. And it is
-held to the draft's seed like the text is: a compose retargeted in place
-keeps its id, and the files a reply left are not the forward's.
+## Files
 
-And because `server_msg` lives outside the undo world, undoing an
-already-pushed archive needs no compensation machinery at all — intent
-flips back, the next pass moves the mail back. A moved mail whose new uid
-the server never reported (no COPYUID) is re-identified by Message-ID
-instead of duplicated; per-message push failures land on that message's
-status line.
+The file browser uses the selected effect implementation for directory listings, metadata,
+reads, opening files, creating directories, copying, moving, and trashing.
+Delete always moves an item to the system trash; undo moves it back.
 
-The push pass itself **never talks to the server**. It materializes each
-disagreement as a row in the `effect` table, and one executor performs it:
-claim (`WHERE status='pending'`, so undo and the executor have exactly one
-winner), revalidate, perform outside any transaction, then record the
-outcome *in the same transaction as the fact it establishes*. Every job
-re-checks the diff before its round trip, so intent reverted while the job
-waited goes `obsolete` rather than pushing stale work — and intent reverted
-*before* the pass ran was never queued at all. Undoing an archive costs the
-server nothing and works offline.
+File changes run immediately so the UI can report their result and record undo
+in the same action. A large copy can therefore block the UI; moving this work to
+a background runner remains an [open question](./open-questions.md).
 
-One queue, but not one claimant. An account's IMAP session lives in that
-account's sync worker and nowhere else, so a pass claims only what it can
-perform: the worker takes the jobs filed against its own `account:N`, the
-sender takes what needs no session. A job says what it needs by what it is
-filed against, so it routes itself — and a claimant that could only have
-failed it never takes it. Before that, a delete read *pending → "not
-connected" → done*: the sender, waking on its own timer, took the move,
-failed it on a session it never had, and left it sitting out a backoff the
-worker beside it never asked for.
+The real implementation refuses to overwrite an existing destination. Files and
+directories are created exclusively, and macOS moves use an exclusive rename.
+The copy code also refuses a destination inside its source, including paths
+that only become nested after resolving links. It handles regular files,
+directories, and symbolic links; other file types are refused.
 
-A job that fails backs off and retries; after six attempts it stops and
-waits for a human. A job carries whether repeating it is **idempotent**,
-because that is the one judgement a crash cannot guess: on the next launch
-idempotent work returns to the queue, and everything else fails with
-*"interrupted; outcome unknown"* rather than risking a second send. Payloads
-and replies are JSON text and reference rows rather than embedding their
-contents, so `sqlite3` shows every *queued* attempt, with its status, its
-answer and its failures. A panel can ask for its own
-(`WHERE entity = 'panel:7'`); a reply is read back through the same reactive
-query layer as anything else, so watching a job is invalidation, not polling.
+If a copy fails, it removes only the incomplete destination created by that
+copy. An existing destination is never removed. A move across file systems
+copies first, trashes the source second, and removes the copy again if the
+source cannot be trashed.
 
-### The log panel
+The fake implementation provides a writable demo tree for the Panels Library
+and tests. The denied implementation reports that disk access is unavailable.
+End-to-end tests use
+`--demo-disk` so they never change the user's files.
 
-What `sqlite3` shows, the app shows too: the **effects** panel is the queue
-read back, as [a rich table](./richtable.md) over the `effect` table —
-because a queue that is only legible from a shell is legible to the wrong
-person. Rows are newest first; each shows the verb, whose work it was, its
-status (and the attempt count once a job has fought), and under that **the
-sentence the effect describes itself with**. That line is not a string in
-the panel: the registry decodes the payload back into the effect and calls
-the same `describe` that names it everywhere else, so a new effect kind
-arrives in the log the day it is registered and no central table of kinds
-exists to forget it. A row a build cannot decode falls back to its payload
-rather than disappearing.
+Panels display paths with `~` and convert them to an absolute home path only at
+the effect boundary. A restored panel therefore points at the current device's
+home directory.
 
-It is the **queue** read back, though, not a record of everything that left
-the process: an in-memory effect writes no row, so `clip`, `open` and the
-file browser's four writing verbs never appear here. Nothing is retrying
-them and nothing is waiting on them — but a delete is a large thing to
-leave no trace, and closing that gap is an open question, not a decision
-(see [Open Questions](./open-questions.md)).
+Directory listings are snapshots. The browser reloads after its own actions or
+when it changes directory, but it does not yet watch changes made by other
+programs.
 
-The log is the **inbox's shape over another table**: it previews into a
-**job** panel exactly as the inbox previews a message — the cursor walk
-re-aims the pair and keeps the keyboard, `enter` goes. A job panel is the
-whole row as a page: the sentence, the error if there is one, then the job's
-own facts (filed, last touched, attempts, whether a crash may repeat it),
-the payload it was filed as, and the answer the world gave back — all of it
-selectable, because a payload is something one copies into a report. It
-re-reads its row every draw, so a job that finishes while it is open
-finishes on screen. A preview costs the world nothing here: looking at a
-record establishes no fact, which is the one way this pair differs from the
-inbox's.
+## Cached queries and panel context
 
-The filter is the table's own grammar over the log's columns: `@wrote` /
-`@read`, `@failed`, `@live`, `@retried`, `@risky` (the work a crash cannot
-retry for you), `@memory` / `@filed`, `@kind:`, `@entity:`, `@attempts>3`,
-`@date:`, and bare words over the payload — which is where a uid or an
-address actually lives. Nothing in the panel writes: the queue is the
-executor's to move, and a page of it is a cached, reactive query like any
-other, so a job running redraws the rows on screen and nothing else.
+Panels read database data through registered queries such as
+`store.rows(query, params)`. Results are cached by query and parameters.
+SQLite's update hook records changed tables, and cached results that depend on
+those tables rerun when they are next read.
 
-The panel **opens on `@wrote`**. A sync pass asks the outside a dozen
-questions for every answer it acts on — connect, select, search, fetch, and
-again next minute — so an unfiltered log is mostly the app clearing its
-throat, and what a human came for (what was *changed* out there, and
-whether it worked) is buried under it. Every effect answers
-`Effect::writes` for itself: a `MOVE`, a `STORE`, a send, a file written, a
-password filed changed the world; a `FETCH`, a `SEARCH`, a listing, the
-clock, a password recalled did not — and neither did a connect, which makes
-the rest possible and nothing more. There is no default on that method: a
-new effect that guessed would either bury the panel or vanish from it, and
-neither failure announces itself, so the compiler asks. The answer is
-copied onto the row at enqueue time exactly as `idempotent` is, so
-filtering never decodes a payload — and it is on the row rather than
-derived from the kind, so a queue written by a build whose effects this one
-no longer has still filters.
+SQLite records which tables a query reads while it is prepared.
+Callers normally do not list dependencies by hand. The in-memory effect ring is
+the exception because it is not a database table.
 
-The default is **typed into the field**, not folded into the query. What
-narrows the list is on screen and one `cmd+a` clears it: a default, not a
-rule about what the panel can show.
+Each panel draw records the queries and parameters it used. `cmd+i` writes the
+focused panel's identity, parameters, and query trace to the clipboard and to
+`panel-context.md` beside the database.
 
-### The ring: the effects that were never rows
+## Mail sync
 
-Half the effects this app performs are never filed. A connect, a fetch, a
-folder listing, a clipboard write — nobody retries them, nobody waits on a
-row for them, and their answers are values the caller needs now. "Written
-nowhere" used to mean "gone the moment they returned": a connect that
-failed lived exactly as long as the string it handed back.
+Each account has one worker thread and IMAP connection. It runs about once a
+minute and on refresh. A pass discovers special-use folders, receives new mail,
+and reconciles flags and deletions. Each folder keeps the newest 200 messages.
 
-The **ring** keeps the last two hundred of them in memory — the kind, whose
-they were, the same `describe` sentence, and what the outside said if it
-refused. Nothing is written, nothing replicates, a restart forgets it. It
-is not a concession on the rule; it is a record *about* effects rather than
-a result of one.
+Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
+and trash. Only the first four have mailbox panels. Folders without one of these
+roles are not mirrored.
 
-"Whose they were" is the same question a filed job answers, so it is asked
-one trait higher: `entity` moved from the deferred half to `Effect` itself,
-and `@entity:account:1` now finds the connect as well as the move it
-preceded. It is a label here and nothing more — claim routing reads the
-`effect` table's own column, and a ring row was never in it.
+`message` rows store the desired state. `server_msg` rows store the last state
+seen on the server. A difference between them becomes a queued job. A sync pass
+never keeps a database write transaction open during a network request.
 
-The log joins it to the queue **in SQL**, as one more arm of the same
-query. That is the whole design decision: an in-memory effect arriving as a
-second list beside the first would have needed its own filter, its own
-paging and its own idea of order, and the three would have drifted. As a
-`UNION ALL` arm it gets the real ones — `@kind:connect` narrows the ring
-the way `@kind:move` narrows the queue, and the two interleave by when they
-happened. A ring row's id is its place in the ring, **negated**, so the two
-streams share one total order and one unique key and can never collide;
-`@memory` and `@filed` are `e.id < 0` and `e.id > 0`, and a row with no
-answer for a column carries `NULL` rather than a plausible zero — which is
-why `@risky` (`idempotent = 0`) never sweeps in an effect nobody was going
-to retry.
+Server deletions remove local rows. For other differences, the user's desired
+state wins and is sent to the server. Undo changes the desired state again, so
+the next pass can reverse a change without special compensation logic.
 
-Two mechanics pay for it. The ring is queryable from a `query_only`
-connection because it arrives through a **scalar function** every reader is
-taught at open (`mem_effects()`, one JSON array) — nothing is written to
-serve it. And because rows out of memory are invisible to SQLite's read-set,
-the authorizer cannot capture that dependency, so the log's spec is the one
-that **declares** it (`SqlSpec::deps`) and the ring carries a version the
-way the database carries `PRAGMA data_version`. A reader compares the two on
-the same poll: the UI's log shows what a sync worker reached for, and a page
-that read the ring goes stale when the ring moves.
+### Conversations and attachments
 
-The clock is the one exception, and deliberately: `World::now()` is asked
-several times a frame, and a ring of clock readings would have room for
-nothing a human meant to do.
+Thread membership is calculated when mail is received. References and
+`In-Reply-To` headers connect messages within an account. The code also handles
+a parent that arrives later and siblings that share a missing parent. It does
+not use subject-line guesses.
 
-A ring id is meaningful only inside the process that made it — it counts
-from one again on the next run, and the `panel` table replicates to a
-device whose ring is its own — so a job panel on one is **not persisted as
-one**: it is saved as the effect log it was previewed from. Restoring it as
-a job panel would aim it at whatever effect held that number next, which is
-the one thing a dangling reference must not do.
+`message.thread` stores the smallest message ID in the conversation as a stable
+anchor. Mailbox rows group messages by that anchor. A reply includes the
+parent's reference chain so it joins the same conversation after the Sent
+folder is synced.
 
-A worker's commit reaches the UI as a signal; the store notices foreign
-commits by `data_version` and re-runs stale queries on the next draw.
-Account add/remove are undoable actions like everything else.
+Attachment rows contain only metadata and a part index. The bytes remain in the
+message's raw MIME data and are read on a worker when needed. Derived attachment
+rows are rebuilt per device, including after replicated messages arrive.
+Attachment panels use `(message, part)` rather than a local row ID, so their
+identity is stable across devices.
 
-What "perform outside any transaction" is worth, measured: a UI action costs
-0.10 ms uncontended and **468 ms** behind a 400 ms fetch that holds
-`BEGIN IMMEDIATE` across the wire. SQLite has one writer and the UI shares
-the file, so a pass that keeps a transaction open over a round-trip stalls
-everything behind it for as long as the server takes — and it reads as the
-app hanging, not as sync being slow. The rule above is what keeps a reading
-walk down the inbox, which writes on every keystroke, from queueing behind
-the network.
+Draft attachments are different: they store file paths selected on disk. The
+bytes are read when sending, so a missing or oversized file fails with its name.
+The row also records which installation selected the path; another device will
+show it but refuse to send a path it cannot safely identify.
 
-**Sending** is the outbox pattern with the undo window built in. A compose
-panel's draft persists in the store *as you type* (plain upkeep — typing is
-the future editor's local undo, not the system's), keyed by the panel id,
-so half-written mail survives restarts. *Send* is an action: it files an
-outbox row with `send_after = now + 10 s` and closes the panel; `cmd+z`
-inside the window cancels it — the row's deletion *is* the undo, and the
-claim (`WHERE status='pending'`) means the race between undo and the
-sender has exactly one winner. The sender wakes at the deadline and queues
-a `submit` job; the executor submits over SMTP (rustls, port 465; a reply
-names its parent in `In-Reply-To` and both a reply and a forward carry the
-source's chain in `References`, so the Sent copy folds into the
-conversation when it syncs back), appends the sent bytes to the account's
-Sent folder over IMAP, and records the outcome — for a forward, that the
-mail it passed on is now *forwarded*, an intent the next push pass sets on
-the server as the `$Forwarded` keyword, the one other clients draw their
-arrow from — where the folder's `PERMANENTFLAGS` say it keeps keywords;
-elsewhere the mark stays local, neither pushed nor read back. Because both the outbox row
-and the job are durable, a mail that hit *send* and never left goes out late
-rather than never. A delivered send is physics: its claim refuses, the
-history node goes **expired**, and the walk skips it transparently.
-A *failed* send stays cancellable — the error toasts, `cmd+z` reopens the
-draft, and it stands in the problems panel with *retry* and *reopen* until
-it goes out or is taken back. The launcher's *new mail* root opens a blank compose.
+## Sending
 
-## Signing in to Gmail
+Drafts are saved as the user types. Sending creates an outbox row with a default
+10-second delay and closes the compose panel. Undo during that delay deletes the
+outbox row and restores the draft.
 
-Google stopped accepting passwords on IMAP, so a Gmail account proves
-itself with a **bearer token** instead: SASL `XOAUTH2`, the same envelope
-on both IMAP and SMTP. Everything above this line is unchanged — the same
-worker, the same passes, the same desired/actual split. The account row
-carries one extra word (`account.auth`), and the two sites that open a
-session ask one function which mechanism that word means.
+At the deadline, the sender creates a submit job. It sends through SMTP, appends
+the message to Sent over IMAP when the provider requires it, and stores the
+result. Replies and forwards include the headers needed to join the Sent copy to
+its conversation. Forwards also set `$Forwarded` when the server supports that
+keyword.
 
-Getting a token is the **installed application** flow (RFC 8252), and it
-never goes through this app's own UI: pressing *sign in with google* on the
-add-account panel binds a loopback listener on `127.0.0.1`, opens the
-system browser on Google's consent page with a PKCE challenge, and waits
-for the redirect to come back to that port. No embedded webview, and no
-Google password ever typed into superapp.
+A delivered message cannot be undone. A failed send can still be undone to
+restore the draft, or retried and reopened from the Problems panel. Because the
+outbox and job are durable, a restart delays pending work rather than losing it.
 
-Three secrets, three lifetimes, and that is the whole design:
+## Gmail sign-in
 
-| | lives | kept where |
+Gmail uses OAuth bearer tokens for IMAP and SMTP. Pressing **sign in with
+google** starts the installed-application flow: the app listens on a temporary
+local port, opens Google's consent page in the system browser, and receives the
+redirect. It uses PKCE and never asks for the Google password.
+
+| Value | Lifetime | Storage |
 |---|---|---|
-| authorization code | seconds | never leaves `src/oauth.rs` |
-| refresh token | until revoked | the keychain, under `oauth:<address>` |
-| access token | an hour | process memory, refreshed on demand |
+| Authorization code | Seconds | Only inside `oauth.rs` |
+| Refresh token | Until revoked | Platform secret store |
+| Access token | About one hour | Process memory |
 
-The refresh token is what the account *is*; the access token is minted from
-it by the backend that owns the process and is deliberately never written
-down. A grant the human revokes at Google fails at the next refresh, and it
-fails **honestly** — the sync stops and says `invalid_grant` rather than
-falling back to a password that was never there.
+The app checks that the granted scopes include full mail access before creating
+the account. It also reads Google's XOAUTH2 error response so it can distinguish
+a missing scope from disabled IMAP.
 
-Two Gmail behaviours the engine has to know about, both of them the
-provider's rather than the protocol's.
+Gmail uses All Mail as the archive target. The app does not import All Mail,
+because doing so would duplicate messages already mirrored from other folders.
+As a result, mail archived on another device may not appear locally. Gmail also
+creates its own Sent copy, so Superapp skips the usual IMAP append for Gmail.
 
-Gmail advertises no `\Archive` mailbox: archiving there *is* dropping the
-inbox label, leaving the message in All Mail. So the special-use `\All`
-takes the archive role and a MOVE into it is the archive — but that folder
-is a **move target only, never an ingest source**. All Mail holds every
-message the account has, inbox included, under uids of its own, and this
-store gives a message one folder; reading from it would file a second row
-for every mail already mirrored from INBOX. The cost is stated rather than
-hidden: mail archived on *another* device does not appear locally. What
-this device archives stays, because the push records the move rather than
-re-reading it. Gmail's label model is the real answer here, and it is not
-this schema's — `X-GM-MSGID` as a cross-folder identity is where that would
-start.
+Superapp needs the developer's Google Desktop-app registration. Set
+`SUPERAPP_GOOGLE_CLIENT_ID` and `SUPERAPP_GOOGLE_CLIENT_SECRET`, or place the
+downloaded configuration at `google-oauth.json` beside the database. A Web-app
+registration is refused because it cannot accept the temporary loopback port.
 
-And Gmail's SMTP files its own copy into Sent Mail, unlike a plain relay, so
-the APPEND every other account gets is skipped: one letter in Sent, not two.
+The browser consent step is not part of end-to-end tests. OAuth URL, PKCE, token,
+scope, XOAUTH2, sync, and send behavior are covered by unit tests and fake
+services.
 
-A grant is checked before it becomes an account: **asking for a scope is not
-getting it.** A consent screen that does not carry
-`https://mail.google.com/` yields a grant with `openid email` and nothing
-else — no error, no warning — and the account would then fail at its first
-IMAP login with a bare "AUTHENTICATION FAILED", an hour of confusion from
-its cause. The token response says what was granted, so the sign-in refuses
-there instead, while the human is still standing at the door they must go
-back through. A refusal that does arrive over IMAP is read too: Google's
-XOAUTH2 no is a JSON challenge whose status separates a missing scope from a
-mailbox with IMAP switched off, and those want opposite fixes.
+## Data kept outside SQLite
 
-One thing this cannot ship: the OAuth **client registration**. Google issues
-those per developer, so superapp reads yours — `SUPERAPP_GOOGLE_CLIENT_ID`
-and `SUPERAPP_GOOGLE_CLIENT_SECRET`, or the console's downloaded JSON
-dropped verbatim at `google-oauth.json` beside the store. It must be a
-**Desktop app** client: the redirect is a loopback port the OS picks per
-sign-in, and a Web client only accepts redirect URIs registered in advance,
-port and all — so one is refused by name here rather than as a
-`redirect_uri_mismatch` in the browser three steps later. Without any
-registration, the panel says so instead of pretending.
-
-The consent round trip is the one thing e2e cannot script — it wants Google
-and a human — so a run refuses it and puts that refusal on the panel's own
-status line, which is what `e2e/oauth.txt` asserts. Everything up to that
-door is unit-tested: PKCE against RFC 7636's worked vector, the consent
-URL's parameters, the `id_token` read that names the address, the XOAUTH2
-envelope byte for byte, and a bearer-token sync and send against the fake
-world.
-
-## What stays out of the file
-
-- **Ephemeral physics**: spring positions, in-flight gestures, the caret
-  blink, where the camera is mid-slide. The line: *if losing it in a crash
-  would annoy you, it belongs in the store.* Layout, focus, filters — in.
-  Motion — out, re-derived at boot.
-- **History.** The undo tree is in memory, so it dies with the process. A
-  node is a layout snapshot plus its claims on the world; the claims are in
-  memory too, and never serialized. What survives is the row each one wrote
-  — which is all the background passes ever read, and why a restart loses
-  undo but never loses work. See [Interaction
-  Grammar](./interaction-grammar.md).
-- **Secrets**: the macOS keychain (android: an app-private file until a
-  Keystore binding exists), never this file — it is meant to be handed to
-  agents someday. An app password and an OAuth refresh token live side by
-  side there under different keys.
+- Animation positions, active gestures, and other temporary drawing state are
+  recalculated after restart.
+- Undo history is in memory. Database changes made by an action remain durable,
+  but the ability to undo them ends with the process.
+- Passwords, OAuth refresh tokens, and object-store secret keys use the macOS
+  keychain. Android currently uses a private app file until Keystore support is
+  added.
 
 ## Session persistence
 
-Every mutation funnels through the shell's `sync()`, which snapshots the
-logical workspace state and writes it — wholesale, the UI tables are tiny —
-only when the snapshot actually changed. Boot restores it: quit with a mail
-open on workspace 4 and relaunch, and you are on workspace 4 with that mail
-open (and it stays read — flags live in the same file). A store that never
-booted seeds the demo mail and the default layout; `--db` points anywhere
-else, and e2e runs get a fresh seeded temp file so suites stay deterministic.
+After a UI change, the shell compares the current workspace with the last saved
+snapshot and writes it only when it changed. Startup restores the active
+workspace, panels, joins, focus, filters, and other durable UI state.
 
-Panel params are typed columns (`p_int`, `p_txt`), not serialized blobs: a
-`message` panel row *joins* against the `message` table. The schema is the
-API.
+A new store receives the demo mail and default layout. `--db PATH` selects a
+different database. End-to-end tests use a fresh seeded temporary database by
+default.
+
+Panel parameters use typed columns such as `p_int` and `p_txt`, not serialized
+blobs. This lets panel rows join directly to domain tables.

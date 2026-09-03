@@ -1,24 +1,9 @@
-//! Gmail sign-in: OAuth 2 where the other accounts have an app password.
+//! Gmail OAuth sign-in for IMAP and SMTP.
 //!
-//! Google turned off password IMAP, so a Gmail account is reached with a
-//! bearer token instead — SASL `XOAUTH2` on both IMAP and SMTP. Getting one
-//! is the *installed application* flow (RFC 8252): the browser does the
-//! consent, and the answer comes back to a loopback listener this process
-//! opened a moment earlier. No embedded webview, no password ever typed
-//! into this app.
-//!
-//! Three durations, and they are the whole design:
-//!
-//! - the **authorization code** lives seconds, and never leaves this module;
-//! - the **refresh token** is the account, and lives in the keychain beside
-//!   the app passwords ([`crate::secret`]) under a key of its own;
-//! - the **access token** lives an hour and stays in memory — a per-process
-//!   cache in [`crate::effect::Real`], refreshed when a session asks and it
-//!   has gone stale. It is deliberately never written down.
-//!
-//! The one thing this cannot ship is the client registration: Google issues
-//! those per developer, so the app reads yours ([`Client::load`]) rather
-//! than pretending to have one.
+//! The system browser handles consent and returns to a temporary loopback
+//! listener. Authorization codes stay in this module, refresh tokens go to the
+//! platform secret store, and short-lived access tokens stay in memory. The
+//! developer supplies a Google Desktop-app registration through [`Client::load`].
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

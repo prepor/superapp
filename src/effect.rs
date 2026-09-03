@@ -1,40 +1,9 @@
-//! Effects: everything that leaves the process (CR-004).
+//! Work whose result cannot be recreated from the database.
 //!
-//! The rule, and the whole of it:
-//!
-//! > **An effect is anything whose result the store cannot reproduce.**
-//!
-//! The store is the app's memory — replaying its transactions replays the
-//! app — so SQLite is emphatically *not* an effect. A socket, the keychain,
-//! the clipboard, a file beside the store, the screen and the clock are.
-//! Archiving a mail is a plain store write (intent); *pushing* that archive
-//! to the server is an effect.
-//!
-//! Every effect is a serializable value that describes itself in one line
-//! ([`Effect`]). Effects worth retrying are also [`Deferred`]: they become
-//! rows in the one `effect` table, claimed and performed by one executor,
-//! with a status and a reply anyone can read — including the panel that
-//! asked for them, through the ordinary reactive query layer.
-//!
-//! Two classes, told apart by one question — *would anyone retry it, wait
-//! for it, or want to see that it failed?*
-//!
-//! | | examples | how it runs |
-//! |---|---|---|
-//! | deferred | [`Move`], [`Seen`], [`Submit`] | enqueued, claimed, executed by the pass |
-//! | in-memory | [`Now`], [`Connect`], [`Fetch`], [`SecretGet`] | performed at the call, answer returned, nothing written |
-//!
-//! "Nothing written" used to mean "nothing anyone could look at". It no
-//! longer does: the last [`KEPT`] in-memory effects stay in a ring
-//! ([`MemLog`]), and the log joins that ring to the queue in SQL, so one
-//! panel shows everything that left the process — what was filed and
-//! retried beside what merely happened. The ring is memory and stays
-//! memory: nothing is written, nothing replicates, and a restart forgets
-//! it.
-//!
-//! [`Outside`] is the swappable backend — [`Real`], [`Fake`], [`Deny`] —
-//! and it owns the clock too, so a fake world controls time the same way it
-//! controls everything else.
+//! Retryable [`Deferred`] effects are stored as jobs. Immediate effects return
+//! directly and the latest [`KEPT`] entries stay in [`MemLog`]. The Effects
+//! query combines both sources. [`Outside`] selects real access, fake test
+//! data, or no outside access. It also owns the clock.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -120,10 +89,10 @@ pub struct Outgoing {
     pub in_reply_to: Option<String>,
     /// What the mail replied to itself referenced, so `References` carries
     /// the whole chain (RFC 5322) and a reply to a reply threads for the
-    /// other side too. Absent on payloads filed before CR-007.
+    /// other side too. Older payloads may omit it.
     #[serde(default)]
     pub references: Vec<String>,
-    /// What it carries (CR-010) — read off the disk by [`crate::mail::Submit`]
+    /// What it carries — read off the disk by [`crate::mail::Submit`]
     /// as it goes out, never stored: this value is built at submit time, and
     /// a payload holding a file's bytes would be both stale and enormous.
     #[serde(default, skip)]
@@ -276,7 +245,7 @@ pub trait Outside {
     /// cache that keeps it from happening per connect belongs to the
     /// backend that owns the process, not to the caller.
     fn access_token(&mut self, email: &str) -> Result<String, String>;
-    /// The device-sync bucket's secret access key, by key id (CR-005). Its
+    /// The device-sync bucket's secret access key, by key id. Its
     /// own door rather than [`Outside::secret_set`]'s: losing a mailbox and
     /// losing a lineage are different accidents, and they are kept under
     /// different services.
@@ -285,7 +254,7 @@ pub trait Outside {
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     fn shot(&mut self, path: &Path) -> Result<(), String>;
 
-    // The disk, read (CR-008). A files panel lists through these during
+    // The disk, read. A files panel lists through these during
     // draw; the fake serves the demo tree, the real one the filesystem.
     /// One directory's entries, in the browser's order.
     fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String>;
@@ -297,7 +266,7 @@ pub trait Outside {
     /// is executed by us.
     fn open_path(&mut self, path: &Path) -> Result<(), String>;
 
-    // The disk, written (CR-008). None of these is `rm`: what a delete
+    // The disk, written. None of these is `rm`: what a delete
     // takes goes to the trash, and undo moves it back out — so a backend
     // that implements them can never make a path unrecoverable.
     /// One directory, where nothing is yet. Refuses a taken name rather
@@ -374,7 +343,7 @@ pub trait Effect: Sized {
 /// round trip through JSON, so an effect that cannot be written down is a
 /// compile error rather than a discovery.
 // `Send` is required because a job's `settle` closure travels to the store's
-// writer thread (CR-005 phase 0): the effect value and its reply are captured
+// writer thread: the effect value and its reply are captured
 // and committed there. Every real effect is plain data, so this is free.
 pub trait Deferred: Effect + Serialize + DeserializeOwned + Send + 'static
 where
@@ -463,7 +432,7 @@ impl Effect for SecretSet<'_> {
     }
 }
 
-/// Store the device-sync bucket's secret access key (CR-005).
+/// Store the device-sync bucket's secret access key.
 pub struct BucketSecret<'a> {
     pub key_id: &'a str,
     pub secret: &'a str,
@@ -507,7 +476,7 @@ impl Effect for Clip<'_> {
     }
 }
 
-/// Hand a path to the OS: whatever opens that kind of file (CR-008).
+/// Hand a path to the OS: whatever opens that kind of file.
 pub struct OpenPath<'a> {
     pub path: &'a Path,
 }
@@ -528,7 +497,7 @@ impl Effect for OpenPath<'_> {
     }
 }
 
-/// Make one directory — a files panel's `new dir` (CR-008).
+/// Make one directory — a files panel's `new dir`.
 pub struct MakeDir<'a> {
     pub path: &'a Path,
 }
@@ -547,7 +516,7 @@ impl Effect for MakeDir<'_> {
     }
 }
 
-/// `copy here`, one path of it (CR-008).
+/// `copy here`, one path of it.
 pub struct CopyPath<'a> {
     pub from: &'a Path,
     pub to: &'a Path,
@@ -568,7 +537,7 @@ impl Effect for CopyPath<'_> {
 }
 
 /// `move here`, one path of it — and what undo reverses every one of these
-/// verbs with (CR-008).
+/// verbs with.
 pub struct MovePath<'a> {
     pub from: &'a Path,
     pub to: &'a Path,
@@ -589,7 +558,7 @@ impl Effect for MovePath<'_> {
 }
 
 /// `delete`: to the trash, never `rm`, answering where it landed so undo
-/// can take it back out (CR-008).
+/// can take it back out.
 pub struct Trash<'a> {
     pub path: &'a Path,
 }
@@ -682,9 +651,7 @@ pub struct MemEffect {
     pub writes: bool,
     /// [`Effect::describe`], taken at the call. Never carries a secret.
     pub what: String,
-    /// What the outside said, when it refused.
     pub error: Option<String>,
-    /// When it ran, on the world's own clock.
     pub at: f64,
 }
 
@@ -792,7 +759,7 @@ impl MemLog {
 // -- the registry --------------------------------------------------------------
 
 /// The bookkeeping a success carries, committed with its status update.
-/// `Send`, because it is committed on the store's writer thread (CR-005).
+/// `Send`, because it is committed on the store's writer thread.
 type Settle = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<()> + Send>;
 
 /// What running one claimed job produced.
@@ -1158,7 +1125,7 @@ pub fn mark(db: &Connection) -> i64 {
 // -- the log as a rich table ---------------------------------------------------
 //
 // The queue is a table like any other, so the log viewer is the rich table
-// (CR-006) over it rather than a widget of its own invention: the same
+// over it rather than a widget of its own invention: the same
 // filter grammar, the same paging, the same reactive pages — a commit by
 // the executor invalidates exactly the pages on screen, so watching a job
 // run is invalidation and not polling.
@@ -1215,7 +1182,7 @@ static LOG_SPEC: SqlSpec = SqlSpec {
     // because the ring's is negated.
     order: &[("e.created", Dir::Desc), ("e.id", Dir::Desc)],
     group: None,
-    // …and the id is the row's identity too (CR-009).
+    // …and the id is the row's identity too.
     key: "e.id",
     deps: LOG_DEPS,
 };
@@ -1379,7 +1346,7 @@ fn json_err(e: serde_json::Error) -> rusqlite::Error {
 /// write transaction. Owned and `Send`, so it can be moved into a
 /// [`Store::write`](crate::store::Store::write) closure that runs on the
 /// writer thread — the composition primitive the passes build their jobs
-/// from (CR-005 phase 0).
+/// from.
 pub struct Enqueue {
     kind: &'static str,
     payload: String,
@@ -1614,9 +1581,8 @@ impl World {
 
     /// Encodes and timestamps a deferred effect into an owned [`Enqueue`],
     /// **outside** any transaction. This is the `Send`-safe half of filing a
-    /// job: the caller can then insert it inside a write closure that runs on
-    /// the store's writer thread, where the `&World` itself cannot travel
-    /// (CR-005 phase 0).
+    /// job. The caller can insert it from a writer-thread closure without
+    /// moving `&World` across threads.
     ///
     /// # Errors
     ///
@@ -2026,7 +1992,7 @@ pub struct Fake {
     pub clips: Vec<String>,
     pub files: HashMap<PathBuf, Vec<u8>>,
     pub shots: Vec<PathBuf>,
-    /// What `open` handed to the OS (CR-008).
+    /// What `open` handed to the OS.
     pub opened: Vec<PathBuf>,
     /// The demo tree this world's file browser walks — its own copy, which
     /// is what lets a verb that writes run in any number of tests at once.
@@ -2082,7 +2048,7 @@ impl Fake {
 /// The demo tree as a disk, in the panels' spelling: what a fake world
 /// serves, and what a real one serves under `--demo-disk` — the panels
 /// library's fixture, a machine-independent `~` a suite can address a row
-/// of by name. Written as well as read (CR-008): the verbs act on the
+/// of by name. Written as well as read: the verbs act on the
 /// fixture exactly as they act on the filesystem, so a suite proves them.
 ///
 /// The one translation each of its verbs needs: an outside is handed real
@@ -2656,8 +2622,8 @@ fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// No exclusive rename here: [`free`] is the best this platform offers,
-/// and the browser is macOS-shaped today (see the book's open questions).
+/// Other platforms cannot make this rename exclusive. [`free`] checks the
+/// destination first, but another write could still win the race.
 #[cfg(not(target_os = "macos"))]
 fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
@@ -3570,7 +3536,7 @@ mod tests {
     /// A mail that carries something goes out as a `multipart/mixed`: the
     /// letter first, then each part with its name and its type — and the
     /// round trip through the parser gets the same parts back, which is the
-    /// only assertion that means anything (CR-010).
+    /// only assertion that means anything.
     #[test]
     fn a_mail_that_carries_something_goes_out_as_multipart() {
         let plain = Outgoing {

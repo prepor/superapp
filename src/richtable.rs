@@ -1,40 +1,9 @@
-//! The rich table (CR-006): what every list panel shares, ported from
-//! stelaxis's `RichTable` — a **datasource** behind a uniform seam, a
-//! **SQL builder** that turns a [`filter`] AST into the datasource's
-//! `WHERE`, and a **paging engine** that virtualizes the data the way the
-//! `PortalList` already virtualizes the drawing.
+//! Shared list engine for filtering, completion, paging, cursors, and marks.
 //!
-//! Pure: no makepad. The inbox panel in [`crate::panels`] is the first
-//! consumer; a feed or a calendar list is the same widget over another
-//! [`Datasource`].
-//!
-//! # Paging, not "load more"
-//!
-//! A table never holds its rows. It asks its source for a **count** (one
-//! `SELECT COUNT(*)` under the current filter) and for **pages** of a fixed
-//! size, by offset, exactly when a draw needs a row on screen — so the list
-//! can be a hundred thousand rows long and a frame still touches only the
-//! pages under the viewport, each a cached, reactive query in the store
-//! (a commit re-runs the pages on screen, lazily, on the next draw). The
-//! scrollbar is honest because the count is; jumping to the middle of the
-//! list fetches the middle's page and nothing else. The list's cursor is
-//! kept by **rank**: a row's position is one `COUNT(*)` of the rows the
-//! order puts before it, so a mail that moved (a sync landed above it) is
-//! found again without walking anything.
-//!
-//! A source that cannot count (a remote one) says so, and the engine falls
-//! back to a growing window: one more page each time the end of the list
-//! comes on screen — the same scroll-driven load, without the total.
-//!
-//! # Marks
-//!
-//! Beside the cursor a table carries **marks** (CR-009): the rows the
-//! operator picked out for a batch verb, held as a set of keys ([`Marks`])
-//! rather than rows, so a mark survives the filter, the paging and a sync
-//! landing underneath. The datasource answers three more questions under
-//! the filter for them — every matching key, which of *these* keys match,
-//! and the row for a key regardless of the filter — and [`Table::split`]
-//! sorts a set into what the filter shows and what it hides.
+//! A [`Datasource`] supplies counts, pages, stable keys, and filter metadata.
+//! Countable sources load fixed pages as the viewport needs them. Other sources
+//! grow their loaded window at the end. Cursors and [`Marks`] use stable keys,
+//! so database changes and filters do not silently move the selection.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -245,7 +214,7 @@ impl<D: Datasource> Datasource for &D {
 // Marks
 // ---------------------------------------------------------------------------
 
-/// The rows the operator has **marked** for a batch verb (CR-009): a set of
+/// The rows the operator has **marked** for a batch verb: a set of
 /// [`Datasource::Key`]s beside the cursor, and nothing else — no rows, no
 /// store, no widget. A mark is an identity, so it survives the filter, the
 /// paging and a sync landing under the list; sorting the set into what the
@@ -382,7 +351,7 @@ pub struct SqlSpec {
     /// unique column) or paging tears. Under a `group`, these name aliases
     /// of `select`, since the page is read off the grouped subquery.
     pub order: &'static [(&'static str, Dir)],
-    /// A row is a group (CR-007: a thread is its inbox messages). The
+    /// A row is a group (a thread is its inbox messages). The
     /// select is then aggregates over the members, `GROUP BY` this key, and
     /// the filter becomes a membership test: a group matches when **any**
     /// member matches, and its aggregates always cover the whole group.

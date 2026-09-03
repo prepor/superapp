@@ -1,4 +1,4 @@
-# The panels library (CR-006): the catalogue's scenes on one canvas, every
+# The panels library: the catalogue's scenes on one canvas, every
 # node live. Run with
 #   --library --e2e e2e/library.txt --no-draw --draws 3000
 # under MAKEPAD=headless (rendered: drop --no-draw, set

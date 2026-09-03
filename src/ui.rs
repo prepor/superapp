@@ -1,10 +1,5 @@
-//! The shared content vocabulary: text styles and per-kind accelerators.
-//!
-//! This is the seed of the high-level component library (stelaxis's
-//! philosophy: name the *meaning* — style, accelerator — never the pixels).
-//! Panels are retained widget trees now (CR-002), so the drawing lives in
-//! [`crate::panels`]; what stays here is the vocabulary both the shell's own
-//! chrome and those widgets have to agree on.
+//! Text styles, button actions, and keyboard shortcuts shared by the shell and
+//! panel widgets.
 
 use crate::core::{Kind, Role};
 use crate::theme;
@@ -16,19 +11,12 @@ use crate::theme;
 /// Text styles the content grammar needs. Everything monochrome except `Err`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Style {
-    /// Body text.
     N,
-    /// Fake-bold body text (unread rows).
     Bold,
-    /// A bigger fake-bold heading (the contact name).
     Big,
-    /// Secondary.
     T2,
-    /// Muted.
     Muted,
-    /// Uppercase small tracked label.
     Label,
-    /// The one colour: errors.
     Err,
 }
 
@@ -60,7 +48,7 @@ pub enum BtnAct {
     Send,
     Discard,
     TryIt,
-    /// A file card's `open`: hand the path to the OS (CR-008).
+    /// A file card's `open`: hand the path to the OS.
     Open,
     /// A files panel's `new dir`: the one-line field above the rows.
     NewDir,
@@ -74,14 +62,14 @@ pub enum BtnAct {
     /// `copy here` / `move here`: perform the held item into the
     /// directory this files panel shows.
     Here,
-    /// A compose panel's `attach` (CR-010): the held files become parts of
+    /// A compose panel's `attach`: the held files become parts of
     /// the draft. The destination half of the hold grammar, exactly as
     /// `… here` is — a compose *is* a destination for a file.
     Attach,
 }
 
 // ---------------------------------------------------------------------------
-// Accelerators (CR-003): a control carries its own key, drawn into its label
+// Accelerators: a control carries its own key, drawn into its label
 // ---------------------------------------------------------------------------
 
 /// Cmd chords the workspace owns on every panel. An accelerator may never
@@ -100,7 +88,7 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
     match kind {
         // "sync" rather than "refresh": the button kicks the IMAP workers, it
         // does not reload a view. The truer word also frees `r` for the mail
-        // the list is previewing to lend back its `reply` (CR-005).
+        // the list is previewing to lend back its `reply`.
         Kind::Mailbox { .. } => &[("sync", BtnAct::Refresh)],
         // Drawn right to left from the close button, so this reads
         // "delete archive ×" — the destructive one furthest from the corner,
@@ -108,7 +96,7 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
         Kind::Message { .. } => &[("archive", BtnAct::Archive), ("delete", BtnAct::Delete)],
         Kind::Compose { .. } => &[("send", BtnAct::Send), ("discard", BtnAct::Discard)],
         // Every verb acts on the thing the panel shows — a card's on its
-        // file, a files panel's on its directory (CR-008). Reads
+        // file, a files panel's on its directory. Reads
         // "delete move copy new dir ×": the destructive one furthest from
         // the corner, as on a message. A files panel wears the three
         // object verbs only while it is joined under someone's cursor —
@@ -126,15 +114,15 @@ pub fn head_btns(kind: &Kind) -> &'static [(&'static str, BtnAct)] {
             ("move", BtnAct::MoveHold),
             ("delete", BtnAct::Delete),
         ],
-        // A part of a letter is a card over bytes nobody owns a path to
-        // (CR-010): `open` writes it out and hands it to the OS, and the
+        // A mail part has no path. `open` writes it out and hands it to the
+        // OS; the
         // three verbs that act on a place on the disk have no place to act.
         Kind::Attachment { .. } => &[("open", BtnAct::Open)],
         _ => &[],
     }
 }
 
-/// The button a files panel gains while something is held (CR-008):
+/// The button a files panel gains while something is held:
 /// `copy here` or `move here`, naming what will happen. Drawn leftmost —
 /// past `delete` — so the contextual verb is the first thing read.
 #[must_use]
@@ -145,8 +133,7 @@ pub fn hold_btn(op: crate::files::HoldOp) -> (&'static str, BtnAct) {
 /// What one panel's header wears now: its kind's buttons, the held item's
 /// if one is held and the kind takes it, and — for a files panel — the
 /// object verbs only while it is the **end of a chain**: joined under a
-/// parent and driving nothing (CR-008), and no row of it is marked
-/// (CR-009).
+/// parent and driving nothing, and no row of it is marked.
 ///
 /// The end of a chain is the thing under the cursor. A row previews the
 /// directory's own panel beside the list, and *that* panel wears `copy`,
@@ -178,7 +165,7 @@ pub fn head_btns_of(
     if let (Kind::Files { .. }, Some(op)) = (kind, hold) {
         v.push(hold_btn(op));
     }
-    // The other destination for a held file (CR-010). A compose wears
+    // The other destination for a held file. A compose wears
     // `attach` only while something is held, exactly as a files panel wears
     // `… here` — the verb names what will happen to what you are carrying,
     // and with empty hands there is nothing to name. Either hold does: you
@@ -205,7 +192,7 @@ pub fn btn_accel(act: BtnAct) -> Option<char> {
         BtnAct::GoTo => Some('g'),
         // The `p` of "copy", not the `c`: a card's path is selectable, so
         // cmd+c copies the path — the file clipboard is not the text
-        // clipboard (CR-008).
+        // clipboard.
         BtnAct::CopyHold => Some('p'),
         BtnAct::MoveHold => Some('m'),
         BtnAct::Here => Some('h'),
@@ -228,12 +215,12 @@ pub const ACCEL_FORWARD: char = 'f';
 /// the same courtesy an editable field gets, for the same reason.
 pub const ACCEL_ADD_ACCOUNT: char = 'd';
 
-/// Settings' link to the device-sync form (CR-005). The `y` of "sync": `d`
+/// Settings' link to the device-sync form. The `y` of "sync": `d`
 /// is next door on the same panel, and the letters before it are all either
 /// reserved or taken.
 pub const ACCEL_DEVICE_SYNC: char = 'y';
 
-/// The verbs of the marks bar (CR-009): what a list offers on its marked
+/// The verbs of the marks bar: what a list offers on its marked
 /// set. The first ones are the row's own verbs, on the set — the inbox
 /// files, a files panel copies, moves and deletes; then `all`, which marks
 /// every row under the filter, and `clear`, which empties it.
@@ -341,7 +328,7 @@ impl MarkVerb {
 
 /// The kind a panel **previews** into its joined child: a master/detail list
 /// whose cursor walk re-targets the child instead of opening a new panel, and
-/// which keeps focus while doing it (CR-005).
+/// which keeps focus while doing it.
 ///
 /// Such a panel also **borrows** its preview's accelerators — the fifth
 /// letter rule. The borrowed mark is never drawn on the borrower: it stays on
@@ -353,7 +340,7 @@ pub fn preview_kind(kind: &Kind) -> Option<Kind> {
         Kind::Mailbox { .. } => Some(Kind::Message { id: 0 }),
         Kind::Effects => Some(Kind::Job { id: 0 }),
         // A files list previews into the kind its row names — a directory
-        // as a column, a file as a card (CR-008). The placeholder is the
+        // as a column, a file as a card. The placeholder is the
         // card; the union test covers both children.
         Kind::Files { .. } => Some(Kind::File {
             path: String::new(),
@@ -377,8 +364,8 @@ fn mark_verb_of(act: BtnAct) -> Option<MarkVerb> {
     }
 }
 
-/// Whether a list driving a preview **lends** that button's chord (CR-005's
-/// fifth letter). A verb the driver's own marks bar does not wear is not
+/// Whether a list driving a preview lends that button's shortcut. A verb the
+/// driver's own marks bar does not show is not
 /// lent: `archive` borrowed from a sent list's preview would mean, one row
 /// at a time, exactly what its bar refuses to do to a set — and one surface
 /// per answer is the whole point of the bar and the borrow wearing the same
@@ -403,7 +390,7 @@ pub fn lends(driver: &Kind, act: BtnAct) -> bool {
 /// `(key, what it fires)`. One table, so [`tests`] can hold the whole
 /// design to its rules rather than trusting discipline. `marks` is the
 /// one piece of state the table depends on: a list with marked rows wears
-/// its bar's verbs too (CR-009), and its borrowed chords stand down.
+/// its bar's verbs too, and its borrowed chords stand down.
 pub fn accels(kind: &Kind, marks: bool) -> Vec<(char, &'static str)> {
     // As an object — the state that wears the most — and with the marks
     // standing its object verbs down where they do.
@@ -482,9 +469,9 @@ pub enum FieldId {
     SetPass,
     SetImap,
     SetSmtp,
-    /// A files panel's `new dir` field (CR-008).
+    /// A files panel's `new dir` field.
     NewDir,
-    /// A files panel's `go to` path field (CR-008).
+    /// A files panel's `go to` path field.
     Path,
     SetBucketUrl,
     SetBucketKey,
@@ -589,7 +576,7 @@ mod tests {
         }
     }
 
-    /// The hold's other destination (CR-010): a compose wears `attach` only
+    /// The hold's other destination: a compose wears `attach` only
     /// while something is held, and the union still obeys every rule — in
     /// particular it must not claim a text chord, because a compose is
     /// nothing but fields.
@@ -625,7 +612,7 @@ mod tests {
         }
     }
 
-    // The four rules of CR-003, held by test rather than by discipline.
+    // Accelerator rules are enforced by tests.
 
     #[test]
     fn accelerators_never_claim_a_reserved_chord() {
@@ -670,13 +657,13 @@ mod tests {
         }
     }
 
-    /// The fifth rule (CR-005): a panel that previews **borrows** its
+    /// The fifth rule: a panel that previews **borrows** its
     /// preview's accelerators, so while a preview is up the user faces the
     /// union of the two sets. That union has to obey the same rules a single
     /// panel does — otherwise a borrowed chord could shadow a reserved one,
     /// or two visible controls could answer to the same key.
     ///
-    /// One allowance (CR-008): a driver and its preview may share a key
+    /// One allowance: a driver and its preview may share a key
     /// for the **same verb** — a files list and the directory it previews
     /// both wear `copy`. The driver's wins, and the shell draws the
     /// preview's mark plain while it is shadowed, so no visible bold
@@ -714,8 +701,8 @@ mod tests {
 
     /// A files panel wears the object verbs only at the end of a chain —
     /// under a parent's cursor, driving nothing; a root, or a list that
-    /// is driving, wears `new dir` alone (CR-008). Marked rows take them
-    /// too: the verb meant is then the set's (CR-009).
+    /// is driving, wears `new dir` alone. Marked rows take them
+    /// too: the verb meant is then the set's.
     #[test]
     fn a_files_panel_wears_its_object_verbs_only_at_the_end_of_a_chain() {
         let k = Kind::Files { dir: "~".into() };
@@ -808,8 +795,8 @@ mod tests {
         }
     }
 
-    /// What a driver lends its preview (CR-005's fifth letter) is exactly
-    /// what its own bar would do to a set: the inbox lends `archive` and
+    /// A driver lends the same actions its marks bar supports: the inbox
+    /// lends `archive` and
     /// `delete`, every other mailbox lends `delete` alone — so `cmd+a` from
     /// a sent list does not quietly file the conversation the bar and the
     /// swipe both refuse to. What the bar has no opinion about is lent by
@@ -850,7 +837,7 @@ mod tests {
         }
     }
 
-    /// The marks bar's verbs (CR-009): a list with marks wears the letters
+    /// The marks bar's verbs: a list with marks wears the letters
     /// its own rows' verbs wear — the inbox `a`, `d`, `l`, a files panel
     /// `p`, `m`, `d`, `l` — which is the point (a batch is the row's verb
     /// on a set) and the reason the chords it borrows, or wears on its own

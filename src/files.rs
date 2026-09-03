@@ -1,23 +1,10 @@
-//! The file browser's domain: what a directory lists, what a
-//! file card shows, the path field's completion, and the one held item
-//! `copy`/`move` carry to a `… here`.
+//! File listings, cards, path completion, held paths, and undoable operations.
 //!
-//! The disk is **outside** (see [`crate::effect::Outside`]): a listing is
-//! read through it during draw, `open` hands a path to the OS through it,
-//! and so does every verb that writes — `new dir`, a copy, a move, and
-//! the trash a delete is. None of them removes anything anyone had: what a
-//! delete takes goes to the trash, and undo moves it back, so every one of
-//! them is an [`Intent`] a history node can give back — and each records
-//! the **object** it wrote, not just the path, so a reversal can tell its
-//! own work from a stranger standing at the same name. The [`demo`] tree is what the
-//! fake outside serves — the panels library's worlds, the tests, an e2e
-//! run under `--demo-disk` — and it takes the writes too, so a suite
-//! proves the verbs on a fixture instead of on somebody's home.
-//!
-//! Paths cross the boundary in two spellings: the **display** form the
-//! panels show and persist (`~/Downloads/2026`, `/tmp`) and the real
-//! [`Path`] the outside reads; [`real_path`] and [`display_path`] map
-//! between them.
+//! Disk access goes through [`crate::effect::Outside`]. Delete uses the system
+//! trash. Undo records file identity as well as path so it never removes a
+//! different object that later reused the name. [`demo`] supplies the safe
+//! writable tree used by examples and tests. [`real_path`] and [`display_path`]
+//! convert between displayed `~` paths and operating-system paths.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -40,7 +27,7 @@ pub const ROOT: &str = "/";
 pub const TEXT_PREVIEW_MAX: usize = 64 * 1024;
 /// How much of an image the card decodes.
 pub const IMAGE_PREVIEW_MAX: usize = 20 * 1024 * 1024;
-/// How big a file compose will carry out as a part (CR-010). Past this the
+/// How big a file compose will carry out as a part. Past this the
 /// attach refuses on the panel's status line rather than building a mail no
 /// server will take.
 pub const ATTACH_MAX: u64 = 25 * 1024 * 1024;
@@ -51,9 +38,7 @@ pub struct Entry {
     /// The name alone, no slash — the row adds one to a directory's.
     pub name: String,
     pub is_dir: bool,
-    /// Bytes; a directory has none.
     pub size: u64,
-    /// Unix seconds.
     pub modified: f64,
 }
 
@@ -484,7 +469,7 @@ pub fn id_in(world: &World, path: &str) -> Option<FileId> {
 // -- the card ------------------------------------------------------------------
 
 /// What a card draws, whichever side it came from: a file on the disk
-/// (CR-008) or a part of a letter (CR-010). The panel reads this and
+/// or a part of a letter. The panel reads this and
 /// nothing else, so one widget serves both — which is the whole reason
 /// attachments were cheap to build once the browser existed.
 #[derive(Debug, Clone, PartialEq)]
@@ -552,7 +537,7 @@ pub fn preview_of(
     }
 }
 
-/// Where a letter's part lands when it is opened (CR-010): the app's own
+/// Where a letter's part lands when it is opened: the app's own
 /// scratch directory, **a folder per part**, so nothing can be overwritten
 /// by anything — not another letter's part, and not this letter's second
 /// `image.png`, which is a shape mail actually arrives in. The folder
@@ -620,8 +605,7 @@ impl HoldOp {
     }
 }
 
-/// What is held, process-wide: context, not history. A **set** of paths
-/// (CR-009): a panel's own `copy`/`move` holds the one thing it shows, a
+/// Paths held for a copy or move. A panel holds its own object, while a
 /// marked list holds every marked row, and a `… here` performs the set —
 /// refusing per path exactly as it does for one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,7 +613,7 @@ pub struct Hold {
     pub op: HoldOp,
     pub paths: Vec<String>,
     /// The list panel whose marks this set came from, when it came from
-    /// one (CR-009). A move empties the rows it took, so it consumes those
+    /// one. A move empties the rows it took, so it consumes those
     /// marks — and undo has to know where to put them back. A panel's own
     /// verb holds one object and no marks: `None`.
     pub from: Option<u64>,
@@ -778,7 +762,7 @@ pub struct Step {
 
 
 /// What a `… here` can do and what it refuses, path by path — a batch
-/// refuses exactly as one does (CR-009).
+/// refuses exactly as one does.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -1931,7 +1915,7 @@ pub fn matches(e: &Entry, ast: &Ast) -> bool {
 impl Datasource for DirSource {
     type Row = Entry;
     /// A row is its name: unique within the one directory a source lists,
-    /// and what a mark would hold (CR-009).
+    /// and what a mark would hold.
     type Key = String;
 
     fn tags(&self) -> &'static [TagDef] {
@@ -1943,7 +1927,7 @@ impl Datasource for DirSource {
     }
 
     /// Every name the filter shows, in the table's order — what `all`
-    /// marks (CR-009). The listing is in memory, so this is the order
+    /// marks. The listing is in memory, so this is the order
     /// itself, read once.
     fn keys(&self, _store: &Store, ast: Option<&Ast>) -> Option<Vec<String>> {
         Some(self.filtered(ast).into_iter().map(|e| e.name).collect())
@@ -2044,7 +2028,7 @@ mod tests {
         assert_eq!(src.index_of(&store, None, &row), Some(4));
     }
 
-    /// The three questions a mark asks (CR-009), answered off the listing
+    /// The three questions a mark asks, answered off the listing
     /// the source already holds: every name under the filter, which of
     /// these it still shows, and the entry by name whatever the filter —
     /// a directory's own listing is its base `WHERE`, so a dot-file the
@@ -2209,9 +2193,8 @@ mod tests {
         assert!(demo::bytes_of("~/Downloads/nope.txt").is_none());
     }
 
-    /// The card and its preview are the two sides' one vocabulary
-    /// (CR-010): the kind decides whether the bytes are worth reading at
-    /// all, and a source that cannot answer yet is a card with no preview
+    /// The card kind decides whether preview bytes should be read
+    /// at all. A source that cannot answer yet is a card with no preview
     /// rather than a card that says there is none.
     #[test]
     fn one_card_serves_the_disk_and_a_letter() {
@@ -2253,7 +2236,7 @@ mod tests {
     }
 
     /// A name off the wire reaches the disk as one harmless segment, under
-    /// the app's own scratch directory and never anywhere else (CR-010).
+    /// the app's own scratch directory and never anywhere else.
     #[test]
     fn a_parts_name_cannot_climb_out_of_the_scratch_directory() {
         let root = std::env::temp_dir().join("superapp-parts").join("mail-7");
@@ -2450,7 +2433,7 @@ mod tests {
     }
 
     /// What a `… here` refuses, path by path — the same sentences for one
-    /// as for a set (CR-009).
+    /// as for a set.
     #[test]
     fn a_plan_refuses_path_by_path() {
         let w = world();
