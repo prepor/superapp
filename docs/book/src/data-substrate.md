@@ -179,6 +179,16 @@ waited goes `obsolete` rather than pushing stale work — and intent reverted
 *before* the pass ran was never queued at all. Undoing an archive costs the
 server nothing and works offline.
 
+One queue, but not one claimant. An account's IMAP session lives in that
+account's sync worker and nowhere else, so a pass claims only what it can
+perform: the worker takes the jobs filed against its own `account:N`, the
+sender takes what needs no session. A job says what it needs by what it is
+filed against, so it routes itself — and a claimant that could only have
+failed it never takes it. Before that, a delete read *pending → "not
+connected" → done*: the sender, waking on its own timer, took the move,
+failed it on a session it never had, and left it sitting out a backoff the
+worker beside it never asked for.
+
 A job that fails backs off and retries; after six attempts it stops and
 waits for a human. A job carries whether repeating it is **idempotent**,
 because that is the one judgement a crash cannot guess: on the next launch

@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::effect::{Clock, Secrets, World};
+use crate::effect::{Clock, Scope, Secrets, World};
 use crate::mail;
 
 /// One pass over the outbox: claim everything due and queue it. Answers how
@@ -121,7 +121,10 @@ pub fn spawn(
             );
             loop {
                 let did = outbox_pass(&w);
-                let ran = w.run_effects();
+                // Only what needs no session. This thread has none: a
+                // `move` claimed here would fail with "not connected" and
+                // wait out a backoff the account's worker never asked for.
+                let ran = w.run_effects_in(Scope::Sessionless);
                 if did > 0 || ran > 0 {
                     notify();
                 }
@@ -219,6 +222,39 @@ mod tests {
         // Idempotent at the pass level: a second sweep claims nothing.
         assert_eq!(outbox_pass(&w), 0);
         assert_eq!(w.run_effects(), 0);
+    }
+
+    /// The regression this scoping exists for: the sender holds no IMAP
+    /// session, so it leaves an account's push job for the worker that
+    /// does. It used to claim the move, fail it with "not connected", and
+    /// leave it sitting out a backoff — pending, pending, done.
+    #[test]
+    fn the_sender_does_not_steal_an_accounts_push() {
+        let w = world("smtp.t");
+        let mv = w
+            .enqueue(&mail::Move {
+                account: 1,
+                message: 1,
+                to_folder: 2,
+                from: "INBOX".into(),
+                to: "Trash".into(),
+                uid: 5,
+            })
+            .unwrap();
+        w.with_fake(|f| f.clock = 200.0);
+
+        assert_eq!(outbox_pass(&w), 1);
+        assert_eq!(w.run_effects_in(Scope::Sessionless), 1, "the submit, not the move");
+
+        let job = |id: i64| w.jobs().into_iter().find(|j| j.id == id).unwrap();
+        let m = job(mv);
+        assert_eq!(m.status, "pending", "untouched");
+        assert_eq!(m.attempts, 0, "no attempt burned");
+        assert!(m.error.is_none(), "and nothing to explain to a human");
+        assert_eq!(outbox(&w).0, "sent", "while the send still went");
+
+        // The account's own worker is what takes it.
+        assert_eq!(w.run_effects_in(Scope::Account(1)), 1);
     }
 
     /// Undo inside the window deletes the pending row, so the pass never
