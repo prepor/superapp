@@ -630,6 +630,43 @@ fn backoff(attempts: i64) -> f64 {
 /// After this many attempts a job stops retrying and waits for a human.
 pub const MAX_ATTEMPTS: i64 = 6;
 
+/// Which of the due jobs an executor pass may claim.
+///
+/// The pass used to claim every due row, whoever ran it — and that is wrong
+/// the moment a job needs something only *one* thread holds. An account's
+/// IMAP session lives in that account's sync worker's [`Real`] and nowhere
+/// else, so the sender thread, waking on its own timer, would take a `move`,
+/// fail it with "not connected", burn an attempt and leave it sitting out a
+/// backoff — a round trip the worker beside it could have made at once. A
+/// pass now claims only what it can perform.
+///
+/// A job says what it needs by what it is filed against: an entity of
+/// `account:N` needs that account's session, anything else needs none. So a
+/// new deferred effect routes itself, and still no central list names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Everything due. The manual pump, where one thread is every thread.
+    All,
+    /// One account's jobs and nothing else — its worker's, being the thread
+    /// that holds its session.
+    Account(i64),
+    /// Only what needs no session: the sender, whose `submit` carries its
+    /// own credentials and opens its own connection to file the copy to
+    /// Sent.
+    Sessionless,
+}
+
+impl Scope {
+    /// The claim's extra predicate, and the `?2` it binds.
+    fn sql(self) -> (&'static str, Option<String>) {
+        match self {
+            Scope::All => ("", None),
+            Scope::Account(a) => ("AND entity = ?2", Some(format!("account:{a}"))),
+            Scope::Sessionless => ("AND (entity IS NULL OR entity NOT LIKE 'account:%')", None),
+        }
+    }
+}
+
 // -- reading the table ---------------------------------------------------------
 
 fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
@@ -1123,19 +1160,33 @@ impl World {
         cancel_tx(tx, id, self.now())
     }
 
-    /// One executor pass: claim every due job and run it. Answers how many
-    /// were claimed.
+    /// One executor pass over every due job, whoever it belongs to. Answers
+    /// how many were claimed.
     pub fn run_effects(&self) -> usize {
+        self.run_effects_in(Scope::All)
+    }
+
+    /// One executor pass: claim every due job this pass is allowed to run
+    /// ([`Scope`]) and perform it. Answers how many were claimed.
+    pub fn run_effects_in(&self, scope: Scope) -> usize {
         let now = self.now();
+        let (mine, param) = scope.sql();
         let due: Vec<(i64, String, String)> = {
-            let Ok(mut stmt) = self.store.conn().prepare(
+            let sql = format!(
                 "SELECT id, kind, payload FROM effect
-                 WHERE status='pending' AND not_before <= ?1 ORDER BY id",
-            ) else {
+                 WHERE status='pending' AND not_before <= ?1 {mine} ORDER BY id"
+            );
+            let Ok(mut stmt) = self.store.conn().prepare(&sql) else {
                 return 0;
             };
-            stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .map(|it| it.filter_map(Result::ok).collect())
+            fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            }
+            let rows = match &param {
+                Some(p) => stmt.query_map(rusqlite::params![now, p], row),
+                None => stmt.query_map(rusqlite::params![now], row),
+            };
+            rows.map(|it| it.filter_map(Result::ok).collect())
                 .unwrap_or_default()
         };
 
@@ -2466,11 +2517,14 @@ mod tests {
         fails: bool,
         idem: bool,
         wanted: bool,
+        /// The account whose session it would need, if any — what
+        /// [`Scope`] routes on.
+        acct: Option<i64>,
     }
 
     impl Poke {
         fn ok(note: &str) -> Poke {
-            Poke { note: note.into(), fails: false, idem: true, wanted: true }
+            Poke { note: note.into(), fails: false, idem: true, wanted: true, acct: None }
         }
     }
 
@@ -2494,7 +2548,10 @@ mod tests {
             self.idem
         }
         fn entity(&self) -> Option<String> {
-            Some(format!("panel:{}", self.note.len()))
+            Some(match self.acct {
+                Some(a) => format!("account:{a}"),
+                None => format!("panel:{}", self.note.len()),
+            })
         }
         fn still_wanted(&self, _db: &Connection) -> bool {
             self.wanted
@@ -2584,6 +2641,32 @@ mod tests {
         assert_eq!(w.with_fake(|f| f.clips.clone()), vec!["hello"]);
 
         assert_eq!(w.run_effects(), 0, "a closed job is not reclaimed");
+    }
+
+    /// A pass claims only what it can perform. An account's jobs are its
+    /// own worker's — the one thread holding its session — and a
+    /// sessionless pass beside it takes the rest instead of failing them on
+    /// its way past.
+    #[test]
+    fn a_pass_claims_only_what_it_can_run() {
+        let w = world();
+        let clips = || w.with_fake(|f| f.clips.clone());
+        w.enqueue(&Poke { acct: Some(7), ..Poke::ok("seven") }).unwrap();
+        w.enqueue(&Poke { acct: Some(9), ..Poke::ok("nine") }).unwrap();
+        w.enqueue(&Poke::ok("free")).unwrap();
+
+        assert_eq!(w.run_effects_in(Scope::Sessionless), 1, "the unbound job alone");
+        assert_eq!(clips(), vec!["free"]);
+
+        assert_eq!(w.run_effects_in(Scope::Account(7)), 1);
+        assert_eq!(clips(), vec!["free", "seven"], "its own, and only its own");
+
+        assert_eq!(w.run_effects_in(Scope::Account(7)), 0, "never account 9's");
+        assert_eq!(w.run_effects_in(Scope::All), 1, "the manual pump takes it");
+        assert_eq!(clips(), vec!["free", "seven", "nine"]);
+
+        // And nothing was failed on the way past: three jobs, three dones.
+        assert!(w.jobs().iter().all(|j| j.status == "done"), "{:?}", w.jobs());
     }
 
     /// Cancelling beats the executor while the row is `pending`, and the
@@ -2769,6 +2852,7 @@ mod tests {
             fails: true,
             idem: false,
             wanted: true,
+            acct: None,
         })
         .unwrap();
         w.run_effects();

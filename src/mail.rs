@@ -664,8 +664,19 @@ pub fn add_account_tx(
     Ok(c.last_insert_rowid())
 }
 
-/// Removes an account and everything it brought.
-pub fn remove_account_tx(c: &rusqlite::Connection, id: i64) -> rusqlite::Result<()> {
+/// Removes an account and everything it brought, `now` being the world's
+/// clock (the queue it retires is timestamped with it).
+pub fn remove_account_tx(c: &rusqlite::Connection, id: i64, now: f64) -> rusqlite::Result<()> {
+    // Its queued work goes with it. Only this account's worker may claim
+    // these ([`crate::effect::Scope`]), and that worker retires with the
+    // row — so a job left behind would wait for a thread that is never
+    // coming back. Obsolete rather than deleted: the log keeps what was
+    // asked for.
+    c.execute(
+        "UPDATE effect SET status='obsolete', updated=?2
+         WHERE entity=?1 AND status IN ('pending','processing')",
+        rusqlite::params![format!("account:{id}"), now],
+    )?;
     c.execute("DELETE FROM message WHERE account=?1", [id])?;
     c.execute("DELETE FROM folder WHERE account=?1", [id])?;
     c.execute("DELETE FROM account WHERE id=?1", [id])?;
@@ -2182,9 +2193,9 @@ impl Intent for AccountAdded {
         format!("account:{} added", self.id)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let id = self.id;
+        let (id, now) = (self.id, w.now());
         w.store()
-            .write(move |c| remove_account_tx(c, id))
+            .write(move |c| remove_account_tx(c, id, now))
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {

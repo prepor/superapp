@@ -5826,12 +5826,13 @@ impl Stage {
                         .find(|acc| acc.id == id)
                         .map(|acc| acc.email.clone())
                         .unwrap_or_default();
+                    let now = state.world.now();
                     state.act(
                         "account",
                         format!("remove account {email}"),
                         None,
                         |_| {},
-                        move |tx| mail::remove_account_tx(tx, id),
+                        move |tx| mail::remove_account_tx(tx, id, now),
                         vec![Box::new(mail::AccountRemoved {
                             email: email.clone(),
                         }) as Box<dyn crate::history::Intent>],

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use rusqlite::Transaction;
 
-use crate::effect::{Clock, RemoteMail, Secrets, UidSet, World};
+use crate::effect::{Clock, RemoteMail, Scope, Secrets, UidSet, World};
 use crate::mail;
 
 /// How many most-recent messages a folder retains on first contact (and
@@ -724,8 +724,10 @@ pub fn spawn(
                     Some(_) => {}
                 }
                 let outcome = sync_account(&w, account);
-                // The push pass only queued; the executor is what talks.
-                w.run_effects();
+                // The push pass only queued; the executor is what talks —
+                // and this thread is the only one holding this account's
+                // session, so it claims this account's jobs and no other's.
+                w.run_effects_in(Scope::Account(account));
                 let status = match &outcome {
                     Ok(()) => format!("ok · {}", mail::fmt_date(w.now())),
                     Err(e) => format!("error: {e}"),
