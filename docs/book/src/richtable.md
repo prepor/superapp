@@ -79,7 +79,10 @@ lands); a dynamic tag's values come from the datasource with the typed
 prefix, on the spot — in-process there is nothing to wait for. A quoted
 value keeps its spaces while it is typed. Arrows walk the offer, `enter`
 and `tab` take it, `esc` puts it away (a second `esc` leaves the field);
-a pick keeps the field's focus. The box is capped at eight rows.
+a pick keeps the field's focus. The box is capped at eight rows. With no
+box up, `↓` belongs to the field's own panel: it hands the keyboard to the
+rows and lands on the first — where `enter` lands, but as a walk rather
+than an opening.
 
 The box is not the filter's. What a field completes is a **completion**
 (`richtable::Completion`): how the caret's context is read off the line,

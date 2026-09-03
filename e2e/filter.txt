@@ -98,6 +98,63 @@ shot f10-dismissed
 key esc
 wait 300
 
+# `↓` with no offer up hands the keyboard from the filter to the rows and
+# lands on the first — where `enter` lands, but as the walk's preview. The
+# field really let go: two more steps walk on, and the from-link of the
+# mail they reach (Max's, the third row) resolves only if they did.
+key /
+wait 200
+key cmd+a
+key backspace
+wait 300
+key down
+wait 600
+shot f11-down-leaves-filter
+key down
+wait 400
+key down
+wait 600
+click "Max Ivanov <max@ivanov.dev"
+wait 700
+shot f12-walked-from-filter
+key cmd+w
+wait 500
+
+# A filter that matched nothing has no rows to hand the keyboard to, so
+# `↓` leaves it where it is: `cmd+a` and what follows still edit the
+# filter — and the row that comes back is the proof. (Out of the field,
+# `cmd+a` would be the marks' own and `vera` would go nowhere, so the
+# filter would still be the one that matched nothing.) The row click is
+# the list taking the keyboard back, so `/` reaches it.
+click "Sat hike"
+wait 600
+key /
+wait 200
+key cmd+a
+type "zzzznothing"
+wait 400
+key down
+wait 300
+key cmd+a
+type "vera"
+wait 500
+shot f13-empty-keeps-field
+key esc
+wait 400
+click "Q3 infra"
+wait 600
+
+# Back to the whole list, the cursor where the clicks left it.
+key /
+wait 200
+key cmd+a
+key backspace
+wait 300
+key esc
+wait 300
+click "Sat hike"
+wait 600
+
 # Clear the filter and walk to the bottom of the whole list: the oldest
 # row is on the second page, fetched because the viewport reached it.
 # The walk is the keyboard's (the arrows scroll-follow); a touch swipe
@@ -112,8 +169,8 @@ key esc
 wait 300
 key down 68
 wait 1500
-shot f11-scrolled-end
+shot f14-scrolled-end
 click "archive digest #01"
 wait 600
-shot f12-oldest-opened
+shot f15-oldest-opened
 quit
