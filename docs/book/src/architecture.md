@@ -12,7 +12,7 @@ the layout is, and a shell that owns *how it gets there*.
 | `src/filter.rs` | the rich table's filter grammar and completion context | no |
 | `src/richtable.rs` | the rich table: datasources, the SQL builder, paging | no |
 | `src/mail.rs` | the mail domain: queries, titles, seed, attachments, effects, intents | no |
-| `src/files.rs` | the file browser's domain: paths, listings, the card (a file's *and* a letter's part's), the path completion | no |
+| `src/files.rs` | the file browser's domain: paths, listings, the card (a file's *and* a letter's part's), the path completion, the verbs that write and their intents | no |
 | `src/html.rs` | narrowing HTML from outside — mail, feed articles — to what a panel draws | no |
 | `src/sync.rs` | the IMAP engine: passes, ingest, push, the pump | no |
 | `src/send.rs` | drafts → outbox → SMTP, with the undo window | no |

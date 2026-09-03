@@ -86,16 +86,33 @@ isolation without it quietly sending mail.
 The filesystem is outside by that same line — nothing the store can
 reproduce — so the [file browser](./interaction-grammar.md#files-a-directory-is-a-column-a-file-is-a-card)
 reaches it through the same backend the network does: `list_dir`, `stat`,
-`read_file` and `open_path` sit beside `now` and `clip`. A files panel is
-the one kind that reads outside the store *while drawing*, so the world
-rides its props; everything else in the app draws from rows alone.
+`read_file` and `open_path` sit beside `now` and `clip`, and so do the four
+that write — `make_dir`, `copy_path`, `move_path` and `trash`. A files
+panel is the one kind that reads outside the store *while drawing*, so the
+world rides its props; everything else in the app draws from rows alone.
 
-What that buys is what every backend buys: the real one reads the disk and
-hands a path to the OS (`/usr/bin/open` on macOS), the fake serves a demo
-tree — which is why the panels library draws the same directory on every
-machine — and a sealed world says *this world has no outside* on the status
-line instead of pretending. What it costs is the reactive layer: a listing
-is not a query, so nothing invalidates it when the disk moves.
+The write verbs are performed inline, where the click is, the way `clip`
+and `open` are — not filed as jobs. They are effects because the store
+cannot reproduce them, not because anyone would retry them: a copy that
+refuses has to say so in the same breath as the click, and an action whose
+undo is recorded the moment it happens can never race a queue. The costs
+are both open questions: the wait for a large tree, and a delete that
+leaves no row in [the log panel](#the-log-panel). There is no
+`remove` among them on purpose: `trash` answers *where it put it*, which is
+what makes a delete an ordinary move to undo, and it is the only way this
+app takes a path away — the reversal of a copy uses it too.
+
+What that buys is what every backend buys: the real one reads and writes
+the disk, hands a path to the OS (`/usr/bin/open` on macOS) and trashes
+through `NSFileManager`'s own door — the right trash for the volume, the
+Put Back the Finder offers — the fake serves a demo tree, which is why the
+panels library draws the same directory on every machine, and a sealed
+world says *this world has no outside* on the status line instead of
+pretending. The demo tree takes the writes too, so an e2e run under
+`--demo-disk` proves the verbs against a fixture rather than against
+somebody's home. What it costs is the reactive layer: a listing is not a
+query, so nothing invalidates it when the disk moves — a verb that wrote
+tells the panels itself.
 
 Paths cross that boundary in two spellings, and the mapping is one function
 each way: the panels show and persist `~/Downloads/2026`, the outside reads
@@ -237,8 +254,8 @@ because that is the one judgement a crash cannot guess: on the next launch
 idempotent work returns to the queue, and everything else fails with
 *"interrupted; outcome unknown"* rather than risking a second send. Payloads
 and replies are JSON text and reference rows rather than embedding their
-contents, so `sqlite3` shows every attempt the app has made on the world,
-with its status, its answer and its failures. A panel can ask for its own
+contents, so `sqlite3` shows every *queued* attempt, with its status, its
+answer and its failures. A panel can ask for its own
 (`WHERE entity = 'panel:7'`); a reply is read back through the same reactive
 query layer as anything else, so watching a job is invalidation, not polling.
 
@@ -255,6 +272,13 @@ the same `describe` that names it everywhere else, so a new effect kind
 arrives in the log the day it is registered and no central table of kinds
 exists to forget it. A row a build cannot decode falls back to its payload
 rather than disappearing.
+
+It is the **queue** read back, though, not a record of everything that left
+the process: an in-memory effect writes no row, so `clip`, `open` and the
+file browser's four writing verbs never appear here. Nothing is retrying
+them and nothing is waiting on them — but a delete is a large thing to
+leave no trace, and closing that gap is an open question, not a decision
+(see [Open Questions](./open-questions.md)).
 
 The log is the **inbox's shape over another table**: it previews into a
 **job** panel exactly as the inbox previews a message — the cursor walk

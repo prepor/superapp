@@ -1284,13 +1284,25 @@ fn files_walk() -> Scene<Setup> {
             "pasted",
             from_home(&format!("{chain}key enter\nwait 400\nkey cmd+p\nwait 300\nkey cmd+left\nwait 300\nkey cmd+left\nwait 400\nkey cmd+h\nwait 700")),
         )
-        .about("⌘h — copy here — performs into the directory shown (it says so; the write is not built)")
+        .about("⌘h — copy here — performs into the directory shown; into the file's own directory it lands under a free name")
+        .node(
+            "deleted",
+            from_home(&format!("{chain}key enter\nwait 400\nkey cmd+d\nwait 700")),
+        )
+        .about("⌘d on the card: to the trash, never rm — the row goes, and the panel that was showing it closes")
+        .node(
+            "undone",
+            from_home(&format!("{chain}key enter\nwait 400\nkey cmd+d\nwait 500\nkey cmd+z\nwait 700")),
+        )
+        .about("⌘z is the move back out of the trash — the file, and the card that was on it")
         .edge("root", "preview", "↓")
         .edge("preview", "re-aimed", "enter, ↓, ↓")
         .edge("preview", "chain", "enter, ↓, enter, ↓")
         .edge("chain", "replaced", "↑")
         .edge("chain", "holding", "enter, ⌘p, ⌘← ⌘←")
         .edge("holding", "pasted", "⌘h")
+        .edge("chain", "deleted", "enter, ⌘d")
+        .edge("deleted", "undone", "⌘z")
 }
 
 fn small_panels() -> Scene<Setup> {

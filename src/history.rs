@@ -101,7 +101,27 @@ pub struct Node {
     /// Context restored with the delta (CR-009): the marks a batch verb
     /// consumed, per list panel. Undo puts them back, redo takes them
     /// again — marks are never a node of their own.
-    pub marks: Vec<(u64, Vec<i64>)>,
+    pub marks: Vec<(u64, MarkKeys)>,
+}
+
+/// The keys one list's marks are made of. The two lists differ in what a
+/// row *is* (CR-009): the inbox's rows are threads, and a files panel's
+/// are the names in one directory — so the context a node carries is the
+/// one or the other, never a shared integer that means neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkKeys {
+    Threads(Vec<i64>),
+    Names(Vec<String>),
+}
+
+impl MarkKeys {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            MarkKeys::Threads(v) => v.is_empty(),
+            MarkKeys::Names(v) => v.is_empty(),
+        }
+    }
 }
 
 /// One action, as history is asked to record it.
@@ -136,7 +156,7 @@ pub struct Step {
     pub label: String,
     pub snap: WmSnap,
     /// The marks the node consumed, per list panel.
-    pub marks: Vec<(u64, Vec<i64>)>,
+    pub marks: Vec<(u64, MarkKeys)>,
     /// Whether the step undid the node (the marks go back) or applied it
     /// (they go).
     pub undone: bool,
@@ -239,7 +259,7 @@ impl History {
 
     /// Attaches the marks a batch verb consumed to the node just applied,
     /// so undoing it gives them back (CR-009).
-    pub fn claim_marks(&mut self, pid: u64, keys: Vec<i64>) {
+    pub fn claim_marks(&mut self, pid: u64, keys: MarkKeys) {
         if keys.is_empty() {
             return;
         }

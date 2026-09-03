@@ -287,6 +287,22 @@ pub trait Outside {
     /// is executed by us.
     fn open_path(&mut self, path: &Path) -> Result<(), String>;
 
+    // The disk, written (CR-008). None of these is `rm`: what a delete
+    // takes goes to the trash, and undo moves it back out — so a backend
+    // that implements them can never make a path unrecoverable.
+    /// One directory, where nothing is yet. Refuses a taken name rather
+    /// than adopting whatever is there.
+    fn make_dir(&mut self, path: &Path) -> Result<(), String>;
+    /// A file, or a directory with everything under it, copied. Refuses a
+    /// taken destination — a copy never writes over anything.
+    fn copy_path(&mut self, from: &Path, to: &Path) -> Result<(), String>;
+    /// A path moved, and the same verb undo puts one back with. Refuses a
+    /// taken destination, for the same reason.
+    fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), String>;
+    /// To the trash, answering where it landed — the trash picks the name,
+    /// and undo needs the one it picked.
+    fn trash(&mut self, path: &Path) -> Result<PathBuf, String>;
+
     /// Reach the concrete backend — how a test arranges a [`Fake`] world.
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
@@ -461,6 +477,74 @@ impl Effect for OpenPath<'_> {
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.open_path(self.path)
+    }
+}
+
+/// Make one directory — a files panel's `new dir` (CR-008).
+pub struct MakeDir<'a> {
+    pub path: &'a Path,
+}
+
+impl Effect for MakeDir<'_> {
+    const KIND: &'static str = "make_dir";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("make the directory {}", self.path.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.make_dir(self.path)
+    }
+}
+
+/// `copy here`, one path of it (CR-008).
+pub struct CopyPath<'a> {
+    pub from: &'a Path,
+    pub to: &'a Path,
+}
+
+impl Effect for CopyPath<'_> {
+    const KIND: &'static str = "copy_path";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("copy {} to {}", self.from.display(), self.to.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.copy_path(self.from, self.to)
+    }
+}
+
+/// `move here`, one path of it — and what undo reverses every one of these
+/// verbs with (CR-008).
+pub struct MovePath<'a> {
+    pub from: &'a Path,
+    pub to: &'a Path,
+}
+
+impl Effect for MovePath<'_> {
+    const KIND: &'static str = "move_path";
+    type Reply = ();
+    fn describe(&self) -> String {
+        format!("move {} to {}", self.from.display(), self.to.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.out.move_path(self.from, self.to)
+    }
+}
+
+/// `delete`: to the trash, never `rm`, answering where it landed so undo
+/// can take it back out (CR-008).
+pub struct Trash<'a> {
+    pub path: &'a Path,
+}
+
+impl Effect for Trash<'_> {
+    const KIND: &'static str = "trash";
+    type Reply = PathBuf;
+    fn describe(&self) -> String {
+        format!("move {} to the trash", self.path.display())
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<PathBuf, String> {
+        cx.out.trash(self.path)
     }
 }
 
@@ -1415,6 +1499,18 @@ impl Outside for Deny {
     fn open_path(&mut self, _p: &Path) -> Result<(), String> {
         Self::no("open_path")
     }
+    fn make_dir(&mut self, _p: &Path) -> Result<(), String> {
+        Self::no("make_dir")
+    }
+    fn copy_path(&mut self, _f: &Path, _t: &Path) -> Result<(), String> {
+        Self::no("copy_path")
+    }
+    fn move_path(&mut self, _f: &Path, _t: &Path) -> Result<(), String> {
+        Self::no("move_path")
+    }
+    fn trash(&mut self, _p: &Path) -> Result<PathBuf, String> {
+        Self::no("trash")
+    }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -1528,6 +1624,9 @@ pub struct Fake {
     pub shots: Vec<PathBuf>,
     /// What `open` handed to the OS (CR-008).
     pub opened: Vec<PathBuf>,
+    /// The demo tree this world's file browser walks — its own copy, which
+    /// is what lets a verb that writes run in any number of tests at once.
+    pub disk: crate::files::demo::Disk,
     /// Accounts with a live session. A verb that reaches a server without
     /// one is a bug in the pass, and this catches it.
     pub connected: HashSet<i64>,
@@ -1579,21 +1678,13 @@ impl Fake {
 /// The demo tree as a disk, in the panels' spelling: what a fake world
 /// serves, and what a real one serves under `--demo-disk` — the panels
 /// library's fixture, a machine-independent `~` a suite can address a row
-/// of by name.
-fn demo_list(dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
-    let d = crate::files::display_path(dir);
-    crate::files::demo::list(&d).ok_or_else(|| format!("{d}: no such directory"))
-}
-
-fn demo_stat(path: &Path) -> Result<Option<crate::files::Entry>, String> {
-    Ok(crate::files::demo::entry(&crate::files::display_path(path)))
-}
-
-fn demo_read(path: &Path, max: usize) -> Result<Vec<u8>, String> {
-    let d = crate::files::display_path(path);
-    let mut bytes = crate::files::demo::bytes_of(&d).ok_or_else(|| format!("{d}: no such file"))?;
-    bytes.truncate(max);
-    Ok(bytes)
+/// of by name. Written as well as read (CR-008): the verbs act on the
+/// fixture exactly as they act on the filesystem, so a suite proves them.
+///
+/// The one translation each of its verbs needs: an outside is handed real
+/// paths, and the fixture is keyed by the spelling the panels show.
+fn demo(path: &Path) -> String {
+    crate::files::display_path(path)
 }
 
 impl Outside for Fake {
@@ -1813,13 +1904,14 @@ impl Outside for Fake {
         Ok(())
     }
 
-    // The demo tree, in the panels' spelling: a fake world's disk.
+    // The demo tree, in the panels' spelling: a fake world's disk, read
+    // and written.
     fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
-        demo_list(dir)
+        self.disk.list(&demo(dir))
     }
 
     fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
-        demo_stat(path)
+        Ok(self.disk.entry(&demo(path)))
     }
 
     /// What was written here, if anything was — a fake disk is writable,
@@ -1828,13 +1920,33 @@ impl Outside for Fake {
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
         match self.files.get(path) {
             Some(b) => Ok(b[..b.len().min(max)].to_vec()),
-            None => demo_read(path, max),
+            None => self.disk.read(&demo(path), max),
         }
     }
 
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
         self.opened.push(path.to_path_buf());
         Ok(())
+    }
+
+    fn make_dir(&mut self, path: &Path) -> Result<(), String> {
+        let now = self.clock;
+        self.disk.make_dir(&demo(path), now)
+    }
+
+    fn copy_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        self.disk.copy(&demo(from), &demo(to))
+    }
+
+    fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        self.disk.mv(&demo(from), &demo(to))
+    }
+
+    fn trash(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let now = self.clock;
+        self.disk
+            .trash(&demo(path), now)
+            .map(|p| crate::files::real_path(&p))
     }
 
     fn as_any(&mut self) -> &mut dyn std::any::Any {
@@ -1958,6 +2070,44 @@ impl Clock {
     }
 }
 
+/// `EXDEV` — "cross-device link", what a `rename` between two filesystems
+/// answers. The same number on macOS and on linux, and not worth a libc
+/// dependency to name.
+const EXDEV: i32 = 18;
+
+/// What a real copy and a real move ask of a destination before they write
+/// anything: nothing is there. `std::fs::rename` and `std::fs::copy` both
+/// replace silently, and this app never does — a clash is refused on the
+/// panel's status line, and undo is free to move a path back without
+/// wondering what it lands on.
+fn free(to: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Err(format!("{} is already there", to.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", to.display())),
+    }
+}
+
+/// A file, a symlink as itself, or a directory with everything under it.
+/// The recursion is the tree's depth, which is the disk's own bound.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        // Copied as a link, the way `cp -R` does it: following it would
+        // duplicate what it points at, which is not what was asked for.
+        return std::os::unix::fs::symlink(std::fs::read_link(from)?, to);
+    }
+    if !meta.is_dir() {
+        return std::fs::copy(from, to).map(|_| ());
+    }
+    std::fs::create_dir(to)?;
+    for ent in std::fs::read_dir(from)? {
+        let ent = ent?;
+        copy_tree(&ent.path(), &to.join(ent.file_name()))?;
+    }
+    Ok(())
+}
+
 /// Where [`Real`] keeps passwords.
 #[derive(Clone)]
 pub enum Secrets {
@@ -2016,7 +2166,14 @@ pub struct Real {
     /// browser then walks the same fixture the panels library shows — a
     /// suite can address a row by name — while its screenshots, its
     /// network and its keychain are the ones a run always had.
-    demo_disk: bool,
+    /// The demo tree, when a run asked for it — otherwise the real disk.
+    demo: Option<crate::files::demo::Disk>,
+    /// Whether the file browser's verbs may write at all. Off for an e2e
+    /// script replayed against a real disk: a suite must no more delete a
+    /// human's files than write to their keychain, and the refusal lands
+    /// on the status line where a forgotten `--demo-disk` is a failing
+    /// step rather than a trip to the trash.
+    writes: bool,
 }
 
 /// How early a cached access token is treated as spent, so a long sync
@@ -2040,15 +2197,29 @@ impl Real {
             clock,
             dir,
             tokens: HashMap::new(),
-            demo_disk: false,
+            demo: None,
+            writes: true,
         }
     }
 
     /// The same outside with the demo tree for a disk (see [`Real`]).
     #[must_use]
     pub fn with_demo_disk(mut self) -> Real {
-        self.demo_disk = true;
+        self.demo = Some(crate::files::demo::Disk::new());
         self
+    }
+
+    /// The same outside with the file browser's verbs that write refused
+    /// (see the `writes` field).
+    #[must_use]
+    pub fn read_only_disk(mut self) -> Real {
+        self.writes = false;
+        self
+    }
+
+    /// The one sentence every refused write gives.
+    fn sealed<T>() -> Result<T, String> {
+        Err("this run may not write to the disk — a script wants --demo-disk".into())
     }
 
     fn session(&mut self, account: i64) -> Result<&mut imap_session::Imap, String> {
@@ -2251,8 +2422,8 @@ impl Outside for Real {
     }
 
     fn list_dir(&mut self, dir: &Path) -> Result<Vec<crate::files::Entry>, String> {
-        if self.demo_disk {
-            return demo_list(dir);
+        if let Some(d) = &self.demo {
+            return d.list(&demo(dir));
         }
         let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut out = Vec::new();
@@ -2272,8 +2443,8 @@ impl Outside for Real {
     }
 
     fn stat(&mut self, path: &Path) -> Result<Option<crate::files::Entry>, String> {
-        if self.demo_disk {
-            return demo_stat(path);
+        if let Some(d) = &self.demo {
+            return Ok(d.entry(&demo(path)));
         }
         match std::fs::metadata(path) {
             Ok(m) => {
@@ -2289,8 +2460,8 @@ impl Outside for Real {
     }
 
     fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
-        if self.demo_disk {
-            return demo_read(path, max);
+        if let Some(d) = &self.demo {
+            return d.read(&demo(path), max);
         }
         use std::io::Read;
         let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -2307,7 +2478,7 @@ impl Outside for Real {
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
         // A demo path names a file only the fixture has: nothing is handed
         // to the OS, and the card's `open` still answers.
-        if self.demo_disk {
+        if self.demo.is_some() {
             return Ok(());
         }
         #[cfg(target_os = "macos")]
@@ -2326,6 +2497,76 @@ impl Outside for Real {
         {
             let _ = path;
             Err("no opener on this platform".into())
+        }
+    }
+
+    fn make_dir(&mut self, path: &Path) -> Result<(), String> {
+        if !self.writes {
+            return Self::sealed();
+        }
+        if let Some(d) = &mut self.demo {
+            let now = self.clock.read();
+            return d.make_dir(&demo(path), now);
+        }
+        // `create_dir`, never `create_dir_all`: `new dir` makes the one
+        // directory it named, and a typo is a refusal rather than a tree.
+        std::fs::create_dir(path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn copy_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        if !self.writes {
+            return Self::sealed();
+        }
+        if let Some(d) = &mut self.demo {
+            return d.copy(&demo(from), &demo(to));
+        }
+        free(to)?;
+        copy_tree(from, to).map_err(|e| format!("{}: {e}", from.display()))
+    }
+
+    fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        if !self.writes {
+            return Self::sealed();
+        }
+        if let Some(d) = &mut self.demo {
+            return d.mv(&demo(from), &demo(to));
+        }
+        free(to)?;
+        match std::fs::rename(from, to) {
+            Ok(()) => Ok(()),
+            // EXDEV: the two paths are on different filesystems, where a
+            // rename cannot reach. Copy, then trash the source — so even
+            // the halfway state of a cross-volume move is recoverable.
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {
+                copy_tree(from, to).map_err(|e| format!("{}: {e}", from.display()))?;
+                self.trash(from).map(|_| ())
+            }
+            Err(e) => Err(format!("{}: {e}", from.display())),
+        }
+    }
+
+    /// macOS: `NSFileManager`'s own `trashItemAtURL:`, the door the Finder
+    /// uses — the right trash for the volume the file is on, a name that
+    /// does not clash, and Put Back where the Finder shows it. Never a
+    /// `remove_file`: undo has to be able to move it back.
+    fn trash(&mut self, path: &Path) -> Result<PathBuf, String> {
+        if !self.writes {
+            return Self::sealed();
+        }
+        if let Some(d) = &mut self.demo {
+            let now = self.clock.read();
+            return d
+                .trash(&demo(path), now)
+                .map(|p| crate::files::real_path(&p));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::trash(path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err("no trash on this platform".into())
         }
     }
 
@@ -3091,6 +3332,81 @@ mod tests {
         // A plain folder is no role, and an extension attribute that merely
         // spells one of the words is not that role.
         assert_eq!(role("Receipts", &["HasNoChildren"]), (String::new(), false));
-        assert_eq!(role("Odd", &[r#"Extension("All")"#]), (String::new(), false));
+        assert_eq!(
+            role("Odd", &[r#"Extension("All")"#]),
+            (String::new(), false)
+        );
+    }
+
+    /// The real disk, on a scratch tree of its own: a file copied, a
+    /// directory copied whole, a symlink copied as a symlink, a taken
+    /// destination refused rather than written over, and a move that
+    /// empties where it came from. The demo disk answers the same
+    /// questions in `files`; this is the backend that actually touches a
+    /// filesystem.
+    #[test]
+    fn the_real_outside_copies_and_moves_on_disk() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!("superapp-disk-{stamp}"));
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("src/deep/b.txt"), b"b").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("src/link")).unwrap();
+
+        let mut out = Real::new(Secrets::Memory(MemSecrets::new()), Clock::System);
+        // `new dir` makes the one directory it named, and refuses a taken
+        // name rather than adopting what is there.
+        out.make_dir(&root.join("dest")).unwrap();
+        assert!(out.make_dir(&root.join("dest")).is_err());
+
+        // A file, then the whole tree beside it.
+        out.copy_path(&root.join("src/a.txt"), &root.join("dest/a.txt"))
+            .unwrap();
+        assert_eq!(std::fs::read(root.join("dest/a.txt")).unwrap(), b"a");
+        assert!(
+            out.copy_path(&root.join("src/a.txt"), &root.join("dest/a.txt"))
+                .is_err(),
+            "a copy never writes over anything"
+        );
+        out.copy_path(&root.join("src"), &root.join("dest/src"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("dest/src/deep/b.txt")).unwrap(),
+            b"b"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("dest/src/link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a link is copied as a link, not as what it points at"
+        );
+
+        // A move empties where it came from, and refuses a taken
+        // destination — `rename` would have replaced it silently.
+        out.move_path(&root.join("dest/a.txt"), &root.join("dest/moved.txt"))
+            .unwrap();
+        assert!(!root.join("dest/a.txt").exists());
+        assert_eq!(std::fs::read(root.join("dest/moved.txt")).unwrap(), b"a");
+        assert!(out
+            .move_path(&root.join("src/a.txt"), &root.join("dest/moved.txt"))
+            .is_err());
+
+        // …and a run that may not write to a real disk refuses all of it.
+        let mut sealed =
+            Real::new(Secrets::Memory(MemSecrets::new()), Clock::System).read_only_disk();
+        assert!(sealed.make_dir(&root.join("nope")).is_err());
+        assert!(sealed
+            .copy_path(&root.join("src/a.txt"), &root.join("nope.txt"))
+            .is_err());
+        assert!(sealed
+            .move_path(&root.join("src/a.txt"), &root.join("nope.txt"))
+            .is_err());
+        assert!(sealed.trash(&root.join("src/a.txt")).is_err());
+        assert!(!root.join("nope").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

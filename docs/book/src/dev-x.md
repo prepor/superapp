@@ -137,8 +137,12 @@ seeded temp store** (unless `--db` overrides it), so suites never touch your
 session. The one thing a store cannot seed is the **disk**: `--demo-disk`
 gives the file browser the demo tree the [panels library](#panels-library)
 shows instead of this machine’s own, so a files suite can address a row by
-name. Nothing else changes — the network, the keychain and the screenshots
-are the ones a run always had.
+name. It takes the writes too, which is why forgetting the flag is safe:
+a script replayed against a **real** disk has the browser's four writing
+verbs sealed, and each one refuses on the status line. A suite must no
+more delete your files than write to your keychain — the same reason a
+run's passwords live in memory. Nothing else changes: the network and the
+screenshots are the ones a run always had.
 
 Runs go through makepad's **headless backend** (`MAKEPAD=headless`), a
 software rasterizer with a virtual GPU and a shader JIT. There is no window,
@@ -232,15 +236,20 @@ the same marks over a directory — the object verbs a joined files panel
 wears, then the bar taking them while rows are marked, a dot-file marked
 under `@hidden` and still drawn above the rows once the filter leaves it
 out, `⌘p` holding the whole set and `copy here` performing it, and a
-`move here` refusing it path by path — `e2e/attach.txt` (also with
-`--demo-disk`) both directions of what a letter carries: the seeded
-letter's part as a link, the card over it and its preview, `open` handing
-it out; then a file held with `copy` in the browser, `attach` on the
-compose that appears only because something is held, the `CARRIES` link to
-the file's own card, and `cmd+z` taking the attach back off — and
-`e2e/problems.txt` (with `--send-delay 1
---draws 100000` — it waits out the executor's backoff in virtual time) the
-problems surface: a send the demo account cannot make raises the mark, the
+`move here` refusing it path by path. `e2e/files.txt` (with `--demo-disk`)
+walks the verbs that write: `new dir` and the row it made, a `delete` found
+again in the trash by `go to`, a copy beside itself under a free name, a
+move proved by the card's own path line, and `⌘z` after each. It is the
+suite that leans hardest on the clicks being the assertions — where two
+panels could both be showing a row of that name, the card's path settles
+which. `e2e/attach.txt` (also with `--demo-disk`) walks both directions of
+what a letter carries: the seeded letter's part as a link, the card over it
+and its preview, `open` handing it out; then a file held with `copy` in the
+browser, `attach` on the compose that appears only because something is
+held, the `CARRIES` link to the file's own card, and `cmd+z` taking the
+attach back off. `e2e/problems.txt` (with `--send-delay 1
+--draws 100000` — it waits out the executor's backoff in virtual time) walks
+the problems surface: a send the demo account cannot make raises the mark, the
 mark opens the panel, *retry* files it again, *reopen* brings the draft back
 and `cmd+z` takes that back; an account against an `.invalid` host joins the
 list, *sync* kicks it, and removing the account clears it.

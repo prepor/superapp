@@ -5679,6 +5679,38 @@ impl FilesPanelRef {
         }
     }
 
+    /// Marks these names again — an undo giving back what a batch verb
+    /// consumed (CR-009).
+    pub fn add_marks(&self, cx: &mut Cx, keys: &[String]) {
+        if let Some(mut p) = self.borrow_mut() {
+            p.marks.extend(keys.iter().cloned());
+            p.redraw(cx);
+        }
+    }
+
+    /// Unmarks these names — what a batch verb deleted, or a redo taking
+    /// them again.
+    pub fn remove_marks(&self, cx: &mut Cx, keys: &[String]) {
+        if let Some(mut p) = self.borrow_mut() {
+            for k in keys {
+                p.marks.remove(k);
+            }
+            p.redraw(cx);
+        }
+    }
+
+    /// Lists the same directory again, keeping the filter as typed and the
+    /// cursor on the name it stood on. What a verb that wrote the disk
+    /// calls: nothing watches it, so the panel has to be told (CR-008).
+    pub fn refresh(&self, cx: &mut Cx, world: &crate::effect::World) {
+        let Some(mut p) = self.borrow_mut() else {
+            return;
+        };
+        let dir = p.table.source().dir.clone();
+        p.relist(world, &dir);
+        p.redraw(cx);
+    }
+
     /// The marks bar's buttons, `(label, rect, verb)`, for the shell's hit
     /// table — none while the set is empty.
     pub fn verb_hits(&self, cx: &mut Cx) -> Vec<(String, Rect, ui::MarkVerb)> {
