@@ -3173,7 +3173,7 @@ impl Stage {
                 // before the key comes back up. Never a fresh `Search` —
                 // that would retire the provider threads with it.
                 let store = state.store.clone();
-                state.launcher.ask(&state.ws, &store, "");
+                state.launcher.open(&state.ws, &store);
                 state.overlay = Overlay::Launcher;
                 true
             }
@@ -3194,7 +3194,7 @@ impl Stage {
             let opening = state.overlay != Overlay::Launcher;
             if opening {
                 let store = state.store.clone();
-                state.launcher.ask(&state.ws, &store, "");
+                state.launcher.open(&state.ws, &store);
                 state.overlay = Overlay::Launcher;
             }
             opening

@@ -25,7 +25,7 @@
 
 use crate::core::{Kind, PanelId, Seed, Wm, WS_N};
 use crate::mail;
-use crate::search::{Answer, Engine, Go, Hit};
+use crate::search::{self, Answer, Engine, Go, Hit};
 use crate::store::Store;
 
 /// How many rows the list is allowed to reach. A palette is refined by
@@ -78,17 +78,6 @@ fn mail_extra(store: &Store, kind: &Kind) -> String {
     }
 }
 
-/// Does every token appear among a candidate's words? The parts are joined
-/// before the search, but a token never spans two of them — the query is
-/// split on whitespace, so it cannot contain the joining space.
-fn matches(tokens: &[String], parts: &[&str]) -> bool {
-    if tokens.is_empty() {
-        return true;
-    }
-    let hay = parts.join(" ").to_lowercase();
-    tokens.iter().all(|t| hay.contains(t.as_str()))
-}
-
 /// Where a kind is to be found: focus it if it is open on any workspace,
 /// open it fresh otherwise — the launcher's verb, for anything else that
 /// reaches a root panel (the problems mark, a menu item). Never a second
@@ -122,7 +111,9 @@ fn roots() -> [Kind; 8] {
 /// and the one answer that reads no mail at all.
 #[must_use]
 pub fn windows(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
-    let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    // The same reading of the query the index gets, so one word means one
+    // thing whether the thing it names is open or not.
+    let terms = search::terms(query);
     let mut hits: Vec<Hit> = Vec::new();
 
     let mut order: Vec<usize> = (0..WS_N).collect();
@@ -134,7 +125,7 @@ pub fn windows(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
             let label = mail::title(store, &p.kind);
             let detail = kind_detail(store, &p.kind);
             let extra = mail_extra(store, &p.kind);
-            if !matches(&tokens, &[&label, &detail, kind_word(&p.kind), &extra]) {
+            if !search::matches(&terms, &[&label, &detail, kind_word(&p.kind), &extra]) {
                 continue;
             }
             hits.push(Hit {
@@ -155,7 +146,7 @@ pub fn windows(wm: &Wm, store: &Store, query: &str) -> Vec<Hit> {
         };
         let label = mail::title(store, &kind);
         let detail = kind_detail(store, &kind);
-        if !matches(&tokens, &[&label, &detail, &extra]) {
+        if !search::matches(&terms, &[&label, &detail, &extra]) {
             continue;
         }
         hits.push(Hit::found(label, detail, kind));
@@ -185,6 +176,13 @@ pub struct Search {
     answers: Vec<Option<Vec<Hit>>>,
     hits: Vec<Hit>,
     sel: usize,
+    /// What the selection is *of*, as against where it last sat. A source
+    /// answering late inserts its band into the middle of the list and
+    /// pushes every later source's rows down; the index alone would then
+    /// point at a different thing than the one a person had picked, and
+    /// enter would open it. So the row is remembered, and the index is
+    /// re-derived from it on every merge.
+    anchor: Option<Go>,
 }
 
 impl std::fmt::Debug for Search {
@@ -217,6 +215,7 @@ impl Search {
         if self.query != query {
             self.query = query.to_string();
             self.sel = 0;
+            self.anchor = None;
         }
         self.gen += 1;
         self.answers.clear();
@@ -235,6 +234,16 @@ impl Search {
         // asked for it. Against threads this is one `try_recv` that finds
         // nothing yet.
         self.collect(wm);
+    }
+
+    /// Raised fresh: a blank question and the selection back at the top.
+    /// Reopening is not the same act as re-asking — whatever was picked
+    /// last time is not what this one is about.
+    pub fn open(&mut self, wm: &Wm, store: &Store) {
+        self.query.clear();
+        self.sel = 0;
+        self.anchor = None;
+        self.ask(wm, store, "");
     }
 
     /// Asks the current question again — what a foreign commit means for a
@@ -294,6 +303,15 @@ impl Search {
             hits.push(hit);
         }
         self.hits = hits;
+        // The selection follows the row it was made of, wherever the new
+        // list put it. A row that is gone — typed past, or not answered for
+        // yet — leaves the index alone: it is still the person's intent,
+        // and the row may well come back.
+        if let Some(go) = &self.anchor {
+            if let Some(i) = self.hits.iter().position(|h| h.go == *go) {
+                self.sel = i;
+            }
+        }
     }
 
     #[must_use]
@@ -328,9 +346,11 @@ impl Search {
         let n = self.hits.len() as isize;
         if n == 0 {
             self.sel = 0;
+            self.anchor = None;
             return;
         }
         self.sel = ((self.sel() as isize + by).rem_euclid(n)) as usize;
+        self.anchor = self.hits.get(self.sel).map(|h| h.go.clone());
     }
 }
 
@@ -351,6 +371,18 @@ mod tests {
         wm.focus = Some(inbox);
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(mail::Provider)];
         (wm, store, Search::new(Engine::inline(providers)))
+    }
+
+    /// Waits for the list to reach `n` rows, collecting as answers land.
+    fn settle(s: &mut Search, wm: &Wm, n: usize) {
+        for _ in 0..2000 {
+            s.collect(wm);
+            if s.hits().len() == n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the list never reached {n} rows: {:?}", s.hits().len());
     }
 
     /// Everything the query matches, as one list — what the overlay draws
@@ -627,6 +659,144 @@ mod tests {
         assert_eq!(s.sel(), 0);
     }
 
+    /// A source answering late inserts its band above another's rows. The
+    /// selection has to follow the row a person picked, not the number that
+    /// row happened to sit at — otherwise enter opens something else.
+    #[test]
+    fn a_late_source_does_not_move_the_selection_off_its_row() {
+        struct Held {
+            id: &'static str,
+            base: i64,
+            go: std::sync::mpsc::Receiver<()>,
+        }
+        impl Provider for Held {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+            fn search(
+                &self,
+                _store: &Store,
+                _query: &str,
+                _a: &crate::search::Abandoned,
+            ) -> Vec<Hit> {
+                let _ = self.go.recv();
+                (0..3)
+                    .map(|i| {
+                        Hit::found(
+                            format!("{}{i}", self.id),
+                            "",
+                            Kind::Job { id: self.base + i },
+                        )
+                    })
+                    .collect()
+            }
+        }
+
+        let store = Store::open(None).expect("in-memory store");
+        let wm = Wm::new();
+        let (release_a, go_a) = std::sync::mpsc::channel();
+        let (release_b, go_b) = std::sync::mpsc::channel();
+        let mut s = Search::new(Engine::threads(
+            &store.db(),
+            vec![
+                Box::new(Held {
+                    id: "a",
+                    base: 10,
+                    go: go_a,
+                }),
+                Box::new(Held {
+                    id: "b",
+                    base: 20,
+                    go: go_b,
+                }),
+            ],
+            || {},
+        ));
+
+        // A query no window answers, so the list is the providers' alone.
+        s.ask(&wm, &store, "zzz");
+        assert!(s.hits().is_empty());
+
+        // The second source answers first.
+        release_b.send(()).expect("release b");
+        settle(&mut s, &wm, 3);
+        assert_eq!(
+            s.hits().iter().map(|h| h.label.clone()).collect::<Vec<_>>(),
+            vec!["b0", "b1", "b2"]
+        );
+        s.step(1);
+        let picked = s.selected().expect("a row").go.clone();
+        assert_eq!(s.hits()[s.sel()].label, "b1");
+
+        // Now the first source lands, three rows above it.
+        release_a.send(()).expect("release a");
+        settle(&mut s, &wm, 6);
+        assert_eq!(
+            s.hits().iter().map(|h| h.label.clone()).collect::<Vec<_>>(),
+            vec!["a0", "a1", "a2", "b0", "b1", "b2"]
+        );
+        assert_eq!(s.sel(), 4, "the index moved with the row");
+        assert_eq!(
+            s.selected().expect("a row").go,
+            picked,
+            "and it is the same row"
+        );
+    }
+
+    /// Raising the launcher is not re-asking it: whatever was picked last
+    /// time is not what this one is about.
+    #[test]
+    fn reopening_starts_at_the_top() {
+        let (wm, store, mut s) = world();
+        hits(&wm, &store, &mut s, "");
+        s.step(2);
+        assert_eq!(s.sel(), 2);
+        s.open(&wm, &store);
+        assert_eq!(s.sel(), 0, "a launcher raised fresh is at the top");
+        assert_eq!(s.query(), "");
+        // A typed query left behind goes with it.
+        hits(&wm, &store, &mut s, "vera");
+        s.step(1);
+        s.open(&wm, &store);
+        assert_eq!(s.query(), "");
+        assert_eq!(s.sel(), 0);
+    }
+
+    /// One query, one answer, whether or not a panel happens to be open on
+    /// the thing it names. The windows are sifted in memory and the letters
+    /// by SQLite, and the two must cut a person's typing the same way.
+    #[test]
+    fn the_windows_and_the_index_read_a_query_the_same_way() {
+        let (mut wm, store, mut s) = world();
+        wm.switch(3);
+        wm.open(Kind::Message { id: 1 }, None, false); // "Q3 infra budget draft"
+        wm.switch(0);
+
+        // The start of a word: both halves answer, so the row is there once.
+        let out = hits(&wm, &store, &mut s, "inf");
+        let infra: Vec<&Hit> = out
+            .iter()
+            .filter(|h| h.label.contains("Q3 infra"))
+            .collect();
+        assert_eq!(infra.len(), 1, "{out:?}");
+        assert_eq!(infra[0].ws, Some(3), "and it is the open one");
+
+        // The middle of a word: neither half answers. What matters is not
+        // which rule wins but that the list does not depend on what is open.
+        let out = hits(&wm, &store, &mut s, "nfra");
+        assert!(
+            out.iter().all(|h| !h.label.contains("Q3 infra")),
+            "an open panel must not match where the index cannot: {out:?}"
+        );
+
+        // An address is words too, on both sides of its punctuation.
+        let out = hits(&wm, &store, &mut s, "kov");
+        assert!(out.iter().any(|h| matches!(
+            &h.go,
+            Go::Open(Kind::Contact { email }) if email == "vera@kovac.io"
+        )));
+    }
+
     /// A one-letter query over a real mailbox matches nearly all of it. The
     /// index answers with its best hundred, not with the mailbox, and the
     /// windows still lead.
@@ -704,4 +874,3 @@ mod tests {
         assert_eq!(wm.focus_panel(0xdead_beef), None);
     }
 }
-

@@ -491,15 +491,14 @@ static Q_FTS: Q = Q {
 #[must_use]
 pub fn fts_match(query: &str) -> Option<String> {
     let mut out = String::new();
-    for w in query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-    {
+    // [`crate::search::terms`] is where the cutting lives, so the index is
+    // asked for exactly what the in-memory sources match on.
+    for w in crate::search::terms(query) {
         if !out.is_empty() {
             out.push_str(" AND ");
         }
         out.push('"');
-        out.push_str(w); // no quote can be in it: it was cut on non-alphanumerics
+        out.push_str(&w); // no quote can be in it: it was cut on non-alphanumerics
         out.push_str("\"*");
     }
     (!out.is_empty()).then_some(out)
@@ -547,15 +546,14 @@ impl crate::search::Provider for Provider {
 /// enough (one row a correspondent) to sift in memory, and not a thing FTS5
 /// indexes: a contact is a fact about the mailbox, not a document in it.
 fn matching_senders(store: &Store, query: &str) -> Vec<crate::search::Hit> {
-    let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let terms = crate::search::terms(query);
     senders(store)
         .iter()
         .filter_map(|s| {
             // The name as of their latest letter, the address when they
             // signed none.
             let label = if s.name.is_empty() { &s.email } else { &s.name };
-            let hay = format!("{label} {} contact", s.email).to_lowercase();
-            tokens.iter().all(|t| hay.contains(t.as_str())).then(|| {
+            crate::search::matches(&terms, &[label, &s.email, "contact"]).then(|| {
                 crate::search::Hit::found(
                     label,
                     &s.email,

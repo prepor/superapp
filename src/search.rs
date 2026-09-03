@@ -68,6 +68,48 @@ impl Hit {
     }
 }
 
+/// The query cut into the words a source matches on: lowercased, split at
+/// every non-alphanumeric boundary.
+///
+/// This is the *one* reading of a query the whole list shares. The windows
+/// are sifted in memory and the mail is sifted by SQLite, and if the two
+/// cut a person's typing differently then the same word finds a letter or
+/// not depending on whether a panel happens to be open on it — which is
+/// exactly what a reader cannot see and cannot explain.
+#[must_use]
+pub fn terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Every term a **prefix** of some word among `parts` — the match a source
+/// that sifts in memory makes, and the one [`crate::mail::fts_match`] asks
+/// SQLite for with its trailing `*`.
+///
+/// Prefix rather than substring, on both sides: it is what makes a launcher
+/// answer while a word is still being typed, and it is the only infix-free
+/// thing FTS5 can do without a trigram index three times the size. So
+/// "kov" reaches Vera Kovac through her address — the words are cut at the
+/// `@` and the `.` — and "ovac" reaches nobody, from either half.
+#[must_use]
+pub fn matches(terms: &[String], parts: &[&str]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let words: Vec<String> = parts
+        .iter()
+        .flat_map(|p| p.split(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    terms
+        .iter()
+        .all(|t| words.iter().any(|w| w.starts_with(t.as_str())))
+}
+
 /// Whether the question being answered has already been replaced.
 ///
 /// The cheap providers ignore this and finish; a directory walk or a server
@@ -313,6 +355,32 @@ mod tests {
 
     fn store() -> Store {
         Store::open(None).expect("in-memory store")
+    }
+
+    /// The one reading of a query the whole list shares.
+    #[test]
+    fn a_query_is_words_cut_at_the_punctuation_and_matched_by_prefix() {
+        assert_eq!(terms("  vera@kovac.io "), vec!["vera", "kovac", "io"]);
+        assert_eq!(terms("Re: Q3!"), vec!["re", "q3"]);
+        assert_eq!(terms("Вера"), vec!["вера"]);
+        assert!(terms("  *^\" ").is_empty(), "no word in it at all");
+
+        let hay = &["Vera Kovac", "vera@kovac.io", "Q3 infra budget"];
+        assert!(
+            matches(&terms(""), hay),
+            "an empty query matches everything"
+        );
+        assert!(matches(&terms("kov"), hay), "a word inside an address");
+        assert!(matches(&terms("vera q3"), hay), "every term must land");
+        assert!(matches(&terms("VERA"), hay), "case is nothing");
+        assert!(
+            !matches(&terms("ovac"), hay),
+            "the middle of a word is not a prefix"
+        );
+        assert!(
+            !matches(&terms("vera zzz"), hay),
+            "one term short is no match"
+        );
     }
 
     #[test]
