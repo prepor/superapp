@@ -262,7 +262,9 @@ Per panel, below the reserved set:
   always was. In a message panel the arrows
   scroll; its rows open and close by pointer only. In the filter, `@` opens the tag
   autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
-  [The Rich Table](./richtable.md) for the grammar
+  [The Rich Table](./richtable.md) for the grammar. With no offer up, `↓`
+  leaves the filter for the rows it made and lands on the first, so a
+  narrowing runs on into the walk without a hand leaving the arrows
 - compose: in TO, typing offers the senders the store knows, by name or
   address — the same box, the same keys; `enter` and `tab` take the
   address and stay in the field, so a comma starts the next one

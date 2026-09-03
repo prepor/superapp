@@ -2785,6 +2785,20 @@ fn focus_input(cx: &mut Cx, input: &TextInputRef) {
     }
 }
 
+/// Whether this key is the plain `↓` that leaves a filter field for the
+/// rows under it: the field is one line, so down has nothing else to mean,
+/// and the walk should start where the eye already is. The autocomplete
+/// has the first claim on it while its box is up (see [`Suggest::key`]);
+/// modified downs are not this — `cmd+↓` is the shell's focus walk and
+/// `shift+↓` is the field's own selection.
+fn leaves_filter_down(k: &KeyEvent) -> bool {
+    k.key_code == KeyCode::ArrowDown
+        && !k.modifiers.shift
+        && !k.modifiers.control
+        && !k.modifiers.alt
+        && !k.modifiers.logo
+}
+
 /// Walk a tab ring one step: wrap around; when the panel itself holds
 /// focus, the first Tab lands on the first stop (last, shifted).
 fn tab_ring(cx: &mut Cx, ring: &[RingStop], shift: bool) {
@@ -4365,6 +4379,21 @@ impl Widget for InboxPanel {
                 self.redraw(cx);
                 return;
             }
+            // With no offer up, `↓` hands the keyboard from the filter to
+            // the rows it made, landing on the first — the same place
+            // `enter` lands, minus the opening. A filter that matched
+            // nothing keeps the field: there is nowhere to hand it to.
+            if filter_focused && leaves_filter_down(k) {
+                if let Some(store) = Self::store(scope) {
+                    self.sync_filter(cx);
+                    if self.table.len(&store) > 0 {
+                        cx.set_key_focus(Area::Empty);
+                        self.set_sel(cx, pid, &store, 0);
+                        self.redraw(cx);
+                    }
+                    return;
+                }
+            }
         }
         self.view.handle_event(cx, event, scope);
         let Some(store) = Self::store(scope) else { return };
@@ -4951,6 +4980,19 @@ impl Widget for EffectsPanel {
             if self.ac.key(cx, &self.table, &filter, k) {
                 self.redraw(cx);
                 return;
+            }
+            // `↓` out of the filter and onto the first row — the inbox's
+            // rule, and for the same reason.
+            if filter_focused && leaves_filter_down(k) {
+                if let Some(store) = panel_store(scope) {
+                    self.sync_filter(cx);
+                    if self.table.len(&store) > 0 {
+                        cx.set_key_focus(Area::Empty);
+                        self.set_sel(cx, pid, &store, 0);
+                        self.redraw(cx);
+                    }
+                    return;
+                }
             }
         }
         self.view.handle_event(cx, event, scope);
@@ -5660,6 +5702,20 @@ impl Widget for FilesPanel {
             if self.ac.key(cx, &self.table, &filter, k) {
                 self.redraw(cx);
                 return;
+            }
+            // `↓` out of the filter and onto the first row — the inbox's
+            // rule. Only the filter's: the path field's `↓` is its own
+            // offer's, and `new dir` has no rows under it.
+            if filter_focused && leaves_filter_down(k) {
+                if let Some(store) = panel_store(scope) {
+                    self.sync_filter(cx);
+                    if self.table.len(&store) > 0 {
+                        cx.set_key_focus(Area::Empty);
+                        self.set_sel(cx, pid, &store, 0);
+                        self.redraw(cx);
+                    }
+                    return;
+                }
             }
         }
         self.view.handle_event(cx, event, scope);
