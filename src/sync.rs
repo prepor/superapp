@@ -1371,6 +1371,78 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
         );
     }
 
+    /// A reply names its parent in `In-Reply-To` and carries the whole
+    /// chain in `References` — the parent's own references and then the
+    /// parent — so it threads for the other side too, and its Sent copy
+    /// folds into the conversation when it syncs back.
+    #[test]
+    fn a_sent_reply_names_its_parent_and_carries_the_chain() {
+        const RAW_RE: &str = "From: Vera Kovac <vera@kovac.io>\r\n\
+Subject: Re: Budget v2\r\n\
+Message-ID: <budget-v2-2@kovac.io>\r\n\
+References: <budget-v2@kovac.io>\r\n\
+Date: Mon, 31 Aug 2026 10:20:00 +0000\r\n\
+\r\n\
+And the egress line.\r\n";
+
+        let w = world();
+        w.with_fake(|f| {
+            f.server(1).folder("Sent", 5);
+            f.server(1).deliver("INBOX", false, RAW);
+            f.server(1).deliver("INBOX", false, RAW_RE);
+        });
+        settle(&w);
+
+        let now = w.now();
+        let draft = mail::Draft {
+            to: "vera@kovac.io".into(),
+            subject: "Re: Budget v2".into(),
+            body: "Checked.".into(),
+        };
+        w.store()
+            .write(move |c| {
+                mail::upsert_draft_tx(c, 9, Seed::Reply(2), &draft, now)?;
+                mail::file_send_tx(c, 9, now)
+            })
+            .unwrap();
+        settle(&w);
+
+        let sent = w.with_fake(|f| f.server(1).submitted.clone());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].in_reply_to.as_deref(),
+            Some("budget-v2-2@kovac.io"),
+            "the mail it answers"
+        );
+        assert_eq!(
+            sent[0].references,
+            vec![
+                "budget-v2@kovac.io".to_string(),
+                "budget-v2-2@kovac.io".to_string()
+            ],
+            "the parent's chain, then the parent"
+        );
+
+        // Nothing was passed on, so nothing wears the forwarded mark.
+        assert!(!forwarded_of(&w, 2), "a reply forwards nothing");
+
+        let sent_id: i64 = w
+            .store()
+            .conn()
+            .query_row(
+                "SELECT m.id FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE f.role = 'sent'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the Sent copy synced back");
+        assert_eq!(
+            mail::thread_of(w.store(), sent_id),
+            mail::thread_of(w.store(), 1),
+            "one conversation, the reply included"
+        );
+    }
+
     /// A UIDVALIDITY change wipes the folder and refetches inside the cap.
     #[test]
     fn uidvalidity_reset_refetches() {

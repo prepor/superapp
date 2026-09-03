@@ -70,17 +70,23 @@ one undo node. A reply arriving later puts the thread back by itself.
 A message panel shows the thread its mail belongs to, oldest first, the
 account it came to once at the top and `forward` and `reply` at the foot —
 both on the conversation's newest mail. A **reply** answers it: TO and
-SUBJECT prefilled, the cursor in the body, and the send threads to it. A
-**forward** passes it on: the letter sits in the body under a header block
-(who wrote it, about what, when, to whom), SUBJECT is prefilled and TO is
-empty, so the cursor lands there. A forward is not a reply — it names no
-parent — but it carries the conversation's chain, so it threads for anyone
-who already has it, your own Sent folder included. Once it has gone, the
-mail it passed on wears a muted `↪` by its date, in every client that
-reads the `$Forwarded` keyword. **Each message is one row, open or
-closed.** Closed, the row is the
-sender, the first line they wrote in grey (or the status line, red when it
-is an error) and the date.
+SUBJECT prefilled — one `Re:`, never two — and the letter it answers under
+the attribution line every client writes (`On <date>, <who> wrote:`), each
+of its lines behind a `>`. The cursor sits above all of it, where the
+answer goes; the whole letter is quoted, its own quoted tail included,
+because that chain is how the conversation reaches whoever joins it late —
+and what this app sends is what its own fold knows how to take back off.
+The send threads to it: `In-Reply-To` names the parent, `References`
+carries the parent's chain and then the parent. A **forward** passes it on:
+the letter sits in the body under a header block (who wrote it, about what,
+when, to whom), SUBJECT is prefilled and TO is empty, so the cursor lands
+there. A forward is not a reply — it names no parent — but it carries the
+conversation's chain, so it threads for anyone who already has it, your own
+Sent folder included. Once it has gone, the mail it passed on wears a muted
+`↪` by its date, in every client that reads the `$Forwarded` keyword.
+**Each message is one row, open or closed.** Closed, the row is the sender,
+the first line they wrote in grey (or the status line, red when it is an
+error) and the date.
 Open, the same row is the sender as a contact link and the date, with the
 letter unfolded under it; its quoted tail — the message above, usually —
 sits folded behind `› quoted`. Touching a closed row opens it in place;
