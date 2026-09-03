@@ -814,6 +814,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 11 {
         conn.pragma_update(None, "user_version", 11)?;
     }
+    // The search index, rebuilt whenever its shape is not this build's. The
+    // rebuild reads `message` up to `body` — no column past `raw`, so it
+    // never walks a letter it does not need (see `mail::head_row`).
+    let indexed: i64 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'fts_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if indexed != FTS_VERSION {
+        conn.execute_batch(SCHEMA_FTS)?;
+        conn.execute("INSERT INTO message_fts(message_fts) VALUES('rebuild')", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_version', ?1)",
+            [FTS_VERSION],
+        )?;
+    }
     // The HTML narrowing runs at ingest, so a stored reading is as good as
     // the build that wrote it. The version of the narrowing the store holds
     // lives in `meta`; when the build's differs, every reading is redone
@@ -830,6 +848,60 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     Ok(())
 }
+
+/// The mail search index (FTS5): subject, both halves of the sender, and
+/// the letter's text, over `message` by rowid.
+///
+/// It is **derived**, not a schema step, and it is versioned like the HTML
+/// narrowing rather than by `user_version`: a rebuild reproduces it from
+/// `message` at any moment, so the honest question is not "how old is this
+/// database" but "is this index the shape this build wants". Bump
+/// [`FTS_VERSION`] and every store re-indexes on its next open.
+///
+/// That also settles what the one store shared by many builds does to it.
+/// The triggers live in the database, not in a binary, so a build that has
+/// never heard of this index still maintains it on every write; and a
+/// changeset a peer device applies fires them too (`sqlite3changeset_apply`
+/// runs triggers), so a follower's index is as good as the holder's.
+///
+/// `content='message'` means the index stores terms and no text of its own —
+/// the letters are already in `message` and are not worth a second copy.
+/// `unicode61` is what makes a Cyrillic subject tokenize like a Latin one.
+const FTS_VERSION: i64 = 1;
+
+const SCHEMA_FTS: &str = "
+DROP TRIGGER IF EXISTS message_fts_ai;
+DROP TRIGGER IF EXISTS message_fts_ad;
+DROP TRIGGER IF EXISTS message_fts_au;
+DROP TABLE IF EXISTS message_fts;
+
+CREATE VIRTUAL TABLE message_fts USING fts5(
+  subject, from_name, from_email, body,
+  content='message', content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER message_fts_ai AFTER INSERT ON message BEGIN
+  INSERT INTO message_fts(rowid, subject, from_name, from_email, body)
+  VALUES(new.id, new.subject, new.from_name, new.from_email, new.body);
+END;
+
+CREATE TRIGGER message_fts_ad AFTER DELETE ON message BEGIN
+  INSERT INTO message_fts(message_fts, rowid, subject, from_name, from_email, body)
+  VALUES('delete', old.id, old.subject, old.from_name, old.from_email, old.body);
+END;
+
+-- `UPDATE OF` on purpose: marking a mail read, moving it, threading it —
+-- none of those touch a word of it, and none of them should cost a
+-- re-index.
+CREATE TRIGGER message_fts_au
+AFTER UPDATE OF subject, from_name, from_email, body ON message BEGIN
+  INSERT INTO message_fts(message_fts, rowid, subject, from_name, from_email, body)
+  VALUES('delete', old.id, old.subject, old.from_name, old.from_email, old.body);
+  INSERT INTO message_fts(rowid, subject, from_name, from_email, body)
+  VALUES(new.id, new.subject, new.from_name, new.from_email, new.body);
+END;
+";
 
 /// A stable per-install device id (CR-005): two devices must never share one,
 /// or they publish under the same name and corrupt `state.acked`. No `rand`
@@ -1880,4 +1952,6 @@ mod tests {
         );
     }
 }
+
+
 

@@ -53,6 +53,7 @@ pub mod problems;
 pub mod repl;
 pub mod richtable;
 pub mod scene;
+pub mod search;
 pub mod secret;
 pub mod send;
 pub mod spring;

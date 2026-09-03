@@ -32,6 +32,7 @@ use crate::e2e;
 use crate::launcher;
 use crate::mail;
 use crate::panels::*;
+use crate::search;
 use crate::store::Store;
 use crate::sync;
 use crate::spring::{Spring, SpringParams};
@@ -1001,16 +1002,6 @@ enum Overlay {
     History,
 }
 
-/// The launcher's editable state. Hits are recomputed on draw, and kept here
-/// so a click resolves against exactly what was on screen.
-#[derive(Debug, Default)]
-struct LauncherUi {
-    query: String,
-    /// Selected row (enter activates it).
-    sel: usize,
-    hits: Vec<launcher::Hit>,
-}
-
 /// How device sync runs. Production spawns a worker thread; a headless run
 /// drives the passes inline from the frame loop against the virtual clock, so
 /// a scripted `wait` advances a handoff exactly the way it advances the mail
@@ -1066,7 +1057,10 @@ struct State {
     /// The overlay most recently up — what a close fade keeps drawing
     /// while the chassis' presence spring runs out.
     overlay_last: Overlay,
-    launcher: LauncherUi,
+    /// The launcher's live question (query, selection, and the merged hits
+    /// its sources have answered with). Every mutation is on an event; the
+    /// draw only reads it.
+    launcher: launcher::Search,
     /// A panel to reveal alongside focus on the next [`State::sync`], once.
     /// A preview opens without taking focus, so nothing else would pull the
     /// camera onto it — and this must stay one-shot: `sync` runs on every
@@ -1146,6 +1140,21 @@ fn grid_for(vp: DVec2, forced: Option<core::Grid>) -> core::Grid {
     }
 }
 
+/// Who answers the launcher's providers. Threads in production — one each,
+/// so a slow source never delays a fast one — and inline under virtual time,
+/// where a scripted `type` must be followed by its rows in the same tick.
+/// The same split [`sync::Pump`] makes, for the same reason.
+fn search_engine(virtual_time: bool, store: &Store) -> search::Engine {
+    let providers: Vec<Box<dyn search::Provider>> = vec![Box::new(mail::Provider)];
+    if virtual_time {
+        search::Engine::inline(providers)
+    } else {
+        search::Engine::threads(&store.db(), providers, || {
+            SignalToUI::set_ui_signal();
+        })
+    }
+}
+
 impl State {
     fn new(store: Store, boot: &Boot) -> Self {
         let store = std::rc::Rc::new(store);
@@ -1213,6 +1222,9 @@ impl State {
         if repl.is_some() {
             store.set_writable(false);
         }
+        // The engine is built here rather than in the struct below, where
+        // `store` has already been moved into its field.
+        let launcher = launcher::Search::new(search_engine(boot.virtual_time, &store));
         // What already stands at boot is old news: the mark shows it, the
         // toasts are for what arrives from here on.
         let seen_problems: BTreeSet<String> = crate::problems::list(&store, None)
@@ -1257,7 +1269,7 @@ impl State {
             toast: None,
             overlay: Overlay::None,
             overlay_last: Overlay::None,
-            launcher: LauncherUi::default(),
+            launcher,
             show_also: None,
             expand: HashMap::new(),
             hold: None,
@@ -2907,22 +2919,20 @@ impl Stage {
                     self.kick(cx);
                 }
                 KeyCode::ReturnKey => {
-                    let hit = state.launcher.hits.get(state.launcher.sel).cloned();
+                    let hit = state.launcher.selected().cloned();
                     if let Some(hit) = hit {
                         self.launcher_go(cx, hit);
                     }
                 }
-                // The hits are a ring: past the last is the first. The
-                // draw still clamps, against a list that shrank under
-                // the query.
+                // The hits are a ring: past the last is the first. A list
+                // that grew under an arriving answer keeps the selection
+                // where it was; one that shrank clamps it.
                 KeyCode::ArrowDown => {
-                    let n = state.launcher.hits.len();
-                    state.launcher.sel = if n == 0 { 0 } else { (state.launcher.sel + 1) % n };
+                    state.launcher.step(1);
                     self.kick(cx);
                 }
                 KeyCode::ArrowUp => {
-                    let n = state.launcher.hits.len();
-                    state.launcher.sel = if n == 0 { 0 } else { (state.launcher.sel + n - 1) % n };
+                    state.launcher.step(-1);
                     self.kick(cx);
                 }
                 _ => {
@@ -3159,7 +3169,11 @@ impl Stage {
                 state.overlay = Overlay::None;
                 false
             } else {
-                state.launcher = LauncherUi::default();
+                // A blank question, asked now: the switcher is on screen
+                // before the key comes back up. Never a fresh `Search` —
+                // that would retire the provider threads with it.
+                let store = state.store.clone();
+                state.launcher.ask(&state.ws, &store, "");
                 state.overlay = Overlay::Launcher;
                 true
             }
@@ -3179,7 +3193,8 @@ impl Stage {
             };
             let opening = state.overlay != Overlay::Launcher;
             if opening {
-                state.launcher = LauncherUi::default();
+                let store = state.store.clone();
+                state.launcher.ask(&state.ws, &store, "");
                 state.overlay = Overlay::Launcher;
             }
             opening
@@ -3271,12 +3286,33 @@ impl Stage {
             None => return,
         };
         if changed {
+            // A launcher standing open over mail that just arrived asks its
+            // question again, so the list is of the world as it is now.
+            if let Some(state) = self.state.as_deref_mut() {
+                if state.overlay == Overlay::Launcher {
+                    let store = state.store.clone();
+                    state.launcher.again(&state.ws, &store);
+                }
+            }
             self.redraw_scoped(cx);
             // The menu bar mirrors the problems; a pass that changed them
             // rebuilds it (a signature check keeps it cheap).
             self.update_menu(cx);
         }
         self.tick_repl(cx);
+    }
+
+    /// Takes whatever the search providers have answered with. Ridden by
+    /// the same signal a sync worker rings and by the fallback poll timer —
+    /// a lost wake must never strand the list a row short.
+    fn collect_search(&mut self, cx: &mut Cx) {
+        let landed = self
+            .state
+            .as_deref_mut()
+            .is_some_and(|s| s.launcher.collect(&s.ws));
+        if landed {
+            self.redraw_scoped(cx);
+        }
     }
 
     /// Opens the browser on Google's consent page and puts the flow's
@@ -3583,7 +3619,7 @@ impl Stage {
         self.kick(cx);
     }
 
-    fn launcher_go(&mut self, cx: &mut Cx, hit: launcher::Hit) {
+    fn launcher_go(&mut self, cx: &mut Cx, hit: search::Hit) {
         self.go(cx, hit.go);
     }
 
@@ -3598,13 +3634,13 @@ impl Stage {
         self.go(cx, go);
     }
 
-    fn go(&mut self, cx: &mut Cx, go: launcher::Go) {
+    fn go(&mut self, cx: &mut Cx, go: search::Go) {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
         state.overlay = Overlay::None;
         match go {
-            launcher::Go::Focus(pid) => {
+            search::Go::Focus(pid) => {
                 let was = state.ws.active;
                 if let Some(k) = state.ws.focus_panel(pid) {
                     state.sync();
@@ -3615,7 +3651,7 @@ impl Stage {
                     }
                 }
             }
-            launcher::Go::Open(kind) => {
+            search::Go::Open(kind) => {
                 let label = format!("open “{}”", state.panel_title(&kind));
                 let mid = if let Kind::Message { id } = kind { Some(id) } else { None };
                 // Opening a mail reads its whole thread (CR-007): every
@@ -3760,7 +3796,7 @@ impl Stage {
                 return;
             }
             Act::LauncherRow(i) => {
-                let hit = state.launcher.hits.get(i).cloned();
+                let hit = state.launcher.hits().get(i).cloned();
                 if let Some(hit) = hit {
                     self.launcher_go(cx, hit);
                 }
@@ -5370,16 +5406,17 @@ impl Stage {
                 }
             }
         }
-        // The launcher's field reports its own edits; the search re-runs on
-        // the next draw from this query.
+        // The launcher's field reports its own edits, and this is where a
+        // keystroke becomes a question: the windows answer inside `ask`,
+        // the providers are sent away and land in `Event::Signal`.
         for a in actions {
             if let Some(crate::panels::OverlayAction::Query(q)) =
                 a.downcast_ref::<crate::panels::OverlayAction>()
             {
                 if let Some(state) = self.state.as_deref_mut() {
-                    if state.launcher.query != *q {
-                        state.launcher.query = q.clone();
-                        state.launcher.sel = 0;
+                    if state.launcher.query() != q {
+                        let store = state.store.clone();
+                        state.launcher.ask(&state.ws, &store, q);
                         refresh = true;
                     }
                 }
@@ -5599,7 +5636,7 @@ impl Widget for Stage {
                     let q = self
                         .state
                         .as_deref()
-                        .map(|s| s.launcher.query.clone())
+                        .map(|s| s.launcher.query().to_string())
                         .unwrap_or_default();
                     w.as_launcher_overlay().focus_query(cx, &q);
                 } else {
@@ -5667,6 +5704,7 @@ impl Widget for Stage {
             }
             if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
                 self.poll_store(cx);
+                self.collect_search(cx);
             }
             if self.ime_guard_timer.0 != 0 && te.timer_id == self.ime_guard_timer.0 {
                 self.ime_guard_timer = Timer::default();
@@ -5721,6 +5759,7 @@ impl Widget for Stage {
             Event::Signal => {
                 self.tick_signin(cx);
                 self.poll_store(cx);
+                self.collect_search(cx);
             }
 
             // Device-sync lease lifecycle (CR-005): hand the lease back when
@@ -6881,11 +6920,9 @@ impl Stage {
                 labels.push("the beginning".into());
             }
             Overlay::Launcher => {
-                state.launcher.hits =
-                    launcher::search(&state.ws, &state.store, &state.launcher.query);
-                let n = state.launcher.hits.len();
-                state.launcher.sel = state.launcher.sel.min(n.saturating_sub(1));
-                for (i, hit) in state.launcher.hits.iter().enumerate() {
+                // Pure read. The list was settled by the event that changed
+                // it — a keystroke, or an answer arriving.
+                for (i, hit) in state.launcher.hits().iter().enumerate() {
                     rows.push(OverlayRowData {
                         main: hit.label.clone(),
                         detail: if hit.detail == hit.label {
@@ -6897,7 +6934,7 @@ impl Stage {
                             Some(k) => format!("#{}", k + 1),
                             None => "new".into(),
                         },
-                        current: i == state.launcher.sel,
+                        current: i == state.launcher.sel(),
                         hovered: hover == Some(Act::LauncherRow(i)),
                         ..Default::default()
                     });
@@ -6938,7 +6975,7 @@ impl Stage {
         if launcher {
             widget
                 .as_launcher_overlay()
-                .scroll_to(cx, state.launcher.sel);
+                .scroll_to(cx, state.launcher.sel());
         }
 
         // Fit height: the field and its rule (measured — the field's own
@@ -6984,7 +7021,7 @@ impl Stage {
         // The widget, inside the frame, composited at the chassis' alpha.
         let props = OverlayProps {
             rows,
-            query: state.launcher.query.clone(),
+            query: state.launcher.query().to_string(),
             alpha: p as f32,
         };
         let mut scope = Scope::with_props(&props);

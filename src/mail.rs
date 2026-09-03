@@ -115,11 +115,13 @@ static Q_INBOX: Q = Q {
     describe: "every mail in the inbox folders, newest first",
 };
 
-static Q_ALL: Q = Q {
+/// Every mail, archived and deleted included. See [`head_row`] for why the
+/// column list stops where it does.
+static Q_CORPUS: Q = Q {
     id: "all_mail",
     sql: "SELECT id, from_name, from_email, subject, date, unread
           FROM message ORDER BY date DESC, id DESC",
-    describe: "every mail, archived included, newest first",
+    describe: "every mail's headers, newest first",
 };
 
 static Q_MAIL: Q = Q {
@@ -194,6 +196,19 @@ static Q_THREAD_OF: Q = Q {
     describe: "which conversation a mail belongs to",
 };
 
+/// A list row's worth of a mail, and **the last column any list may read**.
+///
+/// A `message` row carries the letter it arrived as: `raw` is a blob of a
+/// hundred kilobytes sitting at column 11, and SQLite decodes a record left
+/// to right. So a query that asks for `thread`, `topic` or `forwarded` walks
+/// the overflow chain of every mail it touches — over a real mailbox that is
+/// two hundred megabytes to answer one keystroke, and it is exactly what the
+/// launcher used to do. `unread` is column 7; everything here is before the
+/// letter, and a scan of the whole mailbox costs a millisecond.
+///
+/// What a conversation is called comes from [`topic_of`] the subject rather
+/// than from the `topic` column, for the same reason — and it is the same
+/// string, by that function's definition.
 fn head_row(r: &rusqlite::Row) -> rusqlite::Result<MailHead> {
     Ok(MailHead {
         id: r.get(0)?,
@@ -410,9 +425,9 @@ pub fn inbox_filtered(store: &Store, filter: &str) -> Vec<ThreadHead> {
     t.rows(store, 0, n)
 }
 
-/// Every mail, archived included (the launcher's corpus).
-pub fn all(store: &Store) -> Rc<Vec<MailHead>> {
-    store.rows(&Q_ALL, &[], head_row)
+/// Every mail, archived included, headers only, in one flat scan.
+pub fn corpus(store: &Store) -> Rc<Vec<MailHead>> {
+    store.rows(&Q_CORPUS, &[], head_row)
 }
 
 /// One mail by id.
@@ -439,6 +454,148 @@ pub fn raw(store: &Store, id: MailId) -> Option<Vec<u8>> {
 /// Distinct senders, most recent first.
 pub fn senders(store: &Store) -> Rc<Vec<Sender>> {
     store.rows(&Q_SENDERS, &[], sender_row)
+}
+
+// -- the launcher's mail provider --------------------------------------------
+
+/// How many letters one question is worth showing. The index ranks them, so
+/// the hundred best are the hundred a person would ever look at; past that
+/// the answer is "type another word", not "scroll".
+const FTS_LIMIT: i64 = 100;
+
+/// The letters a query matches, best first. The index answers with rowids
+/// and a rank; the join is what turns them into rows to show, and it reads
+/// no further into `message` than [`head_row`] allows.
+static Q_FTS: Q = Q {
+    id: "mail search",
+    sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread
+          FROM message_fts JOIN message m ON m.id = message_fts.rowid
+          WHERE message_fts MATCH ?1
+          ORDER BY message_fts.rank
+          LIMIT ?2",
+    describe: "the letters a query matches, best first, out of the FTS5 index",
+};
+
+/// The query as FTS5 reads it: every word its own quoted prefix term, all of
+/// them required.
+///
+/// The quoting is the point. A person types `vera@kovac.io` or `re: q3` or a
+/// bare `*`, and none of it may be mistaken for the match language — so the
+/// words are cut out on non-alphanumeric boundaries (which is also how
+/// `unicode61` tokenizes, Cyrillic included) and put back quoted, where no
+/// operator can survive. The trailing `*` is what makes it type-ahead:
+/// "ver kov" finds Vera Kovac on the fourth keystroke.
+///
+/// `None` when there is no word in it at all — the empty launcher asks
+/// nothing of the mail world.
+#[must_use]
+pub fn fts_match(query: &str) -> Option<String> {
+    let mut out = String::new();
+    for w in query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        if !out.is_empty() {
+            out.push_str(" AND ");
+        }
+        out.push('"');
+        out.push_str(w); // no quote can be in it: it was cut on non-alphanumerics
+        out.push_str("\"*");
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The mail world as a search source (CR-006): the people who wrote, then
+/// the letters, best match first.
+///
+/// Runs on its own thread with its own reader. Two rules it keeps:
+///
+/// - **Poll first.** A worker's store never hears about a commit by itself,
+///   so the cached reads below would answer with yesterday's senders
+///   forever. [`Store::poll_external`] is what the UI thread does with the
+///   same problem.
+/// - **The index query goes round the cache.** Its parameter is the
+///   person's typing, and the result cache is keyed on parameters: every
+///   keystroke would leave an entry behind that nothing ever reads again.
+pub struct Provider;
+
+impl crate::search::Provider for Provider {
+    fn id(&self) -> &'static str {
+        "mail"
+    }
+
+    fn search(
+        &self,
+        store: &Store,
+        query: &str,
+        abandoned: &crate::search::Abandoned,
+    ) -> Vec<crate::search::Hit> {
+        let Some(m) = fts_match(query) else {
+            return Vec::new();
+        };
+        store.poll_external();
+        let mut hits = matching_senders(store, query);
+        if abandoned.yes() {
+            return hits;
+        }
+        hits.extend(matching_mail(store, &m));
+        hits
+    }
+}
+
+/// The people whose name or address carries every word of the query. Small
+/// enough (one row a correspondent) to sift in memory, and not a thing FTS5
+/// indexes: a contact is a fact about the mailbox, not a document in it.
+fn matching_senders(store: &Store, query: &str) -> Vec<crate::search::Hit> {
+    let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    senders(store)
+        .iter()
+        .filter_map(|s| {
+            // The name as of their latest letter, the address when they
+            // signed none.
+            let label = if s.name.is_empty() { &s.email } else { &s.name };
+            let hay = format!("{label} {} contact", s.email).to_lowercase();
+            tokens.iter().all(|t| hay.contains(t.as_str())).then(|| {
+                crate::search::Hit::found(
+                    label,
+                    &s.email,
+                    Kind::Contact {
+                        email: s.email.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The letters, as the index ranks them.
+fn matching_mail(store: &Store, m: &str) -> Vec<crate::search::Hit> {
+    let mut stmt = match store.conn().prepare_cached(Q_FTS.sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("search: preparing the mail index failed: {e}");
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map(rusqlite::params![m, FTS_LIMIT], head_row);
+    let rows = match rows {
+        Ok(rows) => rows,
+        // A malformed match string is the one error a person can cause from
+        // the keyboard, and the answer to it is no rows, not a crash.
+        Err(e) => {
+            eprintln!("search: the mail index refused {m:?}: {e}");
+            return Vec::new();
+        }
+    };
+    rows.filter_map(Result::ok)
+        .map(|c| {
+            crate::search::Hit::found(
+                topic_of(&c.subject),
+                &c.from_name,
+                Kind::Message { id: c.id },
+            )
+        })
+        .collect()
 }
 
 /// A sender's `(name, mail count)`; the name falls back to the address.
@@ -2859,7 +3016,7 @@ mod tests {
         assert!(s.write(|c| archive_tx(c, 1)).unwrap(), "archive moved it");
         assert_eq!(inbox(&s).len(), 69);
         assert_ne!(inbox(&s)[0].id, 1);
-        assert_eq!(all(&s).len(), 76, "archived mail stays in the corpus");
+        assert_eq!(corpus(&s).len(), 76, "archived mail stays in the corpus");
         let (name, n) = contact(&s, "vera@kovac.io");
         assert_eq!((name.as_str(), n), ("Vera Kovac", 1));
     }
@@ -2874,7 +3031,7 @@ mod tests {
         assert!(s.write(|c| delete_tx(c, 2)).unwrap(), "delete moved it");
         assert_eq!(inbox(&s).len(), 69);
         assert!(!inbox(&s).iter().any(|m| m.id == 2));
-        assert_eq!(all(&s).len(), 76, "deleted mail stays in the corpus");
+        assert_eq!(corpus(&s).len(), 76, "deleted mail stays in the corpus");
 
         // An account without the folder: the mail must stay exactly where it
         // is. A fresh store, because the folder can only be dropped while
@@ -2904,12 +3061,44 @@ mod tests {
         let gh = mail(&s, 2).expect("github");
         assert!(reading_lines(&gh, 1000) >= 5, "{}", reading_lines(&gh, 1000));
         // And the demo world's one long letter dwarfs them both.
-        let long = all(&s)
+        let long = corpus(&s)
             .iter()
             .find(|m| m.subject.starts_with("long version"))
             .and_then(|m| mail(&s, m.id))
             .expect("the long letter");
         assert!(reading_lines(&long, 60) > 4 * reading_lines(&vera, 60));
+    }
+
+    /// `raw` is a whole letter sitting in the middle of every `message`
+    /// row, and SQLite decodes a record left to right: reading one column
+    /// past it walks the overflow chain of every mail it touches. Every
+    /// list read must stop before it — over a real mailbox the difference
+    /// is a millisecond against thirty (see [`head_row`]).
+    #[test]
+    fn the_corpus_stops_before_the_letter() {
+        let s = store();
+        let cid = |name: &str| -> i64 {
+            s.conn()
+                .query_row(
+                    "SELECT cid FROM pragma_table_info('message') WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .expect("a column of message")
+        };
+        let raw = cid("raw");
+        for col in ["id", "from_name", "from_email", "subject", "date", "unread"] {
+            assert!(cid(col) < raw, "{col} sits past raw");
+            for q in [&Q_CORPUS, &Q_FTS] {
+                assert!(q.sql.contains(col), "{} lost {col}", q.id);
+            }
+        }
+        for late in ["body", "html", "thread", "topic", "forwarded", "raw"] {
+            assert!(cid(late) > cid("unread"));
+            for q in [&Q_CORPUS, &Q_FTS] {
+                assert!(!q.sql.contains(late), "{} reads {late}", q.id);
+            }
+        }
     }
 
     /// A trace records exactly what was read between begin and end — the
