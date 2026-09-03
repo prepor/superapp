@@ -87,6 +87,48 @@ pub fn configure_background_window() {
     }
 }
 
+/// Moves a path to the trash through `NSFileManager` — the door the Finder
+/// uses — and answers where it landed. That is the right trash for the
+/// volume the path is on, a name that does not clash with what is already
+/// in there, and the Put Back the Finder offers; the landing path is what
+/// undo moves back.
+///
+/// # Errors
+///
+/// Whatever `trashItemAtURL:` refused, in its own words.
+pub fn trash(path: &Path) -> Result<std::path::PathBuf, String> {
+    unsafe {
+        let fm: ObjcId = msg_send![class!(NSFileManager), defaultManager];
+        let url: ObjcId = msg_send![
+            class!(NSURL),
+            fileURLWithPath: str_to_nsstring(&path.to_string_lossy())
+        ];
+        let mut landed: ObjcId = nil;
+        let mut err: ObjcId = nil;
+        let ok: BOOL = msg_send![
+            fm,
+            trashItemAtURL: url
+            resultingItemURL: &mut landed
+            error: &mut err
+        ];
+        if ok != YES {
+            let why = if err == nil {
+                format!("the trash refused {}", path.display())
+            } else {
+                nsstring_to_string(msg_send![err, localizedDescription])
+            };
+            return Err(why);
+        }
+        // A trash that answers no URL is one we cannot undo from; say so
+        // rather than remembering a path that is not where the file is.
+        if landed == nil {
+            return Err(format!("{}: the trash did not say where", path.display()));
+        }
+        let p: ObjcId = msg_send![landed, path];
+        Ok(std::path::PathBuf::from(nsstring_to_string(p)))
+    }
+}
+
 /// Captures our window to `path` as a PNG via `screencapture -l`: the window's
 /// own layer — no cursor, no desktop, no other windows, and no dependence on
 /// whether anything covers it.
@@ -114,4 +156,34 @@ pub fn screenshot(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trash is a real system call, so this is the one test here that
+    /// touches the machine — and it takes back everything it does: a file
+    /// made in a scratch directory, trashed, and moved straight out again,
+    /// which is exactly what undo does with it.
+    #[test]
+    fn a_file_goes_to_the_trash_and_comes_back_out() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("superapp-trash-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let file = dir.join("scratch.txt");
+        std::fs::write(&file, b"scratch").expect("a scratch file");
+
+        let landed = trash(&file).expect("the trash took it");
+        assert!(!file.exists(), "gone from where it was");
+        assert!(landed.exists(), "and there, where the trash said it put it");
+
+        // Out again — the move an undo makes — and then the scratch tree
+        // goes, which is the one `remove` in this app and is our own.
+        std::fs::rename(&landed, &file).expect("back out");
+        assert!(file.exists());
+        std::fs::remove_dir_all(&dir).expect("the scratch tree goes");
+    }
 }

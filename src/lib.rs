@@ -13,7 +13,7 @@
 //! | [`filter`] | the rich table's filter grammar and completion context | no |
 //! | [`richtable`] | the rich table: datasources, the SQL builder, paging | no |
 //! | [`mail`] | the mail domain: queries, titles, seed, mutations | no |
-//! | [`files`] | the file browser's domain: listings, the card, the held item (CR-008 draft) | no |
+//! | [`files`] | the file browser's domain: listings, the card, the held item, the verbs that write | no |
 //! | [`sync`] | the IMAP engine: workers, ingest, push, reconciliation | no |
 //! | [`send`] | drafts → outbox → SMTP, with the undo window | no |
 //! | [`repl`] | device sync: the changeset log, the lease, the passes | no |

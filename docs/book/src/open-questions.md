@@ -52,41 +52,59 @@ current state; everything else in this book is settled.
     inside a node cannot be saved back as a node; and a node's pass
     texture stays allocated at the last size it was seen at.
 
-12. **The file browser reads; it does not write yet.** `new dir`, `copy`,
-    `move` and `delete` are drawn with their chords and their whole
-    grammar — the hold and its `… here`, the refusals, the end-of-chain
-    rule, and now the marked set they act on — and each of them toasts
-    what it *would* have done rather than touching the disk. What is
-    settled and waiting: the verbs are effects
-    (the store cannot reproduce them), the rename-class ones performing
-    inline like `clip` while a copy is a deferred job with its status on
-    the panel; `delete` is the trash, never `rm`, so undo can restore;
-    every one is an undoable action whose reversal expires honestly when
-    the disk has moved on (a new directory that is no longer empty, a
-    trash that was emptied); a clash refuses on the status line, with the
-    one exception of a copy into the file's own directory.
+12. **A copy waits for its own bytes.** The browser writes now — `new
+    dir`, `copy here`, `move here` and `delete` are effects through the
+    outside, each an undoable action, `delete` the trash and never `rm`
+    — but all four are performed **inline**, on the frame of the click.
+    A file or a small tree is the same wait as the listing that follows
+    it; a large tree is a stall. The shape that was drafted for it is a
+    deferred job with its status on the panel, and what is in the way is
+    real: the effect executor runs on the sender and sync threads, each
+    of which builds its own `Real` outside — and under `--demo-disk`
+    that is a *different disk* from the one the panel is looking at, so
+    a filed copy would run somewhere else. A runner that shares the
+    panel's outside comes first; progress on the panel comes with it,
+    and with progress, a cancel. Until then the honest reading is that a
+    copy is as fast as the disk and the window is still.
 
-13. **Nothing watches the disk.** A files panel lists when it lands on a
-    directory, so a file another program wrote appears when you walk back
-    to it, not when it lands. FSEvents on macOS and inotify on android,
-    one watch per directory a panel shows, coalesced into one invalidation
-    per burst, is the shape — until then the listing is a snapshot with no
-    generation to bump, which is also why the panel has no `sync` button:
-    a button for it would be an admission rather than a feature.
+13. **The effect log is a queue, not a log.** The `effects` panel is the
+    `effect` table read back, and only a *deferred* effect writes a row
+    there — so `clip`, `open` and the file browser's four writing verbs
+    leave no trace at all. For the clipboard that is proportionate; for a
+    delete it is not, and the panel's own promise — everything the app has
+    tried on the outside world — was quietly the queue's promise instead.
+    Two ways to close it, and the choice is the question: file the file
+    verbs as deferred jobs, which is question 12 with all of its problems,
+    or let an inline effect write its row **after** it is performed,
+    `done` or `failed`, never `pending`. The second is the smaller change
+    and the truer one: the queue keeps its meaning, the log becomes the
+    log, and undo never races anything. What it needs is a serializable
+    payload per logged effect — the panel's one-line description is
+    decoded through the registry — and a judgement about which inline
+    effects opt in: the file verbs, `clip` and `open` yes; `now`,
+    `connect`, `fetch` and `secret_get` would bury the panel.
 
-14. **Files beyond the app's own directory on android**, and `open` there:
-    scoped storage puts the rest of the disk behind SAF and the OS opener
-    behind a FileProvider, both JNI the shell does not have. The browser
-    is macOS-shaped today.
+14. **Nothing watches the disk.** A files panel lists when it lands on a
+    directory and again when one of our own verbs writes — that much a
+    verb can say for itself — so a file *another* program wrote appears
+    when you walk back to it, not when it lands. FSEvents on macOS and
+    inotify on android, one watch per directory a panel shows, coalesced
+    into one invalidation per burst, is the shape — until then the
+    listing is a snapshot with no generation to bump, which is also why
+    the panel has no `sync` button: a button for it would be an
+    admission rather than a feature. It is the same absence that makes a
+    `… here` plan against the disk at the click rather than at the hold,
+    and an undo ask the disk before it reverses.
 
 15. **Saving an attachment to the disk** is the one direction
     [attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card)
     do not go. `open` writes a part into the app's scratch directory and
     hands it to the OS, which is enough to read one; putting it somewhere
-    you chose means `copy` on a part *holding* it and a files panel's
-    `copy here` performing it — and `copy here` is itself still a draft
-    (question 12). Both become real together, or the grammar tells two
-    different stories about the same verb.
+    you chose means `copy` on a part *holding* it, and a files panel's
+    `copy here` — which now performs — would carry it the rest of the way.
+    What is missing is the hold: it is a set of **paths**, and a part is
+    not one until it has been written out. The same gap as question 16,
+    from the other side.
 
 16. **A letter cannot carry a letter's part.** Compose attaches files off
     the disk; forwarding a mail that carried something drops what it
@@ -94,4 +112,11 @@ current state; everything else in this book is settled.
     hold is a set of *paths*, so the fix is a hold that can name a part
     too — at which point a forward can carry the source's parts by
     default, which is what every other client does.
+
+17. **Files beyond the app's own directory on android**, and `open` and
+    the trash there: scoped storage puts the rest of the disk behind SAF,
+    the OS opener behind a FileProvider and a delete behind
+    `MediaStore`'s own trash, all JNI the shell does not have — a
+    `delete` on android refuses rather than falling back to a `rm`. The
+    browser is macOS-shaped today.
 

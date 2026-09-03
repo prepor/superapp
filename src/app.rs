@@ -170,7 +170,14 @@ pub enum BootOutside {
     /// The network, the keychain (or memory), the clipboard, the screen —
     /// and, unless a run asked for the demo tree (`--demo-disk`), this
     /// machine's own disk.
-    Real { demo_disk: bool },
+    ///
+    /// `writes` is off for a script replayed against that real disk: a
+    /// suite must no more delete a human's files than write to their
+    /// keychain (see `secrets_in_memory`), and a files suite says
+    /// `--demo-disk` for exactly that reason. The refusal lands on the
+    /// status line, where a forgotten flag is a failing step rather than
+    /// a trip to the trash.
+    Real { demo_disk: bool, writes: bool },
     /// Every verb fails, loudly; the clock still runs.
     Deny,
     /// The in-memory mail world.
@@ -205,6 +212,7 @@ impl Boot {
             virtual_time: cfg!(headless),
             outside: BootOutside::Real {
                 demo_disk: config().demo_disk,
+                writes: config().e2e.is_none() || config().demo_disk,
             },
             secrets_in_memory: config().e2e.is_some(),
             steps,
@@ -1268,9 +1276,14 @@ impl State {
             crate::effect::Clock::System
         };
         let outside: Box<dyn crate::effect::Outside> = match boot.outside {
-            BootOutside::Real { demo_disk } => {
+            BootOutside::Real { demo_disk, writes } => {
                 let real = crate::effect::Real::new(secrets.clone(), clock.clone());
-                Box::new(if demo_disk { real.with_demo_disk() } else { real })
+                let real = if demo_disk {
+                    real.with_demo_disk()
+                } else {
+                    real
+                };
+                Box::new(if writes { real } else { real.read_only_disk() })
             }
             BootOutside::Deny => Box::new(crate::effect::Deny::with_clock(clock.clone())),
             BootOutside::Fake => Box::new(crate::effect::Fake {
@@ -1734,6 +1747,13 @@ impl State {
             .unwrap_or_else(|| "panel".into())
     }
 
+    /// Whether this device may write at all (CR-005): a follower's store
+    /// refuses, and a verb that reaches the disk has to ask *before* it
+    /// acts — the disk would take the write even where the store will not.
+    fn writable(&self) -> bool {
+        self.repl.is_none() || self.store.is_writable()
+    }
+
     /// Runs one **undoable action**: mutates the in-memory `Wm`, writes the
     /// whole thing through in one transaction, and records a node — the
     /// layout before and after, plus whatever the action claimed of the
@@ -1755,10 +1775,31 @@ impl State {
         // Under replication, a follower does not write — the gate would refuse
         // it anyway, but returning here keeps the in-memory `Wm` from drifting
         // ahead of a store that never took the change (CR-005).
-        if self.repl.is_some() && !self.store.is_writable() {
+        if !self.writable() {
             self.toast("read-only — acquire the lease to write", true);
             return None;
         }
+        self.act_done(kind, label, entity, mutate, data, intents)
+    }
+
+    /// [`State::act`] with the gate already asked, for an action whose
+    /// claim on the world has **already happened**: the file browser's
+    /// verbs reach the disk on the frame of the click, and a disk takes
+    /// writes a follower's store will not. By the time one of those calls
+    /// this, the question is no longer whether to refuse — it is that a
+    /// change with no node behind it would be a change nobody can undo.
+    /// The caller asks [`State::writable`] before it writes, and again
+    /// after; what it does about a lease that turned over in between is
+    /// compensation, not refusal.
+    fn act_done<R: Send + 'static>(
+        &mut self,
+        kind: &str,
+        label: String,
+        entity: Option<String>,
+        mutate: impl FnOnce(&mut Wm),
+        data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<R> + Send + 'static,
+        intents: Vec<Box<dyn crate::history::Intent>>,
+    ) -> Option<R> {
         let before = self.ws.snapshot();
         mutate(&mut self.ws);
         let snap = self.ws.snapshot();
@@ -3454,12 +3495,20 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // A walk gives claims back, and a claim can be a file — which a
+        // follower's disk would take even though its store would not
+        // (CR-005). The gate belongs on the walk, not only on the action.
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
         let was = state.ws.active;
         let step = state.history.undo(&state.world);
         let mut marks = None;
         match step {
             Some(step) => {
                 marks = Some((step.marks.clone(), step.undone));
+                let failed = crate::history::said(&step.failed);
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3467,10 +3516,13 @@ impl Stage {
                     state.anim.camera().jump_to(cam);
                 }
                 state.pump.kick(); // reverted intent pushes to the server too
-                state.toast(format!("undid — {label}"), false);
+                state.toast(format!("undid — {label}{failed}"), !failed.is_empty());
             }
             None => state.toast("nothing to undo", false),
         }
+        // A walk may have moved something on the disk back or forward
+        // (CR-008), and nothing watches it: the listings are told.
+        self.refresh_files(cx);
         if let Some(m) = marks {
             self.restore_marks(cx, m);
         }
@@ -3483,12 +3535,20 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // A walk gives claims back, and a claim can be a file — which a
+        // follower's disk would take even though its store would not
+        // (CR-005). The gate belongs on the walk, not only on the action.
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
         let was = state.ws.active;
         let step = state.history.redo(&state.world);
         let mut marks = None;
         match step {
             Some(step) => {
                 marks = Some((step.marks.clone(), step.undone));
+                let failed = crate::history::said(&step.failed);
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3496,10 +3556,13 @@ impl Stage {
                     state.anim.camera().jump_to(cam);
                 }
                 state.pump.kick();
-                state.toast(format!("redid — {label}"), false);
+                state.toast(format!("redid — {label}{failed}"), !failed.is_empty());
             }
             None => state.toast("nothing to redo", false),
         }
+        // A walk may have moved something on the disk back or forward
+        // (CR-008), and nothing watches it: the listings are told.
+        self.refresh_files(cx);
         if let Some(m) = marks {
             self.restore_marks(cx, m);
         }
@@ -4051,11 +4114,16 @@ impl Stage {
                 return;
             }
             Act::HistoryRow(id) => {
+                if !state.writable() {
+                    state.toast("read-only — acquire the lease to write", true);
+                    return;
+                }
                 let was = state.ws.active;
                 let step = state.history.travel(&state.world, id);
                 let mut marks = None;
                 if let Some(step) = step {
                     marks = Some((step.marks.clone(), step.undone));
+                    let failed = crate::history::said(&step.failed);
                     let label = state.land(step);
                     state.sync();
                     if state.ws.active != was {
@@ -4063,8 +4131,9 @@ impl Stage {
                         state.anim.camera().jump_to(cam);
                     }
                     state.pump.kick();
-                    state.toast(format!("history — {label}"), false);
+                    state.toast(format!("history — {label}{failed}"), !failed.is_empty());
                 }
+                self.refresh_files(cx);
                 if let Some(m) = marks {
                     self.restore_marks(cx, m);
                 }
@@ -4404,10 +4473,11 @@ impl Stage {
                             state.toast("syncing…", false);
                         }
                     }
-                    // The files verbs (CR-008): `open` performs, and the
-                    // hold and its `… here` are real as far as the chrome
-                    // goes — but nothing here writes yet, and the toasts
-                    // say so rather than pretending.
+                    // The files verbs (CR-008). Every one reaches the
+                    // disk through the outside, and every one that writes
+                    // is an undoable action whose reversal asks the disk
+                    // rather than trusting it — `here` and `delete_paths`
+                    // below.
                     BtnAct::Open => {
                         // The card's path to the OS, through the outside:
                         // the first real verb of the browser (CR-008). A
@@ -4574,94 +4644,8 @@ impl Stage {
                         }
                     }
                     BtnAct::Here => {
-                        let dir = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
-                            Some(Kind::Files { dir }) => Some(dir),
-                            _ => None,
-                        };
-                        if let (Some(hold), Some(dir)) = (state.hold.clone(), dir) {
-                            // The set, path by path: what can be performed
-                            // and what each refusal was — a batch refuses
-                            // exactly as one does (CR-009).
-                            let mut done: Vec<String> = Vec::new();
-                            let mut refused: Vec<String> = Vec::new();
-                            for path in &hold.paths {
-                                let name = crate::files::basename(path).to_string();
-                                let same_dir = crate::files::parent(path) == Some(dir.as_str());
-                                let into_itself =
-                                    *path == dir || dir.starts_with(&format!("{path}/"));
-                                // Clashes refuse — except a copy into its
-                                // own directory, which is the one case the
-                                // duplicate is the point.
-                                let refuse = if into_itself {
-                                    Some(format!("cannot {} “{name}” into itself", hold.op.verb()))
-                                } else if (same_dir && hold.op == crate::files::HoldOp::Move)
-                                    || (!same_dir
-                                        && crate::files::stat_in(
-                                            &state.world,
-                                            &crate::files::join(&dir, &name),
-                                        )
-                                        .is_some())
-                                {
-                                    // A move that goes nowhere, or a name
-                                    // the destination already has: one
-                                    // sentence covers both, so it is
-                                    // written once.
-                                    Some(format!("“{name}” is already here"))
-                                } else {
-                                    None
-                                };
-                                match refuse {
-                                    Some(msg) => refused.push(msg),
-                                    None => done.push(name),
-                                }
-                            }
-                            let here = crate::files::basename(&dir).to_string();
-                            if done.is_empty() {
-                                // Nothing could be done: the refusal is the
-                                // word, and the hold stands as it was.
-                                let msg = if refused.len() == 1 {
-                                    refused.remove(0)
-                                } else {
-                                    format!(
-                                        "nothing to {} into {here} — {} refused",
-                                        hold.op.verb(),
-                                        refused.len()
-                                    )
-                                };
-                                if let Some(w) = self.hosted.get(&pid) {
-                                    w.as_files_panel().set_status(cx, Some(msg.clone()));
-                                }
-                                state.toast(msg, true);
-                            } else {
-                                let what = if done.len() == 1 && refused.is_empty() {
-                                    format!("“{}”", done[0])
-                                } else if refused.is_empty() {
-                                    crate::files::plural(done.len())
-                                } else {
-                                    format!(
-                                        "{} of {}",
-                                        done.len(),
-                                        crate::files::plural(done.len() + refused.len())
-                                    )
-                                };
-                                let but = if refused.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" — {}", refused.join(", "))
-                                };
-                                state.toast(
-                                    format!(
-                                        "{} {what} into {here}{but} — draft: the disk is untouched",
-                                        hold.op.done()
-                                    ),
-                                    false,
-                                );
-                                // A move clears the hold; a copy keeps it.
-                                if hold.op == crate::files::HoldOp::Move {
-                                    state.hold = None;
-                                }
-                            }
-                        }
+                        self.here(cx, pid);
+                        return;
                     }
                     BtnAct::Delete
                         if matches!(
@@ -4669,11 +4653,17 @@ impl Stage {
                             Some(Kind::Files { .. } | Kind::File { .. })
                         ) =>
                     {
-                        let title = state.title_of(pid);
-                        state.toast(
-                            format!("“{title}” to the trash — draft: nothing left the disk"),
-                            false,
-                        );
+                        // The panel's own object verb: the one thing it
+                        // shows, through the same door the marked set uses.
+                        let path = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+                            Some(Kind::Files { dir }) => Some(dir),
+                            Some(Kind::File { path }) => Some(path),
+                            _ => None,
+                        };
+                        if let Some(path) = path {
+                            self.delete_paths(cx, pid, vec![path]);
+                        }
+                        return;
                     }
                     BtnAct::Archive | BtnAct::Delete => {
                         // The button acts on the mail its panel is showing;
@@ -5021,6 +5011,398 @@ impl Stage {
         }
     }
 
+    /// `new dir`: the one directory the field named, in the directory the
+    /// panel shows (CR-008). Undo trashes it while it is still empty — a
+    /// directory somebody has since put something in is a reversal that
+    /// has expired, and the walk says so rather than taking the contents
+    /// with it.
+    fn new_dir(&mut self, cx: &mut Cx, pid: PanelId, dir: &str, name: &str) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
+        let path = crate::files::join(dir, name);
+        if let Err(e) = crate::files::make_dir_in(&state.world, &path) {
+            // A name the directory already has, a directory that has gone:
+            // the panel's own line, where the field was.
+            if let Some(w) = self.hosted.get(&pid) {
+                w.as_files_panel().set_status(cx, Some(e.clone()));
+            }
+            if let Some(state) = self.state.as_deref_mut() {
+                state.toast(e, true);
+            }
+            self.kick(cx);
+            return;
+        }
+        let here = crate::files::basename(dir).to_string();
+        let intent: Box<dyn crate::history::Intent> =
+            Box::new(crate::files::MadeDir::of(&state.world, &path));
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
+            "new dir",
+            format!("new dir “{name}/” in {here}"),
+            None,
+            |_| {},
+            |_| Ok::<(), rusqlite::Error>(()),
+            vec![intent],
+        );
+        state.toast(format!("created “{name}/” in {here} — ⌘z undoes"), false);
+        self.refresh_files(cx);
+        self.kick(cx);
+    }
+
+    /// Asked after a disk verb has written and before its node is
+    /// recorded: whether the lease turned over in between (CR-005). If it
+    /// did, the claim is given straight back — a change with no node
+    /// behind it is a change nobody can undo — and the sentence says both
+    /// what happened and what became of it.
+    fn lost_the_lease(state: &State, intent: &dyn crate::history::Intent) -> Option<String> {
+        if state.writable() {
+            return None;
+        }
+        let line = "read-only — the lease turned over";
+        Some(match intent.reverse(&state.world) {
+            Ok(()) => format!("{line}; what was done has been put back"),
+            Err(e) => format!("{line}, and putting it back failed: {e}"),
+        })
+    }
+
+    /// `copy here` / `move here`: the held set performed into the directory
+    /// this files panel shows (CR-008, CR-009).
+    ///
+    /// The plan is made first, against the disk as it is right now — the
+    /// hold may have waited while another program moved things, and nothing
+    /// watches the disk. What it refuses, it refuses path by path, exactly
+    /// as it does for one; what it can do becomes **one** undoable action,
+    /// so a single ⌘z takes the whole batch back.
+    fn here(&mut self, cx: &mut Cx, pid: PanelId) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        let dir = match state.ws.panels.get(&pid).map(|p| p.kind.clone()) {
+            Some(Kind::Files { dir }) => dir,
+            _ => return,
+        };
+        let Some(hold) = state.hold.clone() else {
+            return;
+        };
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
+        let mut plan = crate::files::plan_here(&state.world, &hold, &dir);
+        // Performed one at a time, and a path the disk refuses at the last
+        // moment joins the refusals rather than failing the batch: what is
+        // left is exactly what happened.
+        let mut done: Vec<crate::files::Done> = Vec::new();
+        for step in plan.steps.drain(..) {
+            let r = match hold.op {
+                crate::files::HoldOp::Copy => {
+                    crate::files::copy_in(&state.world, &step.from, &step.to)
+                }
+                crate::files::HoldOp::Move => {
+                    crate::files::move_in(&state.world, &step.from, &step.to)
+                }
+            };
+            match r {
+                // Read back the moment after the write: what undo will
+                // compare against before it takes anything away.
+                Ok(()) => done.push(crate::files::Done::of(&state.world, &step.from, &step.to)),
+                Err(e) => plan.refused.push(e),
+            }
+        }
+        let here = crate::files::basename(&dir).to_string();
+        if done.is_empty() {
+            // Nothing could be done: the refusal is the word, and the hold
+            // stands as it was.
+            let msg = if plan.refused.len() == 1 {
+                plan.refused.remove(0)
+            } else {
+                format!(
+                    "nothing to {} into {here} — {} refused",
+                    hold.op.verb(),
+                    plan.refused.len()
+                )
+            };
+            if let Some(w) = self.hosted.get(&pid) {
+                w.as_files_panel().set_status(cx, Some(msg.clone()));
+            }
+            if let Some(state) = self.state.as_deref_mut() {
+                state.toast(msg, true);
+            }
+            self.kick(cx);
+            return;
+        }
+        let what = if done.len() == 1 && plan.refused.is_empty() {
+            format!("“{}”", crate::files::basename(&done[0].to))
+        } else if plan.refused.is_empty() {
+            crate::files::plural(done.len())
+        } else {
+            format!(
+                "{} of {}",
+                done.len(),
+                crate::files::plural(done.len() + plan.refused.len())
+            )
+        };
+        let but = if plan.refused.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", plan.refused.join(", "))
+        };
+        // A move empties the paths it came from; the panels that were
+        // showing them have nothing left to show.
+        let vanished: Vec<String> = match hold.op {
+            crate::files::HoldOp::Copy => Vec::new(),
+            crate::files::HoldOp::Move => done.iter().map(|d| d.from.clone()).collect(),
+        };
+        let closing = self.panels_under(&vanished);
+        // A move empties the rows it came from, so it consumes the marks
+        // that named them — on the panel the hold was taken from, which is
+        // not this one. A copy leaves its rows, and its marks, alone.
+        let consumed = match (hold.op, hold.from) {
+            (crate::files::HoldOp::Move, Some(src)) => vanished.first().map(|p| {
+                (
+                    src,
+                    crate::files::parent(p)
+                        .unwrap_or(crate::files::ROOT)
+                        .to_string(),
+                    vanished
+                        .iter()
+                        .map(|p| crate::files::basename(p).to_string())
+                        .collect::<Vec<String>>(),
+                )
+            }),
+            _ => None,
+        };
+        let intent: Box<dyn crate::history::Intent> = match hold.op {
+            crate::files::HoldOp::Copy => Box::new(crate::files::Copied::new(done.clone())),
+            crate::files::HoldOp::Move => Box::new(crate::files::Moved::new(done.clone())),
+        };
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
+            hold.op.verb(),
+            format!("{} {what} into {here}", hold.op.verb()),
+            // No coalescing scope: a verb that wrote a disk is its own
+            // node, however fast the next one follows. Two copies into one
+            // directory are two things that happened, and ⌘z takes them
+            // back one at a time.
+            None,
+            move |ws| {
+                for p in closing {
+                    ws.close(p);
+                }
+            },
+            |_| Ok::<(), rusqlite::Error>(()),
+            vec![intent],
+        );
+        state.toast(
+            format!("{} {what} into {here}{but} — ⌘z undoes", hold.op.done()),
+            false,
+        );
+        if let Some((src, from_dir, names)) = consumed {
+            state.history.claim_marks(
+                src,
+                crate::history::MarkKeys::Names {
+                    dir: from_dir,
+                    keys: names,
+                },
+            );
+        }
+        // A move consumes the hold; a copy keeps it, so the same set can be
+        // laid down in another directory.
+        if hold.op == crate::files::HoldOp::Move {
+            state.hold = None;
+        }
+        self.refresh_files(cx);
+        // A move closed the panels that were showing what it took, so the
+        // columns and the wishes are not what they were: the layout is
+        // taken again, as it is after any action that closes one.
+        self.sync(cx);
+    }
+
+    /// `delete`, from a panel's own verb or the marks bar: to the trash,
+    /// never `rm` (CR-008). One node for the whole set, so one ⌘z puts all
+    /// of it back — and the reversal expires honestly, on a trash that was
+    /// emptied or a name something else has taken since.
+    fn delete_paths(&mut self, cx: &mut Cx, pid: PanelId, paths: Vec<String>) {
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
+        let mut trashed: Vec<crate::files::Done> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for path in &paths {
+            // A root is where the browser starts: nothing takes one away,
+            // and saying so here means no backend is ever asked to.
+            if crate::files::is_root(path) {
+                refused.push(format!("“{path}” is a root"));
+                continue;
+            }
+            match crate::files::trash_in(&state.world, path) {
+                // Where it went, and what it is there: undo compares both
+                // before it moves anything back out.
+                Ok(landed) => {
+                    trashed.push(crate::files::Done::of(&state.world, path, &landed));
+                }
+                Err(e) => refused.push(e),
+            }
+        }
+        if trashed.is_empty() {
+            let msg = if refused.len() == 1 {
+                refused.remove(0)
+            } else {
+                format!("nothing deleted — {} refused", refused.len())
+            };
+            if let Some(w) = self.hosted.get(&pid) {
+                w.as_files_panel().set_status(cx, Some(msg.clone()));
+            }
+            if let Some(state) = self.state.as_deref_mut() {
+                state.toast(msg, true);
+            }
+            self.kick(cx);
+            return;
+        }
+        // The row's own wording where the set is one, as a batch archive
+        // has it.
+        let what = match trashed.as_slice() {
+            [one] if refused.is_empty() => {
+                format!("“{}”", crate::files::basename(&one.from))
+            }
+            many if refused.is_empty() => crate::files::plural(many.len()),
+            many => format!(
+                "{} of {}",
+                many.len(),
+                crate::files::plural(many.len() + refused.len())
+            ),
+        };
+        let but = if refused.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", refused.join(", "))
+        };
+        // Every panel showing one of these paths — or anything under one —
+        // is showing nothing now. Undo restores the layout with them.
+        let gone: Vec<String> = trashed.iter().map(|d| d.from.clone()).collect();
+        let closing = self.panels_under(&gone);
+        // The marks this delete consumed — the ones whose row went, never
+        // one that stayed because its path refused. Undo puts exactly
+        // these back, and redo takes exactly these again.
+        let panel = self.hosted.get(&pid).map(|w| w.as_files_panel());
+        let claimed_dir = panel
+            .as_ref()
+            .and_then(FilesPanelRef::dir)
+            .unwrap_or_default();
+        let claimed: Vec<String> = panel
+            .map(|p| p.marks())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| gone.iter().any(|g| crate::files::basename(g) == n))
+            .collect();
+        let intent: Box<dyn crate::history::Intent> = Box::new(crate::files::Deleted::new(trashed));
+        let Some(state) = self.state.as_deref_mut() else {
+            return;
+        };
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
+            "delete",
+            format!("delete {what}"),
+            None,
+            move |ws| {
+                for p in closing {
+                    ws.close(p);
+                }
+            },
+            |_| Ok::<(), rusqlite::Error>(()),
+            vec![intent],
+        );
+        // What was held is not there any more; a hold with nothing left in
+        // it is no hold.
+        if let Some(h) = state.hold.as_mut() {
+            let world = state.world.clone();
+            h.paths
+                .retain(|p| crate::files::stat_in(&world, p).is_some());
+            if h.is_empty() {
+                state.hold = None;
+            }
+        }
+        state.toast(format!("{what} to the trash{but} — ⌘z undoes"), false);
+        state.history.claim_marks(
+            pid,
+            crate::history::MarkKeys::Names {
+                dir: claimed_dir,
+                keys: claimed,
+            },
+        );
+        self.refresh_files(cx);
+        // The panels showing what went are closed, so the layout is taken
+        // again — a viewport left on the geometry of a panel that is no
+        // longer there is the one thing worse than a stale listing.
+        self.sync(cx);
+    }
+
+    /// The panels that were showing one of these paths, or something under
+    /// one: what a move or a delete leaves pointing at nothing.
+    fn panels_under(&self, gone: &[String]) -> Vec<PanelId> {
+        let Some(state) = self.state.as_deref() else {
+            return Vec::new();
+        };
+        state
+            .ws
+            .panels
+            .iter()
+            .filter(|(_, p)| {
+                let shown = match &p.kind {
+                    Kind::Files { dir } => dir,
+                    Kind::File { path } => path,
+                    _ => return false,
+                };
+                gone.iter()
+                    .any(|g| shown == g || shown.starts_with(&format!("{g}/")))
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
+    /// Lists every files panel again. Nothing watches the disk (there is no
+    /// generation to bump), so a verb that wrote it says so itself — and it
+    /// says it to all of them, since a copy changes the directory it came
+    /// from as well as the one it landed in.
+    fn refresh_files(&mut self, cx: &mut Cx) {
+        let Some(world) = self.state.as_deref().map(|s| s.world.clone()) else {
+            return;
+        };
+        for w in self.hosted.values().cloned().collect::<Vec<_>>() {
+            w.as_files_panel().refresh(cx, &world);
+        }
+    }
+
     /// `copy` / `move` on a files panel's marked set (CR-009): the hold is
     /// a set of paths, and every files panel then offers `… here`. The
     /// marks stand — nothing has been consumed, and the destination is
@@ -5035,6 +5417,7 @@ impl Stage {
         let hold = crate::files::Hold {
             op,
             paths: names.iter().map(|n| crate::files::join(&dir, n)).collect(),
+            from: Some(pid),
         };
         if let Some(state) = self.state.as_deref_mut() {
             state.toast(
@@ -5051,26 +5434,23 @@ impl Stage {
         self.kick(cx);
     }
 
-    /// `delete` on a files panel's marked set — a draft like the single
-    /// row's, so the toast says the disk is untouched and the marks stay
-    /// exactly where they were.
+    /// `delete` on a files panel's marked set (CR-009): the same door the
+    /// panel's own verb uses, over every marked name. The rows go with the
+    /// paths, so the marks go with the rows — and undo brings all three
+    /// back together.
     fn delete_marked(&mut self, cx: &mut Cx, pid: PanelId) {
-        let Some(w) = self.hosted.get(&pid).cloned() else { return };
-        let names = w.as_files_panel().marks();
-        // The row's own wording where the set is one, as a batch archive
-        // has it.
-        let what = match names.as_slice() {
-            [] => return,
-            [one] => format!("“{one}”"),
-            many => crate::files::plural(many.len()),
+        let Some(w) = self.hosted.get(&pid).cloned() else {
+            return;
         };
-        if let Some(state) = self.state.as_deref_mut() {
-            state.toast(
-                format!("{what} to the trash — draft: nothing left the disk"),
-                false,
-            );
+        let panel = w.as_files_panel();
+        let (Some(dir), names) = (panel.dir(), panel.marks()) else {
+            return;
+        };
+        if names.is_empty() {
+            return;
         }
-        self.kick(cx);
+        let paths = names.iter().map(|n| crate::files::join(&dir, n)).collect();
+        self.delete_paths(cx, pid, paths);
     }
 
     /// The batch verb (CR-009): [`Stage::triage`] over a list's marked set.
@@ -5161,7 +5541,9 @@ impl Stage {
         };
         // The node carries the marks it consumed: context restored with the
         // delta, so ⌘z brings the rows back marked.
-        state.history.claim_marks(pid, filed.clone());
+        state
+            .history
+            .claim_marks(pid, crate::history::MarkKeys::Threads(filed.clone()));
         let what = if skipped > 0 {
             let have = if skipped == 1 { "has" } else { "have" };
             format!(
@@ -5181,14 +5563,38 @@ impl Stage {
 
     /// Puts back, or takes again, the marks a node consumed (CR-009): the
     /// context that rides an undo or a redo.
-    fn restore_marks(&mut self, cx: &mut Cx, (marks, undone): (Vec<(PanelId, Vec<i64>)>, bool)) {
+    fn restore_marks(
+        &mut self,
+        cx: &mut Cx,
+        (marks, undone): (Vec<(PanelId, crate::history::MarkKeys)>, bool),
+    ) {
         for (pid, keys) in marks {
-            let Some(w) = self.hosted.get(&pid).cloned() else { continue };
-            let panel = w.as_mailbox_panel();
-            if undone {
-                panel.add_marks(cx, &keys);
-            } else {
-                panel.remove_marks(cx, &keys);
+            let Some(w) = self.hosted.get(&pid).cloned() else {
+                continue;
+            };
+            match keys {
+                crate::history::MarkKeys::Threads(keys) => {
+                    let panel = w.as_mailbox_panel();
+                    if undone {
+                        panel.add_marks(cx, &keys);
+                    } else {
+                        panel.remove_marks(cx, &keys);
+                    }
+                }
+                crate::history::MarkKeys::Names { dir, keys } => {
+                    let panel = w.as_files_panel();
+                    // Only where the panel is still showing the listing
+                    // those names were names in — it may have walked on,
+                    // and a name means nothing in another directory.
+                    if panel.dir().as_deref() != Some(dir.as_str()) {
+                        continue;
+                    }
+                    if undone {
+                        panel.add_marks(cx, &keys);
+                    } else {
+                        panel.remove_marks(cx, &keys);
+                    }
+                }
             }
         }
     }
@@ -6164,19 +6570,8 @@ impl Stage {
                     state.announce_problems();
                     refresh = true;
                 }
-                crate::panels::PanelAction::NewDir { pid: _, dir, name } => {
-                    // CR-008, draft: the effect and its undo arrive with
-                    // the implementation; the toast is honest about it.
-                    let Some(state) = self.state.as_deref_mut() else {
-                        continue;
-                    };
-                    state.toast(
-                        format!(
-                            "created “{name}/” in {} — draft: the disk is untouched",
-                            crate::files::basename(&dir)
-                        ),
-                        false,
-                    );
+                crate::panels::PanelAction::NewDir { pid, dir, name } => {
+                    self.new_dir(cx, pid, &dir, &name);
                     refresh = true;
                 }
                 crate::panels::PanelAction::ConnectBucket {
@@ -8421,11 +8816,15 @@ impl Stage {
             }
             // One card, two sources (CR-010): the same runs either way —
             // the line under the name (a path, or a media type) and a text
-            // preview.
+            // preview. That line carries its own text as its label, the
+            // way a row and a status line do, so a suite can address the
+            // card by the file it is on — the one thing about a card two
+            // panels can never both be right about.
             Some(Kind::File { .. } | Kind::Attachment { .. }) => {
+                let detail = w.text_input(cx, ids!(path_txt)).text();
                 let pr = w.widget(cx, ids!(path_txt)).area().rect(cx);
                 if pr.size.x > 0.0 {
-                    reg.push(("path".to_string(), pr, Act::Pointer(pid)));
+                    reg.push((detail, pr, Act::Pointer(pid)));
                 }
                 let tr = w.widget(cx, ids!(text_box.text_prev)).area().rect(cx);
                 if tr.size.x > 0.0 {

@@ -7,6 +7,9 @@
 # panel's own object verb, `delete marked` · `copy marked` · `move marked`
 # · `mark all` · `clear marks` are the bar's, and each resolves only while
 # it is drawn.
+#
+# The verbs are real (CR-008), so every one that writes is followed by the
+# ⌘z that puts the fixture back — which is an assertion of its own.
 wait 900
 
 # The launcher opens the files root; ~ lists the demo tree.
@@ -22,28 +25,38 @@ click "Downloads/"
 wait 500
 
 # Enter goes: the Downloads panel is joined under ~ and drives nothing, so
-# it is the object — and wears the verbs of the directory it shows.
+# it is the object — and wears the verbs of the directory it shows. It
+# deletes the directory it shows, which closes it; ⌘z brings both back.
 key enter
 wait 800
 click "delete"
-wait 500
+wait 700
 shot f1-object-verbs
+key cmd+z
+wait 900
 
 # Space marks the cursor's row without moving it, so the panel is still an
 # object — and its own verbs stand down while the bar carries them.
 type " "
 wait 500
 shot f2-one-mark
+
+# The bar's delete takes the marked row to the trash; the row goes and its
+# mark with it, so the bar goes down. ⌘z puts the file back — and the mark
+# it was carrying, which is what `clear marks` then finds.
 click "delete marked"
-wait 500
-# A draft leaves the set alone: nothing left the disk, so nothing was
-# consumed.
+wait 700
+shot f2b-deleted
+key cmd+z
+wait 900
 click "clear marks"
 wait 500
 
 # …and with the last mark gone the panel's own verb answers again.
 click "delete"
-wait 500
+wait 700
+key cmd+z
+wait 900
 
 # A range by the walk's own keys: space, then shift+↓ twice.
 type " "

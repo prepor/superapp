@@ -23,10 +23,10 @@ scrolling 12×6 workspace, joins with cascade-close, spring animation, the
 link/button grammar, keyboard and mouse parity — exercised by fake mail panels:
 `email/mailbox` (inbox, archive, sent, spam), `email/message`, `email/compose`,
 `contact`, plus `settings`, `problems`, `help`, `about`, and `effects` with the
-`job` it previews into — the queue of everything the app has tried on the
-outside world, read back as a list panel and its detail. Mail talks to a real
-IMAP account; the **file browser** (`files` and the `file` card) reads the real
-disk, which is the first thing here that is not the app's own data at all — and
+`job` it previews into — the queue of the outside work worth retrying, read
+back as a list panel and its detail. Mail talks to a real IMAP account; the
+**file browser** (`files` and the `file` card) reads and writes the real disk,
+which is the first thing here that is not the app's own data at all — and
 the two meet at
 [attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card),
 where a part of a letter draws on the browser's own card and a file held in the

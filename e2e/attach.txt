@@ -28,10 +28,12 @@ shot a2-card
 
 # The card is the file browser's card over the letter's own bytes: the
 # kind and size line, the media type where a path would be, and — the part
-# being text — the preview under the rule.
+# being text — the preview under the rule. The line under the name carries
+# its own text as its label (a disk card's is the path, a part's is this),
+# so clicking it is an assertion about which card this is.
 click "preview"
 wait 400
-click "path"
+click "text/csv"
 wait 400
 shot a3-preview
 

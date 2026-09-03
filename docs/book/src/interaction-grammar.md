@@ -274,11 +274,11 @@ picks the viewer. Nothing is executed by us. A card measures its preview and
 asks for the rows it needs, the way a long letter does — a long file opens
 tall rather than scrolled, a short one stays short.
 
-The rest of the verbs are drawn and their grammar settled, but they do not
-touch the disk yet (see [Open Questions](./open-questions.md)). What the
-grammar says: every verb acts on **the thing the panel shows** — a card's on
-its file, a files panel's on its directory — never on a row, and the list
-reaches them by borrowing, exactly as the inbox borrows `archive`. So a
+The rest of the verbs reach the disk — `new dir`, `copy here`, `move here`
+and `delete` are performed, not described — and every one of them acts on
+**the thing the panel shows**: a card's on its file, a files panel's on its
+directory, never on a row. The list reaches them by borrowing, exactly as
+the inbox borrows `archive`. So a
 files panel wears `copy`, `move` and `delete` only while it is the **end of
 a chain**: joined under a parent and driving nothing, which is to say the
 thing under someone's cursor. A root, a list opened from the launcher, or a
@@ -303,6 +303,51 @@ the process. `new dir` (`cmd+n`) opens a one-line field above the rows;
 separator is refused on the status line. Note `copy` wears `p`, not `c`: a
 card's path is selectable, so rule 3 leaves `cmd+c` to the text. The file
 clipboard is not the text clipboard.
+
+A `… here` is planned against the disk as it stands at the moment of the
+click, not as it stood when the hold was taken — nothing watches the disk,
+so that moment is the first time anyone has looked. It refuses **path by
+path**: a source that has gone since, a directory asked into itself, a name
+the destination already has, and a move that would go nowhere. The one
+clash allowed is a copy into the file's own directory, where the duplicate
+is the point: it lands as `notes copy.txt`, and beside that as `notes copy
+2.txt`. What can be done is done — one refusal never fails the rest — and
+the toast says how many of how many, with the refusals after a dash.
+
+**`delete` (`cmd+d`) is the trash, never `rm`.** The path is handed to the
+system trash, which answers where it put it, and undo is the move back out.
+That holds for every reversal here, the ones that take something away
+included: undoing a copy trashes what the copy made, and undoing a `new
+dir` trashes the empty directory. Nothing this app does to a file is
+unrecoverable.
+
+Each of these is **one undoable action**, a marked set included — one `⌘z`
+takes the whole batch back, and puts the marks it consumed back with it
+(a move empties the rows it took; a copy leaves them, and their marks,
+alone). A reversal is asked of the disk before it is made, and expires
+honestly when the world has moved on: a directory that is no longer empty,
+a trash that has been emptied, a name something else has taken since — and
+a path that is *there* but is not **the object this action put there**,
+which is not the same question at all, because undo takes things away. Each
+verb reads back the object it wrote the moment after — the disk's own
+identity for it, not its name, size and date, which a stranger can match
+exactly — and a reversal compares before it moves anything. A record that
+never learned what it made refuses outright: undo may decline, it may not
+guess. An expired node goes transparent, exactly as a sent mail's does —
+the walk says so and carries on rather than writing over what is there now.
+
+A reversal that fails *while* it is being made — the disk moved between
+the asking and the doing — does every path it holds anyway, names the ones
+that would not go in the same toast as the walk, and **expires its node**.
+The layout still lands, because the snapshot is ours and stranding the
+tree helps nobody; but the world is now somewhere between that node and
+its parent, and nothing, least of all a redo, can say where. Expired is
+exactly what that is.
+
+Nothing watches the disk, so a verb that wrote it tells the listings
+itself — every files panel on screen, since a copy changes the directory
+it came from as well as the one it landed in. A panel showing a path that
+a move or a delete emptied closes with it, and undo brings both back.
 
 **A directory's rows can be marked**, exactly as the inbox's are (see
 [The Rich Table](./richtable.md#marks)): `space` marks the row under the

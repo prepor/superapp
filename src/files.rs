@@ -3,21 +3,29 @@
 //! `copy`/`move` carry to a `… here`.
 //!
 //! The disk is **outside** (see [`crate::effect::Outside`]): a listing is
-//! read through it during draw, and `open` hands a path to the OS
-//! through it. The [`demo`] tree is what the fake outside serves — the
-//! panels library's worlds, the tests — and what a real world never
-//! sees.
+//! read through it during draw, `open` hands a path to the OS through it,
+//! and so does every verb that writes — `new dir`, a copy, a move, and
+//! the trash a delete is. None of them removes anything anyone had: what a
+//! delete takes goes to the trash, and undo moves it back, so every one of
+//! them is an [`Intent`] a history node can give back — and each records
+//! the **object** it wrote, not just the path, so a reversal can tell its
+//! own work from a stranger standing at the same name. The [`demo`] tree is what the
+//! fake outside serves — the panels library's worlds, the tests, an e2e
+//! run under `--demo-disk` — and it takes the writes too, so a suite
+//! proves the verbs on a fixture instead of on somebody's home.
 //!
 //! Paths cross the boundary in two spellings: the **display** form the
 //! panels show and persist (`~/Downloads/2026`, `/tmp`) and the real
 //! [`Path`] the outside reads; [`real_path`] and [`display_path`] map
 //! between them.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::effect::World;
 use crate::filter::{Ast, Op};
+use crate::history::Intent;
 use crate::richtable::{
     self, Completion, Datasource, Suggestion, TagDef, TagType, Values, MAX_SUGGESTIONS,
 };
@@ -90,6 +98,21 @@ impl Entry {
             modified,
         }
     }
+}
+
+/// What the **disk** calls an object, as opposed to what a path calls it:
+/// the device and inode `lstat` reports. Two paths with this id are the
+/// same object; a path whose id has changed wears the same name over a
+/// different thing — which is the one question a reversal has to ask
+/// before it takes something away, because a name is cheap to reuse and
+/// undo is not a suggestion.
+///
+/// Never off `metadata`: that follows links, and a link replaced by a
+/// link to the same target would answer the same twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// What a file is, off its extension — the card's word and `@kind:`.
@@ -290,6 +313,14 @@ pub fn parent(path: &str) -> Option<&str> {
         .map(|(p, _)| if p.is_empty() { ROOT } else { p })
 }
 
+/// One of the two roots. No verb takes a root away: `~` and `/` are where
+/// the browser starts, and a hold or a delete that named one is refused
+/// before anything is asked of the disk.
+#[must_use]
+pub fn is_root(path: &str) -> bool {
+    path == HOME || path == ROOT
+}
+
 /// The last segment: the panel's title. A root is its own name.
 #[must_use]
 pub fn basename(path: &str) -> &str {
@@ -440,6 +471,16 @@ pub fn read_in(world: &World, path: &str, max: usize) -> Result<Vec<u8>, String>
     world.outside(|o| o.read_file(&real_path(path), max))
 }
 
+/// What the disk calls the object at this path — `None` for nothing there
+/// **and** for a disk that would not say, which a reversal treats the same
+/// way: it refuses.
+pub fn id_in(world: &World, path: &str) -> Option<FileId> {
+    world
+        .outside(|o| o.file_id(&real_path(path)))
+        .ok()
+        .flatten()
+}
+
 // -- the card ------------------------------------------------------------------
 
 /// What a card draws, whichever side it came from: a file on the disk
@@ -587,6 +628,11 @@ impl HoldOp {
 pub struct Hold {
     pub op: HoldOp,
     pub paths: Vec<String>,
+    /// The list panel whose marks this set came from, when it came from
+    /// one (CR-009). A move empties the rows it took, so it consumes those
+    /// marks — and undo has to know where to put them back. A panel's own
+    /// verb holds one object and no marks: `None`.
+    pub from: Option<u64>,
 }
 
 impl Hold {
@@ -596,6 +642,7 @@ impl Hold {
         Hold {
             op,
             paths: vec![path.into()],
+            from: None,
         }
     }
 
@@ -630,13 +677,445 @@ pub fn plural(n: usize) -> String {
     }
 }
 
+// -- the disk, written --------------------------------------------------------
+//
+// Four verbs, each an effect ([`crate::effect::Effect`]) — the store cannot
+// reproduce what happens on a disk — performed where the click is, the way
+// `clip` and `open` are: the wait for a copy is the wait for the listing
+// that follows it. No path anyone ever *had* is removed: what a delete
+// takes goes to the trash, and undo moves it back; even the reversal of a
+// copy trashes what the copy made. (The half-tree of a copy that failed is
+// swept rather than trashed — see [`crate::effect::Real::copy_path`] — but
+// that is a name no panel ever listed.)
+
+/// `new dir`: one directory, where nothing is yet.
+///
+/// # Errors
+///
+/// Whatever the outside said.
+pub fn make_dir_in(world: &World, path: &str) -> Result<(), String> {
+    world.run(&crate::effect::MakeDir {
+        path: &real_path(path),
+    })
+}
+
+/// A file, or a directory with everything under it, copied.
+///
+/// # Errors
+///
+/// Whatever the outside said.
+pub fn copy_in(world: &World, from: &str, to: &str) -> Result<(), String> {
+    world.run(&crate::effect::CopyPath {
+        from: &real_path(from),
+        to: &real_path(to),
+    })
+}
+
+/// A path moved — and the same verb undo uses to put one back.
+///
+/// # Errors
+///
+/// Whatever the outside said.
+pub fn move_in(world: &World, from: &str, to: &str) -> Result<(), String> {
+    world.run(&crate::effect::MovePath {
+        from: &real_path(from),
+        to: &real_path(to),
+    })
+}
+
+/// To the trash, and where it landed — in the panels' spelling, so an
+/// intent can carry it until the undo that needs it.
+///
+/// # Errors
+///
+/// Whatever the outside said.
+pub fn trash_in(world: &World, path: &str) -> Result<String, String> {
+    world
+        .run(&crate::effect::Trash {
+            path: &real_path(path),
+        })
+        .map(|p| display_path(&p))
+}
+
+/// The one clash a copy is allowed to make is into the file's own
+/// directory, where the duplicate is the point: `notes.txt` lands beside
+/// `notes.txt` as `notes copy.txt`, and beside that as `notes copy 2.txt`.
+/// The extension stays where it belongs, and a dot-file — which is all
+/// extension — takes the suffix at the end.
+#[must_use]
+pub fn copy_name(name: &str, n: usize) -> String {
+    let suffix = if n <= 1 {
+        " copy".to_string()
+    } else {
+        format!(" copy {n}")
+    };
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}{suffix}.{ext}"),
+        _ => format!("{name}{suffix}"),
+    }
+}
+
+/// The first [`copy_name`] `dir` has room for: not on the disk, and not
+/// already claimed by an earlier step of the same plan.
+fn free_name(world: &World, dir: &str, name: &str, taken: &BTreeSet<String>) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = copy_name(name, n);
+        if !taken.contains(&candidate) && stat_in(world, &join(dir, &candidate)).is_none() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// One path a `… here` will perform: where it comes from and where it
+/// lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub from: String,
+    pub to: String,
+}
+
+
+/// What a `… here` can do and what it refuses, path by path — a batch
+/// refuses exactly as one does (CR-009).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub steps: Vec<Step>,
+    /// One sentence per path that will not be performed, as the status
+    /// line says it.
+    pub refused: Vec<String>,
+}
+
+/// Resolves a hold against the directory it is dropped into, before
+/// anything is written: the destination each path takes, and the refusal
+/// for each one that has none.
+#[must_use]
+pub fn plan_here(world: &World, hold: &Hold, dir: &str) -> Plan {
+    let mut plan = Plan::default();
+    // The names this plan has already spoken for: two `report.pdf`s held
+    // from two directories clash with each other, not only with the disk.
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for path in &hold.paths {
+        let name = basename(path).to_string();
+        let same_dir = parent(path) == Some(dir);
+        // The source may have gone while the hold waited — nothing watches
+        // the disk, so this is the first time anyone has looked.
+        if is_root(path) {
+            plan.refused.push(format!("“{path}” is a root"));
+        } else if stat_in(world, path).is_none() {
+            plan.refused.push(format!("“{name}” is no longer there"));
+        } else if *path == dir || dir.starts_with(&format!("{path}/")) {
+            plan.refused
+                .push(format!("cannot {} “{name}” into itself", hold.op.verb()));
+        } else if same_dir && hold.op == HoldOp::Copy {
+            // The one clash allowed, under a name that is free.
+            let fresh = free_name(world, dir, &name, &taken);
+            taken.insert(fresh.clone());
+            plan.steps.push(Step {
+                from: path.clone(),
+                to: join(dir, &fresh),
+            });
+        } else if same_dir || taken.contains(&name) || stat_in(world, &join(dir, &name)).is_some() {
+            // A move that goes nowhere, or a name the destination already
+            // has: one sentence covers both, so it is written once.
+            plan.refused.push(format!("“{name}” is already here"));
+        } else {
+            taken.insert(name.clone());
+            plan.steps.push(Step {
+                from: path.clone(),
+                to: join(dir, &name),
+            });
+        }
+    }
+    plan
+}
+
+// -- the file browser's intents -----------------------------------------------
+//
+// What a verb claimed of the disk, and how to give it back. In memory, on a
+// history node, never serialized — what survives a restart is the disk
+// itself. Each one asks the disk before it reverses rather than trusting
+// what it remembers: nothing watches the disk, so the world may well have
+// moved on, and a reversal that has to be refused says so ([`Intent::blocked`])
+// instead of writing over whatever is there now.
+
+/// One path a verb performed, and what it left where it put it. A [`Step`]
+/// is the plan — what is about to happen; this is the record of what did.
+/// The entry is how a reversal tells its own work from a stranger's: a
+/// path that is *there* is not the same question as a path that is *ours*,
+/// and undo takes things away.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Done {
+    pub from: String,
+    pub to: String,
+    /// The object the disk had at `to` the moment after the write. `None`
+    /// where the disk would not say — and then the reversal is refused
+    /// rather than guessed at, because undo takes things away.
+    pub landed: Option<FileId>,
+}
+
+impl Done {
+    /// The record of a step just performed: the object the disk now has at
+    /// its destination.
+    #[must_use]
+    pub fn of(world: &World, from: &str, to: &str) -> Done {
+        Done {
+            from: from.to_string(),
+            to: to.to_string(),
+            landed: id_in(world, to),
+        }
+    }
+}
+
+/// Why a path cannot be put back: something else took the name.
+fn occupied(world: &World, path: &str) -> Option<String> {
+    stat_in(world, path)
+        .is_some()
+        .then(|| format!("something else is at “{}” now", basename(path)))
+}
+
+/// Why what is at `path` is not this action's to take away: nothing is
+/// there, or the thing there is a different object wearing the same name —
+/// a file deleted and replaced, a directory made again from scratch. The
+/// question is asked of the **object**, not the path, because a name is
+/// cheap to reuse and a reversal removes what it finds.
+///
+/// Fail closed: a record that never learned what it made, or a disk that
+/// will not say now, refuses. Undo may decline; it may not guess.
+fn ours(world: &World, path: &str, landed: Option<FileId>) -> Option<String> {
+    let name = basename(path);
+    match (id_in(world, path), landed) {
+        (None, _) => Some(format!("“{name}” is no longer there")),
+        (_, None) => Some(format!(
+            "“{name}” cannot be told apart from what is there now"
+        )),
+        (Some(now), Some(was)) if now != was => Some(format!("“{name}” is not what was put there")),
+        _ => None,
+    }
+}
+
+/// Every path attempted, and then one error naming the ones that would
+/// not go: a reversal that stopped at the first failure would leave the
+/// rest of a batch untouched and say nothing about which half moved.
+fn all(rs: impl IntoIterator<Item = Result<(), String>>) -> Result<(), String> {
+    let bad: Vec<String> = rs.into_iter().filter_map(Result::err).collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join(", "))
+    }
+}
+
+/// `copy here`: undo puts the copies in the trash — never an `rm`, even
+/// for what we made ourselves.
+pub struct Copied {
+    /// A redo copies again and lands a new file, with its own times, so
+    /// what each one *is* is rewritten rather than assumed.
+    pub done: std::cell::RefCell<Vec<Done>>,
+}
+
+impl Copied {
+    #[must_use]
+    pub fn new(done: Vec<Done>) -> Copied {
+        Copied {
+            done: std::cell::RefCell::new(done),
+        }
+    }
+}
+
+impl Intent for Copied {
+    fn describe(&self) -> String {
+        format!("copied {}", plural(self.done.borrow().len()))
+    }
+
+    fn blocked(&self, w: &World) -> Option<String> {
+        self.done
+            .borrow()
+            .iter()
+            .find_map(|d| ours(w, &d.to, d.landed))
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| trash_in(w, &d.to).map(|_| ())))
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            copy_in(w, &d.from, &d.to)?;
+            d.landed = id_in(w, &d.to);
+            Ok(())
+        }))
+    }
+}
+
+/// `move here`: undo moves each one back where it was.
+pub struct Moved {
+    pub done: std::cell::RefCell<Vec<Done>>,
+}
+
+impl Moved {
+    #[must_use]
+    pub fn new(done: Vec<Done>) -> Moved {
+        Moved {
+            done: std::cell::RefCell::new(done),
+        }
+    }
+}
+
+impl Intent for Moved {
+    fn describe(&self) -> String {
+        format!("moved {}", plural(self.done.borrow().len()))
+    }
+
+    fn blocked(&self, w: &World) -> Option<String> {
+        self.done
+            .borrow()
+            .iter()
+            .find_map(|d| ours(w, &d.to, d.landed).or_else(|| occupied(w, &d.from)))
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| move_in(w, &d.to, &d.from)))
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            move_in(w, &d.from, &d.to)?;
+            d.landed = id_in(w, &d.to);
+            Ok(())
+        }))
+    }
+}
+
+/// `delete`: what the trash took, and where it took it from. A redo
+/// trashes again and lands somewhere new — the trash picks the name — so
+/// where each one *is* is remembered rather than assumed.
+pub struct Deleted {
+    /// `from` is where it was, `to` where the trash put it.
+    pub done: std::cell::RefCell<Vec<Done>>,
+}
+
+impl Deleted {
+    #[must_use]
+    pub fn new(done: Vec<Done>) -> Deleted {
+        Deleted {
+            done: std::cell::RefCell::new(done),
+        }
+    }
+}
+
+impl Intent for Deleted {
+    fn describe(&self) -> String {
+        format!("trashed {}", plural(self.done.borrow().len()))
+    }
+
+    /// The three ways a restore expires: the trash was emptied, what is in
+    /// there is not what went in, or something took the name back.
+    fn blocked(&self, w: &World) -> Option<String> {
+        self.done.borrow().iter().find_map(|d| {
+            let name = basename(&d.from);
+            match (id_in(w, &d.to), d.landed) {
+                (None, _) => Some(format!("“{name}” is not in the trash any more")),
+                (_, None) => Some(format!(
+                    "“{name}” cannot be told apart from what is in the trash"
+                )),
+                (Some(now), Some(was)) if now != was => {
+                    Some(format!("“{name}” in the trash is not what went there"))
+                }
+                _ => occupied(w, &d.from),
+            }
+        })
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| move_in(w, &d.to, &d.from)))
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            d.to = trash_in(w, &d.from)?;
+            d.landed = id_in(w, &d.to);
+            Ok(())
+        }))
+    }
+}
+
+/// `new dir`: undo trashes it, while it is still the empty directory it
+/// was made as. Anything inside and the reversal has expired — which is
+/// what it means for one to expire honestly, and it is also why an empty
+/// directory needs no identity of its own: one is exactly like another.
+pub struct MadeDir {
+    pub path: String,
+    /// The directory this made, as the disk numbers it. One empty
+    /// directory looks exactly like another, so without this an undo would
+    /// happily trash somebody else's — a redo mints a new one, so it is
+    /// rewritten rather than assumed.
+    pub landed: std::cell::RefCell<Option<FileId>>,
+}
+
+impl MadeDir {
+    /// The record of a directory just made.
+    #[must_use]
+    pub fn of(world: &World, path: &str) -> MadeDir {
+        MadeDir {
+            path: path.to_string(),
+            landed: std::cell::RefCell::new(id_in(world, path)),
+        }
+    }
+}
+
+impl Intent for MadeDir {
+    fn describe(&self) -> String {
+        format!("made “{}/”", basename(&self.path))
+    }
+
+    fn blocked(&self, w: &World) -> Option<String> {
+        if let Some(why) = ours(w, &self.path, *self.landed.borrow()) {
+            return Some(why);
+        }
+        match list_in(w, &self.path) {
+            Ok(v) if v.is_empty() => None,
+            Ok(_) => Some(format!("“{}/” is not empty any more", basename(&self.path))),
+            Err(e) => Some(e),
+        }
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        trash_in(w, &self.path).map(|_| ())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        make_dir_in(w, &self.path)?;
+        *self.landed.borrow_mut() = id_in(w, &self.path);
+        Ok(())
+    }
+}
+
 // -- the demo tree -----------------------------------------------------------
 
 /// A home directory a design review can walk, and a little beyond it:
 /// what the fake outside serves — the panels library's worlds, the tests.
 /// Display spellings throughout.
 pub mod demo {
-    use super::{basename, parent, sort, Entry, FileKind, HOME, ROOT};
+    use std::collections::BTreeMap;
+
+    use super::{basename, join, parent, sort, Entry, FileKind, HOME, ROOT};
 
     struct Fx {
         path: &'static str,
@@ -650,49 +1129,488 @@ pub mod demo {
     pub(super) const MB: u64 = 1024 * 1024;
 
     const TREE: &[Fx] = &[
-        Fx { path: "~/Desktop", dir: true, size: 0, at: (2026, 8, 31, 18, 40) },
-        Fx { path: "~/Documents", dir: true, size: 0, at: (2026, 8, 29, 11, 5) },
-        Fx { path: "~/Downloads", dir: true, size: 0, at: (2026, 9, 1, 9, 12) },
-        Fx { path: "~/Pictures", dir: true, size: 0, at: (2026, 8, 24, 20, 3) },
-        Fx { path: "~/superapp", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-        Fx { path: "~/.config", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
-        Fx { path: "~/notes.md", dir: false, size: 2 * KB + 130, at: (2026, 8, 30, 22, 47) },
-        Fx { path: "~/.zshrc", dir: false, size: KB + 90, at: (2026, 6, 2, 9, 0) },
-        Fx { path: "~/Desktop/todo.txt", dir: false, size: 300, at: (2026, 8, 31, 18, 40) },
-        Fx { path: "~/Documents/panel-model.md", dir: false, size: 9 * KB, at: (2026, 8, 29, 11, 5) },
-        Fx { path: "~/Documents/interaction-grammar.md", dir: false, size: 14 * KB, at: (2026, 9, 2, 6, 55) },
-        Fx { path: "~/Documents/Lease.tla", dir: false, size: 5 * KB, at: (2026, 8, 28, 15, 20) },
-        Fx { path: "~/Downloads/2026", dir: true, size: 0, at: (2026, 8, 17, 12, 0) },
-        Fx { path: "~/Downloads/report-q3.pdf", dir: false, size: MB + 200 * KB, at: (2026, 8, 31, 9, 14) },
-        Fx { path: "~/Downloads/budget-2026.xlsx", dir: false, size: 84 * KB, at: (2026, 8, 31, 9, 14) },
-        Fx { path: "~/Downloads/screenshot-2026-08-30.png", dir: false, size: 412 * KB, at: (2026, 8, 30, 14, 2) },
-        Fx { path: "~/Downloads/superapp-0.1.0.dmg", dir: false, size: 38 * MB, at: (2026, 9, 1, 9, 12) },
-        Fx { path: "~/Downloads/logs.tar.gz", dir: false, size: 3 * MB + 400 * KB, at: (2026, 8, 30, 7, 30) },
-        Fx { path: "~/Downloads/README.txt", dir: false, size: 640, at: (2026, 8, 12, 16, 45) },
-        Fx { path: "~/Downloads/.DS_Store", dir: false, size: 6 * KB, at: (2026, 9, 1, 9, 12) },
-        Fx { path: "~/Downloads/2026/invoice-0817.pdf", dir: false, size: 96 * KB, at: (2026, 8, 17, 12, 0) },
-        Fx { path: "~/Downloads/2026/photo-lisbon.jpg", dir: false, size: 2 * MB + 800 * KB, at: (2026, 8, 3, 19, 21) },
-        Fx { path: "~/Downloads/2026/notes.txt", dir: false, size: KB + 100, at: (2026, 8, 17, 12, 0) },
-        Fx { path: "~/Pictures/lisbon", dir: true, size: 0, at: (2026, 8, 3, 19, 21) },
-        Fx { path: "~/Pictures/fold-cover.png", dir: false, size: MB + 100 * KB, at: (2026, 8, 24, 20, 3) },
-        Fx { path: "~/Pictures/lisbon/IMG_0417.jpg", dir: false, size: 3 * MB + 200 * KB, at: (2026, 8, 3, 19, 21) },
-        Fx { path: "~/Pictures/lisbon/IMG_0418.jpg", dir: false, size: 3 * MB, at: (2026, 8, 3, 19, 24) },
-        Fx { path: "~/superapp/files", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-        Fx { path: "~/superapp/superapp.db", dir: false, size: 24 * MB, at: (2026, 9, 2, 7, 30) },
-        Fx { path: "~/superapp/panel-context.md", dir: false, size: 3 * KB, at: (2026, 9, 1, 23, 8) },
+        Fx {
+            path: "~/Desktop",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 31, 18, 40),
+        },
+        Fx {
+            path: "~/Documents",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 29, 11, 5),
+        },
+        Fx {
+            path: "~/Downloads",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 1, 9, 12),
+        },
+        Fx {
+            path: "~/Pictures",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 24, 20, 3),
+        },
+        Fx {
+            path: "~/superapp",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 7, 30),
+        },
+        Fx {
+            path: "~/.config",
+            dir: true,
+            size: 0,
+            at: (2026, 7, 14, 10, 0),
+        },
+        Fx {
+            path: "~/notes.md",
+            dir: false,
+            size: 2 * KB + 130,
+            at: (2026, 8, 30, 22, 47),
+        },
+        Fx {
+            path: "~/.zshrc",
+            dir: false,
+            size: KB + 90,
+            at: (2026, 6, 2, 9, 0),
+        },
+        Fx {
+            path: "~/Desktop/todo.txt",
+            dir: false,
+            size: 300,
+            at: (2026, 8, 31, 18, 40),
+        },
+        Fx {
+            path: "~/Documents/panel-model.md",
+            dir: false,
+            size: 9 * KB,
+            at: (2026, 8, 29, 11, 5),
+        },
+        Fx {
+            path: "~/Documents/interaction-grammar.md",
+            dir: false,
+            size: 14 * KB,
+            at: (2026, 9, 2, 6, 55),
+        },
+        Fx {
+            path: "~/Documents/Lease.tla",
+            dir: false,
+            size: 5 * KB,
+            at: (2026, 8, 28, 15, 20),
+        },
+        Fx {
+            path: "~/Downloads/2026",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 17, 12, 0),
+        },
+        Fx {
+            path: "~/Downloads/report-q3.pdf",
+            dir: false,
+            size: MB + 200 * KB,
+            at: (2026, 8, 31, 9, 14),
+        },
+        Fx {
+            path: "~/Downloads/budget-2026.xlsx",
+            dir: false,
+            size: 84 * KB,
+            at: (2026, 8, 31, 9, 14),
+        },
+        Fx {
+            path: "~/Downloads/screenshot-2026-08-30.png",
+            dir: false,
+            size: 412 * KB,
+            at: (2026, 8, 30, 14, 2),
+        },
+        Fx {
+            path: "~/Downloads/superapp-0.1.0.dmg",
+            dir: false,
+            size: 38 * MB,
+            at: (2026, 9, 1, 9, 12),
+        },
+        Fx {
+            path: "~/Downloads/logs.tar.gz",
+            dir: false,
+            size: 3 * MB + 400 * KB,
+            at: (2026, 8, 30, 7, 30),
+        },
+        Fx {
+            path: "~/Downloads/README.txt",
+            dir: false,
+            size: 640,
+            at: (2026, 8, 12, 16, 45),
+        },
+        Fx {
+            path: "~/Downloads/.DS_Store",
+            dir: false,
+            size: 6 * KB,
+            at: (2026, 9, 1, 9, 12),
+        },
+        Fx {
+            path: "~/Downloads/2026/invoice-0817.pdf",
+            dir: false,
+            size: 96 * KB,
+            at: (2026, 8, 17, 12, 0),
+        },
+        Fx {
+            path: "~/Downloads/2026/photo-lisbon.jpg",
+            dir: false,
+            size: 2 * MB + 800 * KB,
+            at: (2026, 8, 3, 19, 21),
+        },
+        Fx {
+            path: "~/Downloads/2026/notes.txt",
+            dir: false,
+            size: KB + 100,
+            at: (2026, 8, 17, 12, 0),
+        },
+        Fx {
+            path: "~/Pictures/lisbon",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 3, 19, 21),
+        },
+        Fx {
+            path: "~/Pictures/fold-cover.png",
+            dir: false,
+            size: MB + 100 * KB,
+            at: (2026, 8, 24, 20, 3),
+        },
+        Fx {
+            path: "~/Pictures/lisbon/IMG_0417.jpg",
+            dir: false,
+            size: 3 * MB + 200 * KB,
+            at: (2026, 8, 3, 19, 21),
+        },
+        Fx {
+            path: "~/Pictures/lisbon/IMG_0418.jpg",
+            dir: false,
+            size: 3 * MB,
+            at: (2026, 8, 3, 19, 24),
+        },
+        Fx {
+            path: "~/superapp/files",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 7, 30),
+        },
+        Fx {
+            path: "~/superapp/superapp.db",
+            dir: false,
+            size: 24 * MB,
+            at: (2026, 9, 2, 7, 30),
+        },
+        Fx {
+            path: "~/superapp/panel-context.md",
+            dir: false,
+            size: 3 * KB,
+            at: (2026, 9, 1, 23, 8),
+        },
         // Beyond home: what `go to` reaches.
-        Fx { path: "/Applications", dir: true, size: 0, at: (2026, 8, 20, 10, 0) },
-        Fx { path: "/Users", dir: true, size: 0, at: (2026, 6, 1, 9, 0) },
-        Fx { path: "/Users/andrey", dir: true, size: 0, at: (2026, 9, 2, 7, 30) },
-        Fx { path: "/etc", dir: true, size: 0, at: (2026, 7, 14, 10, 0) },
-        Fx { path: "/etc/hosts", dir: false, size: 213, at: (2026, 7, 14, 10, 0) },
-        Fx { path: "/tmp", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
-        Fx { path: "/tmp/superapp-e2e", dir: true, size: 0, at: (2026, 9, 2, 12, 40) },
-        Fx { path: "/tmp/superapp-e2e/frames", dir: true, size: 0, at: (2026, 9, 2, 12, 41) },
-        Fx { path: "/tmp/superapp-e2e/superapp.db", dir: false, size: 2 * MB, at: (2026, 9, 2, 12, 40) },
-        Fx { path: "/tmp/notes.txt", dir: false, size: 380, at: (2026, 9, 1, 18, 5) },
-        Fx { path: "/tmp/.keep", dir: false, size: 0, at: (2026, 9, 1, 18, 5) },
+        Fx {
+            path: "/Applications",
+            dir: true,
+            size: 0,
+            at: (2026, 8, 20, 10, 0),
+        },
+        Fx {
+            path: "/Users",
+            dir: true,
+            size: 0,
+            at: (2026, 6, 1, 9, 0),
+        },
+        Fx {
+            path: "/Users/andrey",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 7, 30),
+        },
+        Fx {
+            path: "/etc",
+            dir: true,
+            size: 0,
+            at: (2026, 7, 14, 10, 0),
+        },
+        Fx {
+            path: "/etc/hosts",
+            dir: false,
+            size: 213,
+            at: (2026, 7, 14, 10, 0),
+        },
+        Fx {
+            path: "/tmp",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 12, 40),
+        },
+        Fx {
+            path: "/tmp/superapp-e2e",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 12, 40),
+        },
+        Fx {
+            path: "/tmp/superapp-e2e/frames",
+            dir: true,
+            size: 0,
+            at: (2026, 9, 2, 12, 41),
+        },
+        Fx {
+            path: "/tmp/superapp-e2e/superapp.db",
+            dir: false,
+            size: 2 * MB,
+            at: (2026, 9, 2, 12, 40),
+        },
+        Fx {
+            path: "/tmp/notes.txt",
+            dir: false,
+            size: 380,
+            at: (2026, 9, 1, 18, 5),
+        },
+        Fx {
+            path: "/tmp/.keep",
+            dir: false,
+            size: 0,
+            at: (2026, 9, 1, 18, 5),
+        },
     ];
+
+    /// The demo tree as a disk that can be **written**: the fixture
+    /// materialised into one map, so `new dir`, a copy, a move and the
+    /// trash act on it exactly as they act on a real one — and an e2e run
+    /// under `--demo-disk` proves the verbs rather than a draft of them.
+    ///
+    /// An outside owns one of these, which is what keeps any number of
+    /// fake worlds independent of each other.
+    #[derive(Debug, Clone)]
+    pub struct Disk {
+        /// Display path → what is there. The two roots are in here as
+        /// directories, so nothing special-cases them.
+        nodes: BTreeMap<String, Node>,
+        /// The next object number. A fixture needs identity for the same
+        /// reason a disk does — a reversal asks whether the thing at a
+        /// path is the thing it put there — so a node gets one when it is
+        /// **made**: a move carries it (a rename keeps the inode) and a
+        /// copy takes a fresh one (a copy is another object).
+        next: u64,
+    }
+
+    /// One thing on the demo disk.
+    #[derive(Debug, Clone)]
+    struct Node {
+        entry: Entry,
+        bytes: Vec<u8>,
+        id: u64,
+    }
+
+    impl Default for Disk {
+        fn default() -> Disk {
+            Disk::new()
+        }
+    }
+
+    impl Disk {
+        /// The fixture, as it stands before anything has written to it.
+        #[must_use]
+        pub fn new() -> Disk {
+            let mut d = Disk {
+                nodes: BTreeMap::new(),
+                next: 1,
+            };
+            for root in [HOME, ROOT] {
+                if let Some(e) = entry(root) {
+                    d.put(root, e, Vec::new());
+                }
+            }
+            for fx in TREE {
+                d.put(fx.path, entry_of(fx), bytes_of(fx.path).unwrap_or_default());
+            }
+            d
+        }
+
+        /// A node with a fresh object number — what making something does.
+        fn put(&mut self, path: &str, entry: Entry, bytes: Vec<u8>) {
+            let id = self.next;
+            self.next += 1;
+            self.nodes
+                .insert(path.to_string(), Node { entry, bytes, id });
+        }
+
+        fn dir_at(&self, path: &str) -> bool {
+            self.nodes.get(path).is_some_and(|n| n.entry.is_dir)
+        }
+
+        /// The entry at a path, `None` for what the disk does not have.
+        #[must_use]
+        pub fn entry(&self, path: &str) -> Option<Entry> {
+            self.nodes.get(path).map(|n| n.entry.clone())
+        }
+
+        /// The object at a path, as this disk numbers them — the fixture's
+        /// answer to `lstat`'s device and inode.
+        #[must_use]
+        pub fn id(&self, path: &str) -> Option<super::FileId> {
+            self.nodes
+                .get(path)
+                .map(|n| super::FileId { dev: 1, ino: n.id })
+        }
+
+        /// One directory's listing, in the browser's order.
+        ///
+        /// # Errors
+        ///
+        /// If there is no such directory.
+        pub fn list(&self, dir: &str) -> Result<Vec<Entry>, String> {
+            if !self.dir_at(dir) {
+                return Err(format!("{dir}: no such directory"));
+            }
+            let mut v: Vec<Entry> = self
+                .nodes
+                .iter()
+                .filter(|(p, _)| parent(p) == Some(dir))
+                .map(|(_, n)| n.entry.clone())
+                .collect();
+            sort(&mut v);
+            Ok(v)
+        }
+
+        /// The first `max` bytes of a file.
+        ///
+        /// # Errors
+        ///
+        /// If there is no such file.
+        pub fn read(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
+            let node = self
+                .nodes
+                .get(path)
+                .ok_or_else(|| format!("{path}: no such file"))?;
+            let mut out = node.bytes.clone();
+            out.truncate(max);
+            Ok(out)
+        }
+
+        /// A path and everything under it — what a copy, a move and the
+        /// trash carry as one.
+        fn subtree(&self, path: &str) -> Vec<String> {
+            let under = format!("{path}/");
+            self.nodes
+                .keys()
+                .filter(|p| p.as_str() == path || p.starts_with(&under))
+                .cloned()
+                .collect()
+        }
+
+        /// What every verb that writes asks of a destination first: it is
+        /// not a root, nothing is there, and its directory is.
+        fn free(&self, path: &str) -> Result<(), String> {
+            if path == HOME || path == ROOT {
+                return Err(format!("{path} is a root"));
+            }
+            if self.nodes.contains_key(path) {
+                return Err(format!("{path} is already there"));
+            }
+            match parent(path) {
+                Some(d) if self.dir_at(d) => Ok(()),
+                Some(d) => Err(format!("{d}: no such directory")),
+                None => Err(format!("{path} is a root")),
+            }
+        }
+
+        /// One directory, where nothing is yet.
+        ///
+        /// # Errors
+        ///
+        /// If something is already there, or its parent is not a directory.
+        pub fn make_dir(&mut self, path: &str, now: f64) -> Result<(), String> {
+            self.free(path)?;
+            let e = Entry {
+                name: basename(path).to_string(),
+                is_dir: true,
+                size: 0,
+                modified: now,
+            };
+            self.put(path, e, Vec::new());
+            Ok(())
+        }
+
+        /// A file, or a directory with everything under it. The times come
+        /// along: a copy of a file is that file.
+        ///
+        /// # Errors
+        ///
+        /// If the source is gone, the destination is taken, or a directory
+        /// is asked to copy into itself.
+        pub fn copy(&mut self, from: &str, to: &str) -> Result<(), String> {
+            if super::is_root(from) {
+                return Err(format!("{from} is a root"));
+            }
+            if !self.nodes.contains_key(from) {
+                return Err(format!("{from}: no such path"));
+            }
+            self.free(to)?;
+            if to.starts_with(&format!("{from}/")) {
+                return Err(format!("{from} is inside itself"));
+            }
+            for p in self.subtree(from) {
+                let node = self.nodes[&p].clone();
+                let dest = format!("{to}{}", &p[from.len()..]);
+                let mut e = node.entry;
+                e.name = basename(&dest).to_string();
+                // A fresh number each: a copy is another object, however
+                // alike its bytes.
+                self.put(&dest, e, node.bytes);
+            }
+            Ok(())
+        }
+
+        /// The copy, and then the source is gone.
+        ///
+        /// # Errors
+        ///
+        /// As [`Disk::copy`].
+        pub fn mv(&mut self, from: &str, to: &str) -> Result<(), String> {
+            self.copy(from, to)?;
+            // The objects go with the names: a rename keeps the inode, so
+            // the moved nodes carry the numbers they had rather than the
+            // fresh ones the copy just minted.
+            for p in self.subtree(from) {
+                let Some(old) = self.nodes.remove(&p) else {
+                    continue;
+                };
+                let dest = format!("{to}{}", &p[from.len()..]);
+                if let Some(n) = self.nodes.get_mut(&dest) {
+                    n.id = old.id;
+                }
+            }
+            Ok(())
+        }
+
+        /// The trash: where a delete puts a path, answering where it
+        /// landed so undo can move it back. `~/.Trash`, made if it is not
+        /// there, and a name that does not clash — the real one's shape.
+        ///
+        /// # Errors
+        ///
+        /// If the path is a root, or the trash cannot be made.
+        pub fn trash(&mut self, path: &str, now: f64) -> Result<String, String> {
+            let dir = join(HOME, ".Trash");
+            if !self.dir_at(&dir) {
+                self.make_dir(&dir, now)?;
+            }
+            let name = basename(path);
+            let mut to = join(&dir, name);
+            let mut n = 1;
+            while self.nodes.contains_key(&to) {
+                n += 1;
+                to = join(&dir, &format!("{name} {n}"));
+            }
+            self.mv(path, &to)?;
+            Ok(to)
+        }
+    }
 
     fn entry_of(fx: &Fx) -> Entry {
         let (y, mo, d, h, min) = fx.at;
@@ -1435,5 +2353,362 @@ mod tests {
         let roots = c.offer(&store, &ctx);
         assert_eq!(roots[1].value, "/");
         assert_eq!(c.splice("", 0, &ctx, &roots[0]), ("~/".into(), 2));
+    }
+
+    fn world() -> World {
+        World::fake(crate::effect::Registry::new())
+    }
+
+    /// The demo tree can be written: a copy carries a whole sub-tree, a
+    /// move takes it away from where it was, and the trash is a move to a
+    /// place undo can reach.
+    #[test]
+    fn the_demo_disk_takes_the_verbs_that_write() {
+        let mut d = demo::Disk::new();
+        // A file: copied, then the copy is a file of its own.
+        d.copy("~/Downloads/README.txt", "~/Desktop/README.txt")
+            .unwrap();
+        assert_eq!(
+            d.read("~/Desktop/README.txt", 64 * 1024).unwrap(),
+            d.read("~/Downloads/README.txt", 64 * 1024).unwrap()
+        );
+        assert!(
+            d.copy("~/Downloads/README.txt", "~/Desktop/README.txt")
+                .is_err(),
+            "a copy never writes over anything"
+        );
+        // A directory: everything under it comes along.
+        d.copy("~/Downloads/2026", "~/Desktop/2026").unwrap();
+        assert_eq!(
+            names(&d.list("~/Desktop/2026").unwrap()),
+            names(&d.list("~/Downloads/2026").unwrap())
+        );
+        assert!(d.entry("~/Desktop/2026/notes.txt").is_some());
+        assert!(
+            d.copy("~/Downloads/2026", "~/Downloads/2026/again")
+                .is_err(),
+            "a directory does not copy into itself"
+        );
+        // A move empties where it came from.
+        d.mv("~/Desktop/2026", "~/Pictures/2026").unwrap();
+        assert!(d.entry("~/Desktop/2026").is_none());
+        assert!(d.entry("~/Desktop/2026/notes.txt").is_none());
+        assert!(d.entry("~/Pictures/2026/notes.txt").is_some());
+        // `new dir` makes one, refuses a taken name, and refuses a parent
+        // that is not there.
+        d.make_dir("~/Desktop/new", 100.0).unwrap();
+        assert_eq!(d.entry("~/Desktop/new").map(|e| e.is_dir), Some(true));
+        assert!(d.make_dir("~/Desktop/new", 100.0).is_err());
+        assert!(d.make_dir("~/nowhere/new", 100.0).is_err());
+        // The trash: where it went, and a second one of the same name
+        // beside it rather than over it.
+        let a = d.trash("~/Desktop/todo.txt", 100.0).unwrap();
+        assert_eq!(a, "~/.Trash/todo.txt");
+        assert!(d.entry("~/Desktop/todo.txt").is_none());
+        d.make_dir("~/Desktop/todo.txt", 100.0).unwrap();
+        let b = d.trash("~/Desktop/todo.txt", 100.0).unwrap();
+        assert_eq!(b, "~/.Trash/todo.txt 2");
+        // …and a move back is all a restore is.
+        d.mv(&a, "~/Desktop/back.txt").unwrap();
+        assert!(d.entry("~/Desktop/back.txt").is_some());
+        // A root is not a path a verb may take away, by any of them.
+        assert!(d.copy(HOME, "~/Desktop/home").is_err());
+        assert!(d.mv(ROOT, "~/Desktop/root").is_err());
+        assert!(d.trash(HOME, 100.0).is_err());
+    }
+
+    /// The one clash a copy is allowed: the name the duplicate takes.
+    #[test]
+    fn a_copy_beside_itself_takes_the_next_free_name() {
+        assert_eq!(copy_name("notes.txt", 1), "notes copy.txt");
+        assert_eq!(copy_name("notes.txt", 3), "notes copy 3.txt");
+        assert_eq!(copy_name("lisbon", 1), "lisbon copy");
+        assert_eq!(
+            copy_name(".zshrc", 1),
+            ".zshrc copy",
+            "a dot-file is all extension"
+        );
+        let w = world();
+        let hold = Hold::one(HoldOp::Copy, "~/Downloads/README.txt");
+        let plan = plan_here(&w, &hold, "~/Downloads");
+        assert_eq!(plan.refused, Vec::<String>::new());
+        assert_eq!(plan.steps[0].to, "~/Downloads/README copy.txt");
+        // Performed, the next one has to go past it.
+        copy_in(&w, "~/Downloads/README.txt", "~/Downloads/README copy.txt").unwrap();
+        let plan = plan_here(&w, &hold, "~/Downloads");
+        assert_eq!(plan.steps[0].to, "~/Downloads/README copy 2.txt");
+        // Two of the same name held from two directories clash with each
+        // other, not only with the disk.
+        let hold = Hold {
+            op: HoldOp::Move,
+            paths: vec!["~/Downloads/2026/notes.txt".into(), "/tmp/notes.txt".into()],
+            from: None,
+        };
+        let plan = plan_here(&w, &hold, "~/Desktop");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.refused, ["“notes.txt” is already here"]);
+    }
+
+    /// What a `… here` refuses, path by path — the same sentences for one
+    /// as for a set (CR-009).
+    #[test]
+    fn a_plan_refuses_path_by_path() {
+        let w = world();
+        let refusals = |op: HoldOp, paths: &[&str], dir: &str| {
+            let hold = Hold {
+                op,
+                paths: paths.iter().map(|p| (*p).to_string()).collect(),
+                from: None,
+            };
+            plan_here(&w, &hold, dir).refused
+        };
+        assert_eq!(
+            refusals(HoldOp::Move, &["~/Downloads/README.txt"], "~/Downloads"),
+            ["“README.txt” is already here"],
+            "a move that goes nowhere"
+        );
+        assert_eq!(
+            refusals(HoldOp::Copy, &["~/Downloads"], "~/Downloads/2026"),
+            ["cannot copy “Downloads” into itself"]
+        );
+        assert_eq!(
+            refusals(HoldOp::Move, &["~/Downloads"], "~/Downloads"),
+            ["cannot move “Downloads” into itself"]
+        );
+        assert_eq!(
+            refusals(HoldOp::Copy, &["~/Downloads/gone.txt"], "~/Desktop"),
+            ["“gone.txt” is no longer there"],
+            "the hold waited while the disk moved on"
+        );
+        assert_eq!(
+            refusals(HoldOp::Move, &[HOME, ROOT], "~/Desktop"),
+            ["“~” is a root", "“/” is a root"],
+            "no verb takes a root away"
+        );
+        // A name the destination already has — the same sentence a
+        // pointless move gets.
+        assert_eq!(
+            refusals(HoldOp::Copy, &["~/Downloads/2026/notes.txt"], "/tmp"),
+            ["“notes.txt” is already here"]
+        );
+        // …and a set is only the sum of them: what can go, goes.
+        let hold = Hold {
+            op: HoldOp::Copy,
+            paths: vec![
+                "~/Downloads/README.txt".into(),
+                "~/Downloads/2026/notes.txt".into(),
+            ],
+            from: None,
+        };
+        let plan = plan_here(&w, &hold, "/tmp");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].to, "/tmp/README.txt");
+        assert_eq!(plan.refused.len(), 1);
+    }
+
+    /// A copy, and the undo that takes it back: to the trash, never an
+    /// `rm`, even for what the copy itself made.
+    #[test]
+    fn a_copy_is_undone_into_the_trash() {
+        let w = world();
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        copy_in(&w, from, to).unwrap();
+        let intent = Copied::new(vec![Done::of(&w, from, to)]);
+        assert!(intent.blocked(&w).is_none());
+        intent.reverse(&w).unwrap();
+        assert!(stat_in(&w, "~/Desktop/README.txt").is_none());
+        assert!(stat_in(&w, "~/.Trash/README.txt").is_some(), "recoverable");
+        assert!(
+            stat_in(&w, "~/Downloads/README.txt").is_some(),
+            "the source stands"
+        );
+        intent.reapply(&w).unwrap();
+        assert!(stat_in(&w, "~/Desktop/README.txt").is_some());
+        // A copy somebody else has since taken away cannot be given back…
+        trash_in(&w, "~/Desktop/README.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is no longer there".into())
+        );
+        // …and neither can a stranger standing where it was. Undo takes
+        // things away, so *there* is not the same question as *ours*.
+        copy_in(&w, "~/Downloads/2026/notes.txt", "~/Desktop/README.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is not what was put there".into())
+        );
+    }
+
+    /// A move, and the undo that puts it back where it was — refused when
+    /// something else has taken the name it left.
+    #[test]
+    fn a_move_is_undone_back_to_where_it_was() {
+        let w = world();
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        move_in(&w, from, to).unwrap();
+        assert!(stat_in(&w, "~/Downloads/README.txt").is_none());
+        let intent = Moved::new(vec![Done::of(&w, from, to)]);
+        assert!(intent.blocked(&w).is_none());
+        intent.reverse(&w).unwrap();
+        assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
+        assert!(stat_in(&w, "~/Desktop/README.txt").is_none());
+        intent.reapply(&w).unwrap();
+        // Something took the name back: the reversal has expired, and says
+        // so rather than writing over it.
+        make_dir_in(&w, "~/Downloads/README.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("something else is at “README.txt” now".into())
+        );
+    }
+
+    /// A delete is a move to the trash, and undo is the move back. A redo
+    /// lands somewhere new, and the intent follows it there.
+    #[test]
+    fn a_delete_is_undone_out_of_the_trash() {
+        let w = world();
+        let landed = trash_in(&w, "~/Downloads/README.txt").unwrap();
+        assert_eq!(landed, "~/.Trash/README.txt");
+        assert!(stat_in(&w, "~/Downloads/README.txt").is_none());
+        let intent = Deleted::new(vec![Done::of(&w, "~/Downloads/README.txt", &landed)]);
+        assert!(intent.blocked(&w).is_none());
+        intent.reverse(&w).unwrap();
+        assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
+        // The trash picks the name, so a redo remembers the new one: the
+        // first is still in there, and this one lands beside it.
+        copy_in(&w, "~/Downloads/README.txt", "~/.Trash/README.txt").unwrap();
+        intent.reapply(&w).unwrap();
+        assert_eq!(intent.done.borrow()[0].to, "~/.Trash/README.txt 2");
+        intent.reverse(&w).unwrap();
+        assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
+        // An emptied trash is a reversal that has expired.
+        intent.reapply(&w).unwrap();
+        let inside = intent.done.borrow()[0].to.clone();
+        move_in(&w, &inside, "~/Desktop/elsewhere.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is not in the trash any more".into())
+        );
+    }
+
+    /// Identity, not the name. A reversal asks the disk *which object* is
+    /// at the path, because a name is cheap to reuse and undo takes things
+    /// away — the same size and the same times are not the same file.
+    #[test]
+    fn a_reversal_knows_its_own_object_from_a_stranger() {
+        let w = world();
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        copy_in(&w, from, to).unwrap();
+        let intent = Copied::new(vec![Done::of(&w, from, to)]);
+        assert!(intent.blocked(&w).is_none());
+        // Taken away, and a copy of the very same source put back in its
+        // place: the same name, the same size, the same modified time —
+        // and a different object, which is the only thing that counts.
+        trash_in(&w, to).unwrap();
+        copy_in(&w, from, to).unwrap();
+        assert_eq!(
+            stat_in(&w, to),
+            stat_in(&w, from),
+            "indistinguishable by everything a listing shows"
+        );
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is not what was put there".into())
+        );
+        // And a record that never learned what it made refuses outright:
+        // undo may decline, it may not guess.
+        let blind = Copied::new(vec![Done {
+            from: from.into(),
+            to: to.into(),
+            landed: None,
+        }]);
+        assert_eq!(
+            blind.blocked(&w),
+            Some("“README.txt” cannot be told apart from what is there now".into())
+        );
+    }
+
+    /// A reversal does every path it holds before it complains: stopping
+    /// at the first failure would leave half a batch untouched, and
+    /// nothing to say about which half.
+    #[test]
+    fn a_reversal_does_all_of_it_before_it_complains() {
+        let w = world();
+        let pairs = [
+            ("~/Downloads/README.txt", "~/Desktop/README.txt"),
+            ("~/Downloads/2026/notes.txt", "~/Desktop/notes.txt"),
+        ];
+        for (from, to) in pairs {
+            copy_in(&w, from, to).unwrap();
+        }
+        let intent = Copied::new(pairs.iter().map(|(f, t)| Done::of(&w, f, t)).collect());
+        // The first copy is taken out from under it; the second is still
+        // there, and still goes.
+        move_in(&w, "~/Desktop/README.txt", "~/Desktop/elsewhere.txt").unwrap();
+        let err = intent.reverse(&w).unwrap_err();
+        assert!(err.contains("README.txt"), "it says which one: {err}");
+        assert!(
+            stat_in(&w, "~/Desktop/notes.txt").is_none(),
+            "the rest of the batch went anyway"
+        );
+        assert!(stat_in(&w, "~/.Trash/notes.txt").is_some());
+    }
+
+    /// `new dir`, and the undo that takes it back — while it is still the
+    /// empty directory it was made as.
+    #[test]
+    fn a_new_directory_is_undone_only_while_it_is_empty() {
+        let w = world();
+        make_dir_in(&w, "~/Desktop/2026").unwrap();
+        assert!(
+            make_dir_in(&w, "~/Desktop/2026").is_err(),
+            "a name the directory already has"
+        );
+        let intent = MadeDir::of(&w, "~/Desktop/2026");
+        assert!(intent.blocked(&w).is_none());
+        // Something arrived in it: the reversal has expired, honestly.
+        copy_in(&w, "~/Downloads/README.txt", "~/Desktop/2026/README.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“2026/” is not empty any more".into())
+        );
+        trash_in(&w, "~/Desktop/2026/README.txt").unwrap();
+        assert!(intent.blocked(&w).is_none());
+        intent.reverse(&w).unwrap();
+        assert!(stat_in(&w, "~/Desktop/2026").is_none());
+        intent.reapply(&w).unwrap();
+        assert!(is_dir_in(&w, "~/Desktop/2026"));
+        // One empty directory is exactly like another to look at, so this
+        // one is known by its object too: somebody else's, made at the
+        // same name, is not the one to take away.
+        trash_in(&w, "~/Desktop/2026").unwrap();
+        make_dir_in(&w, "~/Desktop/2026").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“2026” is not what was put there".into())
+        );
+    }
+
+    /// Every write goes through the outside, and a world that has none
+    /// refuses each of them rather than reaching a disk of its own.
+    #[test]
+    fn a_world_with_no_outside_writes_nothing() {
+        let deny = World::new(
+            Rc::new(Store::open(None).unwrap()),
+            Box::new(crate::effect::Deny::with_clock(
+                crate::effect::Clock::Virtual(std::sync::Arc::new(std::sync::Mutex::new(0.0))),
+            )),
+            crate::effect::Registry::new(),
+        );
+        assert!(make_dir_in(&deny, "~/x")
+            .unwrap_err()
+            .contains("no outside"));
+        assert!(copy_in(&deny, "~/a", "~/b")
+            .unwrap_err()
+            .contains("no outside"));
+        assert!(move_in(&deny, "~/a", "~/b")
+            .unwrap_err()
+            .contains("no outside"));
+        assert!(trash_in(&deny, "~/a").unwrap_err().contains("no outside"));
     }
 }
