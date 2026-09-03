@@ -2090,15 +2090,26 @@ fn free(to: &Path) -> Result<(), String> {
 
 /// A file, a symlink as itself, or a directory with everything under it.
 /// The recursion is the tree's depth, which is the disk's own bound.
+///
+/// Nothing else: a FIFO, a socket or a device node is refused by name.
+/// `fs::copy` opens what it is given, and opening a FIFO blocks until
+/// somebody writes to the other end — the browser performs its verbs on
+/// the frame of the click, so that would be the window stopped for good.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(from)?;
-    if meta.file_type().is_symlink() {
+    let ft = std::fs::symlink_metadata(from)?.file_type();
+    if ft.is_symlink() {
         // Copied as a link, the way `cp -R` does it: following it would
         // duplicate what it points at, which is not what was asked for.
         return std::os::unix::fs::symlink(std::fs::read_link(from)?, to);
     }
-    if !meta.is_dir() {
-        return std::fs::copy(from, to).map(|_| ());
+    if ft.is_file() {
+        return copy_file(from, to);
+    }
+    if !ft.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a file or a directory", from.display()),
+        ));
     }
     std::fs::create_dir(to)?;
     for ent in std::fs::read_dir(from)? {
@@ -2106,6 +2117,82 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         copy_tree(&ent.path(), &to.join(ent.file_name()))?;
     }
     Ok(())
+}
+
+/// One file's bytes. The name is claimed with `create_new` — `O_EXCL`,
+/// which is atomic — before `fs::copy` writes through it: `fs::copy` alone
+/// truncates whatever it finds, and the [`free`] check above it is a
+/// window another program can write into. What it truncates now is the
+/// empty file we just made ourselves.
+fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::fs::copy(from, to).map(|_| ())
+}
+
+/// Whether `to` is `from` itself or somewhere under it — asked of the
+/// **resolved** paths, which is the question a comparison of two spellings
+/// cannot answer. An alias in the middle (`~/link` pointing at
+/// `~/Downloads`) makes a copy feed itself its own output otherwise: the
+/// walk creates entries in the directory it is still reading.
+///
+/// Only a real directory can contain anything, so a symlink source answers
+/// *no*: it is copied as a link and recurses into nothing. A destination
+/// that does not exist yet — the ordinary case — is resolved through its
+/// parent.
+fn inside(from: &Path, to: &Path) -> bool {
+    if std::fs::symlink_metadata(from).is_ok_and(|m| !m.is_dir()) {
+        return false;
+    }
+    let Ok(src) = from.canonicalize() else {
+        return false;
+    };
+    let dst = match to.canonicalize() {
+        Ok(p) => p,
+        Err(_) => match (to.parent().map(Path::canonicalize), to.file_name()) {
+            (Some(Ok(parent)), Some(name)) => parent.join(name),
+            _ => return false,
+        },
+    };
+    dst.starts_with(&src)
+}
+
+/// `RENAME_EXCL` from macOS' `sys/stdio.h`: fail if the destination exists.
+#[cfg(target_os = "macos")]
+const RENAME_EXCL: std::ffi::c_uint = 0x0000_0004;
+
+/// A rename that refuses an existing destination, where the platform has
+/// one. Plain `rename(2)` replaces silently, and checking first is a
+/// window another program can write into — so on macOS this is
+/// `renamex_np`, whose exclusion is the kernel's.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, c_int, c_uint, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+    }
+
+    let f = CString::new(from.as_os_str().as_bytes())?;
+    let t = CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: two NUL-terminated paths that outlive the call, and the one
+    // flag the man page defines for it.
+    if unsafe { renamex_np(f.as_ptr(), t.as_ptr(), RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// No exclusive rename here: [`free`] is the best this platform offers,
+/// and the browser is macOS-shaped today (see the book's open questions).
+#[cfg(not(target_os = "macos"))]
+fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 /// Where [`Real`] keeps passwords.
@@ -2520,8 +2607,25 @@ impl Outside for Real {
         if let Some(d) = &mut self.demo {
             return d.copy(&demo(from), &demo(to));
         }
+        if inside(from, to) {
+            return Err(format!("{} cannot go inside itself", from.display()));
+        }
         free(to)?;
-        copy_tree(from, to).map_err(|e| format!("{}: {e}", from.display()))
+        let Err(e) = copy_tree(from, to) else {
+            return Ok(());
+        };
+        // What reached the disk before it failed is nobody's: not the copy
+        // that was asked for, and not anything a panel is showing. It goes
+        // where everything this app takes away goes — and if even that
+        // fails, the message says what was left where.
+        let err = format!("{}: {e}", from.display());
+        if std::fs::symlink_metadata(to).is_err() {
+            return Err(err);
+        }
+        match self.trash(to) {
+            Ok(_) => Err(err),
+            Err(_) => Err(format!("{err} — a part of it was left at {}", to.display())),
+        }
     }
 
     fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
@@ -2531,14 +2635,22 @@ impl Outside for Real {
         if let Some(d) = &mut self.demo {
             return d.mv(&demo(from), &demo(to));
         }
+        if inside(from, to) {
+            return Err(format!("{} cannot go inside itself", from.display()));
+        }
+        // The check is for the sentence; the exclusion is the kernel's.
         free(to)?;
-        match std::fs::rename(from, to) {
+        match rename_excl(from, to) {
             Ok(()) => Ok(()),
+            // Somebody took the name between the check and the rename.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(format!("{} is already there", to.display()))
+            }
             // EXDEV: the two paths are on different filesystems, where a
             // rename cannot reach. Copy, then trash the source — so even
             // the halfway state of a cross-volume move is recoverable.
             Err(e) if e.raw_os_error() == Some(EXDEV) => {
-                copy_tree(from, to).map_err(|e| format!("{}: {e}", from.display()))?;
+                self.copy_path(from, to)?;
                 self.trash(from).map(|_| ())
             }
             Err(e) => Err(format!("{}: {e}", from.display())),
@@ -3393,6 +3505,59 @@ mod tests {
         assert!(out
             .move_path(&root.join("src/a.txt"), &root.join("dest/moved.txt"))
             .is_err());
+
+        // An alias in the middle is still inside: a copy that fed itself
+        // its own output would grow until the disk did not.
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        assert!(
+            out.copy_path(&root.join("src"), &root.join("alias/again"))
+                .is_err(),
+            "resolved, not spelled"
+        );
+        assert!(out
+            .move_path(&root.join("src"), &root.join("alias/again"))
+            .is_err());
+        // …but the alias itself copies fine: it is a link, and a link
+        // recurses into nothing.
+        out.copy_path(&root.join("alias"), &root.join("dest/alias"))
+            .unwrap();
+
+        // The exclusive rename is the kernel's, not a check of ours: it
+        // refuses a destination that is there, whoever put it there.
+        assert!(rename_excl(&root.join("dest/moved.txt"), &root.join("src/a.txt")).is_err());
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            b"a",
+            "untouched"
+        );
+
+        // Nothing that is not a file, a directory or a link: opening a
+        // FIFO blocks until somebody writes to it, and the window with it.
+        // What the walk had already made goes to the trash rather than
+        // staying as a half-copy nobody asked for.
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(root.join("src/pipe"))
+            .status()
+            .unwrap();
+        let trash = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".Trash");
+        let listing = |d: &Path| -> std::collections::BTreeSet<PathBuf> {
+            std::fs::read_dir(d)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        };
+        let before = listing(&trash);
+        assert!(out
+            .copy_path(&root.join("src"), &root.join("dest/pipes"))
+            .is_err());
+        assert!(
+            !root.join("dest/pipes").exists(),
+            "the half-copy was swept, not left"
+        );
+        // Sweep the sweep: a test leaves nothing in anybody's trash.
+        for p in listing(&trash).difference(&before) {
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+        std::fs::remove_file(root.join("src/pipe")).unwrap();
 
         // …and a run that may not write to a real disk refuses all of it.
         let mut sealed =

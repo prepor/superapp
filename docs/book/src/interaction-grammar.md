@@ -321,12 +321,19 @@ dir` trashes the empty directory. Nothing this app does to a file is
 unrecoverable.
 
 Each of these is **one undoable action**, a marked set included — one `⌘z`
-takes the whole batch back, and puts the marks it consumed back with it.
-A reversal is asked of the disk before it is made, and expires honestly
-when the world has moved on: a directory that is no longer empty, a trash
-that has been emptied, a name something else has taken since. An expired
-node goes transparent, exactly as a sent mail's does — the walk says so
-and carries on rather than writing over what is there now.
+takes the whole batch back, and puts the marks it consumed back with it
+(a move empties the rows it took; a copy leaves them, and their marks,
+alone). A reversal is asked of the disk before it is made, and expires
+honestly when the world has moved on: a directory that is no longer empty,
+a trash that has been emptied, a name something else has taken since — and
+a path that is *there* but is not **what this action put there**, which is
+not the same question at all, because undo takes things away. Each verb
+reads back what it wrote the moment after, and a reversal compares before
+it moves anything. An expired node goes transparent, exactly as a sent
+mail's does — the walk says so and carries on rather than writing over
+what is there now. A reversal that fails while it is being made — the disk
+moved between the asking and the doing — does every path it holds anyway
+and names the ones that would not go, in the same toast as the walk.
 
 Nothing watches the disk, so a verb that wrote it tells the listings
 itself — every files panel on screen, since a copy changes the directory

@@ -102,6 +102,19 @@ leaves no row in [the log panel](#the-log-panel). There is no
 what makes a delete an ordinary move to undo, and it is the only way this
 app takes a path away — the reversal of a copy uses it too.
 
+A destination is claimed by the kernel, never by a check: a copy makes its
+file with `O_EXCL` before writing through it, a directory with `create_dir`,
+and a move renames with macOS' `renamex_np` and `RENAME_EXCL`. Plain
+`rename` and `fs::copy` replace what they find, and a check before them is
+a window another program can write into — the sentence on the status line
+is worth a check, but not the file. Two more refusals are the same
+carefulness: a destination inside its own source, asked of the *resolved*
+paths so an alias in the middle cannot make a copy feed itself its own
+output; and anything that is not a file, a directory or a link, because
+opening a FIFO blocks until somebody writes to it and these verbs run on
+the frame of the click. A copy that fails partway sends what it had already
+made to the trash rather than leaving a half-tree nobody asked for.
+
 What that buys is what every backend buys: the real one reads and writes
 the disk, hands a path to the OS (`/usr/bin/open` on macOS) and trashes
 through `NSFileManager`'s own door — the right trash for the volume, the

@@ -3480,6 +3480,7 @@ impl Stage {
         match step {
             Some(step) => {
                 marks = Some((step.marks.clone(), step.undone));
+                let failed = crate::history::said(&step.failed);
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3487,7 +3488,7 @@ impl Stage {
                     state.anim.camera().jump_to(cam);
                 }
                 state.pump.kick(); // reverted intent pushes to the server too
-                state.toast(format!("undid — {label}"), false);
+                state.toast(format!("undid — {label}{failed}"), !failed.is_empty());
             }
             None => state.toast("nothing to undo", false),
         }
@@ -3512,6 +3513,7 @@ impl Stage {
         match step {
             Some(step) => {
                 marks = Some((step.marks.clone(), step.undone));
+                let failed = crate::history::said(&step.failed);
                 let label = state.land(step);
                 state.sync();
                 if state.ws.active != was {
@@ -3519,7 +3521,7 @@ impl Stage {
                     state.anim.camera().jump_to(cam);
                 }
                 state.pump.kick();
-                state.toast(format!("redid — {label}"), false);
+                state.toast(format!("redid — {label}{failed}"), !failed.is_empty());
             }
             None => state.toast("nothing to redo", false),
         }
@@ -4082,6 +4084,7 @@ impl Stage {
                 let mut marks = None;
                 if let Some(step) = step {
                     marks = Some((step.marks.clone(), step.undone));
+                    let failed = crate::history::said(&step.failed);
                     let label = state.land(step);
                     state.sync();
                     if state.ws.active != was {
@@ -4089,7 +4092,7 @@ impl Stage {
                         state.anim.camera().jump_to(cam);
                     }
                     state.pump.kick();
-                    state.toast(format!("history — {label}"), false);
+                    state.toast(format!("history — {label}{failed}"), !failed.is_empty());
                 }
                 self.refresh_files(cx);
                 if let Some(m) = marks {
@@ -5036,7 +5039,7 @@ impl Stage {
         // Performed one at a time, and a path the disk refuses at the last
         // moment joins the refusals rather than failing the batch: what is
         // left is exactly what happened.
-        let mut done: Vec<crate::files::Step> = Vec::new();
+        let mut done: Vec<crate::files::Done> = Vec::new();
         for step in plan.steps.drain(..) {
             let r = match hold.op {
                 crate::files::HoldOp::Copy => {
@@ -5047,7 +5050,9 @@ impl Stage {
                 }
             };
             match r {
-                Ok(()) => done.push(step),
+                // Read back the moment after the write: what undo will
+                // compare against before it takes anything away.
+                Ok(()) => done.push(crate::files::Done::of(&state.world, &step.from, &step.to)),
                 Err(e) => plan.refused.push(e),
             }
         }
@@ -5074,7 +5079,7 @@ impl Stage {
             return;
         }
         let what = if done.len() == 1 && plan.refused.is_empty() {
-            format!("“{}”", done[0].name())
+            format!("“{}”", crate::files::basename(&done[0].to))
         } else if plan.refused.is_empty() {
             crate::files::plural(done.len())
         } else {
@@ -5093,13 +5098,30 @@ impl Stage {
         // showing them have nothing left to show.
         let vanished: Vec<String> = match hold.op {
             crate::files::HoldOp::Copy => Vec::new(),
-            crate::files::HoldOp::Move => done.iter().map(|s| s.from.clone()).collect(),
+            crate::files::HoldOp::Move => done.iter().map(|d| d.from.clone()).collect(),
         };
         let closing = self.panels_under(&vanished);
-        let steps = done.clone();
+        // A move empties the rows it came from, so it consumes the marks
+        // that named them — on the panel the hold was taken from, which is
+        // not this one. A copy leaves its rows, and its marks, alone.
+        let consumed = match (hold.op, hold.from) {
+            (crate::files::HoldOp::Move, Some(src)) => vanished.first().map(|p| {
+                (
+                    src,
+                    crate::files::parent(p)
+                        .unwrap_or(crate::files::ROOT)
+                        .to_string(),
+                    vanished
+                        .iter()
+                        .map(|p| crate::files::basename(p).to_string())
+                        .collect::<Vec<String>>(),
+                )
+            }),
+            _ => None,
+        };
         let intent: Box<dyn crate::history::Intent> = match hold.op {
-            crate::files::HoldOp::Copy => Box::new(crate::files::Copied { steps }),
-            crate::files::HoldOp::Move => Box::new(crate::files::Moved { steps }),
+            crate::files::HoldOp::Copy => Box::new(crate::files::Copied::new(done.clone())),
+            crate::files::HoldOp::Move => Box::new(crate::files::Moved::new(done.clone())),
         };
         let Some(state) = self.state.as_deref_mut() else {
             return;
@@ -5124,6 +5146,15 @@ impl Stage {
             format!("{} {what} into {here}{but} — ⌘z undoes", hold.op.done()),
             false,
         );
+        if let Some((src, from_dir, names)) = consumed {
+            state.history.claim_marks(
+                src,
+                crate::history::MarkKeys::Names {
+                    dir: from_dir,
+                    keys: names,
+                },
+            );
+        }
         // A move consumes the hold; a copy keeps it, so the same set can be
         // laid down in another directory.
         if hold.op == crate::files::HoldOp::Move {
@@ -5148,7 +5179,7 @@ impl Stage {
             state.toast("read-only — acquire the lease to write", true);
             return;
         }
-        let mut trashed: Vec<(String, String)> = Vec::new();
+        let mut trashed: Vec<crate::files::Done> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
         for path in &paths {
             // A root is where the browser starts: nothing takes one away,
@@ -5158,7 +5189,11 @@ impl Stage {
                 continue;
             }
             match crate::files::trash_in(&state.world, path) {
-                Ok(landed) => trashed.push((path.clone(), landed)),
+                // Where it went, and what it is there: undo compares both
+                // before it moves anything back out.
+                Ok(landed) => {
+                    trashed.push(crate::files::Done::of(&state.world, path, &landed));
+                }
                 Err(e) => refused.push(e),
             }
         }
@@ -5180,8 +5215,8 @@ impl Stage {
         // The row's own wording where the set is one, as a batch archive
         // has it.
         let what = match trashed.as_slice() {
-            [(one, _)] if refused.is_empty() => {
-                format!("“{}”", crate::files::basename(one))
+            [one] if refused.is_empty() => {
+                format!("“{}”", crate::files::basename(&one.from))
             }
             many if refused.is_empty() => crate::files::plural(many.len()),
             many => format!(
@@ -5197,15 +5232,18 @@ impl Stage {
         };
         // Every panel showing one of these paths — or anything under one —
         // is showing nothing now. Undo restores the layout with them.
-        let gone: Vec<String> = trashed.iter().map(|(was, _)| was.clone()).collect();
+        let gone: Vec<String> = trashed.iter().map(|d| d.from.clone()).collect();
         let closing = self.panels_under(&gone);
         // The marks this delete consumed — the ones whose row went, never
         // one that stayed because its path refused. Undo puts exactly
         // these back, and redo takes exactly these again.
-        let claimed: Vec<String> = self
-            .hosted
-            .get(&pid)
-            .map(|w| w.as_files_panel().marks())
+        let panel = self.hosted.get(&pid).map(|w| w.as_files_panel());
+        let claimed_dir = panel
+            .as_ref()
+            .and_then(FilesPanelRef::dir)
+            .unwrap_or_default();
+        let claimed: Vec<String> = panel
+            .map(|p| p.marks())
             .unwrap_or_default()
             .into_iter()
             .filter(|n| gone.iter().any(|g| crate::files::basename(g) == n))
@@ -5237,9 +5275,13 @@ impl Stage {
             }
         }
         state.toast(format!("{what} to the trash{but} — ⌘z undoes"), false);
-        state
-            .history
-            .claim_marks(pid, crate::history::MarkKeys::Names(claimed));
+        state.history.claim_marks(
+            pid,
+            crate::history::MarkKeys::Names {
+                dir: claimed_dir,
+                keys: claimed,
+            },
+        );
         self.refresh_files(cx);
         self.kick(cx);
     }
@@ -5294,6 +5336,7 @@ impl Stage {
         let hold = crate::files::Hold {
             op,
             paths: names.iter().map(|n| crate::files::join(&dir, n)).collect(),
+            from: Some(pid),
         };
         if let Some(state) = self.state.as_deref_mut() {
             state.toast(
@@ -5457,8 +5500,14 @@ impl Stage {
                         panel.remove_marks(cx, &keys);
                     }
                 }
-                crate::history::MarkKeys::Names(keys) => {
+                crate::history::MarkKeys::Names { dir, keys } => {
                     let panel = w.as_files_panel();
+                    // Only where the panel is still showing the listing
+                    // those names were names in — it may have walked on,
+                    // and a name means nothing in another directory.
+                    if panel.dir().as_deref() != Some(dir.as_str()) {
+                        continue;
+                    }
                     if undone {
                         panel.add_marks(cx, &keys);
                     } else {

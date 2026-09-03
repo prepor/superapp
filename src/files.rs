@@ -601,6 +601,11 @@ impl HoldOp {
 pub struct Hold {
     pub op: HoldOp,
     pub paths: Vec<String>,
+    /// The list panel whose marks this set came from, when it came from
+    /// one (CR-009). A move empties the rows it took, so it consumes those
+    /// marks — and undo has to know where to put them back. A panel's own
+    /// verb holds one object and no marks: `None`.
+    pub from: Option<u64>,
 }
 
 impl Hold {
@@ -610,6 +615,7 @@ impl Hold {
         Hold {
             op,
             paths: vec![path.into()],
+            from: None,
         }
     }
 
@@ -741,14 +747,6 @@ pub struct Step {
     pub to: String,
 }
 
-impl Step {
-    /// What the destination calls it — a copy into its own directory lands
-    /// under a fresh name, and that is the name to say.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        basename(&self.to)
-    }
-}
 
 /// What a `… here` can do and what it refuses, path by path — a batch
 /// refuses exactly as one does (CR-009).
@@ -813,6 +811,34 @@ pub fn plan_here(world: &World, hold: &Hold, dir: &str) -> Plan {
 // moved on, and a reversal that has to be refused says so ([`Intent::blocked`])
 // instead of writing over whatever is there now.
 
+/// One path a verb performed, and what it left where it put it. A [`Step`]
+/// is the plan — what is about to happen; this is the record of what did.
+/// The entry is how a reversal tells its own work from a stranger's: a
+/// path that is *there* is not the same question as a path that is *ours*,
+/// and undo takes things away.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Done {
+    pub from: String,
+    pub to: String,
+    /// The disk's account of `to`, read the moment after the write. `None`
+    /// where even that could not be read — then only presence can honestly
+    /// be asked of it.
+    pub landed: Option<Entry>,
+}
+
+impl Done {
+    /// The record of a step just performed: its destination as the disk
+    /// has it now.
+    #[must_use]
+    pub fn of(world: &World, from: &str, to: &str) -> Done {
+        Done {
+            from: from.to_string(),
+            to: to.to_string(),
+            landed: stat_in(world, to),
+        }
+    }
+}
+
 /// Why a path can no longer be given back: there is nothing there.
 fn gone(world: &World, path: &str) -> Option<String> {
     stat_in(world, path)
@@ -827,64 +853,121 @@ fn occupied(world: &World, path: &str) -> Option<String> {
         .then(|| format!("something else is at “{}” now", basename(path)))
 }
 
+/// Why what is at `path` is not this action's to take away: nothing is
+/// there, or what is there is not what the action put there — a file
+/// deleted and replaced, a directory somebody has since written into. A
+/// record with no entry asks for presence alone, which is all it can
+/// honestly ask.
+fn ours(world: &World, path: &str, landed: Option<&Entry>) -> Option<String> {
+    match (stat_in(world, path), landed) {
+        (None, _) => gone(world, path),
+        (Some(now), Some(was)) if now != *was => {
+            Some(format!("“{}” is not what was put there", basename(path)))
+        }
+        _ => None,
+    }
+}
+
+/// Every path attempted, and then one error naming the ones that would
+/// not go: a reversal that stopped at the first failure would leave the
+/// rest of a batch untouched and say nothing about which half moved.
+fn all(rs: impl IntoIterator<Item = Result<(), String>>) -> Result<(), String> {
+    let bad: Vec<String> = rs.into_iter().filter_map(Result::err).collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join(", "))
+    }
+}
+
 /// `copy here`: undo puts the copies in the trash — never an `rm`, even
 /// for what we made ourselves.
 pub struct Copied {
-    pub steps: Vec<Step>,
+    /// A redo copies again and lands a new file, with its own times, so
+    /// what each one *is* is rewritten rather than assumed.
+    pub done: std::cell::RefCell<Vec<Done>>,
+}
+
+impl Copied {
+    #[must_use]
+    pub fn new(done: Vec<Done>) -> Copied {
+        Copied {
+            done: std::cell::RefCell::new(done),
+        }
+    }
 }
 
 impl Intent for Copied {
     fn describe(&self) -> String {
-        format!("copied {}", plural(self.steps.len()))
+        format!("copied {}", plural(self.done.borrow().len()))
     }
 
     fn blocked(&self, w: &World) -> Option<String> {
-        self.steps.iter().find_map(|s| gone(w, &s.to))
+        self.done
+            .borrow()
+            .iter()
+            .find_map(|d| ours(w, &d.to, d.landed.as_ref()))
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        for s in &self.steps {
-            trash_in(w, &s.to)?;
-        }
-        Ok(())
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| trash_in(w, &d.to).map(|_| ())))
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        for s in &self.steps {
-            copy_in(w, &s.from, &s.to)?;
-        }
-        Ok(())
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            copy_in(w, &d.from, &d.to)?;
+            d.landed = stat_in(w, &d.to);
+            Ok(())
+        }))
     }
 }
 
 /// `move here`: undo moves each one back where it was.
 pub struct Moved {
-    pub steps: Vec<Step>,
+    pub done: std::cell::RefCell<Vec<Done>>,
+}
+
+impl Moved {
+    #[must_use]
+    pub fn new(done: Vec<Done>) -> Moved {
+        Moved {
+            done: std::cell::RefCell::new(done),
+        }
+    }
 }
 
 impl Intent for Moved {
     fn describe(&self) -> String {
-        format!("moved {}", plural(self.steps.len()))
+        format!("moved {}", plural(self.done.borrow().len()))
     }
 
     fn blocked(&self, w: &World) -> Option<String> {
-        self.steps
+        self.done
+            .borrow()
             .iter()
-            .find_map(|s| gone(w, &s.to).or_else(|| occupied(w, &s.from)))
+            .find_map(|d| ours(w, &d.to, d.landed.as_ref()).or_else(|| occupied(w, &d.from)))
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        for s in &self.steps {
-            move_in(w, &s.to, &s.from)?;
-        }
-        Ok(())
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| move_in(w, &d.to, &d.from)))
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        for s in &self.steps {
-            move_in(w, &s.from, &s.to)?;
-        }
-        Ok(())
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            move_in(w, &d.from, &d.to)?;
+            d.landed = stat_in(w, &d.to);
+            Ok(())
+        }))
     }
 }
 
@@ -892,54 +975,61 @@ impl Intent for Moved {
 /// trashes again and lands somewhere new — the trash picks the name — so
 /// where each one *is* is remembered rather than assumed.
 pub struct Deleted {
-    /// `(where it was, where the trash put it)`, rewritten by a redo.
-    pub paths: std::cell::RefCell<Vec<(String, String)>>,
+    /// `from` is where it was, `to` where the trash put it.
+    pub done: std::cell::RefCell<Vec<Done>>,
 }
 
 impl Deleted {
     #[must_use]
-    pub fn new(paths: Vec<(String, String)>) -> Deleted {
+    pub fn new(done: Vec<Done>) -> Deleted {
         Deleted {
-            paths: std::cell::RefCell::new(paths),
+            done: std::cell::RefCell::new(done),
         }
     }
 }
 
 impl Intent for Deleted {
     fn describe(&self) -> String {
-        format!("trashed {}", plural(self.paths.borrow().len()))
+        format!("trashed {}", plural(self.done.borrow().len()))
     }
 
-    /// The two ways a restore expires: the trash was emptied, or something
-    /// took the name back.
+    /// The three ways a restore expires: the trash was emptied, what is in
+    /// there is not what went in, or something took the name back.
     fn blocked(&self, w: &World) -> Option<String> {
-        self.paths.borrow().iter().find_map(|(was, now)| {
-            if stat_in(w, now).is_none() {
-                Some(format!("“{}” is not in the trash any more", basename(was)))
-            } else {
-                occupied(w, was)
+        self.done.borrow().iter().find_map(|d| {
+            let name = basename(&d.from);
+            match stat_in(w, &d.to) {
+                None => Some(format!("“{name}” is not in the trash any more")),
+                Some(now) if d.landed.as_ref().is_some_and(|was| now != *was) => {
+                    Some(format!("“{name}” in the trash is not what went there"))
+                }
+                _ => occupied(w, &d.from),
             }
         })
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        for (was, now) in self.paths.borrow().iter() {
-            move_in(w, now, was)?;
-        }
-        Ok(())
+        all(self
+            .done
+            .borrow()
+            .iter()
+            .map(|d| move_in(w, &d.to, &d.from)))
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        for (was, now) in self.paths.borrow_mut().iter_mut() {
-            *now = trash_in(w, was)?;
-        }
-        Ok(())
+        let mut done = self.done.borrow_mut();
+        all(done.iter_mut().map(|d| {
+            d.to = trash_in(w, &d.from)?;
+            d.landed = stat_in(w, &d.to);
+            Ok(())
+        }))
     }
 }
 
 /// `new dir`: undo trashes it, while it is still the empty directory it
 /// was made as. Anything inside and the reversal has expired — which is
-/// what it means for one to expire honestly.
+/// what it means for one to expire honestly, and it is also why an empty
+/// directory needs no identity of its own: one is exactly like another.
 pub struct MadeDir {
     pub path: String,
 }
@@ -2261,6 +2351,7 @@ mod tests {
         let hold = Hold {
             op: HoldOp::Move,
             paths: vec!["~/Downloads/2026/notes.txt".into(), "/tmp/notes.txt".into()],
+            from: None,
         };
         let plan = plan_here(&w, &hold, "~/Desktop");
         assert_eq!(plan.steps.len(), 1);
@@ -2276,6 +2367,7 @@ mod tests {
             let hold = Hold {
                 op,
                 paths: paths.iter().map(|p| (*p).to_string()).collect(),
+                from: None,
             };
             plan_here(&w, &hold, dir).refused
         };
@@ -2315,6 +2407,7 @@ mod tests {
                 "~/Downloads/README.txt".into(),
                 "~/Downloads/2026/notes.txt".into(),
             ],
+            from: None,
         };
         let plan = plan_here(&w, &hold, "/tmp");
         assert_eq!(plan.steps.len(), 1);
@@ -2327,12 +2420,9 @@ mod tests {
     #[test]
     fn a_copy_is_undone_into_the_trash() {
         let w = world();
-        let steps = vec![Step {
-            from: "~/Downloads/README.txt".into(),
-            to: "~/Desktop/README.txt".into(),
-        }];
-        copy_in(&w, &steps[0].from, &steps[0].to).unwrap();
-        let intent = Copied { steps };
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        copy_in(&w, from, to).unwrap();
+        let intent = Copied::new(vec![Done::of(&w, from, to)]);
         assert!(intent.blocked(&w).is_none());
         intent.reverse(&w).unwrap();
         assert!(stat_in(&w, "~/Desktop/README.txt").is_none());
@@ -2343,11 +2433,18 @@ mod tests {
         );
         intent.reapply(&w).unwrap();
         assert!(stat_in(&w, "~/Desktop/README.txt").is_some());
-        // A copy somebody else has since taken away cannot be given back.
+        // A copy somebody else has since taken away cannot be given back…
         trash_in(&w, "~/Desktop/README.txt").unwrap();
         assert_eq!(
             intent.blocked(&w),
             Some("“README.txt” is no longer there".into())
+        );
+        // …and neither can a stranger standing where it was. Undo takes
+        // things away, so *there* is not the same question as *ours*.
+        copy_in(&w, "~/Downloads/2026/notes.txt", "~/Desktop/README.txt").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is not what was put there".into())
         );
     }
 
@@ -2356,13 +2453,10 @@ mod tests {
     #[test]
     fn a_move_is_undone_back_to_where_it_was() {
         let w = world();
-        let steps = vec![Step {
-            from: "~/Downloads/README.txt".into(),
-            to: "~/Desktop/README.txt".into(),
-        }];
-        move_in(&w, &steps[0].from, &steps[0].to).unwrap();
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        move_in(&w, from, to).unwrap();
         assert!(stat_in(&w, "~/Downloads/README.txt").is_none());
-        let intent = Moved { steps };
+        let intent = Moved::new(vec![Done::of(&w, from, to)]);
         assert!(intent.blocked(&w).is_none());
         intent.reverse(&w).unwrap();
         assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
@@ -2385,7 +2479,7 @@ mod tests {
         let landed = trash_in(&w, "~/Downloads/README.txt").unwrap();
         assert_eq!(landed, "~/.Trash/README.txt");
         assert!(stat_in(&w, "~/Downloads/README.txt").is_none());
-        let intent = Deleted::new(vec![("~/Downloads/README.txt".into(), landed)]);
+        let intent = Deleted::new(vec![Done::of(&w, "~/Downloads/README.txt", &landed)]);
         assert!(intent.blocked(&w).is_none());
         intent.reverse(&w).unwrap();
         assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
@@ -2393,17 +2487,43 @@ mod tests {
         // first is still in there, and this one lands beside it.
         copy_in(&w, "~/Downloads/README.txt", "~/.Trash/README.txt").unwrap();
         intent.reapply(&w).unwrap();
-        assert_eq!(intent.paths.borrow()[0].1, "~/.Trash/README.txt 2");
+        assert_eq!(intent.done.borrow()[0].to, "~/.Trash/README.txt 2");
         intent.reverse(&w).unwrap();
         assert!(stat_in(&w, "~/Downloads/README.txt").is_some());
         // An emptied trash is a reversal that has expired.
         intent.reapply(&w).unwrap();
-        let inside = intent.paths.borrow()[0].1.clone();
+        let inside = intent.done.borrow()[0].to.clone();
         move_in(&w, &inside, "~/Desktop/elsewhere.txt").unwrap();
         assert_eq!(
             intent.blocked(&w),
             Some("“README.txt” is not in the trash any more".into())
         );
+    }
+
+    /// A reversal does every path it holds before it complains: stopping
+    /// at the first failure would leave half a batch untouched, and
+    /// nothing to say about which half.
+    #[test]
+    fn a_reversal_does_all_of_it_before_it_complains() {
+        let w = world();
+        let pairs = [
+            ("~/Downloads/README.txt", "~/Desktop/README.txt"),
+            ("~/Downloads/2026/notes.txt", "~/Desktop/notes.txt"),
+        ];
+        for (from, to) in pairs {
+            copy_in(&w, from, to).unwrap();
+        }
+        let intent = Copied::new(pairs.iter().map(|(f, t)| Done::of(&w, f, t)).collect());
+        // The first copy is taken out from under it; the second is still
+        // there, and still goes.
+        move_in(&w, "~/Desktop/README.txt", "~/Desktop/elsewhere.txt").unwrap();
+        let err = intent.reverse(&w).unwrap_err();
+        assert!(err.contains("README.txt"), "it says which one: {err}");
+        assert!(
+            stat_in(&w, "~/Desktop/notes.txt").is_none(),
+            "the rest of the batch went anyway"
+        );
+        assert!(stat_in(&w, "~/.Trash/notes.txt").is_some());
     }
 
     /// `new dir`, and the undo that takes it back — while it is still the

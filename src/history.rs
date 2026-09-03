@@ -111,7 +111,13 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkKeys {
     Threads(Vec<i64>),
-    Names(Vec<String>),
+    /// Names, and the directory they are names *in*: a files panel's marks
+    /// belong to the listing it is showing, and a panel that has since
+    /// walked somewhere else has no business being handed them back.
+    Names {
+        dir: String,
+        keys: Vec<String>,
+    },
 }
 
 impl MarkKeys {
@@ -119,8 +125,19 @@ impl MarkKeys {
     pub fn is_empty(&self) -> bool {
         match self {
             MarkKeys::Threads(v) => v.is_empty(),
-            MarkKeys::Names(v) => v.is_empty(),
+            MarkKeys::Names { keys, .. } => keys.is_empty(),
         }
+    }
+}
+
+/// What a walk's failures read as, appended to its toast: nothing at all
+/// when a claim gave everything back, which is the ordinary case.
+#[must_use]
+pub fn said(failed: &[String]) -> String {
+    if failed.is_empty() {
+        String::new()
+    } else {
+        format!(" — but {}", failed.join(", "))
     }
 }
 
@@ -160,6 +177,12 @@ pub struct Step {
     /// Whether the step undid the node (the marks go back) or applied it
     /// (they go).
     pub undone: bool,
+    /// What the node's claims would **not** give back. The layout walks
+    /// either way — the snapshot is ours to restore, and stopping the
+    /// walk on a half-reversed claim would strand the tree — but a claim
+    /// that failed is not a walk that worked, so it travels up to the
+    /// shell instead of ending on stderr.
+    pub failed: Vec<String>,
 }
 
 /// The tree and its cursor.
@@ -304,14 +327,17 @@ impl History {
                 self.head = parent;
                 continue;
             }
-            {
+            let failed = {
                 let n = self.nodes.get(&id)?;
+                let mut failed = Vec::new();
                 for i in &n.intents {
                     if let Err(e) = i.reverse(w) {
                         eprintln!("history: reversing {} failed: {e}", i.describe());
+                        failed.push(e);
                     }
                 }
-            }
+                failed
+            };
             let n = self.nodes.get_mut(&id)?;
             n.state = State::Undone;
             let step = Step {
@@ -319,6 +345,7 @@ impl History {
                 snap: n.before.clone(),
                 marks: n.marks.clone(),
                 undone: true,
+                failed,
             };
             self.head = parent;
             return Some(step);
@@ -337,14 +364,17 @@ impl History {
     /// branch.
     pub fn redo(&mut self, w: &World) -> Option<Step> {
         let id = self.newest_undone_child()?;
-        {
+        let failed = {
             let n = self.nodes.get(&id)?;
+            let mut failed = Vec::new();
             for i in &n.intents {
                 if let Err(e) = i.reapply(w) {
                     eprintln!("history: reapplying {} failed: {e}", i.describe());
+                    failed.push(e);
                 }
             }
-        }
+            failed
+        };
         let n = self.nodes.get_mut(&id)?;
         n.state = State::Applied;
         let step = Step {
@@ -352,6 +382,7 @@ impl History {
             snap: n.after.clone(),
             marks: n.marks.clone(),
             undone: false,
+            failed,
         };
         self.head = id;
         Some(step)
@@ -396,21 +427,29 @@ impl History {
                 self.head = id;
                 continue;
             }
-            {
-                let Some(n) = self.nodes.get(&id) else { continue };
+            let failed = {
+                let Some(n) = self.nodes.get(&id) else {
+                    continue;
+                };
+                let mut failed = Vec::new();
                 for i in &n.intents {
                     if let Err(e) = i.reapply(w) {
                         eprintln!("history: reapplying {} failed: {e}", i.describe());
+                        failed.push(e);
                     }
                 }
-            }
-            let Some(n) = self.nodes.get_mut(&id) else { continue };
+                failed
+            };
+            let Some(n) = self.nodes.get_mut(&id) else {
+                continue;
+            };
             n.state = State::Applied;
             last = Some(Step {
                 label: n.label.clone(),
                 snap: n.after.clone(),
                 marks: n.marks.clone(),
                 undone: false,
+                failed,
             });
             self.head = id;
         }
@@ -428,6 +467,7 @@ impl History {
                 snap,
                 marks: Vec::new(),
                 undone: true,
+                failed: Vec::new(),
             });
         }
         last
@@ -485,6 +525,9 @@ mod tests {
         log: Rc<RefCell<Vec<String>>>,
         name: &'static str,
         blocked: bool,
+        /// A claim that lets itself be tried and then cannot do it — the
+        /// disk moved under a reversal `blocked` had already passed.
+        breaks: bool,
     }
 
     impl Intent for Spy {
@@ -496,10 +539,16 @@ mod tests {
         }
         fn reverse(&self, _w: &World) -> Result<(), String> {
             self.log.borrow_mut().push(format!("-{}", self.name));
+            if self.breaks {
+                return Err(format!("{} would not go back", self.name));
+            }
             Ok(())
         }
         fn reapply(&self, _w: &World) -> Result<(), String> {
             self.log.borrow_mut().push(format!("+{}", self.name));
+            if self.breaks {
+                return Err(format!("{} would not go again", self.name));
+            }
             Ok(())
         }
     }
@@ -576,18 +625,60 @@ mod tests {
         let w = world();
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut h = History::new();
-        act(&mut h, 
+        act(
+            &mut h,
             "archive",
             "archive".into(),
             None,
             WmSnap::default(),
             snap(&[Kind::Help]),
-            vec![Box::new(Spy { log: log.clone(), name: "archive", blocked: false })],
+            vec![Box::new(Spy {
+                log: log.clone(),
+                name: "archive",
+                blocked: false,
+                breaks: false,
+            })],
             1.0,
         );
         h.undo(&w);
         h.redo(&w);
         assert_eq!(*log.borrow(), vec!["-archive", "+archive"]);
+    }
+
+    /// A claim that fails *while* it is being given back — `blocked` let
+    /// it through and the disk moved under it — is not a walk that
+    /// worked. The layout still lands (the snapshot is ours, and stopping
+    /// here would strand the tree), but the failure travels up with the
+    /// step instead of ending on stderr.
+    #[test]
+    fn a_reversal_that_fails_says_so_on_the_step() {
+        let w = world();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut h = History::new();
+        act(
+            &mut h,
+            "delete",
+            "delete “notes.txt”".into(),
+            None,
+            WmSnap::default(),
+            snap(&[Kind::Help]),
+            vec![Box::new(Spy {
+                log: log.clone(),
+                name: "delete",
+                blocked: false,
+                breaks: true,
+            })],
+            1.0,
+        );
+        let step = h.undo(&w).expect("the layout walks either way");
+        assert_eq!(step.label, "delete “notes.txt”");
+        assert_eq!(step.failed, ["delete would not go back"]);
+        assert_eq!(said(&step.failed), " — but delete would not go back");
+        // …and the same on the way forward.
+        let step = h.redo(&w).expect("redone");
+        assert_eq!(step.failed, ["delete would not go again"]);
+        // A walk that gave everything back says nothing extra.
+        assert_eq!(said(&[]), "");
     }
 
     /// A claim the world will not take back makes its node transparent —
@@ -599,22 +690,34 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut h = History::new();
         let a = snap(&[Kind::Help]);
-        act(&mut h, 
+        act(
+            &mut h,
             "open",
             "open help".into(),
             None,
             WmSnap::default(),
             a.clone(),
-            vec![Box::new(Spy { log: log.clone(), name: "open", blocked: false })],
+            vec![Box::new(Spy {
+                log: log.clone(),
+                name: "open",
+                blocked: false,
+                breaks: false,
+            })],
             1.0,
         );
-        act(&mut h, 
+        act(
+            &mut h,
             "send",
             "send “Hi”".into(),
             Some("outbox:9".into()),
             a.clone(),
             snap(&[Kind::Help, Kind::About]),
-            vec![Box::new(Spy { log: log.clone(), name: "send", blocked: true })],
+            vec![Box::new(Spy {
+                log: log.clone(),
+                name: "send",
+                blocked: true,
+                breaks: false,
+            })],
             2.0,
         );
 
