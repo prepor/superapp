@@ -1021,7 +1021,7 @@ fn compose() -> Scene<Setup> {
         )
     };
     Scene::new("compose", (560.0, 420.0))
-        .note("A reply: TO and SUBJECT from the mail it answers, the cursor in the body.")
+        .note("A reply: TO and SUBJECT from the mail it answers, its letter quoted under the attribution line, the cursor above both.")
         .note("A forward: the letter under its header block, SUBJECT from it, the cursor in the empty TO.")
         .note("Send is a side effect with an undo window.")
         .node("reply", reply(""))

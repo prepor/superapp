@@ -1117,14 +1117,48 @@ pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
         Seed::Blank => Draft::default(),
         Seed::Reply(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
             to: m.head.from_email.clone(),
-            subject: format!("Re: {}", m.head.subject),
-            body: String::new(),
+            subject: format!("Re: {}", topic_of(&m.head.subject)),
+            body: quoted(&m),
         }),
         Seed::Forward(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
             to: String::new(),
-            subject: format!("Fwd: {}", m.head.subject),
+            subject: format!("Fwd: {}", topic_of(&m.head.subject)),
             body: forwarded(&m),
         }),
+    }
+}
+
+/// A reply's body: room to write at the top, then the letter it answers
+/// under the attribution line every client writes — `On <date>, <who>
+/// wrote:` — with each of its lines behind a `>`. That is the shape
+/// [`split_quote`] folds away on the way back in, so what this app sends
+/// is what it knows how to read.
+///
+/// The whole letter goes, its own quoted tail included: the chain is how
+/// the conversation reaches someone who joins it late, and every reader
+/// folds it.
+#[must_use]
+pub fn quoted(m: &MailFull) -> String {
+    let quote = m
+        .body
+        .trim_end()
+        .lines()
+        // A `> ` before every line — and nothing but `>` before an empty
+        // one, which is the shape a quote is written in everywhere.
+        .map(|l| format!("> {l}").trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let head = format!(
+        "\n\nOn {}, {} wrote:",
+        fmt_date_long(m.head.date),
+        writer(m)
+    );
+    // A letter with nothing to quote — an image alone — still says whose
+    // it was, and leaves nothing hanging under the line.
+    if quote.is_empty() {
+        head
+    } else {
+        format!("{head}\n{quote}")
     }
 }
 
@@ -1134,22 +1168,27 @@ pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
 /// exactly this.
 #[must_use]
 pub fn forwarded(m: &MailFull) -> String {
-    // A sender without a name is stored under their address as the name
-    // (see [`crate::sync::parse_mail`]); written out, that is the address
-    // once, not twice.
-    let (name, email) = (&m.head.from_name, &m.head.from_email);
-    let from = if name.is_empty() || name == email {
-        email.clone()
-    } else {
-        format!("{name} <{email}>")
-    };
     format!(
-        "\n\nBegin forwarded message:\n\nFrom: {from}\nSubject: {}\nDate: {}\nTo: {}\n\n{}",
+        "\n\nBegin forwarded message:\n\nFrom: {}\nSubject: {}\nDate: {}\nTo: {}\n\n{}",
+        writer(m),
         m.head.subject,
         fmt_date_long(m.head.date),
         m.to,
         m.body.trim_end()
     )
+}
+
+/// Who wrote a letter, as a reply's attribution and a forward's header
+/// block name them: `Name <addr>`. A sender without a name is stored
+/// under their address as the name (see [`crate::sync::parse_mail`]);
+/// written out, that is the address once, not twice.
+fn writer(m: &MailFull) -> String {
+    let (name, email) = (&m.head.from_name, &m.head.from_email);
+    if name.is_empty() || name == email {
+        email.clone()
+    } else {
+        format!("{name} <{email}>")
+    }
 }
 
 /// Loads a panel's draft, if any (boot restore, prefill).
@@ -2730,8 +2769,39 @@ mod tests {
 
         let re = seed_draft(&s, Seed::Reply(1));
         assert_eq!(
-            (re.to.as_str(), re.subject.as_str(), re.body.as_str()),
-            ("vera@kovac.io", "Re: Q3 infra budget draft", "")
+            (re.to.as_str(), re.subject.as_str()),
+            ("vera@kovac.io", "Re: Q3 infra budget draft")
+        );
+        assert!(
+            re.body.starts_with(
+                "\n\nOn 31 Aug 2026 at 09:14, Vera Kovac <vera@kovac.io> wrote:\n> Draft for Q3"
+            ),
+            "{}",
+            re.body
+        );
+        // The whole letter, every line behind a `>` and the blank ones
+        // bare — and nothing before the attribution but the room to write.
+        let letter = mail(&s, 1).expect("vera").body;
+        for line in re.body.lines().skip(3) {
+            assert!(line == ">" || line.starts_with("> "), "{line:?}");
+        }
+        assert_eq!(
+            re.body.lines().skip(3).count(),
+            letter.trim_end().lines().count()
+        );
+        assert!(re.body.ends_with("the CDN line is stale."), "{}", re.body);
+
+        // What it writes is what it reads: the app's own fold takes the
+        // quote back off, attribution and all.
+        let sent = format!("Numbers check out.{}", re.body);
+        let (own, quote) = split_quote(&sent);
+        assert_eq!(own, "Numbers check out.");
+        assert!(quote.expect("a quote").starts_with("On 31 Aug 2026"));
+
+        // A reply to a reply is still one `Re:` (mail 3 arrived as one).
+        assert_eq!(
+            seed_draft(&s, Seed::Reply(3)).subject,
+            "Re: superapp panel model"
         );
 
         let fwd = seed_draft(&s, Seed::Forward(1));
@@ -2746,7 +2816,6 @@ mod tests {
             "{}",
             fwd.body
         );
-        let letter = mail(&s, 1).expect("vera").body;
         assert!(
             fwd.body.ends_with(letter.trim_end()),
             "the whole letter goes"
@@ -2776,6 +2845,12 @@ mod tests {
         assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
         bare.head.from_name.clear();
         assert!(forwarded(&bare).contains("\nFrom: vera@kovac.io\nSubject:"));
+        assert!(quoted(&bare).starts_with("\n\nOn 31 Aug 2026 at 09:14, vera@kovac.io wrote:"));
+
+        // Nothing to quote: the attribution stands alone rather than over
+        // an empty line.
+        bare.body.clear();
+        assert!(quoted(&bare).ends_with("wrote:"), "{}", quoted(&bare));
     }
 
     /// A compose replaced in place keeps its panel id: the row its old
