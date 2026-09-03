@@ -1,0 +1,167 @@
+# The four mailboxes: one panel over the inbox, the archive, sent and spam.
+#
+# Assertions are the clicks, and each list is asked for a row only its own
+# folder holds — so a label that resolves is proof the right folder answered.
+# Exactly one mail list is open at a time (the boot inbox is closed first,
+# and each mailbox is closed before the next opens): two of them on screen
+# would make "click the CI conversation" mean either, and the run would
+# stop asserting anything.
+wait 900
+
+# Boot is help + the inbox, the inbox focused. Close it: the rest of this
+# run is about the other three.
+key cmd+w
+wait 600
+shot m0-inbox-closed
+
+# The launcher offers all four as roots. The archive: the five CI runs the
+# inbox's GitHub mail continues are filed there, so the conversation has a
+# row here — and clicking it previews the archived mail beside it.
+key cmd 2
+wait 400
+type "archive"
+wait 500
+shot m1-launcher-archive
+key enter
+wait 800
+shot m2-archive
+click "[stelaxis] CI"
+wait 700
+shot m3-archive-previews
+
+# Its bar carries no `archive`: the mail is already out of the inbox. Space
+# marks the row under the cursor and the verbs come up — `delete` and the
+# two that close every bar. `clear marks` resolves only while the bar is up.
+type " "
+wait 500
+shot m4-archive-marked
+click "clear marks"
+wait 500
+key cmd+w
+wait 600
+
+# Sent: my own letter to Max, and nothing else. Its row is the conversation
+# read from the other end — the reply that answered it lives in the inbox,
+# which is closed, so this row can only be the sent one.
+key cmd 2
+wait 400
+type "sent"
+wait 500
+key enter
+wait 800
+shot m5-sent
+click "superapp panel model"
+wait 700
+shot m6-sent-previews
+key cmd+w
+wait 600
+
+# Spam: its own three, and the same grammar in the filter. `@unread` keeps
+# the two that arrived unread; clearing it brings the third back, which is
+# how the run knows the filter really let go.
+key cmd 2
+wait 400
+type "spam"
+wait 500
+key enter
+wait 800
+shot m7-spam
+key /
+wait 300
+type "@unread"
+wait 500
+key esc
+wait 500
+shot m8-spam-unread
+click "Your 4.2 BTC withdrawal"
+wait 700
+shot m9-spam-filtered
+key /
+wait 200
+key cmd+a
+key backspace
+wait 300
+key esc
+wait 500
+click "Invitation: keynote speaker"
+wait 700
+shot m10-spam-whole
+key cmd+w
+wait 600
+
+# The inbox is untouched by any of it, and its bar is the one that still
+# wears `archive`: mark a row, file the batch, take it back.
+key cmd 2
+wait 400
+type "inbox"
+wait 500
+key enter
+wait 800
+click "Q3 infra"
+wait 700
+type " "
+wait 500
+shot m11-inbox-marked
+click "archive marked"
+wait 900
+shot m12-inbox-archived
+key cmd+z
+wait 900
+click "Q3 infra"
+wait 700
+shot m13-undone
+
+# The borrow follows the bar. A sent list wears no `archive`, so the chord
+# it would lend its preview does not archive either — the letter on the
+# message's own button is drawn plain from here for the same reason. The
+# proof is the row still being there afterwards; ⌘d, which every mailbox
+# does offer, is the control.
+key cmd+w
+wait 600
+key cmd 2
+wait 400
+type "sent"
+wait 500
+key enter
+wait 800
+click "superapp panel model"
+wait 700
+key cmd+a
+wait 900
+shot m14-sent-keeps-its-row
+click "superapp panel model"
+wait 700
+key cmd+w
+wait 600
+
+# Two mailboxes at once, on purpose: the CI conversation is a row in the
+# inbox and a row in the archive. Filing it from the archive is the
+# archive's cursor's business — the inbox's stands where it stood, and the
+# mail it is previewing is untouched. The rows are addressed one panel at a
+# time (the two lists label that conversation identically): the inbox's is
+# clicked while it is alone, the archive's is walked to once it opens.
+key cmd 2
+wait 400
+type "inbox"
+wait 500
+key enter
+wait 800
+click "[stelaxis] CI"
+wait 700
+shot m15-inbox-on-ci
+key cmd 2
+wait 400
+type "archive"
+wait 500
+key enter
+wait 800
+key down
+wait 700
+shot m16-archive-on-ci
+key cmd+d
+wait 1200
+shot m17-archive-emptied
+click "GitHub <notifications@github.com"
+wait 700
+shot m18-inbox-preview-untouched
+quit

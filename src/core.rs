@@ -87,6 +87,51 @@ impl Seed {
     }
 }
 
+/// Which folder a mail list shows — the `folder.role` the store files a
+/// message under, as a panel parameter. One kind, four panels: the list, the
+/// filter, the walk and the preview are the same everywhere; only the rows
+/// the query starts from differ.
+///
+/// Trash is not among them on purpose. A conversation's trashed mails are
+/// left out of every thread query (they are what `delete` produced), so a
+/// bin would be a list about single mails rather than about conversations —
+/// a different panel, not another role of this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    Inbox,
+    Archive,
+    Sent,
+    Spam,
+}
+
+/// Every role a mail list can show, in the order the launcher offers them:
+/// the inbox first, then where mail goes when it leaves it.
+pub const ROLES: [Role; 4] = [Role::Inbox, Role::Archive, Role::Sent, Role::Spam];
+
+impl Role {
+    /// The `folder.role` string — the store's spelling, the persisted
+    /// panel's kind, and the panel's title, which are all one word by
+    /// design: a mailbox is called what its folder is.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Inbox => "inbox",
+            Role::Archive => "archive",
+            Role::Sent => "sent",
+            Role::Spam => "spam",
+        }
+    }
+
+    /// The role a `folder.role` string names, or `None` for one no list
+    /// shows (`trash`, and anything a later build learns to file). Not
+    /// `FromStr`: this reads the store's own column, not a person's typing,
+    /// and there is no error to report — only "no panel for that".
+    #[must_use]
+    pub fn named(s: &str) -> Option<Role> {
+        ROLES.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
 /// A panel's kind, parameters included: the whole identity of what it shows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -94,8 +139,11 @@ pub enum Kind {
     Help,
     /// One line about the prototype.
     About,
-    /// The mail list, optionally pre-filtered (a contact's address).
-    Inbox {
+    /// A mail list over one folder role, optionally pre-filtered (a
+    /// contact's address).
+    Mailbox {
+        /// Which folder's mail: inbox, archive, sent, spam.
+        role: Role,
         /// Substring filter baked into the panel's params (not the typed one).
         filter: Option<String>,
     },
@@ -171,7 +219,7 @@ impl Kind {
         match self {
             Kind::Help => (4, 6),
             Kind::About => (3, 2),
-            Kind::Inbox { .. } => (4, 6),
+            Kind::Mailbox { .. } => (4, 6),
             Kind::Message { .. } => (4, 3),
             Kind::Contact { .. } => (3, 2),
             Kind::Compose { .. } => (4, 4),
@@ -1441,7 +1489,7 @@ mod tests {
                     .map(|pid| match ws.panels[pid].kind {
                         Kind::Help => "help",
                         Kind::About => "about",
-                        Kind::Inbox { .. } => "inbox",
+                        Kind::Mailbox { .. } => "inbox",
                         Kind::Message { .. } => "msg",
                         Kind::Contact { .. } => "contact",
                         Kind::Compose { .. } => "compose",
@@ -1463,7 +1511,7 @@ mod tests {
     fn boot() -> (Ws, PanelId, PanelId) {
         let mut ws = Ws::new();
         let help = ws.open(Kind::Help, None, false);
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         ws.focus = Some(inbox);
         (ws, help, inbox)
     }
@@ -1535,7 +1583,7 @@ mod tests {
     #[test]
     fn literal_heights_leave_empty_space() {
         let mut ws = Ws::new();
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         let scene = ws.scene(VP, opts());
         let inbox_r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
@@ -1550,7 +1598,7 @@ mod tests {
     #[test]
     fn a_measured_wish_overrides_the_kinds_constant() {
         let mut ws = Ws::new();
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         ws.wish(Kind::Message { id: 1 }, (4, 6));
         let msg = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
         let tall = |ws: &mut Ws, pid| {
@@ -1577,7 +1625,7 @@ mod tests {
     #[test]
     fn a_tall_letter_earns_its_own_column() {
         let mut ws = Ws::new();
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let contact = ws.open(Kind::Contact { email: "vera@kovac.io".into() }, Some(inbox), false);
         // Short (3 rows) under the contact (2): 5 of 6 rows, it fits.
         let short = ws.follow_open(inbox, Kind::Message { id: 1 }, false);
@@ -1655,7 +1703,7 @@ mod tests {
     #[test]
     fn a_move_between_workspaces_leaves_the_chain_behind() {
         let mut wm = Wm::new();
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
         wm.focus = Some(inbox);
         wm.send_focused_to(2);
@@ -1715,7 +1763,7 @@ mod tests {
         let vp = (400.0, 700.0);
         let mut ws = Ws::new();
         ws.set_grid(Grid { w: 4, h: 3 });
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let scene = ws.scene(vp, opts());
         let r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
         // 4 of 4 units wide, 3 of 3 rows tall: the whole viewport minus gaps.
@@ -1731,7 +1779,7 @@ mod tests {
     fn set_grid_relayouts() {
         let vp = (840.0, 700.0);
         let mut ws = Ws::new();
-        let inbox = ws.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = ws.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         ws.set_grid(Grid { w: 8, h: 4 });
         let scene = ws.scene(vp, opts());
         let r = scene.panels.iter().find(|p| p.id == inbox).unwrap().rect;
@@ -1848,7 +1896,7 @@ mod tests {
     fn workspaces_switch_and_move() {
         let mut wm = Wm::new();
         let help = wm.open(Kind::Help, None, false);
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         wm.focus = Some(inbox);
         wm.camera_x = 120.0;
 
@@ -1898,7 +1946,7 @@ mod tests {
                 (Vec::new(), true, 0),
                 (vec![2], false, 0),
             ],
-            panels: vec![(1, Kind::Help), (2, Kind::Inbox { filter: None })],
+            panels: vec![(1, Kind::Help), (2, Kind::Mailbox { role: Role::Inbox, filter: None })],
             joins: Vec::new(),
             focus: Some(2),
         };
@@ -1914,7 +1962,7 @@ mod tests {
     #[test]
     fn snapshot_restore_round_trips() {
         let mut wm = Wm::new();
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
         wm.toggle_tabbed(msg);
         wm.send_focused_to(2); // msg (a ws-1 id) now lives on ws 3
@@ -1947,7 +1995,7 @@ mod tests {
     #[test]
     fn workspace_move_breaks_joins_and_grid_is_global() {
         let mut wm = Wm::new();
-        let inbox = wm.open(Kind::Inbox { filter: None }, None, false);
+        let inbox = wm.open(Kind::Mailbox { role: Role::Inbox, filter: None }, None, false);
         let msg = wm.follow_open(inbox, Kind::Message { id: 1 }, false);
         assert_eq!(wm.joined_child(inbox), Some(msg));
         wm.send_focused_to(1);

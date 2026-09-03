@@ -140,6 +140,13 @@ per account** — its own connection to the same file — polls every minute
 (each folder retains the newest **200** messages; below that window the
 panels honestly know nothing), reconcile flags and deletions.
 
+A folder's **role** comes from its RFC 6154 special-use attribute:
+`inbox`, `archive` (`\Archive`, or `\All` — see Gmail below), `sent`,
+`spam` (`\Junk`, spelled the way every client and every server that is not
+the RFC spells it) and `trash`. A folder with no such attribute is not
+mirrored at all. Four of those five roles have a panel — the mailboxes; the
+fifth is where `delete` puts things.
+
 Server effects run on a **desired/actual split**: a `message` row is the
 user's *intent* (which folder, read or not, passed on or not); `server_msg` is what the
 server actually holds, written only by the workers. A row whose two sides

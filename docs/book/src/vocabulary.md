@@ -1,8 +1,8 @@
 # Vocabulary
 
 - **Panel** — the only building block. A panel is a *kind + parameters*
-  (`email/inbox`, `email/message {id}`), specialized on a single function.
-  There are no apps and no windows.
+  (`email/mailbox {archive}`, `email/message {id}`), specialized on a single
+  function. There are no apps and no windows.
 - **Kind** — what a panel shows, parameters included. Replacing a panel swaps
   its kind in place, keeping its identity and slot.
 - **Workspace / strip** — the single horizontally scrolling surface all
@@ -15,9 +15,13 @@
 - **Wish** — a request measured from the content rather than fixed by the
   kind: a long letter asks for more rows than a short one. The kind's
   request is its floor, the grid its ceiling.
+- **Mailbox** — a mail list over one folder **role**: inbox, archive, sent,
+  spam. One kind with the role as a parameter — four panels of the same
+  object, differing only in the folder their rows come from.
 - **Thread** — a conversation: every mail that answers, or is answered by,
-  another, joined through their `References` headers. The inbox's rows are
-  threads, and a message panel shows the whole thread its mail belongs to.
+  another, joined through their `References` headers. A mailbox's rows are
+  threads — one row per conversation with a mail in that folder — and a
+  message panel shows the whole thread its mail belongs to.
 - **Mark** — a row picked out for a batch verb. The **marks** are the set,
   held as row keys beside the list's cursor, so they survive the filter, the
   paging and a sync landing underneath; they are context, never history.

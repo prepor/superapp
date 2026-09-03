@@ -1496,6 +1496,7 @@ impl FakeServer {
             "INBOX" => Some("inbox".into()),
             "Archive" | "[Gmail]/All Mail" => Some("archive".into()),
             "Sent" => Some("sent".into()),
+            "Spam" | "Junk" => Some("spam".into()),
             "Trash" => Some("trash".into()),
             _ => None,
         }
@@ -2335,7 +2336,7 @@ impl Outside for Real {
 
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
-/// Which of the four roles a mailbox plays, from its name and its RFC 6154
+/// Which of the five roles a mailbox plays, from its name and its RFC 6154
 /// special-use attributes (rendered — see the caller).
 ///
 /// `\All` is the Gmail case, and it is why archive is not just `\Archive`:
@@ -2343,6 +2344,10 @@ impl Outside for Real {
 /// dropping the inbox label, leaving the message in All Mail — which is
 /// exactly what a MOVE into it does. A real `\Archive` wins where a server
 /// has one (fastmail does), and `\All` is the fallback.
+///
+/// `\Junk` is spelled `spam` here, which is what every mail client and
+/// every server that is not the RFC calls it — and what the panel is
+/// titled.
 fn role_for(name: &str, attrs: &[String]) -> (Option<String>, bool) {
     let has = |want: &str| attrs.iter().any(|a| a == want);
     let role = if name.eq_ignore_ascii_case("inbox") {
@@ -2351,6 +2356,8 @@ fn role_for(name: &str, attrs: &[String]) -> (Option<String>, bool) {
         "archive"
     } else if has("Sent") {
         "sent"
+    } else if has("Junk") {
+        "spam"
     } else if has("Trash") {
         "trash"
     } else {
@@ -3064,6 +3071,9 @@ mod tests {
             role("[Gmail]/Sent Mail", &["HasNoChildren", "Sent"]),
             ("sent".into(), false)
         );
+        // \Junk is spam, whatever the folder is called.
+        assert_eq!(role("[Gmail]/Spam", &["HasNoChildren", "Junk"]), ("spam".into(), false));
+        assert_eq!(role("Junk", &["Junk"]), ("spam".into(), false));
         assert_eq!(
             role("[Gmail]/Trash", &["HasNoChildren", "Trash"]),
             ("trash".into(), false)

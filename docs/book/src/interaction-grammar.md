@@ -57,15 +57,42 @@ each the same way whatever the row is, so there is one of each verb rather
 than one per table. A click on a row is the one door too: the list takes
 focus, its cursor follows, and what the row names previews beside it.
 
+### Four mailboxes, one list
+
+The mail list is one panel over one **folder role** — the inbox, the
+archive, sent, spam — and the role is a panel parameter like any other. The
+launcher offers all four as roots; a panel is titled what its folder is.
+Everything else about them is the same object: the same rows, the same
+cursor walk, the same preview into a message, the same filter grammar, the
+same marks. Only the folder the query starts from differs.
+
+What differs is the one verb that is about *leaving* a folder: the inbox's
+bar offers `archive` and `delete`, and the other three offer `delete`
+alone — mail that is already out of the inbox has nowhere to be archived to.
+Every surface agrees: the bar, the row swipe, and the chord a list
+[borrows](#borrowed-keys) from its preview. The `@from:` completion follows the list it is on: the spam list
+completes against the people who wrote to *it*, and no other list — nor a
+compose's TO field, nor the launcher's contacts — ever offers one of them.
+A spammer is not a correspondent.
+
+Trash is not one of the four. A conversation's trashed mails are left out
+of every thread query — being left out is what `delete` did to them — so a
+bin would be a list about single mails rather than about conversations: a
+different panel, not another role of this one.
+
 ### Threads: the row is the conversation, the panel is the whole of it
 
-An inbox row is a **thread**: every mail of a conversation counts, and it is
-a row while at least one of them sits in the inbox. The row names who wrote
-in it — newest speaker first, `me` for your own address, first names once
-there are two — and the count past one (`Max, me · 3`), the subject with its
-`Re:` stripped, and the date of the latest inbox mail; it is bold while any
-of them is unread. Filing the row files every inbox mail of the thread in
-one undo node. A reply arriving later puts the thread back by itself.
+A mail list's row is a **thread**: every mail of a conversation counts, and
+it is a row while at least one of them sits in *this* folder. The row names
+who wrote in it — newest speaker first, `me` for your own address, first
+names once there are two — and the count past one (`Max, me · 3`), the
+subject with its `Re:` stripped, and the date of the latest mail in the
+folder; it is bold while any of them is unread. So one conversation can be a
+row in two mailboxes at once — the GitHub thread is a row in the inbox and a
+row in the archive, six mails long in both, and only the mail the row opens
+differs. Filing a row files every mail of the thread that sits in the
+folder the row was read in, in one undo node. A reply arriving later puts
+the thread back in the inbox by itself.
 
 A message panel shows the thread its mail belongs to, oldest first, the
 account it came to once at the top and `forward` and `reply` at the foot —
@@ -405,6 +432,14 @@ verbs, which fall back to `new dir` and `go to` while any row is marked.
 Two visible controls may not answer to one chord. The guard is the
 filter's: with the field holding the keyboard `cmd+a` is select-all, not an
 archive of the set.
+
+And a list **lends only what its own bar would do**. The bar and the borrow
+are one verb over many rows and over one, which is why they wear the same
+letter — so a verb the bar does not offer is not lent either: `cmd+a` from a
+sent or a spam list does not file the conversation its bar and its row swipe
+both refuse to. The withheld letter goes plain on the preview's button, since
+a bold mark may only promise a chord that answers. The button itself is
+untouched — it belongs to the mail, and pressing it there still archives.
 
 ## Workspaces
 

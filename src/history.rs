@@ -455,7 +455,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Kind, Wm};
+    use crate::core::{Kind, Role, Wm};
     use crate::effect::World;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -538,7 +538,7 @@ mod tests {
 
         assert_eq!(h.redo(&w).map(|s| s.snap), Some(a.clone()));
         // A new action mid-tree branches; redo prefers the newer branch.
-        let fork = snap(&[Kind::Help, Kind::Inbox { filter: None }]);
+        let fork = snap(&[Kind::Help, Kind::Mailbox { role: Role::Inbox, filter: None }]);
         act(&mut h, "open", "open inbox".into(), None, a.clone(), fork.clone(), vec![], 3.0);
         h.undo(&w);
         assert_eq!(h.redo(&w).map(|s| s.label), Some("open inbox".into()));
@@ -636,7 +636,7 @@ mod tests {
         act(&mut h, "open", "open help".into(), None, WmSnap::default(), a.clone(), vec![], 1.0);
         act(&mut h, "open", "open about".into(), None, a.clone(), b.clone(), vec![], 2.0);
         h.undo(&w);
-        let fork = snap(&[Kind::Help, Kind::Inbox { filter: None }]);
+        let fork = snap(&[Kind::Help, Kind::Mailbox { role: Role::Inbox, filter: None }]);
         act(&mut h, "open", "open inbox".into(), None, a.clone(), fork.clone(), vec![], 3.0);
 
         assert_eq!(h.travel(&w, 2).map(|s| s.snap), Some(b), "across the fork");
