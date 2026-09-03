@@ -45,4 +45,16 @@ shot launcher-vera
 click "Vera Kovac"
 wait 700
 shot launcher-contact-opened
+# the index reads the letter, not just its subject: "egress" appears in one
+# body and in no subject anywhere. The panel showing that mail is already
+# open, so the row that comes back is a *go to* — found by a provider that
+# knows nothing of the windows, given its verb on the merge.
+key cmd 2
+wait 300
+type "egress"
+wait 400
+shot launcher-body-word
+click "Q3 infra budget draft"
+wait 700
+shot launcher-body-opened
 quit
