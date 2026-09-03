@@ -232,7 +232,13 @@ the same marks over a directory — the object verbs a joined files panel
 wears, then the bar taking them while rows are marked, a dot-file marked
 under `@hidden` and still drawn above the rows once the filter leaves it
 out, `⌘p` holding the whole set and `copy here` performing it, and a
-`move here` refusing it path by path — and `e2e/problems.txt` (with `--send-delay 1
+`move here` refusing it path by path — `e2e/attach.txt` (also with
+`--demo-disk`) both directions of what a letter carries: the seeded
+letter's part as a link, the card over it and its preview, `open` handing
+it out; then a file held with `copy` in the browser, `attach` on the
+compose that appears only because something is held, the `CARRIES` link to
+the file's own card, and `cmd+z` taking the attach back off — and
+`e2e/problems.txt` (with `--send-delay 1
 --draws 100000` — it waits out the executor's backoff in virtual time) the
 problems surface: a send the demo account cannot make raises the mark, the
 mark opens the panel, *retry* files it again, *reopen* brings the draft back

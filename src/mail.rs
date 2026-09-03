@@ -986,17 +986,27 @@ fn wrapped_lines(text: &str, cols: usize) -> usize {
 /// How many lines a conversation reads as, wrapped at `cols`. A closed
 /// message is its one row, which with its inset stands half a line taller
 /// than a line of text; an open one is that row, its own text (the quote
-/// folded), the status line if it has one, and the spacing and rule around
-/// them — about four lines beyond the text. An estimate, like the chrome
+/// folded), the status line if it has one, the line its parts are listed
+/// on if it carries any (CR-010), and the spacing and rule around them —
+/// about four lines beyond the text. An estimate, like the chrome
 /// allowance it feeds: the wish only has to land on the right grid row.
+///
+/// `carries` is which mails have parts; the caller has the store and this
+/// does not.
 #[must_use]
-pub fn thread_lines(msgs: &[ThreadMail], open: &BTreeSet<MailId>, cols: usize) -> usize {
+pub fn thread_lines(
+    msgs: &[ThreadMail],
+    open: &BTreeSet<MailId>,
+    carries: &BTreeSet<MailId>,
+    cols: usize,
+) -> usize {
     let lines: f64 = msgs
         .iter()
         .map(|t| {
             if open.contains(&t.mail.head.id) {
                 4.0 + wrapped_lines(&own_text(&t.mail), cols) as f64
                     + if t.mail.status.is_some() { 1.0 } else { 0.0 }
+                    + if carries.contains(&t.mail.head.id) { 1.0 } else { 0.0 }
             } else {
                 1.5
             }
@@ -1074,8 +1084,239 @@ pub fn title(store: &Store, kind: &Kind) -> String {
         Kind::Job { id } => job_title(store, *id),
         Kind::Files { dir } => crate::files::basename(dir).into(),
         Kind::File { path } => crate::files::basename(path).into(),
+        Kind::Attachment { id } => {
+            attachment(store, *id).map_or_else(|| "attachment".into(), |a| a.name)
+        }
         Kind::Bucket => "device sync".into(),
     }
+}
+
+// -- what a letter carries (CR-010) -------------------------------------------
+
+/// One part of a letter, as the panels see it: the row [`crate::sync`]
+/// derived from the mail's `raw`. The bytes are not here — [`part`] reads
+/// them back out of the letter when a card asks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub id: i64,
+    pub message: MailId,
+    /// Which part of the letter it is (see [`crate::sync::part_bytes`]).
+    pub at: u32,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// Its Content-ID, for a part the reading refers to; empty otherwise.
+    pub cid: String,
+}
+
+impl Attachment {
+    /// What the message row's link says: the name, and how big it is.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{} · {}", self.name, crate::files::fmt_size(self.size))
+    }
+
+    /// The card this part draws as — the same card a file on the disk
+    /// draws (CR-008's, reused whole), so one widget serves both.
+    #[must_use]
+    pub fn card(&self, from: &str, date: f64) -> crate::files::Card {
+        crate::files::Card {
+            kind: crate::files::FileKind::of_name(&self.name),
+            name: self.name.clone(),
+            size: self.size,
+            when: format!("with {from}, {}", fmt_date(date)),
+            detail: self.mime.clone(),
+        }
+    }
+}
+
+static Q_ATTACHMENTS: Q = Q {
+    id: "attachments",
+    sql: "SELECT id, message, part, name, mime, size, cid
+          FROM attachment WHERE message = ?1 ORDER BY id",
+    describe: "the parts one letter carries, in the order they arrived",
+};
+
+static Q_ATTACHMENT: Q = Q {
+    id: "attachment",
+    sql: "SELECT id, message, part, name, mime, size, cid
+          FROM attachment WHERE id = ?1",
+    describe: "one part of a letter, by its row",
+};
+
+fn attachment_row(r: &rusqlite::Row) -> rusqlite::Result<Attachment> {
+    Ok(Attachment {
+        id: r.get(0)?,
+        message: r.get(1)?,
+        at: r.get::<_, i64>(2)? as u32,
+        name: r.get(3)?,
+        mime: r.get(4)?,
+        size: r.get::<_, i64>(5)? as u64,
+        cid: r.get(6)?,
+    })
+}
+
+/// The parts one letter carries.
+pub fn attachments(store: &Store, id: MailId) -> Rc<Vec<Attachment>> {
+    store.rows(&Q_ATTACHMENTS, &[Val::I(id)], attachment_row)
+}
+
+/// One part, by its row.
+pub fn attachment(store: &Store, id: i64) -> Option<Attachment> {
+    store
+        .rows(&Q_ATTACHMENT, &[Val::I(id)], attachment_row)
+        .first()
+        .cloned()
+}
+
+/// One part's bytes, out of the letter that carries them. Reads the whole
+/// `raw` and walks its MIME, so it belongs on a thread and never in a draw
+/// (see the book's *nothing heavy in a draw*); [`crate::panels`] asks for
+/// it the way it asks for a letter's pictures.
+#[must_use]
+pub fn part(store: &Store, a: &Attachment) -> Option<Vec<u8>> {
+    crate::sync::part_bytes(&raw(store, a.message)?, a.at)
+}
+
+/// Records what a letter carries, and marks the mail walked at this
+/// build's version. One transaction with the ingest that stored the letter,
+/// so no draw ever sees a mail without its parts.
+///
+/// An **upsert on `(message, part)`**, not a delete and a re-insert: a row's
+/// id is what a `Kind::Attachment` panel persists, and a re-derive — the
+/// walk's version changed, or a peer's snapshot landed — must not hand that
+/// id to a different part of a different letter. Parts the letter no longer
+/// has go afterwards, which is the only thing a re-derive may take away.
+pub fn attach_tx(
+    c: &rusqlite::Connection,
+    message: MailId,
+    parts: &[crate::sync::Part],
+) -> rusqlite::Result<()> {
+    for p in parts {
+        c.execute(
+            "INSERT INTO attachment(message, part, name, mime, size, cid)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(message, part) DO UPDATE SET
+               name = excluded.name, mime = excluded.mime,
+               size = excluded.size, cid = excluded.cid",
+            rusqlite::params![message, i64::from(p.at), p.name, p.mime, p.size as i64, p.cid],
+        )?;
+    }
+    // Interpolated rather than bound: the values are part indices this
+    // build just read off a MIME walk, and `NOT IN ()` is not a thing —
+    // a letter that carries nothing has every row of its own to drop.
+    let kept: Vec<String> = parts.iter().map(|p| p.at.to_string()).collect();
+    let sql = if kept.is_empty() {
+        "DELETE FROM attachment WHERE message = ?1".to_string()
+    } else {
+        format!(
+            "DELETE FROM attachment WHERE message = ?1 AND part NOT IN ({})",
+            kept.join(",")
+        )
+    };
+    c.execute(&sql, [message])?;
+    mark_scanned_tx(c, message)
+}
+
+/// Notes that this mail's `raw` has been walked at the current version —
+/// including the answer "there was nothing to walk", which is why it is its
+/// own function.
+pub fn mark_scanned_tx(c: &rusqlite::Connection, message: MailId) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO attachment_scan(message, version) VALUES(?1, ?2)
+         ON CONFLICT(message) DO UPDATE SET version = excluded.version",
+        rusqlite::params![message, crate::store::attach_version()],
+    )?;
+    Ok(())
+}
+
+// -- what a draft will carry (CR-010) ------------------------------------------
+
+/// One file a compose panel will carry out. The **path**, not the bytes: an
+/// attach costs a `stat`, the file stays where it is, and the send is what
+/// reads it — so a draft that sits for a day carries the file as it is when
+/// it leaves, and a file that has moved fails the send honestly rather than
+/// going out stale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftFile {
+    pub id: i64,
+    /// The display path (`~/Downloads/report-q3.pdf`).
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+}
+
+impl DraftFile {
+    /// What the compose panel's line says.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{} · {}", self.name, crate::files::fmt_size(self.size))
+    }
+}
+
+static Q_DRAFT_FILES: Q = Q {
+    id: "draft files",
+    sql: "SELECT id, path, name, size FROM draft_attachment
+          WHERE panel = ?1 ORDER BY id",
+    describe: "the files one compose panel will carry out, in the order they were attached",
+};
+
+/// What a compose panel will carry out.
+pub fn draft_files(store: &Store, panel: i64) -> Rc<Vec<DraftFile>> {
+    store.rows(&Q_DRAFT_FILES, &[Val::I(panel)], |r| {
+        Ok(DraftFile {
+            id: r.get(0)?,
+            path: r.get(1)?,
+            name: r.get(2)?,
+            size: r.get::<_, i64>(3)? as u64,
+        })
+    })
+}
+
+/// Attaches a set of paths to a draft. Reversed by [`Attached`]: the rows
+/// are matched back by path, since a redo mints fresh ids.
+pub fn attach_files_tx(
+    c: &rusqlite::Connection,
+    panel: i64,
+    files: &[DraftFile],
+    now: f64,
+) -> rusqlite::Result<()> {
+    for f in files {
+        // The same file twice is one attachment: a second `attach` of a
+        // held set that overlaps is not two copies in the envelope.
+        c.execute(
+            "DELETE FROM draft_attachment WHERE panel = ?1 AND path = ?2",
+            rusqlite::params![panel, f.path],
+        )?;
+        c.execute(
+            "INSERT INTO draft_attachment(panel, path, name, size, added)
+             VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![panel, f.path, f.name, f.size as i64, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Takes them off again — undo's half of an attach.
+pub fn detach_files_tx(
+    c: &rusqlite::Connection,
+    panel: i64,
+    paths: &[String],
+) -> rusqlite::Result<()> {
+    for p in paths {
+        c.execute(
+            "DELETE FROM draft_attachment WHERE panel = ?1 AND path = ?2",
+            rusqlite::params![panel, p],
+        )?;
+    }
+    Ok(())
+}
+
+/// A draft's files go with the draft: a discard, and a send once it has
+/// left. Called wherever `draft` rows are.
+pub fn discard_draft_files_tx(c: &rusqlite::Connection, panel: i64) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM draft_attachment WHERE panel = ?1", [panel])?;
+    Ok(())
 }
 
 // -- local mutations ---------------------------------------------------------
@@ -1513,13 +1754,20 @@ fn move_draft_tx(
         rusqlite::params![from, to, now],
     )?;
     c.execute("DELETE FROM draft WHERE panel = ?1", [from])?;
+    // What it was going to carry moves with it (CR-010) — a reopened send
+    // keeps its attachments, or the letter that goes out the second time is
+    // not the letter that failed.
+    c.execute(
+        "UPDATE draft_attachment SET panel = ?2 WHERE panel = ?1",
+        rusqlite::params![from, to],
+    )?;
     Ok(())
 }
 
 /// Discard: the draft goes with the panel (both revert on undo).
 pub fn discard_draft_tx(c: &rusqlite::Connection, panel: i64) -> rusqlite::Result<()> {
     c.execute("DELETE FROM draft WHERE panel=?1", [panel])?;
-    Ok(())
+    discard_draft_files_tx(c, panel)
 }
 
 /// Outbox rows that failed — surfaced as toasts and on settings.
@@ -1745,7 +1993,23 @@ impl Effect for Submit {
     }
 
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
-        let d = load_outgoing(cx.db, self.outbox)?;
+        let mut d = load_outgoing(cx.db, self.outbox)?;
+        // The files the draft named are read *now*, through the outside,
+        // rather than having been copied into the store when they were
+        // attached (CR-010): what leaves is the file as it stands, and a
+        // file that has since gone fails the send instead of sending a
+        // stale copy of it.
+        for f in &d.files {
+            let bytes = cx
+                .out
+                .read_file(&crate::files::real_path(&f.path), crate::files::ATTACH_MAX as usize)
+                .map_err(|e| format!("cannot attach “{}”: {e}", f.name))?;
+            d.mail.attachments.push(crate::effect::Part {
+                name: f.name.clone(),
+                mime: crate::files::mime_of(&f.name).to_string(),
+                bytes,
+            });
+        }
         let smtp = creds_for(cx.out, &d.email, &d.smtp, d.oauth)?;
         let raw = cx.out.submit(&smtp, &d.mail)?;
         // Gmail's SMTP files its own copy into Sent Mail, so appending one
@@ -1822,9 +2086,26 @@ struct Outgo {
     /// The account authenticates with a bearer token, not a password.
     oauth: bool,
     mail: Outgoing,
+    /// What the draft named to carry out (CR-010) — paths; the bytes are
+    /// read at the last moment, in [`Submit::perform`].
+    files: Vec<DraftFile>,
 }
 
 fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
+    let files: Vec<DraftFile> = db
+        .prepare("SELECT id, path, name, size FROM draft_attachment WHERE panel = ?1 ORDER BY id")
+        .and_then(|mut s| {
+            s.query_map([outbox], |r| {
+                Ok(DraftFile {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    name: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                })
+            })
+            .and_then(|it| it.collect())
+        })
+        .map_err(|e| format!("outbox:{outbox} cannot read its attachments: {e}"))?;
     db.query_row(
         "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
                 COALESCE((SELECT name FROM folder WHERE account=a.id AND role='sent'), 'Sent'),
@@ -1869,7 +2150,9 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                     body: r.get(7)?,
                     in_reply_to: r.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
                     references,
+                    attachments: Vec::new(),
                 },
+                files: files.clone(),
             })
         },
     )
@@ -2151,11 +2434,42 @@ impl Intent for Retried {
     }
 }
 
-/// Discarding a compose takes its text with it.
+/// Attaching files to a draft (CR-010). The draft holds paths, so giving it
+/// back is taking those paths off again — matched by path rather than by
+/// row id, which a redo mints afresh.
+pub struct Attached {
+    pub panel: i64,
+    pub files: Vec<DraftFile>,
+}
+
+impl Intent for Attached {
+    fn describe(&self) -> String {
+        format!("panel:{} carries {}", self.panel, crate::files::plural(self.files.len()))
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let (panel, paths) = (
+            self.panel,
+            self.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        );
+        w.store()
+            .write(move |c| detach_files_tx(c, panel, &paths))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let (panel, files, now) = (self.panel, self.files.clone(), w.now());
+        w.store()
+            .write(move |c| attach_files_tx(c, panel, &files, now))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Discarding a compose takes its text with it — and what it was going to
+/// carry, which undo has to put back too.
 pub struct Discarded {
     pub panel: i64,
     pub draft: Draft,
     pub seed: Seed,
+    pub files: Vec<DraftFile>,
 }
 
 impl Intent for Discarded {
@@ -2164,8 +2478,12 @@ impl Intent for Discarded {
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
         let (now, panel, seed, draft) = (w.now(), self.panel, self.seed, self.draft.clone());
+        let files = self.files.clone();
         w.store()
-            .write(move |c| upsert_draft_tx(c, panel, seed, &draft, now))
+            .write(move |c| {
+                upsert_draft_tx(c, panel, seed, &draft, now)?;
+                attach_files_tx(c, panel, &files, now)
+            })
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
@@ -2444,6 +2762,66 @@ struct SeedMail<'a> {
     refs: &'a [&'a str],
 }
 
+/// The demo letters that carry something (CR-010), by subject. A seeded
+/// mail normally has no `raw` at all; these two get one — built as a real
+/// `multipart/mixed` and walked by the ingest path's own parser — so the
+/// message row, the card and the browser meet real MIME rather than a
+/// fixture. One is text, so the card previews it; one is not, so `open` has
+/// something to hand to the OS.
+type SeedPart = (&'static str, &'static [u8]);
+const SEED_PARTS: &[(&str, &[SeedPart])] = &[
+    (
+        "Q3 infra budget draft",
+        &[("q3-budget.csv", CSV.as_bytes())],
+    ),
+    (
+        "invoice 2026-08 — €46.20",
+        &[("invoice-2026-08.pdf", PDF)],
+    ),
+];
+
+const CSV: &str = "line,aug,sep,delta\n\
+                   staging cluster,1840,0,-1840\n\
+                   ci runners,320,910,+590\n\
+                   object store,210,224,+14\n\
+                   egress,640,?,?\n\
+                   ,,,\n\
+                   total,3010,1134+egress,\n";
+
+/// The smallest thing that is honestly a PDF: one empty page. Enough for
+/// the card to say `pdf`, and for `open` to hand the OS something a viewer
+/// will actually show.
+const PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]>>endobj\n\
+trailer<</Root 1 0 R>>\n%%EOF\n";
+
+/// One seeded letter as the bytes it would have arrived as: the plain text
+/// it already has, then each part, base64'd. No `Message-ID` and no
+/// `References` — the seed carries those itself, and a raw that disagreed
+/// with the row would re-thread the mail somewhere else on the next
+/// back-fill.
+fn seed_raw(m: &SeedMail<'_>, parts: &[SeedPart]) -> Vec<u8> {
+    let mut raw = format!(
+        "From: {} <{}>\r\nTo: me@prepor.dev\r\nSubject: {}\r\n\
+         MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"seed\"\r\n\r\n\
+         --seed\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+        m.from_name, m.from_email, m.subject, m.body
+    );
+    for (name, bytes) in parts {
+        raw += &format!(
+            "--seed\r\nContent-Type: {}\r\n\
+             Content-Disposition: attachment; filename=\"{name}\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+            crate::files::mime_of(name),
+            crate::html::base64_encode(bytes)
+        );
+    }
+    raw += "--seed--\r\n";
+    raw.into_bytes()
+}
+
 /// The hand-written demo mail, newest first — ids land as 1..=9 in a fresh
 /// store, which the tests and e2e suites rely on.
 fn base_mails() -> Vec<SeedMail<'static>> {
@@ -2709,7 +3087,20 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
             Ok(id)
         };
         for m in &base_mails() {
-            insert(m)?;
+            let id = insert(m)?;
+            // The two that carry something (CR-010): the letter they would
+            // have arrived as goes into `raw`, and the parts come back out
+            // of it through the ingest path's own walk — so the demo world
+            // proves the real one rather than standing in for it.
+            let Some((_, parts)) = SEED_PARTS.iter().find(|(s, _)| *s == m.subject) else {
+                continue;
+            };
+            let raw = seed_raw(m, parts);
+            c.execute(
+                "UPDATE message SET raw = ?2 WHERE id = ?1",
+                rusqlite::params![id, raw],
+            )?;
+            attach_tx(c, id, &crate::sync::parse_mail(&raw).attachments)?;
         }
         // One mail already passed on, so the mark has somewhere to show.
         c.execute(
@@ -2783,6 +3174,142 @@ mod tests {
         let s = Store::open(None).expect("in-memory store");
         seed_if_empty(&s).expect("seed");
         s
+    }
+
+    /// The demo world's two letters that carry something (CR-010): the
+    /// rows come off a real `multipart/mixed` raw, the bytes come back out
+    /// of it, and the card the panel draws is the file browser's own.
+    #[test]
+    fn the_seeded_letters_carry_their_parts() {
+        let s = store();
+        let of = |subject: &str| -> Rc<Vec<Attachment>> {
+            let id = corpus(&s)
+                .iter()
+                .find(|m| m.subject == subject)
+                .map(|m| m.id)
+                .expect("the seeded letter");
+            attachments(&s, id)
+        };
+        let budget = of("Q3 infra budget draft");
+        assert_eq!(budget.len(), 1);
+        assert_eq!(budget[0].name, "q3-budget.csv");
+        assert_eq!(budget[0].mime, "text/csv");
+        assert_eq!(budget[0].size, CSV.len() as u64);
+        assert_eq!(budget[0].label(), "q3-budget.csv · 140 B");
+        // The bytes are read back out of the letter, not kept beside it.
+        assert_eq!(part(&s, &budget[0]).as_deref(), Some(CSV.as_bytes()));
+        // The card is the browser's card: a kind word off the name, the
+        // size, the letter it came with, and the media type under it.
+        let card = budget[0].card("Vera Kovac", ts(2026, 8, 31, 9, 14));
+        assert_eq!(card.kind, crate::files::FileKind::Text);
+        assert_eq!(card.kind_line(), "text · 140 B");
+        assert_eq!(card.when, "with Vera Kovac, aug 31 09:14");
+        assert_eq!(card.detail, "text/csv");
+        // …so the shared preview reads it as text, and would not read a
+        // pdf at all.
+        let read = |max: usize| part(&s, &budget[0]).map(|b| b.into_iter().take(max).collect());
+        assert!(matches!(
+            crate::files::preview_of(card.kind, &card.name, read),
+            crate::files::Preview::Text(t) if t.starts_with("line,aug")
+        ));
+
+        let invoice = of("invoice 2026-08 — €46.20");
+        assert_eq!(invoice.len(), 1);
+        assert_eq!(invoice[0].name, "invoice-2026-08.pdf");
+        assert!(part(&s, &invoice[0]).is_some_and(|b| b.starts_with(b"%PDF")));
+        assert_eq!(
+            invoice[0].card("Hetzner", 0.0).kind,
+            crate::files::FileKind::Pdf
+        );
+        assert!(attachments(&s, 3).is_empty(), "the rest carry nothing");
+        assert_eq!(title(&s, &Kind::Attachment { id: budget[0].id }), "q3-budget.csv");
+        assert_eq!(title(&s, &Kind::Attachment { id: 9999 }), "attachment");
+
+        // A re-derive — a newer walk, or a peer's snapshot landing — keeps
+        // the row's id: a `Kind::Attachment` panel persists that id, and
+        // handing it to a different letter's part is exactly what must not
+        // happen. Parts the letter no longer has still go.
+        let (mail, was) = (budget[0].message, budget[0].id);
+        let raw = raw(&s, mail).expect("the seeded raw");
+        let parts = crate::sync::parse_mail(&raw).attachments;
+        s.write(move |c| attach_tx(c, mail, &parts)).unwrap();
+        assert_eq!(attachments(&s, mail)[0].id, was, "the same part, the same row");
+        s.write(move |c| attach_tx(c, mail, &[])).unwrap();
+        assert!(attachments(&s, mail).is_empty(), "a part that left, left");
+    }
+
+    /// A draft holds the *paths* it will carry (CR-010): attaching the same
+    /// file twice is one part, detaching takes it off, and the whole thing
+    /// goes with the draft when it is discarded.
+    #[test]
+    fn a_draft_holds_the_files_it_will_carry() {
+        let s = store();
+        let file = |path: &str, size: u64| DraftFile {
+            id: 0,
+            path: path.to_string(),
+            name: crate::files::basename(path).to_string(),
+            size,
+        };
+        let names = |panel: i64| -> Vec<String> {
+            draft_files(&s, panel).iter().map(|f| f.name.clone()).collect()
+        };
+        let two = vec![
+            file("~/Downloads/report-q3.pdf", 96 * 1024),
+            file("~/Downloads/2026/notes.txt", 1124),
+        ];
+        s.write(move |c| attach_files_tx(c, 7, &two, 1.0)).unwrap();
+        assert_eq!(names(7), ["report-q3.pdf", "notes.txt"]);
+        assert_eq!(draft_files(&s, 7)[0].label(), "report-q3.pdf · 96 KB");
+        // The same file again is the same part, in its original place —
+        // never two copies in one envelope.
+        let again = vec![file("~/Downloads/report-q3.pdf", 96 * 1024)];
+        s.write(move |c| attach_files_tx(c, 7, &again, 2.0)).unwrap();
+        assert_eq!(names(7), ["notes.txt", "report-q3.pdf"]);
+        // Undo's half.
+        s.write(|c| detach_files_tx(c, 7, &["~/Downloads/2026/notes.txt".to_string()]))
+            .unwrap();
+        assert_eq!(names(7), ["report-q3.pdf"]);
+        // A reopened send takes them along; a discard takes them with it.
+        s.write(|c| move_draft_tx(c, 7, 42, 3.0)).unwrap();
+        assert!(names(7).is_empty());
+        assert_eq!(names(42), ["report-q3.pdf"]);
+        s.write(|c| discard_draft_tx(c, 42)).unwrap();
+        assert!(names(42).is_empty());
+    }
+
+    /// An attach is an action, so undo takes the files back off and redo
+    /// puts them on — matched by path, because a redo mints fresh rows.
+    #[test]
+    fn an_attach_is_given_back_by_path() {
+        let w = World::fake(registry());
+        let files = vec![
+            DraftFile {
+                id: 0,
+                path: "~/Downloads/report-q3.pdf".into(),
+                name: "report-q3.pdf".into(),
+                size: 96 * 1024,
+            },
+            DraftFile {
+                id: 0,
+                path: "~/notes.md".into(),
+                name: "notes.md".into(),
+                size: 2 * 1024,
+            },
+        ];
+        let names = || -> Vec<String> {
+            draft_files(w.store(), 7).iter().map(|f| f.name.clone()).collect()
+        };
+        let intent = Attached { panel: 7, files };
+        intent.reapply(&w).unwrap();
+        assert_eq!(names(), ["report-q3.pdf", "notes.md"]);
+        assert!(intent.describe().contains("2 files"));
+        intent.reverse(&w).unwrap();
+        assert!(names().is_empty());
+        // …and again, over rows whose ids are not the ones it recorded.
+        intent.reapply(&w).unwrap();
+        assert_eq!(names(), ["report-q3.pdf", "notes.md"]);
+        intent.reverse(&w).unwrap();
+        assert!(names().is_empty());
     }
 
     /// The seed reproduces the demo world: 69 mails, m1/m2 unread, ids in
@@ -3403,8 +3930,14 @@ mod tests {
         let m = mail(&s, 71).expect("max's second reply");
         assert_eq!(own_text(&m).lines().count(), 1, "one paragraph; the quote is gone");
         let open: BTreeSet<MailId> = [71].into_iter().collect();
+        let none: BTreeSet<MailId> = BTreeSet::new();
         let t = thread(&s, 71);
-        assert_eq!(thread_lines(&t, &open, 1000), 8, "1.5 + 1.5 + (4 + 1)");
+        assert_eq!(thread_lines(&t, &open, &none, 1000), 8, "1.5 + 1.5 + (4 + 1)");
+        // A letter that carries something is a line taller open (CR-010),
+        // and not a pixel taller closed.
+        assert_eq!(thread_lines(&t, &open, &open, 1000), 9);
+        let shut: BTreeSet<MailId> = BTreeSet::new();
+        assert_eq!(thread_lines(&t, &shut, &open, 1000), thread_lines(&t, &shut, &none, 1000));
     }
 
     /// The civil-date maths round-trips.

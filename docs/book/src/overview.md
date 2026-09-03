@@ -26,7 +26,10 @@ link/button grammar, keyboard and mouse parity — exercised by fake mail panels
 the queue of everything the app has tried on the outside world, read back as
 a list panel and its detail. Mail talks to a real IMAP account; the **file
 browser** (`files` and the `file` card) reads the real disk, which is the
-first thing here that is not the app's own data at all.
+first thing here that is not the app's own data at all — and the two meet
+at [attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card),
+where a part of a letter draws on the browser's own card and a file held in
+the browser becomes what a draft carries out.
 
 The first, throwaway web prototype that validated the interaction model is kept
 under `web/`.

@@ -257,6 +257,63 @@ mod tests {
         assert_eq!(w.run_effects_in(Scope::Account(1)), 1);
     }
 
+    /// A draft that carries files (CR-010) reads them **at submit time**,
+    /// through the outside — so what goes out is the file as it stands,
+    /// and a file that is no longer there fails the send rather than
+    /// sending nothing under its name.
+    #[test]
+    fn a_send_carries_the_files_the_draft_named() {
+        let w = world("smtp.t");
+        w.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO draft_attachment(panel, path, name, size, added)
+                     VALUES(9, '~/Downloads/README.txt', 'README.txt', 640, 0)",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        w.with_fake(|f| f.clock = 200.0);
+        assert_eq!(outbox_pass(&w), 1);
+        assert_eq!(w.run_effects(), 1);
+        assert_eq!(outbox(&w).0, "sent");
+
+        let sent = w.with_fake(|f| f.server(1).submitted.clone());
+        assert_eq!(sent.len(), 1);
+        let parts = &sent[0].attachments;
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0].name.as_str(), parts[0].mime.as_str()), ("README.txt", "text/plain"));
+        // The demo tree's own reading of that file — read now, not copied
+        // into the store when it was attached.
+        assert!(String::from_utf8_lossy(&parts[0].bytes).starts_with("superapp 0.1.0"));
+
+        // A file the outside cannot read fails the send with a sentence
+        // naming it, rather than quietly sending the letter without it.
+        w.store()
+            .write(|c| {
+                c.execute("UPDATE outbox SET status='pending', send_after=0 WHERE id=9", [])?;
+                c.execute(
+                    "UPDATE draft_attachment SET path='~/Downloads/gone.txt', name='gone.txt'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        outbox_pass(&w);
+        for _ in 0..8 {
+            w.with_fake(|f| f.clock += 3600.0);
+            w.run_effects();
+        }
+        let e = w.jobs().last().and_then(|j| j.error.clone()).unwrap_or_default();
+        assert!(e.contains("cannot attach “gone.txt”"), "{e}");
+        assert_eq!(
+            w.with_fake(|f| f.server(1).submitted.len()),
+            1,
+            "the second letter never left"
+        );
+    }
+
     /// Undo inside the window deletes the pending row, so the pass never
     /// claims it and the mail never leaves.
     #[test]

@@ -139,6 +139,12 @@ pub enum Kind {
         /// The file's path, in display form.
         path: String,
     },
+    /// One part of a letter as a card (CR-010) — the same card a file
+    /// draws, over the mail's own bytes rather than the disk's.
+    Attachment {
+        /// The `attachment` row.
+        id: i64,
+    },
     /// The device-sync form: where a device is pointed at its bucket, and
     /// where the key that opens it is typed in rather than pushed over a
     /// cable (CR-005). Settings links here.
@@ -169,7 +175,7 @@ impl Kind {
             // Four wide: the header carries five verbs, and three columns
             // of `Files → Files → File` still fill a 12-grid.
             Kind::Files { .. } => (4, 6),
-            Kind::File { .. } => (4, 3),
+            Kind::File { .. } | Kind::Attachment { .. } => (4, 3),
             Kind::Bucket => (4, 2),
         }
     }
@@ -1438,6 +1444,7 @@ mod tests {
                         Kind::Job { .. } => "job",
                         Kind::Files { .. } => "files",
                         Kind::File { .. } => "file",
+                        Kind::Attachment { .. } => "attachment",
                         Kind::Bucket => "bucket",
                     })
                     .collect()

@@ -35,6 +35,7 @@ extra_args() {
     effects)  echo "--send-delay 1" ;;               # …so a job reaches the queue
     library)  echo "--library" ;;                    # the canvas, not a workspace
     files-marks) echo "--demo-disk" ;;               # the demo tree, not this machine's ~
+    attach)   echo "--demo-disk" ;;                  # …and the file a draft carries
     *)        echo "" ;;
   esac
 }

@@ -49,9 +49,12 @@ use crate::core::{self, Kind, PanelId, Seed};
 /// must be told about (CR-005). `repl_log` and `repl` are replication's own
 /// bookkeeping and are deliberately absent, so a frame a follower *applies*
 /// is never recaptured and never echoes back into the log.
+/// `attachment` is absent for a third reason: it is derived from `message.raw`,
+/// which *is* replicated, and every device re-derives it on open — so shipping
+/// the rows too would be the same facts twice.
 pub(crate) const REPLICATED: &[&str] = &[
     "meta", "account", "folder", "message", "workspace", "ws_col", "panel", "wm",
-    "server_msg", "draft", "outbox", "effect",
+    "server_msg", "draft", "draft_attachment", "outbox", "effect",
 ];
 
 /// A registered query: identity, SQL, and the one-line purpose that panel
@@ -488,6 +491,105 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
     ("account", "auth", "ALTER TABLE account ADD COLUMN auth TEXT"),
 ];
 
+/// Schema v12 (CR-010): what a letter carries, and what a draft will.
+///
+/// `attachment` is **derived**, like the HTML reading: one row per part of
+/// a mail's `raw`, holding the description a list and a card need — name,
+/// media type, size, the Content-ID an inline part wears — and `part`, the
+/// index [`crate::sync::part_bytes`] reads the bytes back by. The bytes
+/// themselves stay in `raw`; a second copy of every attachment in the
+/// mailbox is exactly the cost this design refuses.
+///
+/// Being derived, the rows are versioned by the walk that made them
+/// ([`ATTACH_VERSION`]) rather than by `user_version` — the argument
+/// [`SCHEMA_FTS`] makes at more length — and `attachment_scan` is where
+/// that version is written down, one row per mail. A **table** rather than
+/// one `meta` key, because the question is per mail and not per store: a
+/// letter that arrives through replication (a changeset apply, which runs
+/// no ingest code) has a `raw` nobody has walked yet, and this is what
+/// notices. It is also why neither table is in [`REPLICATED`]: each device
+/// derives its own from the `raw` it already has, and two devices deriving
+/// would otherwise fight over one id sequence.
+///
+/// `draft_attachment` is the other direction and is not derived at all: a
+/// compose panel's own list of files to carry out, keyed by panel like the
+/// draft it belongs to, holding the *path* rather than the bytes — the file
+/// stays where it is until the send reads it.
+///
+/// Applied by presence, like v10: the one store is shared by many builds.
+const SCHEMA_V12: &str = "
+CREATE TABLE IF NOT EXISTS attachment(
+  id      INTEGER PRIMARY KEY,
+  message INTEGER NOT NULL,
+  part    INTEGER NOT NULL,
+  name    TEXT NOT NULL,
+  mime    TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size    INTEGER NOT NULL DEFAULT 0,
+  cid     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_attachment_message ON attachment(message, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attachment_part ON attachment(message, part);
+CREATE TABLE IF NOT EXISTS attachment_scan(
+  message INTEGER PRIMARY KEY,
+  version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_attachment(
+  id    INTEGER PRIMARY KEY,
+  panel INTEGER NOT NULL,
+  path  TEXT NOT NULL,
+  name  TEXT NOT NULL,
+  size  INTEGER NOT NULL DEFAULT 0,
+  added REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_draft_attachment_panel ON draft_attachment(panel, id);
+";
+
+/// Which walk over `raw` the stored `attachment` rows came out of. Bump it
+/// and every store re-derives every letter's parts on its next open.
+const ATTACH_VERSION: i64 = 1;
+
+/// The walk version a freshly written row records — the mail domain writes
+/// those rows ([`crate::mail::attach_tx`]) and this is the one number it
+/// needs from here.
+#[must_use]
+pub fn attach_version() -> i64 {
+    ATTACH_VERSION
+}
+
+/// Derives the `attachment` rows of every mail nobody has walked at this
+/// version — the twin of [`backfill_html`], made incremental because it
+/// runs on every open and after every applied peer batch, not once.
+///
+/// The anti-join is what makes that affordable. A `WHERE raw IS NOT NULL`
+/// would decode every record as far as column 11 to answer, over the whole
+/// mailbox, every time; driving off `attachment_scan` instead reads no
+/// letter at all once they have all been walked. A mail *without* raw gets
+/// its scan row too — nothing to walk is an answer, and it should be given
+/// once.
+pub(crate) fn backfill_attachments(conn: &Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, Option<Vec<u8>>)> = conn
+        .prepare(
+            "SELECT m.id, m.raw FROM message m
+             LEFT JOIN attachment_scan s ON s.message = m.id
+             WHERE s.version IS NULL OR s.version != ?1",
+        )?
+        .query_map([ATTACH_VERSION], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, raw) in rows {
+        let parts = raw.map(|raw| crate::sync::parse_mail(&raw).attachments);
+        // No raw is not the same as no parts: the demo seed writes its own
+        // rows and this must not take them away, so only a mail there *is*
+        // something to walk is rewritten.
+        if let Some(parts) = parts {
+            crate::mail::attach_tx(conn, id, &parts)?;
+        } else {
+            crate::mail::mark_scanned_tx(conn, id)?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the store has `table` — what the table steps of the ladder go by.
 fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     conn.query_row(
@@ -828,6 +930,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 11 {
         conn.pragma_update(None, "user_version", 11)?;
     }
+    if !has_table(conn, "attachment")? || !has_table(conn, "draft_attachment")? {
+        conn.execute_batch(SCHEMA_V12)?;
+    }
+    if version < 12 {
+        conn.pragma_update(None, "user_version", 12)?;
+    }
     // The search index, rebuilt whenever its shape is not this build's. The
     // rebuild reads `message` up to `body` — no column past `raw`, so it
     // never walks a letter it does not need (see `mail::head_row`).
@@ -860,6 +968,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             [i64::from(crate::html::VERSION)],
         )?;
     }
+    // The parts a letter carries, on the same terms as its HTML reading:
+    // derived from `raw`, versioned by the walk that derived them — and
+    // asked per mail, so this costs nothing once they are all walked.
+    backfill_attachments(conn)?;
     Ok(())
 }
 
@@ -1471,6 +1583,12 @@ impl Store {
                 // (CR-005: "repl_log cleared") while `repl.next_local_seq`
                 // survives, so a re-drain never resends a stale frame.
                 tx.execute("DELETE FROM repl_log", [])?;
+                // The derived rows described the mailbox that was just
+                // replaced (CR-010). They are local, so they are dropped
+                // rather than copied, and the walk below rebuilds them from
+                // the `raw` the snapshot brought.
+                tx.execute("DELETE FROM attachment", [])?;
+                tx.execute("DELETE FROM attachment_scan", [])?;
                 tx.execute(
                     "UPDATE repl SET materialized_seq = ?1, epoch = ?2, holding = 0 WHERE id = 1",
                     rusqlite::params![materialized, epoch],
@@ -1480,6 +1598,7 @@ impl Store {
             let _ = c.execute("DETACH DATABASE snap", []);
             result
         })?;
+        self.db.raw(backfill_attachments)?;
         self.poll_external();
         Ok(())
     }
@@ -1509,6 +1628,11 @@ impl Store {
             )?;
             tx.commit()
         })?;
+        // A letter that arrives this way ran no ingest code, so nothing has
+        // walked its `raw` for the parts it carries (CR-010). Derived rows
+        // are local, so this device does its own walking — over exactly the
+        // mails the batch brought, since the scan table answers per mail.
+        self.db.raw(backfill_attachments)?;
         self.poll_external();
         Ok(())
     }
@@ -1717,6 +1841,7 @@ pub fn kind_cols(kind: &Kind) -> (&'static str, Option<i64>, Option<String>) {
         Kind::Job { id } => ("job", Some(*id), None),
         Kind::Files { dir } => ("files", None, Some(dir.clone())),
         Kind::File { path } => ("file", None, Some(path.clone())),
+        Kind::Attachment { id } => ("attachment", Some(*id), None),
         Kind::Bucket => ("bucket", None, None),
     }
 }
@@ -1745,6 +1870,7 @@ fn kind_from(kind: &str, p_int: Option<i64>, p_txt: Option<String>) -> Option<Ki
         "job" => Kind::Job { id: p_int? },
         "files" => Kind::Files { dir: p_txt? },
         "file" => Kind::File { path: p_txt? },
+        "attachment" => Kind::Attachment { id: p_int? },
         "bucket" => Kind::Bucket,
         _ => return None,
     })
@@ -1788,16 +1914,20 @@ mod tests {
              ALTER TABLE folder DROP COLUMN keywords;
              ALTER TABLE account DROP COLUMN auth;
              DROP TABLE repl_log;
-             DROP TABLE repl;",
+             DROP TABLE repl;
+             DROP TABLE attachment;
+             DROP TABLE attachment_scan;
+             DROP TABLE draft_attachment;",
         )
         .unwrap();
         let version = || -> i64 {
             c.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version(), 11, "the counter says nothing is missing");
+        assert_eq!(version(), 12, "the counter says nothing is missing");
         assert!(!has_column(&c, "message", "forwarded").unwrap());
         assert!(!has_table(&c, "repl").unwrap());
+        assert!(!has_table(&c, "attachment").unwrap());
 
         migrate(&c).unwrap();
         for (table, column, _) in SCHEMA_V11 {
@@ -1811,7 +1941,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM repl", [], |r| r.get(0))
             .unwrap();
         assert_eq!(devices, 1, "the device row is back too");
-        assert_eq!(version(), 11);
+        for t in ["attachment", "attachment_scan", "draft_attachment"] {
+            assert!(has_table(&c, t).unwrap(), "{t} is back");
+        }
+        assert_eq!(version(), 12);
 
         // And a store that has everything is left exactly as it is.
         let device: String = c

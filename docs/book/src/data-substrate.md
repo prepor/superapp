@@ -162,6 +162,27 @@ subject heuristic. A reply of yours carries the parent's whole `References`
 chain, so it threads for the other side too. A mail present twice in an
 account — your reply, in Sent and back through a list — is one message to
 the panel.
+**What a letter carries** is derived, not stored twice. An `attachment` row
+per part holds only the description a link and
+[a card](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card)
+need — name, media type, size, the Content-ID an inline part wears — plus
+the part's index into the parsed message; the bytes stay in the `raw` every
+synced mail already keeps, and a card reads them back through that index on
+a thread of its own. So the rows are versioned by the *walk* that made them
+rather than by the schema counter (the argument the search index makes, and
+for the same reason), and an `attachment_scan` row per mail says which walk
+that was. A table rather than one `meta` key because the question is per
+mail: a letter that arrives through **replication** ran no ingest code, so
+its `raw` is one nobody has walked, and this is what notices. Neither table
+replicates — every device derives its own from the `raw` it already has,
+which is also what stops two devices fighting over one id sequence.
+
+The other direction is not derived at all: `draft_attachment` is a compose
+panel's own list, keyed by panel like the draft beside it, holding each
+file's **path**. The bytes are read at submit time, through the outside —
+what leaves is the file as it stands, and a file that has moved fails the
+send by name.
+
 And because `server_msg` lives outside the undo world, undoing an
 already-pushed archive needs no compensation machinery at all — intent
 flips back, the next pass moves the mail back. A moved mail whose new uid

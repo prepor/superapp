@@ -79,10 +79,19 @@ current state; everything else in this book is settled.
     behind a FileProvider, both JNI the shell does not have. The browser
     is macOS-shaped today.
 
-15. **Mail attachments** are the reason the browser was built first and
-    are not built: `parse_mail` still drops every part that is not the
-    text or the HTML. The shape that fits: an `attachment` row per part
-    with the bytes staying in the `raw` the store already keeps, a card
-    over that instead of a path, and compose gaining `attach` bound to a
-    files panel by the join, the way `copy here` is bound to a directory.
+15. **Saving an attachment to the disk** is the one direction
+    [attachments](./interaction-grammar.md#attachments-a-part-of-a-letter-is-a-card)
+    do not go. `open` writes a part into the app's scratch directory and
+    hands it to the OS, which is enough to read one; putting it somewhere
+    you chose means `copy` on a part *holding* it and a files panel's
+    `copy here` performing it — and `copy here` is itself still a draft
+    (question 12). Both become real together, or the grammar tells two
+    different stories about the same verb.
+
+16. **A letter cannot carry a letter's part.** Compose attaches files off
+    the disk; forwarding a mail that carried something drops what it
+    carried, and `attach` cannot be pointed at an attachment card. The
+    hold is a set of *paths*, so the fix is a hold that can name a part
+    too — at which point a forward can carry the source's parts by
+    default, which is what every other client does.
 
