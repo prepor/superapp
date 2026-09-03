@@ -339,7 +339,17 @@ impl History {
                 failed
             };
             let n = self.nodes.get_mut(&id)?;
-            n.state = State::Undone;
+            // A claim that would not go back leaves the world somewhere
+            // between this node and its parent, and nobody — least of all
+            // a redo — can say where. The node is **expired**, not undone:
+            // transparent to the walk from here on, exactly as a claim the
+            // world refused outright is. The layout still lands, because
+            // the snapshot is ours and stranding the tree helps nobody.
+            n.state = if failed.is_empty() {
+                State::Undone
+            } else {
+                State::Expired
+            };
             let step = Step {
                 label: n.label.clone(),
                 snap: n.before.clone(),
@@ -376,7 +386,13 @@ impl History {
             failed
         };
         let n = self.nodes.get_mut(&id)?;
-        n.state = State::Applied;
+        // The same on the way forward: a re-application that failed is not
+        // a node the tree may claim to have applied.
+        n.state = if failed.is_empty() {
+            State::Applied
+        } else {
+            State::Expired
+        };
         let step = Step {
             label: n.label.clone(),
             snap: n.after.clone(),
@@ -411,10 +427,15 @@ impl History {
         let tc = chain(target);
         let lca = *hc.iter().find(|id| tc.contains(id))?;
 
+        // What every leg of the walk could not give back, kept for the one
+        // step that comes out of it.
+        let mut walked: Vec<String> = Vec::new();
         while self.head != lca {
             let before = self.head;
-            if self.undo(w).is_none() && self.head == before {
-                break; // nothing left to walk
+            match self.undo(w) {
+                Some(step) => walked.extend(step.failed),
+                None if self.head == before => break, // nothing left to walk
+                None => {}
             }
         }
 
@@ -443,13 +464,18 @@ impl History {
             let Some(n) = self.nodes.get_mut(&id) else {
                 continue;
             };
-            n.state = State::Applied;
+            n.state = if failed.is_empty() {
+                State::Applied
+            } else {
+                State::Expired
+            };
+            walked.extend(failed);
             last = Some(Step {
                 label: n.label.clone(),
                 snap: n.after.clone(),
                 marks: n.marks.clone(),
                 undone: false,
-                failed,
+                failed: Vec::new(),
             });
             self.head = id;
         }
@@ -467,10 +493,27 @@ impl History {
                 snap,
                 marks: Vec::new(),
                 undone: true,
-                failed: Vec::new(),
+                failed: walked,
             });
         }
-        last
+        // Every leg's failures land on the one step the shell sees: a
+        // travel is one move as far as anyone watching is concerned, and a
+        // reversal that would not go halfway up must not be swallowed by
+        // the legs after it.
+        let mut step = last.or_else(|| {
+            // A travel that only walked *up* has no node to re-apply, and
+            // it has still moved the head: the landing is where it stopped.
+            let n = self.nodes.get(&self.head)?;
+            Some(Step {
+                label: n.label.clone(),
+                snap: n.after.clone(),
+                marks: Vec::new(),
+                undone: false,
+                failed: Vec::new(),
+            })
+        })?;
+        step.failed = walked;
+        Some(step)
     }
 
     /// The whole tree plus the cursor — what the overlay draws.
@@ -674,9 +717,12 @@ mod tests {
         assert_eq!(step.label, "delete “notes.txt”");
         assert_eq!(step.failed, ["delete would not go back"]);
         assert_eq!(said(&step.failed), " — but delete would not go back");
-        // …and the same on the way forward.
-        let step = h.redo(&w).expect("redone");
-        assert_eq!(step.failed, ["delete would not go again"]);
+        // …and the node is expired, not undone: the world is somewhere
+        // between it and its parent, and a redo may not pretend to know
+        // where. The walk goes past it from here on.
+        assert_eq!(h.rows().0[0].state, "expired");
+        assert!(h.redo(&w).is_none(), "nothing to re-apply");
+        assert!(!h.can_undo(), "and nothing behind it either");
         // A walk that gave everything back says nothing extra.
         assert_eq!(said(&[]), "");
     }

@@ -326,14 +326,22 @@ takes the whole batch back, and puts the marks it consumed back with it
 alone). A reversal is asked of the disk before it is made, and expires
 honestly when the world has moved on: a directory that is no longer empty,
 a trash that has been emptied, a name something else has taken since — and
-a path that is *there* but is not **what this action put there**, which is
-not the same question at all, because undo takes things away. Each verb
-reads back what it wrote the moment after, and a reversal compares before
-it moves anything. An expired node goes transparent, exactly as a sent
-mail's does — the walk says so and carries on rather than writing over
-what is there now. A reversal that fails while it is being made — the disk
-moved between the asking and the doing — does every path it holds anyway
-and names the ones that would not go, in the same toast as the walk.
+a path that is *there* but is not **the object this action put there**,
+which is not the same question at all, because undo takes things away. Each
+verb reads back the object it wrote the moment after — the disk's own
+identity for it, not its name, size and date, which a stranger can match
+exactly — and a reversal compares before it moves anything. A record that
+never learned what it made refuses outright: undo may decline, it may not
+guess. An expired node goes transparent, exactly as a sent mail's does —
+the walk says so and carries on rather than writing over what is there now.
+
+A reversal that fails *while* it is being made — the disk moved between
+the asking and the doing — does every path it holds anyway, names the ones
+that would not go in the same toast as the walk, and **expires its node**.
+The layout still lands, because the snapshot is ours and stranding the
+tree helps nobody; but the world is now somewhere between that node and
+its parent, and nothing, least of all a redo, can say where. Expired is
+exactly what that is.
 
 Nothing watches the disk, so a verb that wrote it tells the listings
 itself — every files panel on screen, since a copy changes the directory

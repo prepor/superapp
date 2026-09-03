@@ -5,9 +5,11 @@
 //! The disk is **outside** (see [`crate::effect::Outside`]): a listing is
 //! read through it during draw, `open` hands a path to the OS through it,
 //! and so does every verb that writes — `new dir`, a copy, a move, and
-//! the trash a delete is. None of them is `rm`: what a delete takes goes
-//! to the trash, and undo moves it back, so every one of them is an
-//! [`Intent`] a history node can give back. The [`demo`] tree is what the
+//! the trash a delete is. None of them removes anything anyone had: what a
+//! delete takes goes to the trash, and undo moves it back, so every one of
+//! them is an [`Intent`] a history node can give back — and each records
+//! the **object** it wrote, not just the path, so a reversal can tell its
+//! own work from a stranger standing at the same name. The [`demo`] tree is what the
 //! fake outside serves — the panels library's worlds, the tests, an e2e
 //! run under `--demo-disk` — and it takes the writes too, so a suite
 //! proves the verbs on a fixture instead of on somebody's home.
@@ -96,6 +98,21 @@ impl Entry {
             modified,
         }
     }
+}
+
+/// What the **disk** calls an object, as opposed to what a path calls it:
+/// the device and inode `lstat` reports. Two paths with this id are the
+/// same object; a path whose id has changed wears the same name over a
+/// different thing — which is the one question a reversal has to ask
+/// before it takes something away, because a name is cheap to reuse and
+/// undo is not a suggestion.
+///
+/// Never off `metadata`: that follows links, and a link replaced by a
+/// link to the same target would answer the same twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// What a file is, off its extension — the card's word and `@kind:`.
@@ -454,6 +471,16 @@ pub fn read_in(world: &World, path: &str, max: usize) -> Result<Vec<u8>, String>
     world.outside(|o| o.read_file(&real_path(path), max))
 }
 
+/// What the disk calls the object at this path — `None` for nothing there
+/// **and** for a disk that would not say, which a reversal treats the same
+/// way: it refuses.
+pub fn id_in(world: &World, path: &str) -> Option<FileId> {
+    world
+        .outside(|o| o.file_id(&real_path(path)))
+        .ok()
+        .flatten()
+}
+
 // -- the card ------------------------------------------------------------------
 
 /// What a card draws, whichever side it came from: a file on the disk
@@ -655,9 +682,11 @@ pub fn plural(n: usize) -> String {
 // Four verbs, each an effect ([`crate::effect::Effect`]) — the store cannot
 // reproduce what happens on a disk — performed where the click is, the way
 // `clip` and `open` are: the wait for a copy is the wait for the listing
-// that follows it. Nothing here is `rm`. What a delete takes goes to the
-// trash, and undo moves it back; even the reversal of a copy trashes what
-// the copy made, so no path this app touches is ever unrecoverable.
+// that follows it. No path anyone ever *had* is removed: what a delete
+// takes goes to the trash, and undo moves it back; even the reversal of a
+// copy trashes what the copy made. (The half-tree of a copy that failed is
+// swept rather than trashed — see [`crate::effect::Real::copy_path`] — but
+// that is a name no panel ever listed.)
 
 /// `new dir`: one directory, where nothing is yet.
 ///
@@ -820,30 +849,23 @@ pub fn plan_here(world: &World, hold: &Hold, dir: &str) -> Plan {
 pub struct Done {
     pub from: String,
     pub to: String,
-    /// The disk's account of `to`, read the moment after the write. `None`
-    /// where even that could not be read — then only presence can honestly
-    /// be asked of it.
-    pub landed: Option<Entry>,
+    /// The object the disk had at `to` the moment after the write. `None`
+    /// where the disk would not say — and then the reversal is refused
+    /// rather than guessed at, because undo takes things away.
+    pub landed: Option<FileId>,
 }
 
 impl Done {
-    /// The record of a step just performed: its destination as the disk
-    /// has it now.
+    /// The record of a step just performed: the object the disk now has at
+    /// its destination.
     #[must_use]
     pub fn of(world: &World, from: &str, to: &str) -> Done {
         Done {
             from: from.to_string(),
             to: to.to_string(),
-            landed: stat_in(world, to),
+            landed: id_in(world, to),
         }
     }
-}
-
-/// Why a path can no longer be given back: there is nothing there.
-fn gone(world: &World, path: &str) -> Option<String> {
-    stat_in(world, path)
-        .is_none()
-        .then(|| format!("“{}” is no longer there", basename(path)))
 }
 
 /// Why a path cannot be put back: something else took the name.
@@ -854,16 +876,21 @@ fn occupied(world: &World, path: &str) -> Option<String> {
 }
 
 /// Why what is at `path` is not this action's to take away: nothing is
-/// there, or what is there is not what the action put there — a file
-/// deleted and replaced, a directory somebody has since written into. A
-/// record with no entry asks for presence alone, which is all it can
-/// honestly ask.
-fn ours(world: &World, path: &str, landed: Option<&Entry>) -> Option<String> {
-    match (stat_in(world, path), landed) {
-        (None, _) => gone(world, path),
-        (Some(now), Some(was)) if now != *was => {
-            Some(format!("“{}” is not what was put there", basename(path)))
-        }
+/// there, or the thing there is a different object wearing the same name —
+/// a file deleted and replaced, a directory made again from scratch. The
+/// question is asked of the **object**, not the path, because a name is
+/// cheap to reuse and a reversal removes what it finds.
+///
+/// Fail closed: a record that never learned what it made, or a disk that
+/// will not say now, refuses. Undo may decline; it may not guess.
+fn ours(world: &World, path: &str, landed: Option<FileId>) -> Option<String> {
+    let name = basename(path);
+    match (id_in(world, path), landed) {
+        (None, _) => Some(format!("“{name}” is no longer there")),
+        (_, None) => Some(format!(
+            "“{name}” cannot be told apart from what is there now"
+        )),
+        (Some(now), Some(was)) if now != was => Some(format!("“{name}” is not what was put there")),
         _ => None,
     }
 }
@@ -906,7 +933,7 @@ impl Intent for Copied {
         self.done
             .borrow()
             .iter()
-            .find_map(|d| ours(w, &d.to, d.landed.as_ref()))
+            .find_map(|d| ours(w, &d.to, d.landed))
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
@@ -921,7 +948,7 @@ impl Intent for Copied {
         let mut done = self.done.borrow_mut();
         all(done.iter_mut().map(|d| {
             copy_in(w, &d.from, &d.to)?;
-            d.landed = stat_in(w, &d.to);
+            d.landed = id_in(w, &d.to);
             Ok(())
         }))
     }
@@ -950,7 +977,7 @@ impl Intent for Moved {
         self.done
             .borrow()
             .iter()
-            .find_map(|d| ours(w, &d.to, d.landed.as_ref()).or_else(|| occupied(w, &d.from)))
+            .find_map(|d| ours(w, &d.to, d.landed).or_else(|| occupied(w, &d.from)))
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
@@ -965,7 +992,7 @@ impl Intent for Moved {
         let mut done = self.done.borrow_mut();
         all(done.iter_mut().map(|d| {
             move_in(w, &d.from, &d.to)?;
-            d.landed = stat_in(w, &d.to);
+            d.landed = id_in(w, &d.to);
             Ok(())
         }))
     }
@@ -998,9 +1025,12 @@ impl Intent for Deleted {
     fn blocked(&self, w: &World) -> Option<String> {
         self.done.borrow().iter().find_map(|d| {
             let name = basename(&d.from);
-            match stat_in(w, &d.to) {
-                None => Some(format!("“{name}” is not in the trash any more")),
-                Some(now) if d.landed.as_ref().is_some_and(|was| now != *was) => {
+            match (id_in(w, &d.to), d.landed) {
+                (None, _) => Some(format!("“{name}” is not in the trash any more")),
+                (_, None) => Some(format!(
+                    "“{name}” cannot be told apart from what is in the trash"
+                )),
+                (Some(now), Some(was)) if now != was => {
                     Some(format!("“{name}” in the trash is not what went there"))
                 }
                 _ => occupied(w, &d.from),
@@ -1020,7 +1050,7 @@ impl Intent for Deleted {
         let mut done = self.done.borrow_mut();
         all(done.iter_mut().map(|d| {
             d.to = trash_in(w, &d.from)?;
-            d.landed = stat_in(w, &d.to);
+            d.landed = id_in(w, &d.to);
             Ok(())
         }))
     }
@@ -1032,6 +1062,22 @@ impl Intent for Deleted {
 /// directory needs no identity of its own: one is exactly like another.
 pub struct MadeDir {
     pub path: String,
+    /// The directory this made, as the disk numbers it. One empty
+    /// directory looks exactly like another, so without this an undo would
+    /// happily trash somebody else's — a redo mints a new one, so it is
+    /// rewritten rather than assumed.
+    pub landed: std::cell::RefCell<Option<FileId>>,
+}
+
+impl MadeDir {
+    /// The record of a directory just made.
+    #[must_use]
+    pub fn of(world: &World, path: &str) -> MadeDir {
+        MadeDir {
+            path: path.to_string(),
+            landed: std::cell::RefCell::new(id_in(world, path)),
+        }
+    }
 }
 
 impl Intent for MadeDir {
@@ -1040,7 +1086,7 @@ impl Intent for MadeDir {
     }
 
     fn blocked(&self, w: &World) -> Option<String> {
-        if let Some(why) = gone(w, &self.path) {
+        if let Some(why) = ours(w, &self.path, *self.landed.borrow()) {
             return Some(why);
         }
         match list_in(w, &self.path) {
@@ -1055,7 +1101,9 @@ impl Intent for MadeDir {
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        make_dir_in(w, &self.path)
+        make_dir_in(w, &self.path)?;
+        *self.landed.borrow_mut() = id_in(w, &self.path);
+        Ok(())
     }
 }
 
@@ -1339,9 +1387,23 @@ pub mod demo {
     /// fake worlds independent of each other.
     #[derive(Debug, Clone)]
     pub struct Disk {
-        /// Display path → what is there; a file carries its bytes. The two
-        /// roots are in here as directories, so nothing special-cases them.
-        nodes: BTreeMap<String, (Entry, Vec<u8>)>,
+        /// Display path → what is there. The two roots are in here as
+        /// directories, so nothing special-cases them.
+        nodes: BTreeMap<String, Node>,
+        /// The next object number. A fixture needs identity for the same
+        /// reason a disk does — a reversal asks whether the thing at a
+        /// path is the thing it put there — so a node gets one when it is
+        /// **made**: a move carries it (a rename keeps the inode) and a
+        /// copy takes a fresh one (a copy is another object).
+        next: u64,
+    }
+
+    /// One thing on the demo disk.
+    #[derive(Debug, Clone)]
+    struct Node {
+        entry: Entry,
+        bytes: Vec<u8>,
+        id: u64,
     }
 
     impl Default for Disk {
@@ -1354,29 +1416,46 @@ pub mod demo {
         /// The fixture, as it stands before anything has written to it.
         #[must_use]
         pub fn new() -> Disk {
-            let mut nodes = BTreeMap::new();
+            let mut d = Disk {
+                nodes: BTreeMap::new(),
+                next: 1,
+            };
             for root in [HOME, ROOT] {
                 if let Some(e) = entry(root) {
-                    nodes.insert(root.to_string(), (e, Vec::new()));
+                    d.put(root, e, Vec::new());
                 }
             }
             for fx in TREE {
-                nodes.insert(
-                    fx.path.to_string(),
-                    (entry_of(fx), bytes_of(fx.path).unwrap_or_default()),
-                );
+                d.put(fx.path, entry_of(fx), bytes_of(fx.path).unwrap_or_default());
             }
-            Disk { nodes }
+            d
+        }
+
+        /// A node with a fresh object number — what making something does.
+        fn put(&mut self, path: &str, entry: Entry, bytes: Vec<u8>) {
+            let id = self.next;
+            self.next += 1;
+            self.nodes
+                .insert(path.to_string(), Node { entry, bytes, id });
         }
 
         fn dir_at(&self, path: &str) -> bool {
-            self.nodes.get(path).is_some_and(|(e, _)| e.is_dir)
+            self.nodes.get(path).is_some_and(|n| n.entry.is_dir)
         }
 
         /// The entry at a path, `None` for what the disk does not have.
         #[must_use]
         pub fn entry(&self, path: &str) -> Option<Entry> {
-            self.nodes.get(path).map(|(e, _)| e.clone())
+            self.nodes.get(path).map(|n| n.entry.clone())
+        }
+
+        /// The object at a path, as this disk numbers them — the fixture's
+        /// answer to `lstat`'s device and inode.
+        #[must_use]
+        pub fn id(&self, path: &str) -> Option<super::FileId> {
+            self.nodes
+                .get(path)
+                .map(|n| super::FileId { dev: 1, ino: n.id })
         }
 
         /// One directory's listing, in the browser's order.
@@ -1392,7 +1471,7 @@ pub mod demo {
                 .nodes
                 .iter()
                 .filter(|(p, _)| parent(p) == Some(dir))
-                .map(|(_, (e, _))| e.clone())
+                .map(|(_, n)| n.entry.clone())
                 .collect();
             sort(&mut v);
             Ok(v)
@@ -1404,11 +1483,11 @@ pub mod demo {
         ///
         /// If there is no such file.
         pub fn read(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
-            let (_, bytes) = self
+            let node = self
                 .nodes
                 .get(path)
                 .ok_or_else(|| format!("{path}: no such file"))?;
-            let mut out = bytes.clone();
+            let mut out = node.bytes.clone();
             out.truncate(max);
             Ok(out)
         }
@@ -1453,7 +1532,7 @@ pub mod demo {
                 size: 0,
                 modified: now,
             };
-            self.nodes.insert(path.to_string(), (e, Vec::new()));
+            self.put(path, e, Vec::new());
             Ok(())
         }
 
@@ -1476,10 +1555,13 @@ pub mod demo {
                 return Err(format!("{from} is inside itself"));
             }
             for p in self.subtree(from) {
-                let (mut e, bytes) = self.nodes[&p].clone();
+                let node = self.nodes[&p].clone();
                 let dest = format!("{to}{}", &p[from.len()..]);
+                let mut e = node.entry;
                 e.name = basename(&dest).to_string();
-                self.nodes.insert(dest, (e, bytes));
+                // A fresh number each: a copy is another object, however
+                // alike its bytes.
+                self.put(&dest, e, node.bytes);
             }
             Ok(())
         }
@@ -1491,8 +1573,17 @@ pub mod demo {
         /// As [`Disk::copy`].
         pub fn mv(&mut self, from: &str, to: &str) -> Result<(), String> {
             self.copy(from, to)?;
+            // The objects go with the names: a rename keeps the inode, so
+            // the moved nodes carry the numbers they had rather than the
+            // fresh ones the copy just minted.
             for p in self.subtree(from) {
-                self.nodes.remove(&p);
+                let Some(old) = self.nodes.remove(&p) else {
+                    continue;
+                };
+                let dest = format!("{to}{}", &p[from.len()..]);
+                if let Some(n) = self.nodes.get_mut(&dest) {
+                    n.id = old.id;
+                }
             }
             Ok(())
         }
@@ -2500,6 +2591,43 @@ mod tests {
         );
     }
 
+    /// Identity, not the name. A reversal asks the disk *which object* is
+    /// at the path, because a name is cheap to reuse and undo takes things
+    /// away — the same size and the same times are not the same file.
+    #[test]
+    fn a_reversal_knows_its_own_object_from_a_stranger() {
+        let w = world();
+        let (from, to) = ("~/Downloads/README.txt", "~/Desktop/README.txt");
+        copy_in(&w, from, to).unwrap();
+        let intent = Copied::new(vec![Done::of(&w, from, to)]);
+        assert!(intent.blocked(&w).is_none());
+        // Taken away, and a copy of the very same source put back in its
+        // place: the same name, the same size, the same modified time —
+        // and a different object, which is the only thing that counts.
+        trash_in(&w, to).unwrap();
+        copy_in(&w, from, to).unwrap();
+        assert_eq!(
+            stat_in(&w, to),
+            stat_in(&w, from),
+            "indistinguishable by everything a listing shows"
+        );
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“README.txt” is not what was put there".into())
+        );
+        // And a record that never learned what it made refuses outright:
+        // undo may decline, it may not guess.
+        let blind = Copied::new(vec![Done {
+            from: from.into(),
+            to: to.into(),
+            landed: None,
+        }]);
+        assert_eq!(
+            blind.blocked(&w),
+            Some("“README.txt” cannot be told apart from what is there now".into())
+        );
+    }
+
     /// A reversal does every path it holds before it complains: stopping
     /// at the first failure would leave half a batch untouched, and
     /// nothing to say about which half.
@@ -2536,9 +2664,7 @@ mod tests {
             make_dir_in(&w, "~/Desktop/2026").is_err(),
             "a name the directory already has"
         );
-        let intent = MadeDir {
-            path: "~/Desktop/2026".into(),
-        };
+        let intent = MadeDir::of(&w, "~/Desktop/2026");
         assert!(intent.blocked(&w).is_none());
         // Something arrived in it: the reversal has expired, honestly.
         copy_in(&w, "~/Downloads/README.txt", "~/Desktop/2026/README.txt").unwrap();
@@ -2552,6 +2678,15 @@ mod tests {
         assert!(stat_in(&w, "~/Desktop/2026").is_none());
         intent.reapply(&w).unwrap();
         assert!(is_dir_in(&w, "~/Desktop/2026"));
+        // One empty directory is exactly like another to look at, so this
+        // one is known by its object too: somebody else's, made at the
+        // same name, is not the one to take away.
+        trash_in(&w, "~/Desktop/2026").unwrap();
+        make_dir_in(&w, "~/Desktop/2026").unwrap();
+        assert_eq!(
+            intent.blocked(&w),
+            Some("“2026” is not what was put there".into())
+        );
     }
 
     /// Every write goes through the outside, and a world that has none

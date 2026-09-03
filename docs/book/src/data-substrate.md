@@ -103,17 +103,28 @@ what makes a delete an ordinary move to undo, and it is the only way this
 app takes a path away — the reversal of a copy uses it too.
 
 A destination is claimed by the kernel, never by a check: a copy makes its
-file with `O_EXCL` before writing through it, a directory with `create_dir`,
-and a move renames with macOS' `renamex_np` and `RENAME_EXCL`. Plain
-`rename` and `fs::copy` replace what they find, and a check before them is
-a window another program can write into — the sentence on the status line
-is worth a check, but not the file. Two more refusals are the same
-carefulness: a destination inside its own source, asked of the *resolved*
-paths so an alias in the middle cannot make a copy feed itself its own
-output; and anything that is not a file, a directory or a link, because
-opening a FIFO blocks until somebody writes to it and these verbs run on
-the frame of the click. A copy that fails partway sends what it had already
-made to the trash rather than leaving a half-tree nobody asked for.
+file with `O_EXCL` and then writes **through that descriptor** — reopening
+the name would give a racer room to unlink the empty file and leave one of
+their own to be truncated — a directory with `create_dir`, and a move
+renames with macOS' `renamex_np` and `RENAME_EXCL`. Plain `rename` and
+`fs::copy` replace what they find, and a check before them is a window
+another program can write into: the sentence on the status line is worth a
+check, but not the file. Two more refusals are the same carefulness: a
+destination inside its own source, asked of the *resolved* paths so an
+alias in the middle cannot make a copy feed itself its own output; and
+anything that is not a file, a directory or a link, because opening a FIFO
+blocks until somebody writes to it and these verbs run on the frame of the
+click.
+
+A copy that fails partway takes back what it had already made — and only
+that: the claim on the destination is also the record of whose it is, so a
+failure that never got the name leaves whatever is standing there alone.
+This is the one thing the app *removes* rather than trashes, and it is the
+narrow case that earns it: a tree this process made, that no panel ever
+listed and no one ever had, is not a deletion, and filling somebody's trash
+with failed attempts would be the ruder of the two. The far side of a
+cross-volume move goes the same way when the source will not move: a move
+either happened or it did not.
 
 What that buys is what every backend buys: the real one reads and writes
 the disk, hands a path to the OS (`/usr/bin/open` on macOS) and trashes

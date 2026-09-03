@@ -1779,6 +1779,27 @@ impl State {
             self.toast("read-only — acquire the lease to write", true);
             return None;
         }
+        self.act_done(kind, label, entity, mutate, data, intents)
+    }
+
+    /// [`State::act`] with the gate already asked, for an action whose
+    /// claim on the world has **already happened**: the file browser's
+    /// verbs reach the disk on the frame of the click, and a disk takes
+    /// writes a follower's store will not. By the time one of those calls
+    /// this, the question is no longer whether to refuse — it is that a
+    /// change with no node behind it would be a change nobody can undo.
+    /// The caller asks [`State::writable`] before it writes, and again
+    /// after; what it does about a lease that turned over in between is
+    /// compensation, not refusal.
+    fn act_done<R: Send + 'static>(
+        &mut self,
+        kind: &str,
+        label: String,
+        entity: Option<String>,
+        mutate: impl FnOnce(&mut Wm),
+        data: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<R> + Send + 'static,
+        intents: Vec<Box<dyn crate::history::Intent>>,
+    ) -> Option<R> {
         let before = self.ws.snapshot();
         mutate(&mut self.ws);
         let snap = self.ws.snapshot();
@@ -3474,6 +3495,13 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // A walk gives claims back, and a claim can be a file — which a
+        // follower's disk would take even though its store would not
+        // (CR-005). The gate belongs on the walk, not only on the action.
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
         let was = state.ws.active;
         let step = state.history.undo(&state.world);
         let mut marks = None;
@@ -3507,6 +3535,13 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
+        // A walk gives claims back, and a claim can be a file — which a
+        // follower's disk would take even though its store would not
+        // (CR-005). The gate belongs on the walk, not only on the action.
+        if !state.writable() {
+            state.toast("read-only — acquire the lease to write", true);
+            return;
+        }
         let was = state.ws.active;
         let step = state.history.redo(&state.world);
         let mut marks = None;
@@ -4079,6 +4114,10 @@ impl Stage {
                 return;
             }
             Act::HistoryRow(id) => {
+                if !state.writable() {
+                    state.toast("read-only — acquire the lease to write", true);
+                    return;
+                }
                 let was = state.ws.active;
                 let step = state.history.travel(&state.world, id);
                 let mut marks = None;
@@ -4999,17 +5038,41 @@ impl Stage {
             return;
         }
         let here = crate::files::basename(dir).to_string();
-        state.act(
+        let intent: Box<dyn crate::history::Intent> =
+            Box::new(crate::files::MadeDir::of(&state.world, &path));
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
             "new dir",
             format!("new dir “{name}/” in {here}"),
             None,
             |_| {},
             |_| Ok::<(), rusqlite::Error>(()),
-            vec![Box::new(crate::files::MadeDir { path }) as Box<dyn crate::history::Intent>],
+            vec![intent],
         );
         state.toast(format!("created “{name}/” in {here} — ⌘z undoes"), false);
         self.refresh_files(cx);
         self.kick(cx);
+    }
+
+    /// Asked after a disk verb has written and before its node is
+    /// recorded: whether the lease turned over in between (CR-005). If it
+    /// did, the claim is given straight back — a change with no node
+    /// behind it is a change nobody can undo — and the sentence says both
+    /// what happened and what became of it.
+    fn lost_the_lease(state: &State, intent: &dyn crate::history::Intent) -> Option<String> {
+        if state.writable() {
+            return None;
+        }
+        let line = "read-only — the lease turned over";
+        Some(match intent.reverse(&state.world) {
+            Ok(()) => format!("{line}; what was done has been put back"),
+            Err(e) => format!("{line}, and putting it back failed: {e}"),
+        })
     }
 
     /// `copy here` / `move here`: the held set performed into the directory
@@ -5126,7 +5189,13 @@ impl Stage {
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        state.act(
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
             hold.op.verb(),
             format!("{} {what} into {here}", hold.op.verb()),
             // No coalescing scope: a verb that wrote a disk is its own
@@ -5248,11 +5317,17 @@ impl Stage {
             .into_iter()
             .filter(|n| gone.iter().any(|g| crate::files::basename(g) == n))
             .collect();
-        let intent = crate::files::Deleted::new(trashed);
+        let intent: Box<dyn crate::history::Intent> = Box::new(crate::files::Deleted::new(trashed));
         let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        state.act(
+        if let Some(why) = Self::lost_the_lease(state, intent.as_ref()) {
+            state.toast(why, true);
+            self.refresh_files(cx);
+            self.kick(cx);
+            return;
+        }
+        state.act_done(
             "delete",
             format!("delete {what}"),
             None,
@@ -5262,7 +5337,7 @@ impl Stage {
                 }
             },
             |_| Ok::<(), rusqlite::Error>(()),
-            vec![Box::new(intent) as Box<dyn crate::history::Intent>],
+            vec![intent],
         );
         // What was held is not there any more; a hold with nothing left in
         // it is no hold.
