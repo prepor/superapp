@@ -25,7 +25,10 @@ directly:
   device sync carries from one device to the other. It reinstates
   `buildtime_bindgen` on the android cross-build, a known-good configuration.
   SQLite's **JSON1** functions carry the effect queue's payloads (TEXT, not
-  JSONB — a shell must be able to read them).
+  JSONB — a shell must be able to read them), and `json_each` is how the
+  effect log joins the in-memory ring to the queue: a scalar function
+  registered on every reader hands the ring over as one array, so a page of
+  the log is still one query.
 - **`serde` + `serde_json`** — effects are serializable values, and the
   deferred ones are JSON payloads in the `effect` table; the device-sync
   `state` object and batch headers are JSON too.

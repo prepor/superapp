@@ -68,6 +68,10 @@ value a typed tag cannot read (`@date>yesterday`). A tag being typed at
 the end of the line is not wrong yet, so its error waits until the caret
 leaves. A date is written `dd.mm.yyyy` and is a **span**: `@date>D` means
 after that day, `@date:D` on it, `@date:"30.08.2026 09:14"` that minute.
+`@not:` is a **complement**, not a bare SQL `NOT`: a column with no answer
+makes the inner expression NULL, and `NOT NULL` is NULL, so those rows
+would otherwise fall out of both halves of a tag — `@not:risky` has to keep
+the effects nobody was ever going to retry.
 
 A mailbox's tags: `@unread`, `@html`, `@from:` (senders, dynamic),
 `@subject:`, `@date`, `@account:` (dynamic) — one table for all four lists,
@@ -217,8 +221,17 @@ a `Suggest` over that table, as the inbox's is; the filter field, the error
 line and the paging loop are the inbox panel's, and the next list kind
 lifts them as they are.
 
-The effect log (`effect::LOG`) is what that costs, measured: a flat spec
-over one table, nine tags, a row decoder shared with the queue's own
-helpers, and a panel that lifted the inbox's filter, error line and paging
-loop unchanged. It carries no aggregate and no group key — so it is also
-the plain case the inbox's grouping is the exception to.
+The effect log (`effect::LOG`) is what that costs, measured: a flat spec,
+thirteen tags, a row decoder shared with the queue's own helpers, and a panel
+that lifted the inbox's filter, error line and paging loop unchanged. It
+carries no aggregate and no group key — so it is also the plain case the
+inbox's grouping is the exception to.
+
+Its `from` is the one that is not a table: the queue `UNION ALL` the
+in-memory effect ring, read through a scalar function
+([the ring](./data-substrate.md#the-ring-the-effects-that-were-never-rows)).
+Everything above the `FROM` is unchanged by that — which is the point of
+putting the join in SQL rather than in the panel. The one thing a spec has
+to say for itself there is `deps`: rows that were never in the database are
+invisible to the authorizer, so a query that reads them names that
+dependency instead of having it captured.

@@ -79,7 +79,9 @@ the lease is **stranded**: read-only, recovery by hand, never a silent merge.
 Effects are values that describe themselves in one line and know how to do
 themselves, behind one swappable backend — the real one, an in-memory fake,
 or one that refuses everything. That last is what lets a panel be drawn in
-isolation without it quietly sending mail.
+isolation without it quietly sending mail. Each also says whether it
+**changed** the world or only asked it something; that is what the effects
+panel opens narrowed to.
 
 ## The disk
 
@@ -316,13 +318,87 @@ finishes on screen. A preview costs the world nothing here: looking at a
 record establishes no fact, which is the one way this pair differs from the
 inbox's.
 
-The filter is the table's own grammar over the queue's columns: `@failed`,
-`@live`, `@retried`, `@risky` (the work a crash cannot retry for you),
-`@kind:`, `@entity:`, `@attempts>3`, `@date:`, and bare words over the
-payload — which is where a uid or an address actually lives. Nothing in the
-panel writes: the queue is the executor's to move, and a page of it is a
-cached, reactive query like any other, so a job running redraws the rows on
-screen and nothing else.
+The filter is the table's own grammar over the log's columns: `@wrote` /
+`@read`, `@failed`, `@live`, `@retried`, `@risky` (the work a crash cannot
+retry for you), `@memory` / `@filed`, `@kind:`, `@entity:`, `@attempts>3`,
+`@date:`, and bare words over the payload — which is where a uid or an
+address actually lives. Nothing in the panel writes: the queue is the
+executor's to move, and a page of it is a cached, reactive query like any
+other, so a job running redraws the rows on screen and nothing else.
+
+The panel **opens on `@wrote`**. A sync pass asks the outside a dozen
+questions for every answer it acts on — connect, select, search, fetch, and
+again next minute — so an unfiltered log is mostly the app clearing its
+throat, and what a human came for (what was *changed* out there, and
+whether it worked) is buried under it. Every effect answers
+`Effect::writes` for itself: a `MOVE`, a `STORE`, a send, a file written, a
+password filed changed the world; a `FETCH`, a `SEARCH`, a listing, the
+clock, a password recalled did not — and neither did a connect, which makes
+the rest possible and nothing more. There is no default on that method: a
+new effect that guessed would either bury the panel or vanish from it, and
+neither failure announces itself, so the compiler asks. The answer is
+copied onto the row at enqueue time exactly as `idempotent` is, so
+filtering never decodes a payload — and it is on the row rather than
+derived from the kind, so a queue written by a build whose effects this one
+no longer has still filters.
+
+The default is **typed into the field**, not folded into the query. What
+narrows the list is on screen and one `cmd+a` clears it: a default, not a
+rule about what the panel can show.
+
+### The ring: the effects that were never rows
+
+Half the effects this app performs are never filed. A connect, a fetch, a
+folder listing, a clipboard write — nobody retries them, nobody waits on a
+row for them, and their answers are values the caller needs now. "Written
+nowhere" used to mean "gone the moment they returned": a connect that
+failed lived exactly as long as the string it handed back.
+
+The **ring** keeps the last two hundred of them in memory — the kind, whose
+they were, the same `describe` sentence, and what the outside said if it
+refused. Nothing is written, nothing replicates, a restart forgets it. It
+is not a concession on the rule; it is a record *about* effects rather than
+a result of one.
+
+"Whose they were" is the same question a filed job answers, so it is asked
+one trait higher: `entity` moved from the deferred half to `Effect` itself,
+and `@entity:account:1` now finds the connect as well as the move it
+preceded. It is a label here and nothing more — claim routing reads the
+`effect` table's own column, and a ring row was never in it.
+
+The log joins it to the queue **in SQL**, as one more arm of the same
+query. That is the whole design decision: an in-memory effect arriving as a
+second list beside the first would have needed its own filter, its own
+paging and its own idea of order, and the three would have drifted. As a
+`UNION ALL` arm it gets the real ones — `@kind:connect` narrows the ring
+the way `@kind:move` narrows the queue, and the two interleave by when they
+happened. A ring row's id is its place in the ring, **negated**, so the two
+streams share one total order and one unique key and can never collide;
+`@memory` and `@filed` are `e.id < 0` and `e.id > 0`, and a row with no
+answer for a column carries `NULL` rather than a plausible zero — which is
+why `@risky` (`idempotent = 0`) never sweeps in an effect nobody was going
+to retry.
+
+Two mechanics pay for it. The ring is queryable from a `query_only`
+connection because it arrives through a **scalar function** every reader is
+taught at open (`mem_effects()`, one JSON array) — nothing is written to
+serve it. And because rows out of memory are invisible to SQLite's read-set,
+the authorizer cannot capture that dependency, so the log's spec is the one
+that **declares** it (`SqlSpec::deps`) and the ring carries a version the
+way the database carries `PRAGMA data_version`. A reader compares the two on
+the same poll: the UI's log shows what a sync worker reached for, and a page
+that read the ring goes stale when the ring moves.
+
+The clock is the one exception, and deliberately: `World::now()` is asked
+several times a frame, and a ring of clock readings would have room for
+nothing a human meant to do.
+
+A ring id is meaningful only inside the process that made it — it counts
+from one again on the next run, and the `panel` table replicates to a
+device whose ring is its own — so a job panel on one is **not persisted as
+one**: it is saved as the effect log it was previewed from. Restoring it as
+a job panel would aim it at whatever effect held that number next, which is
+the one thing a dangling reference must not do.
 
 A worker's commit reaches the UI as a signal; the store notices foreign
 commits by `data_version` and re-runs stale queries on the next draw.

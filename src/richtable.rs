@@ -394,6 +394,12 @@ pub struct SqlSpec {
     /// page names it — an alias of `select` under a group, since the page
     /// is read off the grouped subquery.
     pub key: &'static str,
+    /// Tables this query reads that SQLite's authorizer cannot report, so
+    /// that the store still knows when to re-run it. Empty for every table
+    /// whose `from` is honest SQL; the effect log's is not — one arm of its
+    /// union comes out of memory through a function, and rows that were
+    /// never in the database are invisible to a read-set.
+    pub deps: &'static [&'static str],
 }
 
 /// Built SQL and its parameters.
@@ -554,7 +560,13 @@ impl SqlSpec {
             }
             Ast::Not(inner) => {
                 let e = self.expr(tags, inner, params)?;
-                Some(format!("NOT ({e})"))
+                // `COALESCE`, because a bare `NOT` is not a complement in
+                // SQL: a column with no answer makes the inner expression
+                // NULL, and `NOT NULL` is NULL — so the rows a tag says
+                // nothing about would fall out of *both* halves of it.
+                // `@not:risky` means every row that is not risky, and an
+                // effect nobody was going to retry is one of them.
+                Some(format!("NOT COALESCE(({e}), 0)"))
             }
             Ast::And(v) | Ast::Or(v) => {
                 let joiner = if matches!(ast, Ast::And(_)) {
@@ -833,11 +845,12 @@ where
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
         let q = self.spec.count(self.tags, ast);
         let n = store
-            .rows_sql(
+            .rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
                 &q.params,
+                self.spec.deps,
                 |r| r.get::<_, i64>(0),
             )
             .first()
@@ -848,14 +861,26 @@ where
 
     fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<R>> {
         let q = self.spec.page(self.tags, ast, offset, limit);
-        store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
+        store.rows_sql_deps(
+            self.spec.id,
+            self.spec.describe,
+            &q.sql,
+            &q.params,
+            self.spec.deps,
+            self.map,
+        )
     }
 
     fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<K>> {
         let q = self.spec.keys(self.tags, ast);
-        let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
-            r.get::<_, K>(0)
-        });
+        let rows = store.rows_sql_deps(
+            self.spec.id,
+            self.spec.describe,
+            &q.sql,
+            &q.params,
+            self.spec.deps,
+            |r| r.get::<_, K>(0),
+        );
         Some(rows.as_ref().clone())
     }
 
@@ -864,9 +889,14 @@ where
         for chunk in keys.chunks(KEYS_PER_QUERY) {
             let mut q = self.spec.present(self.tags, ast, chunk.len());
             q.params.extend(chunk.iter().cloned().map(Into::into));
-            let rows = store.rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, |r| {
-                r.get::<_, K>(0)
-            });
+            let rows = store.rows_sql_deps(
+                self.spec.id,
+                self.spec.describe,
+                &q.sql,
+                &q.params,
+                self.spec.deps,
+                |r| r.get::<_, K>(0),
+            );
             out.extend(rows.iter().cloned());
         }
         out
@@ -876,7 +906,14 @@ where
         let mut q = self.spec.by_key();
         q.params.push(key.clone().into());
         store
-            .rows_sql(self.spec.id, self.spec.describe, &q.sql, &q.params, self.map)
+            .rows_sql_deps(
+                self.spec.id,
+                self.spec.describe,
+                &q.sql,
+                &q.params,
+                self.spec.deps,
+                self.map,
+            )
             .first()
             .cloned()
     }
@@ -884,11 +921,12 @@ where
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &R) -> Option<usize> {
         let q = self.spec.rank(self.tags, ast, &(self.rank)(row));
         store
-            .rows_sql(
+            .rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
                 &q.params,
+                self.spec.deps,
                 |r| r.get::<_, i64>(0),
             )
             .first()
@@ -1298,6 +1336,7 @@ mod tests {
         order: &[("n", Dir::Desc), ("id", Dir::Asc)],
         group: None,
         key: "id",
+        deps: &[],
     };
 
     static TAGS: &[TagDef] = &[
@@ -1345,6 +1384,7 @@ mod tests {
         order: &[("last", Dir::Desc), ("g", Dir::Desc)],
         group: Some("i.ok"),
         key: "g",
+        deps: &[],
     };
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1523,7 +1563,13 @@ mod tests {
     fn builds_every_filter_shape() {
         let w = |s: &str| SPEC.where_clause(TAGS, a(s).as_ref());
         assert_eq!(w("@ok"), (" WHERE id > 0 AND (ok = 1)".into(), vec![]));
-        assert_eq!(w("@not:ok"), (" WHERE id > 0 AND NOT ((ok = 1))".into(), vec![]));
+        // `COALESCE`, so a negation is the complement even where the tag's
+        // column has no answer — `NOT NULL` is NULL, and those rows would
+        // otherwise fall out of both halves of the tag.
+        assert_eq!(
+            w("@not:ok"),
+            (" WHERE id > 0 AND NOT COALESCE(((ok = 1)), 0)".into(), vec![])
+        );
         assert_eq!(
             w("@name:Al"),
             (" WHERE id > 0 AND name LIKE ? ESCAPE '\\'".into(), vec![Val::S("%Al%".into())])
@@ -1531,7 +1577,7 @@ mod tests {
         assert_eq!(
             w("@not:name:al"),
             (
-                " WHERE id > 0 AND NOT (name LIKE ? ESCAPE '\\')".into(),
+                " WHERE id > 0 AND NOT COALESCE((name LIKE ? ESCAPE '\\'), 0)".into(),
                 vec![Val::S("%al%".into())]
             )
         );

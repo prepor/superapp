@@ -24,16 +24,26 @@
 //! | deferred | [`Move`], [`Seen`], [`Submit`] | enqueued, claimed, executed by the pass |
 //! | in-memory | [`Now`], [`Connect`], [`Fetch`], [`SecretGet`] | performed at the call, answer returned, nothing written |
 //!
+//! "Nothing written" used to mean "nothing anyone could look at". It no
+//! longer does: the last [`KEPT`] in-memory effects stay in a ring
+//! ([`MemLog`]), and the log joins that ring to the queue in SQL, so one
+//! panel shows everything that left the process — what was filed and
+//! retried beside what merely happened. The ring is memory and stays
+//! memory: nothing is written, nothing replicates, and a restart forgets
+//! it.
+//!
 //! [`Outside`] is the swappable backend — [`Real`], [`Fake`], [`Deny`] —
 //! and it owns the clock too, so a fake world controls time the same way it
 //! controls everything else.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, Transaction};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -335,6 +345,26 @@ pub trait Effect: Sized {
     /// One line of English — the row's description, the label in a status
     /// UI, and what an assertion failure prints. Never carries a secret.
     fn describe(&self) -> String;
+    /// Did the world change because of this, or was it only asked
+    /// something? A `MOVE`, a `STORE`, a send, a file written, a password
+    /// filed: those changed it. A `FETCH`, a `SEARCH`, a folder listing,
+    /// the clock, a password recalled: those did not — and neither did a
+    /// connect, which is what makes the rest possible and nothing more.
+    ///
+    /// No default, on purpose. A sync pass asks the outside a dozen
+    /// questions for every answer it acts on, so the log is mostly reads,
+    /// and the panel opens on `@wrote` for exactly that reason — a new
+    /// effect that guessed here would either bury the panel or vanish from
+    /// it, and neither failure announces itself. The compiler asks instead.
+    fn writes(&self) -> bool;
+    /// What this belongs to, in the `action.entity` vocabulary —
+    /// `account:2`, `outbox:7`. A deferred effect files it on its row so a
+    /// panel can query its own work; an in-memory one hands it to the ring
+    /// for the same reason, which is why the question is asked here and not
+    /// one trait down.
+    fn entity(&self) -> Option<String> {
+        None
+    }
     /// Do it.
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
 }
@@ -353,12 +383,6 @@ where
     /// Is running this twice safe? No default — it is the one judgement a
     /// crash cannot guess, and it drives the boot sweep.
     fn idempotent(&self) -> bool;
-
-    /// What this job belongs to, in the `action.entity` vocabulary —
-    /// `account:2`, `panel:7`. Lets a panel query its own effects.
-    fn entity(&self) -> Option<String> {
-        None
-    }
 
     /// Does the world still want this? Checked after the claim and before
     /// the round trip: if undo landed while the job sat in the queue, it
@@ -391,6 +415,9 @@ impl Effect for Now {
     fn describe(&self) -> String {
         "read the clock".into()
     }
+    fn writes(&self) -> bool {
+        false
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<f64, String> {
         Ok(cx.out.now())
     }
@@ -404,6 +431,9 @@ impl Effect for SecretGet<'_> {
     type Reply = Option<String>;
     fn describe(&self) -> String {
         format!("read the password for {}", self.0)
+    }
+    fn writes(&self) -> bool {
+        false
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         Ok(cx.out.secret_get(self.0))
@@ -421,6 +451,9 @@ impl Effect for SecretSet<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("store the password for {}", self.email)
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
@@ -441,6 +474,9 @@ impl Effect for BucketSecret<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("store the bucket secret for {}", self.key_id)
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
@@ -463,6 +499,9 @@ impl Effect for Clip<'_> {
     fn describe(&self) -> String {
         format!("copy {} ({} bytes)", self.what, self.text.len())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.clip(self.text)
     }
@@ -478,6 +517,11 @@ impl Effect for OpenPath<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("open {}", self.path.display())
+    }
+    /// Nothing of ours changes; something out there starts, which is more
+    /// than a question.
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.open_path(self.path)
@@ -495,6 +539,9 @@ impl Effect for MakeDir<'_> {
     fn describe(&self) -> String {
         format!("make the directory {}", self.path.display())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.make_dir(self.path)
     }
@@ -511,6 +558,9 @@ impl Effect for CopyPath<'_> {
     type Reply = ();
     fn describe(&self) -> String {
         format!("copy {} to {}", self.from.display(), self.to.display())
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.copy_path(self.from, self.to)
@@ -530,6 +580,9 @@ impl Effect for MovePath<'_> {
     fn describe(&self) -> String {
         format!("move {} to {}", self.from.display(), self.to.display())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.move_path(self.from, self.to)
     }
@@ -546,6 +599,9 @@ impl Effect for Trash<'_> {
     type Reply = PathBuf;
     fn describe(&self) -> String {
         format!("move {} to the trash", self.path.display())
+    }
+    fn writes(&self) -> bool {
+        true
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<PathBuf, String> {
         cx.out.trash(self.path)
@@ -564,6 +620,9 @@ impl Effect for WriteFile<'_> {
     fn describe(&self) -> String {
         format!("write {} ({} bytes)", self.path.display(), self.bytes.len())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.write_file(self.path, self.bytes)
     }
@@ -578,8 +637,155 @@ impl Effect for Shot<'_> {
     fn describe(&self) -> String {
         format!("capture {}", self.0.display())
     }
+    fn writes(&self) -> bool {
+        true
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.shot(self.0)
+    }
+}
+
+// -- what the process keeps of them --------------------------------------------
+//
+// An in-memory effect writes nothing, and for a long time that also meant
+// nobody could look at one: a connect that failed lived exactly as long as
+// the string it returned. The ring fixes that without touching the rule —
+// it keeps a *description* of the last few, in memory, and the log reads it
+// through SQL beside the queue.
+
+/// How many in-memory effects the ring keeps. A sync pass and the
+/// keystrokes around it fit; the whole ring is one JSON string the log's
+/// query reads in full, so this is also how big that string gets.
+pub const KEPT: usize = 200;
+
+/// The name the ring goes by in the store's invalidation clock. Not a
+/// table: SQLite's authorizer cannot report the rows a function handed it,
+/// so the log's spec names this dependency itself
+/// ([`SqlSpec::deps`](crate::richtable::SqlSpec::deps)), and the store
+/// bumps it when the ring moves.
+pub const MEM_TABLE: &str = "mem_effect";
+
+/// One in-memory effect, after the fact — everything the log can show of
+/// one, and nothing else. There is no payload because there was never one
+/// to have (an in-memory effect is deliberately not `Serialize`: see
+/// [`Effect`]), and no reply because the reply went to the caller. What is
+/// left is the sentence the effect described itself with, which is what a
+/// human reads anyway.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemEffect {
+    /// Its place in the ring, counting up for the life of the process. The
+    /// log carries it **negated** — see [`LOG_FROM`].
+    pub seq: i64,
+    pub kind: &'static str,
+    pub entity: Option<String>,
+    /// [`Effect::writes`] — the one question the panel opens on.
+    pub writes: bool,
+    /// [`Effect::describe`], taken at the call. Never carries a secret.
+    pub what: String,
+    /// What the outside said, when it refused.
+    pub error: Option<String>,
+    /// When it ran, on the world's own clock.
+    pub at: f64,
+}
+
+/// The last [`KEPT`] in-memory effects.
+///
+/// One per process, held by the [`Db`](crate::store::Db) every [`World`]
+/// shares — the UI's and each worker's — so the log shows what the sync
+/// thread reached for as readily as what the keyboard did. It is also why
+/// this is `Mutex` and not `RefCell`: the writers are threads.
+#[derive(Debug)]
+pub struct MemLog {
+    rows: Mutex<VecDeque<MemEffect>>,
+    /// Bumped on every record. This is the ring's `PRAGMA data_version`:
+    /// a reader compares it against what it last saw and invalidates the
+    /// pages that read the ring, since no commit hook will ever fire for
+    /// something that is not in the database.
+    version: AtomicU64,
+    /// The next `seq`. Starts at 1, so a negated id is always negative.
+    next: AtomicI64,
+}
+
+impl Default for MemLog {
+    fn default() -> MemLog {
+        MemLog::new()
+    }
+}
+
+impl MemLog {
+    /// An empty ring. `seq` starts at 1, never 0 — a negated 0 is 0, and
+    /// 0 would read as a filed row.
+    #[must_use]
+    pub fn new() -> MemLog {
+        MemLog {
+            rows: Mutex::default(),
+            version: AtomicU64::new(0),
+            next: AtomicI64::new(1),
+        }
+    }
+
+    /// Files one, dropping the oldest once the ring is full.
+    pub fn record(&self, e: MemEffect) {
+        {
+            let mut rows = self.rows.lock().expect("the effect ring");
+            while rows.len() >= KEPT {
+                rows.pop_front();
+            }
+            rows.push_back(e);
+        }
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// The next seq — taken before the effect runs, so the ring's order is
+    /// the order things were *asked for*, as the queue's ids are.
+    pub fn next_seq(&self) -> i64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// How many records the ring holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.lock().expect("the effect ring").len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What the ring has moved to. Compared, never interpreted.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// The ring as one JSON array, oldest first — what `mem_effects()`
+    /// answers with.
+    #[must_use]
+    pub fn json(&self) -> String {
+        let rows = self.rows.lock().expect("the effect ring");
+        serde_json::to_string(&*rows).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Teaches one connection the `mem_effects()` function [`LOG_FROM`]
+    /// reads the ring through. Every reader gets it at open, which is what
+    /// makes the ring queryable from a `query_only` connection at all —
+    /// nothing is written anywhere, the rows are handed to SQLite on the
+    /// spot.
+    ///
+    /// Deliberately **not** `SQLITE_DETERMINISTIC`: the ring moves under a
+    /// prepared statement, and a call SQLite factored out would freeze it.
+    ///
+    /// # Errors
+    ///
+    /// If SQLite refuses the registration.
+    pub fn install(self: &Arc<Self>, conn: &Connection) -> rusqlite::Result<()> {
+        let me = Arc::clone(self);
+        // The name is spelled out in `LOG_FROM` too — a `const` cannot
+        // interpolate one, and the two live in this file together.
+        conn.create_scalar_function("mem_effects", 0, FunctionFlags::SQLITE_UTF8, move |_| {
+            Ok(me.json())
+        })
     }
 }
 
@@ -689,12 +895,15 @@ impl Registry {
 
 // -- the log -------------------------------------------------------------------
 
-/// One row of the effect table, as tests and the log viewer read it. The
-/// whole row, payload included: this is the only shape the queue is ever
+/// One row of the log, as tests and the log viewer read it: a job of the
+/// queue, or an in-memory effect the ring kept ([`Job::transient`]). The
+/// whole row, payload included — this is the only shape the queue is ever
 /// read in, and a viewer that showed less than `sqlite3` does would defeat
 /// the reason the queue lives in the store at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
+    /// The `effect` rowid — or, for a ring row, the negated
+    /// [`MemEffect::seq`]. Positive is filed, negative never was.
     pub id: i64,
     pub kind: String,
     pub entity: Option<String>,
@@ -707,22 +916,46 @@ pub struct Job {
     /// into one line of English ([`Registry::describe`]).
     pub payload: String,
     /// Whether running it twice is safe, copied onto the row at enqueue
-    /// time so the crash sweep never has to decode a payload.
+    /// time so the crash sweep never has to decode a payload. False for a
+    /// ring row, which nobody was going to retry either way — the column
+    /// itself is `NULL` there, so `@risky` never sweeps one in.
     pub idempotent: bool,
     /// Filed at, last touched at, and the earliest the executor may claim
     /// it (a backoff, or the send window) — unix seconds, the world's clock.
     pub created: f64,
     pub updated: f64,
     pub not_before: f64,
+    /// The sentence, for a row that carries no payload to derive one from:
+    /// a ring row's [`MemEffect::what`]. `None` on a filed job, whose
+    /// sentence the registry decodes ([`Registry::describe`]).
+    pub what: Option<String>,
+    /// Whether the world changed for it ([`Effect::writes`]). What the
+    /// panel opens narrowed to, because a sync pass asks a dozen questions
+    /// for every answer it acts on.
+    pub writes: bool,
 }
 
 impl Job {
+    /// Whether this effect ran at the call and left no row — an
+    /// [`MemEffect`] out of the ring rather than a job of the queue. The
+    /// id says so: the queue's are rowids, the ring's are negated, so the
+    /// two streams share one total order and one unique key without ever
+    /// colliding.
+    #[must_use]
+    pub fn transient(&self) -> bool {
+        self.id < 0
+    }
+
     /// The status as the log reads it aloud: the word, and — once a job has
     /// been tried more than once — how many times. A count on every row
     /// would be noise; a count on the rows that fought is the whole story.
+    /// A ring row says where it lives instead: it was never filed, so there
+    /// is no row to go and look at, and that is worth saying on the line.
     #[must_use]
     pub fn status_line(&self) -> String {
-        if self.attempts > 1 {
+        if self.transient() {
+            format!("{} · in memory", self.status)
+        } else if self.attempts > 1 {
             format!("{} · {} tries", self.status, self.attempts)
         } else {
             self.status.clone()
@@ -793,10 +1026,14 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         error: r.get(5)?,
         attempts: r.get(6)?,
         payload: r.get(7)?,
-        idempotent: r.get::<_, i64>(8)? != 0,
+        // `NULL` on a ring row: it was never going to be retried, so it has
+        // no answer here rather than the wrong one.
+        idempotent: r.get::<_, Option<i64>>(8)?.is_some_and(|v| v != 0),
         created: r.get(9)?,
         updated: r.get(10)?,
         not_before: r.get(11)?,
+        what: r.get(12)?,
+        writes: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -805,11 +1042,63 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
 /// decode through the same [`job_row`], in the same order. Qualified,
 /// because the spec's `FROM` aliases the table.
 const JOB_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.attempts,
-                        e.payload, e.idempotent, e.created, e.updated, e.not_before";
+                        e.payload, e.idempotent, e.created, e.updated, e.not_before,
+                        e.what, e.writes";
+
+/// The same, read straight off `effect` — the helpers below want the queue
+/// and only the queue, so the sentence column a ring row would fill is a
+/// literal `NULL` and [`job_row`] decodes both shapes.
+const QUEUE_COLS: &str = "e.id, e.kind, e.entity, e.status, e.reply, e.error, e.attempts,
+                          e.payload, e.idempotent, e.created, e.updated, e.not_before,
+                          NULL, e.writes";
+
+/// What the log selects from: the queue, and the ring of effects that never
+/// became rows. One `UNION ALL` rather than two lists stitched together in
+/// the panel, so the filter grammar, the paging, the count and the rank
+/// stay the rich table's own — a ring row is narrowed by exactly the same
+/// `@kind:` a filed one is.
+///
+/// Two things carry the join. The ring's ids are **negated**, and the
+/// queue's are SQLite rowids, so the streams cannot collide: `e.id` is
+/// still unique (the key a mark holds) and still the tiebreak that makes
+/// the order total, and `e.id < 0` is how "never became a row" is asked.
+/// And the columns a ring row has no answer for are `NULL` rather than a
+/// plausible zero — `idempotent` above all, since `@risky` reads
+/// `idempotent = 0` and must not sweep in effects nobody was going to
+/// retry.
+///
+/// `mem_effects()` is the ring itself, one JSON array, taught to every
+/// reader at open by [`MemLog::install`].
+const LOG_FROM: &str = "(SELECT id, kind, entity, status, reply, error, attempts,
+                                payload, idempotent, created, updated, not_before,
+                                NULL AS what, writes
+                           FROM effect
+                          UNION ALL
+                         SELECT -json_extract(r.value, '$.seq'),
+                                json_extract(r.value, '$.kind'),
+                                json_extract(r.value, '$.entity'),
+                                CASE WHEN json_extract(r.value, '$.error') IS NULL
+                                     THEN 'done' ELSE 'failed' END,
+                                NULL,
+                                json_extract(r.value, '$.error'),
+                                1, '', NULL,
+                                json_extract(r.value, '$.at'),
+                                json_extract(r.value, '$.at'),
+                                0,
+                                json_extract(r.value, '$.what'),
+                                json_extract(r.value, '$.writes')
+                           FROM json_each(mem_effects()) r) e";
+
+/// The dependency [`LOG_FROM`] has that no authorizer can see: the rows
+/// `mem_effects()` hands over come from memory, so nothing in SQLite will
+/// ever report them as read. Every query built on the union declares this
+/// and the store bumps it when the ring moves.
+const LOG_DEPS: &[&str] = &[MEM_TABLE];
 
 /// Every job, oldest first.
 pub fn jobs(db: &Connection) -> Vec<Job> {
-    let Ok(mut stmt) = db.prepare(&format!("SELECT {JOB_COLS} FROM effect e ORDER BY e.id")) else {
+    let Ok(mut stmt) = db.prepare(&format!("SELECT {QUEUE_COLS} FROM effect e ORDER BY e.id"))
+    else {
         return Vec::new();
     };
     stmt.query_map([], job_row)
@@ -820,7 +1109,7 @@ pub fn jobs(db: &Connection) -> Vec<Job> {
 /// Jobs after `id` — how a test marks a point and asserts on what followed.
 pub fn jobs_since(db: &Connection, id: i64) -> Vec<Job> {
     let Ok(mut stmt) = db.prepare(&format!(
-        "SELECT {JOB_COLS} FROM effect e WHERE e.id > ?1 ORDER BY e.id"
+        "SELECT {QUEUE_COLS} FROM effect e WHERE e.id > ?1 ORDER BY e.id"
     )) else {
         return Vec::new();
     };
@@ -832,7 +1121,7 @@ pub fn jobs_since(db: &Connection, id: i64) -> Vec<Job> {
 /// One entity's jobs — what a panel shows about its own in-flight work.
 pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
     let Ok(mut stmt) = db.prepare(&format!(
-        "SELECT {JOB_COLS} FROM effect e WHERE e.entity = ?1 ORDER BY e.id"
+        "SELECT {QUEUE_COLS} FROM effect e WHERE e.entity = ?1 ORDER BY e.id"
     )) else {
         return Vec::new();
     };
@@ -841,13 +1130,21 @@ pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
         .unwrap_or_default()
 }
 
-/// One job by id — what its panel reads on every draw. Through the query
-/// cache like everything else, so a job that finishes while it is open
-/// finishes on screen.
+/// One row of the log by id — what its panel reads on every draw. Through
+/// the query cache like everything else, so a job that finishes while it is
+/// open finishes on screen. Over the union, so a negative id (an effect the
+/// ring kept) opens as readily as a filed one.
 pub fn job(store: &Store, id: i64) -> Option<Job> {
-    let sql = format!("SELECT {JOB_COLS} FROM effect e WHERE e.id = ?1");
+    let sql = format!("SELECT {JOB_COLS} FROM {LOG_FROM} WHERE e.id = ?1");
     store
-        .rows_sql("effect job", "one job of the effect queue, in full", &sql, &[Val::I(id)], job_row)
+        .rows_sql_deps(
+            "effect job",
+            "one effect of the log, in full",
+            &sql,
+            &[Val::I(id)],
+            LOG_DEPS,
+            job_row,
+        )
         .first()
         .cloned()
 }
@@ -865,6 +1162,11 @@ pub fn mark(db: &Connection) -> i64 {
 // filter grammar, the same paging, the same reactive pages — a commit by
 // the executor invalidates exactly the pages on screen, so watching a job
 // run is invalidation and not polling.
+//
+// The ring joins it there, in SQL (`LOG_FROM`), for the same reason: an
+// in-memory effect that arrived as a second list beside the first would
+// need its own filter, its own paging and its own idea of order, and the
+// three would drift. As a `UNION ALL` arm it gets the real ones.
 
 /// The statuses a row can be in, as the filter offers them.
 const STATUSES: &[(&str, &str)] = &[
@@ -875,18 +1177,20 @@ const STATUSES: &[(&str, &str)] = &[
     ("obsolete", "obsolete"),
 ];
 
-/// The effect log's fixed query: every job, newest first. Flat — a job is a
-/// row, and nothing about it is an aggregate.
+/// The effect log's fixed query: everything that left the process, newest
+/// first — the queue and the ring both. Flat: an effect is a row, and
+/// nothing about it is an aggregate.
 static LOG_SPEC: SqlSpec = SqlSpec {
     id: "effect log",
-    describe: "the effect queue under the panel's filter, newest first, one page at a time",
+    describe: "everything that left the process, under the panel's filter, newest first",
     select: JOB_COLS,
-    from: "effect e",
+    from: LOG_FROM,
     base: "",
     // Bare words search what a human would type: the verb, whose it was,
     // and what went wrong. The payload too — that is where a uid or an
-    // address actually lives.
-    text: &["e.kind", "e.entity", "e.payload", "e.error"],
+    // address actually lives — and the ring's sentence, which is all a
+    // row with no payload has.
+    text: &["e.kind", "e.entity", "e.payload", "e.error", "e.what"],
     tags: &[
         ("failed", TagSql::Where("e.status = 'failed'")),
         (
@@ -894,19 +1198,26 @@ static LOG_SPEC: SqlSpec = SqlSpec {
             TagSql::Where("e.status IN ('pending', 'processing')"),
         ),
         ("retried", TagSql::Where("e.attempts > 1")),
+        // `NULL` on a ring row, so this never sweeps one in.
         ("risky", TagSql::Where("e.idempotent = 0")),
+        ("memory", TagSql::Where("e.id < 0")),
+        ("filed", TagSql::Where("e.id > 0")),
+        ("wrote", TagSql::Where("e.writes = 1")),
+        ("read", TagSql::Where("e.writes = 0")),
         ("status", TagSql::Col("e.status")),
         ("kind", TagSql::Col("e.kind")),
         ("entity", TagSql::Col("e.entity")),
         ("attempts", TagSql::Col("e.attempts")),
         ("date", TagSql::Col("e.created")),
     ],
-    // Total by construction: the id is unique, and it is also the order the
-    // queue was filed in.
-    order: &[("e.id", Dir::Desc)],
+    // When it happened, then the id. Total by construction: within each
+    // stream the id counts up, and across the two it cannot collide,
+    // because the ring's is negated.
+    order: &[("e.created", Dir::Desc), ("e.id", Dir::Desc)],
     group: None,
-    // …which is the row's identity too (CR-009).
+    // …and the id is the row's identity too (CR-009).
     key: "e.id",
+    deps: LOG_DEPS,
 };
 
 /// The effect filter's tags: what `@` offers in the log panel.
@@ -937,6 +1248,34 @@ static LOG_TAGS: &[TagDef] = &[
         kind: TagType::Bool,
         ops: &[],
         describe: "not idempotent: a crash cannot retry it",
+        values: Values::None,
+    },
+    TagDef {
+        name: "wrote",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "changed something out there — what the panel opens on",
+        values: Values::None,
+    },
+    TagDef {
+        name: "read",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "only asked: a fetch, a search, a folder listing, a connect",
+        values: Values::None,
+    },
+    TagDef {
+        name: "memory",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "ran at the call and left no row — kept only in the ring",
+        values: Values::None,
+    },
+    TagDef {
+        name: "filed",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "a job of the queue: filed, claimed, retried",
         values: Values::None,
     },
     TagDef {
@@ -977,9 +1316,10 @@ static LOG_TAGS: &[TagDef] = &[
 ];
 
 /// Values for the log's dynamic tags, under what has been typed. Both are
-/// read off the queue itself rather than off the registry: what is *in* the
-/// table is what filtering it can find, and a kind this build no longer
-/// registers is exactly the row a human goes looking for.
+/// read off the log itself rather than off the registry: what is *there* is
+/// what filtering it can find, and a kind this build no longer registers is
+/// exactly the row a human goes looking for. Off the union, so `connect`
+/// and `fetch` are on offer the moment a sync has reached for them.
 fn suggest_log(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
     let col = match tag {
         "kind" => "kind",
@@ -987,13 +1327,18 @@ fn suggest_log(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
         _ => return Vec::new(),
     };
     let sql = format!(
-        "SELECT DISTINCT {col} FROM effect
-          WHERE {col} IS NOT NULL AND {col} != '' ORDER BY {col}"
+        "SELECT DISTINCT e.{col} FROM {LOG_FROM}
+          WHERE e.{col} IS NOT NULL AND e.{col} != '' ORDER BY e.{col}"
     );
     store
-        .rows_sql("effect log values", "the distinct values one effect-log tag takes", &sql, &[], |r| {
-            r.get::<_, String>(0)
-        })
+        .rows_sql_deps(
+            "effect log values",
+            "the distinct values one effect-log tag takes",
+            &sql,
+            &[],
+            LOG_DEPS,
+            |r| r.get::<_, String>(0),
+        )
         .iter()
         .filter(|v| v.to_lowercase().contains(typed))
         .map(Suggestion::value)
@@ -1006,12 +1351,23 @@ pub static LOG: SqlSource<Job, i64> = SqlSource {
     tags: LOG_TAGS,
     map: job_row,
     key: |j| j.id,
-    rank: |j| vec![Val::I(j.id)],
+    rank: |j| vec![Val::F(j.created), Val::I(j.id)],
     suggest: suggest_log,
 };
 
 /// Rows per page of the log table.
 pub const LOG_PAGE: usize = 50;
+
+/// What the log panel opens with in its filter field.
+///
+/// A sync pass asks the outside a dozen questions for every answer it acts
+/// on — connect, select, search, fetch, and again next minute — so an
+/// unfiltered log is mostly the app clearing its throat, and what a human
+/// came to see (what was *changed* out there, and whether it worked) is
+/// buried. It is typed into the field rather than folded into the query, so
+/// it is visible, and clearing it is one gesture: this is a default, not a
+/// rule about what the panel can show.
+pub const LOG_DEFAULT: &str = "@wrote";
 
 // -- the world -----------------------------------------------------------------
 
@@ -1029,6 +1385,10 @@ pub struct Enqueue {
     payload: String,
     entity: Option<String>,
     idempotent: bool,
+    /// [`Effect::writes`], copied onto the row for the same reason
+    /// `idempotent` is: the log filters on it, and asking would mean
+    /// decoding every payload on the page.
+    writes: bool,
     not_before: f64,
     now: f64,
 }
@@ -1041,14 +1401,15 @@ impl Enqueue {
     /// If the insert fails.
     pub fn insert(&self, tx: &Transaction) -> rusqlite::Result<i64> {
         tx.execute(
-            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+            "INSERT INTO effect(kind, payload, entity, status, idempotent, writes,
                                 attempts, not_before, created, updated)
-             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
+             VALUES(?1, ?2, ?3, 'pending', ?4, ?5, 0, ?6, ?7, ?7)",
             rusqlite::params![
                 self.kind,
                 self.payload,
                 self.entity,
                 self.idempotent,
+                self.writes,
                 self.not_before,
                 self.now
             ],
@@ -1126,7 +1487,11 @@ impl World {
     }
 
     /// Unix seconds, from whichever backend this world has. Shorthand for
-    /// `run(&Now)`, because it is on every hot path there is.
+    /// `run(&Now)`, because it is on every hot path there is — and the one
+    /// place the ring is deliberately skipped: the clock is asked several
+    /// times a frame, and a ring of clock readings would have room for
+    /// nothing a human meant to do. `run(&Now)` still records, for the
+    /// caller who genuinely wants that noted.
     #[must_use]
     pub fn now(&self) -> f64 {
         self.outside.borrow_mut().now()
@@ -1162,19 +1527,42 @@ impl World {
         })
     }
 
-    /// Performs an in-memory effect now and answers it. Nothing is written:
-    /// these are the effects nobody would retry or wait for.
+    /// Performs an in-memory effect now and answers it. Nothing is written
+    /// — these are the effects nobody would retry or wait for — but the
+    /// ring keeps what it was and what it said, so the log can show it
+    /// beside the queue. What the ring keeps is [`Effect::describe`], which
+    /// never carries a secret; the payload stays where it was, which is
+    /// nowhere.
     ///
     /// # Errors
     ///
     /// Whatever the backend said, verbatim.
     pub fn run<E: Effect>(&self, e: &E) -> Result<E::Reply, String> {
-        let mut out = self.outside.borrow_mut();
-        let mut cx = Ctx {
-            out: &mut **out,
-            db: self.store.conn(),
+        // The seq is taken before the round trip, so the ring orders
+        // effects by when they were *asked for*, as the queue's ids do.
+        let seq = self.store.mem().next_seq();
+        let (at, ran) = {
+            let mut out = self.outside.borrow_mut();
+            let at = out.now();
+            let mut cx = Ctx {
+                out: &mut **out,
+                db: self.store.conn(),
+            };
+            (at, e.perform(&mut cx))
         };
-        e.perform(&mut cx)
+        self.store.mem().record(MemEffect {
+            seq,
+            kind: E::KIND,
+            entity: e.entity(),
+            writes: e.writes(),
+            what: e.describe(),
+            error: ran.as_ref().err().cloned(),
+            at,
+        });
+        // This reader's own pages go stale at once; other threads' notice
+        // on their next poll, exactly as they do for a foreign commit.
+        self.store.poll_mem();
+        ran
     }
 
     /// Files a deferred effect inside the caller's transaction, so the job
@@ -1208,10 +1596,18 @@ impl World {
         let payload = serde_json::to_string(e).map_err(json_err)?;
         let now = self.now();
         tx.execute(
-            "INSERT INTO effect(kind, payload, entity, status, idempotent,
+            "INSERT INTO effect(kind, payload, entity, status, idempotent, writes,
                                 attempts, not_before, created, updated)
-             VALUES(?1, ?2, ?3, 'pending', ?4, 0, ?5, ?6, ?6)",
-            rusqlite::params![E::KIND, payload, e.entity(), e.idempotent(), not_before, now],
+             VALUES(?1, ?2, ?3, 'pending', ?4, ?5, 0, ?6, ?7, ?7)",
+            rusqlite::params![
+                E::KIND,
+                payload,
+                e.entity(),
+                e.idempotent(),
+                e.writes(),
+                not_before,
+                now
+            ],
         )?;
         Ok(tx.last_insert_rowid())
     }
@@ -1246,6 +1642,7 @@ impl World {
             payload: serde_json::to_string(e).map_err(json_err)?,
             entity: e.entity(),
             idempotent: e.idempotent(),
+            writes: e.writes(),
             not_before,
             now: self.now(),
         })
@@ -3079,6 +3476,15 @@ mod tests {
         fn describe(&self) -> String {
             format!("poke {}", self.note)
         }
+        fn writes(&self) -> bool {
+            true
+        }
+        fn entity(&self) -> Option<String> {
+            Some(match self.acct {
+                Some(a) => format!("account:{a}"),
+                None => format!("panel:{}", self.note.len()),
+            })
+        }
         fn perform(&self, cx: &mut Ctx<'_>) -> Result<String, String> {
             if self.fails {
                 return Err("poke refused".into());
@@ -3091,12 +3497,6 @@ mod tests {
     impl Deferred for Poke {
         fn idempotent(&self) -> bool {
             self.idem
-        }
-        fn entity(&self) -> Option<String> {
-            Some(match self.acct {
-                Some(a) => format!("account:{a}"),
-                None => format!("panel:{}", self.note.len()),
-            })
         }
         fn still_wanted(&self, _db: &Connection) -> bool {
             self.wanted
@@ -3496,6 +3896,209 @@ mod tests {
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0].status_line(), "pending · 2 tries");
         assert_eq!(retried[0].error.as_deref(), Some("poke refused"));
+    }
+
+    /// An in-memory effect leaves no row, and the log shows it anyway: the
+    /// ring keeps the last few, and the table's `FROM` is the queue and the
+    /// ring joined. Filed and unfiled sit in one list, in the order they
+    /// happened, and `@memory` / `@filed` are what tell them apart.
+    #[test]
+    fn the_log_joins_the_ring_to_the_queue() {
+        let w = world();
+        w.enqueue(&Poke::ok("filed")).unwrap();
+        w.with_fake(|f| f.clock += 10.0);
+        w.run(&Clip {
+            text: "hello",
+            what: "a note",
+        })
+        .unwrap();
+
+        let rows = log(&w, "");
+        assert_eq!(rows.len(), 2, "the queue's row and the ring's");
+        assert_eq!(rows[0].kind, "clip", "newest first, across both");
+        assert!(rows[0].transient());
+        assert!(!rows[1].transient());
+        assert_eq!(rows[0].what.as_deref(), Some("copy a note (5 bytes)"));
+        assert_eq!(rows[0].status_line(), "done · in memory");
+
+        // The queue's own readers still see the queue and nothing else:
+        // a ring row was never filed, and `jobs()` is what a test asserts
+        // the *queue* with.
+        assert_eq!(w.jobs().len(), 1);
+
+        assert_eq!(log(&w, "@memory").len(), 1);
+        assert_eq!(log(&w, "@filed").len(), 1);
+        assert_eq!(log(&w, "@kind:clip").len(), 1);
+        // The sentence is searchable: it is all a row with no payload has.
+        assert_eq!(log(&w, "a note").len(), 1);
+        // Nobody was going to retry it, so it is not "risky" — the column
+        // is `NULL` rather than a plausible zero. And "not risky" is the
+        // complement of that, so it keeps the ring row rather than losing
+        // it to `NOT NULL`.
+        assert_eq!(log(&w, "@risky").len(), 0);
+        assert_eq!(log(&w, "@not:risky").len(), 2);
+        assert_eq!(log(&w, "@live").len(), 1);
+
+        // …and the title a tab strip shows reads the log, so a ring row
+        // wears its verb instead of a number nothing answers to.
+        assert_eq!(
+            crate::mail::title(w.store(), &crate::core::Kind::Job { id: rows[0].id }),
+            "clip"
+        );
+        assert_eq!(
+            crate::mail::title(w.store(), &crate::core::Kind::Job { id: -9999 }),
+            "effect · gone"
+        );
+    }
+
+    /// What the outside refused is the whole reason the ring exists: before
+    /// it, the sentence lived exactly as long as the `Err` it returned.
+    #[test]
+    fn the_ring_keeps_what_was_refused() {
+        let w = World::new(
+            Rc::new(Store::open(None).expect("in-memory store")),
+            Box::new(Deny::default()),
+            Registry::new(),
+        );
+        assert!(w.run(&Clip { text: "x", what: "a note" }).is_err());
+
+        let rows = log(&w, "");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        assert_eq!(
+            rows[0].error.as_deref(),
+            Some("this world has no outside (clip)")
+        );
+        assert_eq!(log(&w, "@failed").len(), 1);
+
+        // …and it opens like any other row of the log, by its own id.
+        let j = job(w.store(), rows[0].id).expect("the ring row reads back by id");
+        assert_eq!(j, rows[0]);
+        assert!(j.payload.is_empty(), "there was never a payload to keep");
+    }
+
+    /// The log tells apart what changed the world from what only asked it,
+    /// on both sides of the union — and the panel opens on the first,
+    /// because a sync pass asks a dozen questions for every answer.
+    #[test]
+    fn the_log_tells_a_write_from_a_read() {
+        let w = world();
+        w.enqueue(&Poke::ok("filed")).unwrap(); // a poke reaches the clipboard
+        // Each on its own instant, so "newest first" is not a tie.
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&Clip { text: "x", what: "a note" }).unwrap();
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&SecretGet("elena@fastmail.com")).unwrap();
+        w.with_fake(|f| f.clock += 1.0);
+        w.run(&Now).unwrap();
+
+        assert_eq!(log(&w, "").len(), 4, "everything, unfiltered");
+        let wrote = log(&w, LOG_DEFAULT);
+        assert_eq!(wrote.len(), 2, "the job and the clipboard write");
+        assert!(wrote.iter().all(|j| j.writes));
+        assert_eq!(wrote[0].kind, "clip");
+        assert_eq!(wrote[1].kind, "poke");
+
+        let read = log(&w, "@read");
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().all(|j| !j.writes));
+        // Both halves are total: a row is one or the other, never neither.
+        assert_eq!(log(&w, "@not:wrote").len(), 2);
+
+        // The ring's reads join the queue's writes under one filter, so
+        // `@wrote @memory` is the in-memory half of what was changed.
+        assert_eq!(log(&w, "@wrote @memory").len(), 1);
+        assert_eq!(log(&w, "@wrote @filed").len(), 1);
+    }
+
+    /// The column is on the row, not derived from the kind: the log filters
+    /// a queue written by a build whose effects this one may not have.
+    #[test]
+    fn the_queue_keeps_what_an_effect_was() {
+        let w = world();
+        w.enqueue(&Poke::ok("filed")).unwrap();
+        let filed: i64 = w
+            .store()
+            .conn()
+            .query_row("SELECT writes FROM effect", [], |r| r.get(0))
+            .expect("the column is written at enqueue");
+        assert_eq!(filed, 1);
+    }
+
+    /// The pages that read the ring go stale when it moves. There is no
+    /// commit to notice here — nothing was written — so this is the whole
+    /// of the mechanism: the ring's version is its `data_version`, and the
+    /// log's spec names the dependency the authorizer cannot see.
+    #[test]
+    fn a_ring_that_moves_stales_the_pages_that_read_it() {
+        let w = world();
+        assert_eq!(log(&w, "").len(), 0, "the page is cached empty");
+
+        w.run(&Clip { text: "x", what: "a note" }).unwrap();
+        assert_eq!(log(&w, "").len(), 1, "and re-runs once the ring moved");
+    }
+
+    /// The ring is the process's, not one reader's: a second store over the
+    /// same writer — which is what every worker thread holds — sees what
+    /// this one recorded, on the same poll that catches a foreign commit.
+    #[test]
+    fn another_reader_sees_the_ring_on_its_next_poll() {
+        let w = world();
+        let other = Store::with_db(w.store().db()).expect("a second reader");
+        assert_eq!(
+            other
+                .rows_sql_deps(
+                    "test",
+                    "the ring, from another reader",
+                    &format!("SELECT COUNT(*) FROM {LOG_FROM}"),
+                    &[],
+                    LOG_DEPS,
+                    |r| r.get::<_, i64>(0),
+                )
+                .first()
+                .copied(),
+            Some(0)
+        );
+
+        w.run(&Clip { text: "x", what: "a note" }).unwrap();
+        assert!(other.poll_external(), "the ring moved under it");
+        assert_eq!(
+            other
+                .rows_sql_deps(
+                    "test",
+                    "the ring, from another reader",
+                    &format!("SELECT COUNT(*) FROM {LOG_FROM}"),
+                    &[],
+                    LOG_DEPS,
+                    |r| r.get::<_, i64>(0),
+                )
+                .first()
+                .copied(),
+            Some(1)
+        );
+    }
+
+    /// The ring is bounded, and it drops from the old end.
+    #[test]
+    fn the_ring_keeps_only_the_last_few() {
+        let w = world();
+        for i in 0..KEPT + 5 {
+            w.run(&Clip {
+                text: "x",
+                what: "a note",
+            })
+            .unwrap();
+            // Each on its own instant, so "newest" is not a tie.
+            w.with_fake(|f| f.clock += 1.0);
+            let _ = i;
+        }
+        assert_eq!(w.store().mem().len(), KEPT);
+        let rows = log(&w, "");
+        assert_eq!(rows.len(), KEPT);
+        // The ids count up for the life of the process, negated: the five
+        // that fell off are the five nearest zero.
+        assert_eq!(rows[0].id, -(KEPT as i64 + 5));
+        assert_eq!(rows[KEPT - 1].id, -6);
     }
 
     /// The one line a row shows comes from the effect itself: the registry

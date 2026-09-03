@@ -354,7 +354,9 @@ A node is one of three things:
   effect log's scene files five real jobs, in states the executor will not
   revisit, so the queue it shows stands still while it is read — and its
   job nodes end by touching the sentence they drew, so a panel that stopped
-  naming its effect fails to arrive rather than showing an empty page.
+  naming its effect fails to arrive rather than showing an empty page. The
+  effect-row scene shows the ring's two shapes beside the queue's, built
+  from real in-memory effects the same way.
 - the **workspace** — the whole stage, kept for the shell's own subjects:
   joins, tabs, the phone grid.
 

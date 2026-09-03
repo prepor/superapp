@@ -353,6 +353,7 @@ macro_rules! mailbox_spec {
             order: &[("last", Dir::Desc), ("thread", Dir::Desc)],
             group: Some("m.thread"),
             key: "thread",
+            deps: &[],
         }
     };
 }
@@ -1179,18 +1180,18 @@ pub fn reading_lines(m: &MailFull, cols: usize) -> usize {
 /// is drawn on every frame of a tab strip, and the sentence lives one panel
 /// over anyway.
 fn job_title(store: &Store, id: i64) -> String {
-    store
-        .conn()
-        .query_row(
-            "SELECT kind, entity FROM effect WHERE id = ?1",
-            [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        )
-        .map(|(kind, entity)| match entity {
-            Some(e) if !e.is_empty() => format!("{kind} · {e}"),
-            _ => kind,
-        })
-        .unwrap_or_else(|_| format!("job #{id}"))
+    // Through the log, not the queue: a negative id is an effect the ring
+    // kept, and it wears its verb in a tab strip exactly as a filed job does.
+    match crate::effect::job(store, id) {
+        Some(j) => match j.entity {
+            Some(e) if !e.is_empty() => format!("{} · {e}", j.kind),
+            _ => j.kind,
+        },
+        // A ring id nothing answers to is not a row anyone can go and find,
+        // so it does not get a row's spelling.
+        None if id < 0 => "effect · gone".into(),
+        None => format!("job #{id}"),
+    }
 }
 
 /// The panel's display title for a kind — what headers, tab strips, the
@@ -2030,6 +2031,14 @@ impl Effect for Move {
         format!("move uid {} from {} to {}", self.uid, self.from, self.to)
     }
 
+    fn writes(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.move_uid(self.account, &self.from, &self.to, self.uid)
     }
@@ -2040,10 +2049,6 @@ impl Deferred for Move {
     /// catches the common case first.
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2090,6 +2095,14 @@ impl Effect for Seen {
         )
     }
 
+    fn writes(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out
             .store_flag(self.account, &self.folder, self.uid, MailFlag::Seen, self.seen)
@@ -2099,10 +2112,6 @@ impl Effect for Seen {
 impl Deferred for Seen {
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2153,6 +2162,14 @@ impl Effect for Forwarded {
         )
     }
 
+    fn writes(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.store_flag(
             self.account,
@@ -2167,10 +2184,6 @@ impl Effect for Forwarded {
 impl Deferred for Forwarded {
     fn idempotent(&self) -> bool {
         true
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("account:{}", self.account))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2209,6 +2222,14 @@ impl Effect for Submit {
 
     fn describe(&self) -> String {
         format!("submit outbox:{}", self.outbox)
+    }
+
+    fn writes(&self) -> bool {
+        true
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(format!("outbox:{}", self.outbox))
     }
 
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
@@ -2283,10 +2304,6 @@ impl Deferred for Submit {
     /// must ask a human rather than guess.
     fn idempotent(&self) -> bool {
         false
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(format!("outbox:{}", self.outbox))
     }
 
     fn still_wanted(&self, db: &Connection) -> bool {
@@ -2815,6 +2832,14 @@ impl Effect for Connect {
     fn describe(&self) -> String {
         format!("connect to {} as {}", self.creds.host, self.creds.user)
     }
+    /// A session is what makes the rest possible; nothing out there is
+    /// different for having opened one.
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.out.connect(self.account, &self.creds)
     }
@@ -2831,6 +2856,12 @@ impl Effect for Folders {
     type Reply = Vec<crate::effect::RemoteFolder>;
     fn describe(&self) -> String {
         "list folders".into()
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.folders(self.account)
@@ -2850,6 +2881,12 @@ impl Effect for Meta {
     fn describe(&self) -> String {
         format!("select {}", self.folder)
     }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
+    }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.folder_meta(self.account, &self.folder)
     }
@@ -2868,6 +2905,12 @@ impl Effect for Fetch {
     type Reply = Vec<crate::effect::RemoteMail>;
     fn describe(&self) -> String {
         format!("fetch {} from uid {}", self.folder, self.from)
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.fetch(self.account, &self.folder, self.from)
@@ -2892,6 +2935,12 @@ impl Effect for Uids {
             UidSet::Forwarded => "forwarded",
         };
         format!("search {which} in {}", self.folder)
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(format!("account:{}", self.account))
     }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.out.uids(self.account, &self.folder, self.which)

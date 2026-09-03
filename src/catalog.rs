@@ -287,25 +287,46 @@ fn file<E: effect::Effect + serde::Serialize>(store: &Store, e: &E, f: &Filed) {
         f.attempts,
         f.not_before,
         f.at,
+        e.writes(),
     );
     store
         .write(move |tx| {
             tx.execute(
                 "INSERT INTO effect(kind, payload, entity, status, idempotent,
-                                    reply, error, attempts, not_before, created, updated)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                                    reply, error, attempts, not_before, created, updated,
+                                    writes)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
                 rusqlite::params![
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9
+                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                    row.10
                 ],
             )
         })
         .expect("catalog: planting a job");
 }
 
+/// Files one in-memory effect into a node's ring, the way [`file`] files a
+/// job into its queue — from the real effect value, so its `KIND` and its
+/// own `describe` are what the scene shows.
+fn keep<E: effect::Effect>(store: &Store, e: &E, at: f64, error: Option<&str>) {
+    store.mem().record(effect::MemEffect {
+        seq: store.mem().next_seq(),
+        kind: E::KIND,
+        entity: e.entity(),
+        writes: e.writes(),
+        what: e.describe(),
+        error: error.map(str::to_string),
+        at,
+    });
+}
+
 /// The queue an effect-log node stands on: an ordinary morning of an
 /// account that syncs — two pushes that landed, an archive undone before
 /// the executor reached it, a flag still backing off after a refusal, and
-/// the one genuinely irreversible effect having given up.
+/// the one genuinely irreversible effect having given up. Then the two the
+/// queue never saw: the session those pushes went through, and the read
+/// that found nothing new. Nobody files those, and the ring is the only
+/// place they exist (CR-004).
 ///
 /// The mails are the demo seed's, so the payloads point at rows that exist.
 fn plant_queue(store: &Store) {
@@ -388,6 +409,36 @@ fn plant_queue(store: &Store) {
             ..Filed::default()
         },
     );
+    keep(
+        store,
+        &mail::Connect {
+            account: 1,
+            creds: effect::Creds::password("imap.fastmail.com", "elena@fastmail.com", ""),
+        },
+        ago(181.0),
+        None,
+    );
+    keep(
+        store,
+        &mail::Fetch {
+            account: 1,
+            folder: "INBOX".into(),
+            from: 122,
+        },
+        ago(155.0),
+        None,
+    );
+    // …and one the panel's default keeps: a read is the ring's usual
+    // business, but not all of it.
+    keep(
+        store,
+        &effect::Clip {
+            text: "",
+            what: "panel context",
+        },
+        ago(150.0),
+        None,
+    );
 }
 
 /// One row of the effect queue as the log lists it, taken **from the effect
@@ -410,8 +461,40 @@ fn shown<E: effect::Effect + serde::Serialize>(e: &E, f: &Filed) -> (effect::Job
         created: f.at,
         updated: f.at + 120.0,
         not_before: f.not_before,
+        what: None,
+        writes: e.writes(),
     };
     (job, e.describe())
+}
+
+/// The same row for an effect that was never filed — one out of the ring
+/// (CR-004). A negative id is what says so, and it is the whole difference:
+/// no payload to decode, no attempts to count, no idempotence to promise,
+/// and the sentence carried on the row rather than derived from JSON.
+fn kept<E: effect::Effect>(
+    e: &E,
+    seq: i64,
+    at: f64,
+    error: Option<&'static str>,
+) -> (effect::Job, String) {
+    let what = e.describe();
+    let job = effect::Job {
+        id: -seq,
+        kind: E::KIND.to_string(),
+        entity: e.entity(),
+        status: if error.is_some() { "failed" } else { "done" }.to_string(),
+        reply: None,
+        error: error.map(str::to_string),
+        attempts: 1,
+        payload: String::new(),
+        idempotent: false,
+        created: at,
+        updated: at,
+        not_before: 0.0,
+        what: Some(what.clone()),
+        writes: e.writes(),
+    };
+    (job, what)
 }
 
 /// A job whose kind this build has no handler for — a row an older version
@@ -431,6 +514,11 @@ fn stranger(kind: &str, payload: &str, f: &Filed) -> (effect::Job, String) {
         created: f.at,
         updated: f.at + 120.0,
         not_before: f.not_before,
+        what: None,
+        // The column is all there is to go on for a kind nothing can
+        // decode — and it is on the row, which is the point of it being a
+        // column at all.
+        writes: true,
     };
     (job, payload.to_string())
 }
@@ -869,6 +957,40 @@ fn effect_row() -> Scene<Setup> {
             ),
         )
         .about("a kind this build cannot decode keeps its payload rather than vanishing")
+        .node(
+            "in memory",
+            row(
+                kept(
+                    &mail::Fetch {
+                        account: 1,
+                        folder: "INBOX".into(),
+                        from: 118,
+                    },
+                    12,
+                    ago(2.0),
+                    None,
+                ),
+                false,
+            ),
+        )
+        .about("an effect nobody files: it ran at the call, and the ring is the only place it exists")
+        .node(
+            "in memory, refused",
+            row(
+                kept(
+                    &mail::Connect {
+                        account: 1,
+                        creds: effect::Creds::password("imap.fastmail.com", "elena@fastmail.com", ""),
+                    },
+                    13,
+                    ago(2.0),
+                    Some("connection refused"),
+                ),
+                false,
+            ),
+        )
+        .sized((560.0, 76.0))
+        .about("which is exactly why the ring exists — before it, this line lived as long as the string it returned")
         .node("narrow", row(shown(&a_move(), &queued()), false))
         .sized((380.0, 60.0))
         .about("the phone's width")
@@ -935,18 +1057,26 @@ fn effect_log() -> Scene<Setup> {
             script,
         )
     };
+    // What the panel opens on is `@wrote`; clearing the field is what puts
+    // the reads back. Typed rather than folded into the query, so a node
+    // that clears it is the whole demonstration.
+    const CLEAR: &str = "click \"filter\"\nwait 200\nkey cmd+a\nkey backspace\nwait 400\nkey esc\nwait 300";
     Scene::new("effect log", (600.0, 640.0))
-        .note("The effect queue read back: everything the app has tried on the outside world, newest first, one page at a time.")
+        .note("Everything that left the process, newest first, one page at a time — the queue and the in-memory ring, joined.")
+        .note("It opens on `@wrote`: a sync pass asks a dozen questions for every answer it acts on, and what a human came for is what was changed. The field holds the default, so clearing it is one gesture.")
         .note("The inbox's shape over another table — the cursor walk previews the job beside the list, enter goes to it. Live: enter a node and walk it.")
         .node("queue", log(""))
-        .about("a morning of one account: two pushes landed, one undone, one backing off, one given up")
+        .about("a morning of one account: two pushes landed, one undone, one backing off, one given up — and the clipboard write nobody filed")
+        .node("everything", log(CLEAR))
+        .about("the filter cleared: the session it all went through, and the read that found nothing new")
         .node("cursor", log("click \"filter\"\nwait 200\nkey esc\nwait 200\nkey down 3\nwait 400"))
         .about("the walk previews the job it lands on; the list keeps the keyboard")
         .node("empty", panel(|_| Kind::Effects, ""))
         .sized((600.0, 300.0))
-        .about("nothing has left the process yet — said, rather than left blank")
+        .about("nothing has been changed out there yet — said, rather than left blank")
         .node("phone", log(""))
         .sized((380.0, 720.0))
+        .edge("queue", "everything", "clear the filter")
         .edge("queue", "cursor", "↓ ×3")
 }
 
