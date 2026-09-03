@@ -1,52 +1,30 @@
-//! The look: black on white, monochrome, colour only for errors.
-//!
-//! Numbers live here rather than in the DSL so Rust layout code and shader
-//! defaults cannot drift apart (mosaic's rule).
+//! Shared colours, spacing, and type sizes.
 
 /// A colour as makepad wants it: RGBA floats in `[0, 1]`.
 pub type Rgba = [f32; 4];
 
-/// Workspace background.
 pub const BG: Rgba = [1.0, 1.0, 1.0, 1.0];
-/// Primary text and strong borders (near-black).
 pub const INK: Rgba = [0.078, 0.078, 0.078, 1.0];
-/// Secondary text.
 pub const TEXT2: Rgba = [0.353, 0.353, 0.353, 1.0];
-/// Muted text (footnotes, placeholders).
 pub const MUTED: Rgba = [0.565, 0.565, 0.565, 1.0];
-/// Hairline rules.
 pub const RULE: Rgba = [0.863, 0.863, 0.863, 1.0];
-/// Hover backing.
 pub const HOVER: Rgba = [0.937, 0.937, 0.937, 1.0];
-/// Selected-row backing.
 pub const SEL: Rgba = [0.906, 0.906, 0.906, 1.0];
-/// The only non-monochrome colour: errors.
 pub const ERR: Rgba = [0.627, 0.082, 0.0, 1.0];
 
-/// Gap between panels and viewport edges, in points.
 pub const GAP: f64 = 8.0;
-/// Panel header height, in points.
 pub const HEAD_H: f64 = 26.0;
-/// Body text size, in points (renders ≈14 px, the web prototype's 13 px).
+/// Body text size in points.
 pub const FONT_SIZE: f64 = 10.5;
 /// One mono character's advance, as a fraction of the font size. The face
-/// is measured at first draw; this is the ratio it comes out at, and what
-/// layout arithmetic uses before (and away from) that measurement.
+/// is measured on the first draw; layout uses this value before then.
 pub const MONO_ADV: f64 = 0.8;
-/// One line of body text, as a fraction of the font size — the web
-/// prototype's 1.5 line-height, on this grid.
+/// Line height as a fraction of the font size.
 pub const LINE_H: f64 = 2.0;
-/// Label text size: uppercase tracked labels, headers, buttons.
 pub const LABEL_SIZE: f64 = 8.25;
-/// Extra tracking between label characters, as a fraction of the advance.
 pub const LABEL_TRACK: f64 = 0.18;
-/// Panel body horizontal padding, in points.
 pub const PAD_X: f64 = 10.0;
-/// Panel body vertical padding, in points.
 pub const PAD_Y: f64 = 8.0;
-/// Button box height, in points.
 pub const BTN_H: f64 = 18.0;
-/// Tab strip height above a tabbed column, in points.
 pub const TAB_H: f64 = 24.0;
-/// Gap between the tab strip and the active panel, in points.
 pub const TAB_GAP: f64 = 4.0;

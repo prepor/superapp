@@ -1,4 +1,4 @@
-//! Test helper for the CR-005 draft re-seed proof: acting as the lease
+//! Device-sync test helper: acting as the lease
 //! holder, append a marker to the single compose draft and publish it — a
 //! peer's edit that a *running* follower must pick up live (its retained
 //! compose widget seeds from the row only once, so the shell re-seeds it).

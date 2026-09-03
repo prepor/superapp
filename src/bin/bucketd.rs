@@ -1,4 +1,4 @@
-//! `bucketd` — the local object-store daemon for a CR-005 device-sync demo.
+//! Local object-store server for the device-sync demo.
 //!
 //! A tiny HTTP server implementing the compare-and-swap semantics the sync
 //! engine needs (see [`superapp::object`]), backed by a directory. It stands

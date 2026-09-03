@@ -1,5 +1,5 @@
 #!/bin/bash
-# CR-005 draft re-seed proof (headless). A holder types a compose "alpha";
+# Headless draft re-seed check. A holder types a compose "alpha";
 # a *running* follower installs it; a peer edits it to "alpha beta"; the
 # follower must re-seed its retained compose widget from the materialized
 # row, so on take-over it shows "alpha beta" — not the stale "alpha" buffer.

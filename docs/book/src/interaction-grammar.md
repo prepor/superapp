@@ -1,657 +1,310 @@
 # Interaction Grammar
 
-A small vocabulary with sharp semantics. From looking at any element you must
-know what it does; nothing may reuse a signal to mean something else.
+The same visual signal must have the same meaning everywhere.
 
 ## The three interactive signals
 
 | Signal | Meaning |
 |---|---|
-| solid underline | opens a panel to the right, **joined** to this one |
-| dotted underline | **replaces** the panel it lives in |
-| bordered button | **side effect only** — never navigation |
+| Solid underline | Open a panel to the right and join it to this panel |
+| Dotted underline | Replace this panel |
+| Bordered button | Perform an action without navigating |
 
-Nothing draws a dotted link at the moment: the message panel's newer/older
-walk was the last one, and the inbox cursor does that job now (see
-[Preview](#preview-the-one-open-that-does-not-go)). A list's
-[marks bar](./richtable.md#marks) is bordered buttons throughout: the
-list's own row verbs on the marked set — `archive` and `delete` in the
-inbox, `copy`, `move` and `delete` in a files panel — then `all` and
-`clear`. All of them act and go nowhere.
+Breadcrumbs in the file browser currently use dotted links. Buttons in a
+[marks bar](./richtable.md#marks) act on rows but do not open panels.
 
-**Cmd+click** (or cmd+enter in a list) always opens a fresh, **un-joined**
-panel — the workspace modifier means "workspace-level" with the mouse too
-(alt is kept as a quiet alias). Side-effect feedback is a transient toast in
-the bottom-right corner; errors are the only place colour appears.
+`cmd+click` and `cmd+enter` open a separate panel without a join. Alt remains
+an alias for this behavior. Actions report short results in a bottom-right
+toast. Errors use red; other toasts do not.
 
 ### Preview: the one open that does not go
 
-A **list panel's cursor opens what it lands on, without leaving the list.**
-Walking the inbox with the arrows — or clicking a row — re-targets a joined
-message beside it; focus stays on the rows, so the next arrow keeps walking
-rather than scrolling a message body, and reading a list never costs a trip
-back.
+A list cursor previews the row it lands on in a joined panel, while focus stays
+in the list. Arrow keys can therefore continue through the rows. Clicking a row
+also focuses it and opens its preview.
 
-So the split is: **touching a row previews, `enter` goes.** Enter is the one
-that hands focus over, which is the solid-link rule above, unchanged; `cmd+→`
-is the other way there. Cmd+click still means what it means everywhere — a
-fresh, un-joined panel.
+Press `enter` to move focus into the preview. Use `cmd+enter` to open the same
+target as a separate panel.
 
-A preview is a real open — joined, undoable, and (for a mail) marking it
-read — minus the one thing that would end the walk. It opens **immediately**,
-on every step, with nothing queued between the cursor and what it points at;
-a whole run of them coalesces into a single history node, so one `cmd+z`
-takes it all back.
+A preview is a real open. It can be undone and may have domain effects, such as
+marking mail as read. Consecutive cursor previews combine into one history node,
+so one undo closes the whole run. The Effects list previews queued-job details;
+the file browser previews a directory or file card.
 
-Only a panel that *has* a cursor over a list can preview, and what it
-previews into is **the kind its row names** — the inbox a message, the effect
-log a job, a files panel a sub-directory or a card, depending on the row. The
-pair reads as one thing, which is also why it borrows keys — see
-[Accelerators](#accelerators). What a preview *establishes* is the domain's,
-not the grammar's: opening a mail reads it, while looking at a job or a
-directory leaves the world exactly as it was.
-
-The three list panels say the same three things about the row under the
-cursor — open it, preview it, put the cursor on it — and the shell answers
-each the same way whatever the row is, so there is one of each verb rather
-than one per table. A click on a row is the one door too: the list takes
-focus, its cursor follows, and what the row names previews beside it.
+If the list and preview cannot fit together, as on the cover-screen grid, the
+preview takes focus and behaves like a normal open.
 
 ### Four mailboxes, one list
 
-The mail list is one panel over one **folder role** — the inbox, the
-archive, sent, spam — and the role is a panel parameter like any other. The
-launcher offers all four as roots; a panel is titled what its folder is.
-Everything else about them is the same object: the same rows, the same
-cursor walk, the same preview into a message, the same filter grammar, the
-same marks. Only the folder the query starts from differs.
+Inbox, archive, sent, and spam use one mailbox panel with a folder-role
+parameter. They share rows, filtering, marks, cursor movement, and message
+previews.
 
-What differs is the one verb that is about *leaving* a folder: the inbox's
-bar offers `archive` and `delete`, and the other three offer `delete`
-alone — mail that is already out of the inbox has nowhere to be archived to.
-Every surface agrees: the bar, the row swipe, and the chord a list
-[borrows](#borrowed-keys) from its preview. The `@from:` completion follows the list it is on: the spam list
-completes against the people who wrote to *it*, and no other list — nor a
-compose's TO field, nor the launcher's contacts — ever offers one of them.
-A spammer is not a correspondent.
+Inbox rows can be archived or deleted. Rows in archive, sent, and spam can only
+be deleted. The marks bar, swipe action, and borrowed shortcut all follow this
+rule. `@from:` suggestions come from the current mailbox; senders found only in
+spam are not offered elsewhere.
 
-Trash is not one of the four. A conversation's trashed mails are left out
-of every thread query — being left out is what `delete` did to them — so a
-bin would be a list about single mails rather than about conversations: a
-different panel, not another role of this one.
+Trash is not another mailbox role. Deleting removes a message from these thread
+lists; a future Trash panel would need to list individual messages.
 
 ### Threads: the row is the conversation, the panel is the whole of it
 
-A mail list's row is a **thread**: every mail of a conversation counts, and
-it is a row while at least one of them sits in *this* folder. The row names
-who wrote in it — newest speaker first, `me` for your own address, first
-names once there are two — and the count past one (`Max, me · 3`), the
-subject with its `Re:` stripped, and the date of the latest mail in the
-folder; it is bold while any of them is unread. So one conversation can be a
-row in two mailboxes at once — the GitHub thread is a row in the inbox and a
-row in the archive, six mails long in both, and only the mail the row opens
-differs. Filing a row files every mail of the thread that sits in the
-folder the row was read in, in one undo node. A reply arriving later puts
-the thread back in the inbox by itself.
+Each mailbox row represents a conversation with at least one message in that
+folder. It shows participants, message count, subject, and the date of the
+latest message in that folder. It is bold while any message is unread. The same
+conversation can appear in more than one mailbox.
 
-A message panel shows the thread its mail belongs to, oldest first, the
-account it came to once at the top and `forward` and `reply` at the foot —
-both on the conversation's newest mail. A **reply** answers it: TO and
-SUBJECT prefilled — one `Re:`, never two — and the letter it answers under
-the attribution line every client writes (`On <date>, <who> wrote:`), each
-of its lines behind a `>`. The cursor sits above all of it, where the
-answer goes; the whole letter is quoted, its own quoted tail included,
-because that chain is how the conversation reaches whoever joins it late —
-and what this app sends is what its own fold knows how to take back off.
-The send threads to it: `In-Reply-To` names the parent, `References`
-carries the parent's chain and then the parent. A **forward** passes it on:
-the letter sits in the body under a header block (who wrote it, about what,
-when, to whom), SUBJECT is prefilled and TO is empty, so the cursor lands
-there. A forward is not a reply — it names no parent — but it carries the
-conversation's chain, so it threads for anyone who already has it, your own
-Sent folder included. Once it has gone, the mail it passed on wears a muted
-`↪` by its date, in every client that reads the `$Forwarded` keyword.
-**Each message is one row, open or closed.** Closed, the row is the sender,
-the first line they wrote in grey (or the status line, red when it is an
-error) and the date.
-Open, the same row is the sender as a contact link and the date, with the
-letter unfolded under it; its quoted tail — the message above, usually —
-sits folded behind `› quoted`. Touching a closed row opens it in place;
-touching an open one's header closes it; touching the fold unfolds it. None
-of that is an action: like the inbox cursor it is panel context, no history
-node, gone with the process. There is no chord for it — a panel has many
-rows, and rule 4 gives chords only to controls a panel has one of.
+Filing a row files every message from that conversation that belongs to the
+current mailbox, as one undoable action. A later reply can place the conversation
+back in Inbox.
 
-**Opening a thread reads it.** What starts open is what was new: the mail
-the row pointed at (the oldest unread inbox mail, else the newest) and every
-mail that was unread — and the open marks all of them read, one intent each,
-so one `cmd+z` puts every flag back. After a restart a panel comes back with
-only its own mail open; "what was new" dies with the process, as undo does.
+A message panel shows the full conversation in oldest-first order. The account
+appears at the top. Reply and forward actions apply to the newest message.
 
-A preview needs somewhere to *be*. Where the pair cannot share the screen —
-a phone grid, where each panel is the whole of it — the open simply goes, as
-any other open would; a preview nobody can see is worse than no preview.
+A reply fills the recipient and subject, quotes the source message, and sends
+`In-Reply-To` and `References` headers. A forward starts with an empty recipient,
+adds a forwarded-message header block, and keeps the reference chain without
+naming a reply parent. Sent mail can then join the same conversation. Forwarded
+source mail shows a muted `↪` when the server supports `$Forwarded`.
+
+Each message is one expandable row. A closed row shows the sender, first content
+line or error, and date. Click its header to open or close it. Quoted text is
+collapsed behind `› quoted`. These open states are temporary panel context and
+are not part of undo history.
+
+Opening a conversation marks its initially open unread messages as read. One
+undo restores exactly those unread flags. After restart, only the message named
+by the panel starts open.
 
 ### Attachments: a part of a letter is a card
 
-An open message lists **what its letter carries** under the reading: one
-link a part, `name · size`, and past five of them a count of the rest. A
-part the reading already draws — the pasted screenshot a
-`multipart/related` wraps around a `cid:` image — is not listed: it is
-visible one line up, and a picture under a picture of itself is noise.
+An open message lists attachments not already shown in the body as `name · size`, with at most five
+links followed by a remaining count. Inline images already shown in the body are
+not repeated.
 
-Following a link opens **a card**, joined to the right. It is the *same*
-card [a file on the disk](#files-a-directory-is-a-column-a-file-is-a-card)
-draws, over the mail's own bytes: the name, `text · 140 B`, and under the
-rule the preview — a text part read as text, a PNG or a JPEG decoded, and
-nothing at all for the rest, decided by the same rules a file card decides
-by. Two differences, both because a part is not a place on the disk. Where
-a file card shows its **path**, a part shows its **media type**; and where
-a file card's muted line says when the file changed, a part's says which
-letter it came with (`with Vera Kovac, aug 31 09:14`) — a part has no life
-of its own.
+An attachment opens in the same card widget used by a disk file. It shows the
+name, type, size, source message, and a preview for text, PNG, or JPEG content.
+A mail attachment has no disk path, so its only action is `open` (`cmd+o`). This
+writes it to an app-owned temporary directory and asks the operating system to
+open it.
 
-The verbs follow from that too. A card over a file wears `open`, `copy`,
-`move` and `delete`; a part wears **`open` alone** (`cmd+o`), because the
-other three act on a place and a part has none. `open` writes the part into
-the app's own scratch directory — a folder per *part*, since one letter
-really does arrive carrying two `image.png`s, and the folder takes the
-disambiguation so the file keeps the name the sender gave it — and hands
-*that* to the OS. From there it is an ordinary file, and the browser can
-walk to it.
+Attachment bytes remain in the raw message. Derived rows store metadata and a
+part number. A worker reads the bytes so opening a panel does not parse a large
+message during drawing.
 
-The bytes stay in the letter. What a mail carries is stored once, in the
-`raw` this app already keeps for every synced message; the rows behind the
-links are a **description** derived from it, and a card asks a reader
-thread for the bytes rather than reading a megabyte inside its own frame
-(the same machinery a letter's pictures come through — see
-[Architecture](./architecture.md#frame-loop)). That is also the one place a
-part's card is poorer than a file's: a file card *measures* its preview and
-opens as tall as it needs, and a part's bytes are not there to measure when
-the wish is taken, so it opens at its three rows and a long part is cut
-off at the bottom. The message row it hangs off does grow by the line its
-parts are listed on.
+To add a disk file to a draft, open its card and choose `copy` (`cmd+p`). The
+compose panel then offers `attach` (`cmd+h`). The draft shows a `CARRIES` line
+with links to the selected file cards. Attaching is undoable and adding the same
+path twice does nothing.
 
-**Compose carries files the same way, in reverse.** A draft's files are
-named by *walking to them*, not by a dialog — the destination grammar the
-file browser already has, read the other way round. `copy` (`cmd+p`) on a
-file card holds it; a compose panel then wears **`attach`** (`cmd+h`), the
-same key `copy here` wears, because both are the held thing's destination
-verb. With empty hands a compose wears `send` and `discard` and nothing
-else: a verb that names what will happen to what you are carrying has
-nothing to name.
-
-What it will carry shows as a `CARRIES` line above the body, each file a
-link to its own card — so what is about to leave can be looked at before it
-does. An attach is an **action**, so `cmd+z` takes it back off and
-`cmd+shift+z` puts it on — and it takes off only what it *put* on, so
-attaching a file the draft already carries changes nothing and undoes
-nothing. The draft holds the file's *path*, not a copy of it, so what goes
-out is the file as it stands when the send leaves; a file that has moved by
-then, or grown past the limit, fails the send by name in the problems panel
-rather than going out empty or truncated. A directory refuses (a letter
-carries files), and so does anything past 25 MB. And because a draft
-replicates while a path does not mean the same file on two machines, a send
-from a device other than the one that picked the file refuses too, and says
-to attach it again there.
+The draft stores the path, not a copy of the bytes. Sending fails clearly if the
+file moved, is larger than 25 MB, or was selected on another device. Directories
+cannot be attached.
 
 ## Problems
 
-A toast is an **event**; a problem is a **condition**. When something in
-the background is wrong — an account whose last sync failed, a send the
-sender gave up on, a device-sync bucket that cannot be reached — the toast
-that announced it fades in three seconds, and what remains is the
-**mark**: a small red box in the toast's own corner, bottom-right on both
-platforms, that counts what stands (`2 problems`) and stays until the
-conditions clear. It is static, deliberately: the shell idles at zero
-frames, and red on a monochrome screen is already the alarm — that is the
-one job the colour has. It says what it is in words, because a dot would
-not.
+A toast reports an event and fades. A problem represents a condition that still
+exists, such as a failed account sync, failed send, or unreachable device-sync
+bucket. A small red box in the bottom-right corner shows the current count.
 
-The mark is the launcher's verb in one click: it goes to the **problems
-panel** where that is open, or opens it fresh. The panel is a root like
-settings (the launcher finds it as *problems*) and lists every standing
-problem as a row — what it concerns, the error in red, a muted line under
-it (the last successful sync, the recipient, the frames waiting to
-publish) — with what can be done about it. An account offers *sync* and a
-link to *settings*. A failed send offers *retry*, a button that files the
-send again with its usual window, and *reopen*, a solid link that brings
-the draft back as a compose panel joined to the right (`cmd+z` puts the
-failed row back). Device sync offers only its count: the network coming
-back is what fixes it. With nothing standing, the panel says so. `tab`
-walks each row's button and link and `enter` presses; there are no chords,
-since a panel with a control per row gives none.
+Clicking the count opens or focuses the Problems panel. Each row shows what
+failed, the error, supporting details, and available actions. Account failures
+offer sync and a Settings link. Failed sends offer retry and reopen. Device-sync
+failures clear when the connection recovers.
 
-The list is **derived**, never stored: it is read off the account's status
-line, the outbox's failed rows and the lease status the sync worker last
-reported, so it cannot disagree with them and nothing ever has to be
-dismissed — fix the condition and the row is gone. On macOS the menu bar
-mirrors it the way it mirrors the workspaces: a `! 2 problems` menu that
-exists only while something stands, one item per problem, each opening
-the panel. It is plain text; AppKit draws menu titles itself, and the
-colour lives in the window.
+Problems are derived from account, outbox, and replication state. They are not
+stored or dismissed separately. Fixing the source condition removes the row.
+The macOS menu shows the same current problems.
 
 ### Files: a directory is a column, a file is a card
 
-Two rules, and the rest is the grammar already described:
+A `files` panel lists one directory. Directories come first, followed by files,
+with case-insensitive name ordering. Columns show name, size, and modification
+time. Hidden files appear with `@hidden`. Other filters include `@dir`, `@kind:`,
+`@size`, and `@modified`.
 
-> **A directory is a list panel. A file is a card.**
+Moving the cursor previews a subdirectory as another list or a file as a card.
+`enter` moves focus to it. Breadcrumbs such as `~ / Downloads / 2026` replace
+the current panel when clicked.
 
-A `files` panel is [the rich table](./richtable.md) over one directory,
-non-recursive: name (a directory wears a trailing `/`), size, modified;
-directories first, then names, case folded. Dot-files wait for `@hidden`.
-The filter is the inbox's grammar over other tags — `@dir`, `@hidden`,
-`@kind:` (image · text · pdf · archive · other, off the extension),
-`@size>`, `@modified>`.
+`go to` (`cmd+g`) replaces the breadcrumbs with a path field. Completion lists
+entries for the current path segment. `tab` accepts a suggestion, `enter` opens
+the typed path, and `esc` restores the breadcrumbs. Paths may start with `~/` or
+`/`; relative paths are refused. A second root after the seed restarts the path,
+so `~/Downloads//tmp` means `/tmp`.
 
-The walk is the preview walk, so the browser is Finder's column view for
-free: the cursor previews a sub-directory as the next column or a file as
-its card, `enter` goes, the next row replaces what was previewed, `cmd+w`
-closes a level and `cmd+←` steps back. Above the rows a crumb line —
-`~ / Downloads / 2026` — spells the way back, each ancestor a **dotted**
-link that replaces the panel in place; they are the first dotted links
-since the message walk went, and exactly what that underline is for.
+A file card shows the file name, kind, size, modification time, and selectable
+path. It previews up to 64 KiB of text or a PNG/JPEG image detected from its
+bytes. `open` (`cmd+o`) gives the path to the operating system; Superapp does not
+execute the file.
 
-**`go to`** (`cmd+g`) turns the crumbs into a path field, seeded with where
-the panel stands and a slash. Each segment completes like a shell's tab —
-the entries of the directory the segments before it name, a directory
-landing with its own slash so the next offer opens at once, the two roots
-`~/` and `/` before the first slash; `tab` takes the offer, `enter` goes to
-what is typed even with the offer open, `esc` puts the crumbs back. A
-directory replaces the panel, a file opens its card joined, a path that is
-not there is refused on the status line. `.` and `..` are read; a relative
-spelling is not. A second root typed after the seed **restarts** the path
-(find-file's rule): `~/Downloads//tmp` is `/tmp`, so an absolute path wins
-without clearing the field. That is how the browser leaves `~`.
+File operations act on the object represented by a panel, not an arbitrary list
+row. A card can open, copy, move, or delete its file. A directory panel at the
+end of a joined chain can copy, move, or delete that directory. Root and parent
+directory panels offer only `new dir` and `go to`.
 
-The **card** is the file's name, its kind and size, when it changed, and its
-path as selectable text. Under a rule it previews what it can: the first 64
-KB of a text file, or a PNG or JPEG fit to the column — decoded by the
-bytes' own magic rather than the name, so a picture saved under the wrong
-extension still draws. Anything else, a PDF included, is the card alone, and
-**`open`** (`cmd+o`) is how you read one: the path goes to the OS, which
-picks the viewer. Nothing is executed by us. A card measures its preview and
-asks for the rows it needs, the way a long letter does — a long file opens
-tall rather than scrolled, a short one stays short.
+`copy` (`cmd+p`) and `move` (`cmd+m`) hold one or more paths. Directory panels
+then offer `copy here` or `move here` (`cmd+h`). A move clears the hold; a copy
+keeps it. The hold is temporary and is not part of undo history.
 
-The rest of the verbs reach the disk — `new dir`, `copy here`, `move here`
-and `delete` are performed, not described — and every one of them acts on
-**the thing the panel shows**: a card's on its file, a files panel's on its
-directory, never on a row. The list reaches them by borrowing, exactly as
-the inbox borrows `archive`. So a
-files panel wears `copy`, `move` and `delete` only while it is the **end of
-a chain**: joined under a parent and driving nothing, which is to say the
-thing under someone's cursor. A root, a list opened from the launcher, or a
-list that is itself driving a preview wears `new dir` and `go to` alone —
-`~` cannot be deleted, and a chord pressed in a list never hits the
-directory the list itself shows; it hits what the cursor is on, one column
-over, where the mark is.
+Operations check the current disk when they run. Existing destinations,
+missing sources, moves to the same place, and copying a directory into itself
+are refused per path. Copying a file into its own directory creates names such
+as `notes copy.txt` and `notes copy 2.txt`.
 
-Where a driver and its preview share a key for the same verb — two files
-panels both wearing `new dir` — the driver's wins, and the shell draws the
-preview's shadowed mark **plain**, so no bold letter ever promises a chord
-the driver would take. Two *different* verbs on one key stay forbidden by
-test; the same verb twice is allowed exactly because the mark stays honest.
+`new dir` (`cmd+n`) opens a name field. `delete` (`cmd+d`) always moves items to
+the system trash. Copy, move, new directory, and delete are each one undoable
+action, including when they act on marked rows. Undo first checks that paths
+still name the same objects. If the disk has changed, the history node expires
+instead of overwriting or deleting unrelated data.
 
-Destination is named by walking there rather than by a dialog: `copy`
-(`cmd+p`) or `move` (`cmd+m`) **holds** the object, and every files panel
-then offers `copy here` or `move here` (`cmd+h`), which performs into the
-directory that panel shows. A move clears the hold, a copy keeps it. The
-hold is context, not history — `cmd+z` never takes it back, and it dies with
-the process. `new dir` (`cmd+n`) opens a one-line field above the rows;
-`enter` creates, `esc` puts it away, and a name that is taken or holds a
-separator is refused on the status line. Note `copy` wears `p`, not `c`: a
-card's path is selectable, so rule 3 leaves `cmd+c` to the text. The file
-clipboard is not the text clipboard.
+The browser refreshes visible file panels after its own changes. It does not
+watch changes made by other programs.
 
-A `… here` is planned against the disk as it stands at the moment of the
-click, not as it stood when the hold was taken — nothing watches the disk,
-so that moment is the first time anyone has looked. It refuses **path by
-path**: a source that has gone since, a directory asked into itself, a name
-the destination already has, and a move that would go nowhere. The one
-clash allowed is a copy into the file's own directory, where the duplicate
-is the point: it lands as `notes copy.txt`, and beside that as `notes copy
-2.txt`. What can be done is done — one refusal never fails the rest — and
-the toast says how many of how many, with the refusals after a dash.
-
-**`delete` (`cmd+d`) is the trash, never `rm`.** The path is handed to the
-system trash, which answers where it put it, and undo is the move back out.
-That holds for every reversal here, the ones that take something away
-included: undoing a copy trashes what the copy made, and undoing a `new
-dir` trashes the empty directory. Nothing this app does to a file is
-unrecoverable.
-
-Each of these is **one undoable action**, a marked set included — one `⌘z`
-takes the whole batch back, and puts the marks it consumed back with it
-(a move empties the rows it took; a copy leaves them, and their marks,
-alone). A reversal is asked of the disk before it is made, and expires
-honestly when the world has moved on: a directory that is no longer empty,
-a trash that has been emptied, a name something else has taken since — and
-a path that is *there* but is not **the object this action put there**,
-which is not the same question at all, because undo takes things away. Each
-verb reads back the object it wrote the moment after — the disk's own
-identity for it, not its name, size and date, which a stranger can match
-exactly — and a reversal compares before it moves anything. A record that
-never learned what it made refuses outright: undo may decline, it may not
-guess. An expired node goes transparent, exactly as a sent mail's does —
-the walk says so and carries on rather than writing over what is there now.
-
-A reversal that fails *while* it is being made — the disk moved between
-the asking and the doing — does every path it holds anyway, names the ones
-that would not go in the same toast as the walk, and **expires its node**.
-The layout still lands, because the snapshot is ours and stranding the
-tree helps nobody; but the world is now somewhere between that node and
-its parent, and nothing, least of all a redo, can say where. Expired is
-exactly what that is.
-
-Nothing watches the disk, so a verb that wrote it tells the listings
-itself — every files panel on screen, since a copy changes the directory
-it came from as well as the one it landed in. A panel showing a path that
-a move or a delete emptied closes with it, and undo brings both back.
-
-**A directory's rows can be marked**, exactly as the inbox's are (see
-[The Rich Table](./richtable.md#marks)): `space` marks the row under the
-cursor, `shift+↓` / `shift+↑` mark a range, `esc` clears, the pointer
-never marks and a long press does. A files panel's marks are its
-**entries, by name**, so they belong to the directory it lists and go when
-it lands on another one. The bar at its foot carries the row's own verbs
-on the set — `copy` (`cmd+p`), `move` (`cmd+m`), `delete` (`cmd+d`) —
-then `all` and `clear`; and **while any row is marked the panel's own
-object verbs stand down**, back to `new dir` and `go to`, because with
-rows marked the verb meant is the set's. A hold is a set too: `copy` or
-`move` on marked rows holds every marked path, and `copy here` performs
-them all into the directory a panel shows, refusing per path exactly as it
-does for one. Drafts still, and the toast says so.
-
+Directory rows support the same marks as mail: `space` toggles a mark,
+`shift+up/down` extends a range, and `esc` clears all marks. A long press starts
+marking on touch. While marks exist, copy, move, and delete apply to the marked
+set. Each path can succeed or fail independently.
 
 ## Keyboard
 
-**Cmd carries two namespaces.** The **reserved set** below is global and
-fixed — it means the same thing on every panel, forever. Everything else
-under cmd belongs to the **focused panel**, which spends it on
-[accelerators](#accelerators). Plain letters stay free: no modes, and the
-whole keyboard is still there for a future text-editor panel.
+Cmd shortcuts are split into global workspace commands and focused-panel
+commands.
 
-- `cmd` + `←↓↑→` — focus panels; `+shift` — move the focused panel
-- `cmd+1…9` — switch workspace; `cmd+shift+1…9` — move the focused panel to
-  that workspace and follow it
-- `cmd+w` — close the focused panel
-- `cmd+z` / `cmd+shift+z` — undo / redo (see below)
-- `cmd+[` / `cmd+]` — consume into / expel out of a column;
-  `cmd+,` / `cmd+.` — pull from the right / push the bottom out
-- `cmd+t` — toggle column tabs
-- `cmd+u` history · `cmd+i` copy the panel's context
+Global commands:
 
-That is the whole reserved set: `1…9`, the arrows, `w z u i t [ ] , .` and
-`enter`. A panel may claim any other letter.
+- `cmd+arrows`: move focus; add Shift to move the focused panel;
+- `cmd+1…9`: switch workspace; add Shift to move the panel there;
+- `cmd+w`: close the focused panel;
+- `cmd+z` and `cmd+shift+z`: undo and redo;
+- `cmd+[` and `cmd+]`: move a panel into or out of a neighboring column;
+- `cmd+,` and `cmd+.`: pull from or push to the right column;
+- `cmd+t`: toggle tabs for the column;
+- `cmd+u`: open history;
+- `cmd+i`: copy panel context;
+- `cmd+enter`: open the current target as a separate panel.
 
-Per panel, below the reserved set:
+All other Cmd letters may be used by the focused panel.
 
-- inbox: `enter` opens *and goes* (`cmd+enter` un-joined), `/` filter, arrows
-  walk the rows — threads — (scrolling the list to keep the cursor visible,
-  and **previewing** each one beside it). `space` **marks** the cursor's row
-  — it arrives as text the way `/` does, so in a live filter it is a space —
-  `shift+↓` / `shift+↑` mark a range as they walk, and `esc` clears the
-  marks when no field is listening; the bar down a marked row's left edge is
-  an indicator, and nothing on the pointer marks — a click is the preview it
-  always was. In a message panel the arrows
-  scroll; its rows open and close by pointer only. In the filter, `@` opens the tag
-  autocomplete: arrows walk it, `enter`/`tab` take, `esc` puts it away — see
-  [The Rich Table](./richtable.md) for the grammar. With no offer up, `↓`
-  leaves the filter for the rows it made and lands on the first, so a
-  narrowing runs on into the walk without a hand leaving the arrows
-- compose: in TO, typing offers the senders the store knows, by name or
-  address — the same box, the same keys; `enter` and `tab` take the
-  address and stay in the field, so a comma starts the next one
-- forms: `tab` / `shift+tab` walk the fields **and the buttons** — one ring,
-  wrapping; `enter` advances and **submits past the last field**. Read
-  panels have no ring: their controls wear chords instead.
-- `esc` leaves a text field; arrows scroll a panel that has nothing better to do
+In a list, arrows move the cursor and keep it visible. `enter` enters the
+preview. `/` focuses the filter. `space` toggles the current mark unless a text
+field owns the keyboard. Shift with up or down extends the marked range.
 
-There is no vim layer: `hjkl` and the plain `j`/`k` walks are gone. A key is
-an arrow, a cmd chord, or typing — nothing in between.
+In completion boxes, arrows choose an item, `enter` or `tab` accepts it, and
+`esc` closes it. Without an open completion box, down from a filter enters the
+result rows. Compose's recipient field uses the same controls.
 
-Letter keys reach panels as text input, so key repeat and IME behave like
-typing; control keys (enter, arrows, backspace) are routed as key events.
+In forms, `tab` and `shift+tab` move through fields and buttons. `enter` advances
+and submits after the last field. `esc` leaves a text field. There is no Vim key
+layer; plain letters remain text input.
 
 ## Accelerators
 
-**A control carries its own key, drawn into its label.** One character of a
-button or link is **bold**, and `cmd`+that letter fires it: `archive` is
-`cmd+a`, `delete` is `cmd+d`, `reply` is `cmd+r`, `forward` is `cmd+f`, the
-inbox's `sync` is `cmd+s`, settings' `add account` is `cmd+d`. Nothing to
-memorise and no help panel to consult — the shortcut is a property of the
-thing it fires.
+A button or link can show one bold letter. `cmd` plus that letter activates the
+control. For example, archive uses `cmd+a`, delete uses `cmd+d`, reply uses
+`cmd+r`, and sync uses `cmd+s`.
 
-This is the one place bold does a second job, so the rule is sharp:
+Accelerators follow these rules:
 
-> A bold **run** is emphasis (unread rows, a contact's name). A bold **single
-> character inside a bordered button or an underlined link** is that
-> control's key.
+1. They cannot use a global shortcut.
+2. They are unique within a panel.
+3. A panel with editable or selectable text leaves `c`, `v`, `x`, and `a` to
+   normal text operations.
+4. Only a control that appears once in a panel gets an accelerator.
+5. A list may borrow available accelerators from its visible preview.
 
-The two never share a place: emphasis is never applied to a control's label,
-and controls are already marked by border or underline.
-
-Accelerators are **on cmd, not on bare letters**, so they work while a text
-field owns the keyboard — you can archive mid-sentence in a compose body, and
-the mark never has to lie about whether it is live. They are also
-**panel-scoped**: `cmd+a` archives on a message, and stays select-all in a
-compose body. Five rules keep that honest, enforced by unit test rather than
-by discipline:
-
-1. never the reserved set;
-2. unique within a panel;
-3. a panel whose text can be edited *or selected* yields `c` `v` `x` `a` to
-   it — which is why settings' one link is `cmd+d`, not `cmd+a`: the account
-   rows are selectable, so select-all stays theirs;
-4. only for controls a panel has exactly one of — a list of rows each with a
-   *remove* button stays on the Tab ring and the mouse;
-5. **a panel that previews borrows its preview's keys** — see below.
+These rules are checked by unit tests.
 
 ### Borrowed keys
 
-A [preview](#preview-the-one-open-that-does-not-go) and the list driving it
-are one working surface, so they pool their accelerators: with a thread
-previewed, `cmd+a` archives it, `cmd+d` deletes it, `cmd+r` replies and
-`cmd+f` forwards — all without leaving the list. The driver's own keys win
-first (`cmd+s` still syncs the inbox), and the preview lends what is left.
+A list and its preview act as one working area. With a message preview open,
+the list can borrow archive, delete, reply, and forward shortcuts. The list's
+own shortcut wins if there is a conflict.
 
-The mark stays honest because it never moves: it is drawn on the message
-panel's own chrome, one column over and in plain sight. Nothing is ever bold
-on the borrower — a borrowed key is a property of the panel you can see, not a
-hidden binding on the panel you are in. That is also why refresh became
-`sync`: two visible controls may not answer to one letter, and `reply`'s `r`
-was already spoken for.
-
-Borrowed keys **stand down while the driver's own text field holds the
-keyboard**, so `cmd+a` in a live filter is still select-all. Rule 3 survives:
-the list yields the text chords to its field exactly as before, and only
-lends them when the field is not listening.
-
-They stand down for the [marks bar](./richtable.md#marks) too. While a list
-has marked rows the bar wears its rows' own letters itself — `a`, `d` and
-`l` in the inbox; `p`, `m`, `d` and `l` in a files panel — because a batch
-verb is the same verb on a wider set. Whatever the bar wears goes quiet
-elsewhere: the borrowed chords in the inbox, and a files panel's own object
-verbs, which fall back to `new dir` and `go to` while any row is marked.
-Two visible controls may not answer to one chord. The guard is the
-filter's: with the field holding the keyboard `cmd+a` is select-all, not an
-archive of the set.
-
-And a list **lends only what its own bar would do**. The bar and the borrow
-are one verb over many rows and over one, which is why they wear the same
-letter — so a verb the bar does not offer is not lent either: `cmd+a` from a
-sent or a spam list does not file the conversation its bar and its row swipe
-both refuse to. The withheld letter goes plain on the preview's button, since
-a bold mark may only promise a chord that answers. The button itself is
-untouched — it belongs to the mail, and pressing it there still archives.
+Borrowing stops while a text field has focus, so `cmd+a` still means Select All
+in a filter. It also stops while marks exist. The marks bar then owns the batch
+action shortcuts. Mailboxes that do not offer archive do not borrow archive.
 
 ## Workspaces
 
-Nine numbered spaces on a vertical stack; a switch **slides** the viewport a
-workspace-height down or up (see [Panel Model](./panel-model.md)). On macOS
-the **menu bar mirrors them**: one menu per workspace worth showing — every
-occupied one plus the first empty slot — with the current number bracketed,
-and *Switch Here / Move Panel Here* items inside. (The bold app menu itself
-is AppKit-mandatory; it holds only Quit.) An empty workspace names itself in
-muted text, so switching onto a blank screen reads as a place, not a bug.
+Nine numbered workspaces form a vertical stack. On macOS, the menu bar lists
+occupied workspaces and the first empty one, with actions to switch or move the
+focused panel.
 
-On touch, a **two-finger swipe down** raises the workspaces overlay: a
-*search* row (the launcher's entry, below), then one row per workspace
-(number + its panel titles, the current row inverted, the first empty slot
-offered as *new*). A tap on a row switches, a tap outside — or a two-finger
-swipe up, or `esc` — dismisses. There is no touch gesture for *moving* a
-panel between workspaces yet (see [Open Questions](./open-questions.md)).
+On touch, a two-finger swipe down opens the workspace overlay. It shows a search
+row and one row per workspace. Tap a workspace to switch. Tap outside, swipe up,
+or press `esc` to close it. Moving a panel between workspaces has no touch
+gesture yet.
 
 ## The launcher
 
-**Double-tap cmd** (the workspace key itself — no letter spent) and a modal
-query field rises over an ink wash. One query runs over *everything that can
-be a panel*: the open panels on every workspace, the root panels, and the
-mail world — contacts by name and address, mails by subject and sender, the
-same word-by-word substring semantics as the inbox filter. Every token must
-match, so `vera q3` narrows to her budget mail. A root also answers to the
-word one actually reaches for rather than only to its own name: the effect
-log is found by *log* and *queue* as well as by *effects*.
+Double-tap Cmd to open the launcher. It searches open panels, root panels,
+contacts, and mail. Every word in the query must match.
 
-Each hit carries one of two verbs, decided for you:
+An open result focuses its existing panel and switches workspace if needed. A
+new result opens as a separate last column in the current workspace. The
+launcher does not create a duplicate of a panel that is already open.
 
-- already open somewhere → **go to it** — switch workspace, focus it; the
-  row wears its workspace number (`#3`);
-- not open → **open it** — a fresh un-joined trailing column on the active
-  workspace; the row says *new*.
-
-There is never a second copy: an open panel absorbs its would-be duplicate
-(no "force a fresh copy" variant — deliberately). The empty query is the
-pure **switcher**: every open panel, the active workspace's first, roots
-beneath. Arrows pick (the list is a ring: past the last hit is the first),
-`enter` goes, `esc` (or another double-cmd, or a tap outside) dismisses;
-every row is clickable. The sheet is as tall as its hits; a query nothing
-answers says *nothing matches*. A tap only counts as a tap: holding cmd for
-a chord, cmd+clicking, or overshooting ~350 ms between taps never summons it.
-
-On desktop the launcher is also in the menu bar (*Launcher — ⌘ ⌘*); on touch
-it is the search row atop the workspaces overlay — tapping it flips the
-overlay into the launcher and raises the soft keyboard. When real kinds
-arrive (telegram, rss, kb), each contributes its entries to the same query —
-this surface is where global search lives.
+With an empty query, open panels appear first, followed by roots. Arrow keys
+wrap through results. `enter` opens the selected result; `esc`, another
+double-Cmd, or a click outside closes the launcher. It is also available in the
+macOS menu and from the search row in the touch workspace overlay.
 
 ## Undo
 
-**Every action is undoable** — open, close, replace, move, column ops,
-workspace moves, archive, delete — and `cmd+z` walks them back with their
-whole delta: undoing an archive restores the panel *and* the mail's folder;
-filing a thread carries the list's cursor to the next one in the same node,
-so one `cmd+z` takes back the filing and the move together;
-undoing an open makes every mail it read unread again, and none other.
-A batch verb is one node as well: archiving twelve marked conversations
-files every inbox mail of every one of them under a single `archive 12
-conversations`, and undoing it brings the rows back **marked**. A batch
-carries the cursor the same way, but only when the cursor's own row went
-with it; standing on a row that stayed, the cursor does not move and
-nothing new is previewed.
-Undo also puts you back where the action happened (its workspace and focus
-revert with it). `cmd+shift+z` re-applies.
+User actions such as open, close, replace, panel movement, filing mail, and file
+operations create history nodes. Undo restores both layout and data changed by
+the action. A batch operation creates one node and restores its marks on undo.
 
-History lives **in memory** and dies with the process: quit and your undo
-tree is gone, though nothing you did is. The distinction matters and is
-worth stating plainly — a send you fired seconds before a crash still goes
-out on the next launch, you simply cannot call it back; yesterday's archive
-cannot be undone today. The rows every action wrote are durable, and the
-background passes read only those, never the tree.
+Focus movement, workspace switching, camera movement, row cursors, and marks do
+not create history nodes. Rapid repeated layout or preview changes can combine
+into one node.
 
-What is deliberately *not* an action: focus walks, workspace switches,
-camera pans, row selection, a list's marks — context, not intent. They
-persist, but they never become history nodes; undo restores them only as
-part of a real action's delta. Rapid bursts of the same gesture on the same
-panel (arrow moves, the preview walk) **coalesce** into one node — one
-`cmd+z` takes back the whole burst.
+History is kept in memory and is lost when the process ends. The database work
+remains durable, so pending sends and sync continue after restart even though
+they can no longer be undone.
 
-History is a **tree, not a line**: acting after an undo starts a branch and
-destroys nothing; redo follows the newest branch. **`cmd+u` raises the
-history overlay** — the whole tree as rows, newest first, indented by
-branch depth, the current position inverted, abandoned branches muted but
-alive. Clicking any node **travels** there: undo up to the common
-ancestor, re-apply down the other side — including *the beginning*, and
-back out again; the overlay stays up, because browsing is the point.
+History is a tree. Performing an action after undo creates another branch
+without deleting the old one. `cmd+u` opens an overlay that can travel to any
+node by undoing to the shared parent and replaying the selected branch.
 
-Under the hood a node is a **layout snapshot plus zero or more claims on
-the world**. The snapshot is what makes navigation free — open, move,
-column and close undo by restoring a small typed value — and only genuine
-data mutations owe a claim, of which there are six. Each claim decides its
-own reversibility: archiving flips intent back and the next sync pass
-re-converges, while a send asks its outbox row and refuses once the sender
-has taken it. A node whose claims cannot all be given back goes **expired**
-and the walk steps transparently past it — a delivered send shows as
-`· sent`, because blocking all history behind one sent mail would be wrong
-and pretending to undo it would be a lie. Removing an account is expired
-from the start: no snapshot brings its mail back, and saying so beats
-half-restoring. The menu bar carries *Undo / Redo / History* items; toasts
-name what happened. The tree is bounded (200 actions); past that floor
-older ones are simply gone.
+Some changes cannot be reversed after the outside world changes. A delivered
+send, emptied trash, or reused file path makes its node expire. History skips
+expired nodes instead of pretending the action was reversed. Removing an
+account is expired immediately because restoring the panel cannot restore its
+mail. The tree keeps at most 200 actions.
 
 ## Mouse and trackpad
 
-Every action is also reachable by mouse: click focuses, × closes, links and
-buttons are hit-tested exactly (hover states and cursor shapes mark them).
-Horizontal trackpad scroll pans the strip 1:1; vertical scroll scrolls the
-panel body under the pointer. A scrollable body shows a minimal grey thumb on
-its right edge; list panels pin their filter and table header above the
-scrolling region.
+Clicking focuses panels and activates controls. Hover states and cursor shapes
+show hit areas. Horizontal trackpad movement pans the workspace directly;
+vertical movement scrolls the panel under the pointer. Scrollable content shows
+a small grey thumb.
 
-## Touch (android)
+## Touch (Android)
 
-The same grammar, re-based on fingers:
+- **Tap** behaves like click. There is no touch version of `cmd+click`.
+- **One-finger vertical drag** scrolls the panel under the finger.
+- **Sideways drag on a mail row** archives left or deletes right. A labelled
+  curtain shows the pending action. Release after one third of the row to run
+  it; release earlier to cancel.
+- **Two-finger horizontal drag** pans the workspace. On release it aligns to the
+  nearest column edge.
+- **Two-finger vertical drag** opens the workspace overlay when moving down and
+  closes it when moving up.
+- **Long-press a list row** starts marking. While marks exist, taps toggle them.
+- **Long-press a panel header** starts a panel drag. A horizontal insertion bar
+  means stack in that column; a vertical bar means create a column. Holding near
+  a screen edge scrolls the workspace.
 
-- **tap** — exactly a click: follow a link, press a button, focus a panel,
-  preview a mail row. There is **no touch equivalent of cmd+click**; a solid
-  link always follows join semantics on glass. (On a phone grid a previewed
-  panel is the whole screen, so there the tap goes — see
-  [Preview](#preview-the-one-open-that-does-not-go).)
-- **one-finger vertical drag** — scrolls the panel under the finger, 1:1.
-  Vertical keeps ties, so a diagonal is a scroll and never half a swipe.
-- **one-finger sideways drag on a mail row** — triage of the whole thread:
-  **left archives, right deletes**. An ink **curtain** wipes across the row carrying the name
-  of what will happen, entering from the edge that action's button occupies
-  in a message header — so the two surfaces agree about which side means
-  which verb. Under a third of the way it is a grey wash with the word in
-  ink; past that it **inverts**, the same way a header button inverts under
-  the pointer, and letting go there fires it. The curtain finishes covering
-  the row before the mail leaves the inbox, and a toast offers the undo.
-  Let go short of the threshold and it wipes back out.
-  Sideways anywhere *else* still means nothing (deliberately: it would fight
-  taps and the workspace pan).
-- **two-finger drag** — the first move past the slop locks its axis.
-  Horizontal pans the workspace strip, 1:1 while the fingers are down; on
-  release the camera **magnetises** to the nearest column alignment (a
-  column's left edge one gap in from the viewport's left, or its right edge
-  one gap in from the right) and springs there. **Vertical, downward, raises
-  the workspaces overlay** (upward dismisses it), then the gesture goes
-  inert.
-- **long-press a list row** — marks it, in the inbox or a files panel: the
-  phone's way into a batch (a header's long press picks the panel up; a
-  row's was free). While any mark exists a tap **toggles** rather than
-  opens, and the last mark cleared gives the tap back. The bar's controls
-  are buttons, so nothing about marks is keyboard-only.
-- **long-press a panel header** — picks the panel up; it rides the finger
-  (spring-following, so it trails with the same physics as everything else).
-  While held, an **ink insertion bar previews the drop**, judged by the
-  *finger* point: a horizontal bar across a column means *stack at that
-  row*; a vertical bar in a gap means *a fresh column here*. Near a screen
-  edge the camera **auto-pans**, so a drag can reach columns beyond the
-  viewport; the drop lands exactly where the preview said.
-
-One finger decides what it is (tap / scroll) after an 8 pt slop; a second
-finger anywhere turns the gesture into a pan. Gestures that come to nothing
-go inert until every finger lifts — no surprise mode flips mid-gesture.
+Movement starts after an 8 pt threshold. Once a gesture chooses a mode, it does
+not switch modes until all fingers lift.
 
 ### The soft keyboard
 
-The on-screen keyboard belongs to **text fields**, not panels: it rises when
-a field is tapped and the whole workspace **lifts above it** (the viewport
-shrinks by the keyboard's height — no field ever sits under it). Typing
-mirrors android's authoritative IME state, so autocorrect, composition and
-word-swipe all behave natively. Dismissing the keyboard (back gesture)
-leaves the field — the same meaning as `esc` on desktop — and tapping any
-field brings it straight back. The keyboard's action button acts as Enter
-for single-line fields (in the filter: select the first row and leave).
+The on-screen keyboard belongs to the focused text field. The workspace uses
+the remaining height, so the field stays above the keyboard. Android's full
+text state supplies autocorrect, composition, and swipe typing. Dismissing the
+keyboard leaves the field, like `esc` on desktop. Tapping a field shows it
+again. The keyboard action button acts as Enter for single-line fields.

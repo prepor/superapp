@@ -1,4 +1,4 @@
-# CR-008 — the file browser writes. `new dir`, `copy here`, `move here`
+# The file browser writes. `new dir`, `copy here`, `move here`
 # and `delete` reach the disk through the outside, and every one of them
 # is an undoable action whose reversal is another one: a delete is a move
 # to the trash, and undo is the move back.

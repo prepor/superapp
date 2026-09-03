@@ -1,27 +1,18 @@
-//! Secrets live **outside** the store — the SQLite file is meant to be
-//! handed to agents someday, and passwords must never ride along.
+//! Stores mail passwords and device-sync secret keys outside SQLite.
 //!
-//! macOS: the login keychain via `/usr/bin/security` (the item is created
-//! and read by the same tool, so no ACL prompts; the password does pass
-//! through argv for one process — a local, single-user trade, noted).
-//! Elsewhere (android): an app-private file next to the store, mode 0600 —
-//! the app sandbox is the perimeter until a Keystore binding exists.
-//!
-//! Two kinds live here, under two services: a mail account's password, and
-//! (CR-005) the secret access key for a real device-sync bucket. Same
-//! storage, same trade; the bucket key is kept apart because losing it and
-//! losing a mailbox are different accidents.
+//! macOS uses the login keychain through `/usr/bin/security`. Other targets
+//! currently use a mode-0600 file inside the app directory. Mail and bucket
+//! secrets use separate service names.
 
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
 const SERVICE: &str = "superapp-imap";
 
-/// The device-sync bucket's secret access key (CR-005), by key id.
+/// The device-sync bucket's secret access key, by key id.
 #[cfg(target_os = "macos")]
 const BUCKET_SERVICE: &str = "superapp-r2";
 
-/// Stores an account's password.
 pub fn set(dir: &Path, email: &str, pass: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -32,7 +23,6 @@ pub fn set(dir: &Path, email: &str, pass: &str) -> bool {
     file_set(dir, email, pass)
 }
 
-/// Recalls an account's password.
 pub fn get(dir: &Path, email: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -43,8 +33,7 @@ pub fn get(dir: &Path, email: &str) -> Option<String> {
     file_get(dir, email)
 }
 
-/// Stores the device-sync bucket's secret access key, under its key id
-/// (CR-005). Written by `superapp --r2-login`.
+/// Stores a device-sync secret under its key ID.
 pub fn set_bucket_secret(dir: &Path, key_id: &str, secret: &str) -> bool {
     #[cfg(target_os = "macos")]
     {

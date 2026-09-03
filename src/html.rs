@@ -1,48 +1,11 @@
-//! HTML from outside, narrowed to what makepad's `Html` widget draws.
+//! Converts outside HTML into the limited markup supported by Makepad's HTML
+//! widget.
 //!
-//! Mail today, feed articles next: both arrive as whatever a composer or a
-//! CMS felt like emitting — nested layout tables, a stylesheet in the head,
-//! inline styles on every span, tracking pixels, Outlook's conditional
-//! comments, a preview line hidden with CSS. The widget draws a small
-//! semantic vocabulary and no CSS at all, so the job here is a narrowing,
-//! not a rendering: the document is parsed for real (html5ever — the tree a
-//! browser builds, implied end tags and all), the stylesheet is read for the
-//! handful of properties a monochrome page can honour, and the tree is
-//! walked into the widget's tags. Everything the widget cannot say is either
-//! unwrapped (tag goes, text stays) or dropped whole.
-//!
-//! The shape follows FairEmail's `HtmlHelper`, the one open Android client
-//! that renders mail without a browser: parse, apply the stylesheet, flatten
-//! layout tables to lines but keep the data tables, remove what a reader was
-//! never meant to see, and only then draw. Its heuristics are borrowed; its
-//! code (GPL) is not.
-//!
-//! What the stylesheet contributes, and no more: whether an element is
-//! hidden (`display: none`, the preheader tricks), weight, slant, underline
-//! and strike-through, monospace, `white-space: pre`. Colour and size stay
-//! the page's, not the sender's — the app is black on white in one face —
-//! except where a size or colour was chosen so the text could not be seen.
-//!
-//! Emphasis is decided per run of text, not per tag: `<b>`, `<span
-//! style="font-weight:bold">` and `.title { font-weight: 700 }` all arrive
-//! at the same `<b>`, and a `font-weight: normal` inside a `<b>` really does
-//! switch it off, which a tag-for-tag copy could never say. Structure —
-//! paragraphs, headings, lists, quotes, tables — stays tag-based.
-//!
-//! The narrowing is also the security story. Nothing survives that could
-//! fetch: no `<img>`, no `<iframe>`, no `<script>`, no stylesheet reaches
-//! the widget. Links keep only the schemes a reader could have meant. Text
-//! is decoded on the way in and re-escaped on the way out, so no character
-//! reference the widget's own parser would die on can reach it — [`guard`]
-//! covers the rows narrowed by builds before that was true.
-//!
-//! Images stay images when the panel can show them: a `cid:` attachment of
-//! the letter itself, a `data:` image embedded in it, or one on the web —
-//! `<img>` with its source, alt text, size hints and the link it sat in,
-//! for the panel's own image item to place in the flow (`HtmlImage`, in
-//! the panels), which is that link when tapped. Any other
-//! source, and any box small enough to be counting opens rather than
-//! showing anything, is reduced to its alt text or to nothing.
+//! The parser keeps useful text structure and a small set of styles. It removes
+//! scripts, frames, hidden content, unsafe link schemes, and unsupported
+//! styling. Images remain only when the panel can load their source; tiny
+//! tracking images and unsupported sources become alternative text or nothing.
+//! Input and output limits keep large or hostile messages from blocking layout.
 
 use std::fmt::Write as _;
 

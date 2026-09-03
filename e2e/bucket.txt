@@ -1,4 +1,4 @@
-# CR-005: a device gives *itself* a bucket. No `--bucket` flag, no file
+# A device gives *itself* a bucket. No `--bucket` flag, no file
 # pushed over adb — the URL is typed into the device-sync form and the
 # button is pressed, which is the only road a phone has.
 #

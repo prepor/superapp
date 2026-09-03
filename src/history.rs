@@ -1,25 +1,9 @@
-//! History: a tree of actions, in memory (CR-004).
+//! In-memory undo and redo tree.
 //!
-//! An action is a **layout snapshot plus zero or more claims on the world**.
-//! Undo restores the snapshot and gives the claims back; the claims it
-//! cannot give back make their node *transparent* — the walk marks it and
-//! continues past, because blocking all history behind one sent mail is
-//! wrong and silently pretending to undo it is a lie.
-//!
-//! Two things are deliberately separate, and conflating them is the mistake
-//! this module exists to avoid:
-//!
-//! - an [`Intent`] is **in memory**, and dies with the tree. It knows how to
-//!   take a row back, and whether the world still permits that.
-//! - the **row** it wrote is ordinary durable state. Passes read it, and
-//!   they never read history — which is why a restart loses undo but never
-//!   loses work. A pending send still goes out; you just cannot call it
-//!   back.
-//!
-//! `before` is what makes this cheap. Open, move, column and close — the
-//! frequent actions — are pure layout changes, and [`core::WmSnap`] already
-//! round-trips through [`core::Wm::restore`]. Only genuine data mutations
-//! owe an [`Intent`], and there are about six.
+//! A node stores the layout before an action and any [`Intent`] values needed
+//! to reverse data changes. If an intent can no longer be reversed, the node
+//! expires and history moves past it. Database rows remain durable, but history
+//! is lost on restart.
 
 use std::collections::BTreeMap;
 
@@ -98,14 +82,14 @@ pub struct Node {
     pub after: WmSnap,
     pub intents: Vec<Box<dyn Intent>>,
     pub state: State,
-    /// Context restored with the delta (CR-009): the marks a batch verb
+    /// Context restored with the delta: the marks a batch verb
     /// consumed, per list panel. Undo puts them back, redo takes them
     /// again — marks are never a node of their own.
     pub marks: Vec<(u64, MarkKeys)>,
 }
 
 /// The keys one list's marks are made of. The two lists differ in what a
-/// row *is* (CR-009): the inbox's rows are threads, and a files panel's
+/// row *is*: the inbox's rows are threads, and a files panel's
 /// are the names in one directory — so the context a node carries is the
 /// one or the other, never a shared integer that means neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +265,7 @@ impl History {
     }
 
     /// Attaches the marks a batch verb consumed to the node just applied,
-    /// so undoing it gives them back (CR-009).
+    /// so undoing it gives them back.
     pub fn claim_marks(&mut self, pid: u64, keys: MarkKeys) {
         if keys.is_empty() {
             return;

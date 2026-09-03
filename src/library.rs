@@ -1,21 +1,7 @@
-//! The panels library (CR-006): an infinite canvas of live scenes.
+//! Zoomable canvas of live scenes from [`crate::catalog`].
 //!
-//! `--library` opens the window on a zoomable, pannable canvas instead of
-//! the workspace. Every scene of the [`crate::catalog`] is a block on it;
-//! every node a **mount**: a bare component populated with its fixture, or
-//! a whole [`Stage`] — solo on one panel, or the workspace — on a world of
-//! its own (an in-memory store, a sealed outside, a virtual clock) that ran
-//! the node's few steps and stopped there. The edges are the arrows, the
-//! notes the annotations. See [`crate::scene`] for the shape and the
-//! layout, this module for the mounting.
-//!
-//! A mount renders into its own pass at the canvas's zoom (crisp text at
-//! every level: the pass's dpi factor is the zoom), and the canvas shows
-//! the pass's texture. Entering a node — a click — brings it to 1:1 and
-//! routes the keyboard and the pointer to it, remapped into its own
-//! coordinates, so a state can be worked by hand. Actions a mount's
-//! widgets raise are captured and handed straight back to it, so a hundred
-//! mounts never hear each other.
+//! Each node mounts a fixture or isolated [`Stage`] in its own render pass.
+//! Entering a node routes keyboard and pointer input only to that mount.
 
 use std::collections::HashMap;
 use std::rc::Rc;

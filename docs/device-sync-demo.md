@@ -1,4 +1,4 @@
-# Device sync: the demo, and the real bucket (CR-005)
+# Device sync: the demo and the real bucket
 
 Two devices, one store, a leased single writer. Two ways to run it: locally
 against `bucketd` with no cloud account (below), or against a real

@@ -1,11 +1,7 @@
-//! CR-002: retained panel content. The semantic widget library — makepad
-//! primitives wrapped once and themed to the design language — and the
-//! per-kind panel widgets composed from it (Robrix's patterns; same
-//! script_mod generation).
+//! Shared Makepad widgets and panel implementations.
 //!
-//! Data flows in per draw via [`PanelProps`] on the scope; intent flows out
-//! as [`PanelAction`]s (global actions the shell catches and turns into
-//! store actions — so undo semantics never enter this module).
+//! Each draw receives [`PanelProps`]. Widgets return [`PanelAction`] values;
+//! the shell applies them and owns undo behavior.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -26,46 +22,38 @@ use crate::files;
 use crate::store::Store;
 use crate::ui;
 
-/// What a panel widget may read while drawing: the store and its own
-/// panel identity. Passed through `Scope` props each draw (props ride an
-/// `Any`, hence the `Rc` — scope wants `'static`).
+/// Data a panel may read while drawing. `Scope` requires the shared values
+/// to be wrapped in `Rc`.
 pub struct PanelProps {
     pub store: std::rc::Rc<Store>,
-    /// The effect registry, for the one thing a panel does with it: turn a
-    /// filed payload back into the sentence the effect describes itself
-    /// with (the log panel). Performing anything needs an
-    /// [`Outside`](crate::effect::Outside), which stays behind the world.
+    /// Lets the Effects panel describe saved jobs. Panels cannot run jobs
+    /// through this value.
     pub registry: std::rc::Rc<effect::Registry>,
-    /// The world, for the one kind that reads outside the store during
-    /// draw: a files panel lists its directory through the outside
-    /// (CR-008).
+    /// Provides directory listings for file panels.
     pub world: std::rc::Rc<crate::effect::World>,
     pub pid: u64,
     pub kind: crate::core::Kind,
-    /// Which messages of its thread a message panel shows open (CR-007).
+    /// Which messages of its thread a message panel shows open.
     /// Panel context, owned by the shell; `None` for every other kind.
     pub expand: Option<Expansion>,
-    /// The standing problems — the problems panel's rows. Derived by the
-    /// shell, since device sync's entry lives outside the store; empty for
-    /// every other kind.
+    /// Rows for the Problems panel. The shell builds them because device-sync
+    /// problems do not live in the store.
     pub problems: std::rc::Rc<Vec<crate::problems::Problem>>,
 }
 
-/// Which messages of a conversation a panel shows open, and whose quoted
-/// tails are unfolded (CR-007). Seeded by the shell when the panel opens —
-/// the mail it opened on plus whatever was unread — and toggled by touch.
-/// Context, not history: it persists no further than the process.
+/// Which messages and quoted sections are open in a conversation panel.
+/// This state lasts only until the app closes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Expansion {
-    /// The mail the set was seeded for. A panel re-targeted since starts
-    /// over with only its own mail open.
+    /// The message this state belongs to. A panel opened on another message
+    /// starts again with only that message open.
     pub for_mail: i64,
     pub open: std::collections::BTreeSet<i64>,
     pub quotes: std::collections::BTreeSet<i64>,
 }
 
 impl Expansion {
-    /// What a panel shows when nothing seeded it: its own mail, open.
+    /// Starts with one message open and all quoted sections closed.
     #[must_use]
     pub fn just(mail: i64) -> Self {
         Expansion {
@@ -75,8 +63,7 @@ impl Expansion {
         }
     }
 
-    /// The set a panel on `mail` should draw: this one if it was seeded
-    /// for that mail, the bare default otherwise.
+    /// Reuses matching state or starts again for another message.
     #[must_use]
     pub fn for_panel(this: Option<&Expansion>, mail: i64) -> Expansion {
         match this {
@@ -86,43 +73,33 @@ impl Expansion {
     }
 }
 
-/// One row of a modal overlay, already reduced to what it draws. The shell
-/// assembles these per draw — overlays read no store of their own.
+/// The data needed to draw one overlay row.
 #[derive(Clone, Default)]
 pub struct OverlayRowData {
-    /// The big left-hand number (workspaces) — empty elsewhere.
     pub num: String,
-    /// The row's subject: a workspace summary, an action label, a hit.
     pub main: String,
-    /// Dimmed trailing text on the same line (a launcher hit's detail).
     pub detail: String,
-    /// Right-aligned: a date, a workspace badge.
     pub right: String,
-    /// Inverted: the current workspace, the selected hit, the DAG's head.
     pub current: bool,
-    /// Undone history branches draw muted but stay walkable.
+    /// Undone history branches are dimmed but can still be selected.
     pub muted: bool,
-    /// Under the pointer: a grey wash, the way a button or a tab takes one.
     pub hovered: bool,
 }
 
 /// One overlay row's height, in points — the shell sizes the sheet to fit.
 pub const OVERLAY_ROW_H: f64 = 40.0;
 
-/// What an overlay widget draws. Assembled by the shell each frame from the
-/// workspace roster, the undo DAG, or the launcher's live search.
+/// Data for the workspace list, undo history, or launcher overlay.
 #[derive(Clone, Default)]
 pub struct OverlayProps {
     pub rows: Vec<OverlayRowData>,
     /// The launcher's query, pushed into the field when the overlay opens.
     pub query: String,
-    /// The chassis' presence, 0..1: the widget composites its whole
-    /// subtree at this alpha — the open/close fade.
+    /// Opacity used while the overlay opens or closes.
     pub alpha: f32,
 }
 
-/// Intent bubbled from panel widgets to the shell. The shell owns turning
-/// these into undoable store actions.
+/// An action sent from a panel to the shell. The shell handles undo.
 #[derive(Debug, Clone)]
 pub enum PanelAction {
     AddAccount {
@@ -141,7 +118,7 @@ pub enum PanelAction {
         /// The add-account panel that asked — where the flow reports back.
         pid: u64,
     },
-    /// The device-sync form submitted (CR-005): point this device at a
+    /// The device-sync form submitted: point this device at a
     /// bucket. An empty secret keeps whatever key the device already holds.
     ConnectBucket {
         /// The bucket panel that submitted (its secret field clears).
@@ -158,28 +135,15 @@ pub enum PanelAction {
         subject: String,
         body: String,
     },
-    /// **The list verbs.** Every list panel — the inbox over threads, the
-    /// effect log over jobs, a files panel over entries — says the same
-    /// three things about the row under its cursor, and the shell answers
-    /// each the same way whatever the domain, so there is one of each
-    /// rather than one per table. What differs is only the `target`: the
-    /// kind that row names.
-    ///
-    /// Open it — the solid-link semantics; `fresh` is the workspace
-    /// modifier.
+    /// Opens the selected row. `fresh` opens a separate, unjoined panel.
     Open {
         pid: u64,
         target: crate::core::Kind,
         fresh: bool,
     },
-    /// The cursor landed on it (CR-005): open it joined but leave focus in
-    /// the list, so the walk carries on. Deliberately not a flag on
-    /// [`PanelAction::Open`] — a preview is never the `fresh` variant, and
-    /// two bools would let that nonsense be spelled.
+    /// Previews a row in a joined panel while focus stays in the list.
     Preview { pid: u64, target: crate::core::Kind },
-    /// Panel-internal: put the cursor on this row. The shell raises it
-    /// when it moved the cursor on a list's behalf — a row clicked, or the
-    /// walk carried past what was just filed away.
+    /// Moves the list cursor to this row.
     Select { pid: u64, target: crate::core::Kind },
     /// A link was followed: solid opens joined, dotted replaces in place,
     /// `fresh` (the workspace modifier) always opens un-joined.
@@ -206,9 +170,7 @@ pub enum PanelAction {
         seed: crate::core::Seed,
         fresh: bool,
     },
-    /// A files panel's `new dir` field was submitted (CR-008). The shell
-    /// toasts what it would have made; the effect and its undo are open
-    /// work (see the book's open questions).
+    /// Creates a directory through the shell, with undo support.
     NewDir { pid: u64, dir: String, name: String },
 }
 
@@ -216,32 +178,13 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-    // ---- the design language, as widget theming ---------------------------
+    // ---- shared widget theme ----------------------------------------------
     // INK #141414 · BG #ffffff · TEXT2 #5a5a5a · MUTED #909090
     // RULE #dcdcdc · HOVER #efefef · SEL #e7e7e7 · ERR #a01500
 
-    // Sizes mirror theme.rs: FONT_SIZE 10.5 body, LABEL_SIZE 8.25 labels —
-    // the same numbers the char-grid renderer draws with, so migrated and
-    // unmigrated panels read as one app.
-    // The one face, carried rather than borrowed. Menlo fronted the family
-    // until HTML mail asked it for a weight it does not have: Menlo.ttc
-    // yields only its regular face, so `<b>` drew as body text. It was
-    // also macOS furniture — the Fold never had it and fell through to
-    // Liberation, so "the app's face" was already two faces depending on
-    // which screen you read it from.
-    //
-    // Geist Mono replaces it on both, from `resources/` (OFL, shipped
-    // alongside in OFL.txt). It is 0.600 em wide against Menlo's 0.6021,
-    // so the character grid moves by a third of a percent — and that is
-    // Liberation's ratio to four places, so the Fold has been drawing this
-    // width all along. macOS is the side that changes.
-    //
-    // Two files, four styles: both faces are variable on `wght` (100–900),
-    // and the second is a true italic rather than a slant. makepad has no
-    // synthetic oblique — `FontMember` exposes only `weight`, and nothing
-    // in `TextStyle` skews — so italic could only ever come from its own
-    // file. The `[wght]` of the upstream filenames is dropped because the
-    // brackets are awkward in a resource path; the fonts are unmodified.
+    // Keep these sizes in sync with theme.rs and the character-grid renderer.
+    // Panel widgets use bundled Geist Mono on every platform. Separate regular
+    // and italic variable fonts provide all four styles below.
     mod.widgets.SMonoStyle = TextStyle{
         font_family: FontFamily{
             latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0}
@@ -253,11 +196,7 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** The same face leaning on its weight axis. This is what retired the
-        char grid's fake bold: unread rows, contact headers and the
-        accelerator marks were all the same run drawn two or three times,
-        each copy nudged a fraction of a pixel, because Menlo had no weight
-        to ask for. See `SBoldLabel`. */
+    /** Bold Geist Mono used for unread rows, headings, and shortcut letters. */
     mod.widgets.SMonoBoldStyle = TextStyle{
         font_family: FontFamily{
             latin := FontMember{res: crate_resource("self:resources/geist_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
@@ -269,7 +208,7 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** The drawn italic, not a skewed roman: Geist Mono ships its own. */
+    /** Geist Mono's italic face. */
     mod.widgets.SMonoItalicStyle = TextStyle{
         font_family: FontFamily{
             latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0}
@@ -281,7 +220,7 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** Both at once — `<b><i>`, and the `<em>` inside a heading. */
+    /** Bold italic text. */
     mod.widgets.SMonoBoldItalicStyle = TextStyle{
         font_family: FontFamily{
             latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
@@ -293,13 +232,7 @@ script_mod! {
         line_spacing: 1.0
     }
 
-    /** Body text in the mono face.
-
-        No padding of its own: a label sits exactly where its row puts it,
-        so every line a panel writes shares the panel's inset, and the
-        spacing between lines belongs to the rows (`SRow`, `SRule`, a
-        margin). makepad's Label ships a theme inset on every side, which
-        every panel used to zero, or pad around, by hand. */
+    /** Body text with no padding. Its row controls spacing. */
     mod.widgets.SLabel = Label {
         width: Fit, height: Fit
         padding: 0
@@ -309,8 +242,7 @@ script_mod! {
         }
     }
 
-    /** An uppercase section label (the char grid's Style::Label). Bare,
-        like `SLabel`: it shares the inset of the lines under it. */
+    /** Uppercase section label with no padding. */
     mod.widgets.SSection = Label {
         width: Fit, height: Fit
         padding: 0
@@ -320,28 +252,19 @@ script_mod! {
         }
     }
 
-    /** Body text at the family's bold weight.
-
-        This used to be a widget that drew the same run twice with the twin
-        nudged 0.4 px, because Menlo ships no weight to ask for. Geist Mono
-        does, so the trick is gone and with it the overlays, the twin
-        labels and the pair of set_texts each one needed. */
+    /** Bold body text. */
     mod.widgets.SBoldLabel = mod.widgets.SLabel {
         draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
     }
 
-    /** The flat monochrome text field: white well, hairline border that
-        inks on focus, ink caret, grey selection — the design language over
-        makepad's whole TextInput behaviour (click-to-caret, selection,
-        IME/soft keyboard). */
+    /** Plain text field. Its border darkens on focus. */
     mod.widgets.SField = TextInputFlat {
         width: Fill, height: Fit
         padding: Inset{left: 7, right: 7, top: 5, bottom: 5}
         margin: 0
         empty_text: " "
-        // Forms advance: the soft keyboard's action key reads "next" and
-        // lands as the same Returned action the enter-chain walks. Fields
-        // that end a chain override with Done/Search.
+        // The mobile action key moves to the next field. The last field can
+        // replace this with Done or Search.
         return_key_type: ReturnKeyType.Next
         draw_bg +: {
             border_radius: 1.0
@@ -374,11 +297,8 @@ script_mod! {
             color: #141414
         }
         draw_selection +: {
-            // The selection quad paints OVER the glyphs and the state-mix
-            // does not engage reliably — so one translucent ink on every
-            // state: text reads through, and "no selection when blurred"
-            // is enforced by collapsing the selection on focus-lost
-            // instead of by colour.
+            // Selection is drawn over text, so keep it translucent. Selection
+            // is cleared when focus leaves the field.
             color: #00000020
             color_hover: #00000020
             color_focus: #00000020
@@ -387,12 +307,8 @@ script_mod! {
         }
     }
 
-    /** Selectable body text (CR-003): makepad's TextInput held read-only and
-        stripped of every field affordance — no well, no border, no caret —
-        so it reads exactly as an `SLabel` but can be dragged over,
-        double-clicked and copied. Editing is impossible, and a read-only
-        input gates off `Hit::TextInput`, so it cannot swallow a panel's
-        letters; copy still arrives as a platform TextCopy hit. */
+    /** Read-only body text that can be selected and copied. It looks like a
+        normal label and does not take typed input from the panel. */
     mod.widgets.SText = TextInputFlat {
         width: Fill, height: Fit
         padding: 0
@@ -425,7 +341,7 @@ script_mod! {
             color_disabled: #141414
             text_style: mod.widgets.SMonoStyle{}
         }
-        // Nothing is being typed, so the caret never shows.
+        // Read-only text has no cursor.
         draw_cursor +: { color: #00000000 }
         draw_selection +: {
             color: #00000020
@@ -436,25 +352,8 @@ script_mod! {
         }
     }
 
-    /** An HTML mail body, in the app's one face.
-
-        makepad's `Html` draws a semantic vocabulary and no CSS, which is
-        the whole reason it suits this app: a sender's brand colours never
-        arrive to fight the monochrome, because there is no mechanism by
-        which they could. What arrives is structure — lists, quotes,
-        emphasis, links — drawn in Menlo at body size like everything else.
-        [`crate::html`] narrows the letter to this vocabulary first.
-
-        Links need no colour: `HtmlLink` underlines, and in this app the
-        underline *is* the link (CR-003's grammar), so they read correctly
-        in plain #141414.
-
-        Emphasis is real: `<b>` is the weight axis and `<i>` is Geist
-        Mono's drawn italic, so the four `text_style_*` slots are four
-        actual faces rather than one face repeated (see `SMonoStyle`). */
-    /** Declared before `SHtml`, which names it: an image in a letter or an article (see `HtmlImage`): its own size,
-        never wider than the column; its alt text in the muted ink until
-        the bytes arrive, or for good when they never will. */
+    /** An image in a message. It fits the column and shows muted alternative
+        text until the image loads or when loading fails. */
     mod.widgets.HtmlImage = set_type_default() do #(HtmlImage::register_widget(vm)) {
         width: Fit, height: Fit
         image: mod.widgets.Image { width: Fill, height: Fill }
@@ -464,11 +363,13 @@ script_mod! {
         }
     }
 
+    /** HTML message body using the app's fonts and colours. The HTML is
+        cleaned in [`crate::html`] before it reaches this widget. */
     mod.widgets.SHtml = Html {
         width: Fill, height: Fit
         padding: 0
         margin: 0
-        // The body is prose, and CR-003 made prose selectable.
+        // Message text is selectable.
         selectable: true
 
         font_size: 10.5
@@ -481,9 +382,7 @@ script_mod! {
         text_style_bold_italic: mod.widgets.SMonoBoldItalicStyle{}
         text_style_fixed: mod.widgets.SMonoStyle{}
 
-        // `-` for the nested level: `•` comes from the symbol fallback,
-        // whose advance is not the mono cell, and two of them stacked read
-        // as a smudge rather than a hierarchy.
+        // Use different marks so nested lists are easy to scan.
         ul_markers: ["•", "-"]
         ol_separator: "."
 
@@ -491,14 +390,9 @@ script_mod! {
             color: #141414
             pressed_color: #5a5a5a
         }
-        // The picture an `<img>` becomes (see `HtmlImage`).
         img := mod.widgets.HtmlImage {}
 
-        // The wash SText already wears. `Html` is its own widget type, not
-        // a `TextFlow` derivation, so it inherits none of `TextFlowBase`'s
-        // theming — including `draw_call_group`, without which the quad
-        // merges into the call that paints under the panel background and
-        // the selection never appears (CR-002's sixth defect, again).
+        // Keep the selection above the panel background.
         draw_selection +: {
             draw_call_group: @selection
             color: #00000020
@@ -511,14 +405,14 @@ script_mod! {
             quote_fg_color: #141414
             code_color: #f4f4f4
             table_border_color: #dcdcdc
-            // Painted over the header's text, not under it: a fill would
-            // hide the words. Bold is the header's mark.
+            // A background here would cover the header text; bold already
+            // distinguishes the header.
             table_header_bg_color: #0000
             selection_color: #00000020
         }
     }
 
-    /** The bordered side-effect button (the design language's one button). */
+    /** Bordered action button. */
     mod.widgets.SBtn = ButtonFlat {
         width: Fit, height: Fit
         padding: Inset{left: 12, right: 12, top: 5, bottom: 5}
@@ -529,8 +423,7 @@ script_mod! {
             color: #ffffff
             color_hover: #efefef
             color_down: #e7e7e7
-            // Keyboard focus reads as the selection wash — enter/space
-            // will press this button.
+            // Show keyboard focus. Enter or space presses the button.
             color_focus: #e7e7e7
             color_disabled: #ffffff
             border_color: #141414
@@ -549,34 +442,22 @@ script_mod! {
         }
     }
 
-    /** The link grammar as a widget: label over a 1 px underline — solid
-        opens joined, dotted replaces in place (the dashes are shader-drawn). */
+    /** Underlined link. Solid links open a joined panel; dotted links replace
+        the current panel. */
     mod.widgets.SLink = set_type_default() do #(SLink::register_widget(vm)) {
         ..mod.widgets.View
         width: Fit, height: Fit
         flow: Down
         cursor: MouseCursor.Hand
-        // The label is split so one character can carry the accelerator
-        // mark (CR-003): prefix, the key, suffix. The split stays even now
-        // that the key is real bold — `←` arrives from the symbol
-        // fallback, whose advance is not the mono cell, so padding a twin
-        // with spaces would not line up.
-        // The three parts butt against each other: a label has no padding
-        // of its own, so the split leaves no seam in the word.
+        // Split the label so the shortcut letter can be bold.
         row := View {
             width: Fit, height: Fit
             flow: Right
             pre := mod.widgets.SLabel { text: "" }
-            // One pass. It took three nudged copies to make a single
-            // character read as bold at this size; the weight axis does it
-            // properly.
             key := mod.widgets.SBoldLabel { text: "" }
             post := mod.widgets.SLabel { text: "" }
         }
-        // The solid underline needs its own `pixel` for the same reason the
-        // row wash does (CR-002's sixth defect): a stock-shader quad merges
-        // into a draw call that paints *under* the panel background, so it
-        // never appears. A distinct shader earns a correctly-ordered call.
+        // A separate shader keeps the underline above the panel background.
         ul := View {
             width: Fill, height: 1
             show_bg: true
@@ -587,8 +468,7 @@ script_mod! {
                 }
             }
         }
-        // Keyboard focus on a link: the underline doubles, the way a focused
-        // button wears the grey wash — visible, and still no second colour.
+        // A thicker underline shows keyboard focus.
         ul_focus := View {
             visible: false
             width: Fill, height: 2
@@ -606,9 +486,6 @@ script_mod! {
             show_bg: true
             draw_bg +: {
                 color: #141414
-                // `Math` carries only rotate_2d/random_2d on this pin, so
-                // the period comes from fract, not a mod that never
-                // compiled (and so never dashed anything).
                 pixel: fn() {
                     let x = self.pos.x * self.rect_size.x
                     if fract(x / 6.0) > 0.5 {
@@ -620,12 +497,7 @@ script_mod! {
         }
     }
 
-    /** A key cap: the char grid's `Seg::Kbd` as a widget — a hairline box
-        around the key's name, sized to it. Built on ButtonFlat because it
-        carries `text` on the instance (a named child's properties cannot be
-        overridden per instance at this makepad generation: the override
-        parses and is silently dropped). It is inert by construction — no
-        action reads it, and it never takes key focus. */
+    /** A key name inside a thin box. It is display-only and cannot take focus. */
     mod.widgets.SKbd = ButtonFlat {
         width: Fit, height: Fit
         margin: Inset{left: 1, right: 1}
@@ -655,10 +527,7 @@ script_mod! {
         }
     }
 
-    /** One line of prose: children laid out left to right, shared
-        baseline. The row carries the line's leading — the labels have
-        none — so a line of text, a line with a key cap and a line with a
-        button all sit on one rhythm. */
+    /** One line of text and inline controls with shared spacing. */
     mod.widgets.SRow = View {
         width: Fill, height: Fit
         flow: Right
@@ -666,8 +535,7 @@ script_mod! {
         padding: Inset{top: 6, bottom: 6}
     }
 
-    /** The hairline under a section label: a little air above it, and the
-        first line hangs off it by its own leading. */
+    /** Thin rule below a section label. */
     mod.widgets.SRule = View {
         width: Fill, height: 1
         margin: Inset{top: 6, bottom: 4}
@@ -781,9 +649,8 @@ script_mod! {
         // The status line hangs under the address, on the same edge —
         // selectable and wrapping, both for the same reason: a sync error
         // is the one line here a human needs to *act* on, to carry to a
-        // search or to read the whole of. A Label would clip it at the
-        // panel's edge and refuse the drag. (`SText` is the read-only
-        // TextInput the selectable content of CR-003 is made of.)
+        // search or copy. A Label would clip it and would not support text
+        // selection, so this uses the read-only `SText` input.
         status_lbl := mod.widgets.SText {
             width: Fill, is_multiline: true
             margin: Inset{top: 6}
@@ -946,7 +813,7 @@ script_mod! {
         }
     }
 
-    /** The device-sync form (CR-005): where the bucket is, and the key that
+    /** The device-sync form: where the bucket is, and the key that
         opens it. The same three-field shape as the account form, because it
         is the same act — this is how a device that has no cable and no
         shell is given a credential. */
@@ -1031,7 +898,7 @@ script_mod! {
         }
     }
 
-    /** A field's autocomplete (CR-006): a bordered box hung under the
+    /** A field's autocomplete: a bordered box hung under the
         field, over whatever follows it — the inbox filter's `@tag` names
         and values, the compose TO field's addresses. Eight fixed slots,
         shown as needed; the offer is capped there. The panel holds one as
@@ -1092,7 +959,7 @@ script_mod! {
             mod.widgets.SSection { width: 82, text: "SUBJECT" }
             subject_input := mod.widgets.SField {}
         }
-        // What the draft will carry (CR-010), while it carries anything:
+        // What the draft will carry, while it carries anything:
         // one link a file, opening the card over it — so what is about to
         // leave can be looked at before it does.
         carries := View {
@@ -1202,7 +1069,7 @@ script_mod! {
                 }
             }
         }
-        // The mark (CR-009): an ink bar down the row's left edge, inside
+        // The mark: an ink bar down the row's left edge, inside
         // the row's own inset. Shader-drawn like the dotted underline, so
         // a mark costs no layout and the text stays on the header's
         // columns. Two more twins rather than a flag: a quad's colour is
@@ -1247,7 +1114,7 @@ script_mod! {
         }
     }
 
-    // ---- marks (CR-009) ----------------------------------------------------
+    // ---- marks ----------------------------------------------------
 
     /** A bordered side-effect button that wears its key: the label split
         the way `SLink` splits it, so one character draws bold. Its clicks
@@ -1311,7 +1178,7 @@ script_mod! {
         b4 := mod.widgets.KeyBtn {}
     }
 
-    /** The marks bar (CR-009): what a list shows while any row is marked —
+    /** The marks bar: what a list shows while any row is marked —
         how many of how many, how many the filter hides; then the verbs
         that act on the marked set, `all`, `clear`. It comes with the first
         mark and goes with the last: nothing is drawn for an empty set. The
@@ -1352,7 +1219,7 @@ script_mod! {
         verbs_below := mod.widgets.MarkVerbs { visible: false }
     }
     /** A mailbox — the inbox, the archive, sent, spam: the filter over the
-        header over the virtualized list, a rich table (CR-006) over the
+        header over the virtualized list, a rich table over the
         `mail::threads` source of the role its kind names. */
     mod.widgets.MailboxPanel = set_type_default() do #(MailboxPanel::register_widget(vm)) {
         ..mod.widgets.View
@@ -1402,7 +1269,7 @@ script_mod! {
             // minting widgets.
             reuse_items: true
             row := mod.widgets.MailboxRow {}
-            // The marks the filter hides ride above the rows (CR-009): a
+            // The marks the filter hides ride above the rows: a
             // caption, the rows themselves, and a strong rule closing the
             // group. The caption wears the rows' inset the way the header
             // does; the rule has its own pixel fn, or it merges into a
@@ -1423,7 +1290,7 @@ script_mod! {
                 }
             }
         }
-        // The marks bar (CR-009), at the foot: it comes with the first mark
+        // The marks bar, at the foot: it comes with the first mark
         // and goes with the last, and standing under the list it takes its
         // height off the rows' own scroll rather than pushing them down —
         // nothing being read moves when a mark lands.
@@ -1524,7 +1391,7 @@ script_mod! {
     }
 
     /** The effect log: the filter over the header over the virtualized list
-        — a rich table (CR-006) over `effect::LOG`, which is the queue and
+        — a rich table over `effect::LOG`, which is the queue and
         the in-memory ring joined in SQL, so one list holds everything that
         left the process. Read-only by construction; the queue is the
         executor's to move and the ring is the past's. */
@@ -1669,7 +1536,7 @@ script_mod! {
         }
     }
 
-    // ---- files (CR-008) ----------------------------------------------------
+    // ---- files ----------------------------------------------------
 
     /** One entry of a directory: the name (a directory wears its slash),
         the size and the date at the right, on the columns the header
@@ -1721,7 +1588,7 @@ script_mod! {
                 }
             }
         }
-        // The mark (CR-009): an ink bar down the row's left edge, inside
+        // The mark: an ink bar down the row's left edge, inside
         // the row's own inset — an inbox row's, exactly (see `MailboxRow`
         // for why it is a twin rather than a flag).
         line_mark := mod.widgets.FilesLine {
@@ -1764,7 +1631,7 @@ script_mod! {
         }
     }
 
-    /** A directory as a column (CR-008): where the panel stands as crumbs,
+    /** A directory as a column: where the panel stands as crumbs,
         the filter, the `new dir` field while it is up, the header over
         the rows, the status line under them. */
     mod.widgets.FilesPanel = set_type_default() do #(FilesPanel::register_widget(vm)) {
@@ -1859,7 +1726,7 @@ script_mod! {
             flow: Down
             reuse_items: true
             row := mod.widgets.FilesRow {}
-            // The marks the filter hides ride above the rows (CR-009), in
+            // The marks the filter hides ride above the rows, in
             // this one list: a caption, the rows themselves, a strong rule
             // closing the group — the inbox's construction.
             caption := View {
@@ -1878,7 +1745,7 @@ script_mod! {
                 }
             }
         }
-        // The marks bar (CR-009), at the foot: under the list, so it takes
+        // The marks bar, at the foot: under the list, so it takes
         // its height off the rows' own scroll rather than pushing them
         // down as the first mark lands.
         bar := mod.widgets.MarkBar { visible: false }
@@ -1895,7 +1762,7 @@ script_mod! {
         suggest_path: mod.widgets.SuggestBox {}
     }
 
-    /** A file as a card (CR-008): name, kind and size, when it changed,
+    /** A file as a card: name, kind and size, when it changed,
         the path selectable, and under a rule the preview — text or a
         picture; anything else says so. */
     mod.widgets.FilePanel = set_type_default() do #(FilePanel::register_widget(vm)) {
@@ -1941,7 +1808,7 @@ script_mod! {
 
     // ---- the read panels ---------------------------------------------------
 
-    /** One message of a conversation (CR-007): a header row that is the
+    /** One message of a conversation: a header row that is the
         same row open or closed — the sender, the date at the right edge —
         with the letter unfolded under it while open. Closed, the row
         previews the first line the author wrote, or the status line, red
@@ -2034,7 +1901,7 @@ script_mod! {
                 visible: false
                 quote_body := mod.widgets.SHtml {}
             }
-            /* What the letter carries (CR-010): one link a part, opening
+            /* What the letter carries: one link a part, opening
                the card over it. Five slots and a count for the rest — a
                message row may not grow without bound. */
             atts := View {
@@ -2066,7 +1933,7 @@ script_mod! {
         }
     }
 
-    /** One mail, in its conversation (CR-007): the account it came to,
+    /** One mail, in its conversation: the account it came to,
         once; every message of the thread, oldest first, open or closed;
         forward and reply at the foot. */
     mod.widgets.MessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
@@ -2379,10 +2246,8 @@ script_mod! {
 
     // ---- the modal overlays ------------------------------------------------
 
-    /** A view that renders its subtree to a texture and composites it at
-        one alpha. Widgets cannot alpha-fade as a subtree (CR-002's named
-        cost) — an offscreen pass can, and the composite is a single quad
-        whose `alpha` uniform the shell drives per frame. This is what lets
+    /** Renders a subtree to a texture and applies one alpha value. Widgets
+        cannot fade as a group, but an offscreen pass can. This lets
         an overlay's field, caret, rows and all fade as one surface. */
     mod.widgets.FadeView = mod.widgets.View {
         texture_caching: true
@@ -2405,12 +2270,9 @@ script_mod! {
         }
     }
 
-    /** One overlay row on the sheet: bare, inverted while current, a grey
-        wash under the pointer. The shell registers the click (rows live
-        in a PortalList, whose item areas go stale mid-gesture — CR-002's
-        fifth defect), so this is presentation only. The bg is on its own
-        shader — a stock-shader quad merges into a call that paints under
-        the wash (CR-002's sixth defect). */
+    /** Draws one overlay row. The shell handles clicks because PortalList
+        item areas can become stale during a gesture. A separate background
+        shader keeps the row above the overlay wash. */
     mod.widgets.OverlayCard = View {
         width: Fill, height: 40
         flow: Right
@@ -2899,7 +2761,7 @@ impl Widget for SettingsPanel {
         self.view.handle_event(cx, event, scope);
 
         // Tab walks the remove buttons; enter/space press the focused one.
-        // The add-account link wears its own chord instead (CR-003): it is
+        // The add-account link wears its own chord instead: it is
         // the one control this panel has exactly one of.
         if let Event::KeyDown(k) = event {
             if k.modifiers.logo {
@@ -3119,7 +2981,7 @@ impl Widget for AddAccountPanel {
 // BucketPanel
 // ---------------------------------------------------------------------------
 
-/// The device-sync form (CR-005). `AddAccountPanel`'s sibling in every
+/// The device-sync form. `AddAccountPanel`'s sibling in every
 /// respect but one: the secret field is write-only. It is seeded blank on a
 /// configured device too, because a key that can be read back off a screen is
 /// a key that leaves by a route nobody chose.
@@ -3262,7 +3124,7 @@ const SUGGEST_SLOTS: [LiveId; richtable::MAX_SUGGESTIONS] = [
     live_id!(s7),
 ];
 
-/// A field's autocomplete (CR-006): the offer under the caret, where the
+/// A field's autocomplete: the offer under the caret, where the
 /// highlight is, and a dismissal that holds until the caret moves on.
 /// Generic over a [`Completion`] — the part that differs between fields:
 /// the filter's tag grammar, compose's recipient list — while the box, the
@@ -3564,7 +3426,7 @@ impl Widget for ComposePanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         // Its *own* seed's files: a compose retargeted in place keeps its
-        // id, and the files a reply left are not the forward's (CR-010).
+        // id, and the files a reply left are not the forward's.
         if let Some((store, pid, seed)) = scope.props.get::<PanelProps>().and_then(|p| {
             let Kind::Compose { seed } = p.kind else { return None };
             Some((p.store.clone(), p.pid, seed))
@@ -3626,7 +3488,7 @@ impl ComposePanelRef {
 
     /// The `CARRIES` links' rects, in slot order, for the shell's hit
     /// table — the panel knows where they are, the shell knows what they
-    /// name (CR-010).
+    /// name.
     pub fn carry_hits(&self, cx: &mut Cx) -> Vec<Rect> {
         let Some(p) = self.borrow() else { return Vec::new() };
         CARRY_LINKS
@@ -3761,7 +3623,7 @@ impl Widget for MailboxRow {
 }
 
 impl MailboxRowRef {
-    /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
+    /// `selected` is the cursor's wash; `marked` the batch mark.
     /// Exactly one of the four twins draws; only it is populated.
     pub fn populate(&self, cx: &mut Cx, m: &mail::ThreadHead, selected: bool, marked: bool) {
         let Some(row) = self.borrow() else { return };
@@ -3782,7 +3644,7 @@ impl MailboxRowRef {
 }
 
 // ---------------------------------------------------------------------------
-// Marks (CR-009): the draft's widgets
+// Marks: the draft's widgets
 // ---------------------------------------------------------------------------
 
 #[derive(Script, ScriptHook, Widget)]
@@ -3960,7 +3822,7 @@ pub enum MarkSlot<R> {
     Row(usize),
 }
 
-/// The marks a list panel keeps beside its [`Table`] (CR-009): the set of
+/// The marks a list panel keeps beside its [`Table`]: the set of
 /// keys, the rows the filter hides, the prefix they ride in above the
 /// list, and the stamp per live row that keeps a redraw proportional to
 /// what changed.
@@ -4189,7 +4051,7 @@ where
 /// datasource ([`mail::threads`]).
 type MailboxTable = Table<&'static SqlSource<mail::ThreadHead, i64>>;
 
-/// Its marks (CR-009): thread anchors, so a mark survives the filter, the
+/// Its marks: thread anchors, so a mark survives the filter, the
 /// paging and a sync landing underneath.
 type MailboxMarks = PanelMarks<&'static SqlSource<mail::ThreadHead, i64>>;
 
@@ -4202,7 +4064,7 @@ pub struct MailboxPanel {
     /// The autocomplete box, drawn over the rows after everything else.
     #[live]
     suggest: View,
-    /// The rich table (CR-006): the filter and the paging window. It holds
+    /// The rich table: the filter and the paging window. It holds
     /// no rows — every row a draw needs is a page lookup in the store.
     /// Starts on the inbox and is pointed at its panel's own role by the
     /// first draw (see [`MailboxPanel::sync_role`]).
@@ -4219,7 +4081,7 @@ pub struct MailboxPanel {
     /// back to the top of the list instead of carrying on where it stood.
     #[rust]
     sel: Option<(i64, usize)>,
-    /// The marks (CR-009): the threads picked out for a batch verb, the
+    /// The marks: the threads picked out for a batch verb, the
     /// ones the filter hides, and the stamp per live row — one piece,
     /// held beside the table by every list that has marks. Context, not
     /// history: gone with the process.
@@ -4281,7 +4143,7 @@ impl MailboxPanel {
     /// Where the cursor stands now: the remembered row if it still holds
     /// the thread, else the thread's rank (a sync landed above it), else
     /// the row clamped into the table (the thread left; carry on from
-    /// there). The cursor's identity is the thread anchor (CR-007): which
+    /// there). The cursor's identity is the thread anchor: which
     /// mail a row opens can change under it as replies arrive.
     fn cursor_index(&self, store: &Store) -> Option<usize> {
         let (th, idx) = self.sel?;
@@ -4353,7 +4215,7 @@ impl MailboxPanel {
         self.set_sel(cx, pid, store, i);
     }
 
-    /// Space: the mark on the cursor's row, toggled (CR-009).
+    /// Space: the mark on the cursor's row, toggled.
     fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
         let at = self.cursor_index(store);
         if self.marks.toggle_cursor(store, &self.table, at) {
@@ -4381,7 +4243,7 @@ impl MailboxPanelRef {
     }
 
     /// Whether the filter owns the keyboard. The fifth accelerator rule
-    /// (CR-005) stands the borrowed chords down while it does, so `cmd+a`
+    /// stands the borrowed chords down while it does, so `cmd+a`
     /// stays select-all in a live field.
     pub fn filter_focused(&self, cx: &mut Cx) -> bool {
         self.borrow()
@@ -4400,7 +4262,7 @@ impl MailboxPanelRef {
         }
     }
 
-    /// Whether any row is marked (CR-009): the bar is up, and the chords
+    /// Whether any row is marked: the bar is up, and the chords
     /// the list borrows from its preview stand down.
     pub fn has_marks(&self) -> bool {
         self.borrow().is_some_and(|p| !p.marks.is_empty())
@@ -4550,14 +4412,12 @@ impl Widget for MailboxPanel {
         self.view.handle_event(cx, event, scope);
         let Some(store) = Self::store(scope) else { return };
 
-        // `/` focuses the filter — the one plain letter the grammar keeps
-        // (CR-003 retired the vim walk; the arrows already mirrored it).
-        // It arrives as a TextInput event, exactly like real typing.
+        // `/` focuses the filter. It arrives as text input.
         if let Event::TextInput(t) = event {
             if !filter_focused && t.input == "/" {
                 focus_input(cx, &filter);
             }
-            // Space marks the cursor's row (CR-009) — the other plain key
+            // Space marks the cursor's row — the other plain key
             // the grammar keeps, arriving as text the way `/` does. In a
             // live filter it is a space.
             if !filter_focused && t.input == " " {
@@ -4583,11 +4443,11 @@ impl Widget for MailboxPanel {
                             });
                         }
                     }
-                    // The row walk, with scroll-follow (CR-003: the arrows
+                    // The row walk, with scroll-follow (the arrows
                     // are the whole walk now, j/k having gone). Each step
                     // previews what it lands on and keeps the keyboard.
                     // Shift+arrow marks the row it leaves and the row it
-                    // lands on: a range, by the walk's own keys (CR-009).
+                    // lands on: a range, by the walk's own keys.
                     KeyCode::ArrowDown if k.modifiers.shift => {
                         self.mark_and_step(cx, &store, pid, 1);
                     }
@@ -4683,7 +4543,7 @@ impl Widget for MailboxPanel {
 
         let sel = self.sel.map(|(th, _)| th);
         let n = self.table.len(&store);
-        // The marks (CR-009): what the filter shows and what it hides, read
+        // The marks: what the filter shows and what it hides, read
         // fresh by key each draw. A mark whose thread left this folder
         // altogether goes with it — the bar counts rows that exist.
         self.marks.sync(&store, &self.table);
@@ -4743,7 +4603,7 @@ impl Widget for MailboxPanel {
 fn job_line(reg: &effect::Registry, j: &Job) -> String {
     // A ring row carries its own sentence: it never had a payload for the
     // registry to decode, which is what made it in-memory in the first
-    // place (CR-004).
+    // place.
     j.what
         .clone()
         .or_else(|| reg.describe(&j.kind, &j.payload))
@@ -5341,7 +5201,7 @@ impl Widget for EffectsPanel {
 }
 
 // ---------------------------------------------------------------------------
-// Files (CR-008)
+// Files
 // ---------------------------------------------------------------------------
 
 #[derive(Script, ScriptHook, Widget)]
@@ -5399,7 +5259,7 @@ impl Widget for FilesRow {
 }
 
 impl FilesRowRef {
-    /// `selected` is the cursor's wash; `marked` the batch mark (CR-009).
+    /// `selected` is the cursor's wash; `marked` the batch mark.
     /// Exactly one of the four twins draws; only it is populated.
     pub fn populate(&self, cx: &mut Cx, e: &files::Entry, selected: bool, marked: bool) {
         let Some(row) = self.borrow() else { return };
@@ -5422,7 +5282,7 @@ impl FilesRowRef {
 /// The files panel's table: the shared engine over one directory.
 type FilesTable = Table<files::DirSource>;
 
-/// Its marks (CR-009): entry names, unique within the one directory the
+/// Its marks: entry names, unique within the one directory the
 /// panel lists — so a mark survives the filter, and dies with the listing.
 type FilesMarks = PanelMarks<files::DirSource>;
 
@@ -5453,7 +5313,7 @@ pub struct FilesPanel {
     /// The cursor: the entry's name, and the row it sat on.
     #[rust]
     sel: Option<(String, usize)>,
-    /// The marks (CR-009): the entries picked out for a batch verb, the
+    /// The marks: the entries picked out for a batch verb, the
     /// ones the filter hides, and the stamp per live row — the same piece
     /// the inbox holds. They are this directory's, so a panel that lands
     /// on another one starts over.
@@ -5663,7 +5523,7 @@ impl FilesPanel {
         self.redraw(cx);
     }
 
-    /// Space: the mark on the cursor's row, toggled (CR-009) — the
+    /// Space: the mark on the cursor's row, toggled — the
     /// inbox's key, over this list's own keys.
     fn toggle_cursor_mark(&mut self, cx: &mut Cx, store: &Store) {
         let at = self.cursor_index(store);
@@ -5703,7 +5563,7 @@ impl FilesPanelRef {
         Some(FilesPanel::target_of(&p.table.source().dir, &e))
     }
 
-    /// Whether any row is marked (CR-009): the bar is up, and the panel's
+    /// Whether any row is marked: the bar is up, and the panel's
     /// own object verbs stand down.
     pub fn has_marks(&self) -> bool {
         self.borrow().is_some_and(|p| !p.marks.is_empty())
@@ -5746,7 +5606,7 @@ impl FilesPanelRef {
     }
 
     /// Marks these names again — an undo giving back what a batch verb
-    /// consumed (CR-009).
+    /// consumed.
     pub fn add_marks(&self, cx: &mut Cx, keys: &[String]) {
         if let Some(mut p) = self.borrow_mut() {
             p.marks.extend(keys.iter().cloned());
@@ -5767,7 +5627,7 @@ impl FilesPanelRef {
 
     /// Lists the same directory again, keeping the filter as typed and the
     /// cursor on the name it stood on. What a verb that wrote the disk
-    /// calls: nothing watches it, so the panel has to be told (CR-008).
+    /// calls: nothing watches it, so the panel has to be told.
     pub fn refresh(&self, cx: &mut Cx, world: &crate::effect::World) {
         let Some(mut p) = self.borrow_mut() else {
             return;
@@ -5969,7 +5829,7 @@ impl Widget for FilesPanel {
             if !typing && t.input == "/" {
                 focus_input(cx, &filter);
             }
-            // Space marks the cursor's row (CR-009), arriving as text the
+            // Space marks the cursor's row, arriving as text the
             // way `/` does. In a live field it is a space.
             if !typing && t.input == " " {
                 self.toggle_cursor_mark(cx, &store);
@@ -5997,7 +5857,7 @@ impl Widget for FilesPanel {
                         }
                     }
                     // Shift+arrow marks the row it leaves and the row it
-                    // lands on: a range, by the walk's own keys (CR-009).
+                    // lands on: a range, by the walk's own keys.
                     KeyCode::ArrowDown if k.modifiers.shift => {
                         self.mark_and_step(cx, pid, &store, 1);
                     }
@@ -6161,7 +6021,7 @@ impl Widget for FilesPanel {
 
         let sel = self.sel.as_ref().map(|(name, _)| name.clone());
         let n = self.table.len(&store);
-        // The marks (CR-009): what the filter shows and what it hides,
+        // The marks: what the filter shows and what it hides,
         // read fresh by name each draw; an entry that left the listing
         // takes its mark with it.
         self.marks.sync(&store, &self.table);
@@ -6215,8 +6075,8 @@ impl Widget for FilesPanel {
     }
 }
 
-/// The card (CR-008) — and, on the same widget, the card over one part of a
-/// letter (CR-010). Which side the content comes from is the only
+/// The card — and, on the same widget, the card over one part of a
+/// letter. Which side the content comes from is the only
 /// difference: a path is `stat`ed and read through the outside, a part is
 /// described by its row and its bytes come off the picture reader's thread.
 /// Everything past that — the kind word, the size, which preview to attempt
@@ -6487,7 +6347,7 @@ impl SLinkRef {
 // ThreadMsg
 // ---------------------------------------------------------------------------
 
-/// A touchable part of a thread row, for the shell's hit table (CR-007):
+/// A touchable part of a thread row, for the shell's hit table:
 /// the header (a toggle), the contact link and the readings while open,
 /// the quote fold while it is folded.
 pub struct MsgHit {
@@ -6504,7 +6364,7 @@ pub struct MsgHit {
     pub quote: Option<Rect>,
     pub text: Option<Rect>,
     pub html: Option<Rect>,
-    /// The parts the open row lists (CR-010): `(label, rect, part)` — each
+    /// The parts the open row lists: `(label, rect, part)` — each
     /// a link to the card over it.
     pub atts: Vec<(String, Rect, u32)>,
 }
@@ -6689,7 +6549,7 @@ impl ThreadMsgRef {
         v.view(cx, ids!(quote_text)).set_visible(cx, show_quote && !is_html);
         v.view(cx, ids!(quote_html)).set_visible(cx, show_quote && is_html);
 
-        // What the letter carries (CR-010), under its reading: one link a
+        // What the letter carries, under its reading: one link a
         // part, each opening the card over it — a solid link, so it opens
         // joined to the right like anything else the panel names.
         let shown = if open { listed.clone() } else { Vec::new() };
@@ -6761,7 +6621,7 @@ impl ThreadMsgRef {
 ///
 /// Nothing here happens in the frame that first shows a picture. A letter's
 /// own `cid:` parts come off a reader thread with its own connection to the
-/// database the asking panel reads (CR-005 phase 0); a `data:` payload is
+/// database the asking panel reads; a `data:` payload is
 /// un-base64'd on that same thread; an image on the web is an ordinary HTTP
 /// request. All three land in [`pictures_landed`], which redraws. The decode
 /// from those bytes to a texture is makepad's, on its own pool, and lands
@@ -6799,7 +6659,7 @@ enum PicJob {
     Cid { db: Arc<crate::store::Db>, mid: i64 },
     /// Un-base64 one `data:` source, filed under `key`.
     Data { key: String, src: String },
-    /// Read one part of a letter back out of its raw (CR-010), for the card
+    /// Read one part of a letter back out of its raw, for the card
     /// that shows it. The same read and the same MIME walk as `Cid`, asked
     /// for by row rather than by mail — and off the frame for the same
     /// reason: an attachment is exactly the megabyte-sized blob the rule
@@ -6887,8 +6747,8 @@ fn spawn_picture_reader() -> mpsc::Sender<PicJob> {
     std::thread::Builder::new()
         .name("pictures".into())
         .spawn(move || {
-            // A reader over whichever *one* writer the job names (CR-005
-            // phase 0), kept for as long as the jobs keep naming it — one
+            // A reader over the writer named by the job, kept for as long as
+            // the jobs keep naming it — one
             // process can have several worlds open at once (the panels
             // library), and in every other run this opens exactly once.
             let mut held: Option<(Arc<crate::store::Db>, crate::store::Store)> = None;
@@ -6944,7 +6804,7 @@ fn cid_parts(store: Option<&Store>, mid: i64) -> PicturesReady {
     }
 }
 
-/// The name one part of a letter is filed under (CR-010) — the same flat
+/// The name one part of a letter is filed under — the same flat
 /// space a picture's source lives in, since both are "bytes a panel needs
 /// and must not read in its own frame".
 fn part_key(mail: i64, at: u32) -> String {
@@ -7540,7 +7400,7 @@ impl Widget for MessagePanel {
                 }
             }
         }
-        // The message panel's link accelerators (CR-003): reply is cmd+r
+        // The message panel's link accelerators: reply is cmd+r
         // and forward cmd+f, each drawn onto its link. The shell forwards
         // any cmd chord it does not own itself. Both take the newest mail
         // of the thread — the conventional reply to a conversation, and
@@ -8120,7 +7980,7 @@ iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR42mNgQAYAAA4AATo1BFYAAAAA
     }
 
     /// The reader thread does its reading over the *one* writer, on a
-    /// connection of its own (CR-005 phase 0) — a second reader on a second
+    /// connection of its own — a second reader on a second
     /// thread has to see the letter the UI thread just wrote.
     #[test]
     fn the_reader_reads_across_the_one_writer() {

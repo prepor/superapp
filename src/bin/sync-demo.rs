@@ -6,7 +6,7 @@
 //! ```sh
 //! cargo run --bin sync-demo
 //! # …or against a real Cloudflare R2 bucket, which is the same walk over
-//! # TLS and signed requests (CR-005 phase 4):
+//! # TLS and signed requests:
 //! export SUPERAPP_R2_ACCESS_KEY_ID=… SUPERAPP_R2_SECRET_ACCESS_KEY=…
 //! cargo run --bin sync-demo -- --bucket https://<account>.r2.cloudflarestorage.com/<bucket>
 //! ```

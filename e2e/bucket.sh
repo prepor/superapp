@@ -1,5 +1,5 @@
 #!/bin/bash
-# CR-005: the device-sync form, headless. A device with no flag and no
+# The device-sync form, headless. A device with no flag and no
 # adb-pushed file is pointed at a bucket from inside the app, and the proof
 # is outside it: a `bucket` file beside the store, and a lineage in the
 # daemon's directory that only a holder writes.

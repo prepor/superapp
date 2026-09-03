@@ -1,5 +1,4 @@
-# Standalone package; the empty [workspace] table stops cargo from walking up
-# the tree looking for a workspace root (same defence as mosaic's crates).
+# Keep this package separate from any Cargo workspace above it.
 [workspace]
 
 [package]
@@ -7,10 +6,9 @@ name = "superapp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
-description = "Personal user-space OS: specialized panels on one scrolling workspace."
+description = "My personal app for everyday work in one scrolling panel workspace."
 publish = false
-# The helper binaries under src/bin (bucketd, sync-demo, reseed-edit) made a
-# plain `cargo run` ambiguous; the app is what every documented command means.
+# Make `cargo run` start the app instead of asking which binary to use.
 default-run = "superapp"
 
 [lib]
@@ -25,53 +23,23 @@ path = "src/main.rs"
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 mail-parser = "0.11"
-# HTML mail and feed articles, narrowed to the widget vocabulary in
-# src/html.rs. html5ever is the spec tree builder (implied end tags, entity
-# decoding, the adoption agency for misnested emphasis) and rcdom the plain
-# Rc tree over it; simplecss is a one-file CSS parser with selector matching
-# against our own tree, enough for the handful of properties a monochrome
-# reading honours (hidden text, weight, slant, decoration, white-space).
+# Parse and clean the limited HTML and CSS shown in message bodies.
 html5ever = "0.39"
 markup5ever_rcdom = "0.39.0"
 simplecss = "0.2"
-# makepad@dev, re-pinned 2026-09-01 to then-HEAD (53 commits past mosaic's
-# vendor pin; fast-forward, zero source drift, full battery green). None of
-# mosaic's patches; the one superapp used was 0003 (present-when-occluded,
-# for background e2e runs), dropped as an experiment: if occluded e2e
-# suites go stale, run them with --front. Our own patches ride on top —
-# see the [patch] section at the bottom. The API reference is the
-# ~/.cargo git checkout of the fork rev (mosaic's vendored tree lags it).
+# Pin Makepad for repeatable builds. Local fixes are listed below.
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# The one store: bundled SQLite (same pin rel.systems validated) so the hook
-# surface and version are identical on macOS and android. `hooks` powers the
-# query layer's table-level invalidation (update_hook); `session` records
-# every write's transaction as a changeset into `repl_log` — the device-sync
-# replication log (CR-005). (CR-004 had removed `session` with the
-# changeset-based undo; CR-005 brings it back for a different job — carrying
-# one device's writes to the other.) session ⇒ buildtime_bindgen: bindgen
-# runs on the host for both targets (verified on the android cross-build).
+# Bundle SQLite so macOS and Android use the same version. Hooks refresh cached
+# queries; sessions record changes for device sync.
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "session"] }
 
-# CR-004: effects are serializable values, and the deferred ones are JSON
-# payloads in the `effect` table. serde is already in the graph transitively;
-# serde_json is the one new crate.
+# Deferred effects use JSON payloads in the `effect` table.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Gmail sign-in (see `src/oauth.rs`) and the R2 device-sync transport (see
-# `src/r2.rs`) both wanted crates the graph already carried under imap and
-# lettre's `rustls-tls`, so these are promotions to direct deps, not new
-# dependencies:
-#
-#   base64            XOAUTH2's envelope and the id_token's.
-#   ring              PKCE's SHA-256 and randomness; and the SHA-256 and
-#                     HMAC-SHA256 an AWS SigV4 signature is made of.
-#   rustls-connector  the whole HTTP client for one POST to Google's token
-#                     endpoint — that does not earn `reqwest`.
-#   rustls            R2 over TLS, with the `ring` provider explicitly (never
-#                     aws-lc-rs: a new C toolchain on the android cross-build).
-#   webpki-roots      the Mozilla roots R2's certificate is checked against.
+# Gmail sign-in and R2 device sync use these directly. They provide encoding,
+# signing, secure connections, and trusted certificate roots.
 base64 = "0.22"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -82,29 +50,15 @@ webpki-roots = "1"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 
-# Five patches on top of the pin, carried on prepor/makepad@superapp-pin
-# (branched at the pin; rebase them when bumping it):
+# The Makepad fork adds five fixes. Rebase them when updating the pin:
 #
-#   bdb23508  TextInput hides the IME only when key focus goes to nothing —
-#             the unconditional hide-on-blur closed and reopened the
-#             keyboard on every field-to-field move (mobile "next", tab).
-#   5bf8e78f  A dismissed keyboard is not hidden again (Samsung re-presents
-#             it to replay the animation: dismissals "closed twice"), and a
-#             tap on a field clears the dismissed latch, so a re-tap on the
-#             focused field can raise the keyboard again.
-#   99b2a58f  MAKEPAD_PRESENT_WHEN_OCCLUDED (mosaic's patch 0003): a run that
-#             deliberately sits behind the user's windows can still be
-#             photographed. Off by default. E2e moved to `MAKEPAD=headless`
-#             and no longer needs it; the branch carries it anyway.
-#   5d491eea  A trackpad pinch (NSEventTypeMagnify) arrives as a command-
-#             scroll at the pointer: the panels library's canvas zooms on it.
-#   d7795f23  TextFlow: a padded selection row ends at the row under it —
-#             two padded rows overlapped by 4px, and a translucent wash
-#             painted the overlap twice as dark: a band between every two
-#             lines of a selected paragraph.
+#   bdb23508  Keep the mobile keyboard open when focus moves between fields.
+#   5bf8e78f  Let a dismissed mobile keyboard reopen when its field is tapped.
+#   99b2a58f  Allow screenshots while the window is hidden, when enabled.
+#   5d491eea  Send trackpad pinch events to the Panels Library zoom control.
+#   d7795f23  Remove dark bands between selected lines with padding.
 #
-# A local clone at ../makepad-superapp is the working tree for them; the
-# git rev below is what actually builds, here and anywhere else.
+# `../makepad-superapp` is the local working copy. Builds use the revision below.
 [patch."https://github.com/makepad/makepad"]
 makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
 makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }

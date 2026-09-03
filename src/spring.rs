@@ -1,9 +1,8 @@
-//! niri's closed-form spring, ported from mosaic (`mosaic/crates/app/src/spring.rs`),
-//! which transcribed it from niri. Evaluated at absolute elapsed time, so a
-//! dropped frame cannot perturb the trajectory; retargeting preserves position
-//! *and* velocity, so chained motions keep their momentum.
+//! Spring animation that stays consistent when frames are dropped.
+//!
+//! It uses total elapsed time, so dropped frames do not change the path.
+//! Retargeting preserves current position and speed.
 
-/// Mass is fixed at 1.0, as in niri.
 const MASS: f64 = 1.0;
 
 /// Spring coefficients.

@@ -1,4 +1,4 @@
-# CR-010 — what a letter carries, both ways: the parts of a mail as links
+# What a letter carries, both ways: the parts of a mail as links
 # and a card, and a file from the browser becoming a part of a draft.
 #
 # Run with `--demo-disk`: the compose half needs a files panel walking the

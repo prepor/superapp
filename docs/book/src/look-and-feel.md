@@ -1,54 +1,43 @@
 # Look & Feel
 
-Black on white, almost fully monochrome. Colour appears in exactly one role:
-errors (`#a01500`-ish ink red) — a status line, an error toast, and the
-problems mark that stays in the toast's corner while something in the
-background is wrong. There is no second accent; hover and selection are grey
-backings; focus is the inverted panel header.
+The interface is almost entirely black, white, and grey. Red is reserved for
+errors: status lines, error toasts, and the problems count. Focused panel
+headers are inverted. Hovered and selected items use a grey background.
 
 ## Type
 
-Everything is monospace (Menlo fronts the family; makepad's bundled fonts fill
-in symbols), body ≈14 px. Labels — panel titles, table headers, buttons — are
-uppercase, smaller, and letter-tracked (the stelaxis register style). Bold is
-a nudged double-draw (unread rows, the contact name). Panel content is laid
-out on the character grid the face is measured to, which is what keeps tables,
-fields and buttons aligned by construction.
+Body text is monospace at about 14 px. Panel content and controls use bundled
+Geist Mono on every platform. The shell uses Menlo on macOS for panel headers,
+tabs, and a few status messages; elsewhere it falls back to bundled Liberation
+Mono. Titles, table headers, and buttons use smaller uppercase text with extra
+letter spacing.
 
-Bold does exactly two jobs, and they never share a place: a bold **run** is
-emphasis, a bold **single character inside a button or a link** is that
-control's [accelerator](./interaction-grammar.md#accelerators).
+Bold text has two uses: emphasis in prose and one bold letter that marks a
+control's [keyboard shortcut](./interaction-grammar.md#accelerators).
 
-## Chrome
+## Panels and controls
 
-1 pt near-black borders, sharp corners, 8 pt gaps, no shadows. Panel header:
-26 pt, tracked title, side-effect buttons right, × last. Focused header
-inverts; unfocused headers carry a 1 pt rule. Tables: strong rule under the
-header row, hairline rules between rows. A marked row wears a 3 pt ink bar
-down its left edge, drawn *inside* the row's own 8 pt inset, so the text
-keeps the header's columns and nothing shifts when the first mark lands; the
-marks a filter hides sit above the rows under a section caption, closed by a
-strong rule of their own.
+Panels have sharp corners, 1 pt dark borders, and 8 pt gaps. They have no
+shadows. A panel header is 26 pt tall. Action buttons sit on the right, with
+the close button last.
 
-A link that holds keyboard focus wears a doubled underline, the way a
-focused button wears the grey wash. Text carries no padding of its own: a label, a section label, a link sits
-exactly where its row puts it, so every line a panel writes shares the
-panel's inset, and the spacing between lines belongs to the rows and rules
-rather than to the words. Nothing zeroes or pads around a label at the
-site; the vocabulary is bare and the containers carry the rhythm.
+Tables use a strong rule below the header and light rules between rows. A
+marked row has a 3 pt bar inside its left padding, so marking it does not move
+the text. Marked rows hidden by a filter appear in a separate section above the
+visible rows.
+
+A keyboard-focused link has a double underline. A focused button has a grey
+background. Containers own spacing; text controls do not add their own padding.
 
 ## Motion
 
-niri's spring (`k=800, ζ=1`, closed-form, ~330 ms) drives every rect and the
-camera; retargeting preserves velocity, so chained motions keep momentum.
-Panels are born slightly inset and fade in; closed panels fade out as ghosts.
-The modal overlays — launcher, workspaces, history — ride one *presence*
-spring (`k=1200`, ~200 ms): the ink wash, the sheet and its rows fade in
-together while the sheet rises its last few points into place, and a close
-runs the same spring back. Their widget trees render to a texture and are
-composited at the spring's alpha, which is how a real text field, caret and
-all, fades as one surface. Trackpad pans are 1:1 and deliberately not
-springed. The shell idles at zero frames — springs, not timers, request the
-next frame — which is also why the problems mark does not pulse: a pulse
-would keep the loop turning for as long as a server is down, and the colour
-is signal enough.
+Panels and the camera use the same spring animation (`k=800`, `ζ=1`), which
+settles in about 330 ms. Changing a target keeps the current speed. New panels
+fade and grow into place; closed panels leave a short fading image.
+
+Launcher, workspace, and history overlays use a faster spring (`k=1200`) that
+settles in about 200 ms. Their sheet, background, and contents fade together.
+Trackpad movement follows the input directly and does not use a spring.
+
+The application requests another frame only while something is moving. The
+problems count therefore stays still instead of pulsing indefinitely.

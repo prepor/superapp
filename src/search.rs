@@ -1,24 +1,9 @@
-//! Search: many sources, one list, and none of them on the frame.
+//! Runs search providers and combines their results.
 //!
-//! A launcher over a real world asks several different things at once — the
-//! windows that are open, the mail index, tomorrow the files on disk and the
-//! chats on a server — and they answer at wildly different speeds. So
-//! nothing here is a call that returns a list. A question is **put**
-//! ([`Engine::ask`]) and answers arrive when they arrive
-//! ([`Engine::collect`]), each stamped with the question it belongs to;
-//! anything stamped with an older one goes on the floor.
-//!
-//! Each [`Provider`] gets a thread of its own and a store connection of its
-//! own, so the one that waits on a server never delays the one that reads an
-//! index. A provider that can take a while is handed an [`Abandoned`] and is
-//! expected to look at it: the moment a newer question is put, whatever it
-//! is still doing is worth nothing.
-//!
-//! Under a headless build the same providers answer **inline**, on the
-//! calling thread, at ask time — so a scripted `type` is followed by its
-//! rows in the same tick, and a suite stays reproducible. It is the split
-//! [`crate::sync::Pump`] already makes for the mail passes, for the same
-//! reason.
+//! Each provider normally owns a thread and read-only database connection.
+//! Results include the query generation, so replies to older queries are
+//! discarded. Providers receive [`Abandoned`] to stop expensive stale work.
+//! Headless tests run providers inline for predictable timing.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,14 +29,11 @@ pub enum Go {
 /// business; [`crate::launcher::Search`] settles it on the merge.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// Primary text: the panel title / subject / person.
     pub label: String,
-    /// Muted secondary text: sender, address, kind.
     pub detail: String,
     /// The workspace the panel lives on, when it is already open. Filled in
     /// by the merge for anything a provider found.
     pub ws: Option<usize>,
-    /// What enter does.
     pub go: Go,
 }
 
@@ -298,7 +280,7 @@ fn provider_loop(
     newest: &Arc<AtomicU64>,
     notify: impl Fn(),
 ) {
-    // The worker joins the *one* writer (CR-005 phase 0) — its own reader
+    // The worker joins the *one* writer — its own reader
     // over the shared `Db`, never a second writable connection.
     let Ok(store) = Store::with_db(db) else {
         return;

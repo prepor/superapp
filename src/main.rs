@@ -4,7 +4,7 @@
 
 fn main() {
     // `--r2-login` stores the device-sync bucket's secret access key and
-    // exits — it never opens a window (CR-005).
+    // exits — it never opens a window.
     if let Some(code) = superapp::r2::login_from_argv() {
         std::process::exit(code);
     }

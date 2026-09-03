@@ -1,10 +1,5 @@
-//! The e2e harness: a line-based script of user-level steps the shell replays
-//! against its real input paths (hit resolution, key handling, text input),
-//! with window-layer screenshots along the way.
-//!
-//! Runs are meant to be headless-feeling: the window sits behind everything,
-//! click-through, and keeps presenting (makepad patch 0003), while
-//! `screencapture -l` grabs its layer regardless of occlusion.
+//! Line-based end-to-end scripts for clicks, keys, text, touch, and screenshots.
+//! Steps use the shell's normal input paths.
 //!
 //! # Script grammar
 //!
@@ -50,7 +45,6 @@ pub enum Step {
     Shot(String),
     /// Click the element whose label contains this (case-insensitive).
     Click {
-        /// Label substring.
         label: String,
         /// Hold cmd: always a fresh, un-joined panel.
         fresh: bool,
@@ -59,15 +53,12 @@ pub enum Step {
     /// the stage's own event handling rather than the resolved action —
     /// the path a physical click takes, key-focus side effects included.
     Mouse {
-        /// Label substring.
         label: String,
     },
     /// A key chord: `cmd+shift+left`, `enter`, `j`, … with a repeat count
     /// (`key j 5`).
     Key {
-        /// The chord.
         chord: String,
-        /// How many times to press it.
         times: u32,
     },
     /// Text input into whatever owns the keyboard.
@@ -81,9 +72,7 @@ pub enum Step {
     Drag {
         /// Label substring picking the start element.
         label: String,
-        /// Horizontal travel, points.
         dx: f64,
-        /// Vertical travel, points.
         dy: f64,
     },
     /// A one-finger touch drag from the labelled element's centre, by
@@ -92,9 +81,7 @@ pub enum Step {
     Swipe {
         /// Label substring picking the start element.
         label: String,
-        /// Horizontal travel, points.
         dx: f64,
-        /// Vertical travel, points.
         dy: f64,
         /// Keep the finger down after the move — the only way to photograph a
         /// gesture mid-flight, since a whole swipe otherwise runs inside one
@@ -105,9 +92,7 @@ pub enum Step {
     /// strip; vertical toggles the workspaces overlay (down opens, up
     /// closes).
     Pan2 {
-        /// Horizontal travel, points.
         dx: f64,
-        /// Vertical travel, points.
         dy: f64,
     },
     /// Long-press the labelled element (a header picks the panel up), drag by
@@ -116,9 +101,7 @@ pub enum Step {
     HoldMove {
         /// Label substring picking the press point.
         label: String,
-        /// Horizontal travel, points.
         dx: f64,
-        /// Vertical travel, points.
         dy: f64,
         /// Keep holding after the move; release with [`Step::Drop`].
         hold: bool,
@@ -268,13 +251,10 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
 /// machine is idle or running twelve other suites.
 #[derive(Debug)]
 pub struct Runner {
-    /// The script.
     pub steps: Vec<Step>,
-    /// Next step to execute.
     pub idx: usize,
     /// Virtual milliseconds still owed to a pending `wait`.
     pub wait_ms: f64,
-    /// Where screenshots go.
     pub out: PathBuf,
     /// Failed steps so far (missing labels, failed captures).
     pub failures: u32,

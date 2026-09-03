@@ -1,37 +1,13 @@
-//! The one store: a single SQLite file holding **all** durable data — mail
-//! and UI state alike — plus the small reactive layer that derives panels
-//! from it (CR-001).
+//! SQLite storage and cached queries.
 //!
-//! Shape (rel.systems' idioms, in-process):
-//! - **one writable connection**, private to a dedicated writer thread (the
-//!   [`Db`] gate, CR-005 phase 0); every mutation is a `Send` closure
-//!   submitted to it and awaited, one transaction each. Every other
-//!   connection — the UI's, each worker's — is a `query_only` reader, so a
-//!   stray write fails loudly instead of racing. WAL, `synchronous=NORMAL`;
-//! - inside the gate, a **session** over the durable tables records what each
-//!   transaction wrote into `repl_log` — the changeset a peer device applies
-//!   (CR-005). Applying a peer's frame records nothing, so it never echoes;
-//! - `update_hook` records which tables a commit touched; each touched
-//!   table's **generation** bumps at commit;
-//! - reads go through [`Store::rows`]: results are cached per
-//!   `(query, params)` and stamped with the generations of the tables they
-//!   read — a stale entry re-runs lazily on next access. Dependencies are
-//!   captured **automatically** by SQLite's authorizer at prepare time, so
-//!   provenance is complete by construction (that trace is the future panel
-//!   context). The one thing an authorizer cannot see is rows that were
-//!   never in the database — the effect ring the log joins in
-//!   ([`Store::rows_sql_deps`], [`Store::poll_mem`]) — so a query that
-//!   reads those names that dependency itself;
-//! - the logical [`core::Wm`] state persists wholesale ([`Store::save_wm`])
-//!   and boot restores it — ephemeral physics (springs, cameras) stay in
-//!   memory.
+//! [`Db`] owns the only writable connection on a dedicated thread. Other
+//! connections are read-only. Each transaction records a device-sync changeset.
+//! Applying a changeset does not record it again.
 //!
-//! History is **not** here. CR-004 moved the action tree into memory
-//! ([`crate::history`]): the store keeps current state, and what an action
-//! claimed of the world is an `Intent`, not a changeset.
-//!
-//! This module is the generic substrate; the mail domain (schema content,
-//! seed, typed queries) lives in [`crate::mail`].
+//! [`Store::rows`] caches results by SQL and parameters. SQLite reports which
+//! tables a query reads and when those tables change. The in-memory effect log
+//! reports changes itself because it is not a table. Workspace state is saved;
+//! animation and undo history remain in memory.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -49,7 +25,7 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 use crate::core::{self, Kind, PanelId, Seed};
 
 /// The durable tables a write's session records — everything a peer device
-/// must be told about (CR-005). `repl_log` and `repl` are replication's own
+/// must be told about. `repl_log` and `repl` are replication's own
 /// bookkeeping and are deliberately absent, so a frame a follower *applies*
 /// is never recaptured and never echoes back into the log.
 /// `attachment` is absent for a third reason: it is derived from `message.raw`,
@@ -64,9 +40,7 @@ pub(crate) const REPLICATED: &[&str] = &[
 /// context will hand to an agent. Declared `static` at the call site.
 #[derive(Debug)]
 pub struct Q {
-    /// Stable name.
     pub id: &'static str,
-    /// The SQL, `?n` params.
     pub sql: &'static str,
     /// What this query is for, in one line.
     pub describe: &'static str,
@@ -75,11 +49,8 @@ pub struct Q {
 /// A query parameter — small closed set, so cache keys are trivial.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
-    /// An integer (ids).
     I(i64),
-    /// Text.
     S(String),
-    /// A real (the store's timestamps, a `@date>` bound).
     F(f64),
 }
 
@@ -117,13 +88,11 @@ struct Cached {
 /// query layer, plus a handle to the [`Db`] gate every write goes through.
 ///
 /// The UI thread owns one; each worker thread builds its own over the *same*
-/// [`Db`] (CR-005 phase 0). Reads run on this connection; writes are closures
+/// [`Db`]. Reads run on this connection; writes are closures
 /// submitted to the single writer. `conn` is `query_only`, so a stray write
 /// here fails loudly instead of racing.
 pub struct Store {
-    /// The one writer, shared. Every mutation goes through it.
     db: Arc<Db>,
-    /// This thread's read-only connection.
     conn: Connection,
     /// Per-table commit generation — the invalidation clock.
     generations: RefCell<HashMap<String, u64>>,
@@ -215,7 +184,7 @@ CREATE TABLE panel(
 );
 ";
 
-/// Schema v2 (CR-001 phase 2): the action log — the undo DAG — and the
+/// Schema v2: the action log — the undo DAG — and the
 /// `wm` row. `wm.active` moves out of `meta` because sessions must record
 /// it (undo teleports you back to where the action happened) while `meta`
 /// (the head pointer) must stay outside the recorded world.
@@ -241,7 +210,7 @@ INSERT INTO wm(id, active)
 DELETE FROM meta WHERE key='wm_active';
 ";
 
-/// Schema v3 (CR-001 phase 3): real accounts. IMAP identity on folders and
+/// Schema v3: real accounts. IMAP identity on folders and
 /// messages, connection config and sync status on accounts, and the `dirty`
 /// flag — a local change (read, archive) the server has not been told about
 /// yet; reconciliation leaves dirty rows alone (phase 4's op executor
@@ -260,7 +229,7 @@ CREATE UNIQUE INDEX idx_message_folder_uid ON message(folder, uid)
   WHERE uid IS NOT NULL;
 ";
 
-/// Schema v4 (CR-001 phase 4): the desired/actual split. `message` rows are
+/// Schema v4: the desired/actual split. `message` rows are
 /// the user's **intent** (which folder, read or not); `server_msg` is what
 /// the server actually holds. A row whose two sides disagree *is* the push
 /// queue — no op table. Only the sync workers write `server_msg`, and it
@@ -284,7 +253,7 @@ ALTER TABLE message DROP COLUMN uid;
 ALTER TABLE message DROP COLUMN dirty;
 ";
 
-/// Schema v5 (CR-001 phase 5): drafts and the outbox. A draft belongs to
+/// Schema v5: drafts and the outbox. A draft belongs to
 /// its compose **panel** (panel ids are stable and persisted), so
 /// half-written text survives restarts; an outbox row shares the panel's
 /// id — one pending send per compose, and the undo entity (`outbox:N`) is
@@ -322,7 +291,7 @@ const SCHEMA_V6: &str = "
 ALTER TABLE message ADD COLUMN html TEXT;
 ";
 
-/// Schema v8 (CR-004): history moved into memory, so the durable action log
+/// Schema v8: history moved into memory, so the durable action log
 /// and its head pointer go. What an action claimed of the world is now an
 /// `Intent` on an in-memory node; what it *wrote* is ordinary rows, which is
 /// all the passes ever read. `ACTION_TABLES` went with it — nothing records
@@ -332,7 +301,7 @@ DROP TABLE IF EXISTS action;
 DELETE FROM meta WHERE key = 'head';
 ";
 
-/// Schema v7 (CR-004): the effect table — one queue for every deferred
+/// Schema v7: the effect table — one queue for every deferred
 /// effect, whatever domain it came from. `payload` and `reply` are JSON
 /// *text*, not JSONB: SQLite has no JSON type, and a BLOB encoding would
 /// make `SELECT reply FROM effect` unreadable in a shell — inspectability
@@ -359,7 +328,7 @@ CREATE INDEX idx_effect_due    ON effect(status, not_before);
 CREATE INDEX idx_effect_entity ON effect(entity);
 ";
 
-/// Schema v9 (CR-007): threads. `message.thread` is the id of the lowest
+/// Schema v9: threads. `message.thread` is the id of the lowest
 /// member of the conversation a mail belongs to — an anchor, not a root;
 /// no row is the parent of another, and what a thread *has* (participants,
 /// last date, unread) is a `GROUP BY` at read time. `topic` is the subject
@@ -421,10 +390,10 @@ pub(crate) fn backfill_threads(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Schema v10 (CR-005): the replication log and its local state. `repl_log`
+/// Schema v10: the replication log and its local state. `repl_log`
 /// is a **queue that drains and prunes**, not a durable changeset table — the
-/// session extension CR-004 removed comes back for exactly this, and nothing
-/// migrates through it. `repl` is local-only, never replicated: it holds this
+/// SQLite session extension records it, and nothing migrates through it.
+/// `repl` is local-only, never replicated: it holds this
 /// install's stable device id and its sequence counters.
 ///
 /// `repl_log.seq` is fed from `repl.next_local_seq`, **not** a bare rowid — a
@@ -497,7 +466,7 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
     // is one word per account, and because the *secret* — the part a second
     // row would be about — is exactly what must not be in the store.
     ("account", "auth", "ALTER TABLE account ADD COLUMN auth TEXT"),
-    // CR-010: which install picked a draft's file (see [`SCHEMA_V12`]).
+    // which install picked a draft's file (see [`SCHEMA_V12`]).
     (
         "draft_attachment",
         "device",
@@ -515,7 +484,7 @@ const SCHEMA_V11: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Schema v12 (CR-010): what a letter carries, and what a draft will.
+/// Schema v12: what a letter carries, and what a draft will.
 ///
 /// `attachment` is **derived**, like the HTML reading: one row per part of
 /// a mail's `raw`, holding the description a list and a card need — name,
@@ -690,7 +659,7 @@ pub(crate) fn backfill_html(conn: &Connection) -> rusqlite::Result<()> {
 type Erased = Box<dyn Any + Send>;
 
 /// A caller's write closure, boxed and type-erased, on its way to the writer
-/// thread. The `Send` bound is what CR-005 phase 0 costs the call sites.
+/// thread. The `Send` bound lets the closure cross that thread boundary.
 type RunFn = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<Erased> + Send>;
 
 /// The same, for a replication-internal op on the raw connection.
@@ -738,18 +707,16 @@ enum Target {
 
 /// **The one writable connection** — private, single, and living on its own
 /// thread. Every mutation in the process is a closure submitted here and
-/// awaited; every other connection is a reader. This is the capture seam
-/// CR-005 phase 0 exists to make un-bypassable: a write nobody captured is
-/// silent divergence, not a crash, so there is exactly one door and `Db`
-/// owns it.
+/// awaited; every other connection is a reader. This keeps replication from
+/// missing a write, so `Db` owns the only writable connection.
 pub struct Db {
     jobs: mpsc::Sender<Job>,
     target: Target,
     /// Whether ordinary [`Db::write`] mutations are allowed. A follower holds
-    /// this `false` (CR-005): its ordinary writes fail read-only at the gate,
+    /// this `false`: its ordinary writes fail read-only at the gate,
     /// while the replication [`Db::raw`] and [`Db::apply`] paths still run.
     writable: Arc<AtomicBool>,
-    /// The last few in-memory effects (CR-004). Not in the database and
+    /// The last few in-memory effects. Not in the database and
     /// never on disk — it lives here because this is the one handle every
     /// thread's [`Store`] already shares, so the UI's log sees what a sync
     /// worker reached for. Every reader is taught to query it at open.
@@ -818,7 +785,7 @@ impl Db {
         Ok(conn)
     }
 
-    /// The in-memory effect ring this process keeps (CR-004).
+    /// The in-memory effect ring this process keeps.
     #[must_use]
     pub fn mem(&self) -> &Arc<crate::effect::MemLog> {
         &self.mem
@@ -1093,14 +1060,14 @@ END;
 
 /// This install's device id — the one `repl` holds. Empty when the row is
 /// not there yet, which is only true before the first migration has run.
-/// A draft's files record it: a path is a file on one machine (CR-010).
+/// A draft's files record it: a path is a file on one machine.
 #[must_use]
 pub fn this_device(conn: &Connection) -> String {
     conn.query_row("SELECT device FROM repl WHERE id = 1", [], |r| r.get(0))
         .unwrap_or_default()
 }
 
-/// A stable per-install device id (CR-005): two devices must never share one,
+/// A stable per-install device id: two devices must never share one,
 /// or they publish under the same name and corrupt `state.acked`. No `rand`
 /// dependency — a mix of the wall clock, the pid and a process-local counter
 /// is unique enough for two devices.
@@ -1216,7 +1183,7 @@ impl Store {
     }
 
     /// A reader over an existing [`Db`] — how a worker thread joins the one
-    /// writer instead of opening a second (CR-005 phase 0).
+    /// writer instead of opening a second.
     pub fn with_db(db: Arc<Db>) -> rusqlite::Result<Store> {
         let conn = db.reader()?;
         Ok(Store {
@@ -1240,7 +1207,7 @@ impl Store {
         self.db.clone()
     }
 
-    /// This process's in-memory effect ring (CR-004) — shared with every
+    /// This process's in-memory effect ring — shared with every
     /// other [`Store`] over the same [`Db`], which is how the log shows a
     /// worker's connects beside the UI's.
     #[must_use]
@@ -1511,7 +1478,7 @@ impl Store {
         self.write(move |c| save_wm_tx(c, &snap))
     }
 
-    // -- replication (CR-005) ------------------------------------------------
+    // -- replication ------------------------------------------------
 
     /// Frames captured locally but not yet published — the drain's input.
     #[must_use]
@@ -1541,8 +1508,8 @@ impl Store {
     }
 
     /// Marks every unpublished frame through `seq` as published, so a second
-    /// drain moves nothing. `pub_seq` gets a global sequence in CR-005 phase
-    /// 2; locally it is the local seq, which is enough to stop a re-drain.
+    /// drain moves nothing. Locally, `pub_seq` uses the local sequence, which
+    /// is enough to prevent draining the same frame twice.
     ///
     /// # Errors
     ///
@@ -1558,7 +1525,7 @@ impl Store {
     }
 
     /// How many captured frames are still unpublished — the risk an offline
-    /// holder is accruing, surfaced in the UI (CR-005 phase 3).
+    /// holder is accruing, surfaced in the UI.
     #[must_use]
     pub fn unpublished(&self) -> i64 {
         self.conn
@@ -1570,7 +1537,7 @@ impl Store {
             .unwrap_or(0)
     }
 
-    /// This install's stable device id (CR-005).
+    /// This install's stable device id.
     #[must_use]
     pub fn device(&self) -> String {
         self.conn
@@ -1579,7 +1546,7 @@ impl Store {
     }
 
     /// The global sequence this store *contains* through — whatever the
-    /// origin, including its own published writes (CR-005).
+    /// origin, including its own published writes.
     #[must_use]
     pub fn materialized(&self) -> i64 {
         self.conn
@@ -1651,7 +1618,7 @@ impl Store {
     }
 
     /// `VACUUM INTO` a fresh file — a snapshot of the whole logical database,
-    /// taken at a drained boundary (CR-005 bootstrap). Replication's own
+    /// taken after pending replication frames have drained. Replication's own
     /// bookkeeping rides along and is dropped on install.
     ///
     /// # Errors
@@ -1712,11 +1679,11 @@ impl Store {
                 }
                 // The local pending queue is relative to the *old* baseline —
                 // meaningless against the snapshot we just installed. Clear it
-                // (CR-005: "repl_log cleared") while `repl.next_local_seq`
+                // ("repl_log cleared") while `repl.next_local_seq`
                 // survives, so a re-drain never resends a stale frame.
                 tx.execute("DELETE FROM repl_log", [])?;
                 // The derived rows described the mailbox that was just
-                // replaced (CR-010). They are local, so they are dropped
+                // replaced. They are local, so they are dropped
                 // rather than copied, and the walk below rebuilds them from
                 // the `raw` the snapshot brought.
                 tx.execute("DELETE FROM attachment", [])?;
@@ -1761,7 +1728,7 @@ impl Store {
             tx.commit()
         })?;
         // A letter that arrives this way ran no ingest code, so nothing has
-        // walked its `raw` for the parts it carries (CR-010). Derived rows
+        // walked its `raw` for the parts it carries. Derived rows
         // are local, so this device does its own walking — over exactly the
         // mails the batch brought, since the scan table answers per mail.
         self.db.raw(backfill_attachments)?;
@@ -2237,7 +2204,7 @@ mod tests {
 
     /// The reader really is read-only: a write attempted on it fails at the
     /// SQLite level, not by convention. That is what makes [`Store::write`]
-    /// the seam a peer's replication cannot be routed around (CR-005 phase 0).
+    /// the seam a peer's replication cannot be routed around.
     #[test]
     fn the_reader_refuses_writes() {
         let s = store();
@@ -2276,7 +2243,7 @@ mod tests {
     /// The enforcement ceiling, written down as a test: `Connection::open`
     /// lives only in this module. Every other module reads through a
     /// `Store` reader or writes through the gate, so no code can quietly
-    /// open a second writable handle and bypass capture (CR-005 phase 0).
+    /// open a second writable handle and bypass capture.
     #[test]
     fn connection_open_is_confined_to_this_module() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2304,6 +2271,3 @@ mod tests {
         );
     }
 }
-
-
-
