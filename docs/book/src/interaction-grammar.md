@@ -274,10 +274,11 @@ picks the viewer. Nothing is executed by us. A card measures its preview and
 asks for the rows it needs, the way a long letter does — a long file opens
 tall rather than scrolled, a short one stays short.
 
-The rest of the verbs write, and every one of them acts on **the thing the
-panel shows** — a card's on its file, a files panel's on its directory —
-never on a row, and the list reaches them by borrowing, exactly as the
-inbox borrows `archive`. So a
+The rest of the verbs reach the disk — `new dir`, `copy here`, `move here`
+and `delete` are performed, not described — and every one of them acts on
+**the thing the panel shows**: a card's on its file, a files panel's on its
+directory, never on a row. The list reaches them by borrowing, exactly as
+the inbox borrows `archive`. So a
 files panel wears `copy`, `move` and `delete` only while it is the **end of
 a chain**: joined under a parent and driving nothing, which is to say the
 thing under someone's cursor. A root, a list opened from the launcher, or a

@@ -5230,7 +5230,10 @@ impl Stage {
             state.hold = None;
         }
         self.refresh_files(cx);
-        self.kick(cx);
+        // A move closed the panels that were showing what it took, so the
+        // columns and the wishes are not what they were: the layout is
+        // taken again, as it is after any action that closes one.
+        self.sync(cx);
     }
 
     /// `delete`, from a panel's own verb or the marks bar: to the trash,
@@ -5358,7 +5361,10 @@ impl Stage {
             },
         );
         self.refresh_files(cx);
-        self.kick(cx);
+        // The panels showing what went are closed, so the layout is taken
+        // again — a viewport left on the geometry of a panel that is no
+        // longer there is the one thing worse than a stale listing.
+        self.sync(cx);
     }
 
     /// The panels that were showing one of these paths, or something under

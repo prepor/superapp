@@ -183,8 +183,9 @@ folder — ⌘z undoes`. When nothing in the set can be filed there is no
 action at all: the toast is the single row's error and the set stands as it
 was. A files panel's batch refuses the same way, path by path: `copy` and
 `move` hold every marked path the way they hold one, and a `copy here`
-performs the set into the directory a panel shows — refusing per path as it
-does for one, and still a draft, so the toast says the disk is untouched.
+performs the set into the directory a panel shows — reaching the disk, and
+refusing per path exactly as it does for one. `delete marked` takes the set
+to the trash, and one `⌘z` brings the files back with their marks.
 
 None of that is the inbox's any more. `Marks` and the datasource's three
 questions were always the engine's; the panel side — the set beside the

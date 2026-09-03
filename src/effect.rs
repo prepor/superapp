@@ -2107,9 +2107,8 @@ fn free(to: &Path) -> Result<(), String> {
 /// somebody writes to the other end — the browser performs its verbs on
 /// the frame of the click, so that would be the window stopped for good.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyFail> {
-    let ft = std::fs::symlink_metadata(from)
-        .map_err(CopyFail::before)?
-        .file_type();
+    let meta = std::fs::symlink_metadata(from).map_err(CopyFail::before)?;
+    let ft = meta.file_type();
     if ft.is_symlink() {
         // Copied as a link, the way `cp -R` does it: following it would
         // duplicate what it points at, which is not what was asked for.
@@ -2133,7 +2132,11 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), CopyFail> {
             let ent = ent?;
             copy_tree(&ent.path(), &to.join(ent.file_name())).map_err(|f| f.err)?;
         }
-        Ok(())
+        // The mode last, and only once the children are in: a directory
+        // the source kept to itself must not land 0755 in a shared parent,
+        // and setting 0700 (or 0500) before the walk would lock the walk
+        // out of its own destination.
+        std::fs::set_permissions(to, meta.permissions())
     };
     walk().map_err(CopyFail::after)
 }
@@ -2601,7 +2604,16 @@ impl Outside for Real {
         if let Some(d) = &self.demo {
             return Ok(d.entry(&demo(path)));
         }
-        match std::fs::metadata(path) {
+        // A link is answered as what it points at while that exists, and as
+        // itself otherwise — the rule [`Outside::list_dir`] lists by. A
+        // dangling link is a row the panel is showing, so a verb that
+        // called it absent would refuse a source that is right there and
+        // plan a destination the boundary then refuses in other words.
+        let found = std::fs::metadata(path).or_else(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => std::fs::symlink_metadata(path),
+            _ => Err(e),
+        });
+        match found {
             Ok(m) => {
                 let name = path
                     .file_name()
@@ -3573,6 +3585,7 @@ mod tests {
         std::fs::write(root.join("src/deep/b.txt"), b"b").unwrap();
         std::os::unix::fs::symlink("a.txt", root.join("src/link")).unwrap();
 
+        use std::os::unix::fs::PermissionsExt;
         let mut out = Real::new(Secrets::Memory(MemSecrets::new()), Clock::System);
         // `new dir` makes the one directory it named, and refuses a taken
         // name rather than adopting what is there.
@@ -3601,6 +3614,35 @@ mod tests {
                 .is_symlink(),
             "a link is copied as a link, not as what it points at"
         );
+
+        // A directory keeps the mode it had: a 0700 source that landed
+        // 0755 would expose its children to anyone who can read the
+        // parent.
+        std::fs::set_permissions(
+            root.join("src/deep"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        out.copy_path(&root.join("src/deep"), &root.join("dest/deep"))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("dest/deep"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        // A dangling link is a path the browser lists, so it is a path the
+        // verbs agree is there: `stat` answers the link itself once what it
+        // pointed at has gone.
+        std::os::unix::fs::symlink(root.join("src/gone.txt"), root.join("dangle")).unwrap();
+        assert!(
+            out.stat(&root.join("dangle")).unwrap().is_some(),
+            "listed, so not absent"
+        );
+        assert!(out.stat(&root.join("nothing-at-all")).unwrap().is_none());
 
         // A move empties where it came from, and refuses a taken
         // destination — `rename` would have replaced it silently.
