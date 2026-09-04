@@ -7,7 +7,11 @@
 //! fake servers, and the passes running inline — so a scripted action is
 //! followed by its consequences in the same call.
 
-use kernel::app::{App, Apps, Env, Mode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use kernel::app::{App, Apps, Env, Mode, Wake, Worker};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, VerbAct};
@@ -15,9 +19,11 @@ use kernel::search::{Engine, Go};
 use kernel::session::{Action, Session};
 use kernel::store::Store;
 
-use super::caps::FakeServers;
+use super::caps::{FakeServers, Imap, MailFlag};
 use super::model::{self, MailId, Role, Seed};
 use super::panels::{AddAccount, Compose, Contact, Mailbox, Message, Settings};
+use super::seed;
+use super::sync::{self, IdleWatch};
 use super::MAIL;
 
 mod accounts;
@@ -926,12 +932,16 @@ fn the_app_registers_its_tags_workers_and_roots() {
         vec!["inbox", "archive", "sent", "spam", "new mail", "settings"]
     );
 
-    // The passes follow the store: one account is configured, so one sync
-    // worker runs beside the sender.
+    // The passes follow the store: one account is configured, so its sync
+    // worker and its watch run beside the sender.
     open_root(&mut s, Role::Inbox.id());
     assert_eq!(
         s.workers().names(),
-        vec!["sender".to_string(), "sync-1".to_string()]
+        vec![
+            "sender".to_string(),
+            "sync-1".to_string(),
+            "watch-1".to_string()
+        ]
     );
 
     // Every deferred effect this build can read back.
@@ -1700,4 +1710,61 @@ fn the_walk_after_a_filing_previews_whatever_it_lands_on() {
             .map(|p| p.borrow().title());
         assert!(next.is_some(), "row {row}: the walk previewed nothing");
     }
+}
+
+/// The watch is what turns the minute into a moment: the server says a letter
+/// landed, and the pass that may fetch it is told to go and look. It is the
+/// *arrival* that ends a wait — a flag another client set is the interval's
+/// business, or every mark this app pushed would come back as news.
+#[test]
+fn a_watch_hears_a_letter_land_and_wakes_the_pass() {
+    let (s, clock) = session();
+    // The pair's own flag, not the account's: what the session's own passes
+    // hear is theirs, and this test is about this watch.
+    let news = Arc::new(AtomicBool::new(false));
+    let mut watch = IdleWatch::new(seed::ACCOUNT, news.clone());
+
+    // Nothing has arrived, so the wait comes back with nothing — and, since
+    // a fake cannot block, it holds the rest of the window itself rather
+    // than ask again on the next tick.
+    assert_eq!(watch.pass(s.world()), Wake::After(sync::WATCH));
+    assert!(!news.load(Ordering::Relaxed));
+
+    // A letter lands on the server.
+    let raw = "From: Vera <vera@kovac.io>\r\nTo: me@prepor.dev\r\n\
+               Subject: one more\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+               Message-ID: <watch-1@kovac.io>\r\n\r\nlanded";
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", true, false, raw)
+    });
+
+    // The wait ends at once, the pass is told, and the watch goes straight
+    // back to waiting rather than sleeping out the window it never used.
+    clock.advance(sync::WATCH.as_secs_f64());
+    assert_eq!(watch.pass(s.world()), Wake::After(Duration::ZERO));
+    assert!(news.load(Ordering::Relaxed), "the pass is told to pull");
+
+    // A flag is not an arrival. The server takes the mark and the next wait
+    // still comes back quiet.
+    let mut server: FakeServers = servers(&s);
+    server
+        .store_flag(seed::ACCOUNT, "INBOX", 1, MailFlag::Seen, true)
+        .expect("the fake takes a mark");
+    clock.advance(sync::WATCH.as_secs_f64());
+    assert_eq!(watch.pass(s.world()), Wake::After(sync::WATCH));
+}
+
+/// A server that offers no `IDLE` is not one to keep asking. The watch parks
+/// for good and the interval carries the account, exactly as it did before
+/// there was a watch.
+#[test]
+fn a_watch_parks_where_the_server_offers_no_idle() {
+    let (s, _clock) = session();
+    servers(&s).with(seed::ACCOUNT, |srv| srv.idle = false);
+    let news = Arc::new(AtomicBool::new(false));
+    let mut watch = IdleWatch::new(seed::ACCOUNT, news.clone());
+
+    assert_eq!(watch.pass(s.world()), Wake::OnKick);
+    assert_eq!(watch.pass(s.world()), Wake::OnKick, "and it stays parked");
+    assert!(!news.load(Ordering::Relaxed));
 }

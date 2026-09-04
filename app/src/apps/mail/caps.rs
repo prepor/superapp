@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kernel::app::{Capabilities, Env, Mode};
 
@@ -51,6 +52,18 @@ pub struct RemoteMail {
     /// The `$Forwarded` keyword — set by this app or by another client.
     pub forwarded: bool,
     pub raw: Vec<u8>,
+}
+
+/// What waiting on the server came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// The server spoke: mail arrived, or went. Worth a pass.
+    Changed,
+    /// The window ran out with the folder as it was.
+    Quiet,
+    /// This server does not offer `IDLE`, so there is nothing to wait on
+    /// and the interval is the only cadence it has.
+    Unsupported,
 }
 
 /// Which of a folder's uids to list.
@@ -260,6 +273,19 @@ pub trait Imap {
     /// If there is no such folder.
     fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String>;
 
+    /// Waits on the folder: RFC 2177 `IDLE` until the server says something
+    /// worth a pass, or `window` runs out. Blocks for that long — this is
+    /// the one verb that is meant to.
+    ///
+    /// A flag another client set is *not* worth a pass: the interval carries
+    /// those, and a mark this app just pushed would otherwise come back as
+    /// news and cost a full sync for nothing.
+    ///
+    /// # Errors
+    ///
+    /// If there is no session, no such folder, or the link died waiting.
+    fn idle(&mut self, account: i64, folder: &str, window: Duration) -> Result<Watched, String>;
+
     /// `UID MOVE`; the new uid when the server says (UIDPLUS' COPYUID),
     /// `None` otherwise.
     ///
@@ -338,6 +364,13 @@ pub struct FakeServer {
     /// Whether the folders keep keywords — a server whose `PERMANENTFLAGS`
     /// carry `$Forwarded` or `\*`. Off, and the mark stays local.
     pub keywords: bool,
+    /// Whether this server offers `IDLE`. Off, and a watch parks.
+    pub idle: bool,
+    /// Something has arrived that a watch has not been told about yet. The
+    /// fake cannot block, so this is how it says the same thing: whoever
+    /// waits next is told once, and the folder is not part of it — one
+    /// server, one piece of news.
+    pub news: bool,
     /// Mail this account handed to SMTP.
     pub submitted: Vec<Outgoing>,
     /// How many letters this account has handed to a fetch — what a test
@@ -371,6 +404,7 @@ impl FakeServer {
             forwarded,
             raw: raw.as_bytes().to_vec(),
         });
+        self.news = true;
         uid
     }
 
@@ -453,6 +487,7 @@ impl FakeServers {
             let mut server = FakeServer {
                 copyuid: true,
                 keywords: true,
+                idle: true,
                 ..FakeServer::default()
             };
             for (name, _) in seed::FOLDERS {
@@ -466,6 +501,10 @@ impl FakeServers {
                     &seed::rfc822(&m),
                 );
             }
+            // What the demo server was seeded with is not news: it is what
+            // the store already agrees with, and a watch has nothing to
+            // report about it.
+            server.news = false;
             g.by_account.insert(seed::ACCOUNT, server);
         }
         s
@@ -625,6 +664,25 @@ impl Imap for FakeServers {
         })
     }
 
+    /// The fake cannot block, so it answers what it knows at once: news if
+    /// something arrived since the last watch, quiet otherwise. The caller
+    /// paces itself on a watch that came back faster than its window, which
+    /// is what keeps a fake world from spinning — see
+    /// [`IdleWatch`](super::sync::IdleWatch).
+    fn idle(&mut self, account: i64, folder: &str, _window: Duration) -> Result<Watched, String> {
+        self.live(account, |s| {
+            if !s.idle {
+                return Ok(Watched::Unsupported);
+            }
+            s.get(folder)?;
+            Ok(if std::mem::take(&mut s.news) {
+                Watched::Changed
+            } else {
+                Watched::Quiet
+            })
+        })
+    }
+
     fn move_uid(
         &mut self,
         account: i64,
@@ -651,6 +709,7 @@ impl Imap for FakeServers {
             dst.1 += 1;
             let new = m.uid;
             dst.2.push(m);
+            s.news = true;
             Ok(s.copyuid.then_some(new))
         })
     }
@@ -698,6 +757,7 @@ impl Imap for FakeServers {
                 forwarded: false,
                 raw: raw.to_vec(),
             });
+            s.news = true;
             Ok(())
         })
     }

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::accounts;
 use super::caps::{
     Creds, FolderMeta, Imap, MailFlag, OAuth, Outgoing, Part, RemoteFolder, RemoteMail, Smtp,
-    UidSet,
+    UidSet, Watched,
 };
 use super::carry;
 use super::model::{self, Draft, MailId, Seed};
@@ -620,6 +620,36 @@ impl Effect for Uids {
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
             .uids(self.account, &self.folder, self.which)
+    }
+}
+
+/// Wait on a folder until the server has something to say about it.
+///
+/// The one effect that is *meant* to block: it is a pass sitting on an open
+/// connection, not a question with an answer. The window bounds it, so the
+/// thread it is on can still notice it has been retired.
+#[derive(Debug, Clone)]
+pub struct Watch {
+    pub account: i64,
+    pub folder: String,
+    pub window: std::time::Duration,
+}
+
+impl Effect for Watch {
+    const KIND: &'static str = "watch";
+    type Reply = Watched;
+    fn describe(&self) -> String {
+        format!("watch {} for {}s", self.folder, self.window.as_secs())
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(account_entity(self.account))
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.cap::<dyn Imap>()?
+            .idle(self.account, &self.folder, self.window)
     }
 }
 

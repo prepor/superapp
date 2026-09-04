@@ -31,6 +31,26 @@ pub use preview::{
     IMAGE_PREVIEW_MAX, TEXT_PREVIEW_MAX,
 };
 
+// -- waking a pass -------------------------------------------------------------
+
+/// Waking a background pass from another one's thread.
+///
+/// A pass that has learned something another pass owns wakes that one rather
+/// than doing the work itself: mail's watch is told by a server that a letter
+/// arrived, and only the account's own pass holds the session that may fetch
+/// it. The address is the one [`Worker::entity`](crate::app::Worker::entity)
+/// answers to.
+///
+/// Not an effect, and so not in the log: nothing leaves the process, and a
+/// ring of "woke the neighbour" would only make the round trip it led to
+/// harder to find.
+pub trait Kicker {
+    /// Wakes every pass answering to this address. A build that runs no
+    /// passes — a test, a library mount — does nothing, which is what it
+    /// wants: inline, every pass already runs every tick.
+    fn kick(&self, entity: &str);
+}
+
 // -- the clock -----------------------------------------------------------------
 
 /// What time it is. Every world has one, even a [`Mode::Deny`] world: an
@@ -705,6 +725,7 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
         Some(f) => f.make(),
         None => Box::new(env.secrets.clone()),
     });
+    caps.insert::<dyn Kicker>(Box::new(env.kicks.clone()));
     caps.insert::<dyn Clipboard>(Box::new(FakeClipboard::new()));
     caps.insert::<dyn Screen>(Box::new(FakeScreen::new()));
     caps.insert::<dyn Disk>(Box::new(DemoDisk::new(env.clock.clone())));

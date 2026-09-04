@@ -123,8 +123,10 @@ fn the_form_adds_an_account_and_the_row_removes_it() {
         .unwrap();
     assert_eq!(stored, 0);
 
-    // A new account is a new pass, asked for after the action that made it.
+    // A new account is a new pass and a new watch, asked for after the
+    // action that made it.
     assert!(s.workers().names().contains(&"sync-2".to_string()));
+    assert!(s.workers().names().contains(&"watch-2".to_string()));
 
     // The password is gone from the form with the row it made; the hosts
     // stay, because the next account is usually the same provider.
@@ -166,6 +168,7 @@ fn the_form_adds_an_account_and_the_row_removes_it() {
     s.settle();
     assert_eq!(rows(&s).len(), 1);
     assert!(!s.workers().names().contains(&"sync-2".to_string()));
+    assert!(!s.workers().names().contains(&"watch-2".to_string()));
 
     // Undo cannot bring an account's mail back and does not pretend to: the
     // node goes expired and the walk steps past it, so the account stays

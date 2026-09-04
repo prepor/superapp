@@ -8,8 +8,7 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -323,6 +322,11 @@ pub struct Env {
     pub secrets_backend: Option<SecretsFactory>,
     pub clock: ClockSource,
     pub demo_disk: bool,
+    /// The wake channels of this build's background passes, so one may wake
+    /// another — installed as the [`Kicker`](crate::caps::Kicker)
+    /// capability. Empty in a world that runs none, where a kick does
+    /// nothing.
+    pub kicks: Kicks,
 }
 
 impl Default for Env {
@@ -336,6 +340,7 @@ impl Default for Env {
             secrets_backend: None,
             clock: ClockSource::default(),
             demo_disk: true,
+            kicks: Kicks::default(),
         }
     }
 }
@@ -529,6 +534,83 @@ struct Live {
     kick: mpsc::Sender<()>,
 }
 
+/// The running passes' wake channels — the set, shared with the threads in
+/// it.
+///
+/// [`Workers`] lives on the session's thread and a worker does not, so a
+/// pass that has learned something another pass owns cannot reach the set
+/// through it. This is that reach: mail's watch is told by a server that a
+/// letter arrived, and only the account's own pass holds the session that
+/// may fetch it, so the watch wakes that one by address rather than doing
+/// the work on the wrong thread.
+///
+/// Every world a [`Workers::threads`] mount builds carries one, as the
+/// [`Kicker`](crate::caps::Kicker) capability. The set is empty in a build
+/// that runs no passes, where a kick is a no-op.
+#[derive(Clone, Default)]
+pub struct Kicks(Arc<Mutex<HashMap<String, Live>>>);
+
+impl Kicks {
+    fn with<T>(&self, f: impl FnOnce(&mut HashMap<String, Live>) -> T) -> T {
+        // A poisoned lock means a worker thread panicked while registering;
+        // the set is still readable, and refusing to wake anyone ever again
+        // would be the worse answer.
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+
+    /// Whether this one is already running.
+    fn has(&self, name: &str) -> bool {
+        self.with(|live| live.contains_key(name))
+    }
+
+    fn insert(&self, name: String, one: Live) {
+        self.with(|live| live.insert(name, one));
+    }
+
+    /// Retires everyone not in this set: dropping a sender closes the
+    /// channel, and the thread returns on its next wake.
+    fn retain(&self, names: &HashSet<String>) {
+        self.with(|live| live.retain(|name, _| names.contains(name)));
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.with(|live| live.keys().cloned().collect())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.with(|live| live.is_empty())
+    }
+
+    fn wake_all(&self) {
+        self.with(|live| {
+            for l in live.values() {
+                let _ = l.kick.send(());
+            }
+        });
+    }
+}
+
+impl crate::caps::Kicker for Kicks {
+    fn kick(&self, entity: &str) {
+        self.with(|live| {
+            for l in live.values() {
+                if l.entity.as_deref() == Some(entity) {
+                    let _ = l.kick.send(());
+                }
+            }
+        });
+    }
+}
+
+impl std::fmt::Debug for Kicks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self.names();
+        names.sort();
+        f.debug_tuple("Kicks").field(&names).finish()
+    }
+}
+
 /// How the passes run.
 enum Mount {
     /// Production: a thread each, its own world, its own store reader.
@@ -536,7 +618,7 @@ enum Mount {
         mode: Mode,
         env: Env,
         notify: Arc<dyn Fn() + Send + Sync>,
-        live: HashMap<String, Live>,
+        live: Kicks,
     },
     /// Under virtual time: every pass runs from the caller's thread,
     /// against the session's own world, so a scripted tick is followed by
@@ -577,9 +659,13 @@ impl Workers {
         apps: &'static [&'static dyn App],
         store: Rc<Store>,
         mode: Mode,
-        env: Env,
+        mut env: Env,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Workers {
+        // Every world spawned from this env carries the set, so a pass can
+        // wake another one by address from its own thread.
+        let live = Kicks::default();
+        env.kicks = live.clone();
         Workers {
             apps,
             store,
@@ -587,7 +673,7 @@ impl Workers {
                 mode,
                 env,
                 notify: Arc::new(notify),
-                live: HashMap::new(),
+                live,
             }),
         }
     }
@@ -640,7 +726,7 @@ impl Workers {
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = match &*self.mount.borrow() {
-            Mount::Threads { live, .. } => live.keys().cloned().collect(),
+            Mount::Threads { live, .. } => live.names(),
             Mount::Inline { live, .. } => live.iter().map(|w| w.name()).collect(),
             Mount::None => Vec::new(),
         };
@@ -667,10 +753,10 @@ impl Workers {
             } => {
                 // A missing name retires: dropping its sender closes the
                 // channel, and the thread returns on its next wake.
-                live.retain(|name, _| names.contains(name));
+                live.retain(&names);
                 for w in want {
                     let name = w.name();
-                    if live.contains_key(&name) {
+                    if live.has(&name) {
                         continue;
                     }
                     let entity = w.entity();
@@ -689,9 +775,7 @@ impl Workers {
                         Err(e) => eprintln!("workers: {name} did not start: {e}"),
                     }
                 }
-                for l in live.values() {
-                    let _ = l.kick.send(());
-                }
+                live.wake_all();
             }
             Mount::Inline { live, .. } => {
                 live.retain(|w| names.contains(&w.name()));
@@ -712,13 +796,7 @@ impl Workers {
     pub fn kick(&self, entity: &str) {
         let mount = self.mount.borrow();
         match &*mount {
-            Mount::Threads { live, .. } => {
-                for l in live.values() {
-                    if l.entity.as_deref() == Some(entity) {
-                        let _ = l.kick.send(());
-                    }
-                }
-            }
+            Mount::Threads { live, .. } => crate::caps::Kicker::kick(live, entity),
             Mount::Inline { .. } => {
                 drop(mount);
                 self.tick();
@@ -1115,6 +1193,51 @@ mod tests {
         // pass has already done its one job.
         workers.kick("worker:one");
         assert_eq!(meta(&store, "ticks"), 2);
+    }
+
+    /// A pass wakes another by address, from wherever it is standing. The
+    /// set is behind a lock for exactly that: it lives on the session's
+    /// thread and a worker does not.
+    #[test]
+    fn a_pass_wakes_another_by_address() {
+        use crate::caps::Kicker;
+        let live = Kicks::default();
+        let (one, heard_one) = mpsc::channel();
+        let (two, heard_two) = mpsc::channel();
+        let entry = |name: &str, kick| {
+            (
+                name.to_string(),
+                Live {
+                    entity: Some(format!("worker:{name}")),
+                    kick,
+                },
+            )
+        };
+        let (name, l) = entry("one", one);
+        live.insert(name, l);
+        let (name, l) = entry("two", two);
+        live.insert(name, l);
+        assert!(live.has("one"));
+
+        // From another thread, which is where a watch would be.
+        let far = live.clone();
+        std::thread::spawn(move || far.kick("worker:two"))
+            .join()
+            .expect("the kicking thread");
+        assert!(heard_two.try_recv().is_ok());
+        assert!(heard_one.try_recv().is_err(), "only the one addressed");
+
+        // An address nobody answers to wakes nobody, and is not an error.
+        live.kick("worker:three");
+        assert!(heard_one.try_recv().is_err());
+
+        // Retiring closes the channel, which is how the thread returns.
+        live.retain(&HashSet::new());
+        assert!(live.is_empty());
+        assert!(matches!(
+            heard_one.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     /// A worker claims only its own jobs, so an inline pass never runs

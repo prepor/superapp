@@ -127,10 +127,12 @@ answer by name, so a pass that a new row calls for starts without a restart.
 
 A pass answers `Wake::After(d)` or `Wake::OnKick`. `Session::workers().kick(entity)`
 wakes one by the address it answers to; `kick_all()` wakes everyone and re-asks
-the apps for the set. Under virtual time there are no threads: every pass runs
-inline from the frame loop, and the queue is then drained until it stops
-moving, bounded, so a job that files another job shows as a backlog rather than
-a hang.
+the apps for the set. A pass may wake another itself, through the `Kicker`
+capability — how one that learns something another one owns hands it over
+instead of doing the work on the wrong thread. Under virtual time there are no
+threads: every pass runs inline from the frame loop, and the queue is then
+drained until it stops moving, bounded, so a job that files another job shows
+as a backlog rather than a hang.
 
 ## Schema ladders
 
