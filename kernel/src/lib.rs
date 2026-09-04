@@ -4,7 +4,8 @@
 //! Makepad, and nothing names an app.** What is left is the panel model and
 //! navigation, the store and its cached queries, effects and the queue, undo
 //! history, the filter and the rich table's state, search and the launcher
-//! list, problems, springs, the e2e grammar, and the interfaces an app
+//! list, problems, springs, an HTTP client and a server-sent-events reader
+//! for a long streamed answer, the e2e grammar, and the interfaces an app
 //! implements. It is what `cargo test` runs without a window.
 //!
 //! The three layers around it: the **shell** draws and takes input and
@@ -32,6 +33,7 @@ pub mod e2e;
 pub mod effect;
 pub mod filter;
 pub mod history;
+pub mod http;
 pub mod launcher;
 pub mod layout;
 pub mod nav;
@@ -43,6 +45,7 @@ pub mod scene;
 pub mod search;
 pub mod session;
 pub mod spring;
+pub mod sse;
 pub mod store;
 pub mod theme;
 pub mod time;
