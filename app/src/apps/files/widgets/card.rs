@@ -11,8 +11,8 @@
 //! of which file is on the card and writes again only when that moves.
 //!
 //! The bar is the instance's: *open*, *copy*, *move*, the *rename* that
-//! raises a field where the name is drawn, and the *delete* that takes the
-//! card with the file.
+//! raises a field where the name is drawn, the *delete* that takes the card
+//! with the file, and the *copy path* that takes nothing at all.
 
 use kernel::panel::PanelId;
 use kernel::session::Session;

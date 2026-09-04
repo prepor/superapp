@@ -8,9 +8,10 @@
 # itself.
 #
 # Run with `--demo-disk`, so the tree is the fixture rather than whatever
-# this machine's ~ holds — and in a wide window, because a bar is a row and
-# never a wrap: at the default width the last entries of a full one are
-# dropped rather than folded, and this suite reads the whole of it.
+# this machine's ~ holds — and in a wide window, so this full bar stands on
+# the one row it is written as. Narrower it would fold onto a second, which
+# is a taller bar and the same labels, and every click below would still
+# land.
 #
 # Assertions are the clicks — `delete` is the panel's own object verb,
 # `copy 3` and `delete 3` are the bar's over the marked set, and each
@@ -66,6 +67,14 @@ shot k3-range
 click "copy 3"
 wait 700
 shot k4-holding
+
+# The one beside them that carries nothing anywhere: `copy 3 paths` puts
+# what the marked rows are called on this machine onto the system
+# clipboard, one to a line. It writes nothing and consumes nothing, so the
+# set is still three — which the label it wears says on the way back.
+click "copy 3 paths"
+wait 700
+shot k4b-paths
 
 # -- the batch --------------------------------------------------------------------
 

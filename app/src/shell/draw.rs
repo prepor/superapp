@@ -638,7 +638,8 @@ impl Stage {
         ));
         self.draw_chrome(cx, r, &title, focused, alpha, Some(slot), hover.as_ref());
 
-        let bar_h = if verbs.is_empty() { 0.0 } else { bar::BAR_H };
+        // As tall as the wrap needs, which is what the body is drawn under.
+        let bar_h = bar::height(&verbs, &self.cell, r);
         if !verbs.is_empty() {
             // Where this bar stands in the chord routing order, and so what
             // it may promise: the focused panel's own letters less what its
@@ -660,7 +661,7 @@ impl Stage {
                 },
                 (false, false) => bar::Reach::Away,
             };
-            let strip = bar::strip(r);
+            let strip = bar::strip(r, bar_h);
             let bold = bar::bold(&verbs, reach);
             self.draw_bar(cx, slot, &verbs, strip, alpha, bold, hover.as_ref());
         }

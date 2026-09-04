@@ -40,11 +40,13 @@ A panel is a header, a body, and a bar.
   unfocused one is a single rule under the title.
 - The **body** is whatever the panel's own widget draws, clipped to what the
   header and the bar leave.
-- The **bar** is a 26 pt strip at the foot, under a hairline rule, holding the
+- The **bar** is a strip at the foot, under a hairline rule, holding the
   panel's verbs left to right with 6 pt between them. A button is a bordered
   box that inverts on hover; a link is its text with a 1 pt underline. A panel
-  with no verbs has no bar at all, and its body gets the space. A bar is one
-  row: an entry that will not fit is dropped rather than wrapped.
+  with no verbs has no bar at all, and its body gets the space. One row of them
+  is 26 pt; an entry that will not fit wraps to another row, 4 pt below the
+  first, up to three rows or whatever the panel can spare the body — and what
+  is left over then is dropped.
 
 ## Controls
 

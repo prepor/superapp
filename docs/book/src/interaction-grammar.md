@@ -48,8 +48,11 @@ batch verbs over the marked set with their count in the label.
 
 The header wears nothing but the title and the close button.
 
-A bar is one row and never wraps. An entry that would run past the right edge
-is dropped, so a narrow panel shows fewer verbs rather than a taller bar.
+A bar wraps. An entry that would run past the right edge takes the next row,
+up to three of them, so a narrow panel grows a taller bar rather than losing
+verbs; the body is drawn in what is left. Past the last row a bar has to give —
+three, or the one a short panel can spare — what is left over is dropped, and so
+is anything after a label no row is wide enough for.
 
 Every entry is addressed by its label, whether by a click, by a chord, or by an
 end-to-end script. What runs is the verb's stable id, so a bar is a view of the

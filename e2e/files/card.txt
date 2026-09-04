@@ -111,4 +111,16 @@ wait 700
 click "report-q3.pdf"
 wait 700
 shot c5-opened
+
+# -- copy path ----------------------------------------------------------------------
+
+# The card's other harmless verb: what the file is called on *this* machine
+# — the real spelling, not the `~/` one the panel draws — onto the system
+# clipboard. Nothing of ours changes, which the card's own path line
+# resolving after it says: it is showing the same file it was.
+click "copy path"
+wait 700
+click "~/Downloads/report-q3.pdf"
+wait 400
+shot c6-copy-path
 quit

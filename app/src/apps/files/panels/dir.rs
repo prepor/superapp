@@ -14,8 +14,8 @@ use kernel::session::{Action, Session};
 
 use super::super::completion::PathCompletion;
 use super::super::model::{
-    basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural, stat_in,
-    DirRow, DirSource, Entry, HOME, PAGE,
+    basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural,
+    real_path, stat_in, DirRow, DirSource, Entry, HOME, PAGE,
 };
 use super::super::ops::{self, Done, Plan};
 use super::super::{Op, FILES};
@@ -131,11 +131,12 @@ impl Dir {
     ///
     /// The end of a chain is the thing the cursor is on. A row previews the
     /// directory's own panel beside the list, and *that* panel wears
-    /// `copy`, `move` and `delete` for the directory it shows, which the
-    /// list borrows through the chord routing. A root, an un-joined panel,
-    /// or a list that is itself driving a preview is nobody's object right
-    /// now: `~` cannot be deleted, and a chord in a list may not hit the
-    /// directory the list shows when it means the row under the cursor.
+    /// `copy`, `move`, `delete` and `copy path` for the directory it shows,
+    /// which the list borrows through the chord routing. A root, an
+    /// un-joined panel, or a list that is itself driving a preview is
+    /// nobody's object right now: `~` cannot be deleted, and a chord in a
+    /// list may not hit the directory the list shows when it means the row
+    /// under the cursor.
     #[must_use]
     pub fn object(&self) -> bool {
         self.chain.under && !self.chain.driving && !is_root(&self.dir)
@@ -380,7 +381,10 @@ impl Panel for Dir {
     /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
     /// not promise a chord that never arrives — and rather than mail's `m`,
     /// which here is *move*: no bar may wear one letter twice. *clear* wears
-    /// none, because `esc` is the table's own.
+    /// none, because `esc` is the table's own. *copy path* wears the `c`
+    /// that *copy* could not: `p` is the disk copy's, and `c` is the letter
+    /// that copies text wherever text is selected — which is what this verb
+    /// does with a path.
     fn verbs(&self) -> Vec<Verb> {
         let mut v = vec![
             Verb::run("files.new_dir", "new dir", Some('n')),
@@ -395,6 +399,11 @@ impl Panel for Dir {
                 format!("delete {marked}"),
                 Some('d'),
             ));
+            v.push(Verb::run(
+                "files.copy_path",
+                format!("copy {marked} paths"),
+                Some('c'),
+            ));
             v.push(Verb::run("files.all", "mark all", Some('a')));
             v.push(Verb::run("files.clear", "clear", None));
         } else if self.object() {
@@ -402,6 +411,7 @@ impl Panel for Dir {
             v.push(Verb::run("files.move", "move", Some('m')));
             v.push(Verb::run("files.rename", "rename", Some('r')));
             v.push(Verb::run("files.delete", "delete", Some('d')));
+            v.push(Verb::run("files.copy_path", "copy path", Some('c')));
         }
         let clip = FILES.clipboard();
         if !clip.is_empty() {
@@ -452,6 +462,7 @@ impl Panel for Dir {
             "files.copy" => self.hold(s, Op::Copy),
             "files.move" => self.hold(s, Op::Move),
             "files.delete" => self.delete(s),
+            "files.copy_path" => self.copy_path(s),
             "files.here" => self.here(s),
             // The two about the set itself. Neither writes anything, so
             // neither is an action: a mark is the panel's own context.
@@ -541,6 +552,17 @@ impl Dir {
     /// been consumed.
     fn hold(&mut self, s: &mut Session, op: Op) {
         hold(s, op, self.objects());
+    }
+
+    /// `copy path`, over the same set the other object verbs take: their
+    /// names on this machine, onto the system clipboard. Nothing here is
+    /// written, so the marks stand and the listing is as it was.
+    fn copy_path(&mut self, s: &mut Session) {
+        match copy_paths(s, self.objects()) {
+            Said::Went => self.status = None,
+            Said::Refused(line) => self.status = Some(line),
+            Said::Nothing => {}
+        }
     }
 
     /// `delete`, over the marked set or over what the panel shows. A batch
@@ -674,6 +696,30 @@ pub(super) fn hold(s: &mut Session, op: Op, paths: Vec<String>) {
     // The bars of every panel change with the clipboard; a redraw is the
     // one signal they need.
     s.redraw();
+}
+
+/// `copy path`, from a card or from a listing: what the paths are called
+/// on this machine, one to a line, onto the system clipboard.
+///
+/// Nothing of ours changes — no disk, no store — so there is no action and
+/// nothing to undo; what happened is the toast, and the effect log has the
+/// row. The write gate is not asked either: a clipboard is not a device's
+/// to lease.
+pub(super) fn copy_paths(s: &mut Session, paths: Vec<String>) -> Said {
+    if paths.is_empty() {
+        return Said::Nothing;
+    }
+    let world = s.world().clone();
+    if let Err(e) = ops::clip_paths(&world, &paths) {
+        s.notify(e.clone(), true);
+        return Said::Refused(e);
+    }
+    let what = match paths.as_slice() {
+        [one] => format!("“{}”", real_path(one).display()),
+        many => format!("{} paths", many.len()),
+    };
+    s.notify(format!("copied {what}"), false);
+    Said::Went
 }
 
 /// What a verb leaves on the panel's own line: the panel is the one that
