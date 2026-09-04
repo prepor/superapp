@@ -207,9 +207,9 @@ impl Stage {
         self.draw_label_accel(cx, x, y, s, color, alpha, None)
     }
 
-    /// As [`Stage::draw_label`], but the character at `accel` is drawn
-    /// three times, nudged — the grid's own fake bold, narrowed from a run
-    /// to a single glyph.
+    /// As [`Stage::draw_label`], but the character at `accel` is drawn in
+    /// the bold face. Geist Mono is monospaced at every weight, so the bold
+    /// letter sits on the same cell as the light ones around it.
     // Position, ink and the accel index, flat: nothing here groups.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_label_accel(
@@ -224,6 +224,8 @@ impl Stage {
     ) -> f64 {
         self.draw_mono.text_style.font_size = theme::LABEL_SIZE as f32;
         self.draw_mono.color = rgba_a(color, alpha);
+        self.draw_mono_bold.text_style.font_size = theme::LABEL_SIZE as f32;
+        self.draw_mono_bold.color = rgba_a(color, alpha);
         let step = self.cell.label_step();
         let up = s.to_uppercase();
         let mut dx = x;
@@ -231,10 +233,10 @@ impl Stage {
             if ch != ' ' {
                 let mut buf = [0u8; 4];
                 let g = ch.encode_utf8(&mut buf);
-                self.draw_mono.draw_abs(cx, dvec2(dx, y), g);
                 if accel == Some(i) {
-                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.35, y), g);
-                    self.draw_mono.draw_abs(cx, dvec2(dx + 0.7, y), g);
+                    self.draw_mono_bold.draw_abs(cx, dvec2(dx, y), g);
+                } else {
+                    self.draw_mono.draw_abs(cx, dvec2(dx, y), g);
                 }
             }
             dx += step;

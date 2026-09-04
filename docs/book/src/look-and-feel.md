@@ -18,8 +18,9 @@ spacing.
 
 Bold text has two uses: emphasis in prose, and the one bold letter that marks a
 control's [keyboard shortcut](./interaction-grammar.md#accelerators-and-the-bar).
-On the bar that letter is drawn by painting its glyph three times a third of a
-pixel apart, so the character grid never shifts under a bold mark.
+Geist Mono is monospaced at every weight, so that letter is drawn in the bold
+face on the same cell as the light ones around it: the grid never shifts under
+a bold mark.
 
 ## Panels
 

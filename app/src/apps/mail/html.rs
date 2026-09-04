@@ -538,7 +538,6 @@ fn mono_family(v: &str) -> bool {
         "monospace",
         "courier",
         "consolas",
-        "menlo",
         "monaco",
         "lucida console",
         "source code",
