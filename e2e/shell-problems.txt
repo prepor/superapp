@@ -44,4 +44,33 @@ shot q3-history
 click "problems"
 wait 900
 shot q4-still
+
+# -- and every line of it is text ---------------------------------------------
+
+# A problem is a sentence someone carries elsewhere — into a search, into a bug
+# report — so all three of a row's lines are real runs and not labels. Each is
+# addressed by what it says, which is the only thing that tells one row's line
+# from another's: the account, the error, and the muted line under them.
+#
+# `selectall` is the assertion, for the reason `shell-select` gives: keyboard
+# selection needs no pointer capture, so the wash it leaves is the proof the
+# run selects and renders.
+selectall "me@prepor.dev"
+wait 600
+selectall "no-route-to-host"
+wait 600
+shot q5-selected
+
+selectall "never synced"
+wait 600
+shot q6-all-three
+
+# A drag across the error, where the rows are a list and a sweep might have
+# meant something else: found, dragged, and the row's own button still answers
+# afterwards.
+drag "no-route-to-host" 160 0
+wait 600
+click "sync me"
+wait 900
+shot q7-alive
 quit

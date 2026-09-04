@@ -178,10 +178,11 @@ problems as items.
 
 Clicking the count opens or focuses the Problems panel. Each row shows what it
 concerns, what is wrong, a muted line of supporting detail, and the controls
-that source gave it. The controls arrive as data, so a source this build has
-never heard of still draws. A problem is announced once as a toast when it
-first appears, and it clears when the source stops listing it: fixing the
-condition removes the row.
+that source gave it. All three lines are selectable runs, not labels: an error
+is a sentence people carry into a search or a bug report. The controls arrive
+as data, so a source this build has never heard of still draws. A problem is
+announced once as a toast when it first appears, and it clears when the source
+stops listing it: fixing the condition removes the row.
 
 The apps supply their own sources; device sync is the kernel's own, and it is
 listed first.

@@ -205,8 +205,16 @@ impl Stage {
                         eprintln!("{}e2e: FAIL selectall {label:?}: nothing under it", r.tag);
                         r.failures += 1;
                     }
-                    for run in runs {
+                    // Two ways to select, because there are two kinds of
+                    // selectable thing. A text flow or a page answers the
+                    // widget call; a field does not — its selection is its
+                    // own, and `select_all` is what a human's triple-click
+                    // reaches too, so this is the wash a person would see.
+                    for run in &runs {
                         run.selection_select_all();
+                        if let Some(mut t) = run.as_text_input().borrow_mut() {
+                            t.select_all(cx);
+                        }
                     }
                     cx.redraw_all();
                 }
