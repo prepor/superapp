@@ -16,9 +16,9 @@ use kernel::session::{Action, Session};
 use kernel::store::Store;
 
 use super::super::effects::{Filed, MarkRead};
-use super::super::model::{self, MailId, Seed, ThreadMail};
+use super::super::model::{self, MailId, Role, Seed, ThreadMail};
 use super::super::{parts, reading};
-use super::mailbox::{word_of, Mailbox};
+use super::mailbox::{nothing_said, word_of, Mailbox};
 
 /// Roughly how many lines of letter one grid row holds. An estimate, like the
 /// chrome allowance below: the wish only has to land on the right grid row,
@@ -145,7 +145,13 @@ impl Panel for Message {
         self.slot = slot;
     }
 
-    /// Two buttons that file the conversation, and two links that answer it.
+    /// The buttons that file the conversation, and two links that answer it.
+    ///
+    /// *not spam* is the one button that comes and goes: a letter is junk or
+    /// it is not, and only one read out of the spam folder can be said not to
+    /// be. *archive* and *delete* are moves any letter has, so they are on
+    /// the bar wherever it was read and refuse in words when there is nowhere
+    /// to go.
     ///
     /// *forward* is a link like *reply*: opening a sheet claims nothing. The
     /// `$Forwarded` keyword is set when the letter has actually **left** —
@@ -153,35 +159,38 @@ impl Panel for Message {
     /// settles — because that is when a letter has been passed on.
     fn verbs(&self) -> Vec<Verb> {
         let (slot, mail) = (self.slot, self.mail);
-        vec![
-            Verb::run("mail.archive", "archive", Some('a')),
-            Verb::run("mail.delete", "delete", Some('d')),
-            Verb::go(
-                "mail.reply",
-                "reply",
-                Some('r'),
-                Nav::Open {
-                    from: slot,
-                    id: super::Compose::id(Seed::Reply(mail)),
-                    fresh: false,
-                },
-            ),
-            Verb::go(
-                "mail.forward",
-                "forward",
-                Some('f'),
-                Nav::Open {
-                    from: slot,
-                    id: super::Compose::id(Seed::Forward(mail)),
-                    fresh: false,
-                },
-            ),
-        ]
+        let mut v = vec![Verb::run("mail.archive", "archive", Some('a'))];
+        if model::role_of(&self.store, mail) == Some(Role::Spam) {
+            v.push(Verb::run("mail.not_spam", "not spam", Some('n')));
+        }
+        v.push(Verb::run("mail.delete", "delete", Some('d')));
+        v.push(Verb::go(
+            "mail.reply",
+            "reply",
+            Some('r'),
+            Nav::Open {
+                from: slot,
+                id: super::Compose::id(Seed::Reply(mail)),
+                fresh: false,
+            },
+        ));
+        v.push(Verb::go(
+            "mail.forward",
+            "forward",
+            Some('f'),
+            Nav::Open {
+                from: slot,
+                id: super::Compose::id(Seed::Forward(mail)),
+                fresh: false,
+            },
+        ));
+        v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
             "mail.archive" => self.file_thread(s, "archive"),
+            "mail.not_spam" => self.file_thread(s, "inbox"),
             "mail.delete" => self.file_thread(s, "trash"),
             _ => {}
         }
@@ -289,7 +298,7 @@ impl Message {
         // The mail itself moves, so this is the rest of the conversation
         // having nowhere to go — which is not a refusal of the verb.
         if moving.is_empty() {
-            s.notify(format!("nothing to {}", word_of(role)), false);
+            s.notify(nothing_said(role), false);
             return;
         }
 

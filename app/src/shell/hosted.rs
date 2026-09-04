@@ -148,10 +148,12 @@ impl Grab {
 }
 
 /// The word a curtain says for a verb: the last segment of its id, since a
-/// bar's label carries a count of marks and a curtain is about one row.
+/// bar's label carries a count of marks and a curtain is about one row. An
+/// id spells a two-word verb with an underscore (`mail.not_spam`); a curtain
+/// reads it as the space it stands for.
 #[must_use]
-pub fn verb_word(id: &str) -> &str {
-    id.rsplit('.').next().unwrap_or(id)
+pub fn verb_word(id: &str) -> String {
+    id.rsplit('.').next().unwrap_or(id).replace('_', " ")
 }
 
 /// The two slots the modal overlays are hosted under. They are keyed

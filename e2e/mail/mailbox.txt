@@ -90,6 +90,32 @@ wait 500
 click "Invitation: keynote speaker"
 wait 700
 shot m10-spam-whole
+
+# The verb the junk has that no other list wears: mark a row and the bar
+# offers `not spam`, which puts the conversation back in the inbox. One press
+# back brings the mail and the mark that filed it together, because the walk
+# the batch left behind is part of the same node — and `clear`, which is up
+# only while something is marked, is the proof.
+click "Your 4.2 BTC withdrawal"
+wait 700
+type " "
+wait 500
+shot m11-spam-marked
+click "not spam 1"
+wait 900
+shot m12-not-spam
+
+# The cursor stood still and the row under it left, so the preview beside the
+# list is the conversation that took its place: this who line is the reader's
+# own, and pressing it folds a letter rather than acting, so the press below
+# is still the first one after the batch.
+click "IT Helpdesk · aug 29 22:08"
+wait 500
+key cmd+z
+wait 900
+click "clear"
+wait 700
+shot m13-spam-restored
 key cmd+w
 wait 600
 
@@ -105,10 +131,10 @@ click "Q3 infra"
 wait 700
 type " "
 wait 500
-shot m11-inbox-marked
+shot m14-inbox-marked
 click "archive 1"
 wait 900
-shot m12-inbox-archived
+shot m15-inbox-archived
 # One press: the filing and the walk it left behind are one node, so the
 # mails and the marks come back together — and `clear`, which is up only
 # while something is marked, is the proof.
@@ -116,5 +142,5 @@ key cmd+z
 wait 900
 click "clear"
 wait 700
-shot m13-undone
+shot m16-undone
 quit

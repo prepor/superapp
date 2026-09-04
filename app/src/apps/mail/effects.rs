@@ -674,16 +674,17 @@ pub struct Filed {
     pub mail: MailId,
     /// Where it was, so undo can put it back exactly there.
     pub from_folder: i64,
-    /// The role it went to: `archive` or `trash`.
+    /// The role it went to: `archive`, `trash`, or `inbox` for a letter taken
+    /// back out of the spam.
     pub role: &'static str,
 }
 
 impl Intent for Filed {
     fn describe(&self) -> String {
-        let verb = if self.role == "trash" {
-            "deleted"
-        } else {
-            "archived"
+        let verb = match self.role {
+            "trash" => "deleted",
+            "inbox" => "put in the inbox",
+            _ => "archived",
         };
         format!("mail:{} {verb}", self.mail)
     }
