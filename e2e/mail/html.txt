@@ -1,0 +1,61 @@
+# args:
+# env:
+#
+# The HTML reading of a letter: it arrives, and the layout does not move.
+#
+# The GitHub notification is the demo's one HTML sender, and it writes the way
+# real senders do — a stylesheet, tables holding the page together, a pixel
+# counting the open, a `javascript:` link. What the narrowing leaves is the
+# letter, and this walks it.
+#
+# Assertions are the clicks: `mail html` resolves only where an HTML reading
+# was drawn, `mail body` only where a plain one was, so "one reading replaced
+# the other" is checked by the run rather than by a human reading a shot.
+
+wait 900
+shot h1-boot
+
+# The HTML letter, opened from its row. Its picture is a `data:` payload the
+# reader thread un-base64s off the frame, so it is on screen by the time the
+# panel has settled.
+click "CI failed"
+wait 900
+shot h2-html-body
+click "mail html"
+wait 400
+
+# A plain-text sender takes the plain path, in the same panel slot. This is
+# the step that matters: one reading must replace the other, not stack on top
+# of it. Hiding a widget that carries no `visible` is a silent no-op, and the
+# first version of this read as correct only because the plain run had never
+# been given text.
+click "Q3 infra"
+wait 900
+shot h3-plain-body
+click "mail body"
+wait 400
+
+# And back again.
+click "CI failed"
+wait 900
+shot h4-back-to-html
+click "mail html"
+wait 400
+
+# The `@html` tag sifts on the column the narrowing wrote, so the list comes
+# down to the letters that arrived as HTML: this one, and Max's reply from a
+# composer that writes its quote as a `<blockquote>`. The rows are still rows.
+click "filter"
+wait 400
+type "@html"
+wait 700
+shot h5-html-filter
+
+# Max's row is the other one, and his letter is HTML too — a composer's,
+# which is where the reading matters most.
+click "superapp panel model"
+wait 900
+click "mail html"
+wait 400
+shot h6-html-rows
+quit

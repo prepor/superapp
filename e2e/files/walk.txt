@@ -1,0 +1,175 @@
+# args: --demo-disk
+# env:
+#
+# The walk: home lists the demo tree, `go to` carries the one panel wherever
+# it is typed, a crumb takes it back up in place, and a row previews what it
+# names — a directory as a list of its own, a file as a card.
+#
+# The disk is the demo tree, which `--demo-disk` asks for, so a row can be
+# addressed by name.
+# Assertions are the clicks: a label that does not resolve fails the run, so
+# "the panel went there" is checked by clicking a row only that directory
+# has, and "this card is on that file" by the card's own path line.
+#
+# The walk is done with one listing on screen at a time, because the verbs
+# on a bar are addressed by their labels and two listings wear the same
+# ones. A card wears none of them.
+
+wait 900
+
+# The launcher opens the files root; ~ lists the demo tree, directories
+# first, each with its size and the day it changed.
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+shot w1-home
+
+# -- go to ---------------------------------------------------------------------
+
+# `go to` puts a field where the crumbs are, seeded with where the panel
+# stands. The offer under it completes one segment at a time, like a shell.
+click "go to"
+wait 500
+
+# A live field keeps the chords it needs: while `go to` has the keyboard,
+# `cmd+n` is the field's and never the bar's. Had the panel's own `new dir`
+# taken it, the field would have lost the keyboard here and what follows
+# would have made a directory instead of going anywhere — which is what the
+# row further down asserts.
+key cmd+n
+wait 400
+
+type "Down"
+wait 600
+shot w2-offer
+
+# Tab takes the offer, which lands with its slash so the next one opens at
+# once; enter goes, and a directory replaces the panel in place — it is the
+# same walk, one directory down.
+key tab
+wait 500
+key enter
+wait 900
+
+# It went: only ~/Downloads has this row. Clicking it previews the card
+# beside the list, and the line under the card's name carries its own text
+# as its label — the one thing two cards can never both be right about.
+click "README.txt"
+wait 900
+click "~/Downloads/README.txt"
+wait 400
+click "preview"
+wait 400
+shot w3-went
+
+# -- a typed path ---------------------------------------------------------------
+
+# The field is seeded with where the panel stands, so what is typed is
+# appended to it; enter goes there and the card, being joined under the
+# panel that was replaced, closes with it.
+click "go to"
+wait 500
+type "2026/"
+wait 600
+key enter
+wait 900
+click "notes.txt"
+wait 900
+click "~/Downloads/2026/notes.txt"
+wait 400
+shot w4-deeper
+
+# -- a crumb replaces in place ---------------------------------------------------
+
+# The crumbs are dotted: `Downloads` puts that directory in this very slot,
+# and the card under it goes with the panel it hung from. Only ~/Downloads
+# has the row below, so its resolving is where the panel landed.
+click "Downloads"
+wait 900
+click "budget-2026.xlsx"
+wait 900
+shot w5-crumbed
+
+# -- a row previews what it names ------------------------------------------------
+
+# A press on a directory row moves the cursor and previews the listing it
+# opens, in the same place the card was: a cursor step replaces the panel it
+# drives. Focus stays on the list.
+click "2026/"
+wait 900
+
+# The preview really opened on that directory: its own rows resolve, and the
+# one clicked previews a card beside it — a file is not a list.
+click "invoice-0817.pdf"
+wait 900
+click "~/Downloads/2026/invoice-0817.pdf"
+wait 400
+shot w6-joined
+
+# -- what the filter shows -------------------------------------------------------
+
+# cmd+w closes the panel the cursor was walking and the card under it, which
+# leaves one listing to address again.
+key cmd+w
+wait 900
+
+# `/` puts the caret in the filter. `@hidden` is a switch, not a predicate:
+# it adds the dot-files to the listing rather than narrowing it to them, and
+# the row it adds previews a card like any other.
+key /
+wait 300
+key cmd+a
+type "@hidden"
+wait 600
+key esc
+wait 500
+click ".DS_Store"
+wait 900
+click "~/Downloads/.DS_Store"
+wait 400
+shot w7-hidden
+
+# `@kind:` asks what a file **is**, which is not what it is called: the pdf
+# stays and everything else goes, dot-file and directory alike.
+key /
+wait 300
+key cmd+a
+type "@kind:pdf"
+wait 600
+key esc
+wait 600
+click "report-q3.pdf"
+wait 900
+click "~/Downloads/report-q3.pdf"
+wait 400
+shot w8-by-kind
+
+# -- the other root ---------------------------------------------------------------
+
+# `go to` reaches the whole disk as readily as home: a second root inside the
+# field restarts the path, so `//tmp/` over the seed is `/tmp`. The filter
+# goes with the panel that was replaced — a walk arrives unfiltered.
+click "go to"
+wait 500
+type "//tmp/"
+wait 600
+key enter
+wait 900
+click "notes.txt"
+wait 900
+click "/tmp/notes.txt"
+wait 400
+shot w9-root
+
+# Above `/tmp` there is one crumb, and it is the root itself — `/ tmp`, where
+# the disk's own name is its separator. It replaces the panel in place, like
+# any other crumb, and only there does the row below resolve.
+click "/"
+wait 900
+click "Applications/"
+wait 900
+shot w10-the-disk
+quit

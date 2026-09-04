@@ -1,0 +1,74 @@
+# args:
+# env:
+#
+# The rich table's filter, on a mailbox: the tag offer under the caret, the
+# tag it splices in, the error a tag nobody has, and the `↓` that hands the
+# keyboard back to the rows.
+#
+# Assertions are the clicks: a row that does not resolve fails the run, so
+# "the filter kept the unread ones" is checked by the run rather than by a
+# human reading a screenshot.
+
+wait 900
+
+# `/` puts the caret in the filter — the list has the keyboard from the
+# start, being the panel a fresh store comes up on — and `@` opens the tag
+# list under it.
+key /
+wait 400
+type "@unr"
+wait 600
+shot g1-offer
+
+# The offer's rows are hits like any other: a press splices the tag in. A
+# boolean tag needs no value, so nothing more is offered behind it.
+click "@unread"
+wait 600
+key esc
+wait 600
+shot g2-narrowed
+
+# Two conversations have something unread in them; the seven that are read
+# are gone from the list, and a click that would have found one fails the
+# run. Previewing this one reads it — so it leaves the list it was found
+# in, which is what a filter over a flag means.
+click "[stelaxis]"
+wait 800
+click "GitHub · aug 31 08:02"
+wait 500
+shot g3-kept
+
+# A tag no mailbox has reads as an error under the field, once the caret has
+# left it — not while it is still being typed.
+key /
+wait 400
+key cmd+a
+type "@bogus"
+wait 600
+shot g4-typing
+key esc
+wait 600
+shot g5-unknown-tag
+
+# Cleared, the whole list is back. `↓` with no offer up hands the keyboard
+# from the filter to the rows and lands on the first, as the walk's own
+# preview: the reader it opens is the proof that the field really let go.
+key /
+wait 400
+key cmd+a
+key backspace
+wait 600
+key down
+wait 900
+shot g6-down-leaves-filter
+click "Vera Kovac · aug 31 09:14"
+wait 500
+
+# The rows have the keyboard now, so the walk carries on from where it
+# landed.
+key down
+wait 800
+click "GitHub · aug 31 08:02"
+wait 500
+shot g7-walked
+quit

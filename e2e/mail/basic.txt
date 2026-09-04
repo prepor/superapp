@@ -1,0 +1,81 @@
+# args:
+# env:
+#
+# The join and replace journey, on mail. A store nobody has booted comes up
+# on the inbox — the first root the app list offers — so this is also what a
+# person sees first. Assertions are the clicks: a label that does not resolve
+# fails the run, so "the reader opened on that mail" is checked by the run
+# rather than by a human reading a screenshot.
+
+wait 900
+shot m1-inbox
+
+# -- a row previews its conversation, joined ---------------------------------
+
+# A press on a row moves the cursor and previews what it opens: the reader
+# lands joined to the right and the list keeps focus. The conversation is
+# marked read by the open, so its row loses its bold.
+click "Q3 infra"
+wait 800
+shot m2-joined
+
+# The unread letter of it opened with the panel, and is addressed by its
+# sender and date — which resolves only if the reader really opened on it.
+click "Vera Kovac · aug 31 09:14"
+wait 500
+
+# -- the next row replaces the joined panel ----------------------------------
+
+click "Sat hike"
+wait 800
+shot m3-replaced
+click "Elena Petrova · aug 30 18:20"
+wait 500
+
+# -- reply, type, send -------------------------------------------------------
+
+# The reader's bar carries the two links that answer a conversation. Reply
+# opens a sheet joined to it, and the sheet starts in its body: what is typed
+# next lands in the letter and nowhere else.
+click "reply"
+wait 900
+type "Early start suits me — 7:30 at the trailhead."
+wait 500
+shot m4-compose
+
+# Tab walks the ring, wrapping from the body round to the recipient. A
+# one-line field takes its text selected, as a form's does, so what is typed
+# replaces it; the body keeps its caret, because a letter is not a value to
+# type over.
+key tab
+wait 400
+type "elena.p@gmail.com"
+wait 400
+key tab
+wait 400
+type "Saturday"
+wait 500
+shot m5-fields
+
+# Send is a side effect: a toast, and the sheet closes behind it.
+click "send"
+wait 700
+shot m6-sent
+
+# -- un-joining, and closing -------------------------------------------------
+
+# Moving the joined reader away un-joins it: the bridge goes, and it is a
+# panel of its own in the column to the left.
+key cmd+shift+left
+wait 900
+shot m7-unjoined
+
+key cmd+w
+wait 800
+shot m8-closed
+
+# The list is alive afterwards: a row that was never touched still opens.
+click "that airport book"
+wait 800
+shot m9-inbox-after
+quit

@@ -21,8 +21,8 @@ jobs:
   check:
     name: clippy + tests + e2e
     # macOS is the target platform — `makepad-objc-sys`/`makepad-apple-sys` and
-    # the keychain in `src/mac.rs` are cfg'd to it, so a linux runner would be
-    # checking a different dependency graph than the one that ships.
+    # the keychain in `app/src/platform/` are cfg'd to it, so a linux runner
+    # would be checking a different dependency graph than the one that ships.
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -31,7 +31,7 @@ jobs:
       # `stable`, the same channel mise.toml pins for local work — plus the
       # linter. No `cargo fmt --check` gate: the tree is not rustfmt-clean by
       # choice (hand-laid tables and comment columns), and a check would be
-      # red on ~270 untouched files.
+      # red on hundreds of untouched files.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -45,30 +45,35 @@ jobs:
         with:
           cache-on-failure: true
 
-      # `--locked` so a Cargo.lock left behind by an edited manifest fails
-      # here instead of being quietly re-resolved.
+      # `--workspace`, so the kernel is linted with the app rather than only
+      # through it, and `--locked` so a Cargo.lock left behind by an edited
+      # manifest fails here instead of being quietly re-resolved.
       - name: clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # The pure suite: panel mechanics, springs, store, effects, history,
-      # the mail engine — all against a `World::fake()`, no window, no
-      # network, no keychain. See docs/book/src/dev-x.md.
+      # The pure suite, both crates: the kernel's panel mechanics, springs,
+      # store, effects, history and device sync, and the app's own — the mail
+      # engine, the files model, and the two boundary tests that keep the
+      # split honest. All against fakes: no window, no network, no keychain.
       - name: tests
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       # The e2e battery: every single-process suite replayed against the
       # shell's real input paths, through makepad's headless backend. Last,
       # because `MAKEPAD=headless` is a *build-time* switch — build.rs turns
-      # it into cfg(headless) — so it re-does the four crates that read it
-      # and leaves the earlier steps' artifacts alone until then.
+      # it into cfg(headless) — so it re-does the crates that read it and
+      # leaves the earlier steps' artifacts alone until then.
       #
       # `--no-draw` (inside run-all.sh) runs the full widget draw pass and
       # rasterizes nothing: hits and labels resolve exactly as they do with
       # pictures, at ~80× less cost — the whole battery in a couple of
       # seconds. A failure here is a label that did not resolve.
+      #
+      # `e2e/sync/` is not in it: those walks are two devices over one
+      # bucket, so each needs a second process and a `bucketd` beside it.
       - name: e2e
         env:
           MAKEPAD: headless
         run: |
-          cargo build --locked
+          cargo build --locked -p superapp
           ./e2e/run-all.sh

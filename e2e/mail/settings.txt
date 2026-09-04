@@ -1,0 +1,77 @@
+# args:
+# env:
+#
+# The settings walk: reach mail's accounts panel through the launcher, open
+# the add-account form from the bar's link (solid: it joins to the right) — by
+# mouse, then again by the chord the link wears — fill the form with the
+# tab/enter walk (an .invalid host, so the worker fails fast and locally),
+# submit with enter past the last field, watch the status land through the
+# pass's own signal, and remove the account again.
+#
+# The clicks are the assertions: "address" only resolves if the form panel is
+# really open, so the chord is proven without reading a screenshot.
+#
+# Settings are not a shell panel: what a person configures belongs to the app
+# it configures, and these are mail's.
+
+wait 700
+key cmd 2
+wait 400
+type "settings"
+wait 300
+key enter
+wait 600
+shot s1-settings
+
+# The bar's link joins the form to the right.
+click "add account"
+wait 600
+shot s2-add-panel
+
+# Close it and open it again with cmd+d, the letter the link wears.
+key cmd+w
+wait 500
+key cmd+d
+wait 600
+click "address"
+type "andrey@fastmail.test"
+key tab
+type "app-pass-123"
+key tab
+key cmd+a
+type "imap.invalid"
+key tab
+key cmd+a
+type "smtp.invalid"
+wait 200
+shot s3-filled
+
+# Enter past the last field submits, exactly as the bar's *add* does. The
+# worker for the new account starts inside the action that made it, tries the
+# host that does not exist, and writes what it found onto the row.
+key enter
+wait 2500
+shot s4-account-error
+
+# The error is content, not decoration, and it wraps rather than clipping at
+# the panel's edge. The click resolves, so the line is a hit-addressable
+# selectable run and not a label; cmd+a is the smoke step that it stays one.
+click "error"
+wait 300
+key cmd+a
+wait 300
+shot s5-error-selected
+
+# The row's own button takes the account away, with everything it brought.
+# Later hits win, so this is the second row's — the one just added.
+click "remove"
+wait 900
+shot s6-removed
+
+# The demo account is what is left, with the host it syncs from and the line
+# the last pass wrote. Both are selectable runs rather than labels, which is
+# why this resolves at all.
+click "me@prepor.dev"
+wait 300
+shot s7-one-account
+quit

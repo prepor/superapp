@@ -1,0 +1,67 @@
+# args:
+# env:
+#
+# The sweep: the gestures and chords the other shell suites do not cover, in
+# one walk. A fresh un-joined panel from a modified click, an in-panel scroll
+# that keeps the pinned chrome still, the filter's own keys, and `esc` handing
+# the keyboard back from a live field.
+
+wait 900
+
+# -- cmd+click is always a fresh, un-joined panel -----------------------------
+
+# A plain press previews, joined. A modified one opens beside it instead, on
+# no chain at all — so both readers are on screen and each answers for itself.
+click "Q3 infra"
+wait 900
+cmdclick "Sat hike"
+wait 900
+shot p1-fresh-panel
+click "Elena Petrova · aug 30 18:20"
+wait 700
+
+# -- an in-panel scroll -------------------------------------------------------
+
+# Back on the list: its filter is the one control neither reader has, and a
+# press in it takes the panel's focus with it. From there the cursor walks
+# down and drags the view; the filter and the header are pinned and stay put.
+click "filter"
+wait 700
+key down 40
+wait 900
+shot p2-scrolled
+key up 40
+wait 900
+click "Q3 infra"
+wait 900
+shot p3-back-at-the-top
+
+# -- the filter's own keys ----------------------------------------------------
+
+# `/` puts the caret in the filter; typing narrows; `enter` takes the first row
+# and hands the keyboard back to the list; `enter` again opens it un-joined.
+key /
+wait 600
+type "vera"
+wait 900
+shot p4-filtered
+key enter
+wait 600
+key enter
+wait 900
+shot p5-opened-from-the-filter
+click "Vera Kovac · aug 31 09:14"
+wait 700
+
+# -- esc leaves a live field --------------------------------------------------
+
+# The reader's `reply` opens a sheet that starts in its body. `esc` hands the
+# keyboard back, and the sheet's own verb then closes it.
+key cmd+r
+wait 900
+key esc
+wait 600
+click "discard"
+wait 900
+shot p6-discarded
+quit

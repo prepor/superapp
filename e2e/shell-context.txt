@@ -1,0 +1,51 @@
+# args:
+# env:
+#
+# The panel context: `cmd+i` writes the focused panel's identity, what it was
+# asked for, and every query its last draw ran — to the clipboard and to
+# `panel-context.md` beside the store.
+#
+# Both deliveries are effects, which is what makes this assertable: each
+# leaves a row in the log, addressed by the sentence the effect describes
+# itself with. So the proof that the chord did anything is a click on a row
+# that would not be there otherwise.
+
+wait 900
+
+# The manual first: a panel whose draw asks the store nothing at all. The
+# context is written anyway — a panel with no provenance still has an
+# identity — and the two effects are the same two.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 900
+key cmd+i
+wait 700
+shot x1-help
+
+# The log itself, which does read: its last draw ran the log's own query, so
+# the trace under this one is not empty.
+key cmd 2
+wait 500
+type "effects"
+wait 500
+key enter
+wait 900
+key cmd+i
+wait 800
+shot x2-log
+
+# The rows the copy left. The log opens on `@wrote`, and both of these
+# changed something outside the process, so they are there under the panel's
+# own default filter.
+click "copy panel context"
+wait 800
+shot x3-clip-row
+
+# …and the file beside the store, named by the path it was written to.
+click "panel-context.md"
+wait 800
+shot x4-file-row
+quit

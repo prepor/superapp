@@ -1,0 +1,80 @@
+# args: --window 380x780 --grid 4x3
+# env:
+#
+# The cover-display preview: a 380×780 window on a 4×3 grid, which is what the
+# outer screen of a folding phone gets. Every panel clamps to that grid, so a
+# panel that asks for four columns gets the whole screen and the strip holds
+# one panel at a time — the same layout, the same wishes, a smaller board.
+#
+# The gestures are the phone's own hands: a one-finger drag scrolls the list,
+# a tap opens the row it lands on, and two fingers pan the strip back to it.
+
+wait 900
+shot p1-boot
+
+# One finger down the rows and back: at this size the list is the screen, and
+# it scrolls under the finger 1:1.
+swipe "inbox" 0 -200
+wait 700
+shot p2-scrolled
+swipe "inbox" 0 200
+wait 700
+
+# The list fills the screen and still walks. A preview opens beside it, but two
+# panels cannot share a board this narrow, so the camera goes to the preview:
+# the walk reads as a reader that changes letters.
+click "filter"
+wait 700
+key down 12
+wait 900
+shot p3-walked
+
+# Back up the list, and back to the head of the strip.
+key up 12
+wait 900
+key cmd+left
+wait 900
+shot p4-list
+
+# A conversation, opened by a tap: a sweep inside the slop is a press, and the
+# reader takes the whole board.
+swipe "Q3 infra" 2 0
+wait 900
+shot p5-reader
+click "Vera Kovac · aug 31 09:14"
+wait 700
+
+# Two fingers pan the strip back to the list, and the row that resolves is the
+# proof it is on screen.
+pan2 400
+wait 900
+shot p6-back-on-the-list
+click "that airport book"
+wait 900
+
+# The sweep that files a row works at this size too. Two fingers bring the
+# list back first: on a board this narrow a reader takes the whole of it, so
+# there is nothing beside the list to sweep from.
+pan2 400
+wait 900
+swipe "invite: dentist" -200 0 hold
+wait 500
+shot p7-curtain
+drop
+wait 1200
+
+# A filing carries the cursor's own preview with it, and a preview takes the
+# whole of a board this narrow — so two fingers bring the list back. It is one
+# row shorter, and its bar is down to the one verb a list with nothing marked
+# wears: the mark the sweep borrowed came off with the conversation.
+pan2 400
+wait 900
+shot p8-filed
+click "sync"
+wait 700
+
+# And it is alive: a row nothing touched still opens.
+click "weekly: 14 unread"
+wait 900
+shot p9-after
+quit

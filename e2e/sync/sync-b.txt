@@ -1,0 +1,14 @@
+# Device B (follower): finds A holds the lease, installs A's snapshot,
+# materializes A's writes, and shows the locked screen — "take over" only
+# resolves because the locked screen drew its button. Acquiring unlocks the
+# store; opening "Sat hike" (a mail synced from A, untouched by A's archive)
+# then resolves only because B is writable and holds the same inbox.
+wait 1500
+shot sync-b1-locked
+click "take over"
+wait 1500
+shot sync-b2-acquired
+click "Sat hike"
+wait 800
+shot sync-b3-writable
+quit

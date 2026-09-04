@@ -7,14 +7,14 @@ engine, same contract — only the transport differs, and the app picks it from
 the URL scheme.
 
 The local transport is `bucketd`, a tiny object-store daemon that stands in
-for R2/S3 (same compare-and-swap contract; see [`src/object.rs`]). The macOS
-side reaches it at `127.0.0.1`; the android emulator reaches the *same* host
-daemon at `10.0.2.2` (the emulator's alias for the host).
+for R2/S3 with the same compare-and-swap contract; see
+`kernel/src/repl/object.rs`. It is one of the three programs under
+`app/src/bin/`, built with the app.
 
 ## 1. Build
 
 ```sh
-mise exec -- cargo build                 # the app and bucketd
+mise exec -- cargo build -p superapp     # the app and bucketd
 ```
 
 ## 2. Start the bucket
@@ -32,83 +32,49 @@ The bucket URL is resolved, in order, from:
 
 1. `--bucket http://HOST:9000` on the command line (desktop),
 2. the `SUPERAPP_BUCKET` environment variable,
-3. the first line of a `bucket` file **beside the store** (how android is
-   configured).
+3. the first line of a `bucket` file **beside the store**, which is how a
+   device with no shell is configured.
 
 ## 4. Device A — the first to run
 
 ```sh
-mise exec -- cargo run -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
+mise exec -- cargo run -p superapp -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
 ```
 
 A finds no lineage, so it **bootstraps**: it becomes the holder, seeds the
 demo world, uploads a snapshot, and publishes. The account status shows *you
 hold the lease*; the inbox is writable.
 
-## 5. Device B — the android emulator
-
-Build and install the APK (needs `cargo-makepad` + the NDK, per
-[Developer Experience](book/src/dev-x.md)):
+## 5. Device B — a second instance
 
 ```sh
-cargo-makepad android --sdk-path=$HOME/.cache/makepad-android-sdk \
-  --package-name=dev.prepor.superapp --app-label=superapp build -p superapp
-cargo-makepad android --sdk-path=$HOME/.cache/makepad-android-sdk \
-  --package-name=dev.prepor.superapp --app-label=superapp run -p superapp
+mise exec -- cargo run -p superapp -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
 ```
 
-Point it at the host daemon by dropping a `bucket` file next to its store
-(the app's files dir):
+B finds that A holds the lease. It **installs A's snapshot**, gaining the same
+mail, materializes A's writes, and shows the **locked screen**: *another device
+is writing*, with a **take over** button.
 
-```sh
-adb shell run-as dev.prepor.superapp sh -c 'echo http://10.0.2.2:9000 > files/bucket'
-# then relaunch the app
-```
-
-B finds that A holds the lease. It **installs A's snapshot** (gaining the
-same mail), materializes A's writes, and shows the **locked screen**: *held
-by <device> — read-only*, with a **take over** button.
-
-Two android networking notes, if B cannot reach the bucket:
-
-- The APK needs `android.permission.INTERNET`. The client is a **raw TCP
-  socket**, not the framework HTTP stack, so android's cleartext-traffic
-  policy does not apply to it — but the socket permission still must be
-  granted in the manifest.
-- `10.0.2.2` is the emulator's alias for the host loopback; a physical device
-  needs the host's LAN address instead, and `bucketd --bind 0.0.0.0`.
-
-Against R2 the same two notes hold, minus the address: the socket is still a
-raw one, TLS is rustls against the Mozilla roots compiled in, so android's
-system trust store and network-security config are not in the path either —
-only `INTERNET` is. The crates are the ones imap and lettre already build for
-that target, so an APK that can fetch mail can reach R2.
+A device on another machine points itself at the daemon the same way, through
+`--bucket`, `SUPERAPP_BUCKET`, or a `bucket` file beside its store. It needs
+the host's LAN address rather than `127.0.0.1`, and `bucketd --bind 0.0.0.0`.
 
 ## 6. The handoff
 
 - On A, quit the app (or background it): A **releases** the lease.
-- On B, the locked screen now reads *the lease is free*. Tap **acquire** (or
-  **take over** if A is still holding — an override). B becomes the holder
-  and the store unlocks.
+- On B, the locked screen now reads *the lease is free*. Press **acquire** (or
+  **take over** if A is still holding, which is an override). B becomes the
+  holder and the store unlocks.
 - Archive a mail on B. Pick A back up: A is now the follower, and B's archive
   has synced to it.
 
 That is the full loop: synced state, a locked follower, an explicit lease
 request, and a clean handoff.
 
-## No second device? Two desktop instances
-
-```sh
-# terminal 1 — the holder
-mise exec -- cargo run -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
-# terminal 2 — the follower (locked screen, then acquire)
-mise exec -- cargo run -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
-```
-
 ## The real bucket: R2
 
 Everything above is the same walk against a real endpoint; nothing in the
-engine changes. `https://` in the bucket URL selects [`src/r2.rs`] — R2 over
+engine changes. `https://` in the bucket URL selects `kernel/src/repl/r2.rs` — R2 over
 its S3 API — and `http://` keeps the plain daemon client.
 
 Two things a local demo could do without: **TLS**, and **AWS SigV4** request
@@ -140,7 +106,7 @@ https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>[/<PREFIX>]
 ```sh
 export SUPERAPP_R2_ACCESS_KEY_ID=…
 export SUPERAPP_R2_SECRET_ACCESS_KEY=…
-mise exec -- cargo run --bin sync-demo -- \
+mise exec -- cargo run -p superapp --bin sync-demo -- \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>
 ```
 
@@ -155,7 +121,7 @@ SignatureDoesNotMatch` rather than as a puzzling bootstrap four steps later.
 ### 3. Point the app at it
 
 ```sh
-mise exec -- cargo run -- --db /tmp/superapp-A.db \
+mise exec -- cargo run -p superapp -- --db /tmp/superapp-A.db \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
 ```
 
@@ -167,31 +133,30 @@ The access key id and its secret are resolved, in order, from:
    keychain, written by:
 
 ```sh
-mise exec -- cargo run -- --r2-login    # reads the secret from stdin, then exits
+mise exec -- cargo run -p superapp -- --r2-login    # reads the secret from stdin, then exits
 ```
 
 Stdin, not a flag: an argument is in `ps` and in the shell's history, and this
 one key can write the whole lineage. `--r2-login` needs the key id (from the
 environment or the file); it stores only the secret. Secrets never go in the
-store — same rule as mail passwords ([`src/secret.rs`]).
+store — same rule as mail passwords (`app/src/platform/secret.rs`).
 
-### 4. On android: the form, not the cable
+### 4. The form, not the cable
 
-A phone has no environment, no shell and no keychain command. It has the
-**device-sync panel**: settings → *device sync* (`cmd+y` where there is a
-keyboard), three fields — the bucket URL, the access key id, the secret — and
-a *connect* button.
+A device with no environment, no shell and no keychain command still has the
+**device-sync panel**: the launcher root *device sync*, with three fields (the
+bucket URL, the access key id, the secret) and a *connect* verb on its bar.
 
 What connect does is the whole point of the panel:
 
-- the **secret** goes to the platform's secret store — the macOS keychain, or
-  a private 0600 file beside the store on android — through the effect
+- the **secret** goes to the platform's secret store, the macOS login keychain
+  or a private mode-0600 file beside the store, through the effect
   boundary, so an e2e run writes to memory and never to a human's keychain;
 - the **URL and key id** are written to the `bucket` file beside the store,
   and *only* those two: a file that carried a secret on line 3 is rewritten
   without it;
-- the replication worker is restarted onto the new bucket — the lease handed
-  back first — so connecting takes effect without a relaunch.
+- the lease driver is restarted onto the new bucket, the old lease handed back
+  first, so connecting takes effect without a relaunch.
 
 The secret field is write-only: it seeds blank on a configured device, because
 a key that can be read back off a screen is a key that leaves by a route
@@ -201,7 +166,7 @@ The file is still the way to *prefill* a device from a host, and the only way
 to hand one a secret without typing it:
 
 ```sh
-adb shell run-as dev.prepor.superapp sh -c 'cat > files/bucket' <<EOF
+cat > /tmp/superapp-B/bucket <<EOF
 https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
 <ACCESS_KEY_ID>
 <SECRET_ACCESS_KEY>
@@ -237,19 +202,21 @@ single frame renders and the script never advances (`--no-draw --draws N` runs
 the same walk fast, asserting through label resolution instead of pixels).
 
 
-`e2e/sync-demo.sh` orchestrates the two device roles headlessly against a
-`bucketd` for a scripted walk (`e2e/sync-a.txt`, `e2e/sync-b.txt`). It needs
-a headless makepad event loop that pumps frames; where that is available it
-drives the passes on the virtual clock exactly like the mail engine.
+`e2e/sync/sync-demo.sh` orchestrates the two device roles headlessly against a
+`bucketd` for a scripted walk (`e2e/sync/sync-a.txt`, `e2e/sync/sync-b.txt`).
+Under `MAKEPAD=headless` it drives the passes on the virtual clock exactly like
+the mail engine.
 
-`e2e/bucket.sh` proves the panel: a device with **no** `--bucket` flag and no
-pushed file is pointed at a `bucketd` from inside the app — settings, the
-`cmd+y` link, the URL typed into the form, connect — and the assertions are
-outside the app, where a screenshot cannot lie about them: a one-line `bucket`
-file beside the store, and a lineage in the daemon's directory that only a
-holder ever writes.
+`e2e/sync/bucket.sh` proves the panel: a device with **no** `--bucket` flag and no
+pushed file is pointed at a `bucketd` from inside the app: the launcher's
+*device sync* root, the URL typed into the form, then *connect*. The walk
+itself is `e2e/shell-bucket.txt`, which runs in the ordinary battery; this
+script is the other half, starting a daemon on the port the walk types, and
+the assertions are outside the app where a screenshot cannot lie about them: a
+one-line `bucket` file beside the store, and a lineage in the daemon's
+directory that only a holder ever writes.
 
-`e2e/reseed.sh` proves a subtler thing: a *running* follower whose open
+`e2e/sync/reseed.sh` proves a subtler thing: a *running* follower whose open
 compose panel has a peer's draft edit materialized underneath it re-seeds the
 retained widget (a compose seeds its fields from the `draft` row only when
 its widget is built, so without this it would show a stale buffer no reopen
@@ -258,15 +225,20 @@ dislodges). The holder types "alpha", the follower installs it, a helper
 live, and the follower's take-over screenshot must read "alpha beta". Ordering
 is gated on each device's DB state, not wall-clock.
 
-Build for these with `MAKEPAD=headless` **set at build time** as well as run
-time: `build.rs` mirrors it into `cfg(headless)`, which makes the sync passes
-run inline on the frame loop's virtual clock (deterministic) instead of on
-the production worker thread.
+Build for these with `MAKEPAD=headless` **set at build time**:
+
+```sh
+MAKEPAD=headless mise exec -- cargo build -p superapp
+```
+
+`app/build.rs` mirrors it into `cfg(headless)`, which makes the sync passes run
+inline on the frame loop's virtual clock, deterministically, instead of on the
+lease driver's own thread.
 
 ## What is proven without a device
 
 The lease protocol itself is model-checked: [`formal/Lease.tla`](../formal/README.md)
-is a TLA+ model of `src/repl.rs` (every read/CAS interleaving, offline
+is a TLA+ model of `kernel/src/repl/` (every read/CAS interleaving, offline
 passes, overrides) with the single-writer and history properties checked
 exhaustively over a bounded state space — and the one hole it found, a
 superseded holder's unpublished writes surfacing under a later lease, is
@@ -275,16 +247,16 @@ what `acquire`'s unconditional reset closes.
 The mechanism is unit-tested end to end, including over the real HTTP
 transport:
 
-- `repl::tests::two_devices_sync_acquire_and_strand` — bootstrap, install,
+- `repl::tests::two_devices_sync_acquire_and_strand`: bootstrap, install,
   publish/materialize both ways, release+acquire handoff, follower read-only,
   and an override that strands the old holder, over an in-memory bucket.
-- `repl::tests::two_devices_sync_over_real_http` — the same stack over a live
+- `repl::tests::two_devices_sync_over_real_http`: the same stack over a live
   socket: snapshot upload/install, batch upload/apply, and the lease CAS
   through `bucketd`'s handler and the `HttpBucket` client.
 
 And the R2 client's own arithmetic, which no local run exercises:
 
-- `r2::tests::the_signature_matches_the_aws_test_vector` — the AWS SigV4 test
+- `r2::tests::the_signature_matches_the_aws_test_vector`: the AWS SigV4 test
   suite's `get-vanilla` case, byte for byte. It pins canonical request, scope,
   signing key and signature at once, so a drift in any of them fails here
   rather than at a real endpoint with a `SignatureDoesNotMatch` and no clue
@@ -300,7 +272,7 @@ client at real AWS S3 with the documentation's example keys.
 SUPERAPP_R2_REGION=us-east-1 \
 SUPERAPP_R2_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
 SUPERAPP_R2_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
-mise exec -- cargo run --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
+mise exec -- cargo run -p superapp --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
 # → bucket GET contract-check: 403 InvalidAccessKeyId
 ```
 

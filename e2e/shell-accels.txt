@@ -1,0 +1,148 @@
+# args: --demo-disk
+# env:
+#
+# The bold letters, which are a promise: a chord is offered to the reserved
+# set, then to the focused widget, then to the focused panel's bar, then to
+# the bar of the panel it previews — so those are the only two bars that may
+# wear a mark, and the previewed one only on the letters the focused bar
+# leaves free.
+#
+# Two bars is the whole point, so this suite keeps two of them on screen at
+# once and never addresses a verb by a label both wear. What a click can
+# assert it asserts: that the chord fired the *focused* panel's verb, proved
+# by an outcome only that panel could have produced. The rest is in the
+# pictures — `b1`…`b8` under `e2e/out`.
+
+wait 900
+
+# -- the reader under an unmarked inbox ----------------------------------------
+
+# A press on a row previews the conversation, joined, and the list keeps
+# focus: the two bars of the order, side by side. The inbox wears `sync`
+# alone, so the reader's `archive`, `delete`, `reply` and `forward` are all
+# free — and all four are drawn bold, because a chord reaches them.
+click "Q3 infra"
+wait 800
+shot b1-unmarked
+
+# -- and under a marked one ----------------------------------------------------
+
+# Space marks the row under the cursor; the walk carries on, so the mark is
+# on one conversation and the reader is on the next.
+type " "
+wait 600
+key down
+wait 800
+
+# The inbox's bar has grown the batch verbs, and `archive 1` wears the `a`
+# the reader wears too. The chord stops at the focused list, so the reader's
+# `a` and `d` go plain — the same two buttons, the same two clicks, one
+# promise fewer — while its `r` and `f`, which the list does not wear, stay
+# bold.
+shot b2-marked
+
+# The promise is kept: cmd+a fires the *list's* archive, over the marked
+# conversation, not the reader's over the one it shows. Had the reader taken
+# it, it would have filed what it was showing and closed itself, and the
+# letter below — the reader's own, addressed by sender and date — would
+# resolve nowhere.
+key cmd+a
+wait 900
+click "GitHub · aug 31 08:02"
+wait 500
+
+# The marks are gone with what they named, so the inbox is back to `sync`
+# and the reader's letters are free again.
+shot b3-filed
+
+# -- and with the list's own filter live ---------------------------------------
+
+# The second step of the order, which is the widget's: a row marked, and
+# then the caret put in the filter with `/`. While it is there the list
+# answers every cmd chord itself — the shell's table says so on every draw —
+# so the whole bar goes plain, the marked set's letters with it, and the
+# reader below is left with nothing to promise either.
+type " "
+wait 500
+key /
+wait 400
+type "vera"
+wait 700
+shot b4-filtering
+
+# -- three listings, three places in the order ---------------------------------
+
+# Workspace 2, so every panel on screen from here is a files listing.
+key cmd+2
+wait 500
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+
+# Something in the clipboard, so every listing offers `copy here`: the card
+# under the cursor is the object, and its own `copy` holds the file it shows.
+click "notes.md"
+wait 900
+click "copy"
+wait 600
+
+# The cursor walks to a directory: the listing it previews takes the card's
+# place. Enter then *goes* — that listing takes focus, joined under `~` —
+# and a press on one of its own rows gives it a preview of its own.
+click "Downloads/"
+wait 900
+key enter
+wait 900
+click "2026/"
+wait 900
+
+# Three bars: `~` at the left, which a chord never reaches, wearing no mark
+# at all; the focused listing in the middle with `new dir`, `go to` and
+# `copy here` bold; and what it previews at the right, where those same
+# three letters are plain — the middle bar has them — and only `copy`,
+# `move` and `delete`, which it alone wears, are bold.
+shot b5-three-bars
+
+# The middle bar's `n` is the one that fires, and the field it opens takes
+# the keyboard.
+key cmd+n
+wait 600
+type "2026"
+wait 500
+
+# While the caret is in that field the widget answers every cmd chord
+# itself, so no letter would fire and none is drawn: both bars are plain,
+# and the third was plain already.
+shot b6-typing
+
+# Enter hands the keyboard back — a one-line field submits and lets go — so
+# the letters are promises again. The name typed is one the focused
+# directory already has, so the answer is a refusal on its own status line,
+# and the field stays open with what was typed in it: the proof of whose
+# field it is. In the previewed listing the name is free, the directory
+# would have been made, and the field would have closed.
+key enter
+wait 800
+shot b7-refused
+click "new dir name"
+wait 400
+key esc
+wait 500
+
+# And `go to`, whose `g` the previewed listing also wears plain: the field
+# opens on the focused panel, seeded with where *it* stands, and what is
+# typed carries it. The row below belongs to `~/Documents` alone, so it
+# resolves only if the walk started here.
+key cmd+g
+wait 600
+type "~/Documents/"
+wait 700
+key enter
+wait 900
+click "Lease.tla"
+wait 700
+shot b8-went
+quit

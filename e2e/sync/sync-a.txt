@@ -1,0 +1,12 @@
+# Device A (canonical): with --bucket it finds no lineage, bootstraps, holds
+# the lease, seeds the demo world, publishes. Then it opens and archives a
+# mail — actions that only resolve if A is the holder and writable. A quits
+# holding, so device B finds it held.
+wait 1500
+shot sync-a1-holder
+click "Q3 infra"
+wait 800
+click "archive"
+wait 1500
+shot sync-a2-archived
+quit

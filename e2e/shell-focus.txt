@@ -1,0 +1,94 @@
+# args:
+# env:
+#
+# What a click does to the keyboard. `mouse` is a press and a release into the
+# stage — the road a physical click takes, key-focus rule included — which is
+# the half a resolved `click` could never prove.
+#
+# The assertions are chords: a cmd chord reaches the focused panel's bar and
+# nowhere else, so a verb that fired is a panel that had the keyboard.
+
+wait 900
+
+# The inbox that boots is closed first, so every label from here belongs to
+# one of the two panels this suite opens.
+key cmd+w
+wait 700
+
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 900
+
+key cmd 2
+wait 500
+type "effects"
+wait 500
+key enter
+wait 900
+shot f1-two-panels
+
+# -- a press on a panel's own rectangle moves focus and does nothing else -----
+
+# The log has the keyboard, having just opened. Pressing the manual takes it:
+# its rectangle is not a control, so the press acts on nothing at all.
+mouse "help"
+wait 700
+
+# The proof: `cmd+y` is the manual's own *try it*, and a chord only ever
+# reaches the focused panel's bar. It copies a line — a real effect, so the
+# log grows a row for it, which is the assertion two steps down.
+key cmd+y
+wait 800
+shot f2-manual-had-the-keyboard
+
+# -- a press in a field takes its panel with it -------------------------------
+
+# The log's filter. The caret lands in the field and the panel takes focus with
+# it, so what is typed narrows this list.
+mouse "filter"
+wait 600
+key cmd+a
+type "@memory"
+wait 900
+shot f3-filter-typed
+
+# The row the chord left is here under it — both halves of the proof at once.
+click "copy the demo line"
+wait 800
+shot f4-the-row
+
+# `down` hands the keyboard from the field to the rows, and the cursor previews
+# what it lands on: the ring row's own panel, addressed by a run only it draws.
+mouse "filter"
+wait 500
+key down
+wait 900
+click "job facts"
+wait 700
+shot f5-walked-from-the-list
+
+# -- the workspace modifier on a bar entry ------------------------------------
+
+# `cmd+click` reaches a bar too: a link opened with the workspace modifier is
+# a column of its own rather than a joined child, exactly as `cmd+click` on a
+# row is. The manual's *about* is a solid link, so a plain click would join.
+mouse "help"
+wait 700
+cmdclick "about"
+wait 900
+shot f6-un-joined
+
+# The proof: closing the panel it was opened from leaves it standing. A join
+# closes with its parent, so a joined *about* would take its bar with it and
+# the link below would resolve against nothing.
+key cmd+left
+wait 700
+key cmd+w
+wait 900
+click "back to help"
+wait 800
+shot f7-outlived-its-parent
+quit

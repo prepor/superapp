@@ -1,13 +1,15 @@
 # The app icon. makepad's platform/build.rs bakes the PNGs these name into
 # the binary (the dock icon of a plain `cargo run`); it would also find
-# `resources/icon_*.png` on its own, but only by walking up from OUT_DIR to
-# the directory holding `target/`, which a custom CARGO_TARGET_DIR or an
-# explicit `--target` breaks. `resources/make_icons.py` generates the files.
+# `app/resources/icon_*.png` on its own, but only by walking up from OUT_DIR
+# to the directory holding `target/`, which a custom CARGO_TARGET_DIR or an
+# explicit `--target` breaks. `app/resources/make_icons.py` generates the
+# files. The paths are relative to this directory's parent, the workspace
+# root, so they hold wherever cargo is invoked from.
 [env]
-MAKEPAD_APP_ICON_32 = { value = "resources/icon_32.png", relative = true }
-MAKEPAD_APP_ICON_64 = { value = "resources/icon_64.png", relative = true }
-MAKEPAD_APP_ICON_128 = { value = "resources/icon_128.png", relative = true }
-MAKEPAD_APP_ICON_256 = { value = "resources/icon_256.png", relative = true }
-MAKEPAD_APP_ICON_512 = { value = "resources/icon_512.png", relative = true }
-MAKEPAD_APP_ICON_1024 = { value = "resources/icon_1024.png", relative = true }
-MAKEPAD_APP_ICON_ICO = { value = "resources/icon.ico", relative = true }
+MAKEPAD_APP_ICON_32 = { value = "app/resources/icon_32.png", relative = true }
+MAKEPAD_APP_ICON_64 = { value = "app/resources/icon_64.png", relative = true }
+MAKEPAD_APP_ICON_128 = { value = "app/resources/icon_128.png", relative = true }
+MAKEPAD_APP_ICON_256 = { value = "app/resources/icon_256.png", relative = true }
+MAKEPAD_APP_ICON_512 = { value = "app/resources/icon_512.png", relative = true }
+MAKEPAD_APP_ICON_1024 = { value = "app/resources/icon_1024.png", relative = true }
+MAKEPAD_APP_ICON_ICO = { value = "app/resources/icon.ico", relative = true }

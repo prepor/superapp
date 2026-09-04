@@ -1,0 +1,74 @@
+# args:
+# env:
+#
+# The shell's own journey, on the system app's own panels: the bar at the
+# foot, a chord, a close, undo, the launcher, and the workspaces.
+# Assertions are the clicks — a label that does not resolve fails the run —
+# so "the bar is drawn" is checked by clicking a verb on it.
+
+wait 600
+# The store comes up on the first root the app list offers, which is mail's
+# inbox; the manual is a root like any other, one launcher away.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 800
+shot a1-help
+
+# -- the bar at the foot ----------------------------------------------------
+
+# The panel wears its bar: a button that only says something…
+click "try it"
+wait 400
+shot a2-toast
+
+# …and a link that goes somewhere. `about` opens joined to the right.
+click "about"
+wait 800
+shot a3-joined
+
+# The about panel's own bar goes back in place: a dotted link is a replace,
+# so the slot keeps its number and shows the manual instead.
+click "back to help"
+wait 800
+
+# -- closing, and undoing the close -----------------------------------------
+
+key cmd+w
+wait 700
+key cmd+z
+wait 800
+shot a4-undone
+
+# -- the launcher -----------------------------------------------------------
+
+# Double-cmd, a query, enter. `about` is a root, so the launcher offers it
+# whether or not anything shows it.
+key cmd 2
+wait 500
+type "about"
+wait 500
+shot a5-launcher
+key enter
+wait 800
+shot a6-opened
+
+# -- workspaces -------------------------------------------------------------
+
+key cmd+2
+wait 700
+shot a7-empty
+key cmd+1
+wait 700
+
+# -- the history overlay ----------------------------------------------------
+
+key cmd+u
+wait 500
+shot a8-history
+key esc
+wait 400
+
+quit

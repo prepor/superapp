@@ -1,0 +1,55 @@
+# args:
+# env:
+#
+# The Gmail sign-in, as far as a script can go: reach the add-account form,
+# press the Google button, and read the line the panel puts back. A run never
+# leaves for a browser, so the flow refuses itself and says so — and that
+# refusal is exactly the plumbing worth proving here: the button resolves, its
+# verb reaches the instance, the widget hands the flow a waker it never needs,
+# and the answer lands on the panel's own status line rather than in a toast
+# alone.
+#
+# The consent round trip itself cannot be scripted (it wants Google and a
+# human). What can be is unit-tested next to the code: PKCE against the RFC's
+# vector, the consent URL, the console file, the id_token read, the XOAUTH2
+# envelope byte for byte, the scope check, the refusal, and a bearer session's
+# credentials against the fake world.
+
+wait 700
+key cmd 2
+wait 400
+type "settings"
+wait 300
+key enter
+wait 600
+click "add account"
+wait 600
+shot g1-add-panel
+
+# The button is on the bar, where every button that acts on what the panel
+# shows lives.
+click "sign in with google"
+wait 800
+shot g2-refused
+
+# The line is a hit of its own, so this click only resolves if the panel is
+# really saying it — the assertion is the click, not the screenshot.
+click "sign-in needs a real run"
+wait 300
+shot g3-line
+
+# …and the same again by the letter the bar wears, which proves the chord
+# reaches the instance and not only the pointer.
+key cmd+g
+wait 600
+click "sign-in needs a real run"
+wait 300
+shot g4-chord
+
+# The form below it is untouched by any of that: the four fields are still
+# there, and still the ones a password account is typed into.
+click "address"
+wait 200
+click "imap"
+wait 200
+quit

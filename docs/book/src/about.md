@@ -13,6 +13,14 @@ people. If the book and the code disagree, one of them must be fixed.
   are likely to become stale.
 - Keep unresolved decisions in [Open Questions](./open-questions.md).
 
+## The two parts
+
+The book follows the code's own split. A chapter in *The shell* states a rule
+or describes a component, and may use an app as a one-line example. A chapter
+in *Apps* states what that app does and links to the rule it follows rather
+than restating it. [Architecture](./architecture.md) describes the layers and
+[Apps](./apps.md) is the contract between them.
+
 ## Workflow
 
 Start user-visible work with a change request in

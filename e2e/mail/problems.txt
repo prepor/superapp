@@ -1,0 +1,81 @@
+# args:
+# env: SUPERAPP_SEND_DELAY=1 SUPERAPP_MAIL_DOWN=no-route-to-host
+#
+# A send that cannot leave, an account that cannot sync, and what the shell
+# does about either.
+#
+# `SUPERAPP_MAIL_DOWN` is mail's own knob: it takes the fake servers offline
+# for the whole run, so both failures here are real ones — the submission
+# server refuses, the sync pass cannot connect, the executor records what it
+# found, and the problems are derived from the rows that stand. Nothing is
+# mimed.
+#
+# The problems panel is the shell's, and it has never heard of mail: the rows
+# it draws, their lines and all four of their controls come out of mail's two
+# problem sources as data.
+
+wait 900
+
+# A reply that will not go.
+click "Q3 infra"
+wait 800
+click "reply"
+wait 900
+type "This one cannot leave the building."
+wait 500
+click "send"
+wait 700
+
+# The window runs out, the sender claims the row, the submission server
+# refuses — and the problem announces itself as a toast, once.
+wait 3000
+shot p1-announced
+
+key cmd 2
+wait 500
+type "problems"
+wait 600
+key enter
+wait 1000
+shot p2-problem
+
+# Two sources, accounts first: the account cannot reach the server either,
+# which is *why* nothing is moving. Its row's own button is what proves the
+# source listed it — *sync me* exists nowhere else — and pressing it only
+# asks the pass to go and look, which under a dead server changes nothing.
+shot p3-account
+click "sync me"
+wait 900
+shot p4-kicked
+
+# The send's row is the other source. Its link goes: a fresh sheet carrying
+# the letter that failed, which its own bar closes again.
+click "reopen"
+wait 900
+shot p5-reopened
+click "discard"
+wait 900
+
+# The button runs: the send is filed again, on a fresh window, so the
+# condition the problem was derived from is gone with it.
+click "retry"
+wait 900
+shot p6-retried
+
+# …and comes back when the same letter fails again, because a problem is
+# derived from rows and never stored.
+wait 3000
+click "retry"
+wait 700
+shot p7-again
+
+# The account row's own link opens mail's settings, where the account is
+# configured — and where it can be taken away, which is the other way to
+# stop a failing account failing.
+click "settings"
+wait 900
+shot p8-settings
+click "remove"
+wait 900
+shot p9-account-gone
+quit

@@ -1,0 +1,103 @@
+# args:
+# env:
+#
+# The launcher: a double tap on cmd raises it, the query runs over the open
+# panels, every app's roots, and every app's own sources; `enter` goes to a hit
+# wherever it lives, or opens it fresh where it does not. It never makes a
+# second copy of something already open.
+#
+# The workspaces overlay's search row is the other way in: two fingers down
+# raise the roster, and its search row raises this.
+
+wait 600
+
+key cmd 2
+wait 500
+shot l1-empty
+
+# With an empty query the open panels come first, then the roots. A word out of
+# a subject finds the mail nothing is showing.
+type "q3"
+wait 700
+shot l2-query
+
+# `enter`: a fresh, un-joined trailing column on this workspace. The letter it
+# opened on is the assertion.
+key enter
+wait 900
+shot l3-opened
+click "Vera Kovac · aug 31 09:14"
+wait 700
+
+# Park it on workspace 4 and come back to 1.
+key cmd+shift+4
+wait 900
+key cmd+1
+wait 900
+
+# The same question is a *go to* now: the panel is open, so the hit is the one
+# showing it, badged with the workspace it is on.
+key cmd 2
+wait 500
+type "q3"
+wait 700
+shot l4-badged
+
+# `enter` switches to workspace 4 and focuses it rather than opening a second
+# copy — which the letter resolving over there is the proof of.
+key enter
+wait 900
+click "Vera Kovac: Draft for Q3 infra spend"
+wait 700
+shot l5-switched
+
+# `esc` closes a launcher that was just raised, and changes nothing.
+key cmd 2
+wait 500
+key esc
+wait 600
+
+# The index reads the letter and not only its subject: "egress" is in a body
+# and in no subject anywhere.
+key cmd 2
+wait 500
+type "egress"
+wait 800
+shot l6-body-word
+key enter
+wait 900
+shot l7-body-opened
+
+# And the roots: every app offers its own, so the manual is one query away
+# whether or not anything is showing it.
+key cmd 2
+wait 500
+type "help"
+wait 600
+key enter
+wait 900
+click "try it"
+wait 700
+shot l8-root
+
+# -- the way in from the workspaces overlay ----------------------------------
+
+# Two fingers down list the workspaces; its search row is a launcher entry on
+# glass, and the query runs over the same sources.
+pan2 0 260
+wait 700
+shot l9-overlay
+click "search"
+wait 600
+type "vera"
+wait 800
+shot l10-from-the-row
+
+# `enter` opens the top hit here, un-joined, exactly as it would from a
+# double-cmd, and the letter it lands on is the assertion.
+key enter
+wait 900
+click "Vera Kovac · aug 31 09:14"
+wait 700
+shot l11-opened
+quit

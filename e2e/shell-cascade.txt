@@ -1,0 +1,56 @@
+# args: --demo-disk
+# env:
+#
+# Closing a panel takes its joined chain with it, and one undo brings the whole
+# chain back. A join says "this is context I pointed at", so what a panel
+# pointed at goes when the panel does — however deep the pointing went.
+#
+# The clicks are the assertions. A row of the deepest listing only resolves
+# while that listing stands, so the walk proves the chain was built; after the
+# close the same click would find nothing, which is what the undo then makes
+# resolve again.
+
+wait 900
+
+# The inbox that boots is closed first: the chain below is the only thing on
+# the workspace, so nothing else can answer a label.
+key cmd+w
+wait 700
+
+key cmd 2
+wait 500
+type "files"
+wait 500
+key enter
+wait 900
+
+# One listing previews the next, joined; `enter` goes into the preview, which
+# then previews one of its own. Three panels on one chain.
+click "Downloads/"
+wait 900
+key enter
+wait 900
+click "2026/"
+wait 900
+click "invoice-0817.pdf"
+wait 900
+shot c1-chain
+
+# Back to the head of the chain — the walk is focus, not an action, so it adds
+# no node — and close it.
+key cmd+left
+wait 400
+key cmd+left
+wait 600
+key cmd+w
+wait 900
+shot c2-closed
+
+# The chain comes back whole: the row of the deepest listing resolves again,
+# which it could not while that listing was gone.
+key cmd+z
+wait 900
+click "invoice-0817.pdf"
+wait 800
+shot c3-undone
+quit

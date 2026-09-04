@@ -1,0 +1,38 @@
+# args:
+# env:
+#
+# The height wish. A panel asks the layout for grid units rather than being
+# handed a rectangle, and the request is a floor, not a constant: a panel
+# whose content needs more rows asks for more, and the same panel goes back to
+# the floor when it shows something short again.
+#
+# The wish belongs to what is shown, not to the slot: it is read off the
+# instance after every settle, so the one reader panel changes height as the
+# cursor walks. Mail's reader is the panel in this build whose content varies
+# enough to see it; the shape of the assertion is the shell's.
+
+wait 900
+shot h1-boot
+
+# A short letter keeps the floor: the reader is half the column, as ever.
+click "Sat hike"
+wait 900
+shot h2-short
+click "Elena Petrova · aug 30 18:20"
+wait 500
+
+# The long one asks for more, and the same panel — the same slot, replaced in
+# place by the next row — grows into it.
+click "long version"
+wait 900
+shot h3-long
+click "Max Ivanov · aug 28 09:12"
+wait 500
+
+# And back down: the wish went with the letter, not with the panel.
+click "that airport book"
+wait 900
+shot h4-short-again
+click "Dmitry Orlov · aug 28 20:33"
+wait 500
+quit

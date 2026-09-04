@@ -1,0 +1,59 @@
+# args:
+# env:
+#
+# The history walk: `cmd+u` puts the tree up, and clicking a node travels
+# there — backward, all the way to the beginning, and forward again. The tree
+# is not a stack: travelling back and acting again branches it, and every
+# branch stays reachable.
+#
+# The clicks are the assertions twice over: a node is addressed by the label
+# its action was recorded under, so a row that resolves is a node that was
+# recorded, and the state it travels to is checked by what resolves after.
+#
+# A travel puts the overlay away — it is a place to go, not a place to stay —
+# so each hop below opens it again.
+
+wait 900
+
+# Three actions, so the tree has something in it: a preview, an archive from
+# the reader's bar, and the preview the list moves on to.
+click "Q3 infra"
+wait 900
+click "archive"
+wait 900
+
+key cmd+u
+wait 700
+shot y1-tree
+
+# Back to the moment the conversation was read: the archive is undone with it,
+# so the letter is in the reader again.
+click "read “Q3"
+wait 900
+shot y2-back
+click "Vera Kovac · aug 31 09:14"
+wait 700
+
+# All the way to the beginning — before the first root was even opened, so
+# there is nothing on the workspace at all.
+key cmd+u
+wait 700
+click "the beginning"
+wait 900
+shot y3-origin
+
+# …and forward again to the archive, which is still in the tree: travelling is
+# not undoing, and nothing was thrown away.
+key cmd+u
+wait 700
+click "archive “Q3"
+wait 900
+shot y4-forward
+
+# `esc` puts the overlay away.
+key cmd+u
+wait 700
+key esc
+wait 600
+shot y5-closed
+quit

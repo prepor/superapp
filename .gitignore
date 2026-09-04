@@ -1,7 +1,8 @@
-/target
+target/
 /e2e/out
 /docs/book/book
 window_*.png
 
 # TLC model-checker scratch
 formal/states/
+.DS_Store

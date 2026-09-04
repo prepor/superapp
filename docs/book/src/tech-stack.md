@@ -1,53 +1,79 @@
 # Tech Stack
 
-Superapp is a Rust application built with Makepad. macOS is the main target;
-Android is also supported, with special handling for foldable screens.
+Superapp is a Rust application built with Makepad. macOS is the target.
 
-- **Makepad** draws the interface and handles input. The Makepad packages are
-  pinned in `Cargo.toml`. A small fork carries five local fixes for text input,
-  headless tests, canvas zoom, and text selection. `Cargo.toml` explains each
-  patch and names the exact revision.
-- **SQLite**, through `rusqlite`, stores application data. SQLite is bundled so
-  macOS and Android use the same version and features. Update hooks invalidate
-  cached queries, SQLite records query dependencies, and the session
-  extension records changes for device sync.
+One Cargo workspace, two members:
+
+- **`kernel/`**: the crate named `kernel`. It has **no Makepad dependency at
+  all**, which is the layering rule made structural rather than agreed to. It
+  carries `rusqlite`, `serde`, `serde_json`, and the TLS and signing crates
+  device sync needs.
+- **`app/`**: the crate named `superapp`, a library with a one-line binary on
+  top of it, which is the shape Android needs, since a desktop build starts at
+  a `fn main` and an activity has no main at all. It depends on the kernel and
+  on `makepad-widgets`, plus the mail protocols and HTML crates. `bucketd`,
+  `sync-demo`, and `reseed-edit` are auto-discovered binaries under
+  `app/src/bin/`.
+
+The pieces:
+
+- **Makepad** draws the interface and handles input. The packages are pinned in
+  the root `Cargo.toml`, which also patches them to a small fork carrying five
+  local fixes for text input, headless screenshots, canvas zoom, and text
+  selection. The comment there names each patch and the exact revision.
+- **SQLite**, through `rusqlite`, stores application data. It is bundled so
+  every target uses the same version and features. Update hooks invalidate
+  cached queries, SQLite's authorizer records query dependencies, and the
+  session extension records changes for device sync.
 - **Serde and serde_json** encode queued effects and device-sync metadata.
 - **imap, lettre, and mail-parser** provide IMAP, SMTP, and MIME support.
+- **html5ever, markup5ever_rcdom, and simplecss** narrow HTML mail.
 - **rustls** provides TLS. `ring`, `base64`, `rustls-connector`, and
   `webpki-roots` support Gmail sign-in and signed R2 requests. The app does not
   use a general-purpose HTTP client.
 - **Makepad's macOS APIs** provide the menu bar. Small gaps such as screen
-  geometry and window screenshots use `makepad-apple-sys` and
-  `makepad-objc-sys`.
+  geometry, the trash, and window screenshots use `makepad-apple-sys` and
+  `makepad-objc-sys`, in `app/src/platform/mac.rs`.
 - **mise** selects the stable Rust toolchain. The application has no other
   runtime dependency.
 
-Setting `MAKEPAD=headless` replaces macOS drawing with Makepad's software
-renderer. End-to-end tests can then run without a window or display and can
-write frames directly to PNG files. See [Developer Experience](./dev-x.md).
+There are no Cargo features. Every switch is argv, an environment variable, or
+`cfg(headless)`.
+
+## Headless
+
+Setting `MAKEPAD=headless` at build time replaces macOS drawing with Makepad's
+software renderer, and `app/build.rs` mirrors it into `cfg(headless)` for this
+crate, because the shell has to know which backend it is linked against: a
+window-layer screenshot is meaningless when there is no window.
+
+`cfg(headless)` is what turns on virtual time. Workers run inline from the
+frame loop instead of on threads, the device-sync driver does too, and a
+screenshot is a copy of the rasterizer's newest frame rather than a photograph
+of a window. See [Developer Experience](./dev-x.md).
 
 The main window is borderless and covers the display's usable area, leaving the
 menu bar and Dock visible. It does not use a macOS full-screen Space.
 
 ## Android
 
-The library contains Makepad's Android entry point. The desktop binary and
-macOS-only code are excluded from Android builds. `cargo-makepad` builds the
-APK without Gradle.
+An Android build is not part of this tree today, and there is no SDK here to
+make one with. The crate is shaped for it: a library with a JNI entry point
+beside the desktop `fn main`, its own launcher icons under
+`app/resources/android/`, and a grid the layout switches at runtime.
 
-Panel widgets use the bundled Geist Mono font. Shell-drawn text falls back to
-bundled Liberation Mono because Menlo is not available on Android.
+The platform work the shell owns is written and compiles here behind its
+`cfg`s. Touch goes through the same input paths a mouse does. The grid is
+picked from the screen: 8×4 above about 600 dp and 4×3 below it, which is the
+compact/medium breakpoint a fold or an unfold crosses, and `--grid` forces
+either on the desktop for a preview. The workspace sits inside the safe-area
+insets a window-geometry change reports, clear of the notification-shade strip
+at the top; the soft keyboard's occlusion shortens it, since the manifest
+adjusts nothing and the app makes its own room. See [Interaction
+Grammar](./interaction-grammar.md).
 
-Fold and unfold events arrive as window-size changes. At about 600 dp wide, the
-layout switches between the 8×4 unfolded grid and the 4×3 cover-screen grid.
-Safe-area insets are removed from the available space before panels are laid
-out.
-
-Touch uses Makepad's raw touch events. Android's gesture detector supplies the
-long-press event. The shell also keeps a 28 dp top inset so the system gesture
-area does not cover panel headers.
-
-The on-screen keyboard reports its height and full text state. The shell uses
-the remaining visible area for the workspace and mirrors the full text state
-into the focused field. It updates Android's editable state after app-side
-changes, but not while text composition is active.
+What is left is what needs a device or an SDK to write against: a secrets
+backend that is not a private file, and everything the file browser wants
+outside the app's own directory: the Storage Access Framework, a
+`FileProvider` for the system opener, and `MediaStore` for the system trash.
+See [Open Questions](./open-questions.md).

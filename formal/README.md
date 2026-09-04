@@ -1,6 +1,6 @@
 # A formal model of device sync
 
-`Lease.tla` is a TLA+ model of the lease protocol in `src/repl.rs`: one
+`Lease.tla` is a TLA+ model of the lease protocol in `kernel/src/repl/`: one
 `state` object in the bucket advanced only by compare-and-swap on its
 version, and devices that poll, publish, acquire, release, and go offline.
 Every network round trip is modelled as an atomic **read** (snapshotting the

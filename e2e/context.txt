@@ -1,9 +1,0 @@
-# Panel context: cmd+i serializes the focused panel's identity and the
-# query trace from its last draw to a file (and the clipboard).
-wait 700
-click "Q3 infra"
-wait 500
-key cmd+i
-wait 400
-shot x1-context
-quit
