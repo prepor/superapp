@@ -8,6 +8,12 @@
 //! [`Secrets`] capability, which is the macOS keychain
 //! on a real run and memory under a script. This module only knows the key it
 //! is filed under.
+//!
+//! What is filed there is the Cloudflare API token's **value**, not the S3
+//! secret access key: by Cloudflare's definition the latter is the SHA-256 of
+//! the former, so [`creds`] hashes on the way to a signature and the same
+//! entry can be borne as a token by whatever else this account owns —
+//! [`gateway`] is the AI gateway asking for exactly that.
 
 use std::net::TcpStream;
 use std::path::Path;
@@ -27,8 +33,17 @@ const ENV_KEY: &str = "SUPERAPP_R2_ACCESS_KEY_ID";
 const ENV_SECRET: &str = "SUPERAPP_R2_SECRET_ACCESS_KEY";
 const ENV_REGION: &str = "SUPERAPP_R2_REGION";
 
+/// Where the bucket is, when nothing pointed this process at one. The shell
+/// reads the same variable (behind its `--bucket` flag); this is the half of
+/// that resolution the kernel can do on its own.
+const ENV_BUCKET: &str = "SUPERAPP_BUCKET";
+
 /// R2 signs under one region name whatever the bucket's jurisdiction.
 const R2_REGION: &str = "auto";
+
+/// Every R2 endpoint is a label under this domain, and the label is the
+/// Cloudflare account — which is how [`account_of`] finds the gateway.
+const R2_DOMAIN: &str = "r2.cloudflarestorage.com";
 
 // -- credentials ---------------------------------------------------------------
 
@@ -36,6 +51,8 @@ const R2_REGION: &str = "auto";
 #[derive(Clone)]
 pub struct Creds {
     pub key_id: String,
+    /// The *secret access key*, which for an R2 token is the SHA-256 of its
+    /// value — never the value itself. [`creds`] is what computes it.
     pub secret: String,
     pub region: String,
 }
@@ -52,11 +69,11 @@ impl std::fmt::Debug for Creds {
 }
 
 /// Reads the `bucket` file beside the store: line 1 the URL, line 2 the
-/// access key id, line 3 the secret. One file, because a device that is
-/// configured by `adb push` (android) has no environment and no keychain —
-/// the app sandbox is its perimeter, the same trade the platform's secret
-/// store makes. Blank lines and `#` comments are skipped, so the file can
-/// carry a note.
+/// access key id, line 3 the Cloudflare API token's value. One file, because
+/// a device that is configured by `adb push` (android) has no environment and
+/// no keychain — the app sandbox is its perimeter, the same trade the
+/// platform's secret store makes. Blank lines and `#` comments are skipped,
+/// so the file can carry a note.
 fn from_file(dir: Option<&Path>) -> Vec<String> {
     let Some(dir) = dir else {
         return Vec::new();
@@ -94,12 +111,29 @@ pub fn secret_key(key_id: &str) -> String {
 ///
 /// The key id is not a secret and may sit in a file; the secret is looked up
 /// last so that a keychain entry, once written by `--r2-login`, is enough.
+/// What is filed is the token's value and what signs is its hash: see
+/// [`s3_secret`].
 ///
 /// # Errors
 ///
 /// If either half cannot be found — with the places we looked, because a
 /// device that silently syncs nothing is the worst outcome here.
 pub fn creds(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<Creds, String> {
+    let (key_id, secret) = filed(dir, secrets)?;
+    Ok(Creds {
+        key_id,
+        secret: s3_secret(&secret),
+        region: env(ENV_REGION).unwrap_or_else(|| R2_REGION.to_string()),
+    })
+}
+
+/// The key id and the secret exactly as they were filed, in the one order
+/// every reader of them uses.
+///
+/// Two things read this now — [`creds`], which hashes, and [`gateway`], which
+/// bears the value — and they must never disagree about *which* token this
+/// device holds, so neither may look somewhere the other does not.
+fn filed(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<(String, String), String> {
     let file = from_file(dir);
     let key_id = env(ENV_KEY)
         .or_else(|| file.get(1).cloned())
@@ -116,11 +150,132 @@ pub fn creds(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<Creds, Str
                  or put it on line 3 of the `bucket` file"
             )
         })?;
-    Ok(Creds {
-        key_id,
-        secret,
-        region: env(ENV_REGION).unwrap_or_else(|| R2_REGION.to_string()),
-    })
+    Ok((key_id, secret))
+}
+
+/// Whether a filed secret is already an S3 secret access key rather than the
+/// token it is made from: 64 hex digits, which is what a SHA-256 in hex is.
+///
+/// A device configured before the gateway existed filed what the dashboard
+/// showed it — the hash — and from a hash no token can be recovered. Asking
+/// every such device to run `--r2-login` once more would be the tidier rule;
+/// judging a secret by its shape is deliberately preferred to it, because
+/// then a device that already syncs keeps syncing whatever it holds and only
+/// the gateway asks for anything. The shape is unambiguous: a Cloudflare API
+/// token is 40 characters of `[A-Za-z0-9_-]` and can never be 64 hex digits.
+#[must_use]
+fn is_hash(secret: &str) -> bool {
+    secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The S3 secret access key a filed secret signs with: by Cloudflare's
+/// definition the SHA-256 of the API token's value, hex — or the secret
+/// itself, when a device filed that hash before this change.
+#[must_use]
+fn s3_secret(secret: &str) -> String {
+    if is_hash(secret) {
+        secret.to_string()
+    } else {
+        sha256_hex(secret.as_bytes())
+    }
+}
+
+// -- the same token, at the gateway --------------------------------------------
+
+/// What Cloudflare's AI gateway needs: whose account it is, and the API token
+/// to bear. Both are things device sync already holds — there is no second
+/// credential anywhere in this app.
+#[derive(Clone)]
+pub struct GatewayCreds {
+    pub account: String,
+    pub token: String,
+}
+
+/// Never let the token reach a log line by accident, as [`Creds`] does not.
+impl std::fmt::Debug for GatewayCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayCreds")
+            .field("account", &self.account)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The Cloudflare account a bucket URL belongs to: the first label of an
+/// `https://{account}.r2.cloudflarestorage.com/…` host.
+///
+/// A jurisdiction puts one more label between the two
+/// (`{account}.eu.r2.cloudflarestorage.com`); the account is still the first,
+/// so any host under the R2 domain answers.
+///
+/// `None` for anything else — the local `bucketd`, some other S3 endpoint —
+/// which is a device with a bucket and no gateway.
+#[must_use]
+pub fn account_of(url: &str) -> Option<String> {
+    if !url.trim().starts_with("https://") {
+        return None;
+    }
+    let host = host_of(url).to_ascii_lowercase();
+    let (account, domain) = host.split_once('.')?;
+    // Nothing but a jurisdiction's own label may stand between the two.
+    let between = domain.strip_suffix(R2_DOMAIN);
+    let on_r2 = between.is_some_and(|j| j.is_empty() || j.ends_with('.'));
+    (!account.is_empty() && on_r2).then(|| account.to_string())
+}
+
+/// A URL's host, without scheme, port or path — the part worth quoting when
+/// it is the host that is wrong.
+fn host_of(url: &str) -> &str {
+    let rest = url.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    }
+}
+
+/// The gateway's credentials, out of what device sync is already configured
+/// with: the account off the bucket's host, and the same API token, borne
+/// whole this time.
+///
+/// The URL is read the way the kernel reads it — the environment, then the
+/// `bucket` file's first line. The shell's `--bucket` flag is argv's, and
+/// argv is the shell's; a run pointed at a bucket by flag alone still finds
+/// its account here only if the environment or the file names one too. The
+/// token comes through [`filed`], the same lookup in the same order [`creds`]
+/// uses, so the gateway and the bucket can never be opened by two different
+/// tokens.
+///
+/// # Errors
+///
+/// If there is no bucket to read an account off, if its host is not R2's, if
+/// no secret is filed, or if what is filed is the old S3 hash — from which no
+/// token can be recovered. Each says where to put what is missing.
+pub fn gateway(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<GatewayCreds, String> {
+    let url = env(ENV_BUCKET)
+        .or_else(|| url_from_file(dir))
+        .ok_or_else(|| {
+            format!(
+                "no bucket — the gateway's account is read off the bucket's host: \
+                 set {ENV_BUCKET}, or put it on line 1 of the `bucket` file"
+            )
+        })?;
+    let account = account_of(&url).ok_or_else(|| {
+        format!(
+            "the gateway's account cannot be read off {:?} — it is the first label of \
+             an R2 host, <account>.{R2_DOMAIN}",
+            host_of(&url)
+        )
+    })?;
+    let (key_id, token) = filed(dir, secrets)?;
+    if is_hash(&token) {
+        return Err(format!(
+            "the secret for {key_id} is the S3 hash, not the token — \
+             run `superapp --r2-login` again, with the token's value"
+        ));
+    }
+    Ok(GatewayCreds { account, token })
 }
 
 /// A secret as the signature needs it: nothing around it, and not empty.
@@ -157,10 +312,11 @@ pub fn config_path(dir: &Path) -> std::path::PathBuf {
     dir.join("bucket")
 }
 
-/// The `bucket` file's contents for a URL and key id. The secret is
+/// The `bucket` file's contents for a URL and key id. The token is
 /// deliberately **not** written: the form puts it in the platform's secret
 /// store instead, which is the whole reason the form exists. A file pushed by
-/// hand may still carry one on line 3 — this is what replaces it.
+/// hand may still carry the token's value on line 3 — this is what replaces
+/// it.
 #[must_use]
 pub fn config_bytes(url: &str, key_id: &str) -> Vec<u8> {
     let mut out = format!("{}\n", url.trim());
@@ -174,6 +330,9 @@ pub fn config_bytes(url: &str, key_id: &str) -> Vec<u8> {
 /// `key_id` can be found. Nothing is written and nothing is contacted: it is
 /// the check a form runs *before* persisting what the user typed, so a typo
 /// never becomes the thing the next launch reads.
+///
+/// Either shape of secret passes: the token's value, which is what a form
+/// takes now, and the S3 hash a device filed before it did.
 ///
 /// # Errors
 ///
@@ -201,7 +360,7 @@ pub fn check(
         url,
         Creds {
             key_id: key_id.to_string(),
-            secret,
+            secret: s3_secret(&secret),
             region: env(ENV_REGION).unwrap_or_else(|| R2_REGION.to_string()),
         },
     )
@@ -740,10 +899,15 @@ fn xml_tags(text: &str, tag: &str) -> Vec<String> {
 
 // -- --r2-login ----------------------------------------------------------------
 
-/// `superapp --r2-login`: read the secret access key from **stdin** and
-/// put it where the platform keeps secrets — the macOS keychain, or a private
-/// file beside the store. Answers the process exit code, or `None` when the
-/// flag was not given (in which case the app starts normally).
+/// `superapp --r2-login`: read the Cloudflare API token's value from
+/// **stdin** and put it where the platform keeps secrets — the macOS
+/// keychain, or a private file beside the store. Answers the process exit
+/// code, or `None` when the flag was not given (in which case the app starts
+/// normally).
+///
+/// The value, not the S3 secret access key the dashboard shows beside it:
+/// the key is the value's hash ([`s3_secret`] takes it from here), and this
+/// device has more than a bucket to open with it.
 ///
 /// Stdin, not a flag: an argument is in `ps` and in the shell's history, and
 /// this one key can write the whole lineage.
@@ -772,19 +936,19 @@ pub fn login_from_argv(secrets: &mut dyn Secrets) -> Option<i32> {
             return Some(2);
         }
     };
-    eprintln!("secret access key for {key_id} (from stdin):");
+    eprintln!("cloudflare api token for {key_id} — its value, not the S3 hash (from stdin):");
     let mut secret = String::new();
     if std::io::stdin().read_line(&mut secret).is_err() {
-        eprintln!("--r2-login: could not read the secret");
+        eprintln!("--r2-login: could not read the token");
         return Some(2);
     }
     let secret = secret.trim();
     if secret.is_empty() {
-        eprintln!("--r2-login: the secret is empty — nothing stored");
+        eprintln!("--r2-login: the token is empty — nothing stored");
         return Some(2);
     }
     if secrets.set(&secret_key(&key_id), secret) {
-        eprintln!("--r2-login: stored the secret for {key_id}");
+        eprintln!("--r2-login: stored the token for {key_id}");
         Some(0)
     } else {
         eprintln!("--r2-login: the platform refused to store it");
@@ -795,6 +959,7 @@ pub fn login_from_argv(secrets: &mut dyn Secrets) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caps::MemSecrets;
 
     /// The AWS SigV4 test suite's `get-vanilla` case, byte for byte. It fixes
     /// every step at once — canonical request, scope, signing key, signature —
@@ -947,6 +1112,142 @@ mod tests {
         // names where to put one, instead of signing with the empty string.
         assert_eq!(clean_secret("\n".into()), None);
         assert_eq!(clean_secret(String::new()), None);
+    }
+
+    /// A real R2 endpoint, and a token of the shape Cloudflare mints: 40
+    /// characters of `[A-Za-z0-9_-]`.
+    const URL: &str = "https://acc7.r2.cloudflarestorage.com/superapp";
+    const TOKEN: &str = "3Zt_qL9xN2mWv0bYcE8sRfKu-1TgHjAd6PoQiXeZ";
+
+    /// A directory with a `bucket` file in it, as a store's directory has.
+    fn bucket_dir(what: &str, lines: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "superapp-r2-{what}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if lines.is_empty() {
+            let _ = std::fs::remove_file(dir.join("bucket"));
+        } else {
+            std::fs::write(dir.join("bucket"), lines.join("\n")).unwrap();
+        }
+        dir
+    }
+
+    /// The one fact this whole arrangement rests on: what is filed is the
+    /// token's value, what signs is its SHA-256, and the gateway gets the
+    /// value — so one credential opens both and neither is stored twice.
+    #[test]
+    fn the_filed_token_signs_as_its_hash_and_is_borne_whole() {
+        let dir = bucket_dir("token", &[URL, "AK", TOKEN]);
+        let mut secrets = MemSecrets::new();
+
+        let c = creds(Some(&dir), &mut secrets).unwrap();
+        assert_eq!(c.key_id, "AK");
+        assert_eq!(c.secret, sha256_hex(TOKEN.as_bytes()));
+        assert_ne!(c.secret, TOKEN);
+
+        let g = gateway(Some(&dir), &mut secrets).unwrap();
+        assert_eq!(g.token, TOKEN);
+        assert_eq!(g.account, "acc7");
+        // And it is not the sort of thing that lands in a log.
+        assert!(!format!("{g:?}").contains(TOKEN), "{g:?}");
+    }
+
+    /// The keychain of a device configured before any of this: it holds the
+    /// hash, which still signs — the sync it has never breaks — and cannot be
+    /// turned back into a token, so the gateway says exactly that.
+    #[test]
+    fn a_secret_filed_as_the_hash_still_signs_and_opens_no_gateway() {
+        let hash = sha256_hex(TOKEN.as_bytes());
+        let dir = bucket_dir("hash", &[URL, "AK"]);
+        let mut secrets = MemSecrets::new();
+        secrets.plant(&secret_key("AK"), &hash);
+
+        assert_eq!(creds(Some(&dir), &mut secrets).unwrap().secret, hash);
+        assert_eq!(
+            gateway(Some(&dir), &mut secrets).unwrap_err(),
+            "the secret for AK is the S3 hash, not the token — run `superapp --r2-login` \
+             again, with the token's value"
+        );
+    }
+
+    /// What the gateway says when it cannot be opened — each sentence naming
+    /// the place the missing thing goes, because a run that quietly cannot
+    /// ask anything is the worst outcome here too.
+    #[test]
+    fn the_gateway_says_what_it_is_missing() {
+        let mut secrets = MemSecrets::new();
+
+        // No bucket at all: no host, so no account.
+        let none = bucket_dir("no-bucket", &[]);
+        assert_eq!(
+            gateway(Some(&none), &mut secrets).unwrap_err(),
+            "no bucket — the gateway's account is read off the bucket's host: \
+             set SUPERAPP_BUCKET, or put it on line 1 of the `bucket` file"
+        );
+
+        // The local daemon is a bucket, but it is nobody's Cloudflare account.
+        let local = bucket_dir("local", &["http://127.0.0.1:9299", "AK", TOKEN]);
+        assert_eq!(
+            gateway(Some(&local), &mut secrets).unwrap_err(),
+            "the gateway's account cannot be read off \"127.0.0.1\" — it is the first \
+             label of an R2 host, <account>.r2.cloudflarestorage.com"
+        );
+
+        // A real bucket, and nothing filed for its key.
+        let bare = bucket_dir("bare", &[URL, "AK"]);
+        assert_eq!(
+            gateway(Some(&bare), &mut secrets).unwrap_err(),
+            "no secret for AK — run `superapp --r2-login`, set \
+             SUPERAPP_R2_SECRET_ACCESS_KEY, or put it on line 3 of the `bucket` file"
+        );
+    }
+
+    /// The account is the first label of an R2 host, and nothing else is an
+    /// R2 host.
+    #[test]
+    fn the_account_is_read_off_an_r2_host_only() {
+        assert_eq!(
+            account_of("https://acc7.r2.cloudflarestorage.com/superapp/demo-7").as_deref(),
+            Some("acc7")
+        );
+        assert_eq!(
+            account_of("  https://acc7.r2.cloudflarestorage.com  ").as_deref(),
+            Some("acc7")
+        );
+        // A jurisdiction's endpoint has one more label; the account is still
+        // the first one.
+        assert_eq!(
+            account_of("https://acc7.eu.r2.cloudflarestorage.com/superapp").as_deref(),
+            Some("acc7")
+        );
+        // The local daemon, an ordinary host, a plaintext R2 URL, junk.
+        assert_eq!(account_of("http://127.0.0.1:9299"), None);
+        assert_eq!(account_of("https://example.com/superapp"), None);
+        assert_eq!(account_of("http://acc7.r2.cloudflarestorage.com/b"), None);
+        assert_eq!(account_of("not a url"), None);
+        assert_eq!(account_of(""), None);
+    }
+
+    /// Telling the two shapes apart is the whole of the compatibility rule,
+    /// so it is pinned on both of them.
+    #[test]
+    fn a_hash_is_told_from_a_token_by_its_shape() {
+        let hash = sha256_hex(TOKEN.as_bytes());
+        assert_eq!(hash.len(), 64);
+        assert!(is_hash(&hash));
+        assert!(is_hash(&hash.to_ascii_uppercase()));
+        // One digit short of a hash is not one.
+        assert!(!is_hash(&hash[..63]));
+        // A token: 40 characters, and `_` and `-` are not hex.
+        assert_eq!(TOKEN.len(), 40);
+        assert!(!is_hash(TOKEN));
+        assert!(!is_hash(""));
+        // Which is what decides whether the value is hashed or passed on.
+        assert_eq!(s3_secret(TOKEN), hash);
+        assert_eq!(s3_secret(&hash), hash);
     }
 
     /// A broken bucket answers every verb with its reason — which is what

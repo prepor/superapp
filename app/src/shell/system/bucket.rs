@@ -9,6 +9,10 @@
 //! the only way it can be. The secret field is write-only — it is seeded
 //! blank even on a configured device, because a key that can be read back
 //! off a screen is a key that leaves by a route nobody chose.
+//!
+//! What goes in that field is the Cloudflare API token's *value*: the key
+//! the bucket signs with is its hash, taken on the way to a signature
+//! ([`r2::creds`]), and the value is the one credential this device has.
 
 use std::any::Any;
 
@@ -33,8 +37,8 @@ pub struct Bucket {
     id: PanelId,
     url: String,
     key_id: String,
-    /// Write-only: typed in, filed in the platform's secret store, and
-    /// cleared. Never read back out for display.
+    /// The Cloudflare API token's value. Write-only: typed in, filed in the
+    /// platform's secret store, and cleared. Never read back out for display.
     secret: String,
 }
 

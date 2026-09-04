@@ -743,8 +743,9 @@ impl ProblemSource for BucketProblem {
 
 // -- the secret a bucket is opened with ---------------------------------------
 
-/// Store the device-sync bucket's secret access key, under the id it belongs
-/// to. The one road a device with no shell and no cable has to a credential.
+/// Store the device-sync bucket's Cloudflare API token, under the id it
+/// belongs to — its value, which [`r2::creds`] hashes into a secret access
+/// key. The one road a device with no shell and no cable has to a credential.
 pub struct BucketSecret<'a> {
     pub key_id: &'a str,
     pub secret: &'a str,

@@ -563,7 +563,7 @@ script_mod! {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "SECRET" }
             secret_input := mod.widgets.SField {
-                empty_text: "secret access key — stored, never shown"
+                empty_text: "cloudflare api token — its value, stored, never shown"
                 autocapitalize: AutoCapitalize.None
                 autocorrect: AutoCorrect.Disabled
             }
@@ -572,7 +572,7 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel {
                 width: Fill
-                text: "the secret goes to this machine's keychain, never to the store: it is the one thing that must not replicate."
+                text: "the token goes to this machine's keychain, never to the store: it is the one thing that must not replicate."
                 draw_text +: { color: #909090 }
             }
         }

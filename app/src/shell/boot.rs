@@ -87,7 +87,7 @@ superapp — specialized panels on one scrolling workspace.
 
   --db PATH           the store to open (default: the app support directory)
   --bucket URL        point this device at a device-sync bucket
-  --r2-login          read a bucket's secret key from stdin, file it, exit
+  --r2-login          read the cloudflare api token from stdin, file it, exit
   --library [NAME...] open the panels library instead of a workspace,
                       narrowed to the scenes whose names match
   --grid WxH          the unit grid a workspace is cut into
