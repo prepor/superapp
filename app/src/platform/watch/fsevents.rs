@@ -49,9 +49,24 @@ const SINCE_NOW: FSEventStreamEventId = 0xFFFF_FFFF_FFFF_FFFF;
 /// into the latency below, so a single touch is prompt and a thousand-file
 /// copy is still one delivery.
 const NO_DEFER: FSEventStreamCreateFlags = 0x0000_0002;
+/// Report what happens *to* a watched directory as well as in it: moved,
+/// renamed, deleted, or an ancestor of it moved. Without this a panel
+/// whose directory is taken out from under it — `~/src` renamed while a
+/// listing of `~/src/ui` is open — hears nothing more, ever, and goes on
+/// drawing a listing of a path that is not there. The event arrives on
+/// the path as it was asked for, so it matches like any other and the
+/// panel reads again and says what it finds.
+const WATCH_ROOT: FSEventStreamCreateFlags = 0x0000_0004;
 /// How long FSEvents gathers a burst before delivering it, in seconds. The
 /// first grouping of the two; the callback's own is the second.
 const LATENCY: CFTimeInterval = 0.25;
+
+/// The three flags that mean *events were lost*: the queue overflowed in
+/// the daemon or the kernel, or so much happened at once that FSEvents
+/// will only say "look under here again". None of them carries what
+/// changed, so what they are answered with is a reading of everything
+/// being watched — the same thing inotify's own overflow gets.
+const LOST: FSEventStreamEventFlags = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 #[repr(C)]
 struct FSEventStreamContext {
@@ -302,7 +317,7 @@ impl Stream {
                 array,
                 SINCE_NOW,
                 LATENCY,
-                NO_DEFER,
+                NO_DEFER | WATCH_ROOT,
             )
         };
         let made = Stream {
@@ -348,12 +363,16 @@ impl Drop for Stream {
 
 /// One delivery: every path it carried, matched against the directories
 /// somebody is looking at, and reported as a single round.
+///
+/// An event that says events were lost is answered with all of them: a
+/// listing that may be stale and a listing that is known to be stale are
+/// worth the same one reading.
 extern "C" fn changed(
     _stream: FSEventStreamRef,
     info: *mut c_void,
     count: usize,
     paths: *mut c_void,
-    _flags: *const FSEventStreamEventFlags,
+    flags: *const FSEventStreamEventFlags,
     _ids: *const FSEventStreamEventId,
 ) {
     if info.is_null() || paths.is_null() || count == 0 {
@@ -365,12 +384,19 @@ extern "C" fn changed(
     let paths = paths.cast::<*const c_char>();
     let mut hit: Vec<PathBuf> = Vec::new();
     for i in 0..count {
+        if !flags.is_null() && unsafe { *flags.add(i) } & LOST != 0 {
+            let all: Vec<PathBuf> = watch.dirs.iter().map(|(asked, _)| asked.clone()).collect();
+            watch.w.report(&all);
+            return;
+        }
         let p = unsafe { *paths.add(i) };
         if p.is_null() {
             continue;
         }
         let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
         let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+        // Every spelling of the directory it happened in, not the first:
+        // two panels may have reached one directory by two paths.
         for (asked, canon) in &watch.dirs {
             if canon == path && !hit.contains(asked) {
                 hit.push(asked.clone());

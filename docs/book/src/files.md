@@ -252,11 +252,16 @@ The machine behind the capability is `app/src/platform/watch/`: FSEvents on
 macOS, inotify on android, and on any other platform nothing at all, which
 leaves a panel refreshing on its own writes alone. Watching is per directory
 and never recursive, so a build running three levels down is not a listing's
-business. Events are grouped twice: the platform coalesces a burst into one
-delivery, and a delivery bumps a directory once however many paths it carried —
-a thousand-file copy is one reading, not a thousand. The watching thread rings
-the UI thread's bell, and the shell redraws; each panel then works out for
-itself whether the round was its own directory's.
+business. A directory taken out from under a panel — moved, renamed or deleted
+— is a change to that directory and reported as one, so a listing never goes on
+drawing a path that is not there. When the platform says only that events were
+lost, every watched directory is reported: a listing that may be stale and one
+known to be stale are worth the same reading. Events are otherwise grouped
+twice: the platform coalesces a burst into one delivery, and a delivery bumps a
+directory once however many paths it carried — a thousand-file copy is one
+reading, not a thousand. The watching thread rings the UI thread's bell, and
+the shell redraws; each panel then works out for itself whether the round was
+its own directory's.
 
 A scripted run is never watched, real disk or demo tree: a suite's frames may
 not depend on what the machine it runs on happens to be doing.

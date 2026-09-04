@@ -238,8 +238,26 @@ mod tests {
             "the books forgot it with the watch"
         );
 
+        // A directory taken out from under a panel is news about that
+        // directory: without `WATCH_ROOT` this is the one change FSEvents
+        // would never mention, and the panel would draw a listing of a
+        // path that is not there for as long as it stayed open.
+        w.watch(&watched);
+        let gone = next_door.with_file_name("superapp-watch-gone");
+        let _ = std::fs::remove_dir_all(&gone);
+        std::thread::sleep(patience);
+        std::fs::rename(&watched, &gone).expect("the directory moves away");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while w.revision(&watched) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            w.revision(&watched) > 0,
+            "the watched directory itself moving is a change to it"
+        );
+
         drop(w); // the thread stops with the watcher, and joins
-        for dir in [watched, next_door] {
+        for dir in [next_door, gone] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

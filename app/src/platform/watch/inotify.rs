@@ -22,7 +22,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
 use super::{Watching, TURN};
@@ -56,6 +56,12 @@ const IN_ONLYDIR: u32 = 0x0100_0000;
 /// The kernel's own queue overflowed and events were lost. What was missed
 /// cannot be known, so every watched directory is reported.
 const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+/// This watch is over: the directory went, or moved, or the watch was
+/// removed. The kernel says it once and never speaks for that descriptor
+/// again, so what it costs is the watch itself — the loop takes the
+/// descriptor back and asks for the directory again on its next turn, in
+/// case something has put it back.
+const IN_IGNORED: u32 = 0x0000_8000;
 
 const O_CLOEXEC: c_int = 0o200_0000;
 const O_NONBLOCK: c_int = 0o000_4000;
@@ -164,38 +170,66 @@ fn watch_loop(w: &Watching, knocks: c_int) {
         eprintln!("watch: the disk is not being watched — inotify would not open");
         return;
     }
-    // What was last asked for, and what is actually being watched: a
-    // directory that has gone is asked for and not watched, and keeping
-    // the two apart is what stops the loop rebuilding over it every turn.
-    let mut asked: Vec<PathBuf> = Vec::new();
+    // Every directory wanted, with the descriptor it is being watched
+    // under — `NONE` for one that is wanted and not watched, which is a
+    // directory that was not there when the panel opened, or that has
+    // gone since. Those are asked for again on every turn: a watch lost
+    // is a watch the kernel will not restore, and a path can come back.
     let mut have: Vec<(PathBuf, c_int)> = Vec::new();
     while !w.stopped() {
         let want = w.want();
-        if want != asked {
-            for (_, wd) in have.drain(..) {
-                unsafe { inotify_rm_watch(fd, wd) };
+        if !same(&have, &want) {
+            // What is no longer wanted is let go of; what still is keeps
+            // the watch it has, so an opening panel disturbs no other —
+            // and no descriptor is freed only to be handed straight back,
+            // which is how a queued `IN_IGNORED` would land on the wrong
+            // watch.
+            have.retain(|(dir, wd)| {
+                let keep = want.binary_search(dir).is_ok();
+                if !keep && *wd != NONE {
+                    unsafe { inotify_rm_watch(fd, *wd) };
+                }
+                keep
+            });
+            for dir in want {
+                if !have.iter().any(|(d, _)| *d == dir) {
+                    have.push((dir, NONE));
+                }
             }
-            have = want.iter().cloned().filter_map(|d| add(fd, d)).collect();
-            asked = want;
+            have.sort_by(|(a, _), (b, _)| a.cmp(b));
+        }
+        for (dir, wd) in have.iter_mut().filter(|(_, wd)| *wd == NONE) {
+            *wd = add(fd, dir);
         }
         wait(fd, knocks, TURN);
-        let hit = drain(fd, &have);
+        let hit = drain(fd, &mut have);
         w.report(&hit);
     }
-    for (_, wd) in have.drain(..) {
+    for (_, wd) in have.drain(..).filter(|(_, wd)| *wd != NONE) {
         unsafe { inotify_rm_watch(fd, wd) };
     }
     unsafe { close(fd) };
 }
 
-/// One directory watched, with the descriptor it will be reported under.
-/// A directory that has gone between the panel opening and this — or that
-/// is not a directory at all — is simply not watched: the panel's own
-/// listing already says so.
-fn add(fd: c_int, dir: PathBuf) -> Option<(PathBuf, c_int)> {
-    let text = CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let wd = unsafe { inotify_add_watch(fd, text.as_ptr(), WATCHING) };
-    (wd >= 0).then_some((dir, wd))
+/// No descriptor: wanted, not watched.
+const NONE: c_int = -1;
+
+/// Whether the directories being kept are the ones wanted. Both are
+/// sorted — the books answer in key order and the list is kept in it — so
+/// this is the comparison and not a search.
+fn same(have: &[(PathBuf, c_int)], want: &[PathBuf]) -> bool {
+    have.len() == want.len() && have.iter().zip(want).all(|((d, _), w)| d == w)
+}
+
+/// One directory watched, or [`NONE`] where it cannot be: a directory that
+/// has gone, or that is not a directory at all. Never fatal and never
+/// final — the panel's own listing already says what it found, and the
+/// loop asks again next turn.
+fn add(fd: c_int, dir: &Path) -> c_int {
+    let Ok(text) = CString::new(dir.as_os_str().as_bytes()) else {
+        return NONE;
+    };
+    unsafe { inotify_add_watch(fd, text.as_ptr(), WATCHING) }
 }
 
 /// Sleeps until inotify has something, the handle knocks, or the turn ends.
@@ -223,7 +257,10 @@ fn wait(fd: c_int, knocks: c_int, turn: f64) {
 
 /// Everything inotify has to say right now, as the set of directories it
 /// happened in — one round however many events carried it.
-fn drain(fd: c_int, have: &[(PathBuf, c_int)]) -> Vec<PathBuf> {
+///
+/// A watch the kernel has closed is taken back here rather than left
+/// standing dead, so the loop's next turn asks for that directory again.
+fn drain(fd: c_int, have: &mut [(PathBuf, c_int)]) -> Vec<PathBuf> {
     // Aligned, because what is read into it is a run of C structs.
     #[repr(C, align(8))]
     struct Buf([u8; 4096]);
@@ -245,9 +282,15 @@ fn drain(fd: c_int, have: &[(PathBuf, c_int)]) -> Vec<PathBuf> {
                 // What was lost cannot be known: everything is stale.
                 return have.iter().map(|(d, _)| d.clone()).collect();
             }
-            if let Some((dir, _)) = have.iter().find(|(_, wd)| *wd == e.wd) {
+            // Every directory under that descriptor, not the first: one
+            // inode reached by two paths is watched once, and both panels
+            // are looking at what changed.
+            for (dir, wd) in have.iter_mut().filter(|(_, wd)| *wd == e.wd) {
                 if !hit.contains(dir) {
                     hit.push(dir.clone());
+                }
+                if e.mask & IN_IGNORED != 0 {
+                    *wd = NONE;
                 }
             }
             at += HEAD + e.len as usize;
