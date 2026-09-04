@@ -2,7 +2,8 @@
 
 The rich table is one component in two halves. The kernel half is state a panel
 instance owns; the shell half is one widget that draws any such state.
-Mailboxes, the effect log, and the file browser are three panels over one
+Mailboxes, the effect log, the file browser and the
+[search panel](./interaction-grammar.md#search) are four panels over one
 component.
 
 ## The kernel half: state the panel owns
@@ -174,3 +175,9 @@ combined with the in-memory effect ring through `UNION ALL`, and its spec
 declares the ring as a dependency because SQLite's query tracker cannot
 discover changes outside database tables. See
 [Recent in-memory effects](./data-substrate.md#recent-in-memory-effects).
+
+A source need not be SQL at all. The file browser's rows are a directory
+listing and the search panel's are what the sources answered with; both
+implement `Datasource` over a vector in memory, and both hand the table a
+fresh source when what they list changes — which keeps the cursor and the
+marks, since a mark is a key and not a row.

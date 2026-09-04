@@ -105,9 +105,12 @@ Cmd is the workspace modifier. The reserved chords are:
 - `cmd+enter`: reserved so that no bar may claim it, and handed to the focused
   panel, which reads it as *open un-joined*;
 - `shift+cmd+l`: raise or lower the panels library over the workspace;
+- `shift+cmd+s`: go to the search panel, wherever it stands;
 - a double tap of `cmd`: the launcher.
 
-All other Cmd letters may be used by the focused panel's bar.
+All other Cmd letters may be used by the focused panel's bar. Only the shifted
+`s` is reserved: plain `cmd+s` still belongs to whatever bar wears it, and a
+bar is only ever reached without Shift.
 
 In a list, arrows move the cursor and keep it visible, `enter` opens the row
 and goes to it, `/` focuses the filter, `space` toggles the current mark unless
@@ -131,8 +134,10 @@ chords, and the chords are the keyboard's.
 
 ## The launcher
 
-Double-tap Cmd to open the launcher. It searches open panels, every app's
-roots, and every app's own search sources. Every word in the query must match.
+Double-tap Cmd to open the launcher. It is the switcher: it runs over the
+panels that are open and every app's roots, and over nothing else. Every word
+in the query must match, by prefix, some word of a panel's title, its tag, or a
+root's extra words.
 
 An open result focuses its existing panel and switches workspace if needed. A
 new result opens as a separate last column in the current workspace. The
@@ -142,6 +147,28 @@ With an empty query, open panels appear first, followed by roots in app-list
 order. Arrow keys wrap through results. `enter` opens the selected result;
 `esc`, another double-Cmd, or a click outside closes the launcher. It is also
 available in the macOS menu.
+
+## Search
+
+`shift+cmd+s` goes to the search panel — focused wherever it already stands,
+opened beside the focused panel where it does not. It is a panel and not an
+overlay, so an answer stays on screen while it is read, is walked and marked
+like any other list, and can be sent to a workspace of its own.
+
+The line above its rows is read twice over. Its **words** are the question, put
+to every app's own search source at once; each source answers on its own
+thread, and the list stays in the order the sources were registered in however
+the threads were scheduled — so a late source inserts its band where it
+belongs, and the cursor and the marks, which are rows and not numbers, follow
+their own rows through it. Its **`@` tags** narrow what came back: `@app:mail`
+keeps one source's rows. The words are never a second sieve over the answer —
+a letter found by a word deep in its body has none of that word in the line the
+row draws.
+
+The rows are a rich table: arrows walk and preview, `enter` opens and goes,
+`space` marks, and *open n* opens every marked row at once, as one undoable
+step. An empty list says which kind of empty it is: nothing asked, nobody
+answered yet, or an answer of nothing.
 
 ## Undo
 
@@ -217,8 +244,8 @@ follows the join rule.
 
 Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
 column edge when they lift. Two fingers moving down raise the workspaces
-overlay, and its search row raises the launcher; two moving up put whichever
-overlay is up away.
+overlay, and its *search panels* row raises the launcher; two moving up put
+whichever overlay is up away.
 
 A long press on a panel's header picks the panel up. It then rides the finger,
 an ink insertion bar previews where a drop would land: vertical in a gap for

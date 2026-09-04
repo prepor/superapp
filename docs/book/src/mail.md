@@ -170,10 +170,13 @@ many messages are in mail. Its one verb, *messages from …* (`cmd+m`), opens th
 inbox filtered to that address. An address nobody has written from still opens
 and says so.
 
-The launcher's mail source answers with the people who wrote first and then the
+Mail's search source — what the [search panel](./interaction-grammar.md#search)
+puts a question to — answers with the people who wrote first and then the
 letters a query's words reach, best match first, out of an FTS5 index. Spam is
-left out of the sender side, so nothing a launcher or a compose field offers
-came out of the junk.
+left out of the sender side, so nothing a search or a compose field offers came
+out of the junk, and the trash is left out of the letters: a deleted mail is
+out of its own conversation, so a reader opened on one would have nothing to
+show. A source may only offer what can be read.
 
 ## Accounts
 

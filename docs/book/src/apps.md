@@ -2,14 +2,14 @@
 
 An app is what the shell can be extended with without being touched. Mail and
 files are apps; so is `system`, the shell's own, which supplies help, about,
-the effect log, the problems list, the device-sync form, and the card a panel
-gets when no app in this build owns its tag.
+the effect log, the problems list, the search panel, the device-sync form, and
+the card a panel gets when no app in this build owns its tag.
 
 The binary is the only place that knows which apps exist. `app/src/lib.rs`
 holds two lists side by side: `APPS`, what each app adds to the store, the
-queue and the launcher, and `UIS`, what it adds to the screen. The kernel
-builds one registry from the first at boot; the shell asks the second for
-templates.
+queue, the launcher and the search, and `UIS`, what it adds to the screen. The
+kernel builds one registry from the first at boot; the shell asks the second
+for templates.
 
 The doc comments on the traits are the specification. This chapter says what
 the pieces are and how they fit; `cargo doc -p kernel --open` says exactly what
@@ -47,7 +47,7 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `seed` | demo rows for a new store, once, on the first open of an empty one, for the outside that store's worlds will get |
 | `effects` | the app's deferred effect kinds, registered per world so a filed job decodes wherever it is read |
 | `outside` | the app's capabilities for one mode: `Real` gets the network and the OS, `Fake` the in-memory versions, `Deny` nothing |
-| `search_providers` | the launcher's sources beyond open panels and roots |
+| `search_providers` | the sources the search panel puts a question to |
 | `problems` | the standing conditions the app can be in |
 | `workers` | the background passes the app wants running now, derived from the store |
 | `roots` | the panels the launcher offers whether or not they are open |

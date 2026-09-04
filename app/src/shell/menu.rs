@@ -13,7 +13,6 @@
 //! The bar is rebuilt only when its signature changes, never per keystroke.
 
 use kernel::layout::WS_N;
-use kernel::nav::Nav;
 use kernel::problems::Announced;
 use kernel::session::Session;
 use makepad_widgets::*;
@@ -28,6 +27,7 @@ use super::stage::{Shell, Stage};
 const WS_MENU_SWITCH: u64 = 0x5753_0100;
 const WS_MENU_MOVE: u64 = 0x5753_0200;
 const MENU_LAUNCHER: u64 = 0x5753_0300;
+const MENU_SEARCH: u64 = 0x5753_0301;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
@@ -137,6 +137,7 @@ impl Stage {
 
         let mut items = vec![app_menu(vec![
             item(MENU_LAUNCHER, "Launcher — ⌘ ⌘", true, false),
+            item(MENU_SEARCH, "Search — ⇧⌘S", true, false),
             item(MENU_UNDO, "Undo — ⌘Z", true, false),
             item(MENU_REDO, "Redo — ⇧⌘Z", true, false),
             item(MENU_HISTORY, "History — ⌘U", true, false),
@@ -193,6 +194,8 @@ impl Stage {
             self.move_to_ws(sh, (id - WS_MENU_MOVE) as usize);
         } else if id == MENU_LAUNCHER {
             self.open_launcher(cx, sh);
+        } else if id == MENU_SEARCH {
+            self.go_to(sh, super::search_panel());
         } else if id == MENU_UNDO {
             self.do_undo(sh);
         } else if id == MENU_REDO {
@@ -207,17 +210,11 @@ impl Stage {
         }
     }
 
-    /// The panel that lists what stands wrong: focused wherever it already
-    /// is — another workspace included — or opened beside what has focus.
-    /// The same move the launcher makes for a root, and the one door both
-    /// ways in use — this bar's items, and the mark in the chrome's corner.
+    /// The panel that lists what stands wrong, gone to the way any root is
+    /// — the one door both ways in use take: this bar's items, and the mark
+    /// in the chrome's corner.
     pub(super) fn go_to_problems(&mut self, sh: &mut Shell) {
-        sh.overlay = Overlay::None;
-        let id = super::problems_panel();
-        match sh.session.showing(&id).first().copied() {
-            Some(slot) => sh.session.nav(Nav::Focus(slot)),
-            None => self.open_root(sh, id),
-        }
+        self.go_to(sh, super::problems_panel());
     }
 }
 

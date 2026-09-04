@@ -70,7 +70,7 @@ impl RowSpec for MailboxRows {
         Message::id(t.target)
     }
 
-    fn empty_line(filter: &str) -> String {
+    fn empty_line(_panel: &Self::Panel, filter: &str) -> String {
         if filter.trim().is_empty() {
             "nothing here".to_string()
         } else {

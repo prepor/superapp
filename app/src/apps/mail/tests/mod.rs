@@ -15,7 +15,7 @@ use kernel::app::{App, Apps, Env, Mode, Wake, Worker};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, VerbAct};
-use kernel::search::{Engine, Go};
+use kernel::search::{Engine, Go, Hit};
 use kernel::session::{Action, Session};
 use kernel::store::Store;
 
@@ -901,6 +901,47 @@ fn the_search_provider_finds_a_mail_by_its_subject() {
         .collect()
         .into_iter()
         .all(|a| a.hits.is_empty()));
+}
+
+/// A source may only offer what can be read: a deleted letter is out of
+/// every conversation, so a reader opened on one would draw an empty card —
+/// and the search does not offer it in the first place.
+#[test]
+fn a_deleted_letter_is_not_offered() {
+    let (mut s, _clock) = session();
+    let found = |s: &Session, q: &str| -> Vec<Hit> {
+        let mut engine = Engine::inline(s.apps().providers());
+        engine.ask(s.store(), 1, q);
+        engine.collect().into_iter().flat_map(|a| a.hits).collect()
+    };
+    let hits = found(&s, "thermos");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].label, "Sat hike — early start?");
+    // The letter the one hit names — how a search hit is opened.
+    let Go::Open(id) = hits[0].go.clone() else {
+        panic!("a provider offers something to open: {:?}", hits[0].go)
+    };
+    let hike = Message::of(&id).expect("a mail panel");
+
+    // The reader's own verb: the letter goes to the trash.
+    let list = open_root(&mut s, Role::Inbox.id());
+    go(&mut s, Nav::Open {
+        from: list,
+        id,
+        fresh: false,
+    });
+    let reader = s.joined_child(list).expect("a reader");
+    verb(&mut s, reader, "mail.delete");
+    assert_eq!(role_of(s.store(), hike), "trash");
+
+    assert!(
+        found(&s, "thermos").is_empty(),
+        "what the reader will not show, the search does not offer"
+    );
+    // Undo puts it back, and the search finds it again.
+    assert!(s.undo());
+    s.settle();
+    assert_eq!(found(&s, "thermos").len(), 1);
 }
 
 // -- the shape of the app ------------------------------------------------------------

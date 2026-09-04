@@ -92,6 +92,17 @@ pub fn problems_panel() -> kernel::panel::PanelId {
     system::Problems::id()
 }
 
+/// Where a question is put to every app's sources.
+///
+/// The panel that searches belongs to [`system`] like the one that lists
+/// problems does, and for the same reason: it is about no app in
+/// particular. `cmd+shift+s` and the menu's item go through here, so the
+/// chord names a panel and not a kind.
+#[must_use]
+pub fn search_panel() -> kernel::panel::PanelId {
+    system::Search::id()
+}
+
 /// Hands the shell the app list, both halves of it.
 ///
 /// The crate root is the only place that knows which apps exist: it lists

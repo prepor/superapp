@@ -1,0 +1,116 @@
+# args:
+# env:
+#
+# The search panel: `cmd+shift+s` raises it — wherever it already is — and it
+# opens on its field. What is typed there is one question put to every app's
+# own source; what comes back is a rich table like any other, so the walk
+# previews, `enter` opens and goes, and a marked set is opened in one step.
+#
+# Assertions are the clicks: a label that does not resolve fails the run. The
+# walk starts on an empty workspace, so every label that resolves below is
+# this panel's own doing and never the inbox's.
+
+wait 600
+
+key cmd+2
+wait 700
+
+# The chord. Nothing is showing here, so the panel is the whole workspace —
+# and the caret is already in its field: the question is typed without
+# clicking anything first.
+key cmd+shift+s
+wait 900
+shot s1-empty
+
+# A word out of a letter's subject. Every row says which source found it.
+type "q3"
+wait 800
+shot s2-found
+
+# The row opens the letter beside the list, joined — the same walk every
+# rich table's rows make. Its attachment is the proof that the letter, and
+# not merely a row about it, is on screen.
+click "Q3 infra budget draft"
+wait 900
+shot s3-opened
+click "q3-budget.csv"
+wait 500
+
+# The chord again, from the panel the attachment took the focus to: the
+# search is *gone to* wherever it stands, never opened a second time.
+key cmd+shift+s
+wait 800
+
+# The index reads the letter and not only its subject: "thermos" is in a
+# body and in no subject anywhere.
+key /
+wait 300
+key cmd+a
+type "thermos"
+wait 800
+shot s4-body-word
+
+# Down leaves the field for the rows and previews the first; `enter` opens
+# it and hands it the focus, which is the solid-link rule.
+key down
+wait 800
+key enter
+wait 900
+click "Sat hike — early start?"
+wait 500
+shot s5-walked
+
+# -- the tags ----------------------------------------------------------------
+
+# The words are the question; the `@` tags narrow the answer that came back.
+# Mail answers with the person before the letters — a contact is a fact about
+# the mailbox, not a document in it — so the first row is the card, and the
+# link off it is one no other panel carries.
+key cmd+shift+s
+wait 800
+key /
+wait 300
+key cmd+a
+type "vera @app:mail"
+wait 800
+# The tag's completion is up under the caret; esc puts it away and leaves
+# what was typed alone.
+key esc
+wait 400
+shot s6-by-source
+key down
+wait 800
+key enter
+wait 900
+click "messages from vera"
+wait 900
+shot s7-contact
+
+# -- a marked set ------------------------------------------------------------
+
+# Space marks the row under the cursor, shift+down takes the next one with
+# it, and the bar carries what the pair can do.
+key cmd+shift+s
+wait 800
+key /
+wait 300
+key cmd+a
+type "vera"
+wait 800
+key down
+wait 500
+type " "
+wait 400
+key shift+down
+wait 500
+shot s8-marked
+
+# Both at once, each a fresh un-joined column — and one node, so one undo
+# takes the lot back.
+click "open 2"
+wait 900
+shot s9-opened-both
+key cmd+z
+wait 900
+shot s10-undone
+quit

@@ -324,18 +324,6 @@ impl Stage {
         self.stale_hits = self.mount;
         self.arrived = self.mount && boot.steps.is_none();
         let (session, clock) = boot.session();
-        // Who answers the launcher's providers: threads in production — one
-        // each, so a slow source never delays a fast one — and inline under
-        // virtual time, where a scripted `type` must be followed by its rows
-        // in the same tick.
-        let providers = session.apps().providers();
-        let engine = if boot.virtual_time {
-            kernel::search::Engine::inline(providers)
-        } else {
-            kernel::search::Engine::threads(&session.store().db(), providers, || {
-                SignalToUI::set_ui_signal();
-            })
-        };
         let mut sh = Box::new(Shell {
             session,
             anim: Anim::default(),
@@ -345,7 +333,7 @@ impl Stage {
             toasts: Vec::new(),
             overlay: Overlay::None,
             overlay_last: Overlay::None,
-            launcher: launcher::Search::new(engine),
+            launcher: launcher::Search::new(),
             clock,
             virtual_time: boot.virtual_time,
             grid: boot.grid,
@@ -901,7 +889,6 @@ impl Stage {
                         sh.session.announce_problems();
                         sh.session.redraw();
                     }
-                    self.collect_search(sh);
                     self.tick_repl(cx, sh);
                 }
             }
@@ -913,7 +900,6 @@ impl Stage {
                     sh.session.announce_problems();
                     sh.session.redraw();
                 }
-                self.collect_search(sh);
                 self.tick_repl(cx, sh);
             }
 
