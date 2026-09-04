@@ -223,6 +223,10 @@ the log — nothing leaves the process. In a build that runs no passes, a kick
 does nothing, which is what an inline mount wants: every pass already runs
 every tick.
 
+What a world holds is a weak handle. The set holds each pass's own channel,
+so a strong one would be a ring through the very thread it stops, and a
+session that let go of its passes would close no channel and end nothing.
+
 ## Problems
 
 `ProblemSource::list(store)` is asked on every poll. A `Problem` carries a

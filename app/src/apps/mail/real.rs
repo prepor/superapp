@@ -105,6 +105,15 @@ impl Imap for RealServers {
         self.session(account)?.uids(folder, which)
     }
 
+    fn disconnect(&mut self, account: i64) -> Result<(), String> {
+        // Removed first: whatever `LOGOUT` says, this world is done with the
+        // session, and dropping it closes the socket.
+        match self.sessions.remove(&account) {
+            Some(mut s) => s.logout(),
+            None => Ok(()),
+        }
+    }
+
     fn idle(&mut self, account: i64, folder: &str, window: Duration) -> Result<Watched, String> {
         self.session(account)?.idle(folder, window)
     }
@@ -453,6 +462,12 @@ mod session {
     }
 
     impl Imap {
+        /// `LOGOUT`, so the server is told rather than left to time the
+        /// connection out itself.
+        pub fn logout(&mut self) -> Result<(), String> {
+            self.session.logout().map_err(s)
+        }
+
         pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
             let mb = self.session.select(name).map_err(s)?;
             self.selected = Some(name.to_string());

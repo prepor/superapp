@@ -623,6 +623,32 @@ impl Effect for Uids {
     }
 }
 
+/// Hand this account's session back. What a watch does when it finds it has
+/// nothing to wait for: a connection nobody is using is one the account
+/// cannot spend elsewhere.
+#[derive(Debug, Clone)]
+pub struct Disconnect {
+    pub account: i64,
+}
+
+impl Effect for Disconnect {
+    const KIND: &'static str = "disconnect";
+    type Reply = ();
+    fn describe(&self) -> String {
+        "close the session".into()
+    }
+    /// Nothing out there is different for a session having ended.
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(account_entity(self.account))
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.cap::<dyn Imap>()?.disconnect(self.account)
+    }
+}
+
 /// Wait on a folder until the server has something to say about it.
 ///
 /// The one effect that is *meant* to block: it is a pass sitting on an open

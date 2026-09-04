@@ -8,7 +8,7 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -534,23 +534,15 @@ struct Live {
     kick: mpsc::Sender<()>,
 }
 
-/// The running passes' wake channels — the set, shared with the threads in
-/// it.
+/// The running passes' wake channels, and nobody's but [`Workers`]'.
 ///
-/// [`Workers`] lives on the session's thread and a worker does not, so a
-/// pass that has learned something another pass owns cannot reach the set
-/// through it. This is that reach: mail's watch is told by a server that a
-/// letter arrived, and only the account's own pass holds the session that
-/// may fetch it, so the watch wakes that one by address rather than doing
-/// the work on the wrong thread.
-///
-/// Every world a [`Workers::threads`] mount builds carries one, as the
-/// [`Kicker`](crate::caps::Kicker) capability. The set is empty in a build
-/// that runs no passes, where a kick is a no-op.
-#[derive(Clone, Default)]
-pub struct Kicks(Arc<Mutex<HashMap<String, Live>>>);
+/// Letting go of it closes every channel at once, which is how a session
+/// that goes away takes its threads with it — the same drop that retires
+/// one pass, spelled over all of them.
+#[derive(Default)]
+struct Set(Mutex<HashMap<String, Live>>);
 
-impl Kicks {
+impl Set {
     fn with<T>(&self, f: impl FnOnce(&mut HashMap<String, Live>) -> T) -> T {
         // A poisoned lock means a worker thread panicked while registering;
         // the set is still readable, and refusing to wake anyone ever again
@@ -589,9 +581,7 @@ impl Kicks {
             }
         });
     }
-}
 
-impl crate::caps::Kicker for Kicks {
     fn kick(&self, entity: &str) {
         self.with(|live| {
             for l in live.values() {
@@ -603,11 +593,42 @@ impl crate::caps::Kicker for Kicks {
     }
 }
 
+/// A reach into that set from a world, as the [`Kicker`](crate::caps::Kicker)
+/// capability.
+///
+/// [`Workers`] lives on the session's thread and a worker does not, so a
+/// pass that has learned something another pass owns cannot reach the set
+/// through it. This is that reach: mail's watch is told by a server that a
+/// letter arrived, and only the account's own pass holds the session that
+/// may fetch it, so the watch wakes that one by address rather than doing
+/// the work on the wrong thread.
+///
+/// **Weak on purpose.** A worker's own world carries one, and the set holds
+/// that worker's own channel: a strong reference would be a ring through the
+/// thread it stops, and a session that let go of its passes would close no
+/// channel and end nothing. A reach into a set that has gone wakes nobody,
+/// which is the truth — so does a build that runs no passes at all.
+#[derive(Clone, Default)]
+pub struct Kicks(Weak<Set>);
+
+impl crate::caps::Kicker for Kicks {
+    fn kick(&self, entity: &str) {
+        if let Some(set) = self.0.upgrade() {
+            set.kick(entity);
+        }
+    }
+}
+
 impl std::fmt::Debug for Kicks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names = self.names();
-        names.sort();
-        f.debug_tuple("Kicks").field(&names).finish()
+        match self.0.upgrade() {
+            Some(set) => {
+                let mut names = set.names();
+                names.sort();
+                f.debug_tuple("Kicks").field(&names).finish()
+            }
+            None => f.write_str("Kicks(gone)"),
+        }
     }
 }
 
@@ -618,7 +639,7 @@ enum Mount {
         mode: Mode,
         env: Env,
         notify: Arc<dyn Fn() + Send + Sync>,
-        live: Kicks,
+        live: Arc<Set>,
     },
     /// Under virtual time: every pass runs from the caller's thread,
     /// against the session's own world, so a scripted tick is followed by
@@ -662,10 +683,11 @@ impl Workers {
         mut env: Env,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Workers {
-        // Every world spawned from this env carries the set, so a pass can
-        // wake another one by address from its own thread.
-        let live = Kicks::default();
-        env.kicks = live.clone();
+        // Every world spawned from this env reaches the set, so a pass can
+        // wake another one by address from its own thread. What it holds is
+        // a weak handle: the set holds that thread's own channel.
+        let live = Arc::new(Set::default());
+        env.kicks = Kicks(Arc::downgrade(&live));
         Workers {
             apps,
             store,
@@ -796,7 +818,7 @@ impl Workers {
     pub fn kick(&self, entity: &str) {
         let mount = self.mount.borrow();
         match &*mount {
-            Mount::Threads { live, .. } => crate::caps::Kicker::kick(live, entity),
+            Mount::Threads { live, .. } => live.kick(entity),
             Mount::Inline { .. } => {
                 drop(mount);
                 self.tick();
@@ -1201,7 +1223,8 @@ mod tests {
     #[test]
     fn a_pass_wakes_another_by_address() {
         use crate::caps::Kicker;
-        let live = Kicks::default();
+        let live = Arc::new(Set::default());
+        let reach = Kicks(Arc::downgrade(&live));
         let (one, heard_one) = mpsc::channel();
         let (two, heard_two) = mpsc::channel();
         let entry = |name: &str, kick| {
@@ -1219,8 +1242,9 @@ mod tests {
         live.insert(name, l);
         assert!(live.has("one"));
 
-        // From another thread, which is where a watch would be.
-        let far = live.clone();
+        // From another thread, which is where a watch would be, and through
+        // the reach a world carries rather than the set itself.
+        let far = reach.clone();
         std::thread::spawn(move || far.kick("worker:two"))
             .join()
             .expect("the kicking thread");
@@ -1228,7 +1252,7 @@ mod tests {
         assert!(heard_one.try_recv().is_err(), "only the one addressed");
 
         // An address nobody answers to wakes nobody, and is not an error.
-        live.kick("worker:three");
+        reach.kick("worker:three");
         assert!(heard_one.try_recv().is_err());
 
         // Retiring closes the channel, which is how the thread returns.
@@ -1238,6 +1262,35 @@ mod tests {
             heard_one.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    /// The set is the mount's and nobody else's: letting go of it closes
+    /// every channel, whatever worlds are still holding a reach into it.
+    /// A world's handle is weak for exactly this — it is the set that holds
+    /// the channel stopping the thread that holds the handle.
+    #[test]
+    fn letting_go_of_the_passes_ends_them() {
+        use crate::caps::Kicker;
+        let live = Arc::new(Set::default());
+        let reach = Kicks(Arc::downgrade(&live));
+        let (kick, heard) = mpsc::channel();
+        live.insert(
+            "one".to_string(),
+            Live {
+                entity: Some("worker:one".to_string()),
+                kick,
+            },
+        );
+
+        drop(live);
+        assert!(matches!(
+            heard.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        // And the reach that outlived it wakes nobody, rather than holding
+        // the set open to say so.
+        reach.kick("worker:one");
+        assert_eq!(format!("{reach:?}"), "Kicks(gone)");
     }
 
     /// A worker claims only its own jobs, so an inline pass never runs

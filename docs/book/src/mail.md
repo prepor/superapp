@@ -294,8 +294,9 @@ account is gone.
 whose latency anybody feels; the interval carries the rest. What ends a wait is
 mail arriving or going, never a flag: a `STORE` this app just pushed comes back
 on the watch's own connection, and a pull for each would be one per mark. A
-server that offers no `IDLE` parks its watch for good, and the minute is the
-cadence it had before.
+server that offers no `IDLE` parks its watch for good — handing the session
+back, because a connection nobody waits on is one the account cannot spend
+elsewhere — and the minute is the cadence it had before.
 
 A fake cannot block, so a wait that came back before its window was up is
 treated as one that did not wait: the watch holds the remainder itself rather

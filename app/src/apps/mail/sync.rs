@@ -5,9 +5,9 @@
 //! running. Network work always finishes before a database transaction
 //! begins.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kernel::app::{Wake, Worker};
@@ -21,8 +21,8 @@ use super::accounts;
 use super::parts;
 use super::caps::{Creds, OAuth, RemoteMail, UidSet, Watched};
 use super::effects::{
-    account_entity, Backfill, Connect, Fetch, Folders, Forwarded, Meta, Move, Seen, Submit, Uids,
-    Watch,
+    account_entity, Backfill, Connect, Disconnect, Fetch, Folders, Forwarded, Meta, Move, Seen,
+    Submit, Uids, Watch,
 };
 use super::model::{self, topic_of};
 
@@ -970,20 +970,6 @@ pub fn pull_now() {
     PULL.fetch_add(1, Ordering::Relaxed);
 }
 
-/// What each account's watch has heard, by account: set by
-/// [`IdleWatch`], consumed by that account's [`SyncPass`].
-///
-/// Kept here rather than made where the pair is, so the two share one flag
-/// however they came to be built. One entry per account ever configured,
-/// which is a handful.
-static NEWS: Mutex<BTreeMap<i64, Arc<AtomicBool>>> = Mutex::new(BTreeMap::new());
-
-/// This account's flag, made on first ask.
-fn news_of(account: i64) -> Arc<AtomicBool> {
-    let mut g = NEWS.lock().unwrap_or_else(|e| e.into_inner());
-    g.entry(account).or_default().clone()
-}
-
 /// One account's sync pass. It holds the only session for its account, so it
 /// claims that account's jobs and no other thread does.
 ///
@@ -1151,7 +1137,9 @@ pub struct IdleWatch {
     /// Whether this session is open. A failed wait drops it.
     connected: bool,
     /// This server offers no `IDLE`, so there is nothing to wait on and the
-    /// watch is over. The interval carries the account, as it always did.
+    /// watch is over: the session is handed back and the pass sleeps until
+    /// kicked, holding nothing. The interval carries the account, as it
+    /// always did.
     parked: bool,
 }
 
@@ -1247,6 +1235,12 @@ impl Worker for IdleWatch {
                 self.holding(w)
             }
             Ok(Watched::Unsupported) => {
+                // Nothing to wait on is nothing to hold open. A server that
+                // offers no `IDLE` may well be one that counts connections,
+                // and the pass that fetches needs one more than a watch with
+                // no work left does.
+                let _ = w.run(&Disconnect { account });
+                self.connected = false;
                 self.parked = true;
                 Wake::OnKick
             }
@@ -1277,10 +1271,13 @@ pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
         .map(|it| it.filter_map(Result::ok).collect())
         .unwrap_or_default();
     for a in accounts {
-        // One flag per account, whoever asks: the set is re-derived after
-        // every action, and the two halves are not guaranteed to be spawned
-        // from the same answer.
-        let news = news_of(a);
+        // The pair's own flag, made here where the pair is: an account id
+        // means something to one store and this process may hold several,
+        // so nothing about a watch is kept anywhere a second store could
+        // reach. The two halves are always answered for together, and the
+        // kernel spawns a name it does not already have — so the running
+        // pair is one answer's pair.
+        let news = Arc::new(AtomicBool::new(false));
         v.push(Box::new(SyncPass::new(a, news.clone())));
         v.push(Box::new(IdleWatch::new(a, news)));
     }

@@ -1767,4 +1767,13 @@ fn a_watch_parks_where_the_server_offers_no_idle() {
     assert_eq!(watch.pass(s.world()), Wake::OnKick);
     assert_eq!(watch.pass(s.world()), Wake::OnKick, "and it stays parked");
     assert!(!news.load(Ordering::Relaxed));
+
+    // …holding nothing. A server that counts connections gets the one this
+    // watch opened back, for the pass that does the fetching.
+    let mut server: FakeServers = servers(&s);
+    assert_eq!(
+        server.folders(seed::ACCOUNT).unwrap_err(),
+        "not connected",
+        "the parked watch handed its session back"
+    );
 }

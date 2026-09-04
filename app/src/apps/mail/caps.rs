@@ -273,6 +273,15 @@ pub trait Imap {
     /// If there is no such folder.
     fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String>;
 
+    /// Closes this account's session, if it has one. Idempotent, and never
+    /// worth failing over: the caller is giving something back.
+    ///
+    /// # Errors
+    ///
+    /// If the server refuses the `LOGOUT` — the session is dropped either
+    /// way.
+    fn disconnect(&mut self, account: i64) -> Result<(), String>;
+
     /// Waits on the folder: RFC 2177 `IDLE` until the server says something
     /// worth a pass, or `window` runs out. Blocks for that long — this is
     /// the one verb that is meant to.
@@ -662,6 +671,12 @@ impl Imap for FakeServers {
                 .map(|m| m.uid)
                 .collect())
         })
+    }
+
+    fn disconnect(&mut self, account: i64) -> Result<(), String> {
+        let mut g = self.0.lock().map_err(|_| "the servers are poisoned")?;
+        g.connected.remove(&account);
+        Ok(())
     }
 
     /// The fake cannot block, so it answers what it knows at once: news if
