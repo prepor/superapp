@@ -223,6 +223,15 @@ pub trait Panel: Any {
     /// or its own state.
     fn title(&self) -> String;
 
+    /// What this panel is about, for an agent: one paragraph in the app's
+    /// words — what the rows are, what the arguments mean, what a person
+    /// does here. It leads the panel's chip, above the queries that drew
+    /// it, so the model reads the app's own sentence before it reads any
+    /// rows. The default is the title and the identity.
+    fn about(&self) -> String {
+        format!("{} — {}", self.title(), self.id())
+    }
+
     /// The size the panel asks for, width and height in grid units, given
     /// the column's width in characters. Constant for most kinds; a letter
     /// or a file card asks for the rows its content needs. The layout
@@ -458,6 +467,15 @@ mod tests {
         assert_eq!(m.wish(80), crate::layout::DEFAULT_WISH);
         assert!(m.verbs().is_empty());
         assert!(m.as_any().is::<Missing>());
+    }
+
+    /// The default a panel that says nothing gets: the title and the
+    /// identity on one line, which is what an agent reads when the app has
+    /// not written its own paragraph yet.
+    #[test]
+    fn a_panel_that_says_nothing_is_still_about_something() {
+        let m = Missing::new(PanelId::new(T, ["42"]));
+        assert_eq!(m.about(), "message(42) — message(42)");
     }
 
     #[test]

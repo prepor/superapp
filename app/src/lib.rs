@@ -22,14 +22,14 @@ pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{files, mail};
+use crate::apps::{agent, files, mail};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
 /// Every app in this build. `system` is listed last, so the launcher's
 /// roots keep their order: an app's own panels lead, help and about close.
 /// Mail leads, so a store nobody has booted comes up on the inbox.
-static APPS: &[&dyn App] = &[&mail::MAIL, &files::FILES, &system::SYSTEM];
+static APPS: &[&dyn App] = &[&mail::MAIL, &files::FILES, &agent::AGENT, &system::SYSTEM];
 
 /// Their Makepad halves, in the same order.
 static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &system::UI];

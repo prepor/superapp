@@ -49,6 +49,7 @@ pub mod sse;
 pub mod store;
 pub mod theme;
 pub mod time;
+pub mod tool;
 
 #[cfg(test)]
 mod boundary {

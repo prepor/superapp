@@ -18,6 +18,7 @@ use crate::effect::{Job, Registry, World};
 use crate::panel::{PanelId, PanelKind, Tag};
 use crate::search;
 use crate::store::{Db, Store};
+use crate::tool::Tool;
 
 pub use crate::problems::{Announced, Problem, ProblemSource};
 
@@ -37,6 +38,22 @@ pub trait App: Any + Sync + Send + 'static {
     /// nothing.
     fn schema(&self) -> Option<&'static Schema> {
         None
+    }
+
+    /// The app's data in its own words: each table, what a row is, the
+    /// columns that matter, the values a column takes, and what must never
+    /// be written directly (a send is an outbox row through the app's tool,
+    /// not an `INSERT`). Read into the system prompt, so it is prose and
+    /// not a schema dump — the schema the model can ask for.
+    fn describe(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The tools this app offers an agent. Collected into one list at boot
+    /// ([`Apps::tools`]); two apps offering one name stop the process,
+    /// naming both.
+    fn tools(&self) -> Vec<Tool> {
+        Vec::new()
     }
 
     /// Demo rows for a new store. Called once, on the first open of an
@@ -136,10 +153,11 @@ impl Root {
 
 // -- the registry --------------------------------------------------------------
 
-/// Every app in this build, and the tags they own.
+/// Every app in this build, the tags they own, and the tools they offer.
 pub struct Apps {
     list: &'static [&'static dyn App],
     kinds: HashMap<Tag, &'static dyn PanelKind>,
+    tools: Vec<Tool>,
 }
 
 impl Apps {
@@ -147,7 +165,8 @@ impl Apps {
     ///
     /// # Panics
     ///
-    /// If two apps claim one tag — the process stops there, naming both.
+    /// If two apps claim one tag, or two apps offer one tool name — the
+    /// process stops there, naming both.
     #[must_use]
     pub fn new(list: &'static [&'static dyn App]) -> Apps {
         let mut kinds: HashMap<Tag, &'static dyn PanelKind> = HashMap::new();
@@ -162,7 +181,22 @@ impl Apps {
                 kinds.insert(tag, *kind);
             }
         }
-        Apps { list, kinds }
+        // The kernel's own tools — `sql.*` and `panels.*` — are chained in
+        // ahead of these, the way `problem_sources` chains its bucket
+        // problem: every build has them, whatever apps it was given.
+        let mut tools: Vec<Tool> = Vec::new();
+        let mut offers: HashMap<&'static str, &'static str> = HashMap::new();
+        for app in list {
+            for tool in app.tools() {
+                let name = tool.name;
+                if let Some(first) = offers.get(name) {
+                    panic!("two apps offer the tool {name}: {first} and {}", app.id());
+                }
+                offers.insert(name, app.id());
+                tools.push(tool);
+            }
+        }
+        Apps { list, kinds, tools }
     }
 
     /// An app by id, or `None` when it is not in this build. This is how
@@ -200,6 +234,21 @@ impl Apps {
         let mut v: Vec<Tag> = self.kinds.keys().copied().collect();
         v.sort_by_key(|t| t.as_str());
         v
+    }
+
+    /// Every tool this build offers an agent, the kernel's own first and
+    /// then the apps', in list order. This is the list a request carries as
+    /// function definitions.
+    #[must_use]
+    pub fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+
+    /// The tool a call names, or `None` for a name no app in this build
+    /// offers — which the model reads back as *no such tool in this build*.
+    #[must_use]
+    pub fn tool(&self, name: &str) -> Option<&Tool> {
+        self.tools.iter().find(|t| t.name == name)
     }
 
     /// The launcher's roots, apps in list order.
@@ -923,6 +972,7 @@ mod tests {
     use crate::effect::{Ctx, Deferred, Effect};
     use crate::panel::{Opening, Panel, PanelId, Tag};
     use serde::{Deserialize, Serialize};
+    use serde_json::Value;
 
     // -- a tiny app, and a second one that clashes with it -------------------
 
@@ -971,6 +1021,89 @@ mod tests {
 
     static ONE_APP: &[&dyn App] = &[&ONE];
     static BOTH: &[&dyn App] = &[&ONE, &TWO];
+
+    // -- two apps with tools, one of them offering another's name ------------
+
+    fn nothing(_s: &mut crate::session::Session, _in: &Value) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+
+    fn schema() -> Value {
+        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    struct Toolbox;
+    impl App for Toolbox {
+        fn id(&self) -> &'static str {
+            "toolbox"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn describe(&self) -> Option<&'static str> {
+            Some("a box with two tools in it")
+        }
+        fn tools(&self) -> Vec<Tool> {
+            vec![
+                Tool::new("toolbox.look", "looks", schema(), false, nothing),
+                Tool::new("toolbox.touch", "touches", schema(), true, nothing),
+            ]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static TOOLBOX: Toolbox = Toolbox;
+
+    /// Another app reaching for a name that is taken.
+    struct Borrower;
+    impl App for Borrower {
+        fn id(&self) -> &'static str {
+            "borrower"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn tools(&self) -> Vec<Tool> {
+            vec![Tool::new(
+                "toolbox.look",
+                "looks too",
+                schema(),
+                false,
+                nothing,
+            )]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static BORROWER: Borrower = Borrower;
+
+    static TOOLED: &[&dyn App] = &[&TOOLBOX, &ONE];
+    static CLASHING: &[&dyn App] = &[&TOOLBOX, &BORROWER];
+
+    #[test]
+    fn the_registry_lists_every_tool_in_app_order() {
+        let apps = Apps::new(TOOLED);
+        let names: Vec<&str> = apps.tools().iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["toolbox.look", "toolbox.touch"]);
+        assert!(apps.tool("toolbox.touch").is_some_and(|t| t.writes));
+        assert!(!apps.tool("toolbox.look").expect("the tool").writes);
+        assert!(
+            apps.tool("nothing").is_none(),
+            "a name no app in this build offers"
+        );
+        // An app with nothing to offer says so by saying nothing.
+        assert!(Apps::new(ONE_APP).tools().is_empty());
+        assert_eq!(ONE.describe(), None);
+        assert!(TOOLBOX.describe().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "two apps offer the tool toolbox.look: toolbox and borrower")]
+    fn two_apps_offering_one_tool_stop_the_boot() {
+        let _ = Apps::new(CLASHING);
+    }
 
     #[test]
     fn the_registry_answers_by_id_and_by_tag() {
