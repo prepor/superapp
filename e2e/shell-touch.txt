@@ -159,9 +159,9 @@ shot g18-deleted
 # The sweep marks the swept row alone, runs the panel's own verb over that one
 # mark, and puts back whatever stood before — nothing, here. Undo gives the
 # conversation back and the mark that filed it with it, so a bar with a count
-# on it is the proof both halves ran; the walk that follows a filing is a
-# preview and so a node of its own, which is why it takes two.
-key cmd+z 2
+# on it is the proof both halves ran; the walk that follows a filing folds
+# into the filing's own node, which is why one press does it.
+key cmd+z
 wait 1000
 click "clear"
 wait 800

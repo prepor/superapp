@@ -27,48 +27,42 @@ belongs to.
    overflow, shorten labels, or let the chord still fire for a verb that is not
    drawn.
 
-7. **Two undos after filing from a reader.** *(Mail)* Filing closes the reader
-   on one node, and the driving list then previews the next row, which is a
-   node of its own. One `cmd+z` therefore un-previews the successor and a
-   second un-files. Whether the successor's preview should join the filing
-   action is not settled.
-
-8. **Small-screen content.** *(Panel Model)* A smaller grid changes panel size
+7. **Small-screen content.** *(Panel Model)* A smaller grid changes panel size
    but not panel content. Some panels may need fewer columns or shorter dates.
 
-9. **Launcher ranking.** *(Interaction Grammar)* Results use a fixed order:
+8. **Launcher ranking.** *(Interaction Grammar)* Results use a fixed order:
    open panels, then roots and each app's sources in app-list order. The app
    does not record enough focus history for learned recency or frequency
    ranking.
 
-10. **Shared widgets.** *(Architecture)* The widgets under
-    `app/src/shell/widgets/` cover current panels. Denser tables and a future
-    text editor may need new shared widgets. Their interface should describe
-    meaning rather than fixed pixels.
+9. **Shared widgets.** *(Architecture)* The widgets under
+   `app/src/shell/widgets/` cover current panels. Denser tables and a future
+   text editor may need new shared widgets. Their interface should describe
+   meaning rather than fixed pixels.
 
-11. **Panels Library gaps.** *(Developer Experience)* Scenes already live with
+10. **Panels Library gaps.** *(Developer Experience)* Scenes already live with
     their app. What is still missing is live pointer states, editing a scene
     without rebuilding, saving a state reached by hand, and releasing unused
     render textures.
 
-12. **The shell's workspace scene shows an app.** *(Developer Experience)* The
+11. **The shell's workspace scene shows an app.** *(Developer Experience)* The
     shell's own `workspace` scene boots on the first root the app list offers,
     so its picture is whatever app happens to lead. It names no app, which is
     the rule, but the scene is not reproducible across builds. A neutral panel
     for the shell's own scenes would fix it and would be one more thing to
     keep alive.
 
-13. **Background file operations.** *(Files)* Creating, copying, moving, and
+12. **Background file operations.** *(Files)* Creating, copying, moving, and
     trashing run on the UI thread. Large trees can freeze the window. A
     background runner must use the same disk capability as the panel, report
     progress, support cancellation, and preserve the current undo rules.
 
-14. **Watching the disk.** *(Files)* File panels refresh after Superapp changes
+13. **Watching the disk.** *(Files)* File panels refresh after Superapp changes
     the disk or enters another directory, but not after another program makes a
     change. macOS could use FSEvents, with events grouped to avoid repeated
     refreshes.
 
-15. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
+14. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
     covers the tap, the scroll, the workspace pan, the workspaces overlay, the
     panel drag and the row's mark and sweep. Four moves still have no gesture:
     sending a panel to another workspace, moving it between columns, toggling
@@ -76,7 +70,7 @@ belongs to.
     joins. Possible homes include a long press on a link and a menu on the
     header.
 
-16. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
+15. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
     the shell's own half of it is written: touch, the grid the screen picks,
     the safe-area insets, and the soft keyboard's occlusion and full text
     state. There is no SDK in this tree, so none of it has run on a device.

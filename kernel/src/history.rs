@@ -230,6 +230,30 @@ impl History {
         id
     }
 
+    /// Folds an action into the head node instead of growing the tree: the
+    /// head keeps its `before`, its kind and its label, and takes the new
+    /// `after` and the new claims.
+    ///
+    /// For what an action *causes* rather than what somebody asked for —
+    /// the cursor walk a filing leaves behind. That walk is the same
+    /// gesture arriving at its consequence, and a gesture is one undo: two
+    /// nodes would make every other press look like it did nothing.
+    ///
+    /// With no applied head to fold into — the beginning, or a cursor
+    /// walked back — it records a node of its own, so a consequence is
+    /// never lost.
+    pub fn amend(&mut self, a: Action<'_>) -> NodeId {
+        match self.nodes.get_mut(&self.head) {
+            Some(head) if head.state == State::Applied => {
+                head.after = a.after;
+                head.ts = a.ts;
+                head.intents.extend(a.intents);
+                self.head
+            }
+            _ => self.apply(a),
+        }
+    }
+
     /// Attaches a claim to the node just applied. For the actions whose
     /// claim is only knowable *after* the transaction — a freshly inserted
     /// row's id, say.
@@ -577,6 +601,76 @@ mod tests {
 
     fn world() -> World {
         World::fake(Registry::new())
+    }
+
+    /// An amend folds a consequence into the node that caused it: the
+    /// head keeps its label and its `before`, takes the new `after`, and
+    /// reverses both sets of claims on one press.
+    #[test]
+    fn an_amend_folds_into_the_head_and_leaves_one_node() {
+        let w = world();
+        let mut h = History::new();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let spy = |name| {
+            Box::new(Spy {
+                log: log.clone(),
+                name,
+                blocked: false,
+                breaks: false,
+            }) as Box<dyn Intent>
+        };
+        let (a, b, c) = (snap(&[help()]), snap(&[about()]), snap(&[inbox()]));
+        act(
+            &mut h,
+            "file",
+            "delete “note”".into(),
+            None,
+            a.clone(),
+            b.clone(),
+            vec![spy("filed")],
+            1.0,
+        );
+        h.amend(Action {
+            kind: "read",
+            label: "read “next”".into(),
+            entity: Some("slot:1".into()),
+            before: b.clone(),
+            after: c.clone(),
+            intents: vec![spy("marked")],
+            ts: 1.1,
+        });
+
+        // One node still, under the name of the gesture that made it, and
+        // the walk it left behind is where redo lands.
+        assert_eq!(h.rows().0.len(), 1);
+        assert_eq!(h.rows().0[0].label, "delete “note”");
+        let step = h.undo(&w).expect("the one node");
+        assert_eq!((step.label.as_str(), step.snap), ("delete “note”", a));
+        assert_eq!(*log.borrow(), vec!["-filed", "-marked"]);
+        assert_eq!(h.redo(&w).map(|s| s.snap), Some(c));
+        assert_eq!(
+            *log.borrow(),
+            vec!["-filed", "-marked", "+filed", "+marked"]
+        );
+    }
+
+    /// With nothing applied to fold into, an amend records a node of its
+    /// own: a consequence is never lost.
+    #[test]
+    fn an_amend_with_no_head_records_a_node() {
+        let mut h = History::new();
+        let a = snap(&[help()]);
+        h.amend(Action {
+            kind: "read",
+            label: "read “next”".into(),
+            entity: None,
+            before: WmSnap::default(),
+            after: a,
+            intents: vec![],
+            ts: 1.0,
+        });
+        assert_eq!(h.rows().0.len(), 1);
+        assert_eq!(h.rows().0[0].label, "read “next”");
     }
 
     /// The walk: leaves under the cursor, undo restores `before`, redo

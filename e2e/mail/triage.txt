@@ -42,13 +42,10 @@ click "Max Ivanov · aug 31 07:30"
 wait 500
 shot t4-carried-on
 
-# Two steps back, because the walk that followed the filing is a preview
-# like any other and so a node of its own: the first undo closes what the
-# cursor moved onto, the second gives the conversation back — to the inbox,
-# to the panel that was reading it, and to the row the list had.
-key cmd+z
-wait 900
-shot t5-walk-undone
+# One step back, because the walk that followed the filing is part of it:
+# the press closes what the cursor moved onto *and* gives the conversation
+# back — to the inbox, to the panel that was reading it, and to the row the
+# list had.
 key cmd+z
 wait 900
 shot t6-undone
@@ -77,12 +74,10 @@ shot t8-batch
 click "Elena Petrova · aug 30 18:20"
 wait 500
 
-# Two steps back, for the reason the reader's *archive* needs two: the walk
-# that followed the batch is a preview like any other. The second undo brings
-# the mails back *and* the marks that filed them — the batch verb resolving
-# again is the proof, and the bar's own `clear` empties the set.
-key cmd+z
-wait 900
+# One step back, for the reason the reader's *archive* needs one: the walk
+# that followed the batch belongs to it. The press brings the mails back
+# *and* the marks that filed them — the bar's own `clear` resolving again is
+# the proof, since it is up only while something is marked.
 key cmd+z
 wait 900
 shot t9-marks-restored

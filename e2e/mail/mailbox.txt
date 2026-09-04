@@ -109,11 +109,12 @@ shot m11-inbox-marked
 click "archive 1"
 wait 900
 shot m12-inbox-archived
+# One press: the filing and the walk it left behind are one node, so the
+# mails and the marks come back together — and `clear`, which is up only
+# while something is marked, is the proof.
 key cmd+z
 wait 900
-key cmd+z
-wait 900
-click "Q3 infra"
+click "clear"
 wait 700
 shot m13-undone
 quit
