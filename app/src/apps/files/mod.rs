@@ -108,7 +108,8 @@ impl App for Files {
         // Its own runs, whatever anyone else's are doing; then whether
         // anything at all has moved since the last look, which is what a
         // quiet frame costs.
-        let landed = self.take_landed(run::whose(s.store()));
+        let db = run::whose(s.store());
+        let landed = self.take_landed(db);
         let moved = self.moved.load(Ordering::Relaxed);
         let quiet = self.seen.swap(moved, Ordering::Relaxed) == moved;
         if landed.is_empty() && quiet {
@@ -116,6 +117,16 @@ impl App for Files {
         }
         for l in landed {
             panels::dir::land(s, l);
+        }
+        // The worker is asked for again whenever the workers are kicked,
+        // and it retires the moment its session has nothing to perform. An
+        // action kicks them — but a run refused outright, one given back to
+        // the lease, and a cancel that dropped what had not started all
+        // record no action at all, and the thread would sit on a store
+        // reader until something else happened to. So having nothing left
+        // to do is a kick of its own.
+        if !self.busy(db) {
+            s.workers().kick_all();
         }
         // A run that is still going has moved the disk under every listing,
         // and its line has moved under every header.

@@ -69,8 +69,10 @@ pub struct Card {
     /// it decode the same one once a frame for the length of the run.
     read: u64,
     /// The run the line under the header was about, as of the last time
-    /// this card was **drawn** — as a listing's [`Dir::drew`].
+    /// this card was **drawn**, and the line itself — as a listing's, and
+    /// read together for the same reason.
     drew: u64,
+    doing: Option<String>,
     /// The file's directory, watched for as long as this card shows it.
     /// Held, not read.
     _watch: Watch,
@@ -215,10 +217,13 @@ impl Card {
         self.status = line;
     }
 
-    /// Called from the draw, and only from the draw: which run the line
-    /// below is about. As a listing's [`Dir::drawn`](super::Dir::drawn).
+    /// Called from the draw, and only from the draw, and before anything
+    /// reads [`Card::note`]: as a listing's
+    /// [`Dir::drawn`](super::Dir::drawn).
     pub fn drawn(&mut self) {
-        self.drew = FILES.running_id(run::whose_world(&self.world));
+        let (drew, doing) = FILES.drawing(run::whose_world(&self.world));
+        self.drew = drew;
+        self.doing = doing;
     }
 
     /// The line the card draws under its header: what a run is doing, or —
@@ -227,9 +232,8 @@ impl Card {
     /// the run is the app's, not the panel's.
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        FILES
-            .running(run::whose_world(&self.world))
-            .map(|at| at.line())
+        self.doing
+            .clone()
             .or_else(|| self.status().map(str::to_string))
     }
 
@@ -462,6 +466,7 @@ impl PanelKind for CardKind {
             seen: Seen::default(),
             read: 0,
             drew: 0,
+            doing: None,
             _watch,
         };
         card.restat();

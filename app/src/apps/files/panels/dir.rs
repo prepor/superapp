@@ -59,10 +59,12 @@ pub struct Dir {
     /// What the listing was read at, on both counts.
     seen: Seen,
     /// The run the line under the header was about, as of the last time
-    /// this panel was **drawn**. What its *cancel* is a button for: a run
-    /// that finished between the frame and the press is not its
-    /// successor's to answer for.
+    /// this panel was **drawn**, and the line itself. What its *cancel* is
+    /// a button for: a run that finished between the frame and the press is
+    /// not its successor's to answer for. Read together, so the words and
+    /// the number are never about two different runs.
     drew: u64,
+    doing: Option<String>,
     /// The directory watched for as long as this panel shows it. Held, not
     /// read: dropping it is what lets the watcher go.
     _watch: Watch,
@@ -228,10 +230,13 @@ impl Dir {
     /// files panel is looking at, and because it is what the *cancel* on
     /// the bar is about. The refusal is not lost: it comes back when the
     /// run is over.
-    /// Called from the draw, and only from the draw: which run the line
-    /// below is about. See [`Dir::drew`].
+    /// Called from the draw, and only from the draw, and before anything
+    /// reads [`Dir::note`]: what to draw under the header, and which run it
+    /// is about.
     pub fn drawn(&mut self) {
-        self.drew = FILES.running_id(run::whose_world(&self.world));
+        let (drew, doing) = FILES.drawing(run::whose_world(&self.world));
+        self.drew = drew;
+        self.doing = doing;
     }
 
     /// The run this panel last drew a line for; zero for none. The verb
@@ -244,9 +249,8 @@ impl Dir {
 
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        FILES
-            .running(run::whose_world(&self.world))
-            .map(|at| at.line())
+        self.doing
+            .clone()
             .or_else(|| self.status().map(str::to_string))
     }
 
@@ -565,6 +569,7 @@ impl PanelKind for DirKind {
             status,
             seen,
             drew: 0,
+            doing: None,
             _watch,
         })
     }
@@ -892,6 +897,14 @@ fn landed_delete(s: &mut Session, l: Landed) {
     let tail = format!("{}{}", but(&refused), halted(stopped, dropped));
     let trashed: Box<dyn Intent> = Box::new(ops::Deleted::new(done));
     if let Some(why) = s.give_back(trashed.as_ref()) {
+        // The lease turned over and the trash was given back, so the rows
+        // are there again — and their marks must be too. The draws that
+        // went by while the run was out took them off the table one at a
+        // time, and nothing else is going to put them back: the node that
+        // would have carried them was never recorded.
+        if marked {
+            ran.mark_again(s, &gone);
+        }
         s.notify(why, true);
         super::refresh(s, None);
         return;
@@ -1020,6 +1033,24 @@ impl Ran {
             } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
                 c.set_status(line);
             }
+        });
+    }
+
+    /// Puts marks back on the table the run took them from — what a
+    /// reversal owes a panel when the node that would have carried them is
+    /// never recorded.
+    fn mark_again(&self, s: &Session, rows: &[String]) {
+        self.with(s, |p| {
+            let Some(d) = p.as_any().downcast_mut::<Dir>() else {
+                return;
+            };
+            let dir = d.dir.clone();
+            let back: Vec<String> = rows
+                .iter()
+                .filter(|g| parent(g) == Some(dir.as_str()))
+                .map(|g| basename(g).to_string())
+                .collect();
+            d.list.marks_mut().extend(back);
         });
     }
 

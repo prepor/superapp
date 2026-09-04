@@ -612,29 +612,23 @@ impl super::Files {
         self.moved.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How far this session's run in hand has got, or `None` when it has
-    /// none. What every one of its files panels draws under its header.
+    /// The line to draw and the run it is about, **read together**.
+    ///
+    /// One look, not two: a panel that asked for the words and then for the
+    /// number could be handed one run's line and the next run's name, and
+    /// its *cancel* would stop a run whose line was never on screen. The
+    /// question a panel is really asking — *what am I drawing, and what is
+    /// it about* — has one answer, so it is one call.
     ///
     /// # Panics
     ///
     /// If a previous holder panicked while it had the queue.
     #[must_use]
-    pub fn running(&self, db: usize) -> Option<Progress> {
+    pub fn drawing(&self, db: usize) -> (u64, Option<String>) {
         let g = self.runs.lock().expect("the files runs");
-        g.now.get(&db).map(|a| a.at.clone())
-    }
-
-    /// Which run that is, by [`Run::id`]; zero where this session has none.
-    /// A panel records this as it *draws* its line, because that is what
-    /// its *cancel* is about.
-    ///
-    /// # Panics
-    ///
-    /// As [`Files::running`](super::Files::running).
-    #[must_use]
-    pub fn running_id(&self, db: usize) -> u64 {
-        let g = self.runs.lock().expect("the files runs");
-        g.now.get(&db).map_or(0, |a| a.id)
+        g.now
+            .get(&db)
+            .map_or((0, None), |a| (a.id, Some(a.at.line())))
     }
 
     /// Whether this session has anything running or waiting to. Its worker
@@ -642,7 +636,7 @@ impl super::Files {
     ///
     /// # Panics
     ///
-    /// As [`Files::running`](super::Files::running).
+    /// As [`Files::drawing`](super::Files::drawing).
     #[must_use]
     pub fn busy(&self, db: usize) -> bool {
         let g = self.runs.lock().expect("the files runs");
@@ -660,9 +654,11 @@ impl super::Files {
     /// names its run, and one that names a run already over stops nothing
     /// at all.
     ///
-    /// A zero `drew` is a bar drawn with runs queued and none in hand:
-    /// nothing to stop and nothing to keep, so what was waiting simply
-    /// never starts.
+    /// A zero `drew` is a bar drawn with runs queued and none in hand. It
+    /// stops the whole set: what is still waiting never starts, and one
+    /// that has been taken in hand since — out of that same queue — is
+    /// stopped where it is, since a press that could stop nothing at all
+    /// would be a button that lied.
     pub fn stop(&self, db: usize, drew: u64) -> usize {
         let dropped = {
             let Ok(mut g) = self.runs.lock() else {
@@ -679,6 +675,14 @@ impl super::Files {
                 }
                 0
             } else {
+                // The bar was drawn with runs queued and none in hand, so
+                // the button is about that queue — and one of it may have
+                // started in the meantime. It came from the very set that
+                // was being cancelled, so it goes too; the rest never
+                // start, and there is no record of them to say so on.
+                if let Some(a) = g.now.get_mut(&db) {
+                    a.stopping = true;
+                }
                 let n = g.queue.iter().filter(|r| r.db == db).count();
                 g.queue.retain(|r| r.db != db);
                 n

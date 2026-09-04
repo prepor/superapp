@@ -1306,11 +1306,14 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
          control with no chord behind it may not be the one a narrow panel \
          drops off the end"
     );
-    assert_eq!(FILES.running(key(&s)), None, "nothing has been taken in hand yet");
+    assert_eq!(FILES.drawing(key(&s)).1, None, "nothing has been taken in hand yet");
 
     let w = s.world().clone();
     let mut runner = Runner::new();
     runner.pass(&w);
+    // What the widget does at the top of a draw: read the line and the run
+    // it is about, together, once.
+    with_dir(&s, desk, Dir::drawn);
     assert_eq!(
         with_dir(&s, desk, |d| d.note()),
         Some("copying 1 of 3 — “README.txt”".to_string()),
@@ -1322,18 +1325,19 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
     runner.pass(&w);
     runner.pass(&w);
     assert_eq!(
-        FILES.running(key(&s)).map(|p| p.line()),
+        FILES.drawing(key(&s)).1,
         Some("copying 3 of 3 — “logs.tar.gz”".to_string())
     );
     // The pass that finds nothing left files the run for the UI thread, and
     // the settle records it — one node for the batch, as it always was.
     runner.pass(&w);
-    assert_eq!(FILES.running(key(&s)), None);
+    assert_eq!(FILES.drawing(key(&s)).1, None);
     s.settle();
     assert_eq!(nodes(&s), was + 1, "one node for the batch");
     assert!(there(&s, "~/Desktop/logs.tar.gz"));
     assert!(!FILES.busy(key(&s)));
     assert!(!bar(&s, desk).contains(&"files.cancel"), "nothing to stop");
+    with_dir(&s, desk, Dir::drawn);
     assert_eq!(with_dir(&s, desk, |d| d.note()), None);
     assert!(
         s.notes()
@@ -1372,9 +1376,9 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
 
     // *cancel*, between two paths. The path in hand is finished — a
     // half-copied file is nobody's — and the ones behind it are dropped.
-    FILES.stop(key(&s), FILES.running_id(key(&s)));
+    FILES.stop(key(&s), FILES.drawing(key(&s)).0);
     runner.pass(&w);
-    assert_eq!(FILES.running(key(&s)), None);
+    assert_eq!(FILES.drawing(key(&s)).1, None);
     assert!(
         there(&s, "~/Downloads/report-q3.pdf"),
         "what it never reached is untouched"
@@ -1444,7 +1448,7 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
     let w = s.world().clone();
     let mut runner = Runner::new();
     runner.pass(&w);
-    FILES.stop(key(&s), FILES.running_id(key(&s)));
+    FILES.stop(key(&s), FILES.drawing(key(&s)).0);
     runner.pass(&w);
     s.settle();
 
@@ -1525,7 +1529,7 @@ fn a_run_is_performed_and_recorded_only_by_the_session_that_asked() {
     let mut stranger = Runner::new();
     stranger.pass(&w);
     assert!(there(&mine, "~/Downloads/README.txt"), "nothing happened");
-    assert_eq!(FILES.running(key(&theirs)), None);
+    assert_eq!(FILES.drawing(key(&theirs)).1, None);
     assert!(FILES.busy(key(&mine)), "and the run is still ours to do");
 
     // And their settle records nothing: a node belongs in the history of
@@ -1678,8 +1682,8 @@ fn two_sessions_each_perform_and_land_their_own_run() {
     ra.pass(&wa);
     rb.pass(&wb);
     assert!(FILES.busy(key(&mine)) && FILES.busy(key(&theirs)));
-    assert!(FILES.running(key(&mine)).is_some());
-    assert!(FILES.running(key(&theirs)).is_some());
+    assert!(FILES.drawing(key(&mine)).1.is_some());
+    assert!(FILES.drawing(key(&theirs)).1.is_some());
 
     // And both land, each in its own history.
     ra.pass(&wa);
@@ -1718,8 +1722,8 @@ fn a_cancel_stops_the_run_its_line_was_drawn_for_and_no_other() {
     // It finishes and the next one starts, all before the press lands.
     runner.pass(&w);
     assert!(there(&s, "~/one"));
-    assert!(FILES.running(key(&s)).is_some(), "the successor is in hand");
-    assert_ne!(FILES.running_id(key(&s)), drew, "and it is not what was drawn");
+    assert!(FILES.drawing(key(&s)).1.is_some(), "the successor is in hand");
+    assert_ne!(FILES.drawing(key(&s)).0, drew, "and it is not what was drawn");
 
     // The press: about a run that is over, so it stops nothing.
     run(&mut s, slot, "files.cancel");
@@ -1859,7 +1863,7 @@ fn a_run_that_did_nothing_still_says_what_it_took_with_it() {
     let w = s.world().clone();
     let mut runner = Runner::new();
     runner.pass(&w);
-    FILES.stop(key(&s), FILES.running_id(key(&s)));
+    FILES.stop(key(&s), FILES.drawing(key(&s)).0);
     runner.pass(&w);
     s.settle();
 
@@ -1901,6 +1905,195 @@ fn a_new_dir_that_lands_keeps_a_name_typed_since() {
         with_dir(&s, slot, |d| d.naming().map(str::to_string)),
         Some("drafts".to_string()),
         "the field closes on the name it made and on no other"
+    );
+}
+
+#[test]
+fn the_line_and_the_run_it_is_about_are_read_together() {
+    let _alone = alone();
+    let (s, slot) = home();
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: three(),
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    with_dir(&s, slot, Dir::drawn);
+    let (drew, line) = with_dir(&s, slot, |d| (d.drew(), d.note()));
+    assert_eq!(line, Some("deleting 1 of 3 — “README.txt”".to_string()));
+    assert_eq!(drew, FILES.drawing(key(&s)).0);
+
+    // The run moves on, and the panel keeps saying what it last drew — the
+    // words and the number are one sample, taken at the frame, and neither
+    // wanders off on its own between two looks.
+    runner.pass(&w);
+    assert_eq!(
+        with_dir(&s, slot, |d| (d.drew(), d.note())),
+        (drew, line),
+        "nothing changes under a panel until it draws again"
+    );
+    with_dir(&s, slot, Dir::drawn);
+    assert_eq!(
+        with_dir(&s, slot, |d| d.note()),
+        Some("deleting 2 of 3 — “report-q3.pdf”".to_string())
+    );
+}
+
+#[test]
+fn a_cancel_drawn_before_anything_started_stops_what_started_since() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: three(),
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/never".to_string(),
+        },
+        slot,
+        showing(&s, slot),
+    );
+    // The bar is drawn with both runs queued and neither in hand.
+    with_dir(&s, slot, Dir::drawn);
+    assert_eq!(with_dir(&s, slot, |d| d.drew()), 0);
+    assert!(bar(&s, slot).contains(&"files.cancel"));
+
+    // One of them starts before the press lands.
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    assert!(!there(&s, "~/Downloads/README.txt"), "one path went");
+
+    // The press is about that queue, and what came out of it is part of
+    // the set being cancelled: it stops where it is, and the rest of the
+    // queue never starts.
+    s.take_notes();
+    run(&mut s, slot, "files.cancel");
+    runner.pass(&w);
+    s.settle();
+    assert!(
+        there(&s, "~/Downloads/report-q3.pdf"),
+        "the paths it had not reached are untouched"
+    );
+    assert!(!there(&s, "~/never"), "and what was waiting never started");
+    assert!(!FILES.busy(key(&s)));
+    let said: Vec<String> = s.notes().iter().map(|n| n.msg.clone()).collect();
+    assert!(
+        said.iter().any(|m| m.contains("one run dropped")),
+        "the queue it dropped is said: {said:?}"
+    );
+    assert!(
+        said.iter().any(|m| m.contains("stopped")),
+        "and so is the one it stopped: {said:?}"
+    );
+}
+
+#[test]
+fn a_delete_given_back_to_the_lease_puts_its_marks_back_too() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    mark(&s, slot, ["README.txt", "report-q3.pdf"]);
+    let was = nodes(&s);
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: vec![
+                "~/Downloads/README.txt".to_string(),
+                "~/Downloads/report-q3.pdf".to_string(),
+            ],
+            own: false,
+            marked: true,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    let store = s.store().clone();
+    for _ in 0..2 {
+        runner.pass(&w);
+        // The draws that go by while a run is out take the marks of the
+        // rows that have gone.
+        with_dir(&s, slot, |d| {
+            d.relist();
+            d.list_mut().sync(&store);
+        });
+    }
+    assert!(marks(&s, slot).is_empty());
+
+    // The lease turns over before the run lands, so the trash is given
+    // back rather than recorded.
+    s.mount_repl(kernel::session::ReplMount::Inline, || {});
+    s.start_repl_with(std::sync::Arc::new(
+        kernel::repl::object::MemBucket::new(),
+    ));
+    assert!(!s.writable());
+    runner.pass(&w);
+    s.settle();
+
+    assert_eq!(nodes(&s), was, "nothing was recorded");
+    assert!(there(&s, "~/Downloads/README.txt"), "and the trash was given back");
+    assert!(there(&s, "~/Downloads/report-q3.pdf"));
+    assert_eq!(
+        marks(&s, slot),
+        ["README.txt".to_string(), "report-q3.pdf".to_string()],
+        "with the marks the draws took while it was out — nothing else was \
+         going to put them back"
+    );
+}
+
+#[test]
+fn the_worker_retires_when_a_run_ends_with_nothing_to_record() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    // Three paths another program took while nothing was watching: every
+    // one of them is refused at the disk, so the run performs nothing and
+    // there is no action at the end of it — and an action is what usually
+    // retires a worker.
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: (1..=3).map(|n| format!("~/gone-{n}")).collect(),
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    s.workers().kick_all();
+    assert!(
+        s.workers().names().contains(&"files-run".to_string()),
+        "the queue is what calls for the thread"
+    );
+
+    // A kick is a pass: three for the three paths, and one to file it.
+    for _ in 0..3 {
+        s.workers().kick_all();
+    }
+    assert!(!FILES.busy(key(&s)), "the run is over");
+    s.settle();
+    assert!(
+        s.workers().names().is_empty(),
+        "having nothing left to do is a kick of its own — the thread does \
+         not sit on a store reader until something else happens"
     );
 }
 

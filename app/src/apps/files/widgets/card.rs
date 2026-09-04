@@ -130,6 +130,9 @@ impl Widget for CardPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         observe(scope);
+        // The line under the header and the run it is about, both read
+        // here and before anything asks for either: as a listing's.
+        drew(&props);
         let Some(shown) = shown(&props) else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -145,9 +148,6 @@ impl Widget for CardPanel {
             card::fill(cx, &self.view, &data);
             self.shown = Some(shown);
         }
-        // Which run the line is about, remembered on the draw and nowhere
-        // else: as a listing's, and for the same reason.
-        drew(&props);
         let lbl = self.view.label(cx, STATUS);
         lbl.set_text(cx, chrome.status.as_deref().unwrap_or(""));
         lbl.set_visible(cx, chrome.status.is_some());

@@ -266,6 +266,11 @@ impl Widget for DirPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        // What the line under the header says and which run it is about,
+        // both read here and nowhere else: *cancel* is a button about the
+        // run whose line was on screen when it was pressed, and this is the
+        // moment that decides it.
+        drew(&props);
         let Some(f) = observe(&props, scope) else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -286,11 +291,6 @@ impl Widget for DirPanel {
                 || self.rename_field.live(cx, &rename),
         );
         self.crumbs(cx, &props, &f);
-        // Which run that line is about, remembered on the draw and nowhere
-        // else: *cancel* is a button about the run whose line was on
-        // screen when it was pressed, and the frame is where that is
-        // decided.
-        drew(&props);
         // The status line: what a run is doing, or what the last verb
         // refused until the next one.
         let lbl = self.view.label(cx, STATUS);

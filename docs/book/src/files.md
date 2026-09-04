@@ -244,9 +244,12 @@ Four things hold, and they are what the design is for:
   cost — even a run that managed nothing of its own still answers for what it
   took with it. A stop that finds nothing started yet drops what was queued and
   says so itself: work is never dropped in silence. And *cancel* is about the
-  run whose line was on screen when it was pressed: the id is read as the panel
-  **draws**, so a run that finished in the intervening frame is not its
-  successor's to answer for.
+  run whose line was on screen when it was pressed: the line and the run it is
+  about are one sample, taken as the panel **draws**, so a run that finished in
+  the intervening frame is not its successor's to answer for. A *cancel* drawn
+  when nothing had started yet is about the queue instead — what is still
+  waiting never starts, and one that came out of that queue since is stopped
+  where it is.
 - **Undo is unchanged.** The run records nothing. It collects what it performed
   and hands it back; the history node, its intents, the lease check, the marks a
   delete consumed, the panel a delete closes and the toast are all the UI
@@ -263,11 +266,17 @@ since stands; `new dir` closes its field on the name it made and on no other,
 so a name typed while the run was out survives; and the marks a delete
 consumed are worked out from what *went*, not from what is still marked when
 it lands, since the rows disappear one at a time and each draw takes their
-marks with them.
+marks with them. Where the lease turns over and the trash is given back, the
+marks go back on with the rows: the node that would have carried them is never
+recorded, so nothing else would.
 
 Every session performs its own runs, one at a time — the window's and each
 mount's are separate hands, not one between them, or the session whose entry
-was lost would read as idle and have its worker retired mid-run.
+was lost would read as idle and have its worker retired mid-run. The worker
+exists exactly while its session has something to perform: an action retires
+it as it retires any pass, and a run that ends with no action to record — one
+refused outright, one given back to the lease, one cancelled before it started
+— kicks the workers itself rather than leaving a thread on a store reader.
 
 Panels keep up with a run through the same write count as ever, so a listing
 fills as the copy lands in it. A card, though, asks whether the file it is on
