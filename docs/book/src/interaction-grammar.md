@@ -158,10 +158,13 @@ like any other list, and can be sent to a workspace of its own.
 
 The line above its rows is read twice over. Its **words** are the question, put
 to every app's own search source at once; each source answers on its own
-thread, and its rows land as they arrive, under the rows already on screen.
-Its **`@` tags** narrow what came back: `@app:mail` keeps one source's rows.
-The words are never a second sieve over the answer — a letter found by a word
-deep in its body has none of that word in the line the row draws.
+thread, and the list stays in the order the sources were registered in however
+the threads were scheduled — so a late source inserts its band where it
+belongs, and the cursor and the marks, which are rows and not numbers, follow
+their own rows through it. Its **`@` tags** narrow what came back: `@app:mail`
+keeps one source's rows. The words are never a second sieve over the answer —
+a letter found by a word deep in its body has none of that word in the line the
+row draws.
 
 The rows are a rich table: arrows walk and preview, `enter` opens and goes,
 `space` marks, and *open n* opens every marked row at once, as one undoable

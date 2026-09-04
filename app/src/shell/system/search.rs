@@ -12,9 +12,14 @@
 //! matching the line against the query again would hide exactly the rows
 //! the index worked hardest for.
 //!
-//! The sources answer off the UI thread and their rows land as they come:
-//! the panel asks on the keystroke that changed the question and takes
-//! whatever has arrived on every event and every draw. A list that is empty
+//! The sources answer off the UI thread: the panel asks on the keystroke
+//! that changed the question and takes whatever has arrived on every event
+//! and every draw. The list is always in the order the sources were
+//! registered in, whoever was quick — so one question gives one list, and
+//! not a different one each time a thread is scheduled differently. A
+//! source answering late inserts its band where it belongs, and the rows
+//! below it move down; the cursor and the marks are keys rather than
+//! numbers, so both follow their own rows through it. A list that is empty
 //! because nobody has answered *yet* says so, rather than saying that
 //! nothing was found.
 
@@ -270,6 +275,11 @@ impl Search {
     /// The batch verb: every marked row opened, each a fresh un-joined
     /// column beside this panel, and the set let go. One action, so one
     /// undo closes the lot.
+    ///
+    /// The set is let go only once the action has landed. A locked device —
+    /// another one holds the lease — refuses it and says so, and what a
+    /// verb could not do stays marked, ready for the press after the lease
+    /// comes back.
     fn open_marked(&mut self, s: &mut Session) {
         let store = s.store().clone();
         let ids: Vec<PanelId> = self
@@ -280,17 +290,23 @@ impl Search {
             .filter_map(|k| self.list.table().by_key(&store, k))
             .map(|f| f.id)
             .collect();
-        self.list.clear_marks();
         if ids.is_empty() {
+            self.list.clear_marks();
             return;
         }
-        let from = self.slot;
-        let label = format!("open {} found", ids.len());
-        s.act(Action::new("open", label).moving(move |wm| {
-            for id in ids {
-                wm.open(id, from, false);
-            }
-        }));
+        let (from, n) = (self.slot, ids.len());
+        let done = s
+            .act(
+                Action::new("open", format!("open {n} found")).moving(move |wm| {
+                    for id in ids {
+                        wm.open(id, from, false);
+                    }
+                }),
+            )
+            .is_some();
+        if done {
+            self.list.clear_marks();
+        }
     }
 }
 
@@ -382,12 +398,19 @@ impl PanelKind for SearchKind {
     ///
     /// A thread each in an ordinary run, so a source that walks a disk or
     /// calls a server never holds up one that answers out of an index — and
-    /// inline in a headless one, where a scripted keystroke must be followed
-    /// by its rows in the same tick. The threads are this instance's: they
-    /// retire with it, when the ask channel they wait on drops.
+    /// inline wherever time only moves when it is moved, since a scripted
+    /// keystroke must be followed by its rows in the same tick. That is the
+    /// session's own answer and not the build's: a headless run and a
+    /// panels-library mount in a window both run on a virtual clock, and a
+    /// mount that froze before its answer arrived would be a picture of a
+    /// search that never finished. The workers read the same fact to
+    /// choose between threads and inline passes.
+    ///
+    /// The threads are this instance's: they retire with it, when the ask
+    /// channel they wait on drops.
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let providers = cx.session().apps().providers();
-        let engine = if cfg!(headless) {
+        let engine = if cx.session().workers().is_inline() {
             Engine::inline(providers)
         } else {
             Engine::threads(&cx.session().store().db(), providers, || {
@@ -558,7 +581,15 @@ fn greet(cx: &mut Cx, view: &mut View, scope: &mut Scope) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use kernel::app::App;
+    use kernel::repl::object::MemBucket;
+    use kernel::session::ReplMount;
+
     use super::*;
+
+    static APPS: &[&dyn App] = &[&crate::shell::system::SYSTEM];
 
     /// The line is read twice over: its words are the question, its tags
     /// narrow the answer.
@@ -614,6 +645,68 @@ mod tests {
         assert_eq!(rows("thermos @app:mail").len(), 1);
         // A tag this source does not know is dropped, not answered.
         assert_eq!(rows("@bogus:x").len(), 2);
+    }
+
+    /// A search panel over rows it was handed, with two of them marked.
+    fn marked_two() -> (Session, kernel::session::Instance) {
+        let mut s = Session::fake(APPS);
+        s.act(Action::new("open", "open search").moving(|wm| {
+            wm.open(Search::id(), None, false);
+        }))
+        .expect("the panel opened");
+        s.settle();
+        let slot = s.focus().expect("the search panel is focused");
+        let inst = s.panel(slot).expect("its instance");
+        {
+            let mut borrow = inst.borrow_mut();
+            let p = borrow
+                .as_any()
+                .downcast_mut::<Search>()
+                .expect("a search panel");
+            let rows = vec![
+                found("mail", "Q3 infra budget", "message"),
+                found("mail", "Sat hike", "contact"),
+            ];
+            let keys: Vec<String> = rows.iter().map(|f| f.id.to_string()).collect();
+            p.list
+                .table_mut()
+                .retarget(HitSource::new(rows, vec!["mail"]));
+            p.list.marks_mut().extend(keys);
+            assert_eq!(p.list.marks().len(), 2);
+        }
+        (s, inst)
+    }
+
+    /// A batch verb that could not run keeps its set: a locked device — one
+    /// whose lease another holds — refuses the action, and the marks are
+    /// still there for the press after the lease comes back.
+    #[test]
+    fn a_refused_batch_open_keeps_its_marks() {
+        let (mut s, inst) = marked_two();
+        let panels = s.panels().len();
+        s.mount_repl(ReplMount::Inline, || {});
+        s.start_repl_with(Arc::new(MemBucket::new()));
+        assert!(!s.writable(), "shut until the first pass answers");
+
+        inst.borrow_mut().run("system.open_found", &mut s);
+        s.settle();
+        assert_eq!(s.panels().len(), panels, "nothing was opened");
+        {
+            let mut borrow = inst.borrow_mut();
+            let p = borrow.as_any().downcast_mut::<Search>().expect("the panel");
+            assert_eq!(p.list.marks().len(), 2, "and the set is still marked");
+        }
+
+        // With the lease taken, the same press opens both and lets the set
+        // go — one action, so one undo closes them again.
+        s.repl_poll();
+        assert!(s.writable(), "the first pass made it the holder");
+        inst.borrow_mut().run("system.open_found", &mut s);
+        s.settle();
+        assert_eq!(s.panels().len(), panels + 2, "both rows opened");
+        let mut borrow = inst.borrow_mut();
+        let p = borrow.as_any().downcast_mut::<Search>().expect("the panel");
+        assert!(p.list.marks().is_empty(), "the set was let go");
     }
 
     /// The completion offers the sources this build has.

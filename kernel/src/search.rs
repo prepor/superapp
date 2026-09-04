@@ -426,9 +426,16 @@ impl Query {
         true
     }
 
-    /// The sources in order, each row stamped with the one that found it. A
-    /// source that has not answered yet holds no place: its rows land under
-    /// the ones already on screen rather than pushing them down.
+    /// The sources in registration order, each row stamped with the one
+    /// that found it — whoever answered first.
+    ///
+    /// The order is the registration's and not the arrival's, so one
+    /// question gives one list however the threads were scheduled, and a
+    /// source's rows stay together. A source answering late therefore
+    /// inserts its band where it belongs and pushes the rows under it down:
+    /// what a reader is looking at moves, and what a reader has *picked*
+    /// does not, because a list keys its cursor and its marks by the row
+    /// rather than by the number the row sat at.
     fn merge(&mut self) {
         let names = self.engine.names();
         let mut out: Vec<Found> = Vec::new();
@@ -706,10 +713,12 @@ mod tests {
     }
 
     /// A question is put to every source at once; each row says which
-    /// source found it, and a source answering late lands its band under the
-    /// rows already on screen rather than pushing them about.
+    /// source found it, and the list is in the order the sources were
+    /// registered in whoever answered first — so a late first source
+    /// inserts its band above the rows a quick second one already put on
+    /// screen.
     #[test]
-    fn the_sources_answer_in_order_and_a_late_one_lands_underneath() {
+    fn the_rows_are_in_registration_order_whoever_answers_first() {
         let s = store();
         let (a, release_a) = Held::new("a", 10);
         let (b, release_b) = Held::new("b", 20);
@@ -743,7 +752,7 @@ mod tests {
                 .map(|f| f.label.as_str())
                 .collect::<Vec<_>>(),
             ["a0", "a1", "a2", "b0", "b1", "b2"],
-            "the registration order, whoever was quick"
+            "the registration order: a's band lands above b's, late as it was"
         );
         assert_eq!(q.found()[0].source, "a");
         assert_eq!(q.found()[3].source, "b");
