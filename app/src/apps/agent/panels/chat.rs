@@ -28,6 +28,12 @@ use super::Agents;
 /// The argument a chat panel carries when there is no row behind it yet.
 const NEW: &str = "new";
 
+/// What *continue* says, as the person's own turn. A word rather than a
+/// flag on the request: the wire has nothing for *finish what you were
+/// saying*, and a model that reads its own cut answer above this needs
+/// nothing more.
+const CONTINUE: &str = "Continue.";
+
 /// One chat, open.
 pub struct Chat {
     id: PanelId,
@@ -44,6 +50,10 @@ pub struct Chat {
     /// next send and leave the composer with it; like the draft, they are
     /// not a row until then.
     chips: Vec<Chip>,
+    /// The *add panel* field, while it is up: what has been typed into it.
+    /// `None` is the field put away, which is where it is until the verb
+    /// asks for it.
+    picking: Option<String>,
 }
 
 impl Chat {
@@ -114,6 +124,90 @@ impl Chat {
         if i < self.chips.len() {
             self.chips.remove(i);
         }
+    }
+
+    /// The *add panel* field's text, while it is up; `None` while it is
+    /// away. The widget mirrors its own field into it, the way the composer
+    /// mirrors the draft.
+    #[must_use]
+    pub fn picking(&self) -> Option<&str> {
+        self.picking.as_deref()
+    }
+
+    /// Raises the field, changes what is in it, or — with `None` — puts it
+    /// away. `esc` and a pick both put it away.
+    pub fn set_picking(&mut self, text: Option<&str>) {
+        self.picking = text.map(ToString::to_string);
+    }
+
+    /// The panels a pick is offered: every slot on every workspace by its
+    /// title, this chat left out — asking a chat about itself is a mirror,
+    /// and the chip it would make is the one thing already in the room.
+    #[must_use]
+    pub fn pickable(&self, s: &Session) -> Vec<(SlotId, String)> {
+        s.panels()
+            .into_iter()
+            .filter(|(slot, _)| *slot != self.slot)
+            .map(|(slot, inst)| {
+                let title = inst.borrow().title();
+                (slot, title)
+            })
+            .filter(|(_, title)| !title.trim().is_empty())
+            .collect()
+    }
+
+    /// The slot a typed line names, matched against the titles as they
+    /// read: the whole title first, and then the one title that begins with
+    /// what was typed, so *inb* is the inbox where nothing else starts that
+    /// way.
+    #[must_use]
+    pub fn pick(&self, s: &Session, typed: &str) -> Option<SlotId> {
+        let typed = typed.trim().to_lowercase();
+        if typed.is_empty() {
+            return None;
+        }
+        let open = self.pickable(s);
+        open.iter()
+            .find(|(_, t)| t.to_lowercase() == typed)
+            .or_else(|| {
+                open.iter()
+                    .find(|(_, t)| t.to_lowercase().starts_with(&typed))
+            })
+            .map(|(slot, _)| *slot)
+    }
+
+    /// A pick taken: the panel's chip into the composer, and the field away.
+    /// Answers whether one was found — a spelling that names nothing leaves
+    /// the field where it is.
+    pub fn add_panel(&mut self, s: &Session, typed: &str) -> bool {
+        let Some(slot) = self.pick(s, typed) else {
+            return false;
+        };
+        let Some(chip) = Chip::panel(s, slot) else {
+            return false;
+        };
+        self.add_chip(chip);
+        self.picking = None;
+        true
+    }
+
+    /// Whether the last thing said in this chat is an answer the model ran
+    /// out of room for — which is what puts *continue* on the bar.
+    #[must_use]
+    pub fn cut_short(&self) -> bool {
+        self.turns()
+            .last()
+            .is_some_and(|t| t.finish.as_deref() == Some("length"))
+    }
+
+    /// *continue*: the person asking for the rest, as the person's own turn,
+    /// so a cut answer is finished by a round like any other rather than by
+    /// a second kind of request.
+    pub fn carry_on(&mut self, s: &mut Session) {
+        let Some(chat) = self.chat else {
+            return;
+        };
+        model::send(s, Some(chat), CONTINUE, Carried::default());
     }
 
     /// The newest round of the agent in this chat, whatever it is doing —
@@ -239,7 +333,8 @@ impl Panel for Chat {
     }
 
     /// *send* while there is something to send and nothing going, *stop*
-    /// while something is, *retry* on a round that came to nothing — then
+    /// while something is, *retry* on a round that came to nothing,
+    /// *continue* on an answer that ran out of room — then *add panel*, and
     /// the two that are always there: a fresh chat, and the list.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
@@ -257,6 +352,13 @@ impl Panel for Chat {
         {
             v.push(Verb::run("agent.retry", "retry", Some('r')));
         }
+        if !going && self.cut_short() {
+            v.push(Verb::run("agent.continue", "continue", Some('o')));
+        }
+        // The phone's way into the context a chord opens on the desktop, and
+        // harmless where the chord is there: a field over the panels that
+        // are open, one pick apiece.
+        v.push(Verb::run("agent.add_panel", "add panel", Some('p')));
         v.push(Verb::go(
             "agent.new",
             "new",
@@ -294,6 +396,8 @@ impl Panel for Chat {
                     model::retry(s, chat);
                 }
             }
+            "agent.continue" => self.carry_on(s),
+            "agent.add_panel" => self.picking = Some(String::new()),
             _ => {}
         }
     }
@@ -322,6 +426,7 @@ impl PanelKind for ChatKind {
             // about, offered on the app's own static because a navigation
             // carries an identity and nothing else.
             chips: super::super::AGENT.take_offered().into_iter().collect(),
+            picking: None,
         })
     }
 }

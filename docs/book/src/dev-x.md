@@ -53,7 +53,18 @@ a real answer goes through, so a live tail, a stop and a tool call's argument
 fragments are all exercised; and it records every request it was given.
 
 What a run with no test behind it gets is the **default script**, since a suite
-cannot plant one: today it answers anything with `Hello. I am the assistant.`
+cannot plant one. Every entry of it but the last is keyed by a word, so a suite
+asks for the answer it wants in the words it types and the order never matters:
+
+| The message says | What comes back |
+|---|---|
+| *fail* | the gateway refusing — *the gateway is down* |
+| *cut* | *This answer is long and it*, finishing `length` |
+| *rename* | a call of `files.rename` on `~/Downloads/README.txt`, then *Renamed it.* |
+| *looking* | *You are looking at {panel}.* |
+| *continue* | *… and here is the rest.* |
+| anything else | *Hello. I am the assistant.* |
+
 A `{panel}` in a scripted text is filled with the title of the first panel chip
 in the prompt and a `{user}` with the person's latest message.
 

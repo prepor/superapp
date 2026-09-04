@@ -1,0 +1,43 @@
+# args:
+# env:
+#
+# An answer that ran out of room, and the verb that asks for the rest. The
+# fake stops a message with *cut* in it on `length`, which the transcript
+# marks *cut short* in the muted line under the turn — and that mark is what
+# puts **continue** on the bar.
+#
+# *continue* is a send like any other: it files *Continue.* as the person's
+# own turn and the round that answers it is a round. So the assertion is the
+# click on what came back, and on the bar's letting go of the verb once the
+# answer is whole.
+
+wait 900
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+
+type "give me the cut version"
+wait 500
+key enter
+wait 900
+click "This answer is long and it"
+wait 400
+click "cut short"
+wait 400
+shot k1-cut-short
+
+# The bar wears it now, and pressing it asks.
+click "continue"
+wait 900
+click "… and here is the rest."
+wait 400
+
+# The person's own turn is in the transcript, in their own words.
+click "Continue."
+wait 400
+shot k2-continued
+quit

@@ -259,6 +259,12 @@ pub struct Call {
     pub status: String,
     /// What it came to, or why it did not — whichever the model reads back.
     pub output: Option<String>,
+    /// The sentence the history shows for what this call did, on a writing
+    /// tool that filed a node — *rename “README.txt” to
+    /// “readme-renamed.txt”*. `None` for a reading tool, a refusal, and a
+    /// writing tool that changed nothing. It is the card's line and nothing
+    /// else: what the model reads back is the tool's own JSON.
+    pub label: Option<String>,
     pub created: f64,
     pub ended: Option<f64>,
 }
@@ -357,7 +363,7 @@ static Q_CHAT_RUNS: Q = Q {
 
 static Q_RUN_CALLS: Q = Q {
     id: "run calls",
-    sql: "SELECT id, run, turn, tool_call_id, tool, input, status, output, created, ended
+    sql: "SELECT id, run, turn, tool_call_id, tool, input, status, output, label, created, ended
           FROM agent_call WHERE run = ?1 ORDER BY id",
     describe: "every tool call a run asked for, in the order the model asked",
 };
@@ -419,8 +425,9 @@ fn call_row(r: &rusqlite::Row) -> rusqlite::Result<Call> {
         input: r.get(5)?,
         status: r.get(6)?,
         output: r.get(7)?,
-        created: r.get(8)?,
-        ended: r.get(9)?,
+        label: r.get(8)?,
+        created: r.get(9)?,
+        ended: r.get(10)?,
     })
 }
 
@@ -563,7 +570,7 @@ pub fn run_conn(c: &Connection, run: RunId) -> Option<Run> {
 #[must_use]
 pub fn round_calls_conn(c: &Connection, run: RunId) -> Vec<Call> {
     let Ok(mut stmt) = c.prepare(
-        "SELECT id, run, turn, tool_call_id, tool, input, status, output, created, ended
+        "SELECT id, run, turn, tool_call_id, tool, input, status, output, label, created, ended
          FROM agent_call
          WHERE run = ?1 AND turn = (SELECT MAX(turn) FROM agent_call WHERE run = ?1)
          ORDER BY id",
@@ -729,11 +736,12 @@ pub fn set_call_tx(
     call: CallId,
     status: &str,
     output: &str,
+    label: Option<&str>,
     now: f64,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE agent_call SET status = ?2, output = ?3, ended = ?4 WHERE id = ?1",
-        rusqlite::params![call, status, output, now],
+        "UPDATE agent_call SET status = ?2, output = ?3, label = ?4, ended = ?5 WHERE id = ?1",
+        rusqlite::params![call, status, output, label, now],
     )?;
     Ok(())
 }
@@ -1052,8 +1060,9 @@ impl Intent for Kept {
                 for call in &calls {
                     c.execute(
                         "INSERT OR REPLACE INTO agent_call(id, run, turn, tool_call_id, tool,
-                                                           input, status, output, created, ended)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                                           input, status, output, label,
+                                                           created, ended)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                         rusqlite::params![
                             call.id,
                             call.run,
@@ -1063,6 +1072,7 @@ impl Intent for Kept {
                             call.input,
                             call.status,
                             call.output,
+                            call.label,
                             call.created,
                             call.ended
                         ],

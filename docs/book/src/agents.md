@@ -79,7 +79,7 @@ a chat continued on the phone is the same chat only if its turns travel.
 | `agent_chat` | one conversation: `title`, `model`, `created`, `updated` |
 | `agent_turn` | one message: `chat`, `seq`, `role`, `body`, the `run` that wrote it, `created` |
 | `agent_run` | one round: `chat`, `status`, `error`, `started`, `ended`, `usage` |
-| `agent_call` | one tool call: `run`, `turn`, `tool_call_id`, `tool`, `input`, `status`, `output`, `created`, `ended` |
+| `agent_call` | one tool call: `run`, `turn`, `tool_call_id`, `tool`, `input`, `status`, `output`, `label`, `created`, `ended` |
 
 A run's status is `pending`, `streaming`, `waiting`, `done`, `failed`, or
 `stopped`; a call's is `pending`, `done`, or `failed`. A turn's `body` is the
@@ -193,8 +193,9 @@ world's secrets are memory.
 
 There is no HTTP client in this tree on purpose, and this did not add one. The
 need is one verb, one host, no redirects, one long streaming body — so
-[`kernel::http`](./tech-stack.md#still-no-http-client) is HTTP/1.1 over the
-`rustls` connector the kernel already carries, with a body that undoes
+[`kernel::http`](./tech-stack.md#still-no-http-client) is HTTP/1.1 over
+`rustls`, verified against the Mozilla roots rather than the machine's,
+because a phone has no machine roots to verify against; its body undoes
 `Transfer-Encoding: chunked` as it arrives, and `kernel::sse` is the event
 framing over that reader. Both are the kernel's, and both are driven by tests
 over an in-memory cursor, so the wire's edge cases are pinned without a
@@ -393,6 +394,13 @@ The call's row takes `done` or `failed` and the text the model reads back; the
 tool's own action is what the history shows and what `cmd+z` takes back, and
 the bookkeeping around it is no node at all.
 
+A writing tool files exactly one node, and that node's label is the sentence
+the history shows — *rename “README.txt” to “readme-renamed.txt”*. It is read
+off the head of the history the moment the tool returns, where the head moved,
+and kept on the call's `label`, which is the one thing the card says. The model
+never sees it: what the model reads back is the tool's own JSON. So the card
+and the undo tree say one thing in one voice, and neither quotes the other.
+
 ### What the model is told
 
 The system prompt, in this order: what superapp is — one person's workspace,
@@ -422,7 +430,9 @@ cached), 310 out*.
 
 A transcript above, the composer below. The person's turns are on one side and
 the agent's on the other, chips in the person's; the model's reasoning, where
-it sends any, is one folded muted line; a tool call is a card; the live tail
+it sends any, is one folded muted line; a tool call is a card, saying on its
+first line what it did — a writing tool's own undo sentence, a reading tool's
+name and arguments — and, folded behind it, what it came to; the live tail
 streams into the last turn while the answer is being written. A long transcript
 is a list of turns, so a thousand-turn chat costs what it shows, and everything
 the agent wrote is a selectable run, because an answer is something one copies
@@ -434,13 +444,15 @@ message is not a row — and a send the store refuses leaves the words in the
 field, because they are the only copy.
 
 The bar is **send** (`cmd+s`) while there is something to send and nothing
-going, **stop** (`cmd+k`) while something is, and **retry** (`cmd+r`) on a
-round that failed or was stopped, so a bar with none of the three is a chat
-waiting to be written in. Then the two that are always there, both links
-because both go somewhere: **new** (`cmd+n`), a fresh chat of its own, and
-*agents*, which replaces the panel with the list. *agents* wears no letter on
-purpose — the composer is a text field, and a letter here would take a chord
-out of it.
+going, **stop** (`cmd+k`) while something is, **retry** (`cmd+r`) on a round
+that failed or was stopped, and **continue** (`cmd+o`) on an answer the model
+ran out of room for, so a bar with none of the four is a chat waiting to be
+written in. Then **add panel** (`cmd+p`), which is always there because it is
+the phone's way into context and harmless where the chord exists. Then the two
+that are always there and are links because both go somewhere: **new**
+(`cmd+n`), a fresh chat of its own, and *agents*, which replaces the panel with
+the list. *agents* wears no letter on purpose — the composer is a text field,
+and a letter here would take a chord out of it.
 
 The title is the chat's own — the first line of the first thing said in it,
 clipped at sixty characters — and `chat` before anything has been. It wishes
@@ -465,12 +477,21 @@ of the same action.
 
 ### The phone
 
-The chat fills the grid, the composer sits above the soft keyboard and the
-transcript shortens, as every panel does. `cmd+shift+a` has no glass equivalent
-— a long press on a header is already *pick the panel up* — so it joins the
-[gestures the glass has no word for](./open-questions.md), and the chat's own
-*add panel*, which offers the open panels as a list to pick one from, is the
-phone's way in.
+The chat fills the grid, and the composer needs no code of its own to stay
+above the soft keyboard: the shell shortens the workspace by the keyboard's
+occlusion on `Event::VirtualKeyboard`, so the panel is drawn shorter, the
+transcript shortens with it and the composer stays at the foot of whatever room
+is left. That is what every panel with a field at its foot does, the compose
+sheet included.
+
+`cmd+shift+a` has no glass equivalent — a long press on a header is already
+*pick the panel up* — so it joins the
+[gestures the glass has no word for](./open-questions.md), and **add panel** on
+the bar is the phone's way in. It stands a field in the composer's chip row
+with a completion box under it, offering every panel open on every workspace by
+its title — this chat excepted — the ones that begin with what is typed first
+and the ones that merely contain it after. `enter` takes what the offer is
+showing and makes it a chip; `esc` puts the field away.
 
 ## Failure and problems
 
@@ -490,8 +511,12 @@ phone's way in.
   retries by itself: six blind retries of a paid request is not a policy
   anyone wants, and the gateway does its own retrying.
 - **The model stops on a filter** or **runs out of room**: the turn keeps the
-  word the model stopped on, `content_filter` or `length`, and the chat goes
-  on.
+  word the model stopped on, `content_filter` or `length`, drawn as *filtered*
+  or *cut short* in the muted line under it, and the chat goes on. On `length`
+  the bar wears **continue**, which sends *Continue.* as the person's own turn
+  — a cut answer is finished by a round like any other, because the wire has
+  no word for *finish what you were saying* and the model reads its own cut
+  answer just above.
 - **A call fails**: the tool's error is the `tool` message's content, so the
   model reads it and can say what it could not do.
 - **The process dies mid-run**: the ladder's sweep, above.

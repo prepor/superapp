@@ -14,9 +14,10 @@
 //! nothing else.
 
 use kernel::panel::Tag;
+use kernel::scene::Scene;
 use makepad_widgets::*;
 
-use crate::shell::app_ui::AppUi;
+use crate::shell::app_ui::{AppUi, Setup};
 
 use super::panels::{Agents, Chat};
 use super::widgets::{AgentAgentsPanel, AgentChatPanel};
@@ -264,6 +265,23 @@ script_mod! {
         }
         View { width: Fill, height: 8 }
         mod.widgets.TblHairline {}
+        /* *add panel*: the panels that are open, one pick apiece, over the
+           chips the pick joins. Up while the verb asked for it; enter takes
+           what the offer is showing, esc puts it away. */
+        pick_row := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            margin: Inset{top: 8}
+            mod.widgets.SSection { width: 82, text: "ADD PANEL" }
+            pick_input := mod.widgets.SField {
+                empty_text: "a panel that is open"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
         chips := mod.widgets.AgentChipRow { margin: Inset{top: 8} }
         View { width: Fill, height: 8 }
         /* Two lines tall to start with, growing to six and scrolling past
@@ -276,6 +294,9 @@ script_mod! {
             empty_text: "ask…"
             return_key_type: ReturnKeyType.Default
         }
+        // The pick field's own box, hung under it and drawn after
+        // everything else so it covers the composer rather than moving it.
+        suggest_pick: mod.widgets.TblSuggest {}
     }
 
     // ---- the agents list -----------------------------------------------------
@@ -392,5 +413,9 @@ impl AppUi for Ui {
             Agents::TAG => Some(live_id!(agent_agents_tpl)),
             _ => None,
         }
+    }
+
+    fn scenes(&self) -> Vec<Scene<Setup>> {
+        super::scenes::scenes()
     }
 }

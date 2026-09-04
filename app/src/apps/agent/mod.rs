@@ -36,6 +36,7 @@ use chip::Chip;
 
 pub mod calls;
 pub mod chip;
+pub mod completion;
 pub mod fake;
 pub mod gateway;
 pub mod model;
@@ -44,6 +45,7 @@ pub mod problems;
 pub mod prompt;
 pub mod real;
 pub mod run;
+pub mod scenes;
 pub mod schema;
 pub mod ui;
 pub mod widgets;

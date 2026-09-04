@@ -30,8 +30,10 @@ use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
 use crate::shell::keys::{key_char, Letters};
+use crate::shell::widgets::suggest::Suggest;
 
 use super::super::chip::Chip;
+use super::super::completion::PanelPick;
 use super::super::model::{self, Call, CallId, Run, Turn, TurnId};
 use super::super::panels::Chat;
 use super::super::run::Tail;
@@ -169,6 +171,24 @@ pub struct AgentChatPanel {
     /// The frame a streaming run asks for.
     #[rust]
     next_frame: NextFrame,
+    /// The *add panel* field's own completion box, hung under that field.
+    #[live]
+    suggest_pick: View,
+    /// What it is offering: the panels that are open, matched by title.
+    #[rust]
+    picker: Suggest<PanelPick>,
+    /// Whether the pick row was up at the last look, so the field is seeded
+    /// when it opens and not written over as it is typed.
+    #[rust]
+    pick_up: bool,
+    /// A field just raised wants the keyboard, once it has been drawn where
+    /// it will stand: focus on a field with no rectangle lands nowhere.
+    #[rust]
+    pick_land: bool,
+    /// The box's rows of the last draw, in the order it offers them: a
+    /// press on one is a pick, and it must not reach what it covers.
+    #[rust]
+    pick_hits: Vec<Rect>,
 }
 
 impl Widget for AgentChatPanel {
@@ -187,25 +207,62 @@ impl Widget for AgentChatPanel {
         }
 
         let field = self.view.text_input(cx, ids!(ask_input));
+        let pick = self.view.text_input(cx, ids!(pick_input));
+        self.raise(cx, &props, &pick);
+        self.picker.track(cx, &pick);
+        let picking = self.pick_up && pick.key_focus(cx);
         let focused = field.key_focus(cx);
-        if focused {
+        if focused || picking {
             // Exactly the text chords: a caret owns `cmd+x/c/v/a` wherever
             // it blinks, and this bar's own letters stay bold and stay
             // firing — `s`, `k`, `r` and `n` are what the panel is for.
             props.chord.field(Letters::NONE);
         }
         if let Event::KeyDown(k) = event {
-            if focused
+            if (focused || picking)
                 && k.modifiers.logo
                 && key_char(k.key_code).is_some_and(|c| Letters::TEXT.has(c))
             {
                 props.chord.take();
             }
+            // The pick field owns its own keys while it has the keyboard:
+            // enter takes what the offer is showing, esc puts the field
+            // away whether the offer is up or not — a picker is one gesture
+            // and one way out of it.
+            if picking {
+                if k.key_code == KeyCode::Escape {
+                    self.close_pick(cx, &props, scope);
+                    return;
+                }
+                if let Some(c) = self.offer(&props, scope) {
+                    let took = self.picker.key(cx, &c, &pick, k);
+                    if k.key_code == KeyCode::ReturnKey {
+                        self.take_pick(cx, &props, scope, &pick.text());
+                        return;
+                    }
+                    if took {
+                        self.mirror(&props, &pick.text());
+                        self.view.redraw(cx);
+                        return;
+                    }
+                }
+            }
             // Enter sends; shift+enter is the field's own newline. Taken
             // before the field, which would otherwise put a line break in
             // and leave the words behind.
-            if k.key_code == KeyCode::ReturnKey && !k.modifiers.shift {
+            if !picking && k.key_code == KeyCode::ReturnKey && !k.modifiers.shift {
                 self.send(cx, &props, scope);
+                return;
+            }
+        }
+
+        // The box is drawn over the composer, so its rows answer a press
+        // first: what is under them is not what was pressed.
+        if let Event::MouseDown(e) = event {
+            if self.pick_hits.iter().any(|r| r.contains(e.abs)) {
+                if let Some(label) = self.pick_hit(cx, e.abs) {
+                    self.take_pick(cx, &props, scope, &label);
+                }
                 return;
             }
         }
@@ -222,6 +279,19 @@ impl Widget for AgentChatPanel {
             }
             if field.key_focus_lost(actions) {
                 field.set_cursor(cx, field.cursor(), false);
+            }
+            if pick.changed(actions).is_some() {
+                self.mirror(&props, &pick.text());
+                self.view.redraw(cx);
+            }
+            if pick.returned(actions).is_some() {
+                self.take_pick(cx, &props, scope, &pick.text());
+            }
+            if pick.escaped(actions) {
+                self.close_pick(cx, &props, scope);
+            }
+            if pick.key_focus_lost(actions) {
+                pick.set_cursor(cx, pick.cursor(), false);
             }
         }
 
@@ -254,6 +324,10 @@ impl Widget for AgentChatPanel {
         };
         self.at = shown.tail.as_ref().map_or(0, |t| t.version);
         self.compose(cx, &shown);
+        // Said on the draw as well as on the event: a verb is run while the
+        // bar is being drawn, and its field is up in that very frame.
+        let pick = self.view.text_input(cx, ids!(pick_input));
+        self.raise(cx, &props, &pick);
 
         // The widest a person's block may be: most of the column, and the
         // block takes as much of that as its longest line asks for. The
@@ -280,6 +354,7 @@ impl Widget for AgentChatPanel {
         }
 
         self.hits(cx, &props, &shown, drawn);
+        self.draw_pick(cx, &props, scope, &pick);
         // A live answer asks for the frame that draws its next word; a
         // finished one asks for nothing, and the panel sits still.
         if shown.streaming {
@@ -656,6 +731,157 @@ impl AgentChatPanel {
         self.view.redraw(cx);
     }
 
+    /// Raises and lowers the *add panel* row with the instance's own state,
+    /// seeds the field on the look it opens, and hands it the keyboard once
+    /// it has a rectangle to take it in — focus on a field that has never
+    /// been drawn lands nowhere. Called from the draw as well as from the
+    /// event, so the verb's field is up in the very frame it asked for.
+    fn raise(&mut self, cx: &mut Cx, props: &PanelProps, pick: &TextInputRef) {
+        let up = {
+            let mut borrow = props.panel.borrow_mut();
+            match borrow.as_any().downcast_mut::<Chat>() {
+                Some(c) => c.picking().is_some(),
+                None => return,
+            }
+        };
+        if up != self.pick_up {
+            self.pick_up = up;
+            self.view.widget(cx, ids!(pick_row)).set_visible(cx, up);
+            if up {
+                pick.set_text(cx, "");
+                // A fresh field, a fresh offer: nothing of the last pick.
+                self.picker = Suggest::default();
+                self.pick_land = true;
+            }
+        }
+        if self.pick_land && up && pick.area().rect(cx).size.y > 0.0 {
+            self.pick_land = false;
+            pick.set_key_focus(cx);
+        }
+    }
+
+    /// What the pick field is offering: the panels that are open, by title,
+    /// this chat left out. Read fresh — a panel opened while the field is up
+    /// is one more thing to pick.
+    fn offer(&self, props: &PanelProps, scope: &mut Scope) -> Option<PanelPick> {
+        let session = scope.data.get_mut::<Session>()?;
+        let mut borrow = props.panel.borrow_mut();
+        let chat = borrow.as_any().downcast_mut::<Chat>()?;
+        let open = chat
+            .pickable(session)
+            .into_iter()
+            .map(|(slot, title)| {
+                let at = session
+                    .ws()
+                    .ws_of(slot)
+                    .map_or_else(String::new, |k| format!("ws {}", k + 1));
+                (title, at)
+            })
+            .collect();
+        Some(PanelPick { open })
+    }
+
+    /// The field's text into the instance, so the row it draws and the row
+    /// it is are one thing.
+    fn mirror(&self, props: &PanelProps, text: &str) {
+        let mut borrow = props.panel.borrow_mut();
+        if let Some(c) = borrow.as_any().downcast_mut::<Chat>() {
+            c.set_picking(Some(text));
+        }
+    }
+
+    /// A pick taken: the panel's chip into the composer and the field away,
+    /// with the keyboard back where this panel's work is. A spelling that
+    /// names no open panel leaves the field where it is.
+    fn take_pick(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, typed: &str) {
+        let took = match scope.data.get_mut::<Session>() {
+            Some(session) => {
+                let mut borrow = props.panel.borrow_mut();
+                match borrow.as_any().downcast_mut::<Chat>() {
+                    Some(c) => c.add_panel(session, typed),
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        if took {
+            self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+        }
+        if let Some(session) = scope.data.get_mut::<Session>() {
+            session.redraw();
+        }
+        self.view.redraw(cx);
+    }
+
+    /// `esc`: the field away, nothing added, the keyboard back in the
+    /// composer.
+    fn close_pick(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
+        {
+            let mut borrow = props.panel.borrow_mut();
+            if let Some(c) = borrow.as_any().downcast_mut::<Chat>() {
+                c.set_picking(None);
+            }
+        }
+        self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+        if let Some(session) = scope.data.get_mut::<Session>() {
+            session.redraw();
+        }
+        self.view.redraw(cx);
+    }
+
+    /// The offer, drawn last of all — after the transcript and the composer
+    /// — so it covers what it hangs over, and its rows registered last, so a
+    /// press on one wins over what is underneath.
+    fn draw_pick(
+        &mut self,
+        cx: &mut Cx2d,
+        props: &PanelProps,
+        scope: &mut Scope,
+        pick: &TextInputRef,
+    ) {
+        self.pick_hits.clear();
+        if self.pick_up {
+            // Addressable by name: that is all a script needs to put a
+            // caret in it. Only while the row is up — a hidden widget keeps
+            // its last rectangle.
+            let r = self.view.widget(cx, ids!(pick_input)).area().rect(cx);
+            if r.size.x > 0.0 {
+                props.hits.add("panel", r, MouseCursor::Text, props.slot);
+            }
+        }
+        let store = scope.data.get_mut::<Session>().map(|s| s.store().clone());
+        let offer = self.offer(props, scope);
+        let (Some(store), Some(c)) = (store, offer.filter(|_| self.pick_up)) else {
+            self.suggest_pick.set_visible(cx, false);
+            return;
+        };
+        let Self {
+            suggest_pick,
+            picker,
+            pick_hits,
+            ..
+        } = self;
+        picker.draw(cx, scope, &store, &c, pick, suggest_pick);
+        for (label, r) in picker.hits(cx, suggest_pick) {
+            pick_hits.push(r);
+            props.hits.add(label, r, MouseCursor::Hand, props.slot);
+        }
+    }
+
+    /// Which row of the open box a press landed on, by the title it wears.
+    fn pick_hit(&mut self, cx: &mut Cx, at: DVec2) -> Option<String> {
+        let Self {
+            suggest_pick,
+            picker,
+            ..
+        } = self;
+        picker
+            .hits(cx, suggest_pick)
+            .into_iter()
+            .find(|(_, r)| r.contains(at))
+            .map(|(label, _)| label)
+    }
+
     /// A paste that reads as a panel. Answers whether it was one, which is
     /// whether the field is to be kept out of it.
     fn pasted(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, text: &str) -> bool {
@@ -946,12 +1172,18 @@ fn finish_mark(finish: Option<&str>) -> Option<&'static str> {
 
 /// A card's first line: what the call did, in one line.
 ///
-/// The tool's name and a compact reading of the arguments it was given. A
-/// writing tool will say its own sentence here once the tools land — this
-/// is the one place that changes for it — and a folded card wears the same
-/// mark a folded quote does.
+/// A call that **wrote** says the sentence its own node wears — *rename
+/// “README.txt” to “readme-renamed.txt”* — which is the same words the undo
+/// tree offers to take back, so the card and the history agree without
+/// either quoting the other. Everything else — a reading tool, a call that
+/// refused before it did anything — is the tool by name with a compact
+/// reading of the arguments the model wrote for it. A folded card wears the
+/// same mark a folded quote does.
 #[must_use]
 pub fn card_line(call: &Call) -> String {
+    if let Some(label) = call.label.as_ref().filter(|l| !l.trim().is_empty()) {
+        return label.clone();
+    }
     let args = summarize(&call.input());
     if args.is_empty() {
         call.tool.clone()

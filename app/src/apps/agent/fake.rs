@@ -150,6 +150,9 @@ impl FakeGateway {
                 },
             ),
             Reply::when("looking", Answer::Text("You are looking at {panel}.".into())),
+            // What *continue* asks for, and what it is worth: the rest of
+            // the sentence the `cut` reply above stopped in the middle of.
+            Reply::when("continue", Answer::Text("… and here is the rest.".into())),
             Reply::always(Answer::Text("Hello. I am the assistant.".into())),
         ])
     }

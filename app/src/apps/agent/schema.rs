@@ -89,6 +89,11 @@ CREATE TABLE agent_call(
   status       TEXT NOT NULL,
   -- What it came to, or why it did not, whichever the model reads back.
   output       TEXT,
+  -- The sentence the history shows for what a writing tool did — *rename
+  -- “README.txt” to “readme-renamed.txt”* — read off the node the tool
+  -- filed. The card says this where there is one; the model never sees it,
+  -- because the model reads the tool's own JSON.
+  label        TEXT,
   created      REAL NOT NULL,
   ended        REAL
 );

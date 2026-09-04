@@ -690,9 +690,11 @@ use kernel::nav::Nav;
 use kernel::panel::{PanelId, PanelKind, VerbAct};
 use kernel::session::Action;
 
+use super::chip::Chip;
 use super::model::{self, Carried, Chat as ChatRow, ChatId, Cost, Turn};
 use super::panels::{Agents, Chat};
 use super::problems::GatewayProblems;
+use super::widgets::chat::card_line;
 use super::{calls, prompt, real, schema, worker, Agent};
 use crate::apps::files::FILES;
 use crate::apps::mail::MAIL;
@@ -787,6 +789,18 @@ fn send_new(s: &mut Session, text: &str) -> ChatId {
 #[test]
 fn a_send_makes_the_chat_the_turn_and_the_answer() {
     let mut s = session();
+    // The live tails are the app's one static, keyed by run — and every
+    // test here opens a store of its own whose first run would be `1`. So
+    // this one starts counting its runs where no other test's will reach,
+    // and the tail read back below can only be this run's.
+    s.store()
+        .write(|c| {
+            c.execute(
+                "INSERT INTO agent_run(id, chat, status, started) VALUES(900001, 0, 'done', 0)",
+                [],
+            )
+        })
+        .expect("a run id nobody else in this process will hand out");
     let chat = send_new(&mut s, "hello");
 
     let row = model::chat(s.store(), chat).expect("the chat row");
@@ -1161,14 +1175,14 @@ fn the_chat_panel_names_its_conversation_and_wears_its_bar() {
     );
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.new", "agent.agents"],
-        "nothing to send and nothing going"
+        vec!["agent.add_panel", "agent.new", "agent.agents"],
+        "nothing to send and nothing going; a panel is always there to add"
     );
 
     with_chat(&s, blank, |c| c.set_draft("hello"));
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.send", "agent.new", "agent.agents"]
+        vec!["agent.send", "agent.add_panel", "agent.new", "agent.agents"]
     );
 
     verb(&mut s, blank, "agent.send");
@@ -1230,7 +1244,12 @@ fn stop_ends_the_run_and_the_bar_offers_retry() {
     let slot = open_root(&mut s, Chat::id(chat));
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.retry", "agent.new", "agent.agents"],
+        vec![
+            "agent.retry",
+            "agent.add_panel",
+            "agent.new",
+            "agent.agents"
+        ],
         "a round that was stopped is one to ask again"
     );
 }
@@ -1454,10 +1473,174 @@ fn a_refusal_reads_as_its_sentence_and_a_bad_token_says_so() {
     assert_eq!(why.message, r#"{"oops":true}"#);
 }
 
+#[test]
+fn an_answer_that_ran_out_of_room_wears_continue_and_asking_is_a_turn() {
+    let mut s = session();
+    let chat = send_new(&mut s, "cut it short");
+    let slot = open_root(&mut s, Chat::id(chat));
+    assert_eq!(
+        model::turns(s.store(), chat)[1].finish.as_deref(),
+        Some("length"),
+        "the fake's cut answer"
+    );
+    assert!(
+        verb_ids(&s, slot).contains(&"agent.continue"),
+        "a cut answer is one to ask the rest of"
+    );
+
+    verb(&mut s, slot, "agent.continue");
+    assert_eq!(
+        transcript(&s, chat),
+        vec![
+            (Role::User, "cut it short".to_string()),
+            (Role::Assistant, "This answer is long and it".to_string()),
+            (Role::User, "Continue.".to_string()),
+            (Role::Assistant, "… and here is the rest.".to_string()),
+        ],
+        "the rest is asked for as the person's own turn"
+    );
+    assert!(
+        !verb_ids(&s, slot).contains(&"agent.continue"),
+        "an answer that finished is nothing to continue"
+    );
+}
+
+#[test]
+fn add_panel_offers_the_panels_that_are_open_and_a_pick_is_a_chip() {
+    let mut s = session();
+    let list = open_root(&mut s, Agents::id());
+    let slot = open_root(&mut s, Chat::new_id());
+    assert!(
+        verb_ids(&s, slot).contains(&"agent.add_panel"),
+        "the phone's way in, and harmless where the chord is"
+    );
+
+    verb(&mut s, slot, "agent.add_panel");
+    assert_eq!(
+        with_chat(&s, slot, |c| c.picking().map(ToString::to_string)),
+        Some(String::new()),
+        "the verb stands the field up empty"
+    );
+    assert_eq!(
+        with_chat(&s, slot, |c| c.pickable(&s)),
+        vec![(list, "agents".to_string())],
+        "every open panel but this chat"
+    );
+
+    // What is typed names one of them by its leading letters.
+    assert_eq!(with_chat(&s, slot, |c| c.pick(&s, "age")), Some(list));
+    assert_eq!(with_chat(&s, slot, |c| c.pick(&s, "nobody")), None);
+
+    assert!(with_chat(&s, slot, |c| c.add_panel(&s, "age")));
+    assert_eq!(
+        with_chat(&s, slot, |c| c
+            .chips()
+            .iter()
+            .map(Chip::label)
+            .collect::<Vec<_>>()),
+        vec!["agents".to_string()],
+        "the pick is the panel's own chip, in the composer"
+    );
+    assert!(
+        with_chat(&s, slot, |c| c.picking().is_none()),
+        "and the field is away"
+    );
+}
+
+// -- what a card says a call did -----------------------------------------------
+
+/// Plants one call, sends for it, runs it, and answers the row it left.
+fn one_call(s: &mut Session, ask: &str, name: &str, arguments: Value) -> model::Call {
+    plant(
+        s,
+        vec![Reply::always(Answer::Call {
+            name: name.to_string(),
+            arguments,
+            then: "Done.".into(),
+        })],
+    );
+    let chat = send_new(s, ask);
+    assert_eq!(calls::run_pending_calls(s, chat), 1, "the one call ran");
+    s.settle();
+    let run = model::runs(s.store(), chat)
+        .first()
+        .cloned()
+        .expect("the round that asked");
+    model::calls(s.store(), run.id)
+        .first()
+        .cloned()
+        .expect("the call it asked for")
+}
+
+#[test]
+fn a_reading_calls_card_is_the_tool_and_what_the_model_wrote_for_it() {
+    let mut s = session();
+    let call = one_call(
+        &mut s,
+        "how many is one",
+        "sql.query",
+        json!({"sql": "SELECT 1"}),
+    );
+    assert_eq!(call.status, model::CALL_DONE, "{}", call.said());
+    assert_eq!(
+        call.label, None,
+        "a read files no node, so there is no sentence to say"
+    );
+    assert_eq!(card_line(&call), "sql.query SELECT 1");
+}
+
+#[test]
+fn a_writing_calls_card_says_what_it_did_in_the_words_undo_uses() {
+    let mut s = Session::fake(WITH_TESTER);
+    let sql = "INSERT INTO tester_thing(name) VALUES ('a thing')";
+    let call = one_call(&mut s, "keep a thing", "sql.write", json!({"sql": sql}));
+    assert_eq!(call.status, model::CALL_DONE, "{}", call.said());
+    assert_eq!(
+        call.label.as_deref(),
+        Some(sql),
+        "the sentence the tool's own node wears, on the call's row"
+    );
+    assert_eq!(card_line(&call), sql, "and that is the card's line");
+    // One thing said once: the card and the history agree, because the card
+    // read the node rather than writing its own words for it.
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").label,
+        sql,
+        "the head is the node the tool filed"
+    );
+    assert_eq!(
+        s.store()
+            .conn()
+            .query_row("SELECT name FROM tester_thing", [], |r| r
+                .get::<_, String>(0))
+            .expect("the row the call wrote"),
+        "a thing"
+    );
+}
+
+#[test]
+fn a_call_that_refused_keeps_the_tool_on_its_line() {
+    let mut s = session();
+    let call = one_call(&mut s, "rename it", "files.rename", json!({"path": "~"}));
+    assert_eq!(call.status, model::CALL_FAILED);
+    assert_eq!(call.said(), "missing `name`");
+    assert_eq!(call.label, None, "nothing was done, so nothing is claimed");
+    assert_eq!(card_line(&call), "files.rename ~");
+}
+
 // -- what `attach` copies out of the registry -----------------------------------
 
-/// A test app with something to say and something to offer.
+/// A test app with something to say, something to offer, and one table of
+/// its own — keyed, because `sql.write` will not touch a table the session
+/// extension records nothing for.
 struct Tester;
+
+static TESTER_SCHEMA: kernel::app::Schema = kernel::app::Schema {
+    app: "tester",
+    steps: &[kernel::app::Step::Sql(
+        "CREATE TABLE tester_thing(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    )],
+};
 
 impl App for Tester {
     fn id(&self) -> &'static str {
@@ -1465,6 +1648,9 @@ impl App for Tester {
     }
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         &[]
+    }
+    fn schema(&self) -> Option<&'static kernel::app::Schema> {
+        Some(&TESTER_SCHEMA)
     }
     fn describe(&self) -> Option<&'static str> {
         Some("one table, `tester_thing`, and a row is a thing.")
@@ -1542,7 +1728,7 @@ fn a_second_round_of_calls_answers_only_its_own() {
                 },
             };
             let id = model::add_call_tx(c, run, turn, &call, 0.0)?;
-            model::set_call_tx(c, id, model::CALL_DONE, "ok", 0.0)?;
+            model::set_call_tx(c, id, model::CALL_DONE, "ok", None, 0.0)?;
             model::set_run_status_tx(c, run, model::WAITING, None, 0.0)
         })
         .expect("a second round, by hand");
