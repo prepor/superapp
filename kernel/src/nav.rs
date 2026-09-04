@@ -333,7 +333,7 @@ mod tests {
         fn schema(&self) -> Option<&'static crate::app::Schema> {
             Some(&SCHEMA)
         }
-        fn seed(&self, store: &Store) -> rusqlite::Result<()> {
+        fn seed(&self, store: &Store, _mode: crate::app::Mode) -> rusqlite::Result<()> {
             store.write(|tx| {
                 for i in 1..=5 {
                     tx.execute("INSERT OR IGNORE INTO card(id, seen) VALUES(?1, 0)", [i])?;

@@ -41,13 +41,15 @@ pub trait App: Any + Sync + Send + 'static {
     }
 
     /// Demo rows for a new store. Called once, on the first open of an
-    /// empty store. Must be idempotent: a crash between the seed and its
-    /// record repeats it.
+    /// empty store, with the outside that store's worlds will get — a real
+    /// run's demo rows are what a person is left with, so an app writes
+    /// nothing there that only a fake backend could answer for. Must be
+    /// idempotent: a crash between the seed and its record repeats it.
     ///
     /// # Errors
     ///
     /// If the store refuses the write.
-    fn seed(&self, _store: &Store) -> rusqlite::Result<()> {
+    fn seed(&self, _store: &Store, _mode: Mode) -> rusqlite::Result<()> {
         Ok(())
     }
 
@@ -228,14 +230,15 @@ impl Apps {
         self.list.iter().filter_map(|a| a.schema()).collect()
     }
 
-    /// Every app's demo rows, once, on the first open of an empty store.
+    /// Every app's demo rows, once, on the first open of an empty store,
+    /// for the outside that store's worlds will get.
     ///
     /// # Errors
     ///
     /// If any app's seed refuses.
-    pub fn seed(&self, store: &Store) -> rusqlite::Result<()> {
+    pub fn seed(&self, store: &Store, mode: Mode) -> rusqlite::Result<()> {
         for a in self.list {
-            a.seed(store)?;
+            a.seed(store, mode)?;
         }
         Ok(())
     }

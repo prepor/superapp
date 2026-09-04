@@ -7,7 +7,7 @@
 //! fake servers, and the passes running inline — so a scripted action is
 //! followed by its consequences in the same call.
 
-use kernel::app::{App, Env};
+use kernel::app::{App, Apps, Env, Mode};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, VerbAct};
@@ -771,6 +771,37 @@ fn the_app_registers_its_tags_workers_and_roots() {
         s.world().registry().kinds(),
         vec!["forwarded", "move", "seen", "submit"]
     );
+}
+
+/// A real run's demo account is the same letters with no hosts: there is no
+/// `imap.demo` out there, so nothing syncs for it and the sender is the only
+/// pass. Every other mode keeps the hosts, which is what the test above
+/// syncs against.
+#[test]
+fn a_real_seed_leaves_the_demo_account_without_hosts() {
+    let apps = Apps::new(APPS);
+    let store = Store::open(None, &apps.schemas()).expect("in-memory store");
+    apps.seed(&store, Mode::Real).expect("the demo rows");
+
+    let hosts: (Option<String>, Option<String>) = store
+        .conn()
+        .query_row("SELECT imap_host, smtp_host FROM account", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("the demo account is there all the same");
+    assert_eq!(hosts, (None, None));
+
+    let mails: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .unwrap();
+    assert!(mails > 0, "the demo mail is in every fresh store");
+
+    let names: Vec<String> = super::sync::workers(&store)
+        .iter()
+        .map(|w| w.name())
+        .collect();
+    assert_eq!(names, vec!["sender".to_string()], "no pass for a hostless account");
 }
 
 /// A compose's identity round-trips through its arguments, which is the one

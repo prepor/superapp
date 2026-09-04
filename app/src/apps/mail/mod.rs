@@ -96,8 +96,8 @@ impl App for Mail {
         Some(&schema::SCHEMA)
     }
 
-    fn seed(&self, store: &Store) -> rusqlite::Result<()> {
-        seed::seed_if_empty(store)
+    fn seed(&self, store: &Store, mode: Mode) -> rusqlite::Result<()> {
+        seed::seed_if_empty(store, mode)
     }
 
     fn effects(&self, reg: &mut Registry) {

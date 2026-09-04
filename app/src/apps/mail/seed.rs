@@ -5,6 +5,7 @@
 //! — in the same order, so the uids agree and the first sync pass is the
 //! no-op a mirror of an agreeing server should be.
 
+use kernel::app::Mode;
 use kernel::store::Store;
 use kernel::time::{civil_from_days, ts, virtual_epoch};
 
@@ -16,6 +17,8 @@ pub const ACCOUNT: i64 = 1;
 pub const ADDRESS: &str = "me@prepor.dev";
 /// What it signs in with. In the keychain, never in the store.
 pub const PASSWORD: &str = "demo-app-password";
+/// The fake server's hosts. Only a world that has one gets them written
+/// down — see [`seed_if_empty`].
 pub const IMAP_HOST: &str = "imap.demo";
 pub const SMTP_HOST: &str = "smtp.demo";
 
@@ -595,21 +598,36 @@ pub fn rfc822(m: &SeedMail) -> String {
 /// account is a mirror of a server rather than a pile of rows nothing can
 /// push.
 ///
+/// The hosts it is a mirror *of* are written only where they exist: a world
+/// with the fake servers in it ([`Mode::Fake`], [`Mode::Deny`]) gets
+/// `imap.demo` and `smtp.demo`, so a suite and a test can sync the demo
+/// account against them. A real run's demo account has no hosts, because
+/// there is no `imap.demo` out there — and an account with a host is an
+/// account with a [worker](super::sync::workers), which would stand as a
+/// failing sync in a person's own store every minute. The letters are the
+/// same either way.
+///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
+pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
     let n: i64 = store
         .conn()
         .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))?;
     if n > 0 {
         return Ok(());
     }
-    store.write(|c| {
+    let hosts = (mode != Mode::Real).then_some((IMAP_HOST, SMTP_HOST));
+    store.write(move |c| {
         c.execute(
             "INSERT INTO account(id, label, email, imap_host, smtp_host)
              VALUES(?1, 'demo', ?2, ?3, ?4)",
-            rusqlite::params![ACCOUNT, ADDRESS, IMAP_HOST, SMTP_HOST],
+            rusqlite::params![
+                ACCOUNT,
+                ADDRESS,
+                hosts.map(|(imap, _)| imap),
+                hosts.map(|(_, smtp)| smtp)
+            ],
         )?;
         let mut folders: Vec<(&str, i64)> = Vec::new();
         for (name, role) in FOLDERS {

@@ -194,13 +194,17 @@ pub struct Session {
     /// Seeding is a holder-only act under replication: a would-be follower
     /// must not write a world it is about to replace with the holder's.
     seeded: bool,
+    /// Which outside those rows are written for when it does — the same
+    /// mode a boot seeds a plain store with.
+    seed_mode: Mode,
 }
 
 impl Session {
     /// The session a boot builds: the world it was given, the apps it was
-    /// listed with, and an empty layout.
+    /// listed with, the outside its demo rows are written for, and an empty
+    /// layout.
     #[must_use]
-    pub fn new(apps: Apps, world: Rc<World>, workers: Workers) -> Session {
+    pub fn new(apps: Apps, world: Rc<World>, workers: Workers, seed_mode: Mode) -> Session {
         let store = world.store().clone();
         Session {
             store,
@@ -230,6 +234,7 @@ impl Session {
             repl_mount: None,
             lease: repl::Status::default(),
             seeded: false,
+            seed_mode,
         }
     }
 
@@ -271,14 +276,14 @@ impl Session {
     ) -> Session {
         let apps = Apps::new(list);
         let store = Rc::new(Store::open(None, &apps.schemas()).expect("in-memory store"));
-        apps.seed(&store).expect("the apps' demo rows");
+        apps.seed(&store, mode).expect("the apps' demo rows");
         let world = Rc::new(World::new(
             store,
             apps.capabilities(mode, env),
             apps.registry(),
         ));
         let workers = Workers::inline(list, world.clone());
-        Session::new(apps, world, workers)
+        Session::new(apps, world, workers, mode)
     }
 
     // -- what everything reads ------------------------------------------------
@@ -1009,6 +1014,7 @@ mod tests {
             crate::app::Apps::new(APPS),
             s.world().clone(),
             Workers::none(s.store().clone()),
+            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(fresh.panels().len(), 1);
@@ -1031,6 +1037,7 @@ mod tests {
             crate::app::Apps::new(APPS),
             s.world().clone(),
             Workers::none(s.store().clone()),
+            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(fresh.panels().len(), 2);
@@ -1283,6 +1290,7 @@ mod tests {
             crate::app::Apps::new(LIST),
             s.world().clone(),
             Workers::none(s.store().clone()),
+            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(

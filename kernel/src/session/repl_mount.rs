@@ -135,7 +135,7 @@ impl Session {
             // used keeps whatever it was left as, and one that installed a
             // snapshot has the holder's world already.
             if matches!(self.store.load_wm(), Ok(None)) {
-                if let Err(e) = self.apps.seed(&self.store) {
+                if let Err(e) = self.apps.seed(&self.store, self.seed_mode) {
                     eprintln!("store: seeding the demo world failed: {e}");
                 }
             }

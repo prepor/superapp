@@ -339,6 +339,16 @@ impl Boot {
             }
             panic!("store: opening {:?} failed: {e}", self.db)
         });
+        // Which outside the demo rows are written for. A scripted run's
+        // worlds reach the fakes however real the window around them is, so
+        // its store is seeded the fake world's way and a suite has a demo
+        // server to sync against; a run a person is looking at is seeded for
+        // the outside, where no demo server exists.
+        let seed_mode = if scripted || self.virtual_time {
+            Mode::Fake
+        } else {
+            Mode::Real
+        };
         // Demo rows go in once, on the first open of an empty store: a
         // store that has booted keeps whatever it was left as, empty or not.
         //
@@ -347,7 +357,7 @@ impl Boot {
         // world it is about to replace with the holder's snapshot. The
         // session seeds when it first holds instead.
         if self.bucket.is_none() && matches!(store.load_wm(), Ok(None)) {
-            if let Err(e) = apps.seed(&store) {
+            if let Err(e) = apps.seed(&store, seed_mode) {
                 eprintln!("store: seeding the demo world failed: {e}");
             }
         }
@@ -389,7 +399,7 @@ impl Boot {
                 },
             )
         };
-        let mut session = Session::new(apps, world, workers);
+        let mut session = Session::new(apps, world, workers, seed_mode);
         // Device sync, when a bucket is configured. Only the window's own
         // stage replicates: a mount's world is its own, and two drivers over
         // one store is exactly what the lease forbids between machines.

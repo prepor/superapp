@@ -44,7 +44,7 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `id` | one stable word: the schema key `schema:<id>`, the e2e directory, what another app asks the registry for |
 | `kinds` | every `PanelKind` the app owns; two apps claiming one tag stop the process at boot, naming both |
 | `schema` | the app's own migration ladder, applied after the kernel's in app-list order |
-| `seed` | demo rows for a new store, once, on the first open of an empty one |
+| `seed` | demo rows for a new store, once, on the first open of an empty one, for the outside that store's worlds will get |
 | `effects` | the app's deferred effect kinds, registered per world so a filed job decodes wherever it is read |
 | `outside` | the app's capabilities for one mode: `Real` gets the network and the OS, `Fake` the in-memory versions, `Deny` nothing |
 | `search_providers` | the launcher's sources beyond open panels and roots |
