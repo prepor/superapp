@@ -10,9 +10,9 @@
 # draws those titles itself, so there is no label in the window to click and
 # the menu's half is asserted by `cargo test`, not here.
 #
-# The two-finger swipe that lists the workspaces is touch, which is out of
-# the prototype: those steps are dropped rather than written against
-# something that would silently do nothing.
+# The two-finger swipe that lists the workspaces is touch, which is not
+# wired up: those steps are dropped rather than written against something
+# that would silently do nothing.
 
 wait 900
 shot ws-1

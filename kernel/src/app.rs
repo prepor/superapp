@@ -393,6 +393,7 @@ pub struct Schema {
     pub steps: &'static [Step],
 }
 
+/// One rung of a [`Schema`] ladder.
 pub enum Step {
     /// Applied once, in order.
     Sql(&'static str),
@@ -509,9 +510,12 @@ pub trait Worker: Send + 'static {
     fn pass(&mut self, w: &World) -> Wake;
 }
 
+/// When a [`Worker`] wants its next pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wake {
+    /// At the latest this long from now. A kick cuts the wait short.
     After(Duration),
+    /// Only when something kicks: there is nothing on a clock to wait for.
     OnKick,
 }
 

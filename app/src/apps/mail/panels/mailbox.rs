@@ -160,10 +160,10 @@ impl Panel for Mailbox {
     /// something nobody asked for). Delete is the one move every mailbox has —
     /// the trash is where mail goes from anywhere.
     ///
-    /// *mark all* wears `m` rather than the `l` of the shipping app: this
-    /// shell keeps `cmd+l` for itself (see [`keys`](crate::shell::keys)), and
-    /// a bar may not promise a chord that never arrives. *clear* wears none —
-    /// `esc` is the table's own.
+    /// *mark all* wears `m` rather than the obvious `l`: this shell keeps
+    /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
+    /// not promise a chord that never arrives. *clear* wears none — `esc` is
+    /// the table's own.
     fn verbs(&self) -> Vec<Verb> {
         let mut v = vec![Verb::run("mail.sync", "sync", Some('s'))];
         let n = self.list.marks().len();

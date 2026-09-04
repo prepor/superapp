@@ -3,7 +3,7 @@
 //! The kernel's [`App`](kernel::app::App) says what an app adds to the
 //! store, the queue and the launcher; this says what it adds to the screen.
 //! The binary lists the two halves side by side and hands both to
-//! [`run`](super::run).
+//! [`install`](super::install).
 
 use kernel::panel::Tag;
 use kernel::scene::Scene;

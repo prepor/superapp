@@ -7,8 +7,8 @@
 # move to the trash, and undo is the move back.
 #
 # Run with `--demo-disk`, so the tree is the fixture rather than whatever
-# this machine's ~ holds; in the prototype every world has it, and the flag
-# is what a suite written for the shipping tree says.
+# this machine's ~ holds: a suite must no more delete a human's files than
+# write to their keychain.
 #
 # The assertion is the click: a row that resolves is a path that is there.
 # Where two panels could be showing a row of the same name, the card's own

@@ -1,5 +1,14 @@
 # Panel Model
 
+## Slots and identities
+
+A **slot** is a place in a column that holds one live panel instance. What a
+slot shows is a **panel identity**: a tag and its arguments, `inbox` or
+`message(42)`. Slot numbers are what joins, focus, and history refer to;
+identities are what the layout compares, hashes, and stores. Two slots may
+show the same identity, and replacing a panel changes the identity while
+keeping the slot.
+
 ## Workspaces
 
 There are nine numbered workspaces. Each keeps its own columns, focus, and
@@ -12,27 +21,22 @@ workspace moves to a nearby panel.
 
 ## Grid and columns
 
-The screen is divided into grid units with 8 pt gaps:
+The screen is divided into grid units with 8 pt gaps. Desktop uses 12×6.
+`--grid 8x4` or `--grid 4x3` forces a smaller one, which is how a phone layout
+is looked at on a desktop; nothing switches grids by itself in this build.
 
-- desktop: 12×6;
-- unfolded phone: 8×4;
-- cover screen: 4×3.
+Each panel instance asks for a width and a height in grid units, given the
+column's width in characters. A request is limited to the active grid, so an
+inbox fills a 4×3 grid without a separate phone layout. If a column's requested
+heights fit, unused space stays empty. If they do not fit, the panels share the
+column height evenly. A column is as wide as its widest panel. Columns continue
+to the right and the workspace scrolls when they do not fit on screen.
 
-The shell switches phone grids when the width crosses about 600 dp. Animation
-moves panels to the new layout.
-
-Each panel kind requests a width and height. A request is limited to the active
-grid, so an inbox fills the 4×3 cover screen without a separate phone layout.
-If a column's requested heights fit, unused space stays empty. If they do not
-fit, the panels share the column height evenly. A column is as wide as its
-widest panel. Columns continue to the right and the workspace scrolls when they
-do not fit on screen.
-
-Some panels request more height when their content needs it. A long message can
+Some panels ask for more height when their content needs it. A long message can
 grow up to the full column, while a short message stays at its default height.
-A conversation counts the full height of open messages and one line for each
-closed message. The shell recalculates this after content arrives. The size is
-not saved.
+A conversation counts the full height of its open messages and a short fixed
+height for each closed one. A measure that costs anything is taken once and remembered on
+the instance. The size is not saved.
 
 ## Column actions and tabs
 
@@ -47,8 +51,7 @@ not saved.
   choose the visible panel.
 
 The camera moves just enough to keep the focused panel visible with one gap of
-margin. Trackpad movement follows the input directly. Touch movement is free
-while fingers are down, then aligns to the nearest column after release.
+margin. Trackpad movement follows the input directly.
 
 A [preview](./interaction-grammar.md#preview-the-one-open-that-does-not-go) also
 asks to be visible once. Focus wins if both the focused panel and preview
@@ -86,4 +89,11 @@ descendants, moves focus to the nearest remaining panel, and removes empty
 columns. Moving a panel to another workspace is not a close, but it still
 breaks joins with panels that stay behind.
 
-These rules are implemented and unit-tested in `src/core.rs`.
+Closing is one rule, and it belongs to the kernel. A close may come from the
+header's button, from a verb that removed what its own panel showed, or from a
+script; it always takes the joined chain with it and moves focus by these
+rules. No verb looks for other panels on the same subject. A panel elsewhere
+keeps showing what it shows and says so when that is gone.
+
+These rules are implemented and unit-tested in `kernel/src/layout.rs`, and the
+navigation that drives them in `kernel/src/nav.rs`.

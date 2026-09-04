@@ -66,12 +66,12 @@ mod boundary {
         }
     }
 
-    /// Rule 1 of the contract, enforced by reading the source: nothing in
-    /// the kernel names Makepad, and nothing names an app.
+    /// The kernel's half of the layering rule, enforced by reading the
+    /// source: nothing in this crate names Makepad, and nothing names an app.
     ///
-    /// The shell will grow the same test for rule 2. Both are cheap and
-    /// both catch the one mistake that is invisible in review: an import
-    /// that seems harmless until the layer it crossed has to be moved.
+    /// `app/tests/boundaries.rs` is the other half. Both are cheap and both
+    /// catch the one mistake that is invisible in review: an import that
+    /// seems harmless until the layer it crossed has to be moved.
     #[test]
     fn the_kernel_names_no_makepad_and_no_app() {
         // Word-ish matches, so prose about "the mail an app sends" is fine
@@ -114,18 +114,16 @@ mod boundary {
         );
     }
 
-    /// The other half of the store's old guarantee: `Connection::open` lives
-    /// in one module, so no code can quietly open a second writable handle
-    /// and route around the one writer.
+    /// The store's other guarantee: `Connection::open` lives in one module,
+    /// so no code can quietly open a second writable handle and route
+    /// around the one writer.
     #[test]
     fn connection_open_is_confined_to_the_store() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&dir, &mut files);
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("read src") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        for path in files {
             let name = path.file_name().and_then(|n| n.to_str());
             if name == Some("store.rs") || name == Some("lib.rs") {
                 continue; // the one place the writer lives, and this test

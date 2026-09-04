@@ -52,7 +52,7 @@ pub struct Column {
     /// under a tab strip.
     pub tabbed: bool,
     /// Which slot a tabbed column shows while unfocused. Kept in sync with
-    /// focus by [`Ws::normalize`].
+    /// focus by `Ws::normalize`.
     pub active: usize,
 }
 
@@ -449,10 +449,9 @@ impl Ws {
         slot
     }
 
-    /// Raises `sid` to be its column's shown tab. [`Ws::normalize`] does this
+    /// Raises `sid` to be its column's shown tab. `Ws::normalize` does this
     /// for the *focused* slot only, so a panel opened without focus — a
-    /// preview — would otherwise land as a hidden tab and draw at
-    /// alpha 0.
+    /// preview — would otherwise land as a hidden tab and draw at alpha 0.
     pub fn activate(&mut self, sid: SlotId) {
         if let Some((c, r)) = self.locate(sid) {
             self.columns[c].active = r;
@@ -1355,7 +1354,9 @@ mod tests {
         (ws, h, i)
     }
 
-    /// The full web-prototype smoke scenario, transcribed.
+    /// The whole navigation grammar in one walk: open, the joined replace,
+    /// the cascade close, a move that breaks a pair, and where focus lands
+    /// after each.
     #[test]
     fn smoke_scenario() {
         let (mut ws, _help, inbox_id) = boot();

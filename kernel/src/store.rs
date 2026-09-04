@@ -11,7 +11,7 @@
 //!
 //! The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`, `effect` and
 //! the two `repl` tables, and nothing else. Every other table belongs to an
-//! app and arrives through that app's [`Schema`](crate::app::Schema), applied
+//! app and arrives through that app's [`Schema`], applied
 //! after the kernel's ladder in app-list order.
 
 use std::any::Any;
@@ -127,10 +127,30 @@ pub struct TraceEntry {
     pub rows: usize,
 }
 
-/// The kernel's schema. A store at any other number is refused: state starts
-/// from scratch with this design, and there is no migration from the old
-/// shape.
+/// The kernel's schema. A store at any other number is refused rather than
+/// migrated: there is one shape, and a file that is not at it belongs to
+/// another build.
 pub const KERNEL_VERSION: i64 = 1;
+
+/// How that refusal opens. The number follows it, which is what lets a
+/// caller read the store's own schema back out of the error.
+const REFUSED: &str = "this store is schema ";
+
+/// The schema a store was at when [`Store::open`] refused it — `None` when
+/// the open failed for any other reason. The shell reads it to turn the
+/// refusal into a spoken exit instead of a backtrace; every other caller
+/// keeps the error as it is.
+#[must_use]
+pub fn refused_schema(e: &rusqlite::Error) -> Option<i64> {
+    let said = e.to_string();
+    let after = said.split_once(REFUSED)?.1;
+    after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|d| !d.is_empty())?
+        .parse()
+        .ok()
+}
 
 /// The kernel's own tables, and no others. `panel` carries what a slot shows
 /// as `(kind, args)`: the tag, and its arguments as one JSON array in a text
@@ -316,8 +336,8 @@ impl Db {
     }
 
     /// Opens the gate to ordinary writes (a holder) or closes it (a
-    /// follower, or a stranded device). Replication's own [`Db::raw`] and
-    /// [`Db::apply`] paths ignore this — only [`Db::write`] is gated.
+    /// follower, or a stranded device). Replication's own `raw` and `apply`
+    /// paths ignore this — only an ordinary `write` is gated.
     pub fn set_writable(&self, writable: bool) {
         self.writable.store(writable, Ordering::Release);
     }
@@ -448,13 +468,13 @@ fn migrate(conn: &Connection, schemas: &[&'static Schema]) -> rusqlite::Result<(
         conn.pragma_update(None, "user_version", KERNEL_VERSION)?;
     } else if version != KERNEL_VERSION {
         return Err(store_err(&format!(
-            "this store is schema {version}, and this build reads {KERNEL_VERSION} — \
+            "{REFUSED}{version}, and this build reads {KERNEL_VERSION} — \
              point at another file"
         )));
     }
     // Replication's own tables go by presence, not by the counter: every
-    // write needs them, and a store an earlier prototype left at this same
-    // version turns up without them.
+    // write needs them, so a store that turns up at this version without
+    // them gains them here instead of being refused.
     conn.execute_batch(SCHEMA_REPL)?;
     conn.execute(
         "INSERT OR IGNORE INTO repl(id, device) VALUES(1, ?1)",
@@ -1333,6 +1353,14 @@ mod tests {
         let said = format!("{e}");
         assert!(said.contains("schema 12"), "{said}");
         assert!(said.contains("point at another file"), "{said}");
+        // And the caller can read the number back out, which is how the
+        // shell knows this failure from any other and exits on it.
+        assert_eq!(refused_schema(&e), Some(12));
+        assert_eq!(
+            refused_schema(&gone()),
+            None,
+            "any other failure is not this one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -21,7 +21,7 @@ serde_json = "1"
 
 # Device sync signs its requests and reaches a real bucket over TLS: these
 # provide encoding, signing, secure connections, and trusted certificate
-# roots. Kept at the versions the shipping tree pins.
+# roots.
 base64 = "0.22"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

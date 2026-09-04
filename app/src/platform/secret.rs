@@ -1,5 +1,5 @@
 //! Where a password lives on this machine: the kernel's
-//! [`Secrets`](kernel::caps::Secrets) over the platform's own store.
+//! [`Secrets`] over the platform's own store.
 //!
 //! macOS uses the login keychain through `/usr/bin/security`; everywhere
 //! else a mode-0600 file inside the app directory. Never the store: a secret

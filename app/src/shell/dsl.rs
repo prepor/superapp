@@ -5,9 +5,8 @@
 //! app's own `script_mod` builds on these, so two apps look like one
 //! product without either of them saying so.
 //!
-//! Colours are spelled out here rather than read from
-//! [`kernel::theme`](kernel::theme) — the DSL is a script, not Rust — and
-//! the two are kept in step by hand:
+//! Colours are spelled out here rather than read from [`kernel::theme`] —
+//! the DSL is a script, not Rust — and the two are kept in step by hand:
 //! INK #141414 · BG #ffffff · TEXT2 #5a5a5a · MUTED #909090 ·
 //! RULE #dcdcdc · HOVER #efefef · SEL #e7e7e7 · ERR #a01500.
 

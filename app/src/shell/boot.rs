@@ -75,6 +75,31 @@ pub fn e2e_script() -> (Option<&'static str>, &'static str) {
     (c.e2e.as_deref(), &c.out)
 }
 
+/// What `--help` prints. Argv is the shell's; an app's own knobs are
+/// environment variables it reads itself, so they are not here.
+const USAGE: &str = "\
+superapp — specialized panels on one scrolling workspace.
+
+  cargo run -p superapp [-- FLAG...]
+
+  --db PATH           the store to open (default: the app support directory)
+  --bucket URL        point this device at a device-sync bucket
+  --r2-login          read a bucket's secret key from stdin, file it, exit
+  --library [NAME...] open the panels library instead of a workspace,
+                      narrowed to the scenes whose names match
+  --grid WxH          the unit grid a workspace is cut into
+  --window WxH        the window size
+
+Replaying a script:
+
+  --e2e FILE          the suite to replay
+  --e2e-out DIR       where its pictures go (default: e2e/out)
+  --no-draw           do the widget pass and rasterize nothing
+  --demo-disk         read the demo tree rather than this machine's files
+  --front             let the run take the screen
+  --draws N           stop after N frames (a headless build only)
+";
+
 /// The configuration this process was started with.
 pub fn config() -> &'static Config {
     static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
@@ -93,8 +118,6 @@ pub fn config() -> &'static Config {
                     }
                     c.library = Some(names);
                 }
-                // The headless backend's own flags: read (and skipped)
-                // here so they are not reported as unknown.
                 "--no-draw" => c.no_draw = true,
                 "--demo-disk" => c.demo_disk = true,
                 "--front" => c.front = true,
@@ -102,8 +125,14 @@ pub fn config() -> &'static Config {
                 // Handled before the window exists; named here so it is not
                 // reported as unknown.
                 "--r2-login" => {}
+                // The headless backend's own: makepad reads it, and it is
+                // named here so it is not reported as unknown.
                 "--draws" => {
                     args.next();
+                }
+                "--help" | "-h" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
                 }
                 "--e2e" => c.e2e = args.next(),
                 "--e2e-out" => {
@@ -121,7 +150,7 @@ pub fn config() -> &'static Config {
                     });
                 }
                 "--window" => c.window = args.next().and_then(|s| parse_wxh(&s)),
-                other => eprintln!("superapp: ignoring unknown argument {other:?}"),
+                other => eprintln!("superapp: ignoring unknown argument {other:?} — see --help"),
             }
         }
         c
@@ -300,8 +329,16 @@ impl Boot {
             return (Session::fake_mode(super::apps(), self.mode, &env), clock);
         }
         let apps = Apps::new(super::apps());
-        let store = Store::open(self.db.as_deref(), &apps.schemas())
-            .unwrap_or_else(|e| panic!("store: opening {:?} failed: {e}", self.db));
+        // A store another build wrote is not a crash. There is no
+        // migration, so say which file, which two schemas, and the two ways
+        // past it, and leave — before a window exists to put a backtrace in.
+        let store = Store::open(self.db.as_deref(), &apps.schemas()).unwrap_or_else(|e| {
+            if let Some(was) = kernel::store::refused_schema(&e) {
+                eprintln!("{}", foreign_store(self.db.as_deref(), was));
+                std::process::exit(2);
+            }
+            panic!("store: opening {:?} failed: {e}", self.db)
+        });
         // Demo rows go in once, on the first open of an empty store: a
         // store that has booted keeps whatever it was left as, empty or not.
         //
@@ -369,6 +406,20 @@ impl Boot {
         }
         (session, clock)
     }
+}
+
+/// What the shell says when the store it was pointed at belongs to another
+/// build: the file, the schema it is at, the schema this build reads, and
+/// the two ways past — another file, or this one moved aside. Nothing here
+/// touches the file: other checkouts still open it.
+#[must_use]
+fn foreign_store(db: Option<&Path>, was: i64) -> String {
+    let file = db.map_or_else(|| "the store".to_string(), |p| p.display().to_string());
+    format!(
+        "superapp: {file} is schema {was}, and this build reads {} — there is no migration.\n\
+         superapp: open another file with --db PATH, or move this one aside by hand.",
+        kernel::store::KERNEL_VERSION
+    )
 }
 
 /// Where the store lives: `--db` wins; an e2e run gets a fresh directory of
@@ -622,4 +673,41 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
     let w = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
     let h = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
     Some((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The store a previous design left behind: the kernel refuses it, boot
+    /// reads its schema back out of the refusal, and what the person gets is
+    /// two lines naming the file, both numbers and both ways past — not a
+    /// backtrace. The exit itself is `std::process::exit(2)` at the call
+    /// site; this is the message it goes out on.
+    #[test]
+    fn a_store_of_another_schema_is_spoken_not_panicked() {
+        let dir = std::env::temp_dir().join(format!("superapp-boot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", 12).unwrap();
+        }
+        let e = Store::open(Some(&path), &[]).err().expect("refused");
+        let was =
+            kernel::store::refused_schema(&e).expect("boot knows this failure from any other");
+        assert_eq!(was, 12);
+        let said = foreign_store(Some(&path), was);
+        assert_eq!(said.lines().count(), 2, "{said}");
+        assert!(said.contains(&path.display().to_string()), "{said}");
+        assert!(said.contains("schema 12"), "{said}");
+        assert!(
+            said.contains(&format!("reads {}", kernel::store::KERNEL_VERSION)),
+            "{said}"
+        );
+        assert!(said.contains("--db PATH"), "{said}");
+        assert!(said.contains("aside"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

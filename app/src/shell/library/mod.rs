@@ -1,4 +1,4 @@
-//! A zoomable canvas of live scenes from [`catalog`](super::catalog).
+//! A zoomable canvas of live scenes from [`catalog`].
 //!
 //! Each node mounts a fixture, or a whole [`Stage`] on a session of its own,
 //! in its own render pass. Entering a node flies the camera to it at 1:1 and
@@ -10,7 +10,7 @@
 //! This half is the state and the input: the mounts and how they boot, the
 //! camera, what a click and a chord mean, and the canvas's own e2e bridge.
 //! The paint — the render budget, the blocks, the mounts' textures — is in
-//! [`paint`].
+//! `paint`.
 
 mod paint;
 

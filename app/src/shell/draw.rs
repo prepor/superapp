@@ -2,10 +2,9 @@
 //! over them.
 //!
 //! A panel is a bordered box with a header carrying its title and its close
-//! button, a body the hosted widget draws into, and — this is the change
-//! CR-010 makes — a **bar at the foot**, built on every draw from
-//! [`Panel::verbs`](kernel::panel::Panel::verbs). Nothing here knows what a
-//! panel is about; it knows what a panel wears.
+//! button, a body the hosted widget draws into, and a **bar at the foot**,
+//! built on every draw from [`Panel::verbs`](kernel::panel::Panel::verbs).
+//! Nothing here knows what a panel is about; it knows what a panel wears.
 
 use std::collections::HashMap;
 
@@ -211,6 +210,7 @@ impl Stage {
     /// As [`Stage::draw_label`], but the character at `accel` is drawn
     /// three times, nudged — the grid's own fake bold, narrowed from a run
     /// to a single glyph.
+    // Position, ink and the accel index, flat: nothing here groups.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_label_accel(
         &mut self,
@@ -244,6 +244,7 @@ impl Stage {
 
     /// Chrome only: fill, border, header. Used for ghosts and as the first
     /// layer of a live panel.
+    // A rectangle, a title and the states it draws in, flat: nothing groups.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_chrome(
         &mut self,
@@ -305,6 +306,7 @@ impl Stage {
 
     /// A bordered label that fires: the close box, and every button of a
     /// bar. On an inverted header it inverts back when hovered.
+    // Rectangle, two labels and the three states a button draws in, flat.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_box_btn(
         &mut self,
@@ -343,6 +345,7 @@ impl Stage {
     /// `bold` is the set of letters a chord would reach here now
     /// ([`bar::bold`]); a verb whose letter is outside it is drawn without
     /// its mark, and still fires on click.
+    // The strip, its verbs and what they are drawn against, flat.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_bar(
         &mut self,

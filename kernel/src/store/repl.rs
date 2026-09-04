@@ -29,8 +29,8 @@ use super::{gone, Db, Erased, Job, RawFn, Store};
 /// snapshot install clears `repl_log` while `repl` survives, and SQLite would
 /// otherwise reassign rowids from 1 and make a fresh row look long published.
 ///
-/// Applied by presence rather than by the counter, so a store an earlier
-/// prototype wrote gains them at its next open.
+/// Applied by presence rather than by the counter, so a store that turns up
+/// without them gains them at its next open.
 pub(super) const SCHEMA_REPL: &str = "
 CREATE TABLE IF NOT EXISTS repl_log(
   seq       INTEGER PRIMARY KEY,      -- local order, from repl.next_local_seq

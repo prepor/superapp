@@ -41,6 +41,9 @@ impl Library {
         self.text_min(cx, pos, pt, 10.0, true, color, s);
     }
 
+    /// What [`Self::text`] and [`Self::label`] both are: the same draw, at
+    /// two floors, one of which clamps.
+    // Their two arguments on top of a text call's own; nothing groups.
     #[allow(clippy::too_many_arguments)]
     fn text_min(
         &mut self,

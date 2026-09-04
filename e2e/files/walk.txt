@@ -5,8 +5,8 @@
 # it is typed, a crumb takes it back up in place, and a row previews what it
 # names — a directory as a list of its own, a file as a card.
 #
-# The disk is the demo tree — `--demo-disk` is the shipping tree's flag, and
-# in the prototype every world has it — so a row can be addressed by name.
+# The disk is the demo tree, which `--demo-disk` asks for, so a row can be
+# addressed by name.
 # Assertions are the clicks: a label that does not resolve fails the run, so
 # "the panel went there" is checked by clicking a row only that directory
 # has, and "this card is on that file" by the card's own path line.

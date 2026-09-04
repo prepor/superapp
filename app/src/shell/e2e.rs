@@ -121,9 +121,8 @@ impl Stage {
                 None => self.no_such(r, "click", &label),
             },
 
-            // The same path; kept as its own word because a suite written
-            // against the shipping tree says `mouse` when it means "prove
-            // the focus side effects too".
+            // The same path; kept as its own word because a suite says
+            // `mouse` when it means "prove the focus side effects too".
             Step::Mouse { label } => match self.hits.by_label(&label) {
                 Some(h) => {
                     eprintln!("e2e: mouse {label:?}");
@@ -205,11 +204,11 @@ impl Stage {
                 None => self.no_such(r, "selectall", &label),
             },
 
-            // Touch is out of the prototype: the interfaces do not preclude
-            // it, and a suite that asks for it says so out loud rather than
-            // failing on a label that was never drawn.
+            // Touch is not wired up here: nothing precludes it, and a suite
+            // that asks for it says so out loud rather than failing on a
+            // label that was never drawn.
             Step::Swipe { .. } | Step::Pan2 { .. } | Step::HoldMove { .. } | Step::Drop => {
-                eprintln!("e2e: {step:?} (not in the prototype)");
+                eprintln!("e2e: {step:?} (touch is not wired up)");
             }
 
             Step::Quit => {

@@ -1,20 +1,20 @@
 //! The Makepad half: the app list, the shell that runs it, and
 //! the window they draw into.
 //!
-//! It is a library with a binary on top of it, which is the shape shipping
-//! has and for the same reason: a desktop build starts at a `fn main`, and
-//! android has no main at all. There the activity loads this crate as a
-//! shared object and calls the JNI symbol `app_main!` generates in [`root`]
-//! — so everything above the entry point has to live here, where both can
-//! reach it, and `main.rs` is one line.
+//! It is a library with a binary on top of it, which is the shape android
+//! needs: a desktop build starts at a `fn main`, and android has no main at
+//! all. There the activity loads this crate as a shared object and calls the
+//! JNI symbol `app_main!` generates in [`root`] — so everything above the
+//! entry point has to live here, where both can reach it, and `main.rs` is
+//! one line.
 //!
 //! Two lists, side by side: what each app adds to the store, the queue and
 //! the launcher, and what it adds to the screen. The kernel builds its
 //! registry from the first; the shell asks the second for templates. This
 //! is the only place in the build that names an app.
 
-// The apps are leaves: nothing outside this file names one, which is the
-// CR's rule, so nothing outside this crate needs to either.
+// The apps are leaves: nothing outside this file names one, so nothing
+// outside this crate needs to either.
 mod apps;
 pub mod platform;
 pub mod root;
@@ -36,7 +36,7 @@ static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &system::UI];
 
 /// Hands the shell the app list.
 ///
-/// Called from [`root::App::script_mod`], which is the one place *both*
+/// Called from [`root::App`]'s `script_mod`, which is the one place *both*
 /// entry points pass through: a desktop `main` and android's
 /// `activityOnCreate` alike reach it on the startup event, before a widget
 /// exists to ask what a panel is. Idempotent, so calling it from [`run`]

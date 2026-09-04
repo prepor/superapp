@@ -339,11 +339,11 @@ impl Panel for Dir {
     /// while the clipboard holds something, `copy here` or `move here` names
     /// what will happen to it.
     ///
-    /// *mark all* wears `a` rather than the `l` of the shipping app — this
-    /// shell keeps `cmd+l` for itself (see [`keys`](crate::shell::keys)), and
-    /// a bar may not promise a chord that never arrives — and rather than
-    /// mail's `m`, which here is *move*: no bar may wear one letter twice.
-    /// *clear* wears none, because `esc` is the table's own.
+    /// *mark all* wears `a` rather than the obvious `l` — this shell keeps
+    /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
+    /// not promise a chord that never arrives — and rather than mail's `m`,
+    /// which here is *move*: no bar may wear one letter twice. *clear* wears
+    /// none, because `esc` is the table's own.
     fn verbs(&self) -> Vec<Verb> {
         let mut v = vec![
             Verb::run("files.new_dir", "new dir", Some('n')),

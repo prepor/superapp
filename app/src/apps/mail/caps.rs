@@ -317,7 +317,7 @@ pub struct FakeServer {
     /// `folder → (uidvalidity, next uid, mails)`.
     pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
     /// Whether MOVE reports the new uid (UIDPLUS' COPYUID). Both server
-    /// behaviours exist in the wild; the prototype's says so, because a
+    /// behaviours exist in the wild; the demo's reports it, because a
     /// uid-less move is only re-established by a Message-ID the demo seed
     /// mostly does not carry.
     pub copyuid: bool,

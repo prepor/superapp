@@ -5,7 +5,7 @@
 //! HTTPS bucket URL.
 //!
 //! The secret never comes from here: it is asked of the world's
-//! [`Secrets`](crate::caps::Secrets) capability, which is the macOS keychain
+//! [`Secrets`] capability, which is the macOS keychain
 //! on a real run and memory under a script. This module only knows the key it
 //! is filed under.
 
@@ -81,7 +81,7 @@ pub fn url_from_file(dir: Option<&Path>) -> Option<String> {
 }
 
 /// Where a bucket's secret access key is filed in the world's
-/// [`Secrets`](crate::caps::Secrets): under its key id, behind a prefix, so
+/// [`Secrets`]: under its key id, behind a prefix, so
 /// it can never collide with a mail account's address.
 #[must_use]
 pub fn secret_key(key_id: &str) -> String {

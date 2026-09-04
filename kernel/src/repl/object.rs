@@ -173,13 +173,13 @@ pub fn encode_state(state: &State) -> Vec<u8> {
 
 // -- MemBucket -----------------------------------------------------------------
 
+/// A stored object in [`MemBucket`]: its bytes and version (the ETag).
+type Entry = (Vec<u8>, u64);
+
 /// An in-process bucket for tests: a map with a per-key version counter as the
 /// ETag. Shares nothing with the filesystem or the network, so any number run
 /// in parallel. `Clone` shares the same backing store, which is how a test
 /// hands the "same bucket" to two worlds.
-/// A stored object in [`MemBucket`]: its bytes and version (the ETag).
-type Entry = (Vec<u8>, u64);
-
 #[derive(Clone, Default)]
 pub struct MemBucket {
     inner: Arc<Mutex<HashMap<String, Entry>>>,

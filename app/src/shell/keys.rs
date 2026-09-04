@@ -16,8 +16,8 @@
 //!
 //! A bold letter is a promise that the chord fires that verb *now*, so the
 //! bars draw what this order would reach and nothing else: the set is
-//! [`bar::bold`](super::bar::bold), over the [`Letters`] a widget keeps
-//! while one of its fields has the keyboard.
+//! [`bar::bold`], over the [`Letters`] a widget keeps while one of its
+//! fields has the keyboard.
 
 use kernel::layout::Dir;
 use kernel::panel::{slot_entity, VerbAct};
@@ -46,8 +46,8 @@ pub fn is_reserved(c: char) -> bool {
 /// keeps to itself, and what a bar draws bold.
 ///
 /// Copying and subtracting one is a couple of instructions, which is what the
-/// drawing wants: [`bar::bold`](super::bar::bold) takes one bar's letters
-/// away from another's on every draw of every panel.
+/// drawing wants: [`bar::bold`] takes one bar's letters away from another's
+/// on every draw of every panel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Letters(u32);
 

@@ -163,7 +163,7 @@ pub const MEM_TABLE: &str = "mem_effect";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemEffect {
     /// Its place in the ring, counting up for the life of the process. The
-    /// log carries it **negated** — see [`LOG_FROM`].
+    /// log carries it **negated** — see `LOG_FROM`.
     pub seq: i64,
     pub kind: &'static str,
     pub entity: Option<String>,
@@ -254,11 +254,10 @@ impl MemLog {
         serde_json::to_string(&*rows).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// Teaches one connection the `mem_effects()` function [`LOG_FROM`]
-    /// reads the ring through. Every reader gets it at open, which is what
-    /// makes the ring queryable from a `query_only` connection at all —
-    /// nothing is written anywhere, the rows are handed to SQLite on the
-    /// spot.
+    /// Teaches one connection the `mem_effects()` function `LOG_FROM` reads
+    /// the ring through. Every reader gets it at open, which is what makes
+    /// the ring queryable from a `query_only` connection at all — nothing is
+    /// written anywhere, the rows are handed to SQLite on the spot.
     ///
     /// Deliberately **not** `SQLITE_DETERMINISTIC`: the ring moves under a
     /// prepared statement, and a call SQLite factored out would freeze it.

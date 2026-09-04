@@ -1,7 +1,8 @@
-//! Rule 2 of the contract, enforced by reading the source: code under
-//! `shell/` — and under `platform/`, which is lower still — names no app.
+//! The shell's half of the layering rule, enforced by reading the source:
+//! code under `shell/` — and under `platform/`, which is lower still — names
+//! no app.
 //!
-//! The kernel grows the same test for rule 1. Both are cheap and both catch
+//! `kernel/src/lib.rs` holds the other half. Both are cheap and both catch
 //! the one mistake that is invisible in review: an import that seems
 //! harmless until the layer it crossed has to be moved.
 
@@ -23,9 +24,9 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Neither the shell nor the platform may reach for an app.
-/// `shell/system` is the shell's own app — the CR lists it inside the
-/// shell on purpose, so that the shell uses its own extension points —
-/// and `shell/mod.rs` is the list itself.
+/// `shell/system` is the shell's own app — it sits inside the shell on
+/// purpose, so that the shell uses its own extension points — and
+/// `shell/mod.rs` is the list itself.
 #[test]
 fn the_shell_and_the_platform_name_no_app() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

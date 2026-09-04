@@ -11,9 +11,8 @@ itself, every app's tables included.
 
 **The [book](docs/book/src/SUMMARY.md) is the single source of truth** —
 model, grammar, architecture, open questions. `mise exec -- mdbook serve
-docs/book` to read it rendered. `docs/planning/cr-010-apps.md` is the design
-the three layers are written against, and the doc comments on the kernel's
-traits are its specification.
+docs/book` to read it rendered. Under the book, the doc comments on the
+kernel's traits are the specification the three layers are written against.
 
 ## Run
 
@@ -30,7 +29,12 @@ focused panel, and the help panel documents the rest.
 
 The store lives in `~/Library/Application Support/superapp`; `--db <path>`
 puts it anywhere else, and `--bucket <url>` points a run at a device-sync
-bucket.
+bucket. `--help` lists every flag.
+
+There is one store schema and no migration to it, so a file another build
+wrote is refused: the run says which file, which two schemas, and the two
+ways past — `--db PATH` for another file, or that one moved aside by hand —
+and exits 2 without opening a window.
 
 ## Develop
 
@@ -146,5 +150,5 @@ One Cargo workspace, two members.
   (`make_icons.py` regenerates them all from one drawing), and android's
   launcher icons.
 - `e2e/` — the suites, `sync/` for the two-device ones, `out/` generated.
-- `docs/book/` — the book; `docs/planning/` — the design documents.
+- `docs/book/` — the book.
 - `formal/` — the TLA+ model of the device-sync lease.

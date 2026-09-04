@@ -6,13 +6,13 @@
 //! screen and the disk — because the harness, attachments and a file browser
 //! all use them; an app defines its own and supplies them in `App::outside`.
 //!
-//! In the prototype only the fakes exist: the clipboard and the screen are
-//! the shell's to install for real, and the disk is always the demo tree, so
-//! no test can reach a human's files.
+//! What the kernel installs are the fakes: the clipboard, the screen and the
+//! disk are the shell's to replace with the machine's own, and a world it
+//! left alone reads the demo tree, so no test can reach a human's files.
 //!
 //! Two of the answers are long enough to live beside this file: [`demo`] is
-//! the fixture tree the disk reads, and [`preview`] is what a file *is* —
-//! the questions two apps ask of the same bytes.
+//! the fixture tree the disk reads, and `preview` is what a file *is* — the
+//! questions two apps ask of the same bytes.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -595,7 +595,8 @@ pub trait Disk {
     fn file_id(&mut self, path: &Path) -> Result<Option<FileId>, String>;
 }
 
-/// The demo tree as a disk: what every world in the prototype gets.
+/// The demo tree as a disk: what a world gets until the shell hands it the
+/// machine's own.
 ///
 /// The one translation each of its verbs needs is the spelling: a [`Disk`]
 /// is handed real paths, and the fixture is keyed by what the panels show.
@@ -690,8 +691,9 @@ impl Disk for DemoDisk {
 ///
 /// A [`Mode::Deny`] world gets the clock and nothing else: an effect that
 /// asks for anything more fails with *this world has no …*, which is what a
-/// library mount wants. The prototype's disk is the demo tree in every mode,
-/// so no run can reach a human's files.
+/// library mount wants. The disk installed here is the demo tree in every
+/// mode, so a world the shell gave no real one cannot reach a human's
+/// files.
 pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Clock>(env.clock.capability());
     if mode == Mode::Deny {

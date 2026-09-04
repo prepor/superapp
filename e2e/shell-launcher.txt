@@ -6,8 +6,8 @@
 # wherever it lives, or opens it fresh where it does not. It never makes a
 # second copy of something already open.
 #
-# The workspaces overlay's search row is the other way in, and it is touch —
-# out of the prototype — so those steps are dropped rather than written
+# The workspaces overlay's search row is the other way in, and it is touch,
+# which is not wired up — so those steps are dropped rather than written
 # against something that would silently do nothing.
 
 wait 600

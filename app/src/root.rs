@@ -2,11 +2,10 @@
 //! stage.
 //!
 //! This is one of the two files outside `shell/` that name an app, and it is
-//! where the CR says the naming belongs: the crate root is the only place
-//! that knows which apps exist. `AppMain::script_mod` installs that list and
-//! calls the shell's block, then each app's, then its own — and its own is
-//! the window, whose stage carries one named child per panel template in the
-//! build.
+//! where the naming belongs: the crate root is the only place that knows
+//! which apps exist. `AppMain::script_mod` installs that list and calls the
+//! shell's block, then each app's, then its own — and its own is the window,
+//! whose stage carries one named child per panel template in the build.
 
 use makepad_widgets::*;
 

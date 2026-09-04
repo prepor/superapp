@@ -338,6 +338,7 @@ impl fmt::Debug for Verb {
     }
 }
 
+/// What a [`Verb`] does when its button is clicked or its letter typed.
 pub enum VerbAct {
     /// A button of the panel's own: the bar calls [`Panel::run`] with the
     /// verb's id on click or chord.

@@ -14,8 +14,8 @@
 //! of the last draw, because portal-list items are rebuilt every draw and a
 //! synthesized press must land the way a finger does.
 //!
-//! Long presses and sideways swipes are seams: touch is out of the
-//! prototype, and nothing here precludes it.
+//! Long presses and sideways swipes are seams: touch is not wired up, and
+//! nothing here precludes it.
 
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
@@ -66,7 +66,7 @@ pub trait RowSpec: 'static {
     /// The row template inside the panel's `PortalList`.
     fn row_tpl() -> LiveId;
 
-    /// Fills one row. `row` is the item widget; [`line`] answers the twin
+    /// Fills one row. `row` is the item widget; [`line()`] answers the twin
     /// to write into and puts the cursor wash and the mark bar on it.
     fn populate(cx: &mut Cx, row: &WidgetRef, r: &RowOf<Self>, selected: bool, marked: bool);
 

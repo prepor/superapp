@@ -1,28 +1,31 @@
 # The Rich Table
 
-The rich table is the shared list engine used by mailboxes, the Effects panel,
-and the file browser. It provides filtering, completion, paging, a stable cursor,
-and marks. Widgets decide how rows look and what actions mean.
+The rich table is one component in two halves. The kernel half is state a panel
+instance owns; the shell half is one widget that draws any such state.
+Mailboxes, the effect log, and the file browser are three panels over one
+component.
 
-## Data sources
+## The kernel half: state the panel owns
 
-A `DataSource` provides rows, counts, stable row keys, filter tags, and
-completion values. `Table<D>` owns the typed filter and loaded pages for one
-source. It does not depend on Makepad.
+`ListState<D>` is the whole of what a panel that shows a list holds: the
+`Table<D>` over a `Datasource`, the cursor as a key and an index, the `Marks`,
+and the marked rows the filter currently hides. The panel owns it; nothing
+about a list reaches the shell.
+
+A `Datasource` supplies rows, a count, stable row keys and their text spelling,
+filter tags, and completion values. `Table<D>` owns the typed filter and the
+loaded pages for one source. None of it depends on Makepad.
 
 `SqlSource` builds queries from a static `SqlSpec`. A spec defines selected
 columns, source tables, base conditions, searchable text columns, tags, order,
-row decoding, stable keys, and dynamic suggestions. Queries use the store cache
-and dependency tracking, so pages update after relevant commits.
+row decoding, stable keys, and dynamic suggestions. Queries go through the
+store cache with dependency tracking, so pages update after a relevant commit.
 
-A source may group several records into one row. Mailbox rows group messages by
-`message.thread`. A filter matches the group when any member matches, but the
-displayed totals still cover the full conversation. Inbox, archive, sent, and
-spam each use a static spec generated from the same definition.
+A source may group several records into one row. A mailbox's rows group
+messages by their thread anchor: the filter matches the group when any member
+matches, while the displayed totals still cover the whole conversation.
 
 `DirSource` implements the same interface over an in-memory directory listing.
-It reloads when the panel changes directory or one of Superapp's own actions
-changes the disk. It does not watch changes made by other programs.
 
 ## Filter syntax
 
@@ -38,7 +41,7 @@ changes the disk. It does not watch changes made by other programs.
 | `text` | `budget draft` | Substring in searchable columns |
 
 Invalid syntax and unknown tags appear as errors below the field. The valid
-parts still filter. An invalid or unknown term is left out of the SQL rather
+parts still filter: an invalid or unknown term is left out of the SQL rather
 than hiding every row. An unfinished tag at the caret is not reported until the
 caret moves away.
 
@@ -49,8 +52,9 @@ Negation includes rows where the inner value is absent. This matters for a tag
 such as `@not:risky`: in SQL, plain `NOT NULL` is still unknown and would lose
 those rows.
 
-Mailbox tags are `@unread`, `@html`, `@from:`, `@subject:`, `@date`, and
-`@account:`. `@from:` suggestions come only from the current mailbox.
+Which tags a table offers is the source's; [mail](./mail.md#four-mailboxes-one-list),
+[files](./files.md#the-directory-list), and the
+[effect log](./data-substrate.md#effects-and-job-panels) each list their own.
 
 ## Autocomplete
 
@@ -63,11 +67,10 @@ Arrows choose an item, `enter` or `tab` accepts it, and `esc` closes the box. A
 second `esc` leaves the field. With no box open, down moves from the filter to
 the first result row.
 
-Completion is a shared text interface in `richtable::Completion`, not part of a
-specific widget. `panels::Suggest` draws it. Mail filters use one implementation;
-the compose recipient field uses `mail::Recipients`. Recipient completion
-searches known senders by name or address, inserts the bare address, and omits
-addresses already entered.
+Completion is a shared text interface in the kernel, not part of a specific
+widget: the filter's tag grammar and a compose panel's recipient list are two
+implementations of it, and one shell widget draws the box, handles its keys,
+and splices the pick.
 
 ## Paging and the cursor
 
@@ -76,55 +79,75 @@ needs them. A commit invalidates stale pages, but only visible pages are loaded
 again. Sources that cannot count grow their loaded window by one page when the
 end becomes visible.
 
-The cursor stores a row key, not only an index. SQL sources calculate that row's
-rank in the current order. If new rows arrive above it, the cursor finds the same
-row at its new position. If the row disappears, the cursor stays near its old
-position. A mailbox cursor identifies the conversation, not whichever message
-the conversation currently opens.
+The cursor is a key and an index, and resolves in that order: the remembered
+row if it still holds the key, else the key's rank in the current order (a row
+landed above it), else the row clamped into the table (the row went; carry on
+from where it stood). Without the index a row filed out from under the cursor
+would snap the walk back to the top. A mailbox cursor identifies the
+conversation, not whichever message that conversation currently opens.
 
 ## Marks
 
 Marks select rows for a batch action. They are stored as stable keys, so they
-survive filters, paging, and sync updates. `Marks` can toggle a key, add a range,
-select all matching keys, keep failed items, and clear the set.
+survive filters, paging, and updates from a worker. `Marks` can toggle a key,
+add a range, select every matching key, keep failed items, and clear the set.
 
 A source can list all matching keys, test which marked keys still match, and
 read a row by key without applying the current filter. Hidden marks therefore
 remain selected and still take part in actions. A key whose row no longer
-exists is removed. **All** means all filtered rows, including unloaded pages.
+exists is dropped on the next draw. **mark all** means every filtered row,
+including unloaded pages.
 
-Filtering and cursor movement do not change marks. `esc` and **clear** remove
-them. A batch action removes successful keys and leaves refused keys marked.
-Undo restores marks consumed by that action. Marks themselves are temporary UI
-state and do not create history nodes.
+Filtering and cursor movement do not change marks; `esc` and **clear** remove
+them. A batch checks each key separately, removes the keys that succeeded, and
+leaves refused ones marked, so what stays marked is exactly what could not be
+done. If every item is refused, no history node is created.
 
-Marked rows show a left bar. Hidden marked rows appear above the normal rows.
-The marks bar at the bottom shows counts, row actions, **all**, and **clear**.
-Mail offers archive and delete where valid. Files offer copy, move, and delete.
+Marks are the instance's own context, not data, so they create no history node
+of their own. A batch verb adds an intent that holds a handle to its own table,
+which is how undo puts the marks back where they were.
 
-A batch checks each key separately. Unsupported mail folders or refused file
-paths remain marked while valid items proceed. If every item is refused, no
-history action is created.
+## The shell half: one widget for any list
 
-`panels::PanelMarks<D>` contains the shared panel-side behavior: hidden rows,
-counts, row state, keyboard controls, and marks bar. Each panel still supplies
-its row key and batch actions.
+The shell's table widget borrows the `ListState` from the scope on every draw
+and every event, through the instance's `as_any`, and everything it changes it
+changes there. It holds no state that belongs to a panel.
 
-## Drawing long lists
+It draws the filter with its error line and completion box, the rows through a
+`PortalList` with the hidden-marks band above them, the cursor wash and the
+mark bar, and it registers the hits that make a row addressable. It answers a
+press itself, by the row rectangles of its last draw, because portal-list items
+are rebuilt every draw and a synthesized press must land the way a finger does.
+A press moves the cursor and previews; `cmd` or alt opens a fresh un-joined
+panel instead.
 
-Pages keep data loading proportional to the visible area. Makepad's
-`PortalList` reuses row widgets while scrolling. A row is populated again only
-when its data, cursor state, or mark state changes.
+It also owns the keys the [grammar](./interaction-grammar.md#keyboard) gives a
+list: the arrows and their preview, `enter`, `/`, `space`, `shift`+arrows,
+`esc`, and `tab`. While the caret is in the filter it tells the shell that it
+keeps every letter, so no bar draws a bold letter that would not fire.
+
+What a panel supplies is four short functions: the row template, how to fill a
+row, what a script calls it, and what it opens. Two more have defaults: what
+the field is seeded with once, and the line an empty list shows.
+
+Pages keep data loading proportional to the visible area, and `PortalList`
+reuses row widgets while scrolling, so a row is populated again only when its
+data, cursor state, or mark state changes.
+
+Long presses and sideways swipes are seams the widget leaves room for; touch is
+not in this build.
 
 ## Adding a table
 
-For a SQL table, define a `SqlSpec` and `TagDef` values near the domain queries.
-Choose a stable key: the group key for grouped rows, or a unique final order
-column for flat rows. Provide a row decoder, order key, and suggestion function,
-then construct `SqlSource` and `Table` values.
+For a SQL table, define a `SqlSpec` and its `TagDef` values near the domain
+queries. Choose a stable key: the group key for grouped rows, or a unique final
+order column for flat rows. Provide a row decoder, an order key, and a
+suggestion function, then construct the `SqlSource` and put a `ListState` on
+the panel instance. On the shell side, declare the row template in the app's
+own script block and implement the four functions above.
 
-The effect source in `effect::LOG` is a flat example. Its SQL source is the
-database queue combined with the in-memory effect ring through `UNION ALL` and
-`mem_effects()`. The spec declares the ring dependency because SQLite's
-query tracker cannot discover changes outside database tables. See
+The effect log is the flat example. Its SQL source is the database queue
+combined with the in-memory effect ring through `UNION ALL`, and its spec
+declares the ring as a dependency because SQLite's query tracker cannot
+discover changes outside database tables. See
 [Recent in-memory effects](./data-substrate.md#recent-in-memory-effects).
