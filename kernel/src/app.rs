@@ -1183,12 +1183,13 @@ mod tests {
     fn an_app_is_attached_to_the_finished_registry() {
         let apps = Apps::new(WATCHING);
         let seen = ATTACHED.lock().expect("what the watcher saw").clone();
+        let kernels: Vec<String> = crate::tools::all().iter().map(|t| t.name.to_string()).collect();
         assert_eq!(
             seen,
-            vec!["toolbox.look".to_string(), "toolbox.touch".to_string()],
-            "the whole list, whoever offered it, and whatever order the apps came in"
+            [kernels.clone(), vec!["toolbox.look".to_string(), "toolbox.touch".to_string()]].concat(),
+            "the whole list — the kernel's own first, then whoever offered one, in app order"
         );
-        assert_eq!(apps.tools().len(), 2);
+        assert_eq!(apps.tools().len(), kernels.len() + 2);
     }
 
     #[test]
