@@ -58,7 +58,19 @@ impl RealServers {
 }
 
 impl Imap for RealServers {
+    /// The session this account already has, if the server still has it —
+    /// a `NOOP` is one round trip and says so. A pass a minute, and the
+    /// batches a backfill takes, must not be a sign-in each: providers
+    /// count logins, and Gmail counts them narrowly.
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+        if self
+            .sessions
+            .get_mut(&account)
+            .is_some_and(session::Imap::alive)
+        {
+            return Ok(());
+        }
+        self.sessions.remove(&account);
         let s = session::connect(&c.host, &c.user, &c.auth)?;
         self.sessions.insert(account, s);
         Ok(())
@@ -74,6 +86,18 @@ impl Imap for RealServers {
 
     fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
         self.session(account)?.fetch_from(folder, from)
+    }
+
+    fn fetch_uids(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<RemoteMail>, String> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.session(account)?.fetch_set(folder, &seq_set(uids))
     }
 
     fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
@@ -268,6 +292,32 @@ pub fn role_for(name: &str, attrs: &[String]) -> (Option<String>, bool) {
     (Some(role.to_string()), role == "archive" && !has("Archive"))
 }
 
+/// A sorted uid list as an IMAP sequence set, runs collapsed: `1:200` where
+/// the batch is consecutive, `4,9:11` where the server's deletions left
+/// holes. A backfill batch is one command either way, and a folder whose
+/// past is intact costs eleven characters rather than a kilobyte of commas.
+fn seq_set(uids: &[u32]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < uids.len() {
+        let lo = uids[i];
+        while i + 1 < uids.len() && uids[i + 1] == uids[i] + 1 {
+            i += 1;
+        }
+        let hi = uids[i];
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if hi > lo {
+            out.push_str(&format!("{lo}:{hi}"));
+        } else {
+            out.push_str(&lo.to_string());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod session {
@@ -381,6 +431,12 @@ mod session {
             })
         }
 
+        /// Whether the server still has this session. A dead one answers
+        /// with an error rather than a lie, which is what makes reuse safe.
+        pub fn alive(&mut self) -> bool {
+            self.session.noop().is_ok()
+        }
+
         fn ensure(&mut self, name: &str) -> Result<(), String> {
             if self.selected.as_deref() != Some(name) {
                 self.select(name)?;
@@ -409,10 +465,22 @@ mod session {
         }
 
         pub fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+            self.fetch_set(name, &format!("{from}:*"))
+        }
+
+        /// One `UID FETCH` over any sequence set — `12:*` for new mail,
+        /// `1:200` and its like for the backfill.
+        ///
+        /// `BODY.PEEK[]` rather than `RFC822`, which is the same bytes
+        /// without the `\Seen` a plain fetch sets: mirroring a folder is
+        /// not reading it, and a backfill that walked a mailbox's whole
+        /// past would otherwise mark every unread letter in it read — on
+        /// the server, for every client the person owns.
+        pub fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
             self.ensure(name)?;
             let fetches = self
                 .session
-                .uid_fetch(format!("{from}:*"), "(UID FLAGS RFC822)")
+                .uid_fetch(set, "(UID FLAGS BODY.PEEK[])")
                 .map_err(s)?;
             let mut out: Vec<RemoteMail> = fetches
                 .iter()
@@ -530,6 +598,16 @@ mod tests {
             role_for("Notes", &a(&["Extension(\"Sent\")"])),
             (None, false)
         );
+    }
+
+    /// A backfill batch is one command: consecutive uids collapse to a
+    /// range, and the holes a server's deletions left are named beside it.
+    #[test]
+    fn a_uid_batch_is_one_sequence_set() {
+        assert_eq!(seq_set(&[]), "");
+        assert_eq!(seq_set(&[7]), "7");
+        assert_eq!(seq_set(&[1, 2, 3, 4]), "1:4");
+        assert_eq!(seq_set(&[1, 2, 4, 9, 10, 11, 20]), "1:2,4,9:11,20");
     }
 
     /// A folder keeps the keyword when its `PERMANENTFLAGS` name it or allow

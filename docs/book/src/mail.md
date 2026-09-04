@@ -235,8 +235,20 @@ Each account with an IMAP host gets one [worker](./apps.md#workers), named
 `sync-<account>`, kicked at `account:<id>`, claiming only that account's jobs.
 It pushes local changes every turn and pulls about once a minute or on
 **sync**. A pass discovers special-use folders, receives new mail, and
-reconciles flags and deletions. Each folder keeps its newest 200 messages, and
-a UIDVALIDITY reset re-ingests that folder from scratch.
+reconciles flags and deletions. A folder is mirrored **whole**: after the new
+mail lands, the pass compares the server's uid list against what the store
+holds and reaches back for the missing ones 200 at a time, newest first — one
+fetch and one commit a batch, over the session it already holds. Nothing is
+dropped for being old; the batches only keep a whole mailbox out of memory. A
+pass reaches back for at most twenty seconds, so this account's own jobs are
+not left waiting behind a first sync, and comes back five seconds later for
+the rest. A UIDVALIDITY reset re-ingests that folder from scratch, the same
+way.
+
+Letters are fetched with `BODY.PEEK[]`, not `RFC822`: mirroring a folder is
+not reading it, and a plain fetch would mark every unread letter it walked
+`\Seen` on the server. A session is kept between passes and checked with a
+`NOOP` rather than signed in again, because providers count logins.
 
 Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
 and trash. Only the first four have mailbox panels. Folders without one of

@@ -20,18 +20,32 @@ use super::accounts;
 use super::parts;
 use super::caps::{Creds, OAuth, RemoteMail, UidSet};
 use super::effects::{
-    account_entity, Connect, Fetch, Folders, Forwarded, Meta, Move, Seen, Submit, Uids,
+    account_entity, Backfill, Connect, Fetch, Folders, Forwarded, Meta, Move, Seen, Submit, Uids,
 };
 use super::model::{self, topic_of};
 
-/// How many most-recent messages a folder retains on first contact (and after
-/// a UIDVALIDITY reset). Bounded coverage, stated honestly.
-pub const FETCH_CAP: u32 = 200;
+/// How many older messages one pass reaches back for. Nothing is dropped: a
+/// folder is mirrored entire, newest first, a batch a turn — the batching is
+/// what keeps a first sync from holding a whole mailbox in memory, and what
+/// lets new mail land while the past is still arriving.
+pub const BACKFILL: usize = 200;
 
 /// How long a worker sleeps between kicks — and, since the kernel drives
 /// every pass from the frame loop under virtual time, how long a pass waits
 /// before it looks outside again (see [`SyncPass`]).
 const POLL: Duration = Duration::from_secs(60);
+
+/// How long one pass spends reaching into a folder's past before it hands
+/// the thread back. The batches themselves are cheap; what is not cheap is
+/// keeping this account's own jobs — an archive, a mark read — waiting
+/// behind the first sync of fifty thousand letters.
+const REACH_BUDGET: Duration = Duration::from_secs(20);
+
+/// How soon a pass that ran out of budget comes back for the rest. Not
+/// [`POLL`], because there is somewhere to go; not at once either, because
+/// the folder discovery and the three searches a batch sits behind are
+/// round trips of their own.
+const REACH: Duration = Duration::from_secs(5);
 
 // -- one account's pass -----------------------------------------------------------
 
@@ -39,10 +53,13 @@ const POLL: Duration = Duration::from_secs(60);
 /// the server must be told), then mirror folders, fetch what is new, and
 /// reconcile facts.
 ///
+/// Answers `true` while some folder is still filling in its past, which is
+/// what asks [`SyncPass`] for another turn at once rather than in a minute.
+///
 /// # Errors
 ///
 /// If the session cannot be opened, or a folder's round trips fail.
-pub fn sync_account(w: &World, account: i64) -> Result<(), String> {
+pub fn sync_account(w: &World, account: i64) -> Result<bool, String> {
     connect(w, account)?;
     push_account(w, account)?;
     fetch_account(w, account)
@@ -262,11 +279,16 @@ struct Gathered {
 /// The fetch/reconcile pass: for each folder, gather over the network, then
 /// commit once.
 ///
+/// Answers `true` when a folder handed back a full backfill batch — there is
+/// more of its past to come, and the pass that asked should come straight
+/// back for it.
+///
 /// # Errors
 ///
 /// If any round trip fails, or the commit does.
-pub fn fetch_account(w: &World, account: i64) -> Result<(), String> {
+pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
+    let mut more = false;
     for rf in w.run(&Folders { account })? {
         let Some(role) = rf.role.clone() else { continue };
 
@@ -328,18 +350,18 @@ pub fn fetch_account(w: &World, account: i64) -> Result<(), String> {
             folder: rf.name.clone(),
         })?;
 
-        let floor = u32::max(1, meta.uidnext.saturating_sub(FETCH_CAP));
         // The server renumbered (or this is first contact): local copies of
-        // this folder are meaningless, so start over inside the window.
+        // this folder are meaningless, so nothing counts as new mail here —
+        // the whole folder is missing, and the backfill below brings it.
         let reset = known.0 != Some(i64::from(meta.uidvalidity));
         let from = if reset {
-            floor
+            meta.uidnext
         } else {
-            known.1.map_or(floor, |n| n as u32)
+            known.1.map_or(meta.uidnext, |n| n as u32)
         };
 
         // Gather. Every round trip happens here, with nothing held open.
-        let mails = if meta.uidnext > from {
+        let mut mails = if meta.uidnext > from {
             w.run(&Fetch {
                 account,
                 folder: rf.name.clone(),
@@ -348,6 +370,9 @@ pub fn fetch_account(w: &World, account: i64) -> Result<(), String> {
         } else {
             Vec::new()
         };
+        // `from:*` quirk: a server with nothing new answers with its highest
+        // message anyway.
+        mails.retain(|m| m.uid >= from);
         let search = |which: UidSet| {
             w.run(&Uids {
                 account,
@@ -370,20 +395,85 @@ pub fn fetch_account(w: &World, account: i64) -> Result<(), String> {
             uidvalidity: meta.uidvalidity,
             uidnext: meta.uidnext,
             mails,
-            server,
+            // The loop below reads it too: the folder entire, as the
+            // server just listed it.
+            server: server.clone(),
             unseen,
             forwarded,
             keywords: meta.keywords,
         };
         w.store()
-            .write(move |tx| land(tx, account, from, &g))
+            .write(move |tx| land(tx, account, &g))
             .map_err(err)?;
+
+        // Reach back, over the session this pass already holds. The `ALL`
+        // search above is the folder entire, so what this store is missing
+        // is a set difference rather than a guess: one fetch and one commit
+        // a batch, which is what keeps a whole mailbox out of memory while
+        // still mirroring it in one sitting. A folder already whole asks
+        // for nothing and costs no round trip at all.
+        let until = w.now() + REACH_BUDGET.as_secs_f64();
+        loop {
+            let batch = missing(w.store(), fid, &server);
+            if batch.is_empty() {
+                break;
+            }
+            if w.now() >= until {
+                more = true;
+                break;
+            }
+            let got = w.run(&Backfill {
+                account,
+                folder: rf.name.clone(),
+                uids: batch,
+            })?;
+            // Listed by the search and then not handed over: nothing this
+            // pass can do about it, and asking again in a loop is a spin.
+            if got.is_empty() {
+                break;
+            }
+            w.store()
+                .write(move |tx| {
+                    for m in &got {
+                        ingest_message(tx, account, fid, m)?;
+                    }
+                    Ok(())
+                })
+                .map_err(err)?;
+        }
     }
-    Ok(())
+    Ok(more)
+}
+
+/// The uids the server still has and this store does not, newest first,
+/// capped at one batch — what the backfill asks for next. Read back out of
+/// the store after each commit, so a folder that was just reset counts as
+/// holding nothing and a batch already landed is never asked for twice.
+fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
+    let mut have: HashSet<u32> = HashSet::new();
+    if let Ok(mut stmt) = store
+        .conn()
+        .prepare("SELECT uid FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL")
+    {
+        if let Ok(rows) = stmt.query_map([fid], |r| r.get::<_, i64>(0)) {
+            have.extend(rows.filter_map(Result::ok).map(|u| u as u32));
+        }
+    }
+    let mut batch: Vec<u32> = server
+        .iter()
+        .copied()
+        .filter(|u| !have.contains(u))
+        .collect();
+    // Newest first — a person reading down a mailbox meets the batches in
+    // the order they arrive — then ascending, which is what a fetch wants.
+    batch.sort_unstable_by(|a, b| b.cmp(a));
+    batch.truncate(BACKFILL);
+    batch.sort_unstable();
+    batch
 }
 
 /// The commit half of one folder's pass.
-fn land(tx: &Transaction, account: i64, from: u32, g: &Gathered) -> rusqlite::Result<()> {
+fn land(tx: &Transaction, account: i64, g: &Gathered) -> rusqlite::Result<()> {
     if g.reset {
         tx.execute(
             "DELETE FROM message WHERE id IN
@@ -393,9 +483,6 @@ fn land(tx: &Transaction, account: i64, from: u32, g: &Gathered) -> rusqlite::Re
         tx.execute("DELETE FROM server_msg WHERE folder = ?1", [g.fid])?;
     }
     for m in &g.mails {
-        if m.uid < from {
-            continue; // `from:*` quirk: a lone highest message
-        }
         ingest_message(tx, account, g.fid, m)?;
     }
     tx.execute(
@@ -937,7 +1024,7 @@ impl Worker for SyncPass {
         }
         let outcome = sync_account(w, account);
         let status = match &outcome {
-            Ok(()) => format!("ok · {}", fmt_date(w.now())),
+            Ok(_) => format!("ok · {}", fmt_date(w.now())),
             Err(e) => format!("error: {e}"),
         };
         let synced = outcome.is_ok().then(|| w.now());
@@ -959,6 +1046,13 @@ impl Worker for SyncPass {
                 )
                 .map(|_| ())
             });
+        }
+        // A folder still reaching into its past wants the next batch now,
+        // not in a minute: a first sync finishes in one sitting rather than
+        // two hundred messages an hour.
+        if matches!(outcome, Ok(true)) {
+            self.due = w.now();
+            return Wake::After(REACH);
         }
         Wake::After(POLL)
     }

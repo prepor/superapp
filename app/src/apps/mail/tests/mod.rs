@@ -1105,6 +1105,92 @@ fn a_keywordless_server_is_never_told_about_the_mark() {
     );
 }
 
+// -- the backfill ------------------------------------------------------------------
+
+/// A folder bigger than one batch arrives whole, and arrives in batches:
+/// one pass reaches back [`BACKFILL`](super::super::sync::BACKFILL) letters
+/// at a time, newest first, over the session it already holds — and the pass
+/// after it, with nothing missing, asks the server for no letters at all.
+#[test]
+fn a_folder_larger_than_a_batch_arrives_whole() {
+    use super::sync::{self, BACKFILL};
+
+    let (s, _clock) = session();
+    let n = BACKFILL + 40;
+    // The demo account's INBOX, renumbered and refilled: uidvalidity moved,
+    // so nothing local means anything and the whole folder is missing.
+    servers(&s)
+        .with(1, |srv| {
+            srv.folder("INBOX", 9);
+            srv.backfills.clear();
+            for i in 0..n {
+                srv.deliver_flagged(
+                    "INBOX",
+                    true,
+                    false,
+                    &format!(
+                        "Message-ID: <bulk{i}@kovac.io>\r\n\
+                         From: Vera Kovac <vera@kovac.io>\r\n\
+                         Subject: bulk {i}\r\n\
+                         Date: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+                         \r\n\
+                         letter {i}\r\n"
+                    ),
+                );
+            }
+        })
+        .expect("the demo account's server");
+
+    let held = || -> i64 {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message
+                  WHERE folder = (SELECT id FROM folder WHERE name = 'INBOX')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1)
+    };
+    let asked = || -> Vec<(String, Vec<u32>)> {
+        servers(&s)
+            .with(1, |srv| srv.backfills.clone())
+            .unwrap_or_default()
+    };
+
+    assert!(
+        !sync::sync_account(s.world(), 1).expect("a pass"),
+        "the folder was reached to the end, so nothing is owed"
+    );
+    assert_eq!(held(), n as i64, "the folder entire");
+
+    // Two batches, not one fetch of everything — and the first one is the
+    // newest end of the folder, which is where a person reads.
+    let batches = asked();
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    assert_eq!(batches[0].0, "INBOX");
+    assert_eq!(batches[0].1.len(), BACKFILL);
+    assert_eq!(
+        batches[0].1.last().copied(),
+        Some(n as u32),
+        "the newest letter came in the first batch"
+    );
+    assert_eq!(batches[1].1.len(), 40, "and the rest in the second");
+    assert!(
+        batches[0].1[0] > batches[1].1.last().copied().unwrap_or(0),
+        "the second batch reaches further back than the first"
+    );
+
+    // A mirrored folder costs no letters at all: the pass looks, finds
+    // nothing missing, and asks for none.
+    let handed = || servers(&s).with(1, |srv| srv.fetched).unwrap_or_default();
+    let before = handed();
+    assert!(!sync::sync_account(s.world(), 1).expect("a second pass"));
+    assert_eq!(held(), n as i64);
+    assert_eq!(handed(), before, "nothing was fetched a second time");
+    assert_eq!(asked().len(), 2, "and no batch was asked for again");
+}
+
 // -- the accounts -----------------------------------------------------------------
 
 // -- reopening a failed send -------------------------------------------------------

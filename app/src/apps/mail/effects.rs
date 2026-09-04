@@ -557,6 +557,41 @@ impl Effect for Fetch {
     }
 }
 
+/// Fetch an exact set of uids — the backfill's reach into a folder's past.
+#[derive(Debug, Clone)]
+pub struct Backfill {
+    pub account: i64,
+    pub folder: String,
+    /// Ascending, no duplicates: what
+    /// [`fetch_account`](super::sync::fetch_account) found the server still
+    /// has and this store does not.
+    pub uids: Vec<u32>,
+}
+
+impl Effect for Backfill {
+    const KIND: &'static str = "backfill";
+    type Reply = Vec<RemoteMail>;
+    fn describe(&self) -> String {
+        let lowest = self.uids.first().copied().unwrap_or(0);
+        let highest = self.uids.last().copied().unwrap_or(0);
+        format!(
+            "backfill {} older in {} (uid {lowest}..{highest})",
+            self.uids.len(),
+            self.folder,
+        )
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn entity(&self) -> Option<String> {
+        Some(account_entity(self.account))
+    }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.cap::<dyn Imap>()?
+            .fetch_uids(self.account, &self.folder, &self.uids)
+    }
+}
+
 /// Search a folder's uids — all of them, or the unseen.
 #[derive(Debug, Clone)]
 pub struct Uids {
