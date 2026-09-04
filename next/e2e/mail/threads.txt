@@ -1,0 +1,56 @@
+# args:
+# env:
+#
+# The row is the conversation, the panel is the whole of it.
+#
+# Assertions are the clicks: a closed message is addressed by its sender and
+# the line it previews, an open one by its sender and date — so "this message
+# opened in place" is checked by the run rather than by a human reading a
+# screenshot.
+
+wait 900
+
+# Max's conversation folds three letters into one row: my note (in Sent),
+# his reply, and his second reply with a quoted tail. Opening it previews
+# the whole thread — the older two closed, one line each, the newest open.
+click "superapp panel model"
+wait 900
+shot h1-thread
+
+# A closed row opens in place when pressed. It is addressed by its sender
+# and the first line its author wrote, which is what it previews.
+click "Andrey Rudenko: Wrote up the panel model"
+wait 700
+shot h2-opened
+
+# The same row, open, is addressed by sender and date; pressing it folds the
+# letter back and the panel asks for fewer rows again.
+click "Andrey Rudenko · aug 29 14:02"
+wait 700
+shot h3-closed
+
+# The newest letter came open with the panel, and the quote it was written
+# over is folded behind one line. A press unfolds it in place.
+click "› quoted"
+wait 700
+shot h4-quote-unfolded
+
+# The letter itself is a selectable run: a drag across it is a real
+# selection, which is what a passage one wants to quote back needs.
+selectall "mail body"
+wait 500
+shot h5-selected
+
+# The whole conversation files as one: both of Max's inbox letters go, the
+# row goes with them, and undo brings all of it back.
+click "archive"
+wait 900
+shot h6-archived
+key cmd+z
+wait 900
+key cmd+z
+wait 900
+click "superapp panel model"
+wait 800
+shot h7-undone
+quit

@@ -1,0 +1,31 @@
+# args:
+# env:
+#
+# The Dev chord: ⇧⌘L puts the panels library up over the running workspace,
+# and takes it down again. Run as a workspace suite — no `--library` — so the
+# script stays the stage's and keeps ticking underneath while the canvas has
+# the window: the stage is suspended, not torn down.
+
+wait 900
+shot dev-01-workspace
+
+key cmd+shift+l
+wait 900
+shot dev-02-library
+
+key cmd+shift+l
+wait 700
+shot dev-03-workspace-again
+
+# The workspace is the one that was there, with its store and its history:
+# the launcher still finds what this build offers.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 800
+click "try it"
+wait 400
+shot dev-04-alive
+quit

@@ -1,0 +1,28 @@
+[package]
+name = "superapp-next"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "The prototype shell: the Makepad half of the redesign."
+publish = false
+
+[[bin]]
+name = "superapp-next"
+path = "src/main.rs"
+
+[dependencies]
+superapp-kernel = { path = "../kernel" }
+
+# An app writes its own tables and files its own effects, so it names the two
+# crates the kernel's interfaces are spelled in: `App::seed` hands back a
+# `rusqlite::Result`, and a `Deferred` effect is a serde payload.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+
+# Pin Makepad for repeatable builds. The fork's fixes are listed in the
+# workspace manifest's patch block.
+makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

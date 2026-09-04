@@ -1,0 +1,175 @@
+# args: --demo-disk
+# env:
+#
+# The four verbs that write. `new dir`, `copy here`, `move here` and
+# `delete` reach the disk through the world's own capability, and every one
+# of them is an undoable action whose reversal is another one: a delete is a
+# move to the trash, and undo is the move back.
+#
+# Run with `--demo-disk`, so the tree is the fixture rather than whatever
+# this machine's ~ holds; in the prototype every world has it, and the flag
+# is what a suite written for the shipping tree says.
+#
+# The assertion is the click: a row that resolves is a path that is there.
+# Where two panels could be showing a row of the same name, the card's own
+# path line settles which — it resolves only for the file the card is on.
+# Every write is followed by the cmd+z that puts the fixture back, which is an
+# assertion of its own.
+#
+# One listing at a time, because a bar is addressed by its labels and two
+# listings wear the same ones. A card wears none of them.
+
+wait 900
+
+# The launcher opens the files root; ~ lists the demo tree.
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+
+# -- new dir --------------------------------------------------------------------
+
+# The field under the filter makes one directory, and the row it made is the
+# proof: a press on it previews a listing of its own, empty, beside this one.
+click "new dir"
+wait 500
+type "reports"
+wait 500
+shot p1-naming
+key enter
+wait 800
+shot p2-made
+
+# A name the directory already has is refused where the field was — the
+# panel's own line, under the rows — and the field keeps what was typed.
+# Esc puts both away.
+click "new dir"
+wait 500
+type "reports"
+wait 500
+key enter
+wait 800
+shot p3-refused
+key esc
+wait 500
+
+click "reports/"
+wait 800
+shot p4-preview
+
+# cmd+z takes back the preview that click opened; the one under it takes back
+# the directory — to the trash, while it is still empty, because that is
+# where everything this app removes goes.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+
+# …and `go to` reaches the trash like any other directory. The field is
+# seeded with where the panel stands, and a second root inside the text
+# restarts the path, so this is a whole path typed over the seed.
+click "go to"
+wait 500
+type "~/.Trash/"
+wait 600
+key enter
+wait 900
+click "reports/"
+wait 800
+shot p5-in-the-trash
+key cmd+z
+wait 700
+
+# -- copy -----------------------------------------------------------------------
+
+# The card under the cursor is the object: `copy` holds the file it shows,
+# and every files panel then offers `copy here`. Into the directory the file
+# is already in is the one clash a copy is allowed — the duplicate is the
+# point — so it lands under a name that is free.
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+click "README.txt"
+wait 900
+click "copy"
+wait 500
+shot p6-holding
+click "copy here"
+wait 900
+shot p7-copied
+click "README copy.txt"
+wait 900
+click "~/Downloads/README copy.txt"
+wait 400
+
+# cmd+z takes back the preview that click opened, and the one under it takes
+# back the copy — into the trash, like everything else this app removes.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+shot p8-copy-undone
+
+# -- move -----------------------------------------------------------------------
+
+# The same file, moved. The card holds it; `go to` then carries the one
+# listing into the directory it is to land in, and `move here` is that
+# panel's — the hold is a set of paths, not a place, so walking the
+# destination to it is the whole gesture. The card, joined under the panel
+# that was replaced, closes with it.
+click "move"
+wait 500
+click "go to"
+wait 500
+type "2026/"
+wait 600
+key enter
+wait 900
+click "move here"
+wait 900
+shot p9-moved
+click "README.txt"
+wait 900
+click "~/Downloads/2026/README.txt"
+wait 400
+
+# cmd+z takes the preview and then the move, and the file is where it
+# started — which the walk back proves.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+click "README.txt"
+wait 900
+click "~/Downloads/README.txt"
+wait 400
+shot p10-move-undone
+
+# -- delete ---------------------------------------------------------------------
+
+# The card is the object again: `delete` takes the file to the trash and
+# closes the panel that was showing it, in one action — a run can assert
+# what is there and not what is gone, so what it asserts is the cmd+z that
+# brings both back: the card onto the file, and the row into the listing.
+click "delete"
+wait 900
+shot p11-deleted
+key cmd+z
+wait 900
+click "~/Downloads/README.txt"
+wait 400
+click "README.txt"
+wait 700
+shot p12-restored
+quit

@@ -1,0 +1,23 @@
+[workspace]
+members = ["kernel", "app"]
+resolver = "2"
+
+# The Makepad fork adds five fixes. Rebase them when updating the pin:
+#
+#   bdb23508  Keep the mobile keyboard open when focus moves between fields.
+#   5bf8e78f  Let a dismissed mobile keyboard reopen when its field is tapped.
+#   99b2a58f  Allow screenshots while the window is hidden, when enabled.
+#   5d491eea  Send trackpad pinch events to the Panels Library zoom control.
+#   d7795f23  Remove dark bands between selected lines with padding.
+#
+# `../makepad-superapp` is the local working copy. Builds use the revision below.
+[patch."https://github.com/makepad/makepad"]
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "d7795f23" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3

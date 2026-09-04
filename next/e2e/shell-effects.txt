@@ -1,0 +1,77 @@
+# args:
+# env:
+#
+# The effect log. Help's verb really leaves the process — a line onto the
+# clipboard, through the world's Clip capability — so the log has a row to
+# show for it. Assertions are the clicks: a label that does not resolve
+# fails the run, so "the row is drawn" is checked by clicking it.
+
+wait 600
+# The store comes up on the first root the app list offers, which is mail's
+# inbox; the manual is a root like any other, one launcher away.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 800
+
+# -- something leaves the process -------------------------------------------
+
+click "try it"
+wait 400
+shot b1-toast
+
+# -- the log, from the launcher ---------------------------------------------
+
+# `effects` is a root, so the launcher offers it whether or not anything
+# shows it.
+key cmd 2
+wait 400
+type "effects"
+wait 500
+key enter
+wait 900
+shot b2-effects
+
+# The panel opens on `@wrote` — what was changed out there — and the demo
+# effect is the row it has to show.
+click "copy the demo line"
+wait 900
+shot b3-preview
+
+# -- the filter -------------------------------------------------------------
+
+# `@memory` is the other half of the log: what ran at the call and left no
+# row. `cmd+a` in a live field is select-all, not a verb on the bar.
+click "filter"
+wait 300
+key cmd+a
+type "@memory"
+wait 500
+# The tag offer is up under the caret; esc puts it away without leaving the
+# field's own text alone.
+key esc
+wait 400
+shot b4-memory
+
+# -- the walk previews ------------------------------------------------------
+
+# Down leaves the filter for the rows and lands on the first, which previews
+# into a job panel joined to the right.
+key down
+wait 900
+click "job effect"
+wait 400
+shot b5-job
+
+# -- undo -------------------------------------------------------------------
+
+# A preview is one undoable step: undo closes the panel it opened.
+key cmd+z
+wait 900
+click "filter"
+wait 400
+shot b6-undone
+
+quit

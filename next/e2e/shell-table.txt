@@ -1,0 +1,127 @@
+# args:
+# env:
+#
+# The rich table's own behaviour, on the shell's own list: the filter
+# field, its chord and its completion; the marks a space and a shift+arrow
+# make; the band a filter that hides a mark puts above the rows; the batch
+# verbs the panel computes from its own marks; and the esc that lets the
+# set go. Assertions are the clicks — a label that does not resolve fails
+# the run.
+
+wait 600
+# The store comes up on the first root the app list offers, which is mail's
+# inbox; the manual is a root like any other, one launcher away.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 800
+
+# Three effects, so there is a range to mark.
+click "try it"
+wait 300
+click "try it"
+wait 300
+click "try it"
+wait 400
+
+key cmd 2
+wait 400
+type "effects"
+wait 500
+key enter
+wait 900
+
+# -- the field: its chord, and its completion -------------------------------
+
+# `cmd+a` in a live field is select-all: the widget takes the chord, so the
+# bar never sees it and what follows replaces the whole filter.
+click "filter"
+wait 300
+key cmd+a
+type "@mem"
+wait 500
+shot c1-offer
+
+# The offer's rows are hits like any other: a click splices the tag in.
+click "@memory"
+wait 500
+key esc
+wait 400
+
+# -- marks -------------------------------------------------------------------
+
+# Down hands the keyboard from the field to the rows; space marks the row
+# under the cursor, and the panel's bar grows the batch verbs.
+key down
+wait 500
+type " "
+wait 400
+shot c2-one-mark
+
+# Shift+arrow marks the row it leaves and the row it lands on: a range, by
+# the walk's own keys.
+key shift+down
+wait 400
+key shift+down
+wait 500
+shot c3-range
+
+# -- a filter that hides a mark ----------------------------------------------
+
+# A mark is an identity, so narrowing the list does not drop one: the marks
+# the filter hides ride above the rows, under their own caption, and the
+# batch verb still counts them.
+click "filter"
+wait 300
+key cmd+a
+type "@filed"
+wait 500
+key esc
+wait 500
+shot c4-hidden
+
+click "copy 3"
+wait 600
+shot c5-copied
+
+# -- esc lets the set go ------------------------------------------------------
+
+# The copy took the marks with it, so there is a set to make again.
+click "filter"
+wait 300
+key cmd+a
+type "@memory"
+wait 500
+key esc
+wait 400
+key down
+wait 400
+type " "
+wait 400
+key shift+down
+wait 400
+key esc
+wait 500
+shot c6-cleared
+
+# The rows still answer, with no bar in the way.
+click "copy the demo line"
+wait 600
+
+# -- problems -----------------------------------------------------------------
+
+# The other system list, opened from the launcher: nothing is wrong, and it
+# says so rather than showing an empty box.
+key cmd 2
+wait 400
+type "problems"
+wait 500
+key enter
+wait 900
+click "problems"
+wait 400
+shot c7-problems
+
+quit
