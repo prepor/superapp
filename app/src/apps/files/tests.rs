@@ -1360,6 +1360,7 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
         Task::Delete {
             paths: three(),
             own: false,
+            marked: false,
         },
         slot,
         showing(&s, slot),
@@ -1371,7 +1372,7 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
 
     // *cancel*, between two paths. The path in hand is finished — a
     // half-copied file is nobody's — and the ones behind it are dropped.
-    FILES.stop(key(&s));
+    FILES.stop(key(&s), FILES.running_id(key(&s)));
     runner.pass(&w);
     assert_eq!(FILES.running(key(&s)), None);
     assert!(
@@ -1427,6 +1428,7 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
         Task::Delete {
             paths: three(),
             own: false,
+            marked: false,
         },
         slot,
         showing(&s, slot),
@@ -1442,7 +1444,7 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
     let w = s.world().clone();
     let mut runner = Runner::new();
     runner.pass(&w);
-    FILES.stop(key(&s));
+    FILES.stop(key(&s), FILES.running_id(key(&s)));
     runner.pass(&w);
     s.settle();
 
@@ -1469,6 +1471,7 @@ fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
         Task::Delete {
             paths: vec!["~/Downloads/README.txt".to_string()],
             own: true,
+            marked: false,
         },
         slot,
         showing(&s, slot),
@@ -1508,6 +1511,7 @@ fn a_run_is_performed_and_recorded_only_by_the_session_that_asked() {
         Task::Delete {
             paths: vec!["~/Downloads/README.txt".to_string()],
             own: false,
+            marked: false,
         },
         slot,
         showing(&mine, slot),
@@ -1591,6 +1595,7 @@ fn a_delete_closes_the_panel_that_ran_it_and_not_what_took_its_place() {
         Task::Delete {
             paths: vec!["~/notes.md".to_string()],
             own: true,
+            marked: false,
         },
         card,
         showing(&s, card),
@@ -1641,6 +1646,261 @@ fn a_stop_with_nothing_in_hand_says_what_it_dropped() {
             .any(|n| n.msg == "one run dropped — it had not started"),
         "work is never dropped in silence: {:?}",
         s.notes()
+    );
+}
+
+#[test]
+fn two_sessions_each_perform_and_land_their_own_run() {
+    let _alone = alone();
+    let (mut mine, a) = home();
+    let (mut theirs, b) = home();
+    let (was_a, was_b) = (nodes(&mine), nodes(&theirs));
+
+    for (s, slot) in [(&mine, a), (&theirs, b)] {
+        FILES.queue_by_hand(
+            s,
+            Task::Delete {
+                paths: vec!["~/notes.md".to_string()],
+                own: false,
+                marked: false,
+            },
+            slot,
+            showing(s, slot),
+        );
+    }
+    let (wa, wb) = (mine.world().clone(), theirs.world().clone());
+    let (mut ra, mut rb) = (Runner::new(), Runner::new());
+
+    // Both take a run: two hands, not one. A single slot for "the run in
+    // hand" would have the second overwrite the first, and the first
+    // session would read as idle — its worker retired between two of its
+    // own passes, its run stopped half-done with nothing filed.
+    ra.pass(&wa);
+    rb.pass(&wb);
+    assert!(FILES.busy(key(&mine)) && FILES.busy(key(&theirs)));
+    assert!(FILES.running(key(&mine)).is_some());
+    assert!(FILES.running(key(&theirs)).is_some());
+
+    // And both land, each in its own history.
+    ra.pass(&wa);
+    rb.pass(&wb);
+    mine.settle();
+    theirs.settle();
+    assert_eq!(nodes(&mine), was_a + 1);
+    assert_eq!(nodes(&theirs), was_b + 1);
+    assert!(!there(&mine, "~/notes.md") && !there(&theirs, "~/notes.md"));
+    assert!(!FILES.busy(key(&mine)) && !FILES.busy(key(&theirs)));
+}
+
+#[test]
+fn a_cancel_stops_the_run_its_line_was_drawn_for_and_no_other() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    for name in ["one", "two"] {
+        FILES.queue_by_hand(
+            &s,
+            Task::MakeDir {
+                path: format!("~/{name}"),
+            },
+            slot,
+            showing(&s, slot),
+        );
+    }
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+
+    // The frame that drew the bar was about the first run.
+    with_dir(&s, slot, Dir::drawn);
+    let drew = with_dir(&s, slot, |d| d.drew());
+    assert_ne!(drew, 0);
+
+    // It finishes and the next one starts, all before the press lands.
+    runner.pass(&w);
+    assert!(there(&s, "~/one"));
+    assert!(FILES.running(key(&s)).is_some(), "the successor is in hand");
+    assert_ne!(FILES.running_id(key(&s)), drew, "and it is not what was drawn");
+
+    // The press: about a run that is over, so it stops nothing.
+    run(&mut s, slot, "files.cancel");
+    runner.pass(&w);
+    s.settle();
+    assert!(
+        there(&s, "~/two"),
+        "the run the button was not about ran to the end"
+    );
+}
+
+#[test]
+fn a_card_does_not_read_again_while_a_run_writes_elsewhere() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+    let read = with_card(&s, card, |c| c.read_at());
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: three(),
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    for _ in 0..3 {
+        runner.pass(&w);
+        // What a draw does: the card asks the disk again, because somebody
+        // wrote one.
+        with_card(&s, card, |c| c.observe(&s));
+    }
+    assert_eq!(
+        with_card(&s, card, |c| c.read_at()),
+        read,
+        "a `stat` says the file has not moved, so the reading stands — and \
+         the picture on it is not decoded again"
+    );
+
+    // The file it *is* on, though, is read again the moment it changes.
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: vec!["~/notes.md".to_string()],
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    runner.pass(&w);
+    with_card(&s, card, |c| c.observe(&s));
+    assert_ne!(with_card(&s, card, |c| c.read_at()), read);
+    assert!(with_card(&s, card, |c| c.gone()));
+}
+
+#[test]
+fn undo_puts_back_the_marks_a_run_consumed_while_it_was_being_drawn() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    mark(&s, slot, ["README.txt", "report-q3.pdf"]);
+
+    let paths = vec![
+        "~/Downloads/README.txt".to_string(),
+        "~/Downloads/report-q3.pdf".to_string(),
+    ];
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths,
+            own: false,
+            marked: true,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    let store = s.store().clone();
+    for _ in 0..2 {
+        runner.pass(&w);
+        // What a draw does between two paths of a long run: the listing is
+        // read again, and a mark whose row has gone goes with it.
+        with_dir(&s, slot, |d| {
+            d.relist();
+            d.list_mut().sync(&store);
+        });
+    }
+    assert!(marks(&s, slot).is_empty(), "the rows went, and the marks with them");
+
+    runner.pass(&w);
+    s.settle();
+    assert!(!there(&s, "~/Downloads/README.txt"));
+    assert!(s.undo());
+    assert_eq!(
+        marks(&s, slot),
+        ["README.txt".to_string(), "report-q3.pdf".to_string()],
+        "and undo puts back what the run consumed, not what happened to be \
+         left marked when it landed"
+    );
+}
+
+#[test]
+fn a_run_that_did_nothing_still_says_what_it_took_with_it() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    // Three paths another program took while nothing was watching, so
+    // every one of them is refused at the disk — and one more run waiting
+    // behind them.
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: (1..=3).map(|n| format!("~/gone-{n}")).collect(),
+            own: false,
+            marked: false,
+        },
+        slot,
+        showing(&s, slot),
+    );
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/never".to_string(),
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    FILES.stop(key(&s), FILES.running_id(key(&s)));
+    runner.pass(&w);
+    s.settle();
+
+    assert!(!there(&s, "~/never"), "what was waiting never started");
+    assert!(
+        s.notes()
+            .iter()
+            .any(|n| n.msg == "nothing deleted — stopped, and one more never started"),
+        "and a run with nothing of its own to report still answers for what \
+         it took with it: {:?}",
+        s.notes()
+    );
+}
+
+#[test]
+fn a_new_dir_that_lands_keeps_a_name_typed_since() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    run(&mut s, slot, "files.new_dir");
+    with_dir(&s, slot, |d| d.set_naming(Some("reports".to_string())));
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/reports".to_string(),
+        },
+        slot,
+        showing(&s, slot),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    // While the run was out, the next name went into the field.
+    with_dir(&s, slot, |d| d.set_naming(Some("drafts".to_string())));
+    runner.pass(&w);
+    s.settle();
+
+    assert!(there(&s, "~/reports"));
+    assert_eq!(
+        with_dir(&s, slot, |d| d.naming().map(str::to_string)),
+        Some("drafts".to_string()),
+        "the field closes on the name it made and on no other"
     );
 }
 

@@ -51,10 +51,6 @@ pub struct Files {
     /// place the UI thread and the runner's thread meet. A `Mutex` for the
     /// obvious reason, and never held across a disk call.
     runs: Mutex<run::Runs>,
-    /// The run that has been told to stop, by its number; zero for none.
-    /// Named rather than flagged so a stop can never reach a run queued
-    /// after it.
-    stopping: AtomicU64,
     /// Bumped whenever a run moves — a path performed, a run queued, a run
     /// over. A poll that finds this where it left it has nothing to redraw.
     moved: AtomicU64,
@@ -70,7 +66,6 @@ pub static FILES: Files = Files {
     clip: Mutex::new(Clipboard::empty()),
     writes: AtomicU64::new(0),
     runs: Mutex::new(run::Runs::new()),
-    stopping: AtomicU64::new(0),
     moved: AtomicU64::new(0),
     seen: AtomicU64::new(0),
 };

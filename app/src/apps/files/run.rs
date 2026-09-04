@@ -20,7 +20,11 @@
 //!   drifts from it.
 //! * **It says where it is.** [`Files::running`](super::Files::running) is
 //!   what the panels draw under their header while a run is on, and the
-//!   worker's own thread wakes the window between steps.
+//!   worker's own thread wakes the window between steps. A listing reads
+//!   its directory again as the paths land in it; a card asks whether the
+//!   file it is on actually moved first, since every path a run performs
+//!   would otherwise have it re-read — and its widget re-decode — the same
+//!   picture once a frame for the length of the run.
 //! * **It can be stopped.** [`Files::stop`](super::Files::stop) is read
 //!   between steps: the path in hand finishes (a half-copied file is
 //!   nobody's), the ones behind it are dropped, and what was done is kept.
@@ -47,6 +51,7 @@
 //! boot because the machine went down mid-run, and there is nothing here
 //! worth writing to a database — the disk is the state.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -81,6 +86,15 @@ pub enum Task {
         /// Whether the panel that ran it is showing what went, and so
         /// closes with the action.
         own: bool,
+        /// Whether the paths are the panel's marked rows — the marks the
+        /// run consumes, and that undo puts back.
+        ///
+        /// Said here rather than read off the table at the end, because by
+        /// then it cannot be: a row that has gone takes its mark with it on
+        /// the next draw, and a run that lasts a while is drawn all the way
+        /// through. What was marked when the verb ran is a fact about the
+        /// verb; what is marked when it lands is a fact about the frame.
+        marked: bool,
     },
     /// `new dir`: one directory, where nothing is yet.
     MakeDir { path: String },
@@ -215,21 +229,35 @@ impl Landed {
 
 // -- the queue -----------------------------------------------------------------
 
+/// The run one session has in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Active {
+    /// Which run, by [`Run::id`].
+    pub id: u64,
+    /// How far it has got.
+    pub at: Progress,
+    /// Whether it has been told to stop. On the entry rather than beside
+    /// it, so a stop is a fact about one run of one session and cannot be
+    /// read as being about another.
+    pub stopping: bool,
+}
+
 /// Every run this app has in flight, waiting, or finished and not yet
 /// recorded. One of these lives on [`Files`](super::Files), which is a
-/// `static`, so this is the one place the UI thread and the worker meet.
+/// `static`, so this is the one place the UI thread and the workers meet.
 #[derive(Debug, Default)]
 pub struct Runs {
     /// Waiting, oldest first. A run is planned when it reaches the front,
     /// against the disk as it is then.
     pub(super) queue: Vec<Run>,
-    /// The one in hand, and how far it has got.
-    pub(super) now: Option<Progress>,
-    /// Which run that is, by [`Run::id`]. Only meaningful while `now` is.
-    pub(super) now_id: u64,
-    /// And whose, by [`Run::db`] — so the line a panel draws is its own
-    /// session's run and not somebody else's.
-    pub(super) now_db: usize,
+    /// What each session has in hand, by [`Run::db`] — **one apiece**, not
+    /// one between them. A process may be running several sessions, each
+    /// performing its own run on its own thread against its own disk, and a
+    /// single slot here would have one of them overwrite another's: the
+    /// session whose entry was lost would read as idle, its worker would be
+    /// retired between two of its own passes, and the run would stop
+    /// half-done with nothing filed for anyone to record.
+    pub(super) now: BTreeMap<usize, Active>,
     /// How many runs this process has queued: the last [`Run::id`] given
     /// out.
     pub(super) minted: u64,
@@ -243,9 +271,7 @@ impl Runs {
     pub const fn new() -> Runs {
         Runs {
             queue: Vec::new(),
-            now: None,
-            now_id: 0,
-            now_db: 0,
+            now: BTreeMap::new(),
             minted: 0,
             landed: Vec::new(),
         }
@@ -310,7 +336,7 @@ impl Worker for Runner {
                 return Wake::OnKick;
             };
             let inline = work.run.inline;
-            let stopped = FILES.stopping(work.run.id);
+            let stopped = FILES.stopping(db, work.run.id);
             if stopped || work.left() == 0 {
                 let work = self.work.take().expect("the run in hand");
                 // A stop is a stop: what was waiting behind this goes too,
@@ -323,7 +349,7 @@ impl Worker for Runner {
                 continue;
             }
             work.step(w);
-            FILES.showing(work.progress());
+            FILES.showing(db, work.progress());
             if !inline {
                 // One path a pass. The kernel's worker loop wakes the window
                 // between passes, which is what a progress line is made of;
@@ -515,33 +541,40 @@ impl super::Files {
         let mut g = self.runs.lock().ok()?;
         let at = g.queue.iter().position(|r| r.db == db)?;
         let run = g.queue.remove(at);
-        // Marked as running before a single path is attempted: this is what
+        // Marked as in hand before a single path is attempted: this is what
         // keeps the worker from being retired between two of its own passes,
         // and what a stop reaches for.
-        g.now_id = run.id;
-        g.now_db = run.db;
-        g.now = Some(Progress {
-            doing: run.task.doing(),
-            at: 0,
-            total: 0,
-            name: String::new(),
-        });
+        g.now.insert(
+            run.db,
+            Active {
+                id: run.id,
+                at: Progress {
+                    doing: run.task.doing(),
+                    at: 0,
+                    total: 0,
+                    name: String::new(),
+                },
+                stopping: false,
+            },
+        );
         Some(run)
     }
 
-    /// Says where the run in hand has got to.
-    pub(super) fn showing(&self, at: Progress) {
+    /// Says where this session's run in hand has got to.
+    pub(super) fn showing(&self, db: usize, at: Progress) {
         if let Ok(mut g) = self.runs.lock() {
-            g.now = Some(at);
+            if let Some(a) = g.now.get_mut(&db) {
+                a.at = at;
+            }
         }
         self.moved();
     }
 
-    /// Files a finished run for the UI thread to record.
+    /// Files a finished run for the UI thread to record. Only this
+    /// session's hand is emptied — another's run is still going.
     pub(super) fn land(&self, l: Landed) {
         if let Ok(mut g) = self.runs.lock() {
-            g.now = None;
-            g.now_db = 0;
+            g.now.remove(&l.run.db);
             g.landed.push(l);
         }
         self.moved();
@@ -588,7 +621,20 @@ impl super::Files {
     #[must_use]
     pub fn running(&self, db: usize) -> Option<Progress> {
         let g = self.runs.lock().expect("the files runs");
-        (g.now_db == db).then(|| g.now.clone()).flatten()
+        g.now.get(&db).map(|a| a.at.clone())
+    }
+
+    /// Which run that is, by [`Run::id`]; zero where this session has none.
+    /// A panel records this as it *draws* its line, because that is what
+    /// its *cancel* is about.
+    ///
+    /// # Panics
+    ///
+    /// As [`Files::running`](super::Files::running).
+    #[must_use]
+    pub fn running_id(&self, db: usize) -> u64 {
+        let g = self.runs.lock().expect("the files runs");
+        g.now.get(&db).map_or(0, |a| a.id)
     }
 
     /// Whether this session has anything running or waiting to. Its worker
@@ -600,30 +646,39 @@ impl super::Files {
     #[must_use]
     pub fn busy(&self, db: usize) -> bool {
         let g = self.runs.lock().expect("the files runs");
-        (g.now.is_some() && g.now_db == db) || g.queue.iter().any(|r| r.db == db)
+        g.now.contains_key(&db) || g.queue.iter().any(|r| r.db == db)
     }
 
-    /// Stop: the path in hand finishes, the ones behind it are dropped, and
-    /// what was done is recorded. What the *cancel* button does. Answers
-    /// how many runs it dropped that had not started, since nothing else
-    /// will say so — a run that never began leaves no record to say it in.
+    /// Stop, and answer how many runs it dropped that had never started —
+    /// since nothing else will say so: a run that never began leaves no
+    /// record to say it in.
     ///
-    /// The stop names the run it is for, so it can never reach a later one,
-    /// and it reaches only this session's.
-    pub fn stop(&self, db: usize) -> usize {
+    /// `drew` is the run this panel's line was about **when it was drawn**,
+    /// which is what its *cancel* is a button for. A frame is a long time:
+    /// the run may have finished and its successor started between the draw
+    /// and the press, and the successor is not what was pressed. So a stop
+    /// names its run, and one that names a run already over stops nothing
+    /// at all.
+    ///
+    /// A zero `drew` is a bar drawn with runs queued and none in hand:
+    /// nothing to stop and nothing to keep, so what was waiting simply
+    /// never starts.
+    pub fn stop(&self, db: usize, drew: u64) -> usize {
         let dropped = {
             let Ok(mut g) = self.runs.lock() else {
                 return 0;
             };
-            if g.now.is_some() && g.now_db == db {
+            if drew != 0 {
                 // The one in hand answers for the ones behind it: it drops
                 // them itself when it lands, and its toast is where they
                 // are counted.
-                self.stopping.store(g.now_id, Ordering::Relaxed);
+                if let Some(a) = g.now.get_mut(&db) {
+                    // Set, never cleared: a press that names a run already
+                    // over says nothing about the one in hand.
+                    a.stopping |= a.id == drew;
+                }
                 0
             } else {
-                // Nothing of this session's has been taken in hand, so
-                // there is nothing to keep and no record to keep it on.
                 let n = g.queue.iter().filter(|r| r.db == db).count();
                 g.queue.retain(|r| r.db != db);
                 n
@@ -634,8 +689,11 @@ impl super::Files {
     }
 
     /// Whether *this* run has been told to stop.
-    pub(super) fn stopping(&self, run: u64) -> bool {
-        self.stopping.load(Ordering::Relaxed) == run
+    pub(super) fn stopping(&self, db: usize, run: u64) -> bool {
+        let Ok(g) = self.runs.lock() else {
+            return false;
+        };
+        g.now.get(&db).is_some_and(|a| a.stopping && a.id == run)
     }
 
     /// Everything forgotten — the queue, the run in hand's record, and the
@@ -646,7 +704,6 @@ impl super::Files {
         if let Ok(mut g) = self.runs.lock() {
             *g = Runs::new();
         }
-        self.stopping.store(0, Ordering::Relaxed);
         self.moved();
     }
 }

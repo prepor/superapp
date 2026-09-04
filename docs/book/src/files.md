@@ -241,8 +241,12 @@ Four things hold, and they are what the design is for:
   bar is a row and never a wrap, and a verb past the right edge is not drawn at
   all. The path in hand is finished — a half-copied file is nobody's — the runs
   waiting behind it are dropped, and the toast says how far it got and what that
-  cost. A stop that finds nothing started yet drops what was queued and says so
-  itself: work is never dropped in silence.
+  cost — even a run that managed nothing of its own still answers for what it
+  took with it. A stop that finds nothing started yet drops what was queued and
+  says so itself: work is never dropped in silence. And *cancel* is about the
+  run whose line was on screen when it was pressed: the id is read as the panel
+  **draws**, so a run that finished in the intervening frame is not its
+  successor's to answer for.
 - **Undo is unchanged.** The run records nothing. It collects what it performed
   and hands it back; the history node, its intents, the lease check, the marks a
   delete consumed, the panel a delete closes and the toast are all the UI
@@ -253,8 +257,23 @@ A run carries the panel that asked for it — the slot *and* what stood in it �
 because a slot is a place and not a panel: a crumb and `go to` both replace
 what a slot shows, in place, without closing anything. A run that lands after
 that writes no line on the stranger standing there, takes none of its marks,
-and above all does not close it. The same holds for the clipboard: a move lets
-go of the set it carried, and a set held while it was running stands.
+and above all does not close it. The same holds for everything else it may
+have outlived: a move lets go of the clipboard it *carried*, and a set held
+since stands; `new dir` closes its field on the name it made and on no other,
+so a name typed while the run was out survives; and the marks a delete
+consumed are worked out from what *went*, not from what is still marked when
+it lands, since the rows disappear one at a time and each draw takes their
+marks with them.
+
+Every session performs its own runs, one at a time — the window's and each
+mount's are separate hands, not one between them, or the session whose entry
+was lost would read as idle and have its worker retired mid-run.
+
+Panels keep up with a run through the same write count as ever, so a listing
+fills as the copy lands in it. A card, though, asks whether the file it is on
+actually moved before it reads again: every path a run performs bumps that
+count, and a card that re-read on each of them would hand its widget the same
+picture to decode once a frame for the length of the run.
 
 Runs are performed one at a time in the order they were asked for, and each is
 planned when it reaches the front — the disk may have moved on while it waited,

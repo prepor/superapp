@@ -58,6 +58,11 @@ pub struct Dir {
     status: Option<String>,
     /// What the listing was read at, on both counts.
     seen: Seen,
+    /// The run the line under the header was about, as of the last time
+    /// this panel was **drawn**. What its *cancel* is a button for: a run
+    /// that finished between the frame and the press is not its
+    /// successor's to answer for.
+    drew: u64,
     /// The directory watched for as long as this panel shows it. Held, not
     /// read: dropping it is what lets the watcher go.
     _watch: Watch,
@@ -223,6 +228,20 @@ impl Dir {
     /// files panel is looking at, and because it is what the *cancel* on
     /// the bar is about. The refusal is not lost: it comes back when the
     /// run is over.
+    /// Called from the draw, and only from the draw: which run the line
+    /// below is about. See [`Dir::drew`].
+    pub fn drawn(&mut self) {
+        self.drew = FILES.running_id(run::whose_world(&self.world));
+    }
+
+    /// The run this panel last drew a line for; zero for none. The verb
+    /// reads the field itself — this is the tests' door onto it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn drew(&self) -> u64 {
+        self.drew
+    }
+
     #[must_use]
     pub fn note(&self) -> Option<String> {
         FILES
@@ -302,6 +321,13 @@ impl Dir {
             return;
         }
         self.status = None;
+        // The field holds what is being made, for as long as it is out:
+        // that is what it says on screen, and what the run compares against
+        // when it comes back to close it. A field that was never open stays
+        // shut — a submit is not a way to raise one.
+        if self.naming.is_some() {
+            self.naming = Some(name.clone());
+        }
         let path = join(&self.dir, &name);
         FILES.start(s, Task::MakeDir { path }, self.slot, self.id.clone());
     }
@@ -477,7 +503,7 @@ impl Panel for Dir {
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
             "files.here" => self.here(s),
-            "files.cancel" => cancel(s, &self.world),
+            "files.cancel" => cancel(s, &self.world, self.drew),
             // The two about the set itself. Neither writes anything, so
             // neither is an action: a mark is the panel's own context.
             "files.all" => {
@@ -538,6 +564,7 @@ impl PanelKind for DirKind {
             pathing: None,
             status,
             seen,
+            drew: 0,
             _watch,
         })
     }
@@ -589,9 +616,9 @@ impl Dir {
     /// takes rows, and the list stays; the directory this panel *is* takes
     /// the panel with it — when the run lands, which is the same node.
     fn delete(&mut self, s: &mut Session) {
-        let own = self.list.marks().is_empty();
+        let marked = !self.list.marks().is_empty();
         let paths = self.objects();
-        if delete_paths(s, self.slot, &self.id, paths, own) {
+        if delete_paths(s, self.slot, &self.id, paths, !marked, marked) {
             // A run is on its way; the line it will write is its own. One
             // that was never queued leaves the line standing as it was.
             self.status = None;
@@ -701,6 +728,7 @@ pub(super) fn delete_paths(
     showing: &PanelId,
     paths: Vec<String>,
     own: bool,
+    marked: bool,
 ) -> bool {
     if paths.is_empty() {
         return false;
@@ -709,7 +737,7 @@ pub(super) fn delete_paths(
         s.notify("read-only — acquire the lease to write", true);
         return false;
     }
-    FILES.start(s, Task::Delete { paths, own }, by, showing.clone());
+    FILES.start(s, Task::Delete { paths, own, marked }, by, showing.clone());
     true
 }
 
@@ -718,8 +746,8 @@ pub(super) fn delete_paths(
 ///
 /// A run that had not begun leaves nothing to record and so nothing to say
 /// for itself; this says it instead, rather than dropping work in silence.
-pub(super) fn cancel(s: &mut Session, world: &World) {
-    let dropped = FILES.stop(run::whose_world(world));
+pub(super) fn cancel(s: &mut Session, world: &World, drew: u64) {
+    let dropped = FILES.stop(run::whose_world(world), drew);
     match dropped {
         0 => {}
         1 => s.notify("one run dropped — it had not started", false),
@@ -775,7 +803,14 @@ fn landed_here(s: &mut Session, l: Landed) {
         // Nothing could be done: the refusal is the word, and the
         // clipboard stands as it was.
         let msg = match (stopped, refused.len()) {
-            (true, _) => format!("nothing {} into {here} — stopped", verb.done()),
+            // Whatever was waiting behind it went too, and this is the only
+            // line there is to say so in: a run that did nothing still
+            // answers for the ones it took with it.
+            (true, _) => format!(
+                "nothing {} into {here}{}",
+                verb.done(),
+                halted(true, dropped)
+            ),
             (false, 1) => refused[0].clone(),
             (false, n) => format!("nothing to {} into {here} — {n} refused", verb.verb()),
         };
@@ -825,9 +860,10 @@ fn landed_here(s: &mut Session, l: Landed) {
 
 /// `delete`, landed.
 fn landed_delete(s: &mut Session, l: Landed) {
-    let Task::Delete { own, .. } = &l.run.task else {
+    let Task::Delete { own, marked, .. } = &l.run.task else {
         return;
     };
+    let marked = *marked;
     let ran = Ran::of(&l.run);
     // A panel that closed — or walked somewhere else — while the run was
     // going closes nothing now.
@@ -842,7 +878,7 @@ fn landed_delete(s: &mut Session, l: Landed) {
     } = l;
     if done.is_empty() {
         let msg = match (stopped, refused.len()) {
-            (true, _) => "nothing deleted — stopped".to_string(),
+            (true, _) => format!("nothing deleted{}", halted(true, dropped)),
             (false, 1) => refused[0].clone(),
             (false, n) => format!("nothing deleted — {n} refused"),
         };
@@ -864,7 +900,7 @@ fn landed_delete(s: &mut Session, l: Landed) {
     // that stayed because its path refused. Taken only once the action is
     // certain, and undo puts exactly these back.
     let mut intents: Vec<Box<dyn Intent>> = vec![trashed];
-    intents.extend(ran.take_marks(s, &gone));
+    intents.extend(marked.then(|| ran.take_marks(s, &gone)).flatten());
     let closes = ran.by;
     s.act_done(
         Action::new("delete", format!("delete {what}"))
@@ -901,7 +937,7 @@ fn landed_dir(s: &mut Session, l: Landed) {
             .refused
             .first()
             .cloned()
-            .unwrap_or_else(|| format!("“{name}/” was not created — stopped"));
+            .unwrap_or_else(|| format!("“{name}/” was not created{}", halted(true, l.dropped)));
         ran.say(s, Some(msg.clone()));
         s.notify(msg, true);
         return;
@@ -916,10 +952,18 @@ fn landed_dir(s: &mut Session, l: Landed) {
         Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
     );
     ran.with(s, |p| {
-        if let Some(d) = p.as_any().downcast_mut::<Dir>() {
+        let Some(d) = p.as_any().downcast_mut::<Dir>() else {
+            return;
+        };
+        // The field stayed open while the run was out, so somebody may
+        // have typed the next name into it — or submitted it, and be
+        // waiting on a run of their own. It closes on the name it made and
+        // on no other; the line goes either way, since a refusal from
+        // before this went through is a refusal about nothing.
+        if d.naming() == Some(name.as_str()) {
             d.set_naming(None);
-            d.set_status(None);
         }
+        d.set_status(None);
     });
     s.notify(format!("created “{name}/” in {here} — cmd+z undoes"), false);
     super::refresh(s, None);
@@ -983,6 +1027,13 @@ impl Ran {
     /// answers the intent that puts them back. `None` when it consumed
     /// none, and none where the panel has gone — there is nowhere left for
     /// a mark to be.
+    ///
+    /// What was taken is worked out from what *went*, not from what is
+    /// still marked: the rows went one at a time while the panel was being
+    /// drawn, and a row that has gone takes its mark with it on the draw
+    /// after. The marks are removed here all the same — the ones the draw
+    /// took are simply not there to remove — and undo puts back exactly the
+    /// set the run consumed.
     fn take_marks(&self, s: &Session, gone: &[String]) -> Option<Box<dyn Intent>> {
         let inst = self.still(s)?;
         let mut p = inst.try_borrow_mut().ok()?;
@@ -992,7 +1043,6 @@ impl Ran {
             .iter()
             .filter(|g| parent(g) == Some(dir.as_str()))
             .map(|g| basename(g).to_string())
-            .filter(|n| d.list.marks().has(n))
             .collect();
         for n in &taken {
             d.list.marks_mut().remove(n);

@@ -286,6 +286,11 @@ impl Widget for DirPanel {
                 || self.rename_field.live(cx, &rename),
         );
         self.crumbs(cx, &props, &f);
+        // Which run that line is about, remembered on the draw and nowhere
+        // else: *cancel* is a button about the run whose line was on
+        // screen when it was pressed, and the frame is where that is
+        // decided.
+        drew(&props);
         // The status line: what a run is doing, or what the last verb
         // refused until the next one.
         let lbl = self.view.label(cx, STATUS);
@@ -527,6 +532,14 @@ fn observe(props: &PanelProps, scope: &mut Scope) -> Option<Fields> {
         pathing: d.pathing().map(str::to_string),
         status: d.note(),
     })
+}
+
+/// Remembers which run the line under the header is about, at the moment
+/// it is drawn. Called from the draw pass alone — an event that refreshed
+/// it would put the answer back to *now*, which is the very thing a stale
+/// *cancel* must not be able to do.
+fn drew(props: &PanelProps) {
+    edit(props, super::super::panels::Dir::drawn);
 }
 
 /// What the three fields keep from the bars while one of them has the

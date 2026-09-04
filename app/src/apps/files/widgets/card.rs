@@ -24,7 +24,6 @@ use crate::shell::widgets::card::{self, CardData, Preview};
 
 use super::super::model::{fmt_size, FileKind, Preview as Read};
 use super::super::panels::Card;
-use super::super::Seen;
 use super::field::Raised;
 
 /// The children the card's template adds to the shell's own.
@@ -50,9 +49,11 @@ const PICTURE: &[LiveId] = ids!(img_box.img_prev);
 #[derive(Clone, PartialEq, Eq)]
 struct Shown {
     id: PanelId,
-    /// What the instance last read at: a write — anybody's — is a new
-    /// reading of the same path.
-    at: Seen,
+    /// Which reading the instance is holding. Not *when* it last looked: a
+    /// run writing elsewhere brings the card back to the disk on every
+    /// path it performs, and the picture on it has not changed for any of
+    /// them.
+    at: u64,
 }
 
 /// What the card draws around the file: the line a refused verb leaves, and
@@ -144,6 +145,9 @@ impl Widget for CardPanel {
             card::fill(cx, &self.view, &data);
             self.shown = Some(shown);
         }
+        // Which run the line is about, remembered on the draw and nowhere
+        // else: as a listing's, and for the same reason.
+        drew(&props);
         let lbl = self.view.label(cx, STATUS);
         lbl.set_text(cx, chrome.status.as_deref().unwrap_or(""));
         lbl.set_visible(cx, chrome.status.is_some());
@@ -327,6 +331,12 @@ fn edit(props: &PanelProps, f: impl FnOnce(&mut Card)) {
     if let Some(c) = borrow.as_any().downcast_mut::<Card>() {
         f(c);
     }
+}
+
+/// Remembers which run the line under the header is about, at the moment it
+/// is drawn — the frame being where a *cancel* decides what it is about.
+fn drew(props: &PanelProps) {
+    edit(props, Card::drawn);
 }
 
 /// What this widget's keyboard keeps from the bars, said on every draw and

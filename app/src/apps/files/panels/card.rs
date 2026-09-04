@@ -63,6 +63,14 @@ pub struct Card {
     status: Option<String>,
     /// What this reading was taken at, on both counts.
     seen: Seen,
+    /// Which reading is on the card: bumped when the card actually reads
+    /// again, not every time somebody writes a disk. The widget decodes a
+    /// picture once per reading, and a run copying elsewhere must not have
+    /// it decode the same one once a frame for the length of the run.
+    read: u64,
+    /// The run the line under the header was about, as of the last time
+    /// this card was **drawn** — as a listing's [`Dir::drew`].
+    drew: u64,
     /// The file's directory, watched for as long as this card shows it.
     /// Held, not read.
     _watch: Watch,
@@ -170,12 +178,13 @@ impl Card {
         self.pixels
     }
 
-    /// What the card last read, as the two counts it was read at. The
-    /// widget decodes a picture once per reading rather than once a frame,
-    /// so it needs to know when the reading changed.
+    /// Which reading is on the card. The widget decodes a picture once per
+    /// reading rather than once a frame, so it needs to know when the
+    /// reading *changed* — which is not the same question as whether
+    /// anybody wrote a disk.
     #[must_use]
-    pub fn read_at(&self) -> Seen {
-        self.seen
+    pub fn read_at(&self) -> u64 {
+        self.read
     }
 
     /// Whether the disk still has it.
@@ -206,6 +215,12 @@ impl Card {
         self.status = line;
     }
 
+    /// Called from the draw, and only from the draw: which run the line
+    /// below is about. As a listing's [`Dir::drawn`](super::Dir::drawn).
+    pub fn drawn(&mut self) {
+        self.drew = FILES.running_id(run::whose_world(&self.world));
+    }
+
     /// The line the card draws under its header: what a run is doing, or —
     /// while nothing is running — what the last verb refused. As a
     /// listing's [`Dir::note`](super::Dir::note), and for the same reason:
@@ -227,11 +242,23 @@ impl Card {
     /// 38 MB disk image costs one `stat`; a picture's size is taken off the
     /// same bytes the card will draw, so the header is read once and not
     /// again on every wish.
+    ///
+    /// And a `stat` is all it costs when the file has not moved. Every path
+    /// a run performs bumps the count that brings the card back here — a
+    /// copy of forty thousand files does it forty thousand times, and none
+    /// of them is about this file. A card that read again on each of them
+    /// would hand its widget the same picture to decode once a frame, for
+    /// the length of the run.
     pub fn restat(&mut self) {
         // Stamped before the file is read, as a listing is: what lands in
         // between leaves the card one reading behind, never wrongly fresh.
         self.seen = FILES.seen(&self.world, &self.dir);
-        self.entry = stat_in(&self.world, &self.path);
+        let now = stat_in(&self.world, &self.path);
+        if now == self.entry && self.read > 0 {
+            return;
+        }
+        self.entry = now;
+        self.read += 1;
         let (world, path) = (self.world.clone(), self.path.clone());
         self.preview = match &self.entry {
             Some(e) => preview_of(e.kind(), &e.name, e.size, |max| {
@@ -323,7 +350,7 @@ impl Panel for Card {
             "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
-            "files.cancel" => dir::cancel(s, &self.world),
+            "files.cancel" => dir::cancel(s, &self.world, self.drew),
             _ => {}
         }
     }
@@ -400,7 +427,7 @@ impl Card {
     /// looked for: one somewhere else showing the same path keeps showing
     /// it, and says so.
     fn delete(&mut self, s: &mut Session) {
-        if dir::delete_paths(s, self.slot, &self.id, vec![self.path.clone()], true) {
+        if dir::delete_paths(s, self.slot, &self.id, vec![self.path.clone()], true, false) {
             self.status = None;
         }
     }
@@ -433,6 +460,8 @@ impl PanelKind for CardKind {
             renaming: None,
             status: None,
             seen: Seen::default(),
+            read: 0,
+            drew: 0,
             _watch,
         };
         card.restat();
