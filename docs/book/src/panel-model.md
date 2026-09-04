@@ -50,7 +50,8 @@ the instance. The size is not saved.
   right.
 - `cmd+t` switches a column between stacked and tabbed display. A tabbed column
   shows one panel at full height. Click a tab or move focus up and down to
-  choose the visible panel.
+  choose the visible panel. Closing panels until one is left returns the column
+  to stacked display; a column tabbed while already alone keeps its strip.
 
 The camera moves just enough to keep the focused panel visible with one gap of
 margin. Trackpad movement follows the input directly.
