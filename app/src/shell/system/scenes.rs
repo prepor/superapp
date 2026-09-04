@@ -10,12 +10,12 @@ use kernel::scene::Scene;
 use crate::shell::app_ui::Setup;
 use crate::shell::catalog::panel;
 
-use super::{About, Effects, Help, Problems};
+use super::{About, Effects, Help, Problems, Search};
 
 /// The system app's scenes, in canvas order.
 #[must_use]
 pub fn scenes() -> Vec<Scene<Setup>> {
-    vec![small_panels(), lists()]
+    vec![small_panels(), lists(), search()]
 }
 
 /// The manual and the colophon: the two panels a build always has.
@@ -28,6 +28,31 @@ fn small_panels() -> Scene<Setup> {
         .sized((420.0, 220.0))
         .about("three lines and the way back")
         .edge("help", "about", "the colophon link")
+}
+
+/// The panel that asks: empty, answered, and narrowed to one source.
+///
+/// A node opens on the panel's own store, which is seeded like any other —
+/// so what the rows show is what this build's sources really answer with,
+/// found by really asking them.
+fn search() -> Scene<Setup> {
+    let ask = |script: &str| panel(|_| Search::id(), script);
+    Scene::new("search", (560.0, 620.0))
+        .note("One question, put to every app's own source at once. The words in the field are the question; the @ tags narrow the answer that comes back.")
+        .note("Live — enter a node and type. The rows are a rich table like any other: the walk previews, enter opens, space marks.")
+        .node("empty", ask(""))
+        .about("nothing asked: the panel says so rather than showing a blank box")
+        .node("found", ask("type \"vera\"\nwait 600"))
+        .about("mail answers with the person who wrote before the letters they wrote")
+        .node(
+            "by source",
+            ask("type \"vera @app:mail\"\nwait 400\nkey esc\nwait 400"),
+        )
+        .about("@app: keeps one source's rows — a filter over the answer, not a second question")
+        .node("nothing", ask("type \"zzz\"\nwait 600"))
+        .about("an answer of nothing says which question it was an answer to")
+        .edge("empty", "found", "a word")
+        .edge("found", "by source", "a tag")
 }
 
 /// The two lists the shell keeps about itself.

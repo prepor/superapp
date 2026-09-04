@@ -95,9 +95,14 @@ pub trait RowSpec: 'static {
         Self::default_filter().to_string()
     }
 
-    /// The line an empty list shows, given the filter it is empty under.
-    /// Empty for a table that would rather show nothing.
-    fn empty_line(_filter: &str) -> String {
+    /// The line an empty list shows, given the panel it is of and the
+    /// filter it is empty under. Empty for a table that would rather show
+    /// nothing.
+    ///
+    /// The panel is here because *why* a list is empty is often a fact
+    /// about the instance and not about the filter: a search that no source
+    /// has answered yet is not a search that found nothing.
+    fn empty_line(_panel: &Self::Panel, _filter: &str) -> String {
         String::new()
     }
 
@@ -621,6 +626,9 @@ impl<S: RowSpec> TableView<S> {
             drop(borrow);
             return view.draw_walk(cx, scope, walk);
         };
+        // What an empty list would say, asked of the instance before the
+        // list is borrowed out of it.
+        let said = S::empty_line(panel, &text);
         let list = S::list(panel);
         list.set_filter(&text);
 
@@ -646,7 +654,6 @@ impl<S: RowSpec> TableView<S> {
         let cursor = list.cursor_index(&store);
 
         let empty_lbl = view.label(cx, EMPTY);
-        let said = S::empty_line(&text);
         empty_lbl.set_text(cx, &said);
         empty_lbl.set_visible(cx, n == 0 && err.is_none() && !said.is_empty());
 

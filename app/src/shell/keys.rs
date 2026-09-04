@@ -483,6 +483,17 @@ impl Stage {
                 cx.action(super::library::DevAction::ToggleLibrary);
                 true
             }
+            // Search: the panel that puts one question to every app's
+            // sources, focused wherever it already is.
+            //
+            // Only the shifted chord is taken. `s` is not in [`RESERVED`],
+            // because plain `cmd+s` still belongs to whatever bar wears it
+            // — mail's *sync* and *send* both do — and a bar is only ever
+            // reached without shift.
+            KeyCode::KeyS if k.modifiers.shift => {
+                self.go_to(sh, super::search_panel());
+                true
+            }
             // Reserved so that no bar may claim it: a list reads it as
             // *open un-joined*, which the shell leaves to the panel.
             KeyCode::ReturnKey => {

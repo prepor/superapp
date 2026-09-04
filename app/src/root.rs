@@ -54,6 +54,7 @@ script_mod! {
                         sys_effects_tpl := mod.widgets.SysEffectsPanel{}
                         sys_job_tpl := mod.widgets.SysJobPanel{}
                         sys_problems_tpl := mod.widgets.SysProblemsPanel{}
+                        sys_search_tpl := mod.widgets.SysSearchPanel{}
                         sys_bucket_tpl := mod.widgets.SysBucketPanel{}
                         sys_missing_tpl := mod.widgets.SysMissingPanel{}
                         // The modal overlays are hosted the same way, keyed
@@ -92,6 +93,7 @@ script_mod! {
                             sys_effects_tpl := mod.widgets.SysEffectsPanel{}
                             sys_job_tpl := mod.widgets.SysJobPanel{}
                             sys_problems_tpl := mod.widgets.SysProblemsPanel{}
+                            sys_search_tpl := mod.widgets.SysSearchPanel{}
                             sys_bucket_tpl := mod.widgets.SysBucketPanel{}
                             sys_missing_tpl := mod.widgets.SysMissingPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}

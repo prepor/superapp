@@ -203,7 +203,7 @@ impl RowSpec for LogRows {
         effect::LOG_DEFAULT
     }
 
-    fn empty_line(filter: &str) -> String {
+    fn empty_line(_panel: &Self::Panel, filter: &str) -> String {
         match filter.trim() {
             "" => "nothing has left the process yet",
             // The default is not a filter the operator typed, so an empty

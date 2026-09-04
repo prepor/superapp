@@ -24,6 +24,7 @@ mod job;
 mod missing;
 mod problems;
 mod scenes;
+mod search;
 
 pub use about::{About, AboutPanel};
 pub use bucket::{Bucket, BucketPanel};
@@ -32,6 +33,7 @@ pub use help::{Help, HelpPanel};
 pub use job::{Job, JobPanel};
 pub use missing::MissingPanel;
 pub use problems::{Problems, ProblemsPanel};
+pub use search::{Search, SearchPanel};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -117,6 +119,12 @@ script_mod! {
             mod.widgets.SKbd { text: "." }
             mod.widgets.SKbd { text: "t" }
             mod.widgets.SLabel { text: " — columns: consume, expel, pull, push, tabs" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SKbd { text: "s" }
+            mod.widgets.SLabel { text: " — search: one question, every app's own sources" }
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "cmd" }
@@ -323,6 +331,89 @@ script_mod! {
         }
     }
 
+    // ---- search ------------------------------------------------------------
+
+    /** One row of an answer: what was found and which source found it on
+        the first line, the source's own second thought under it.
+
+        The body is declared once and hung in each of the row's four twins,
+        so the cursor wash and the mark bar stay the shell's. */
+    mod.widgets.SysHitBody = View {
+        width: Fill, height: Fit
+        flow: Down
+        View {
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            // The label rides a Fill View whose flow is Down: a Fill label
+            // on a Right flow's main axis defer-walks.
+            View {
+                width: Fill, height: Fit
+                flow: Down
+                label_lbl := mod.widgets.SLabel {
+                    padding: 0
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+                }
+            }
+            View { width: 10, height: 1 }
+            source_lbl := mod.widgets.SLabel {
+                padding: 0, width: Fit, text: "", draw_text +: { color: #909090 }
+            }
+        }
+        detail_lbl := mod.widgets.SLabel {
+            visible: false
+            padding: 0
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { color: #909090 }
+        }
+    }
+
+    /** A row of an answer: the four twins, and the hairline under them. */
+    mod.widgets.SysHitRow = mod.widgets.TblRow {
+        line          := mod.widgets.TblLine        { body := mod.widgets.SysHitBody {} }
+        line_sel      := mod.widgets.TblLineSel     { body := mod.widgets.SysHitBody {} }
+        line_mark     := mod.widgets.TblLineMark    { body := mod.widgets.SysHitBody {} }
+        line_mark_sel := mod.widgets.TblLineMarkSel { body := mod.widgets.SysHitBody {} }
+        mod.widgets.TblHairline {}
+    }
+
+    /** The search panel: the same filter over the same header over the same
+        virtualized list every rich table has — but the words in that field
+        are the question every source is asked, and only its `@` tags narrow
+        what comes back. */
+    mod.widgets.SysSearchPanel = set_type_default() do #(SearchPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        filter_input := mod.widgets.TblFilter {
+            empty_text: "search…  ( / )   @app: for a source"
+        }
+        filter_err_lbl := mod.widgets.TblErr {}
+        View { width: Fill, height: 6 }
+        View {
+            width: Fill, height: Fit
+            padding: Inset{left: 8, right: 8, top: 0, bottom: 3}
+            View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { padding: 0, text: "FOUND" }
+            }
+            mod.widgets.SSection { padding: 0, width: Fit, text: "SOURCE" }
+        }
+        mod.widgets.TblHeadRule {}
+        empty_lbl := mod.widgets.TblEmpty {}
+        list := PortalList {
+            width: Fill, height: Fill
+            flow: Down
+            reuse_items: true
+            row := mod.widgets.SysHitRow {}
+            caption := mod.widgets.TblCaption {}
+            band_rule := mod.widgets.TblBandRule {}
+        }
+        suggest: mod.widgets.TblSuggest {}
+    }
+
     // ---- problems ----------------------------------------------------------
 
     /** A small bordered button a row wears. Rows give no chords — a panel
@@ -495,6 +586,7 @@ static ABOUT_KIND: about::AboutKind = about::AboutKind;
 static EFFECTS_KIND: effects::EffectsKind = effects::EffectsKind;
 static JOB_KIND: job::JobKind = job::JobKind;
 static PROBLEMS_KIND: problems::ProblemsKind = problems::ProblemsKind;
+static SEARCH_KIND: search::SearchKind = search::SearchKind;
 static BUCKET_KIND: bucket::BucketKind = bucket::BucketKind;
 static KINDS: &[&dyn PanelKind] = &[
     &HELP_KIND,
@@ -502,6 +594,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &EFFECTS_KIND,
     &JOB_KIND,
     &PROBLEMS_KIND,
+    &SEARCH_KIND,
     &BUCKET_KIND,
 ];
 
@@ -522,6 +615,7 @@ impl App for System {
             Root::new(About::id(), "about", "colophon version"),
             Root::new(Effects::id(), "effects", "log queue jobs ring"),
             Root::new(Problems::id(), "problems", "wrong failing standing"),
+            Root::new(Search::id(), "search", "find query sources everything"),
             Root::new(Bucket::id(), "device sync", "bucket lease r2 replicate"),
         ]
     }
@@ -549,6 +643,7 @@ impl AppUi for Ui {
             Effects::TAG => Some(live_id!(sys_effects_tpl)),
             Job::TAG => Some(live_id!(sys_job_tpl)),
             Problems::TAG => Some(live_id!(sys_problems_tpl)),
+            Search::TAG => Some(live_id!(sys_search_tpl)),
             Bucket::TAG => Some(live_id!(sys_bucket_tpl)),
             _ => None,
         }

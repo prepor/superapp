@@ -1,26 +1,31 @@
 # args:
 # env:
 #
-# A correspondent, found and read: the launcher's mail source answers a
-# question with the people who wrote before the letters they wrote, the card
-# says how much they have written, and the one link off it opens the inbox
-# filtered to their address.
+# A correspondent, found and read: mail's search source answers a question
+# with the people who wrote before the letters they wrote, the card says how
+# much they have written, and the one link off it opens the inbox filtered to
+# their address.
 #
-# Assertions are the clicks. "Vera Kovac" resolving in the launcher is proof
-# the sender source answered; the card's address resolving is proof the card
-# opened on it; and the filtered list's title is what proves the argument
-# reached the panel rather than the field alone.
+# Assertions are the clicks. The search panel is raised on an empty
+# workspace, so "Vera Kovac" resolving there is proof the sender source
+# answered and nothing else drew it; the card's address resolving is proof
+# the card opened on it; and the filtered list's title is what proves the
+# argument reached the panel rather than the field alone.
 
 wait 900
 
-# The launcher asks every app's source. Mail answers with the person first —
-# a contact is a fact about the mailbox, not a document in it — and then with
-# the letters, as the index ranks them.
-key cmd 2
-wait 400
-type "kovac"
+# An empty workspace: what resolves below is the search panel's own doing.
+key cmd+2
 wait 700
-shot c1-launcher
+
+# The search panel asks every app's source. Mail answers with the person
+# first — a contact is a fact about the mailbox, not a document in it — and
+# then with the letters, as the index ranks them.
+key cmd+shift+s
+wait 900
+type "kovac"
+wait 800
+shot c1-search
 click "Vera Kovac"
 wait 800
 shot c2-card
@@ -52,11 +57,18 @@ shot c5-cleared
 
 # A letter's own words reach it too — the index reads the body, which the
 # headers alone never did.
-key cmd 2
-wait 400
+key cmd+shift+s
+wait 800
+key /
+wait 300
+key cmd+a
 type "thermos"
-wait 700
+wait 800
 shot c6-body-search
+key down
+wait 700
+key enter
+wait 900
 click "Sat hike"
 wait 800
 shot c7-found

@@ -93,8 +93,7 @@ impl Stage {
             // A blank question, asked now: the switcher is on screen before
             // the key comes back up.
             let (windows, roots) = (sh.session.windows(), sh.session.roots());
-            let store = sh.session.store().clone();
-            sh.launcher.open(&store, &windows, &roots);
+            sh.launcher.open(&windows, &roots);
             sh.overlay = Overlay::Launcher;
         }
         // Typing lands in the query the moment it opens — but key focus set
@@ -106,17 +105,8 @@ impl Stage {
     /// Asks the launcher's question again, with whatever was typed.
     pub(super) fn launcher_ask(&mut self, sh: &mut Shell, query: &str) {
         let (windows, roots) = (sh.session.windows(), sh.session.roots());
-        let store = sh.session.store().clone();
-        sh.launcher.ask(&store, &windows, &roots, query);
+        sh.launcher.ask(&windows, &roots, query);
         sh.session.redraw();
-    }
-
-    /// Takes whatever the search providers have answered with.
-    pub(super) fn collect_search(&mut self, sh: &mut Shell) {
-        let windows = sh.session.windows();
-        if sh.launcher.collect(&windows) {
-            sh.session.redraw();
-        }
     }
 
     /// Activates a hit: go to the panel wherever it lives, or open a fresh
@@ -127,6 +117,15 @@ impl Stage {
             Go::Focus(slot) => sh.session.nav(Nav::Focus(slot)),
             Go::Open(id) => self.open_root(sh, id),
         }
+    }
+
+    /// Goes to a panel: focused wherever it already is — another workspace
+    /// included — or opened beside what has focus. The launcher's verb, for
+    /// everything else that reaches a root: a chord, a menu item, the
+    /// problems mark in the corner of the chrome. Never a second copy.
+    pub(super) fn go_to(&mut self, sh: &mut Shell, id: kernel::panel::PanelId) {
+        let windows = sh.session.windows();
+        self.launcher_go(sh, kernel::launcher::locate(&windows, &id));
     }
 
     /// Opens a root: beside whatever has focus, un-joined, or as the first
@@ -263,7 +262,9 @@ impl Stage {
         self.draw_panel.alpha = p as f32;
         self.draw_panel.draw_abs(cx, r);
         // The workspaces overlay's search row: the launcher's entry on
-        // glass, above the roster.
+        // glass, above the roster. It says what the launcher searches —
+        // the panels — because searching *into* what the apps hold is the
+        // search panel's, and one word for two things is one too few.
         let sr = rect(x, top, w, 40.0);
         if kind == Overlay::Ws {
             self.draw_panel.draw_abs(cx, sr);
@@ -272,7 +273,7 @@ impl Stage {
             self.draw_mono.draw_abs(
                 cx,
                 dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
-                "search",
+                "search panels",
             );
         }
 
@@ -320,8 +321,12 @@ impl Stage {
                     .push(Hit::act("search", fr, MouseCursor::Text, Act::LauncherOpen));
             }
         } else if kind == Overlay::Ws {
-            self.hits
-                .push(Hit::act("search", sr, MouseCursor::Hand, Act::LauncherOpen));
+            self.hits.push(Hit::act(
+                "search panels",
+                sr,
+                MouseCursor::Hand,
+                Act::LauncherOpen,
+            ));
         }
     }
 

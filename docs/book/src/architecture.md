@@ -4,9 +4,10 @@ Three layers, in two crates.
 
 - The **kernel** is everything generic that does not draw: the panel model and
   navigation, the store and its cached queries, effects and the queue, undo
-  history, the filter and the rich table's state, search and the launcher list,
-  problems, springs, the e2e grammar, and the interfaces an app implements. It
-  never names Makepad, so it is what `cargo test` runs without a window.
+  history, the filter and the rich table's state, the search sources and the
+  switcher's list, problems, springs, the e2e grammar, and the interfaces an
+  app implements. It never names Makepad, so it is what `cargo test` runs
+  without a window.
 - The **shell** is everything generic that draws or takes input: the stage, the
   chrome, the bar, animation, the overlays, the shared widgets, the panels
   library, and the hosting of panel widgets. It uses Makepad and depends on the
@@ -40,8 +41,8 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `history.rs` | The undo and redo tree |
 | `richtable.rs` | Table sources, SQL building, pages, cursors, and marks |
 | `filter.rs` | Filter parsing and completion context |
-| `search.rs` | Search providers and their results |
-| `launcher.rs` | Open panels, roots, and provider results as one list |
+| `search.rs` | Search providers, and one question put to all of them |
+| `launcher.rs` | Open panels and roots as one switcher list |
 | `problems.rs` | `ProblemSource` and `Problem` |
 | `scene.rs` | The panels library's scene graph and its layout |
 | `e2e.rs` | The end-to-end script grammar and its parser |
@@ -115,8 +116,8 @@ and asks the list for everything; it never asks an app by name.
 
 An app registers panel kinds by tag, a schema ladder, a demo seed, deferred
 effect kinds, capabilities per mode, search providers, problem sources, the
-workers it wants running, and its launcher roots. Its Makepad half registers a
-template per tag, its own script block, and its panels-library scenes.
+workers it wants running, and its roots. Its Makepad half registers a template
+per tag, its own script block, and its panels-library scenes.
 
 A `PanelKind` opens instances and nothing else. A `Panel` instance owns its own
 state, answers with a title, a size wish, and a bar of verbs, and runs a verb
