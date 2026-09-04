@@ -88,6 +88,10 @@ A card wears `open` (`o`), `copy` (`p`), `move` (`m`), `rename` (`r`), `delete`
 (`d`), and `copy path` (`c`). `copy` wears `p` rather than `c` because the
 card's path line is selectable and `cmd+c` copies the text there — which is why
 `c` is exactly the letter `copy path` takes: the chord copies a path either way.
+A caret in one of the card's two selectable runs keeps the four text chords and
+nothing more, so while a path is selected `cmd+c` is the selection's and `cmd+d`
+is still *delete*. The `rename` field keeps every letter, as any field with a
+caret in it does.
 
 A directory wears `new dir` (`n`) and `go to` (`g`) always. It wears `copy`,
 `move`, `rename`, `delete`, and `copy path` when it has an object to act on:

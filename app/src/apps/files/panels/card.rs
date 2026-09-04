@@ -269,8 +269,9 @@ impl Panel for Card {
     /// `copy` wears the `p` of "copy", not the `c`: a card's path is
     /// selectable, so cmd+c copies the path — the file clipboard is not the
     /// text one. Which is why `c` is exactly the letter `copy path` wears:
-    /// the chord does the same thing whether the line has the keyboard or
-    /// the bar does.
+    /// the chord copies a path either way. Which of the two answers is the
+    /// widget's — a caret in one of its runs keeps the text chords, and the
+    /// bar has the letter the rest of the time.
     fn verbs(&self) -> Vec<Verb> {
         vec![
             Verb::run("files.open", "open", Some('o')),

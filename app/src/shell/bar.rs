@@ -42,6 +42,10 @@ pub const MAX_ROWS: usize = 3;
 /// What a bar leaves the body, however many verbs it wears — the same few
 /// points below which the drawing gives up on a body altogether.
 const MIN_BODY: f64 = 4.0;
+/// The hairline under the body, which the panel's rectangle also pays for:
+/// counted here so a wrap is measured against the room the drawing really
+/// has, and never takes the last of it.
+const BORDER: f64 = 1.0;
 
 /// Where one entry landed, and which verb it draws.
 #[derive(Debug, Clone, Copy)]
@@ -72,7 +76,7 @@ pub fn height(verbs: &[Verb], cell: &CellFont, panel: Rect) -> f64 {
         return 0.0;
     }
     let width = (panel.size.x - 2.0).max(0.0);
-    let room = panel.size.y - theme::HEAD_H - MIN_BODY;
+    let room = panel.size.y - theme::HEAD_H - MIN_BODY - BORDER;
     let max = rows_in(room).clamp(1, MAX_ROWS);
     let rows = flow(verbs, cell, width, max)
         .last()
@@ -304,6 +308,28 @@ mod tests {
             BAR_H,
             "a panel with no room for a second row keeps the one it had"
         );
+    }
+
+    /// And a wrap is never paid for out of the body: at every height where
+    /// the bar takes a second row, what is left under it is still a body
+    /// the panel draws. Below that it stands at the one row it always had,
+    /// which is the panel being too short for a bar at all — not the wrap
+    /// having eaten it.
+    #[test]
+    fn a_wrapped_bar_leaves_the_body_standing() {
+        let cell = CellFont::default();
+        let verbs = same("copy", 9);
+        let w = narrow(&cell).size.x;
+        for h in 40..500 {
+            let panel = rect(0.0, 0.0, w, f64::from(h));
+            let bar_h = height(&verbs, &cell, panel);
+            // What `draw_panel_full` gives the widget under the header.
+            let body = panel.size.y - theme::HEAD_H - bar_h - BORDER;
+            assert!(
+                bar_h <= BAR_H || body >= MIN_BODY,
+                "a {h}pt panel wrapped to a {bar_h}pt bar and left {body}pt of body"
+            );
+        }
     }
 
     /// A label no row is wide enough for ends the bar rather than being
