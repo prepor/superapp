@@ -12,7 +12,8 @@ use crate::layout::Rect;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node<S> {
     pub name: String,
-    /// The annotation under the name.
+    /// The annotation under the name, a paragraph an entry: the layout
+    /// wraps each to the node's width.
     pub note: Vec<String>,
     /// The node's viewport, points: the size the subject is shown at.
     pub size: (f64, f64),
@@ -32,7 +33,8 @@ pub struct Edge {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene<S> {
     pub name: String,
-    /// The description under the title.
+    /// The description under the title, a paragraph an entry: the layout
+    /// wraps each to the block's width.
     pub note: Vec<String>,
     /// The size a node has unless it says otherwise.
     pub size: (f64, f64),
@@ -53,10 +55,11 @@ impl<S> Scene<S> {
         }
     }
 
-    /// A line of the scene's description.
+    /// A paragraph of the scene's description. It wraps on the canvas, so
+    /// a sentence of any length is one call.
     #[must_use]
-    pub fn note(mut self, line: &str) -> Self {
-        self.note.push(line.to_string());
+    pub fn note(mut self, text: &str) -> Self {
+        self.note.push(text.to_string());
         self
     }
 
@@ -82,13 +85,13 @@ impl<S> Scene<S> {
         self
     }
 
-    /// A line of annotation on the node just added (on the scene, before
-    /// any node).
+    /// A paragraph of annotation on the node just added (on the scene,
+    /// before any node). It wraps to the node on the canvas.
     #[must_use]
-    pub fn about(mut self, line: &str) -> Self {
+    pub fn about(mut self, text: &str) -> Self {
         match self.nodes.last_mut() {
-            Some(n) => n.note.push(line.to_string()),
-            None => self.note.push(line.to_string()),
+            Some(n) => n.note.push(text.to_string()),
+            None => self.note.push(text.to_string()),
         }
         self
     }
@@ -205,6 +208,10 @@ pub const COL_GAP_MIN: f64 = 200.0;
 pub const ROW_GAP: f64 = 90.0;
 const LABEL_PAD: f64 = 80.0;
 const CAPTION_GAP: f64 = 14.0;
+/// A note wraps to what it annotates — its node, or the block's nodes for
+/// a scene's — but never narrower than this: on a small node the words
+/// would come one to a line.
+pub const NOTE_W_MIN: f64 = 320.0;
 /// Where an arrow meets a node: its vertical centre, or this far down for
 /// anything tall — through a panel's header, not its middle.
 const ARROW_Y_MAX: f64 = 28.0;
@@ -216,6 +223,9 @@ pub struct NodeBox {
     pub rect: Rect,
     /// Top-left of the caption block (name, then the note) above the mount.
     pub caption: (f64, f64),
+    /// The node's note, wrapped to the caption's width: the lines drawn
+    /// under the name.
+    pub note: Vec<String>,
 }
 
 /// An arrow: out of `from` to the right, down or up along `elbow_x`, into
@@ -236,7 +246,11 @@ pub struct Arrow {
 pub struct Block {
     pub scene: usize,
     pub title: (f64, f64),
-    pub note: (f64, f64),
+    /// Top-left of the description, under the title.
+    pub note_at: (f64, f64),
+    /// The scene's description, wrapped to the block: the lines drawn at
+    /// `note_at`.
+    pub note: Vec<String>,
     pub nodes: Vec<NodeBox>,
     pub arrows: Vec<Arrow>,
     /// Everything the block draws, for fitting it in the viewport.
@@ -291,7 +305,7 @@ fn shift(b: &mut Block, dx: f64, dy: f64) {
         p.1 += dy;
     };
     mv(&mut b.title);
-    mv(&mut b.note);
+    mv(&mut b.note_at);
     for nb in &mut b.nodes {
         nb.rect.x += dx;
         nb.rect.y += dy;
@@ -309,14 +323,12 @@ fn shift(b: &mut Block, dx: f64, dy: f64) {
 
 /// One scene's block, laid at the origin.
 fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
+    let ch = m.adv * TEXT_PT;
     let text_w = |s: &str, pt: f64| s.chars().count() as f64 * m.adv * pt;
+    let widest = |lines: &[String]| lines.iter().map(|l| text_w(l, TEXT_PT)).fold(0.0, f64::max);
     let title_h = m.line * TITLE_PT;
     let line_h = m.line * TEXT_PT;
     let n = scene.nodes.len();
-    let title = (0.0, 0.0);
-    let note = (0.0, title_h + 6.0);
-    let note_h = scene.note.len() as f64 * line_h;
-    let top = note.1 + note_h + 48.0;
     let layer = scene.layers().unwrap_or_else(|_| vec![0; n]);
     let n_layers = layer.iter().copied().max().map_or(0, |l| l + 1);
     let edges: Vec<(usize, usize, usize)> = scene
@@ -324,6 +336,13 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
         .iter()
         .enumerate()
         .filter_map(|(ei, e)| Some((ei, scene.index(&e.from)?, scene.index(&e.to)?)))
+        .collect();
+    // A node's note wraps to the node, so its caption stays over its own
+    // mount rather than running on into the next column's.
+    let mut notes: Vec<Vec<String>> = scene
+        .nodes
+        .iter()
+        .map(|nd| wrap(&nd.note, nd.size.0.max(NOTE_W_MIN), ch))
         .collect();
 
     // Columns, and each node's row in its column: a node goes beside
@@ -348,27 +367,8 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
         *col = members;
     }
 
-    // Row bands across the block: a row's caption block is as tall as
-    // the longest note in it, so a chain sits on one line.
-    let n_rows = cols.iter().map(Vec::len).max().unwrap_or(0);
-    let mut band_top = vec![0.0; n_rows];
-    let mut node_top = vec![0.0; n_rows];
-    let mut by = top;
-    for r in 0..n_rows {
-        let in_row = (0..n).filter(|&i| row[i] == r);
-        let (mut notes, mut h) = (0usize, 0.0f64);
-        for i in in_row {
-            notes = notes.max(scene.nodes[i].note.len());
-            h = h.max(scene.nodes[i].size.1);
-        }
-        let caption_h = line_h * (1.0 + notes as f64);
-        band_top[r] = by;
-        node_top[r] = by + caption_h + CAPTION_GAP;
-        by = node_top[r] + h + ROW_GAP;
-    }
-
-    // Column x: each as wide as its widest node, the gap after it as
-    // wide as the widest label leaving it.
+    // Column x: each as wide as its widest node or caption, the gap after
+    // it as wide as the widest label leaving it.
     let mut col_x = vec![0.0; n_layers];
     let mut col_w = vec![0.0; n_layers];
     let mut gap = vec![COL_GAP_MIN; n_layers];
@@ -377,15 +377,50 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
         col_x[l] = x;
         col_w[l] = cols[l]
             .iter()
-            .map(|&i| scene.nodes[i].size.0)
+            .map(|&i| {
+                let nd = &scene.nodes[i];
+                nd.size
+                    .0
+                    .max(text_w(&nd.name, TEXT_PT))
+                    .max(widest(&notes[i]))
+            })
             .fold(0.0, f64::max);
-        let widest = edges
+        let label_w = edges
             .iter()
             .filter(|&&(_, a, _)| layer[a] == l)
             .map(|&(ei, _, _)| text_w(&scene.edges[ei].label, TEXT_PT))
             .fold(0.0, f64::max);
-        gap[l] = COL_GAP_MIN.max(widest + LABEL_PAD);
+        gap[l] = COL_GAP_MIN.max(label_w + LABEL_PAD);
         x += col_w[l] + gap[l];
+    }
+    // What the nodes and their captions span: the description wraps to it.
+    let content_w = (0..n_layers)
+        .map(|l| col_x[l] + col_w[l])
+        .fold(0.0, f64::max);
+
+    let title = (0.0, 0.0);
+    let note_at = (0.0, title_h + 6.0);
+    let note = wrap(&scene.note, content_w.max(NOTE_W_MIN), ch);
+    let note_h = note.len() as f64 * line_h;
+    let top = note_at.1 + note_h + 48.0;
+
+    // Row bands across the block: a row's caption block is as tall as
+    // the longest note in it, so a chain sits on one line.
+    let n_rows = cols.iter().map(Vec::len).max().unwrap_or(0);
+    let mut band_top = vec![0.0; n_rows];
+    let mut node_top = vec![0.0; n_rows];
+    let mut by = top;
+    for r in 0..n_rows {
+        let in_row = (0..n).filter(|&i| row[i] == r);
+        let (mut lines, mut h) = (0usize, 0.0f64);
+        for i in in_row {
+            lines = lines.max(notes[i].len());
+            h = h.max(scene.nodes[i].size.1);
+        }
+        let caption_h = line_h * (1.0 + lines as f64);
+        band_top[r] = by;
+        node_top[r] = by + caption_h + CAPTION_GAP;
+        by = node_top[r] + h + ROW_GAP;
     }
 
     let mut nodes = Vec::new();
@@ -402,6 +437,7 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
                 h,
             },
             caption: (col_x[l], band_top[r]),
+            note: std::mem::take(&mut notes[i]),
         });
     }
     let arrow_y = |i: usize| {
@@ -433,22 +469,16 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
         });
     }
 
-    let title_w = scene
-        .note
-        .iter()
-        .map(|l| text_w(l, TEXT_PT))
-        .fold(text_w(&scene.name, TITLE_PT), f64::max);
-    let right = nodes
-        .iter()
-        .map(|nb| nb.rect.x + nb.rect.w)
-        .fold(title_w, f64::max);
+    let title_w = text_w(&scene.name, TITLE_PT).max(widest(&note));
+    let right = content_w.max(title_w);
     let bottom = nodes
         .iter()
         .map(|nb| nb.rect.y + nb.rect.h)
-        .fold(note.1 + note_h, f64::max);
+        .fold(note_at.1 + note_h, f64::max);
     Block {
         scene: si,
         title,
+        note_at,
         note,
         nodes,
         arrows,
@@ -459,6 +489,32 @@ fn block<S>(scene: &Scene<S>, si: usize, m: &Metrics) -> Block {
             h: bottom,
         },
     }
+}
+
+/// Word-wraps each paragraph to `width` points, at `ch` points a
+/// character: words stay whole, one longer than the line stands alone, a
+/// paragraph never runs on into the next, and an empty one is a blank line.
+fn wrap(paragraphs: &[String], width: f64, ch: f64) -> Vec<String> {
+    let cols = ((width / ch).floor() as usize).max(1);
+    let mut out = Vec::new();
+    for p in paragraphs {
+        let (mut line, mut len) = (String::new(), 0usize);
+        for word in p.split_whitespace() {
+            let wl = word.chars().count();
+            if len > 0 && len + 1 + wl > cols {
+                out.push(std::mem::take(&mut line));
+                len = 0;
+            }
+            if len > 0 {
+                line.push(' ');
+                len += 1;
+            }
+            line.push_str(word);
+            len += wl;
+        }
+        out.push(line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -632,5 +688,85 @@ mod tests {
         assert_eq!(b1.arrows[0].from.1, p.rect.y + 28.0);
         assert!(c.w >= b1.bounds.x + b1.bounds.w + MARGIN);
         assert!(c.h >= b2.bounds.y + b2.bounds.h + MARGIN);
+    }
+
+    #[test]
+    fn wrap_keeps_words_whole_and_paragraphs_apart() {
+        let paras: Vec<String> = ["aa bb cc dd", "", "eeeeeeeeee ff", "  gg  "]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            wrap(&paras, 5.0, 1.0),
+            ["aa bb", "cc dd", "", "eeeeeeeeee", "ff", "gg"]
+        );
+        // Room enough leaves a paragraph as it was written.
+        assert_eq!(wrap(&paras[..1], 100.0, 1.0), ["aa bb cc dd"]);
+    }
+
+    #[test]
+    fn a_long_note_wraps_to_its_node_and_the_band_makes_room() {
+        let long = "a sentence long enough to wrap: the author writes one call per \
+                    thought, and the canvas breaks it into lines over the node it \
+                    annotates rather than running it into the next";
+        let s: Scene<()> = Scene::new("s", (520.0, 56.0))
+            .node("a", ())
+            .about(long)
+            .node("b", ())
+            .edge("a", "b", "x");
+        let c = layout(&[s], &m());
+        let b = &c.blocks[0];
+        let (a, nb) = (&b.nodes[0], &b.nodes[1]);
+        // 520 points at 9.6 a character: 54 to a line.
+        assert!(a.note.len() >= 3);
+        assert!(a.note.iter().all(|l| l.chars().count() <= 54));
+        assert_eq!(a.note.join(" "), long);
+        // The band under the name holds every line before the mount starts.
+        let line_h = 1.2 * TEXT_PT;
+        assert!(a.rect.y - a.caption.1 >= line_h * (1.0 + a.note.len() as f64) + CAPTION_GAP);
+        // The chain still sits level, and the column is no wider for it.
+        assert_eq!(nb.rect.y, a.rect.y);
+        assert_eq!(nb.rect.x, a.rect.x + a.rect.w + COL_GAP_MIN);
+        assert!(nb.note.is_empty());
+    }
+
+    #[test]
+    fn a_narrow_node_keeps_a_readable_measure_and_widens_its_column() {
+        let long = "the words would come one to a line on a node this narrow, so the \
+                    note wraps at the floor instead";
+        let s: Scene<()> = Scene::new("s", (100.0, 20.0))
+            .node("a", ())
+            .about(long)
+            .node("b", ())
+            .edge("a", "b", "");
+        let c = layout(&[s], &m());
+        let b = &c.blocks[0];
+        let (a, nb) = (&b.nodes[0], &b.nodes[1]);
+        // 320 points at 9.6 a character: 33 to a line, past the node's 10.
+        let longest = a.note.iter().map(|l| l.chars().count()).max().unwrap();
+        assert!(longest > 10 && longest <= 33);
+        // The column is as wide as the caption, so the next starts past it.
+        let note_w = longest as f64 * 9.6;
+        assert!(nb.rect.x >= a.rect.x + note_w + COL_GAP_MIN);
+        assert!(b.bounds.w >= note_w);
+    }
+
+    #[test]
+    fn the_description_wraps_to_the_block() {
+        let long = "One question, put to every app's own source at once. The words in \
+                    the field are the question; the tags narrow the answer to one \
+                    source, and the rows are a rich table like any other.";
+        let s: Scene<()> = Scene::new("s", (560.0, 100.0)).note(long).node("a", ());
+        let c = layout(&[s], &m());
+        let b = &c.blocks[0];
+        // 560 points at 9.6 a character: 58 to a line.
+        assert!(b.note.len() >= 3);
+        assert!(b.note.iter().all(|l| l.chars().count() <= 58));
+        assert_eq!(b.note.join(" "), long);
+        // The nodes start under the last line, and the block is no wider
+        // for the description.
+        let line_h = 1.2 * TEXT_PT;
+        assert!(b.nodes[0].caption.1 >= b.note_at.1 + line_h * b.note.len() as f64);
+        assert_eq!(b.bounds.w, 560.0);
     }
 }

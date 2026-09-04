@@ -268,6 +268,9 @@ Scenes are built from real Rust types and the widgets' own APIs, so a change
 that would break a scene breaks the build. A scene's script is parsed at boot
 and a typo in one stops the process. The graph rules (no duplicate node names,
 every edge naming a real node, no cycles) are the kernel's and have unit tests.
+A scene's `note` and a node's `about` are paragraphs, not lines: the layout
+wraps each to the width of what it annotates, so a long sentence stays over
+its own node instead of running into the next.
 
 Its own suites are `e2e/shell-library.txt` and `e2e/shell-library-toggle.txt`.
 

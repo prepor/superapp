@@ -428,8 +428,8 @@ impl Library {
                 },
                 act: HitAct::Scene(block.scene),
             });
-            let mut y = self.to_screen(dvec2(block.note.0, block.note.1)).y;
-            for l in &sc.note {
+            let mut y = self.to_screen(dvec2(block.note_at.0, block.note_at.1)).y;
+            for l in &block.note {
                 self.text(cx, dvec2(title_at.x, y), TEXT_PT, theme::TEXT2, l);
                 y += line * zoom;
             }
@@ -498,7 +498,7 @@ impl Library {
                     &shown,
                 );
                 let mut ny = cap_canvas.y + line * zoom;
-                for l in &node.note {
+                for l in &nb.note {
                     self.text(cx, dvec2(cap.x, ny), TEXT_PT, theme::TEXT2, l);
                     ny += line * zoom;
                 }
