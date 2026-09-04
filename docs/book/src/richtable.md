@@ -129,6 +129,19 @@ list: the arrows and their preview, `enter`, `/`, `space`, `shift`+arrows,
 `esc`, and `tab`. While the caret is in the filter it tells the shell that it
 keeps every letter, so no bar draws a bold letter that would not fire.
 
+A walk keeps its cursor in sight. The row the arrow lands on is brought whole
+into the panel by the overlap alone — a step scrolls by a row, never by a page
+— and it is the rectangles of the last draw that say so, because a portal list
+draws the row that straddles either edge as readily as the ones in plain
+sight. A cursor that is nowhere on screen, the walk taken up again after the
+list was scrolled away from it, is a jump rather than a step: the viewport
+animates to it and lands it at the top.
+
+Where the viewport stands is about the rows it was left on. A new filter is a
+new list and answers at the top; rows that go out from under an unchanged one
+— a batch verb files forty at once — leave it pinned to the last row. Neither
+may leave it standing past the end, where the panel would draw nothing at all.
+
 What a panel supplies is four short functions: the row template, how to fill a
 row, what a script calls it, and what it opens. Two more have defaults: what
 the field is seeded with once, the line an empty list shows, and the two verbs

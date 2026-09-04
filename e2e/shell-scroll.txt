@@ -1,0 +1,76 @@
+# args:
+# env:
+#
+# The walk and the viewport, on a list longer than its panel.
+#
+# Boot is the inbox — sixty-nine rows of demo mail, and the only list on
+# screen, so a row is addressed by its subject. Assertions are the clicks: a
+# label that does not resolve fails the run, and a row scrolled out of the
+# panel has no rectangle to resolve against.
+
+wait 900
+
+# Down hands the keyboard from the field to the rows and lands on the top
+# one; nineteen more walk the cursor past the foot of the panel, which
+# scrolls to keep it.
+key down
+wait 300
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+key down
+wait 120
+wait 400
+shot d1-walked
+
+# It scrolled by the row it landed on, not by the page: the cursor rests at
+# the foot with the rows it walked through still above it, `archive digest
+# #49` five of them back. A page-jump would have put the cursor at the top
+# of the viewport instead, and all five behind it.
+click "archive digest #49"
+wait 500
+
+# A new filter is a new list, and it answers at the top — wherever the walk
+# left the viewport standing. Left where the old rows put it, it stands past
+# the end of a shorter answer and the panel draws nothing at all.
+key /
+wait 300
+type "hike"
+wait 700
+shot d2-filtered
+click "Sat hike"
+wait 600
+quit
