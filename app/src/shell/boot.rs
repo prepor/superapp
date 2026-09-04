@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
-use kernel::caps::{Clipboard, ClockSource, Disk, MemSecrets, Screen, SecretsFactory, Watcher};
+use kernel::caps::{
+    Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, SecretsFactory, Watcher,
+};
 use kernel::e2e;
 use kernel::layout::Grid;
 use kernel::repl::r2;
@@ -100,6 +102,42 @@ Replaying a script:
   --front             let the run take the screen
   --draws N           stop after N frames (a headless build only)
 ";
+
+/// Which disk every world of this run is built with.
+///
+/// It goes on the env for the same reason the keychain does: a files run
+/// works on its own thread with a world of its own, and the disk it writes
+/// must be the disk the panel is listing — one implementation, one set of
+/// refusals, one trash. Two `RealDisk`s are two doors onto the one
+/// filesystem, so each world builds its own; the demo tree *is* its own
+/// state, so every world of this run shares the one.
+///
+/// [`Mode::Real`] gates it exactly as it gates the keychain, and for the
+/// same reason: a library mount is somebody's scene catalogue, and a scene
+/// may no more reach a human's files than their passwords. `None` leaves
+/// every world of a mount the kernel's own demo tree, which is what it had
+/// before the disk was an env at all.
+///
+/// A script against a real disk may read it and not write to it: a suite
+/// must no more delete a human's files than write to their keychain, and
+/// the refusal lands on the panel's line where a forgotten `--demo-disk` is
+/// a failing step.
+fn disk_for(mode: Mode, scripted: bool, demo: bool, clock: &ClockSource) -> Option<DiskFactory> {
+    if mode != Mode::Real {
+        return None;
+    }
+    Some(if demo {
+        DiskFactory::shared(DemoDisk::new(clock.clone()))
+    } else {
+        DiskFactory::new(move || {
+            Box::new(if scripted {
+                RealDisk::read_only()
+            } else {
+                RealDisk::new()
+            })
+        })
+    })
+}
 
 /// The configuration this process was started with.
 pub fn config() -> &'static Config {
@@ -315,13 +353,14 @@ impl Boot {
             let dir = db_dir.clone();
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
+        let disk = disk_for(self.mode, scripted, c.demo_disk, &clock);
         let env = Env {
             db_dir: db_dir.clone(),
             scripted,
             secrets: MemSecrets::new(),
             secrets_backend: keychain,
             clock: clock.clone(),
-            demo_disk: c.demo_disk,
+            disk,
             // Filled in by the mount that runs the passes: only a threaded
             // one has channels to wake anybody through.
             kicks: Kicks::default(),
@@ -374,29 +413,19 @@ impl Boot {
             if !scripted {
                 caps.insert::<dyn Clipboard>(Box::new(RealClipboard));
             }
-            // The disk is the machine's own unless the run asked for the
-            // demo tree. A script against a real disk may read it and not
-            // write to it: a suite must no more delete a human's files than
-            // write to their keychain, and the refusal lands on the panel's
-            // line where a forgotten `--demo-disk` is a failing step.
-            if !c.demo_disk {
-                caps.insert::<dyn Disk>(Box::new(if scripted {
-                    RealDisk::read_only()
-                } else {
-                    RealDisk::new()
-                }));
-                // And watched, on a run that is nobody's but this
-                // person's: a panel then refreshes after another
-                // program's write as it does after one of ours. Never
-                // under a script — a suite's frames may not depend on
-                // what the machine it runs on happens to be doing — and
-                // never over the demo tree, which nothing outside this
-                // process can write to anyway.
-                if !scripted {
-                    caps.insert::<dyn Watcher>(Box::new(RealWatcher::start(|| {
-                        SignalToUI::set_ui_signal();
-                    })));
-                }
+            // The disk came with the env, so that every world of this run
+            // is handed the same one; the watch is this world's alone.
+            //
+            // Watched on a run that is nobody's but this person's: a panel
+            // then refreshes after another program's write as it does after
+            // one of ours. Never under a script — a suite's frames may not
+            // depend on what the machine it runs on happens to be doing —
+            // and never over the demo tree, which nothing outside this
+            // process can write to anyway.
+            if !c.demo_disk && !scripted {
+                caps.insert::<dyn Watcher>(Box::new(RealWatcher::start(|| {
+                    SignalToUI::set_ui_signal();
+                })));
             }
         });
         let workers = if self.virtual_time {
@@ -704,6 +733,33 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library mount reads the kernel's demo tree and never this
+    /// machine's disk — the same rule the keychain follows, and for the
+    /// same reason: a scene catalogue is somebody's window, and a scene may
+    /// no more reach a human's files than their passwords.
+    ///
+    /// A window's own run *does* carry a disk to every world it builds,
+    /// because that is what lets a copy performed off the UI thread write
+    /// the disk the panel is listing.
+    #[test]
+    fn a_mount_gets_the_demo_tree_and_a_window_gets_the_run_s_own_disk() {
+        let clock = ClockSource::default();
+        for mount in [Mode::Fake, Mode::Deny] {
+            assert!(
+                disk_for(mount, false, false, &clock).is_none(),
+                "a {mount:?} mount is given no disk of the shell's"
+            );
+        }
+        assert!(disk_for(Mode::Real, false, false, &clock).is_some());
+
+        // And the demo tree a window asked for is *one* tree, so a run on
+        // another thread writes what the panel lists.
+        let demo = disk_for(Mode::Real, true, true, &clock).expect("the demo disk");
+        let made = kernel::caps::real_path("~/from-a-run");
+        demo.make().make_dir(&made).expect("the run made it");
+        assert!(demo.make().stat(&made).expect("the tree").is_some());
+    }
 
     /// The store a previous design left behind: the kernel refuses it, boot
     /// reads its schema back out of the refusal, and what the person gets is

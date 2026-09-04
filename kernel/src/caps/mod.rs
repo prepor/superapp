@@ -617,6 +617,100 @@ pub trait Disk {
     fn file_id(&mut self, path: &Path) -> Result<Option<FileId>, String>;
 }
 
+/// How one world gets a disk.
+///
+/// The same shape as [`SecretsFactory`], for the same reason: a background
+/// runner works on its own thread with a world of its own, so the disk
+/// cannot be handed over as a value — each world asks for one. This is what
+/// the shell installs the machine's own filesystem through, and it is what
+/// makes a run's disk *the panel's disk*: one implementation, one set of
+/// refusals, one trash.
+#[derive(Clone)]
+pub struct DiskFactory(Arc<dyn Fn() -> Box<dyn Disk> + Send + Sync>);
+
+impl DiskFactory {
+    #[must_use]
+    pub fn new(f: impl Fn() -> Box<dyn Disk> + Send + Sync + 'static) -> DiskFactory {
+        DiskFactory(Arc::new(f))
+    }
+
+    /// One disk, handed to every world that asks — for a backend that *is*
+    /// its state rather than a door onto the machine's.
+    ///
+    /// The [`DemoDisk`] is the only such backend: it holds its own tree, so
+    /// a second copy of it is a second world with different files in it, and
+    /// a run performed on another thread would write a tree nobody is
+    /// looking at. The real filesystem needs none of this — two `RealDisk`s
+    /// are two doors onto the one disk.
+    #[must_use]
+    pub fn shared(disk: impl Disk + Send + 'static) -> DiskFactory {
+        let one: Arc<Mutex<Box<dyn Disk + Send>>> = Arc::new(Mutex::new(Box::new(disk)));
+        DiskFactory::new(move || Box::new(SharedDisk(one.clone())))
+    }
+
+    /// One disk for one world.
+    #[must_use]
+    pub fn make(&self) -> Box<dyn Disk> {
+        (self.0)()
+    }
+}
+
+/// One disk behind a lock, as [`DiskFactory::shared`] hands it out. Every
+/// verb is one call, so the lock is never held across two of them.
+struct SharedDisk(Arc<Mutex<Box<dyn Disk + Send>>>);
+
+impl SharedDisk {
+    /// The one behind the lock. A poisoned lock is still the disk: the
+    /// panic that poisoned it was in a verb, and the tree it left behind is
+    /// the tree there is.
+    fn with<T>(&mut self, f: impl FnOnce(&mut dyn Disk) -> Result<T, String>) -> Result<T, String> {
+        let mut g = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut **g)
+    }
+}
+
+impl Disk for SharedDisk {
+    fn list_dir(&mut self, dir: &Path) -> Result<Vec<Entry>, String> {
+        self.with(|d| d.list_dir(dir))
+    }
+    fn stat(&mut self, path: &Path) -> Result<Option<Entry>, String> {
+        self.with(|d| d.stat(path))
+    }
+    fn read_file(&mut self, path: &Path, max: usize) -> Result<Vec<u8>, String> {
+        self.with(|d| d.read_file(path, max))
+    }
+    fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        self.with(|d| d.write_file(path, bytes))
+    }
+    fn open_path(&mut self, path: &Path) -> Result<(), String> {
+        self.with(|d| d.open_path(path))
+    }
+    fn make_dir(&mut self, path: &Path) -> Result<(), String> {
+        self.with(|d| d.make_dir(path))
+    }
+    fn copy_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        self.with(|d| d.copy_path(from, to))
+    }
+    fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        self.with(|d| d.move_path(from, to))
+    }
+    fn trash(&mut self, path: &Path) -> Result<PathBuf, String> {
+        self.with(|d| d.trash(path))
+    }
+    fn file_id(&mut self, path: &Path) -> Result<Option<FileId>, String> {
+        self.with(|d| d.file_id(path))
+    }
+}
+
+impl std::fmt::Debug for DiskFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiskFactory")
+    }
+}
+
 /// The demo tree as a disk: what a world gets until the shell hands it the
 /// machine's own.
 ///
@@ -848,9 +942,9 @@ impl Watcher for Watched {
 ///
 /// A [`Mode::Deny`] world gets the clock and nothing else: an effect that
 /// asks for anything more fails with *this world has no …*, which is what a
-/// library mount wants. The disk installed here is the demo tree in every
-/// mode, so a world the shell gave no real one cannot reach a human's
-/// files.
+/// library mount wants. The disk installed here is the one the env carries,
+/// and the demo tree where it carries none — so a world the shell gave no
+/// real one cannot reach a human's files.
 pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Clock>(env.clock.capability());
     if mode == Mode::Deny {
@@ -865,7 +959,13 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Kicker>(Box::new(env.kicks.clone()));
     caps.insert::<dyn Clipboard>(Box::new(FakeClipboard::new()));
     caps.insert::<dyn Screen>(Box::new(FakeScreen::new()));
-    caps.insert::<dyn Disk>(Box::new(DemoDisk::new(env.clock.clone())));
+    // The machine's own filesystem when the shell installed one, so a
+    // background runner writes the disk the panel is listing; the demo tree
+    // otherwise.
+    caps.insert::<dyn Disk>(match &env.disk {
+        Some(f) => f.make(),
+        None => Box::new(DemoDisk::new(env.clock.clone())),
+    });
     caps.insert::<dyn Watcher>(Box::new(Watched::new()));
 }
 
@@ -1265,6 +1365,131 @@ mod tests {
         assert_eq!(FileKind::Image.tag(), "image");
         assert!(demo::exists("~/notes.md") && demo::is_dir("~/Downloads"));
         assert!(!demo::exists("~/nothing"));
+    }
+
+    /// The disk the shell installs reaches *every* world built from the
+    /// env, not only the window's — which is what lets a run performed on
+    /// another thread write the very disk the panel is listing, through the
+    /// one implementation with the one set of refusals.
+    #[test]
+    fn every_world_of_a_run_gets_the_disk_the_shell_installed() {
+        /// A disk that answers nothing, so the world holding it is
+        /// unmistakable. Only [`Disk::stat`] is ever reached here.
+        struct Marked;
+        impl Disk for Marked {
+            fn list_dir(&mut self, _d: &Path) -> Result<Vec<Entry>, String> {
+                Ok(Vec::new())
+            }
+            fn stat(&mut self, _p: &Path) -> Result<Option<Entry>, String> {
+                Err("the shell's disk".into())
+            }
+            fn read_file(&mut self, _p: &Path, _m: usize) -> Result<Vec<u8>, String> {
+                Ok(Vec::new())
+            }
+            fn write_file(&mut self, _p: &Path, _b: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+            fn open_path(&mut self, _p: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn make_dir(&mut self, _p: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn copy_path(&mut self, _f: &Path, _t: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn move_path(&mut self, _f: &Path, _t: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn trash(&mut self, _p: &Path) -> Result<PathBuf, String> {
+                Ok(PathBuf::new())
+            }
+            fn file_id(&mut self, _p: &Path) -> Result<Option<FileId>, String> {
+                Ok(None)
+            }
+        }
+
+        let made: Arc<Mutex<usize>> = Arc::default();
+        let env = Env {
+            disk: Some(DiskFactory::new({
+                let made = made.clone();
+                move || {
+                    *made.lock().expect("the count") += 1;
+                    Box::new(Marked)
+                }
+            })),
+            ..Env::default()
+        };
+        // Two worlds, as the window and a runner's thread each build one.
+        for _ in 0..2 {
+            let mut caps = Capabilities::default();
+            install(Mode::Real, &env, &mut caps);
+            let said = caps
+                .get::<dyn Disk>()
+                .expect("a disk")
+                .stat(Path::new("/anywhere"))
+                .unwrap_err();
+            assert_eq!(said, "the shell's disk");
+        }
+        assert_eq!(
+            *made.lock().expect("the count"),
+            2,
+            "one each, from the one factory"
+        );
+
+        // And a world the shell gave none cannot reach a human's files.
+        let mut caps = Capabilities::default();
+        install(Mode::Real, &Env::default(), &mut caps);
+        assert!(caps
+            .get::<dyn Disk>()
+            .expect("a disk")
+            .stat(&real_path("~/notes.md"))
+            .expect("the demo tree")
+            .is_some());
+    }
+
+    /// The demo tree *is* its own state, so a run performed on another
+    /// thread must be given the very one the panel is listing — otherwise
+    /// it writes a second tree nobody can see.
+    #[test]
+    fn a_shared_disk_is_one_tree_for_every_world_of_a_run() {
+        let env = Env {
+            disk: Some(DiskFactory::shared(DemoDisk::new(ClockSource::default()))),
+            ..Env::default()
+        };
+        // Two worlds: the window's, and the one a runner's thread builds.
+        let mut window = Capabilities::default();
+        install(Mode::Real, &env, &mut window);
+        let mut runner = Capabilities::default();
+        install(Mode::Real, &env, &mut runner);
+
+        runner
+            .get::<dyn Disk>()
+            .expect("a disk")
+            .make_dir(&real_path("~/fresh"))
+            .expect("the run made it");
+        assert!(
+            window
+                .get::<dyn Disk>()
+                .expect("a disk")
+                .stat(&real_path("~/fresh"))
+                .expect("the tree")
+                .is_some(),
+            "what the run wrote is what the panel lists"
+        );
+
+        // A world the env gave no disk keeps a tree of its own, which is
+        // what lets any number of tests write one at once.
+        let mut alone = Capabilities::default();
+        install(Mode::Real, &Env::default(), &mut alone);
+        assert_eq!(
+            alone
+                .get::<dyn Disk>()
+                .expect("a disk")
+                .stat(&real_path("~/fresh"))
+                .expect("the tree"),
+            None
+        );
     }
 
     /// A denied world answers the clock and refuses the rest, in words.

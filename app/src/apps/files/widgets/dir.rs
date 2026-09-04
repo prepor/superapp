@@ -110,6 +110,8 @@ struct Fields {
     naming: Option<String>,
     renaming: Option<String>,
     pathing: Option<String>,
+    /// The line under the header: [`Dir::note`] — a run in progress, or
+    /// what the last verb refused.
     status: Option<String>,
 }
 
@@ -264,6 +266,11 @@ impl Widget for DirPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        // What the line under the header says and which run it is about,
+        // both read here and nowhere else: *cancel* is a button about the
+        // run whose line was on screen when it was pressed, and this is the
+        // moment that decides it.
+        drew(&props);
         let Some(f) = observe(&props, scope) else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -284,7 +291,8 @@ impl Widget for DirPanel {
                 || self.rename_field.live(cx, &rename),
         );
         self.crumbs(cx, &props, &f);
-        // The status line: what the last verb refused, until the next one.
+        // The status line: what a run is doing, or what the last verb
+        // refused until the next one.
         let lbl = self.view.label(cx, STATUS);
         lbl.set_text(cx, f.status.as_deref().unwrap_or(""));
         lbl.set_visible(cx, f.status.is_some());
@@ -522,8 +530,16 @@ fn observe(props: &PanelProps, scope: &mut Scope) -> Option<Fields> {
         naming: d.naming().map(str::to_string),
         renaming: d.renaming().map(str::to_string),
         pathing: d.pathing().map(str::to_string),
-        status: d.status().map(str::to_string),
+        status: d.note(),
     })
+}
+
+/// Remembers which run the line under the header is about, at the moment
+/// it is drawn. Called from the draw pass alone — an event that refreshed
+/// it would put the answer back to *now*, which is the very thing a stale
+/// *cancel* must not be able to do.
+fn drew(props: &PanelProps) {
+    edit(props, super::super::panels::Dir::drawn);
 }
 
 /// What the three fields keep from the bars while one of them has the

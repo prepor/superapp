@@ -2,9 +2,10 @@
 
 The files app browses this machine's disk: a directory is a list, a file is a
 card, five verbs write, and one copies a name. It stores nothing, because the
-disk is the state, so it has no schema, no seed, no queued jobs, and no workers.
-What it adds is two panel kinds, one launcher root, and a clipboard other apps
-may read.
+disk is the state, so it has no schema, no seed and no queued jobs. What it
+adds is two panel kinds, one launcher root, a clipboard other apps may read,
+and one worker: the pass that performs the five verbs that write, off the
+thread that draws — see [Runs](#runs).
 
 It reaches the disk through the kernel's `Disk` [capability](./apps.md#capabilities),
 in the display spelling the panels use, and the kernel translates `~` to a real
@@ -140,12 +141,13 @@ system clipboard and not the app's own — a `copy path` never fills a
 
 ## Writing to the disk
 
-Each writing verb is an [effect](./data-substrate.md#effects), performed where
-the click is rather than queued: the wait for a copy is the wait for the
-listing that follows it.
+Each writing verb is an [effect](./data-substrate.md#effects). None of them is
+performed on the thread that draws: `new dir`, `copy here`, `move here` and
+`delete` hand their paths to a **run**, and a background pass performs them one
+at a time. See [Runs](#runs) below for what that costs and what it buys.
 
-`copy here` and `move here` plan against the disk as it is at that moment, then
-perform one path at a time. A path is refused, by name, when:
+`copy here` and `move here` plan against the disk as it is when the run starts,
+then perform one path at a time. A path is refused, by name, when:
 
 - it is a root;
 - it is no longer there, because the source may have gone while the clipboard
@@ -211,6 +213,101 @@ disk would take the write even where the store will not. If the lease turned
 over in between, the write is reversed and the panel says so. See
 [Device Sync](./device-sync.md#the-lease).
 
+## Runs
+
+A directory of forty thousand files is a copy that takes minutes. Performed on
+the frame of the click it would be minutes with nothing drawn, nothing
+scrolled, and no way to press the one button a person wants — so the five verbs
+that write queue a run instead, and a background pass performs it a path at a
+time. `new dir` and `rename` are one syscall each and hardly a freeze, but they
+go the same way: a path on a volume that has gone to sleep is exactly as slow
+as a tree, and there is no second way to write a disk in this app.
+
+A verb still asks everything it can answer before it queues — a name that is a
+path, a root, a destination that is taken, the write lease — because a person
+is waiting on that answer. What goes to the run is the write.
+
+Four things hold, and they are what the design is for:
+
+- **The same disk.** A run performs the same effects the panel did, through the
+  same `Disk` capability. The shell installs the machine's filesystem on the
+  *environment* rather than on the window's world, so every world built from it
+  — the window's and the runner's thread alike — is handed the same
+  implementation, with the same refusals, the same exclusive claim on a
+  destination, and the same trash. There is no second copier to drift from the
+  first.
+- **It says where it is.** While a run is on, every files panel draws
+  *copying 12 of 340 — "report.pdf"* under its header, in place of the line a
+  refusal leaves. The line is the app's, not the panel's: it is one disk, and a
+  run started in one panel writes into directories others are showing.
+- **It can be stopped.** *cancel* is the first verb on every files bar while a
+  run is on, and stops it from wherever anybody is looking. It carries no
+  letter: it is the only verb here that undoes nothing, and no chord should be a
+  keystroke away from stopping a copy — which is also why it goes first, since a
+  bar wraps only so far and a verb past the last row is not drawn at all. The path in hand is finished — a half-copied file is nobody's — the runs
+  waiting behind it are dropped, and the toast says how far it got and what that
+  cost — even a run that managed nothing of its own still answers for what it
+  took with it. A stop that finds nothing started yet drops what was queued and
+  says so itself: work is never dropped in silence. And *cancel* is about the
+  run whose line was on screen when it was pressed: the line and the run it is
+  about are one sample, taken as the panel **draws**, so a run that finished in
+  the intervening frame is not its successor's to answer for. A *cancel* drawn
+  when nothing had started yet is about the queue instead — what is still
+  waiting never starts, and one that came out of that queue since is stopped
+  where it is.
+- **Undo is unchanged.** The run records nothing. It collects what it performed
+  and hands it back; the history node, its intents, the lease check, the marks a
+  delete consumed, the panel a delete closes and the toast are all the UI
+  thread's, one frame later. A run that was stopped halfway lands what it
+  managed, because a change with no node behind it is a change nobody can undo.
+
+A run carries the panel that asked for it — the slot *and* what stood in it —
+because a slot is a place and not a panel: a crumb and `go to` both replace
+what a slot shows, in place, without closing anything. A run that lands after
+that writes no line on the stranger standing there, takes none of its marks,
+and above all does not close it. The same holds for everything else it may
+have outlived: a move lets go of the clipboard it *carried*, and a set held
+since stands; `new dir` closes its field on the name it made and on no other,
+so a name typed while the run was out survives; and the marks a delete
+consumed are worked out from what *went*, not from what is still marked when
+it lands, since the rows disappear one at a time and each draw takes their
+marks with them. Where the lease turns over and the trash is given back, the
+marks go back on with the rows: the node that would have carried them is never
+recorded, so nothing else would.
+
+Every session performs its own runs, one at a time — the window's and each
+mount's are separate hands, not one between them, or the session whose entry
+was lost would read as idle and have its worker retired mid-run. The worker
+exists exactly while its session has something to perform: an action retires
+it as it retires any pass, and a run that ends with no action to record — one
+refused outright, one given back to the lease, one cancelled before it started
+— kicks the workers itself rather than leaving a thread on a store reader.
+
+Panels keep up with a run through the same write count as ever, so a listing
+fills as the copy lands in it. A card, though, asks whether the file it is on
+actually moved before it reads again: every path a run performs bumps that
+count, and a card that re-read on each of them would hand its widget the same
+picture to decode once a frame for the length of the run.
+
+Runs are performed one at a time in the order they were asked for, and each is
+planned when it reaches the front — the disk may have moved on while it waited,
+and nothing watches a disk. Every run is stamped with the session that asked
+for it, by the address of the one database that session and its workers share:
+a process may be running several sessions — the window's, and one per mounted
+scene in the [panels library](./panel-model.md) — and a run performed by
+another session's pass would write another session's disk, while a node
+recorded there would be a node in the wrong history, on a slot number that
+means nothing. A run is *not* a queued
+[job](./data-substrate.md#effects): the store's queue is for work that is
+retried and outlives the process, and a copy is neither. Nobody may replay a
+trash on the next boot; if the process goes away mid-run, what it had already
+written stands, exactly as a force-quit mid-copy always did.
+
+Where the background passes run inline — under virtual time, which is every
+scripted run, and in every test — one pass is the whole run, so a scripted
+`wait` is followed by the run's consequences in the same tick, as everything
+else inline is.
+
 ## Undo
 
 Copy, move, rename, new directory, and delete are each one undoable action,
@@ -235,10 +332,11 @@ not go, rather than stopping at the first.
 
 ## Refreshing
 
-A verb that wrote refreshes every open files panel: each list relists keeping
-its filter, cursor, and marks, and each card restats. Undo and redo are covered
-differently: the app keeps a count of its own writes, and each panel compares
-it on every draw and event, so a reversal that no verb ran still lands.
+A run that wrote refreshes every open files panel when it lands: each list
+relists keeping its filter, cursor, and marks, and each card restats. A run
+still going is covered by the same count the app keeps of its own writes — each
+panel compares it on every draw and event — so a long copy fills the listing it
+lands in as it goes, and so does a reversal that no verb ran.
 
 Another program's write is the other half, and the kernel's `Watcher`
 [capability](./apps.md#capabilities) is how it arrives. A panel watches the one

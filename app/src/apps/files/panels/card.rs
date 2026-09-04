@@ -15,6 +15,7 @@ use super::super::model::{
     FileKind, Preview, Watch,
 };
 use super::super::ops;
+use super::super::run;
 use super::super::{Op, Seen, FILES};
 use super::dir;
 
@@ -62,6 +63,16 @@ pub struct Card {
     status: Option<String>,
     /// What this reading was taken at, on both counts.
     seen: Seen,
+    /// Which reading is on the card: bumped when the card actually reads
+    /// again, not every time somebody writes a disk. The widget decodes a
+    /// picture once per reading, and a run copying elsewhere must not have
+    /// it decode the same one once a frame for the length of the run.
+    read: u64,
+    /// The run the line under the header was about, as of the last time
+    /// this card was **drawn**, and the line itself — as a listing's, and
+    /// read together for the same reason.
+    drew: u64,
+    doing: Option<String>,
     /// The file's directory, watched for as long as this card shows it.
     /// Held, not read.
     _watch: Watch,
@@ -169,12 +180,13 @@ impl Card {
         self.pixels
     }
 
-    /// What the card last read, as the two counts it was read at. The
-    /// widget decodes a picture once per reading rather than once a frame,
-    /// so it needs to know when the reading changed.
+    /// Which reading is on the card. The widget decodes a picture once per
+    /// reading rather than once a frame, so it needs to know when the
+    /// reading *changed* — which is not the same question as whether
+    /// anybody wrote a disk.
     #[must_use]
-    pub fn read_at(&self) -> Seen {
-        self.seen
+    pub fn read_at(&self) -> u64 {
+        self.read
     }
 
     /// Whether the disk still has it.
@@ -205,6 +217,26 @@ impl Card {
         self.status = line;
     }
 
+    /// Called from the draw, and only from the draw, and before anything
+    /// reads [`Card::note`]: as a listing's
+    /// [`Dir::drawn`](super::Dir::drawn).
+    pub fn drawn(&mut self) {
+        let (drew, doing) = FILES.drawing(run::whose_world(&self.world));
+        self.drew = drew;
+        self.doing = doing;
+    }
+
+    /// The line the card draws under its header: what a run is doing, or —
+    /// while nothing is running — what the last verb refused. As a
+    /// listing's [`Dir::note`](super::Dir::note), and for the same reason:
+    /// the run is the app's, not the panel's.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        self.doing
+            .clone()
+            .or_else(|| self.status().map(str::to_string))
+    }
+
     // -- keeping up ------------------------------------------------------------
 
     /// Reads the file again: what it is, and what it shows.
@@ -213,11 +245,23 @@ impl Card {
     /// 38 MB disk image costs one `stat`; a picture's size is taken off the
     /// same bytes the card will draw, so the header is read once and not
     /// again on every wish.
+    ///
+    /// And a `stat` is all it costs when the file has not moved. Every path
+    /// a run performs bumps the count that brings the card back here — a
+    /// copy of forty thousand files does it forty thousand times, and none
+    /// of them is about this file. A card that read again on each of them
+    /// would hand its widget the same picture to decode once a frame, for
+    /// the length of the run.
     pub fn restat(&mut self) {
         // Stamped before the file is read, as a listing is: what lands in
         // between leaves the card one reading behind, never wrongly fresh.
         self.seen = FILES.seen(&self.world, &self.dir);
-        self.entry = stat_in(&self.world, &self.path);
+        let now = stat_in(&self.world, &self.path);
+        if now == self.entry && self.read > 0 {
+            return;
+        }
+        self.entry = now;
+        self.read += 1;
         let (world, path) = (self.world.clone(), self.path.clone());
         self.preview = match &self.entry {
             Some(e) => preview_of(e.kind(), &e.name, e.size, |max| {
@@ -282,14 +326,23 @@ impl Panel for Card {
     /// widget's — a caret in one of its runs keeps the text chords, and the
     /// bar has the letter the rest of the time.
     fn verbs(&self) -> Vec<Verb> {
-        vec![
+        let mut v = Vec::new();
+        // As a listing's, and first for the same reason: a run is the
+        // app's, it stops from wherever anybody is looking, and the one
+        // control with no chord behind it may not be the one a narrow
+        // panel drops off the end of its last row.
+        if FILES.busy(run::whose_world(&self.world)) {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
+        v.extend([
             Verb::run("files.open", "open", Some('o')),
             Verb::run("files.copy", "copy", Some('p')),
             Verb::run("files.move", "move", Some('m')),
             Verb::run("files.rename", "rename", Some('r')),
             Verb::run("files.delete", "delete", Some('d')),
             Verb::run("files.copy_path", "copy path", Some('c')),
-        ]
+        ]);
+        v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
@@ -300,6 +353,7 @@ impl Panel for Card {
             "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
+            "files.cancel" => dir::cancel(s, &self.world, self.drew),
             _ => {}
         }
     }
@@ -353,6 +407,12 @@ impl Card {
                 self.status = None;
             }
             dir::Said::Refused(line) => self.status = Some(line),
+            // The field holds what is being made until the run comes back
+            // to close it — as a listing's does.
+            dir::Said::Doing => {
+                self.renaming = Some(name.trim().to_string());
+                self.status = None;
+            }
             dir::Said::Nothing => {}
         }
         self.restat();
@@ -365,23 +425,20 @@ impl Card {
         match dir::copy_paths(s, vec![self.path.clone()]) {
             dir::Said::Went => self.status = None,
             dir::Said::Refused(line) => self.status = Some(line),
-            dir::Said::Nothing => {}
+            dir::Said::Doing | dir::Said::Nothing => {}
         }
     }
 
     /// `delete`: the file to the trash, and this card closed in the layout
-    /// half of the same action — it would be showing nothing. The instance
-    /// runs to the end of this method all the same, and the settle drops
-    /// it. No other panel is looked for: one somewhere else showing the
-    /// same path keeps showing it, and says so.
+    /// half of the same action — it would be showing nothing. The trash is
+    /// a run like any other, so the card stands until it lands, and the
+    /// settle that records the node is what drops it. No other panel is
+    /// looked for: one somewhere else showing the same path keeps showing
+    /// it, and says so.
     fn delete(&mut self, s: &mut Session) {
-        let (slot, path) = (self.slot, self.path.clone());
-        match dir::delete_paths(s, slot, vec![path], true, |_, _| None) {
-            dir::Said::Went => self.status = None,
-            dir::Said::Refused(line) => self.status = Some(line),
-            dir::Said::Nothing => {}
+        if dir::delete_paths(s, self.slot, &self.id, vec![self.path.clone()], true, false) {
+            self.status = None;
         }
-        self.restat();
     }
 }
 
@@ -412,6 +469,9 @@ impl PanelKind for CardKind {
             renaming: None,
             status: None,
             seen: Seen::default(),
+            read: 0,
+            drew: 0,
+            doing: None,
             _watch,
         };
         card.restat();

@@ -135,10 +135,18 @@ pub fn screenshot(path: &Path) -> Result<(), String> {
 /// in there, and the Put Back the Finder offers; the landing path is what
 /// undo moves back.
 ///
+/// A pool of its own, because this is called from the thread a files
+/// [run](crate::apps::files::run) is performed on. AppKit's own runloop
+/// drains one every turn, but a plain Rust thread has no ambient pool and
+/// `NSFileManager` autoreleases freely inside: without this, a trash of
+/// forty thousand paths leaks every object it makes and Cocoa says so on
+/// stderr, once per path.
+///
 /// # Errors
 ///
 /// Whatever `trashItemAtURL:` refused, in its own words.
 pub fn trash(path: &Path) -> Result<std::path::PathBuf, String> {
+    let _pool = Pool::new();
     unsafe {
         let fm: ObjcId = msg_send![class!(NSFileManager), defaultManager];
         let url: ObjcId = msg_send![
@@ -171,6 +179,28 @@ pub fn trash(path: &Path) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// An `NSAutoreleasePool` for as long as it is held. Objective-C objects
+/// nobody owns are released when this drops, which on a thread AppKit does
+/// not run is the only time they ever would be.
+struct Pool(ObjcId);
+
+impl Pool {
+    fn new() -> Pool {
+        // SAFETY: `+new` on a class that is always there, and the pool is
+        // released exactly once, on this thread, in `Drop`.
+        unsafe { Pool(msg_send![class!(NSAutoreleasePool), new]) }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // SAFETY: the pool this made, released on the thread that made it.
+        unsafe {
+            let _: () = msg_send![self.0, release];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +227,31 @@ mod tests {
         // goes, which is the one `remove` in this app and is our own.
         std::fs::rename(&landed, &file).expect("back out");
         assert!(file.exists());
+        std::fs::remove_dir_all(&dir).expect("the scratch tree goes");
+    }
+
+    /// And from a thread of its own, which is where a files run performs
+    /// it: a plain Rust thread has no ambient autorelease pool, and
+    /// `NSFileManager` autoreleases freely inside.
+    #[test]
+    fn the_trash_works_from_a_thread_with_no_runloop() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("superapp-trash-thread-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let file = dir.join("scratch.txt");
+        std::fs::write(&file, b"scratch").expect("a scratch file");
+
+        let one = file.clone();
+        let landed = std::thread::spawn(move || trash(&one))
+            .join()
+            .expect("the thread finished")
+            .expect("the trash took it");
+        assert!(!file.exists());
+        assert!(landed.exists());
+
+        std::fs::rename(&landed, &file).expect("back out");
         std::fs::remove_dir_all(&dir).expect("the scratch tree goes");
     }
 }
