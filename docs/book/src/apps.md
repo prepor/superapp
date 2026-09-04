@@ -117,6 +117,13 @@ and a cursor walk that previews a row at a time is one undo that closes the
 whole walk. The same spelling names an effect's row in the queue and a worker's
 kick address, so one id means one thing everywhere.
 
+`nav_within` is `nav` for what an action *caused* rather than what somebody
+asked for — the cursor walk a filing leaves behind. It folds the navigation
+into the node the action just recorded: the node keeps its label and its
+layout-before, takes the walk's layout-after and its claims, and one press of
+undo takes the whole gesture back. Without it a delete costs two undos, the
+first of which looks like it did nothing.
+
 `act` and `nav` never touch instances. `settle` is what does: it drops the
 instances of slots that closed, places the ones that opened, re-derives the
 wishes, and writes the session. The shell calls it after every event and a test

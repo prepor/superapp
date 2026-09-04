@@ -102,7 +102,10 @@ and `forward` (`cmd+f`). The first two are buttons; reply and forward are
 links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
 and open a draft joined to the reader. Filing closes the reader's own slot and
 nothing else: another panel reading the same conversation stays where it is and
-says what it shows.
+says what it shows. The list driving that reader then walks on to the row that
+took its place, and that walk is part of the filing rather than a second
+action — one undo puts the mail back, reopens the reader on it, and takes the
+walk's own read mark back with it.
 
 A reply fills the recipient and subject, quotes the source message, and sends
 `In-Reply-To` and `References` headers. A forward starts with an empty

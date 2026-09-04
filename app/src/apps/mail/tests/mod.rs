@@ -462,7 +462,8 @@ fn filing_closes_its_own_slot_and_no_other() {
 }
 
 /// Two marked conversations archived as one action: one node, the walk that
-/// follows is another, and undo brings both the mails and the marks back.
+/// follows folded into it, and undo brings the mails and the marks back on
+/// one press.
 #[test]
 fn the_batch_archive_is_one_node_and_undo_restores_the_marks() {
     let (mut s, _clock) = session();
@@ -492,11 +493,11 @@ fn the_batch_archive_is_one_node_and_undo_restores_the_marks() {
 
     let before = kinds(&s).len();
     verb(&mut s, list, "mail.archive");
-    // One node for the batch, and one for the cursor walk that follows it —
-    // the batch closes nothing, so what happens to the panel beside the list
-    // is a preview like any other.
-    assert_eq!(kinds(&s).len(), before + 2, "{:?}", kinds(&s));
-    assert_eq!(kinds(&s).last().map(String::as_str), Some("read"));
+    // One node for the whole gesture: the batch closes nothing, so what
+    // happens to the panel beside the list is a preview — and that preview
+    // is the batch arriving at its consequence, folded into its node.
+    assert_eq!(kinds(&s).len(), before + 1, "{:?}", kinds(&s));
+    assert_eq!(kinds(&s).last().map(String::as_str), Some("file"));
     assert_eq!(role_of(s.store(), 1), "archive");
     assert_eq!(role_of(s.store(), 2), "archive");
     assert_eq!(with_mailbox(&s, list, |m| m.list().marks().len()), 0);
@@ -510,8 +511,8 @@ fn the_batch_archive_is_one_node_and_undo_restores_the_marks() {
         "the row under the two that left, not one further down for each of them"
     );
 
-    // The walk first, then the batch it followed.
-    assert!(s.undo());
+    // One press takes the whole gesture back — the walk it left behind
+    // included.
     assert!(s.undo());
     assert_eq!(role_of(s.store(), 1), "inbox");
     assert_eq!(role_of(s.store(), 2), "inbox");
@@ -1428,6 +1429,54 @@ fn a_reference_is_one_row_per_id() {
         )
         .unwrap();
     assert_eq!(pk, 2, "message and mid together");
+}
+
+/// A delete from the reader is **one** undo, not two. The filing and the
+/// cursor walk it leaves behind are one gesture, so they are one node: the
+/// press that follows puts the mail back, reopens the reader on it, and
+/// takes the walk's own claim — the next conversation marked read — back
+/// with it.
+#[test]
+fn deleting_from_a_reader_is_one_undo() {
+    let (mut s, _clock) = session();
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(0)).expect("a row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let rows = with_mailbox(&s, list, |m| m.len());
+    let before = kinds(&s).len();
+
+    verb(&mut s, reader, "mail.delete");
+    assert_eq!(role_of(s.store(), 1), "trash");
+    assert!(s.panel(reader).is_none(), "the reader closed with it");
+    assert_eq!(kinds(&s).len(), before + 1, "{:?}", kinds(&s));
+    assert_eq!(kinds(&s).last().map(String::as_str), Some("file"));
+    // The walk that followed marked what it landed on read.
+    let next = s.joined_child(list).expect("the walk previewed a row");
+    let landed = Message::of(s.panel(next).unwrap().borrow().id()).expect("a mail");
+    assert!(!unread(s.store(), landed));
+
+    assert!(s.undo());
+    assert_eq!(role_of(s.store(), 1), "inbox", "one press, and it is back");
+    assert_eq!(with_mailbox(&s, list, |m| m.len()), rows);
+    assert!(unread(s.store(), landed), "the walk's own claim came back");
+    assert_eq!(
+        s.joined_child(list)
+            .and_then(|c| s.panel(c))
+            .map(|p| p.borrow().title()),
+        Some("Q3 infra budget draft".to_string()),
+        "the reader is open on the mail again"
+    );
+
+    // And redo replays the whole gesture, walk included.
+    assert!(s.redo());
+    assert_eq!(role_of(s.store(), 1), "trash");
+    assert_eq!(
+        s.joined_child(list)
+            .and_then(|c| s.panel(c))
+            .map(|p| p.borrow().title()),
+        Some("[stelaxis] CI failed on main".to_string()),
+    );
 }
 
 /// Filing the first conversation from its reader leaves the list previewing

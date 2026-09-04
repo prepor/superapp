@@ -255,7 +255,8 @@ impl Mailbox {
     /// It closes nothing. A panel reading one of the filed conversations is
     /// somebody's own window; what happens instead is the cursor walk — it
     /// lands on the nearest row that stayed and previews it, and the join
-    /// rule puts that preview where the old one was.
+    /// rule puts that preview where the old one was. That walk is part of
+    /// the action, not a second one: one undo takes the whole gesture back.
     fn file_marked(&mut self, s: &mut Session, role: &'static str) {
         let keys = self.list.marks().keys();
         if keys.is_empty() {
@@ -319,10 +320,11 @@ impl Mailbox {
         }
 
         // The cursor stands where it stood; the rows under it may have left,
-        // so it lands on the nearest one that stayed and previews it — a step
-        // like any other in the walk.
+        // so it lands on the nearest one that stayed and previews it. It is
+        // the filing arriving at its consequence, so it folds into the
+        // filing's node rather than costing a second undo.
         if let Some(nav) = self.advance() {
-            s.nav(nav);
+            s.nav_within(nav);
         }
     }
 }

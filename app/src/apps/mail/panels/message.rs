@@ -262,7 +262,7 @@ impl Message {
     /// The mails move in the action's transaction, the reader closes in its
     /// layout half — the instance runs to the end of this method all the
     /// same, and is dropped at the settle — and the cursor walk that follows
-    /// is a preview like any other.
+    /// folds into the same node: filing is one gesture, so it is one undo.
     fn file_thread(&mut self, s: &mut Session, role: &'static str) {
         let (store, slot, mail) = (self.store.clone(), self.slot, self.mail);
         // Asked before acting, of the mail the panel was opened on: without
@@ -323,14 +323,16 @@ impl Message {
 
         // The list that was driving this reader moves on. It finds its own
         // row by the cursor it still holds — the filed one is gone, so the
-        // index it stood at is now the row below.
+        // index it stood at is now the row below. The walk is what the
+        // filing left behind rather than a gesture of its own, so it lands
+        // on the filing's node.
         let Some(driver) = driver else { return };
         let nav = s.panel(driver).and_then(|d| {
             let mut b = d.borrow_mut();
             b.as_any().downcast_mut::<Mailbox>()?.advance()
         });
         if let Some(nav) = nav {
-            s.nav(nav);
+            s.nav_within(nav);
         }
     }
 }

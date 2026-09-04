@@ -22,6 +22,7 @@ use crate::app::{Announced, Apps, Env, Mode, Problem, Workers};
 use crate::effect::World;
 use crate::history::{self, History, Intent, NodeId};
 use crate::layout::{Grid, LayoutOpts, Scene, SlotId, Wm, WmSnap};
+use crate::nav::Nav;
 use crate::panel::{self, Open, Opening, Panel, PanelId};
 use crate::repl;
 use crate::store::{save_wm_tx, Store};
@@ -181,6 +182,10 @@ pub struct Session {
     cols: usize,
     /// A slot the camera should show once — what a preview asks for.
     show_once: Option<SlotId>,
+    /// The next action is a consequence of the one before it, and folds
+    /// into its node — set for the length of one
+    /// [`Session::nav_within`].
+    merge_next: bool,
     /// Device sync, when a bucket is configured. `None` means replication
     /// is off and the store is a plain local one.
     repl: Option<Repl>,
@@ -230,6 +235,7 @@ impl Session {
             opts: LayoutOpts::default(),
             cols: DEFAULT_COLS,
             show_once: None,
+            merge_next: false,
             repl: None,
             repl_mount: None,
             lease: repl::Status::default(),
@@ -702,7 +708,7 @@ impl Session {
             }
         };
         let ts = self.now();
-        self.history.apply(history::Action {
+        let node = history::Action {
             kind,
             label,
             entity,
@@ -710,7 +716,12 @@ impl Session {
             after: after.clone(),
             intents,
             ts,
-        });
+        };
+        if std::mem::take(&mut self.merge_next) {
+            self.history.amend(node);
+        } else {
+            self.history.apply(node);
+        }
         self.last_saved = Some(after);
         self.unsettle();
         self.workers.kick_all();
@@ -718,6 +729,22 @@ impl Session {
         self.repl_kick();
         self.announce_problems();
         Some(out)
+    }
+
+    /// A navigation an action *caused*, folded into the node that caused
+    /// it: the cursor walk a filing leaves behind is not a second gesture,
+    /// and one gesture is one undo. Call it in place of [`Session::nav`],
+    /// straight after the [`Session::act`] whose consequence it is.
+    ///
+    /// The walk still lands in the node's `after`, so redo replays it —
+    /// and its own claims (the mail the new preview marks read) come back
+    /// with the action's on the one press.
+    pub fn nav_within(&mut self, n: Nav) {
+        self.merge_next = true;
+        self.nav(n);
+        // A navigation that recorded nothing — a focus move — would
+        // otherwise leave the flag standing over whatever came next.
+        self.merge_next = false;
     }
 
     /// The compensation when the lease turned over between a disk write and

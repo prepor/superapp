@@ -22,28 +22,29 @@ wait 900
 shot u1-opened
 
 # Archive: the conversation leaves the inbox and the reader closes behind it,
-# and the list carries on to the next mail and previews it. Filing something
-# and then reading the next are two things a person did, so they are two nodes.
+# and the list carries on to the next mail and previews it. That walk is the
+# filing arriving at its consequence, not a second thing the person did, so
+# all of it is one node.
 click "archive"
 wait 900
 shot u2-archived
 
-# Two steps back — the preview the list moved on to, then the archive under it
-# — and the reader is on the same letter again, which is what the click proves.
-key cmd+z 2
+# One step back — the archive and the preview it moved on to together — and
+# the reader is on the same letter again, which is what the click proves.
+key cmd+z
 wait 900
 shot u3-undone
 click "Vera Kovac · aug 31 09:14"
 wait 700
 
-# Redo walks the same two forward: filed again, and the list moved on again.
-key cmd+shift+z 2
+# Redo walks the one node forward: filed again, and the list moved on again.
+key cmd+shift+z
 wait 900
 shot u4-redone
 
 # Back once more, then close the list — which takes its joined reader with it
 # — and take that back too.
-key cmd+z 2
+key cmd+z
 wait 900
 key cmd+w
 wait 900
