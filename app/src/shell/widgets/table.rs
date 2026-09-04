@@ -331,7 +331,7 @@ impl<S: RowSpec> TableView<S> {
                     navs.push(Nav::Open {
                         from: props.slot,
                         id,
-                        fresh: k.modifiers.logo || k.modifiers.alt,
+                        fresh: k.modifiers.logo,
                     });
                 }
             }
@@ -488,8 +488,8 @@ impl<S: RowSpec> TableView<S> {
             with_list::<S, _>(props, |l| l.set_cursor(store, i));
         }
         view.redraw(cx);
-        // cmd (alt as a quiet alias) always opens a fresh, un-joined panel.
-        navs.push(if e.modifiers.logo || e.modifiers.alt {
+        // cmd always opens a fresh, un-joined panel.
+        navs.push(if e.modifiers.logo {
             Nav::Open {
                 from: props.slot,
                 id: target,

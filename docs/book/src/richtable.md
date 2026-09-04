@@ -121,8 +121,8 @@ It draws the filter with its error line and completion box, the rows through a
 mark bar, and it registers the hits that make a row addressable. It answers a
 press itself, by the row rectangles of its last draw, because portal-list items
 are rebuilt every draw and a synthesized press must land the way a finger does.
-A press moves the cursor and previews; `cmd` or alt opens a fresh un-joined
-panel instead.
+A press moves the cursor and previews; `cmd` opens a fresh un-joined panel
+instead.
 
 It also owns the keys the [grammar](./interaction-grammar.md#keyboard) gives a
 list: the arrows and their preview, `enter`, `/`, `space`, `shift`+arrows,

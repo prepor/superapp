@@ -519,9 +519,9 @@ impl Widget for SLink {
             return;
         }
         let Some(nav) = self.nav.clone() else { return };
-        // cmd (alt as a quiet alias) always opens a fresh, un-joined panel.
+        // cmd always opens a fresh, un-joined panel.
         let nav = match nav {
-            Nav::Open { from, id, .. } if fe.modifiers.logo || fe.modifiers.alt => Nav::Open {
+            Nav::Open { from, id, .. } if fe.modifiers.logo => Nav::Open {
                 from,
                 id,
                 fresh: true,

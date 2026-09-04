@@ -15,9 +15,8 @@ shows, its links go somewhere from it. Breadcrumbs in the file browser use
 dotted links. Batch verbs act on marked rows and open nothing.
 
 `cmd+click` and `cmd+enter` open a separate panel without a join, on a link,
-on a row, or on an entry of a bar. Alt remains an alias for this behavior.
-Actions report short results in a bottom-right toast. Errors use red; other
-toasts do not.
+on a row, or on an entry of a bar. Actions report short results in a
+bottom-right toast. Errors use red; other toasts do not.
 
 ### Preview: the one open that does not go
 
