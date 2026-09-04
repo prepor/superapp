@@ -854,7 +854,9 @@ fn a_call_the_build_has_no_tool_for_fails_in_words_and_the_run_goes_on() {
         vec![Reply::when(
             "rename",
             Answer::Call {
-                name: "files.rename".into(),
+                // A tool no app in any build offers: what a model that
+                // guessed a name gets back.
+                name: "nobody.rename".into(),
                 arguments: json!({"path": "~/notes.md", "to": "~/notes-2026.md"}),
                 then: "I could not rename it.".into(),
             },
@@ -870,7 +872,7 @@ fn a_call_the_build_has_no_tool_for_fails_in_words_and_the_run_goes_on() {
     );
     let pending = model::pending_calls(s.store(), run.id);
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].tool, "files.rename");
+    assert_eq!(pending[0].tool, "nobody.rename");
     assert_eq!(
         pending[0].input(),
         json!({"path": "~/notes.md", "to": "~/notes-2026.md"})
@@ -1481,9 +1483,15 @@ static WITH_TESTER: &[&dyn App] = &[&TESTER, &AGENT];
 fn attach_copies_every_tool_and_every_describe() {
     let apps = Apps::new(WITH_TESTER);
     let (tools, describes) = Agent::registry_of(&apps);
+    let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
     assert_eq!(
-        tools.iter().map(|t| t.name).collect::<Vec<_>>(),
-        vec!["test.look"],
+        names.first().copied(),
+        Some("sql.query"),
+        "the kernel's own lead the list"
+    );
+    assert_eq!(
+        names.last().copied(),
+        Some("test.look"),
         "the whole list, whoever offered it"
     );
     assert_eq!(
