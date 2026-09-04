@@ -515,6 +515,17 @@ impl Session {
         self.dirty.redraw = true;
     }
 
+    /// Magnetises a freely panned camera to the nearest column alignment —
+    /// what a two-finger pan asks for when the fingers lift. Ephemeral like
+    /// the pan it ends, so it is not an action either; the shell springs
+    /// towards the result.
+    pub fn snap_camera(&mut self) {
+        let (viewport, opts) = (self.viewport, self.opts);
+        self.wm.snap_camera(viewport, opts);
+        self.scene = self.wm.scene(viewport, opts);
+        self.dirty.redraw = true;
+    }
+
     #[must_use]
     pub fn viewport(&self) -> (f64, f64) {
         self.viewport

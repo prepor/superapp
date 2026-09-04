@@ -68,19 +68,19 @@ belongs to.
     change. macOS could use FSEvents, with events grouped to avoid repeated
     refreshes.
 
-15. **Touch.** *(Interaction Grammar)* Touch is not in this build. The
-    interfaces leave room for it (the table widget's rows, the panel drag, the
-    two-finger workspace pan, and the workspaces overlay are all there) and
-    the script grammar still parses the touch steps. A port has to answer what
-    it did before: there is no touch gesture for moving a panel between columns
-    or workspaces, for toggling tabs, or for opening a separate un-joined
-    panel. Possible homes include a link long-press or a header menu.
+15. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
+    covers the tap, the scroll, the workspace pan, the workspaces overlay, the
+    panel drag and the row's mark and sweep. Four moves still have no gesture:
+    sending a panel to another workspace, moving it between columns, toggling
+    tabs for a column, and opening a link un-joined, which on glass always
+    joins. Possible homes include a long press on a link and a menu on the
+    header.
 
-16. **Android.** *(Tech Stack)* The crate is shaped for an Android build:
-    a library with a JNI entry point, its own launcher icons, and a grid the
-    layout can switch. The platform work is not ported: touch input, fold
-    and unfold as grid changes, safe-area insets, the on-screen keyboard and
-    its full text state, and a secrets backend that is not a private file.
-    Files on Android needs more still: access outside the app directory, the
-    system opener, and the system trash, which mean the Storage Access
+16. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
+    the shell's own half of it is written: touch, the grid the screen picks,
+    the safe-area insets, and the soft keyboard's occlusion and full text
+    state. There is no SDK in this tree, so none of it has run on a device.
+    What is not written is what needs one: a secrets backend that is not a
+    private file, and, for the file browser, access outside the app directory,
+    the system opener and the system trash, which mean the Storage Access
     Framework, a `FileProvider`, and `MediaStore`.

@@ -14,9 +14,10 @@ A panel's [bar](#the-bar) carries both: its buttons act on what the panel
 shows, its links go somewhere from it. Breadcrumbs in the file browser use
 dotted links. Batch verbs act on marked rows and open nothing.
 
-`cmd+click` and `cmd+enter` open a separate panel without a join. Alt remains
-an alias for this behavior. Actions report short results in a bottom-right
-toast. Errors use red; other toasts do not.
+`cmd+click` and `cmd+enter` open a separate panel without a join, on a link,
+on a row, or on an entry of a bar. Alt remains an alias for this behavior.
+Actions report short results in a bottom-right toast. Errors use red; other
+toasts do not.
 
 ### Preview: the one open that does not go
 
@@ -194,8 +195,64 @@ a small grey thumb.
 
 ## Touch
 
-Touch is not in this build. The rich table's rows, the panel drag, and the
-two-finger workspace pan are all seams that the current interfaces leave room
-for, and the script grammar still parses the touch steps so a suite that asks
-for one says so out loud rather than failing on a label that was never drawn.
-See [Open Questions](./open-questions.md).
+A finger lands on the same rectangles a click resolves against, so a gesture
+and a click never disagree about what is under them. One state machine
+arbitrates, and it locks at the first move past eight points and holds until
+every finger lifts, so nothing changes its mind mid-gesture.
+
+| Gesture | Meaning |
+|---|---|
+| Tap | A click where it went down |
+| One finger, vertically | The panel under it scrolls, 1:1 |
+| One finger, sideways on a row | The curtain, and a verb past a third of it |
+| Two fingers, horizontally | The workspace pans, and aligns on release |
+| Two fingers, down | The workspaces overlay |
+| Two fingers, up | Whichever overlay is up goes away |
+| Long press on a header | The panel is picked up |
+| Long press on a row | Its mark, toggled |
+
+A tap is a press and a release at one point, so what it means is what a click
+means. There is no touch equivalent of `cmd+click`: a link on glass always
+follows the join rule.
+
+Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
+column edge when they lift. Two fingers moving down raise the workspaces
+overlay, and its search row raises the launcher; two moving up put whichever
+overlay is up away.
+
+A long press on a panel's header picks the panel up. It then rides the finger,
+an ink insertion bar previews where a drop would land: vertical in a gap for
+a fresh column, horizontal across a column to stack at that row. A finger held
+near an edge pans the strip, so the far columns are reachable. The drop is
+judged by the finger, not by the panel.
+
+A long press on a row toggles its mark, which is the phone's way to a set:
+space and shift belong to a keyboard. A sideways drag on a row draws a curtain
+in from the edge the finger travels away from, carrying the word of the verb a
+lift would run. Below a third of the row it is the selection grey with the word
+in ink and a hairline at its leading edge; past it the whole thing inverts, the
+way a control under the pointer does. On release the curtain finishes covering
+the row and only then does the verb run, so the row is gone from view before it
+is gone from the list.
+
+The verb is the panel's own, run over the swept row alone: the row is marked,
+the batch verb fires, and whatever was marked before goes back on. A list that
+offers no verb that way draws no curtain, and the lift does nothing. In a
+mailbox, a leftward sweep archives and a rightward one deletes.
+
+## The soft keyboard
+
+The workspace lives inside the safe area, so a cutout or a rounded corner takes
+nothing from a panel. Android additionally swallows touches in the
+notification-shade strip at the top of the window, and the workspace stays
+clear of that too.
+
+The soft keyboard shortens the workspace by as much as it occludes, and the
+panels spring up to fit the smaller board: the app makes its own room rather
+than letting the system slide the whole window. The keyboard's own action
+button is this grammar's enter: a form advances, a filter runs, a list opens
+its row.
+
+A field owns the whole input protocol, its authoritative full text state
+included, so the shell hands one over whole rather than reading characters out
+of it. That is what keeps a composition from being typed twice.

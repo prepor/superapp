@@ -517,6 +517,19 @@ impl Stage {
     /// no instance until the stage settles — so a verb may read its table
     /// and then close its own slot.
     pub(super) fn run_verb(&mut self, sh: &mut Shell, slot: kernel::layout::SlotId, id: &str) {
+        self.run_verb_fresh(sh, slot, id, false);
+    }
+
+    /// The same, with the workspace modifier held: an entry that goes
+    /// somewhere opens it un-joined, exactly as `cmd+click` does on a row or
+    /// `cmd+enter` on a list. A verb that opens nothing does not care.
+    pub(super) fn run_verb_fresh(
+        &mut self,
+        sh: &mut Shell,
+        slot: kernel::layout::SlotId,
+        id: &str,
+        fresh: bool,
+    ) {
         let Some(inst) = sh.session.panel(slot) else {
             return;
         };
@@ -527,7 +540,7 @@ impl Stage {
         match act {
             Some(VerbAct::Run) => inst.borrow_mut().run(id, &mut sh.session),
             Some(VerbAct::Call(f)) => f(&mut sh.session),
-            Some(VerbAct::Go(nav)) => sh.session.nav(nav),
+            Some(VerbAct::Go(nav)) => sh.session.nav(un_join(nav, fresh)),
             None => {}
         }
     }
@@ -571,6 +584,29 @@ impl Stage {
         sh.session.settle();
         let cam = sh.session.scene().camera_x;
         sh.anim.camera().jump_to(cam);
+    }
+}
+
+/// A navigation with the workspace modifier applied: a join becomes a fresh
+/// column of its own, and a replace becomes an open beside the panel that
+/// asked — a bar's link answers `cmd` the way a row does.
+fn un_join(nav: kernel::nav::Nav, fresh: bool) -> kernel::nav::Nav {
+    use kernel::nav::Nav;
+    if !fresh {
+        return nav;
+    }
+    match nav {
+        Nav::Open { from, id, .. } | Nav::Preview { from, id } => Nav::Open {
+            from,
+            id,
+            fresh: true,
+        },
+        Nav::Replace { slot, id } => Nav::Open {
+            from: slot,
+            id,
+            fresh: true,
+        },
+        other => other,
     }
 }
 

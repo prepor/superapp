@@ -180,9 +180,14 @@ harness; reach later fields with `tab`. A scripted `drag` does not prove that
 text became selected, because Makepad starts a selection only for a
 platform-captured pointer; `selectall` is the assertion for that.
 
-`swipe`, `pan2`, `holdmove`, and `drop` still parse, and the runner says out
-loud that they are not in this build, so a suite that asks for touch fails
-visibly rather than on a label that was never drawn.
+`swipe`, `pan2`, `holdmove`, and `drop` are the fingers, and they go down the
+stage's own touch path, the one Android drives, so a suite that asks for a
+gesture proves the gesture rather than a shortcut to its result. A whole
+gesture runs inside one tick and so never draws: `hold` on a `swipe` or a
+`holdmove` leaves the finger down long enough to photograph one mid-flight, and
+`drop` lets go. A `holdmove` on a panel presses its header, which is the part
+that grabs; on anything else it presses where it is, and a move of `0 0` is the
+long press alone.
 
 ### Device sync
 

@@ -57,8 +57,23 @@ menu bar and Dock visible. It does not use a macOS full-screen Space.
 
 ## Android
 
-An Android build is not part of this tree today. The crate is already shaped
-for one: a library with a JNI entry point beside the desktop `fn main`, its
-own launcher icons under `app/resources/android/`, and a grid the layout can
-switch at runtime. The touch input, the fold handling, and the on-screen
-keyboard are not ported. See [Open Questions](./open-questions.md).
+An Android build is not part of this tree today, and there is no SDK here to
+make one with. The crate is shaped for it: a library with a JNI entry point
+beside the desktop `fn main`, its own launcher icons under
+`app/resources/android/`, and a grid the layout switches at runtime.
+
+The platform work the shell owns is written and compiles here behind its
+`cfg`s. Touch goes through the same input paths a mouse does. The grid is
+picked from the screen: 8×4 above about 600 dp and 4×3 below it, which is the
+compact/medium breakpoint a fold or an unfold crosses, and `--grid` forces
+either on the desktop for a preview. The workspace sits inside the safe-area
+insets a window-geometry change reports, clear of the notification-shade strip
+at the top; the soft keyboard's occlusion shortens it, since the manifest
+adjusts nothing and the app makes its own room. See [Interaction
+Grammar](./interaction-grammar.md).
+
+What is left is what needs a device or an SDK to write against: a secrets
+backend that is not a private file, and everything the file browser wants
+outside the app's own directory: the Storage Access Framework, a
+`FileProvider` for the system opener, and `MediaStore` for the system trash.
+See [Open Questions](./open-questions.md).

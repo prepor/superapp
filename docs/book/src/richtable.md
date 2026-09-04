@@ -128,14 +128,21 @@ keeps every letter, so no bar draws a bold letter that would not fire.
 
 What a panel supplies is four short functions: the row template, how to fill a
 row, what a script calls it, and what it opens. Two more have defaults: what
-the field is seeded with once, and the line an empty list shows.
+the field is seeded with once, the line an empty list shows, and the two verbs
+a sideways finger runs.
 
 Pages keep data loading proportional to the visible area, and `PortalList`
 reuses row widgets while scrolling, so a row is populated again only when its
 data, cursor state, or mark state changes.
 
-Long presses and sideways swipes are seams the widget leaves room for; touch is
-not in this build.
+A finger is the shell's to arbitrate and the table's to answer. Rows are
+registered as rows, so the shell knows one is under a finger without knowing
+whose. The three questions a gesture over one raises go back to the widget:
+which row is this, what would a sweep across it run, and run it. A long press
+marks the row. A sweep runs one of two verbs the panel names by id, over that
+row alone: it is marked, the panel's own batch verb fires, and whatever was
+marked before goes back on. A table that names no verb that way draws no
+curtain.
 
 ## Adding a table
 

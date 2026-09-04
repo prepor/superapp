@@ -24,7 +24,10 @@
 //!   [`bar::bold`] draws, so a bold letter promises only what that order
 //!   would reach;
 //! - a widget with a live text field says what it keeps from those bars
-//!   through [`hosted::Chord::field`].
+//!   through [`hosted::Chord::field`];
+//! - a widget that draws rows registers them with [`hits::Hits::add_row`],
+//!   and answers what a finger across one means through
+//!   [`hosted::Grab`].
 
 pub mod anim;
 pub mod app_ui;
@@ -45,6 +48,7 @@ pub mod overlays;
 pub mod pointer;
 pub mod stage;
 pub mod system;
+pub mod touch;
 pub mod widgets;
 
 use std::sync::OnceLock;

@@ -31,6 +31,9 @@ pub struct PanelProps {
     pub hits: Hits,
     /// The chord the stage is offering, if it is offering one.
     pub chord: Chord,
+    /// What the touch machine is asking of this widget, if it is asking
+    /// anything. Empty on every event a pointer or a key drives.
+    pub grab: Grab,
 }
 
 /// A chord offered to the focused widget before the bar sees it, and what
@@ -83,6 +86,74 @@ impl Chord {
     }
 }
 
+/// What the shell's touch machine is asking a panel's own widget about a
+/// row under a finger.
+///
+/// The shell knows a row is there — the hit says so, through
+/// [`Act::Row`](super::hits::Act::Row) — and it owns the curtain, its spring
+/// and the commit threshold. What only the widget knows is which row a point
+/// is on, what a sweep across it would run, and how to run it. Three
+/// questions, one answer, and no app named on either side of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ask {
+    /// A finger rested on this point: toggle the mark on the row under it.
+    Mark(DVec2),
+    /// A finger went down here and is sweeping sideways: what would a
+    /// leftward sweep run, and what would a rightward one?
+    Verbs(DVec2),
+    /// The sweep committed: run that verb on the row under `at` alone, and
+    /// put the marks that were standing back afterwards.
+    Run { at: DVec2, left: bool },
+}
+
+/// The question, and the shared cell the widget answers into.
+///
+/// A cell rather than a bubbled action, for the reason [`Chord`] is one:
+/// makepad delivers actions on the *next* event, and a gesture has to be
+/// arbitrated now.
+#[derive(Clone, Default)]
+pub struct Grab {
+    ask: Option<Ask>,
+    verbs: Rc<Cell<[Option<&'static str>; 2]>>,
+}
+
+impl Grab {
+    /// A grab with a question in it.
+    #[must_use]
+    pub fn asking(ask: Ask) -> Grab {
+        Grab {
+            ask: Some(ask),
+            verbs: Rc::new(Cell::new([None, None])),
+        }
+    }
+
+    /// What is being asked, if anything is.
+    #[must_use]
+    pub fn ask(&self) -> Option<Ask> {
+        self.ask
+    }
+
+    /// The widget's answer to [`Ask::Verbs`]: the verb a leftward sweep
+    /// would run and the verb a rightward one would, by id, `None` where
+    /// that way means nothing on this row.
+    pub fn answer(&self, verbs: [Option<&'static str>; 2]) {
+        self.verbs.set(verbs);
+    }
+
+    /// What it answered, or nothing at all.
+    #[must_use]
+    pub fn answered(&self) -> [Option<&'static str>; 2] {
+        self.verbs.get()
+    }
+}
+
+/// The word a curtain says for a verb: the last segment of its id, since a
+/// bar's label carries a count of marks and a curtain is about one row.
+#[must_use]
+pub fn verb_word(id: &str) -> &str {
+    id.rsplit('.').next().unwrap_or(id)
+}
+
 /// The two slots the modal overlays are hosted under. They are keyed
 /// outside the layout's numbering, which is why they are the top of it.
 pub const OVERLAY_ROWS: SlotId = SlotId::MAX;
@@ -93,6 +164,10 @@ pub const OVERLAY_LAUNCHER: SlotId = SlotId::MAX - 1;
 pub fn is_overlay(slot: SlotId) -> bool {
     slot == OVERLAY_ROWS || slot == OVERLAY_LAUNCHER
 }
+
+/// What [`Stage::ask_grab`] knocks with. Nothing reads it: the question is
+/// on the props, and the event only has to reach the widget.
+const GRAB: &str = "shell.grab";
 
 /// The card a slot gets when no app in this build owns its tag. The shell's
 /// own fallback, drawn by the system app inside the shell.
@@ -159,6 +234,7 @@ impl Stage {
             panel: inst,
             hits: self.hits.clone(),
             chord: Chord::default(),
+            grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
         cx.begin_turtle(
@@ -170,6 +246,9 @@ impl Stage {
             },
         );
         w.draw_all(cx, &mut scope);
+        // Inside the panel's own clipped turtle, so a curtain over a row at
+        // the edge of a list is cut off with everything else.
+        self.draw_row_curtain(cx, slot, &w, body);
         cx.end_turtle();
         // Right after the widget drew, when its rectangles are this frame's.
         self.heard_field(cx, sh, slot, &w, &props.chord);
@@ -279,10 +358,42 @@ impl Stage {
             panel,
             hits: self.hits.clone(),
             chord: Chord::default(),
+            grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
         w.handle_event(cx, event, &mut scope);
         props.chord.taken()
+    }
+
+    /// Puts one of the touch machine's questions to a slot's widget and
+    /// answers what it said.
+    ///
+    /// The carrier is [`Event::Custom`], which nothing else in this build
+    /// reads: the event is only a knock at the door, and the question is on
+    /// the props.
+    pub(super) fn ask_grab(
+        &mut self,
+        cx: &mut Cx,
+        sh: &mut Shell,
+        slot: SlotId,
+        ask: Ask,
+    ) -> [Option<&'static str>; 2] {
+        let Some(w) = self.hosted.get(&slot).cloned() else {
+            return [None, None];
+        };
+        let Some(panel) = sh.session.panel(slot) else {
+            return [None, None];
+        };
+        let props = PanelProps {
+            slot,
+            panel,
+            hits: self.hits.clone(),
+            chord: Chord::default(),
+            grab: Grab::asking(ask),
+        };
+        let mut scope = Scope::with_data_props(&mut sh.session, &props);
+        w.handle_event(cx, &Event::Custom(GRAB.to_string()), &mut scope);
+        props.grab.answered()
     }
 
     /// Whether the focused slot has a hosted widget at all — every panel

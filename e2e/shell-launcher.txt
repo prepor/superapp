@@ -6,9 +6,8 @@
 # wherever it lives, or opens it fresh where it does not. It never makes a
 # second copy of something already open.
 #
-# The workspaces overlay's search row is the other way in, and it is touch,
-# which is not wired up — so those steps are dropped rather than written
-# against something that would silently do nothing.
+# The workspaces overlay's search row is the other way in: two fingers down
+# raise the roster, and its search row raises this.
 
 wait 600
 
@@ -80,4 +79,25 @@ wait 900
 click "try it"
 wait 700
 shot l8-root
+
+# -- the way in from the workspaces overlay ----------------------------------
+
+# Two fingers down list the workspaces; its search row is a launcher entry on
+# glass, and the query runs over the same sources.
+pan2 0 260
+wait 700
+shot l9-overlay
+click "search"
+wait 600
+type "vera"
+wait 800
+shot l10-from-the-row
+
+# `enter` opens the top hit here, un-joined, exactly as it would from a
+# double-cmd, and the letter it lands on is the assertion.
+key enter
+wait 900
+click "Vera Kovac · aug 31 09:14"
+wait 700
+shot l11-opened
 quit

@@ -77,6 +77,17 @@ impl RowSpec for MailboxRows {
             "no conversation under this filter".to_string()
         }
     }
+
+    /// Triage under a finger: left archives, right deletes — the same two
+    /// verbs the bar wears over the marks, and asked of the same panel, so
+    /// only the inbox offers the archive. Sweeping left brings *archive* in
+    /// from the right, which is the side of the bar its button sits on.
+    fn swipe_verbs(panel: &Mailbox) -> [Option<&'static str>; 2] {
+        [
+            panel.archives().then_some("mail.archive"),
+            Some("mail.delete"),
+        ]
+    }
 }
 
 /// The widget: the shared table, and the one thing a mailbox adds to it —

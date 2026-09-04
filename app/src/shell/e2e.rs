@@ -33,6 +33,15 @@ pub const E2E_TICK_MS: f64 = 30.0;
 /// a shot waits one.
 const SHOT_PATIENCE: u32 = 240;
 
+/// The two fingers a script has. Any two numbers: what matters is that they
+/// are told apart, exactly as the platform's own uids are.
+const FINGER_A: u64 = 1;
+const FINGER_B: u64 = 2;
+
+/// How many moves a scripted gesture is made of. Enough that the first one
+/// clears the slop and the rest belong to the mode it locked.
+const STEPS: u32 = 8;
+
 /// A `shot` that has asked for its frame and is waiting for it.
 ///
 /// The harness runs from the frame event and the draw is *after* it, so at
@@ -204,11 +213,118 @@ impl Stage {
                 None => self.no_such(r, "selectall", &label),
             },
 
-            // Touch is not wired up here: nothing precludes it, and a suite
-            // that asks for it says so out loud rather than failing on a
-            // label that was never drawn.
-            Step::Swipe { .. } | Step::Pan2 { .. } | Step::HoldMove { .. } | Step::Drop => {
-                eprintln!("e2e: {step:?} (touch is not wired up)");
+            // The touch steps go down the stage's own finger path — the one
+            // android drives — so a suite that asks for a gesture proves the
+            // gesture and not a shortcut to its result.
+            Step::Swipe {
+                label,
+                dx,
+                dy,
+                hold,
+            } => match self.hits.by_label(&label) {
+                Some(h) => {
+                    let c = h.rect.pos + h.rect.size / 2.0;
+                    eprintln!("e2e: swipe {label:?} by ({dx}, {dy})");
+                    self.touch_start(FINGER_A, c);
+                    for i in 1..=STEPS {
+                        let f = f64::from(i) / f64::from(STEPS);
+                        self.touch_move(cx, sh, FINGER_A, dvec2(c.x + dx * f, c.y + dy * f));
+                    }
+                    // A whole sweep runs inside one tick and so never draws:
+                    // `hold` leaves the finger down long enough to photograph.
+                    if !hold {
+                        self.touch_stop(cx, sh, FINGER_A, dvec2(c.x + dx, c.y + dy));
+                    }
+                }
+                None => self.no_such(r, "swipe", &label),
+            },
+
+            Step::Pan2 { dx, dy } => {
+                eprintln!("e2e: pan2 by ({dx}, {dy})");
+                let vp = sh.viewport;
+                let mid = self.origin + dvec2(vp.x / 2.0, vp.y / 2.0);
+                let (a, b) = (mid - dvec2(40.0, 0.0), mid + dvec2(40.0, 0.0));
+                self.touch_start(FINGER_A, a);
+                self.touch_start(FINGER_B, b);
+                for i in 1..=STEPS {
+                    let f = f64::from(i) / f64::from(STEPS);
+                    self.touch_move(cx, sh, FINGER_A, dvec2(a.x + f * dx, a.y + f * dy));
+                    self.touch_move(cx, sh, FINGER_B, dvec2(b.x + f * dx, b.y + f * dy));
+                }
+                self.touch_stop(cx, sh, FINGER_A, dvec2(a.x + dx, a.y + dy));
+                self.touch_stop(cx, sh, FINGER_B, dvec2(b.x + dx, b.y + dy));
+            }
+
+            Step::HoldMove {
+                label,
+                dx,
+                dy,
+                hold,
+            } => match self
+                .hits
+                .panel_by_label(&label)
+                .map(|h| {
+                    // A panel is pressed on its header, which is the part
+                    // that grabs — and a panel wins over a control wearing
+                    // the same word, since this step is about picking things
+                    // up rather than about clicking them.
+                    dvec2(
+                        h.rect.pos.x + h.rect.size.x / 2.0,
+                        h.rect.pos.y + kernel::theme::HEAD_H / 2.0,
+                    )
+                })
+                .or_else(|| {
+                    self.hits
+                        .by_label(&label)
+                        .map(|h| h.rect.pos + h.rect.size / 2.0)
+                }) {
+                Some(c) => {
+                    eprintln!("e2e: holdmove {label:?} by ({dx}, {dy})");
+                    self.touch_start(FINGER_A, c);
+                    self.long_press(cx, sh, FINGER_A, c);
+                    if matches!(self.touch.mode, super::touch::Mode::Drag { .. }) {
+                        for i in 1..=STEPS {
+                            let f = f64::from(i) / f64::from(STEPS);
+                            self.touch_move(cx, sh, FINGER_A, dvec2(c.x + dx * f, c.y + dy * f));
+                        }
+                        if !hold {
+                            self.touch_stop(cx, sh, FINGER_A, dvec2(c.x + dx, c.y + dy));
+                        }
+                    } else if dx != 0.0 || dy != 0.0 {
+                        // A step that asked to move something and picked
+                        // nothing up moved nothing: that is a failure, not a
+                        // long press with a short tail.
+                        eprintln!(
+                            "{}e2e: FAIL holdmove {label:?}: nothing was picked up",
+                            r.tag
+                        );
+                        r.failures += 1;
+                        self.touch_stop(cx, sh, FINGER_A, c);
+                    } else {
+                        self.touch_stop(cx, sh, FINGER_A, c);
+                    }
+                }
+                None => self.no_such(r, "holdmove", &label),
+            },
+
+            Step::Drop => {
+                let held = match self.touch.mode {
+                    super::touch::Mode::Drag { uid, .. } | super::touch::Mode::Row { uid } => {
+                        Some(uid)
+                    }
+                    _ => None,
+                };
+                match held {
+                    Some(uid) => {
+                        let p = self.touch.pts.get(&uid).map_or(self.origin, |&(_, p)| p);
+                        eprintln!("e2e: drop");
+                        self.touch_stop(cx, sh, uid, p);
+                    }
+                    None => {
+                        eprintln!("{}e2e: FAIL drop: no gesture is being held", r.tag);
+                        r.failures += 1;
+                    }
+                }
             }
 
             Step::Quit => {

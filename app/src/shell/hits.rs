@@ -53,6 +53,14 @@ pub enum Act {
     /// A hosted widget's own element. The shell only routes the pointer to
     /// it; what the press means is the widget's business.
     Widget,
+    /// A row of a list, registered by the widget that drew it. Like
+    /// [`Act::Widget`] under the pointer — the widget answers the press —
+    /// and unlike it under a finger: the shell's touch machine needs to know
+    /// a row is there before it can decide what a drag across one means, and
+    /// this is the whole of what it needs to know. Which row, what a sweep
+    /// would run, and how to run it stay the widget's
+    /// ([`Grab`](super::hosted::Grab)).
+    Row(SlotId),
 }
 
 impl Act {
@@ -62,7 +70,7 @@ impl Act {
     #[must_use]
     pub fn slot(&self) -> Option<SlotId> {
         match self {
-            Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) => Some(*s),
+            Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) | Act::Row(s) => Some(*s),
             _ => None,
         }
     }
@@ -91,6 +99,19 @@ impl Hit {
             cursor,
             slot: Some(slot),
             act: Act::Widget,
+        }
+    }
+
+    /// A row of a list. The widget answers the press, as it does for
+    /// [`Hit::new`]; the act is what tells a finger there is a row here.
+    #[must_use]
+    pub fn row(label: impl Into<String>, rect: Rect, cursor: MouseCursor, slot: SlotId) -> Hit {
+        Hit {
+            label: label.into(),
+            rect,
+            cursor,
+            slot: Some(slot),
+            act: Act::Row(slot),
         }
     }
 
@@ -127,6 +148,11 @@ impl Hits {
     /// A hosted widget's element, in one line.
     pub fn add(&self, label: impl Into<String>, rect: Rect, cursor: MouseCursor, slot: SlotId) {
         self.push(Hit::new(label, rect, cursor, slot));
+    }
+
+    /// The same, for a row of a list.
+    pub fn add_row(&self, label: impl Into<String>, rect: Rect, cursor: MouseCursor, slot: SlotId) {
+        self.push(Hit::row(label, rect, cursor, slot));
     }
 
     pub fn clear(&self) {
@@ -176,6 +202,35 @@ impl Hits {
             .filter_map(|h| label_rank(h, label, &needle).map(|k| (k, h)))
             .min_by_key(|(k, _)| *k)
             .map(|(_, h)| h.clone())
+    }
+
+    /// The rectangle of the panel whose title matches, ranked as
+    /// [`Hits::by_label`] ranks anything else. Only a panel's own hit is
+    /// [`Act::Focus`], so this is how a gesture aimed at a *panel* finds one
+    /// under a control that wears the same word.
+    #[must_use]
+    pub fn panel_by_label(&self, label: &str) -> Option<Hit> {
+        let needle = label.to_lowercase();
+        self.0
+            .borrow()
+            .iter()
+            .rev()
+            .filter(|h| matches!(h.act, Act::Focus(_)))
+            .filter_map(|h| label_rank(h, label, &needle).map(|k| (k, h)))
+            .min_by_key(|(k, _)| *k)
+            .map(|(_, h)| h.clone())
+    }
+
+    /// The last hit registered for one act — how a gesture finds a panel's
+    /// own rectangle when the finger is on something drawn over it.
+    #[must_use]
+    pub fn by_act(&self, act: &Act) -> Option<Hit> {
+        self.0
+            .borrow()
+            .iter()
+            .rev()
+            .find(|h| h.act == *act)
+            .cloned()
     }
 
     /// Every label on offer, in draw order, deduped — what a failing step

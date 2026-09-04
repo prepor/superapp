@@ -51,6 +51,14 @@ impl PanelAnim {
         self.h.retarget(t.h);
     }
 
+    /// Puts the panel's corner where a finger is holding it. What a
+    /// long-pressed panel rides on: the springs still carry it, so it
+    /// trails the finger rather than sticking to it.
+    pub fn retarget_pos(&mut self, x: f64, y: f64) {
+        self.x.retarget(x);
+        self.y.retarget(y);
+    }
+
     #[must_use]
     pub fn rect(&self) -> Rect {
         Rect {

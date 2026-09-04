@@ -14,8 +14,11 @@
 //! of the last draw, because portal-list items are rebuilt every draw and a
 //! synthesized press must land the way a finger does.
 //!
-//! Long presses and sideways swipes are seams: touch is not wired up, and
-//! nothing here precludes it.
+//! A finger is the shell's to arbitrate and the table's to answer: rows are
+//! registered as rows ([`Hits::add_row`](super::super::hits::Hits::add_row)),
+//! and the three questions a gesture over one raises — which row, what a
+//! sweep would run, and run it — arrive through
+//! [`Grab`](super::super::hosted::Grab).
 
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
@@ -24,7 +27,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 use makepad_widgets::*;
 
-use super::super::hosted::PanelProps;
+use super::super::hosted::{Ask, PanelProps};
 use super::super::keys::Letters;
 use super::suggest::Suggest;
 
@@ -32,7 +35,9 @@ use super::suggest::Suggest;
 const FILTER: &[LiveId] = ids!(filter_input);
 const FILTER_ERR: &[LiveId] = ids!(filter_err_lbl);
 const EMPTY: &[LiveId] = ids!(empty_lbl);
-const LIST: &[LiveId] = ids!(list);
+/// The rows live in a `PortalList` under this name — public because the
+/// shell draws a swipe curtain clipped to it.
+pub const LIST: &[LiveId] = ids!(list);
 
 /// The two band templates inside that `PortalList`.
 const CAPTION_TPL: LiveId = live_id!(caption);
@@ -94,6 +99,20 @@ pub trait RowSpec: 'static {
     /// Empty for a table that would rather show nothing.
     fn empty_line(_filter: &str) -> String {
         String::new()
+    }
+
+    /// What a sideways sweep across one of this panel's rows runs: the verb
+    /// a leftward sweep fires and the verb a rightward one fires, by id.
+    /// `None` where that way means nothing here — the curtain then never
+    /// appears and the lift does nothing.
+    ///
+    /// They are the panel's own verbs, run over the swept row alone: a
+    /// gesture is a verb like any other, so a finger and a bar can never
+    /// offer different ones. The panel answers, not the spec, because
+    /// whether a list may file its rows is a fact about that list — an inbox
+    /// archives and no other mailbox does.
+    fn swipe_verbs(_panel: &Self::Panel) -> [Option<&'static str>; 2] {
+        [None, None]
     }
 }
 
@@ -166,6 +185,14 @@ impl<S: RowSpec> TableView<S> {
         let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) else {
             return;
         };
+        // A finger, arbitrated by the shell and answered here. It is not a
+        // press: the carrier event says nothing, the props say everything,
+        // and nothing below this line should see it.
+        if let Some(ask) = props.grab.ask() {
+            self.grab(cx, &props, &store, view, scope, ask);
+            return;
+        }
+
         let field = view.text_input(cx, FILTER);
         let focused = field.key_focus(cx);
         filter_keeps(&props, focused);
@@ -344,6 +371,88 @@ impl<S: RowSpec> TableView<S> {
             }
             _ => {}
         }
+    }
+
+    /// The three questions a finger over a row raises, answered by the
+    /// rectangles of the last draw — the same ones a press resolves against.
+    fn grab(
+        &mut self,
+        cx: &mut Cx,
+        props: &PanelProps,
+        store: &Store,
+        view: &mut View,
+        scope: &mut Scope,
+        ask: Ask,
+    ) {
+        match ask {
+            // The phone's way to a mark: space and shift belong to a
+            // keyboard, and a finger has neither.
+            Ask::Mark(p) => {
+                let Some(i) = self.row_at(p) else {
+                    return;
+                };
+                with_list::<S, _>(props, |l| {
+                    let Some(row) = l.row(store, i) else {
+                        return;
+                    };
+                    let key = l.table().key(&row);
+                    l.marks_mut().toggle(key);
+                });
+                view.redraw(cx);
+                // The marked set feeds the bar, which the stage draws.
+                if let Some(session) = scope.data.get_mut::<Session>() {
+                    session.redraw();
+                }
+            }
+
+            Ask::Verbs(p) => {
+                if self.row_at(p).is_none() {
+                    return;
+                }
+                props.grab.answer(swipe_verbs::<S>(props));
+            }
+
+            // The committed sweep. The row is marked alone, the panel's own
+            // verb runs over that set, and whatever was marked before goes
+            // back on: a gesture borrows the batch machinery rather than
+            // asking for a second door into the same action.
+            Ask::Run { at, left } => {
+                let Some(i) = self.row_at(at) else {
+                    return;
+                };
+                let Some(id) = swipe_verbs::<S>(props)[usize::from(!left)] else {
+                    return;
+                };
+                let saved = with_list::<S, _>(props, |l| {
+                    let saved = l.marks_mut().take();
+                    if let Some(row) = l.row(store, i) {
+                        let key = l.table().key(&row);
+                        l.marks_mut().add(key);
+                    }
+                    saved
+                });
+                if let Some(session) = scope.data.get_mut::<Session>() {
+                    props.panel.borrow_mut().run(id, session);
+                }
+                if let Some(saved) = saved {
+                    with_list::<S, _>(props, |l| {
+                        l.clear_marks();
+                        l.marks_mut().extend(saved);
+                    });
+                }
+                view.redraw(cx);
+            }
+        }
+    }
+
+    /// The table index of the row a point is on: `None` off the rows, and
+    /// `None` on a mark the filter hides, which is outside the table.
+    fn row_at(&self, p: DVec2) -> Option<usize> {
+        self.rows
+            .iter()
+            .rev()
+            .find(|(_, r, _)| r.contains(p))
+            .and_then(|(at, _, _)| *at)
     }
 
     /// A press, answered by the rectangles of the last draw.
@@ -584,13 +693,18 @@ impl<S: RowSpec> TableView<S> {
         if fr.size.x > 0.0 {
             props.hits.add("filter", fr, MouseCursor::Text, props.slot);
         }
+        // Clipped to the rows' own rectangle: a `PortalList` item reports the
+        // whole of itself, so the one half-scrolled at either end reaches
+        // past the list — over the bar at the panel's foot, where it would
+        // take a click meant for a verb, and under the filter. What is
+        // hittable is what is visible.
+        let clip = view.widget(cx, LIST).area().rect(cx);
         self.rows.clear();
         for (at, w, label, target) in drawn {
-            let r = w.area().rect(cx);
-            if r.size.x <= 0.0 {
+            let Some(r) = visible(w.area().rect(cx), clip) else {
                 continue;
-            }
-            props.hits.add(label, r, MouseCursor::Hand, props.slot);
+            };
+            props.hits.add_row(label, r, MouseCursor::Hand, props.slot);
             self.rows.push((at, r, target));
         }
 
@@ -605,6 +719,33 @@ impl<S: RowSpec> TableView<S> {
         drop(borrow);
         DrawStep::done()
     }
+}
+
+/// The part of a row that is on screen: `None` for one scrolled entirely
+/// out. A zero-sized clip means the list has not drawn yet, and the row
+/// stands as it is.
+fn visible(r: Rect, clip: Rect) -> Option<Rect> {
+    if r.size.x <= 0.0 {
+        return None;
+    }
+    if clip.size.y <= 0.0 {
+        return Some(r);
+    }
+    let top = r.pos.y.max(clip.pos.y);
+    let bot = (r.pos.y + r.size.y).min(clip.pos.y + clip.size.y);
+    (bot > top).then(|| Rect {
+        pos: dvec2(r.pos.x, top),
+        size: dvec2(r.size.x, bot - top),
+    })
+}
+
+/// What a sweep across this panel's rows would run, asked of the instance.
+fn swipe_verbs<S: RowSpec>(props: &PanelProps) -> [Option<&'static str>; 2] {
+    let mut borrow = props.panel.borrow_mut();
+    borrow
+        .as_any()
+        .downcast_mut::<S::Panel>()
+        .map_or([None, None], |p| S::swipe_verbs(p))
 }
 
 /// What the filter keeps from the bars while it has the keyboard, said on

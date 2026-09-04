@@ -1,0 +1,189 @@
+# args:
+# env:
+#
+# The gestures, driven through the state machine android drives: a tap, the
+# one-finger scroll, the two-finger pan and the two-finger swipe that lists
+# the workspaces, the long press that marks a row or picks a panel up, and
+# the sideways sweep that files a row.
+#
+# Assertions are the labels — a step that resolves nothing fails the run —
+# so "the overlay came up", "the panel landed over there" and "that row is
+# gone" are checked by the run rather than by a human reading a picture.
+#
+# A whole gesture runs inside one tick and so never draws: `hold` leaves the
+# finger down long enough to photograph one mid-flight, and `drop` lets go.
+
+wait 900
+
+# -- one finger: the panel under it scrolls ----------------------------------
+
+# Down the inbox's rows and back up, so the top ones are addressable again.
+swipe "inbox" 0 -160
+wait 500
+shot g1-scrolled
+swipe "inbox" 0 160
+wait 500
+
+# -- a tap is a click --------------------------------------------------------
+
+# A sweep that goes nowhere stays inside the slop and lifts as a tap: it
+# opens the row's conversation joined beside the list, exactly as a press
+# does, and the letter resolving is the proof.
+swipe "Q3 infra" 2 0
+wait 900
+click "Vera Kovac · aug 31 09:14"
+wait 600
+shot g2-tapped
+
+# -- two fingers: the strip pans ---------------------------------------------
+
+# Two more columns, so the strip is wider than the screen.
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 900
+key cmd 2
+wait 500
+type "about"
+wait 500
+key enter
+wait 900
+shot g3-wide
+
+# -- a long press picks a panel up -------------------------------------------
+
+# The header grabs. Mid-drag the insertion bar previews where the panel would
+# land; the drop then lands it exactly there, and the manual's own button
+# resolving is the proof it is alive over there.
+holdmove "help" -600 0 hold
+wait 500
+shot g4-drag-preview
+drop
+wait 900
+shot g5-dropped
+click "try it"
+wait 800
+
+# -- two fingers, again: the strip pans --------------------------------------
+
+# The pan is 1:1 while the fingers are down and aligns to a column edge when
+# they lift.
+pan2 -500
+wait 800
+shot g6-panned
+pan2 500
+wait 800
+shot g7-panned-back
+
+# -- two fingers, vertically: the workspaces ---------------------------------
+
+# Down lists them, and a row switches on a tap.
+pan2 0 260
+wait 700
+shot g8-workspaces
+click "workspace 2"
+wait 900
+shot g9-switched
+
+# Down again, and back to the one with the panels on it.
+pan2 0 260
+wait 700
+click "workspace 1"
+wait 900
+
+# Up dismisses whatever is up: the list resolves again underneath, which is
+# what proves the overlay is gone rather than merely transparent.
+pan2 0 260
+wait 600
+pan2 0 -260
+wait 700
+shot g10-overlay-closed
+click "that airport book"
+wait 700
+
+# The overlay's search row is the other way into the launcher.
+pan2 0 260
+wait 600
+click "search"
+wait 600
+type "vera"
+wait 800
+shot g11-search-row
+key esc
+wait 600
+
+# -- a long press marks a row ------------------------------------------------
+
+# Space and shift belong to a keyboard, so this is the phone's way to a mark:
+# the bar grows the verbs over the marked set, and their count is the
+# assertion.
+holdmove "invite: dentist" 0 0
+wait 700
+shot g12-marked
+click "clear"
+wait 700
+
+# -- a sideways sweep files it -----------------------------------------------
+
+# Short of the threshold — a third of the row — the curtain is the selection
+# grey with the word in ink and a hairline at its leading edge, and the lift
+# wipes it back out leaving the conversation where it was.
+swipe "invite: dentist" -120 0 hold
+wait 500
+shot g13-curtain-short
+drop
+wait 900
+click "invite: dentist"
+wait 800
+shot g14-cancelled
+
+# Past it, leftwards: the curtain inverts to ink and says ARCHIVE, entering
+# from the right — the side of the bar that verb's button sits on.
+swipe "Sat hike" -320 0 hold
+wait 500
+shot g15-curtain-archive
+drop
+wait 1200
+shot g16-archived
+
+# Rightwards is DELETE, entering from the left.
+swipe "invoice 2026-08" 320 0 hold
+wait 500
+shot g17-curtain-delete
+drop
+wait 1200
+shot g18-deleted
+
+# The sweep marks the swept row alone, runs the panel's own verb over that one
+# mark, and puts back whatever stood before — nothing, here. Undo gives the
+# conversation back and the mark that filed it with it, so a bar with a count
+# on it is the proof both halves ran; the walk that follows a filing is a
+# preview and so a node of its own, which is why it takes two.
+key cmd+z 2
+wait 1000
+click "clear"
+wait 800
+shot g19-undone
+
+# The list is alive afterwards: a row nothing touched still opens.
+click "weekly: 14 unread"
+wait 900
+shot g20-alive
+
+# And the archived one really was filed, by the panel's own verb. A row click
+# keeps the keyboard on the list, so closing it leaves exactly one
+# conversation by that name anywhere: the archive's own.
+key cmd+w
+wait 900
+key cmd 2
+wait 500
+type "archive"
+wait 600
+key enter
+wait 1000
+click "Sat hike"
+wait 900
+shot g21-in-the-archive
+quit

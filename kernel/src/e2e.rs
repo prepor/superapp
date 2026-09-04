@@ -26,7 +26,9 @@
 //!                       the finger down (shoot the gesture, then `drop`)
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
 //!                       (the workspaces overlay), `pan2 0 -260` swipes up
-//! holdmove "inbox" 400 0 — long-press the element, drag the panel, drop
+//! holdmove "inbox" 400 0 — long-press the element and drag it: a panel is
+//!                       pressed on its header and picked up, and a move of
+//!                       0 0 is the long press alone (a row marks)
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
 //!
@@ -87,9 +89,10 @@ pub enum Step {
     /// strip; vertical toggles the workspaces overlay (down opens, up
     /// closes).
     Pan2 { dx: f64, dy: f64 },
-    /// Long-press the labelled element (a header picks the panel up), drag by
-    /// `(dx, dy)`, and drop — unless `hold` keeps the drag alive (screenshot
-    /// the preview, then `drop`).
+    /// Long-press the labelled element (a header picks the panel up, a row
+    /// marks itself), drag by `(dx, dy)`, and drop — unless `hold` keeps the
+    /// drag alive (screenshot the preview, then `drop`). A move of `0 0` is
+    /// the long press on its own, which is what a row wants.
     HoldMove {
         /// Label substring picking the press point.
         label: String,

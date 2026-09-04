@@ -28,6 +28,7 @@ use super::hosted::{Hosted, OVERLAY_LAUNCHER};
 use super::keys::CmdTap;
 use super::menu::MenuSig;
 use super::overlays::Overlay;
+use super::touch::TouchNav;
 
 /// A line the session said, and when — on the world's clock, so a toast
 /// fades by the same amount on every run.
@@ -63,9 +64,35 @@ pub struct Shell {
     pub grid: Option<Grid>,
 }
 
-/// The grid for a viewport: desktop is 12×6 unless argv said otherwise.
-fn grid_for(forced: Option<Grid>) -> Grid {
-    forced.unwrap_or_default()
+/// The safe area a cutout or a rounded corner leaves the workspace. Zero
+/// everywhere but a phone.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Insets {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+/// The grid a viewport is cut into.
+///
+/// Desktop is always 12×6. Android picks by width: 8×4 on the unfolded
+/// screen and 4×3 on the cover display, the ~600 dp compact/medium
+/// breakpoint a fold or unfold crosses. `--grid` overrides both, which is
+/// how a desktop run previews a phone.
+fn grid_for(vp: DVec2, forced: Option<Grid>) -> Grid {
+    if let Some(g) = forced {
+        return g;
+    }
+    if cfg!(target_os = "android") {
+        if vp.x >= 600.0 {
+            Grid { w: 8, h: 4 }
+        } else {
+            Grid { w: 4, h: 3 }
+        }
+    } else {
+        Grid::default()
+    }
 }
 
 /// Opens one panel, fresh, as the whole of a session — what a library mount
@@ -146,6 +173,24 @@ pub struct Stage {
     pub hits: Hits,
     #[rust]
     pub cmd_tap: CmdTap,
+    /// Every finger on the glass, and the gesture they add up to.
+    #[rust]
+    pub touch: TouchNav,
+    /// A row mid-sweep and the curtain over it. It outlives the finger: a
+    /// committed sweep keeps animating until the curtain has covered the row.
+    #[rust]
+    pub row_swipe: Option<super::touch::RowSwipe>,
+    /// The insertion bar previewing where a dragged panel would land, in
+    /// strip coordinates.
+    #[rust]
+    pub drag_hint: Option<kernel::layout::Rect>,
+    /// The soft keyboard's bottom occlusion, in points. The workspace is
+    /// shortened by it, so the panels make room themselves.
+    #[rust]
+    pub kb_h: f64,
+    /// What the screen does not lend the workspace.
+    #[rust]
+    pub insets: Insets,
     #[rust]
     pub e2e: Option<kernel::e2e::Runner>,
     /// A `shot` step that has asked the rasterizer for its own frame and is
@@ -214,6 +259,8 @@ fn event_kind(e: &Event) -> &'static str {
         Event::MouseMove(_) => "mouse-move",
         Event::MouseUp(_) => "mouse-up",
         Event::Scroll(_) => "scroll",
+        Event::TouchUpdate(_) => "touch",
+        Event::LongPress(_) => "long-press",
         Event::Timer(_) => "timer",
         Event::Signal => "signal",
         Event::Actions(_) => "actions",
@@ -300,7 +347,7 @@ impl Stage {
             virtual_time: boot.virtual_time,
             grid: boot.grid,
         });
-        sh.session.set_grid(grid_for(sh.grid));
+        sh.session.set_grid(grid_for(sh.viewport, sh.grid));
         match boot.open {
             // One panel, fresh, in place of the session — alone at the
             // viewport when solo, else the first column of the strip.
@@ -578,6 +625,55 @@ impl Stage {
         }
     }
 
+    /// The rectangle the workspace lives in: the drawn turtle, less what the
+    /// screen does not lend it.
+    ///
+    /// Zero everywhere but a phone. There, the safe area takes the cutout
+    /// and the rounded corners, and android swallows touches in the
+    /// notification-shade pull zone at the very top of the window — 40 dp
+    /// clears both that and a punch-hole camera, which reports no inset of
+    /// its own. When the soft keyboard shows, makepad may slide the whole
+    /// pass up by as much as the focused caret needs; that shift is
+    /// compensated, and the height shortened by the occlusion, which is
+    /// there either way.
+    fn workspace_rect(&self, cx: &Cx2d) -> Rect {
+        let r = cx.turtle().rect();
+        let shift = (-r.pos.y).max(0.0);
+        let ins = self.insets;
+        let top = if cfg!(target_os = "android") {
+            ins.top.max(40.0)
+        } else {
+            ins.top
+        };
+        draw::rect(
+            r.pos.x + ins.left,
+            r.pos.y + shift + top,
+            (r.size.x - ins.left - ins.right).max(40.0),
+            (r.size.y - self.kb_h - top - ins.bottom).max(40.0),
+        )
+    }
+
+    /// Android's authoritative text state, when no panel's field is
+    /// listening for it.
+    ///
+    /// The launcher's query is the one field the shell owns, and it owns the
+    /// whole protocol itself — so the state is handed over whole rather than
+    /// read here. That is the guard: a state carrying a composition is a
+    /// keyboard still making up its mind, and a shell that pulled characters
+    /// out of one would type them a second time.
+    fn handle_ime_state(&mut self, cx: &mut Cx, sh: &mut Shell, fs: &FullTextState) {
+        if sh.overlay != Overlay::Launcher {
+            return;
+        }
+        let ev = Event::TextInput(TextInputEvent {
+            input: String::new(),
+            full_state_sync: Some(fs.clone()),
+            ..Default::default()
+        });
+        self.forward_to_overlay(cx, sh, &ev);
+        sh.session.redraw();
+    }
+
     /// One frame of virtual or wall time. Answers the seconds it advanced.
     fn tick(&mut self, cx: &mut Cx, sh: &mut Shell) -> f64 {
         if !sh.virtual_time {
@@ -683,7 +779,7 @@ impl Widget for Stage {
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
         }
-        let vp = cx.turtle().rect();
+        let vp = self.workspace_rect(cx);
         self.origin = vp.pos;
         let dpi = cx.current_dpi_factor();
         self.measure_cell(cx, dpi);
@@ -693,6 +789,7 @@ impl Widget for Stage {
         if let Some(sh) = shell.as_deref_mut() {
             if (sh.viewport - vp.size).length() > 1.0 {
                 sh.viewport = vp.size;
+                sh.session.set_grid(grid_for(vp.size, sh.grid));
                 sh.session.set_viewport((vp.size.x, vp.size.y));
             }
             // How wide a column reads, in characters: the width of a panel
@@ -749,6 +846,7 @@ impl Widget for Stage {
             }
         }
         self.shell = shell;
+        self.track_row_rect();
         // Drawn: a mount's replay may take its next step.
         self.stale_hits = false;
 
@@ -838,11 +936,16 @@ impl Stage {
             Event::KeyUp(k) => self.handle_key_up(cx, sh, k),
 
             Event::TextInput(e) => {
-                // A hosted widget's own field owns the whole input protocol,
-                // so it gets the original event untouched; what is left over
-                // goes through the shell's one text door.
+                // A hosted widget's own field owns the whole input protocol
+                // — a plain character and android's authoritative full state
+                // alike — so it gets the original event untouched. What is
+                // left over splits by shape: a full state to
+                // [`Stage::handle_ime_state`], characters to the shell's one
+                // text door.
                 if sh.overlay == Overlay::None && self.hosted_focus(sh) {
                     self.forward_to_focused(cx, sh, event);
+                } else if let Some(fs) = e.full_state_sync.clone() {
+                    self.handle_ime_state(cx, sh, &fs);
                 } else {
                     let input = e.input.clone();
                     self.handle_text(cx, sh, &input);
@@ -851,6 +954,58 @@ impl Stage {
 
             Event::MouseMove(e) => self.handle_mouse_move(cx, sh, e.abs),
             Event::MouseDown(e) => self.handle_mouse_down(cx, sh, e),
+
+            // The fingers. Everything they mean is decided in `touch`; the
+            // platform's own long press is the one gesture it detects for us.
+            Event::TouchUpdate(e) => {
+                self.cmd_tap.other_input();
+                self.touch_update(cx, sh, e);
+            }
+            Event::LongPress(e) => self.long_press(cx, sh, e.uid, e.abs),
+
+            // The viewport follows the drawn turtle; what is captured here is
+            // what a cutout or a rounded corner carves out of it. The next
+            // draw picks both up.
+            Event::WindowGeomChange(e) => {
+                let ins = e.new_geom.safe_area_insets;
+                self.insets = Insets {
+                    top: ins.top,
+                    right: ins.right,
+                    bottom: ins.bottom,
+                    left: ins.left,
+                };
+                self.redraw_scoped(cx);
+            }
+
+            // An `adjustNothing` manifest: the app makes its own room. The
+            // occlusion shortens the viewport, and the panels spring up.
+            Event::VirtualKeyboard(e) => {
+                self.kb_h = match e {
+                    VirtualKeyboardEvent::WillShow { height, .. }
+                    | VirtualKeyboardEvent::DidShow { height, .. } => *height,
+                    VirtualKeyboardEvent::WillHide { .. }
+                    | VirtualKeyboardEvent::DidHide { .. } => 0.0,
+                };
+                sh.session.redraw();
+                self.next_frame = cx.new_next_frame();
+                self.redraw_scoped(cx);
+            }
+
+            // The soft keyboard's action button. A field that has the caret
+            // answers it itself, through its own hit path; when the keyboard
+            // belongs to the shell it is this grammar's enter.
+            Event::ImeAction(_) => {
+                let field = self.field_letters(sh.session.focus()) != super::keys::Letters::NONE;
+                if !field && sh.overlay != Overlay::Launcher {
+                    let k = KeyEvent {
+                        key_code: KeyCode::ReturnKey,
+                        modifiers: KeyModifiers::default(),
+                        is_repeat: false,
+                        time: sh.session.now(),
+                    };
+                    self.handle_key_down(cx, sh, &k);
+                }
+            }
 
             Event::Scroll(e) => {
                 self.cmd_tap.other_input();
@@ -875,9 +1030,13 @@ impl Stage {
                 }
                 let dt = self.tick(cx, sh);
                 let moving = sh.anim.advance(dt);
+                // A held panel against an edge and a curtain mid-wipe move
+                // outside the scene's own springs, so they say for themselves
+                // whether they still want frames.
+                let gesturing = self.touch_tick(sh, dt);
                 let now = sh.session.now();
                 let toasting = sh.toasts.iter().any(|t| now - t.at <= 3.0);
-                if moving || toasting {
+                if moving || toasting || gesturing {
                     self.next_frame = cx.new_next_frame();
                 }
                 if super::boot::frame_log() && self.mount {
@@ -887,6 +1046,9 @@ impl Stage {
                     );
                 }
                 self.redraw_scoped(cx);
+                // It changes the world, so it runs after the frame's own
+                // bookkeeping rather than in the middle of it.
+                self.settle_row_swipe(cx, sh);
             }
 
             _ => {}

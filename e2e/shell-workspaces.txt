@@ -10,9 +10,10 @@
 # draws those titles itself, so there is no label in the window to click and
 # the menu's half is asserted by `cargo test`, not here.
 #
-# The two-finger swipe that lists the workspaces is touch, which is not
-# wired up: those steps are dropped rather than written against something
-# that would silently do nothing.
+# A two-finger swipe down lists the same roster in an overlay whose rows
+# switch on a tap, and a swipe up puts it away; `e2e/shell-touch.txt` walks
+# every gesture, and the two steps here are the ones that belong to this
+# chapter.
 
 wait 900
 shot ws-1
@@ -66,4 +67,25 @@ wait 900
 click "that airport book"
 wait 900
 shot ws-3-undone
+
+# -- the overlay -------------------------------------------------------------
+
+# Two fingers down lists them: the rows carry what each space is showing, and
+# a tap goes there.
+pan2 0 260
+wait 700
+shot ws-overlay
+click "workspace 3"
+wait 900
+shot ws-3-via-overlay
+
+# Two fingers up put it away again, and the space underneath is untouched: a
+# row of the list it left resolving is the proof it is gone.
+pan2 0 260
+wait 600
+pan2 0 -260
+wait 700
+click "Q3 infra"
+wait 800
+shot ws-overlay-closed
 quit

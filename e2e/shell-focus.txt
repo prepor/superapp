@@ -69,4 +69,26 @@ wait 900
 click "job facts"
 wait 700
 shot f5-walked-from-the-list
+
+# -- the workspace modifier on a bar entry ------------------------------------
+
+# `cmd+click` reaches a bar too: a link opened with the workspace modifier is
+# a column of its own rather than a joined child, exactly as `cmd+click` on a
+# row is. The manual's *about* is a solid link, so a plain click would join.
+mouse "help"
+wait 700
+cmdclick "about"
+wait 900
+shot f6-un-joined
+
+# The proof: closing the panel it was opened from leaves it standing. A join
+# closes with its parent, so a joined *about* would take its bar with it and
+# the link below would resolve against nothing.
+key cmd+left
+wait 700
+key cmd+w
+wait 900
+click "back to help"
+wait 800
+shot f7-outlived-its-parent
 quit

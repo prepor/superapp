@@ -23,7 +23,7 @@ impl Stage {
         // nothing.
         let hover = hit
             .map(|h| h.act)
-            .filter(|a| !matches!(a, Act::Focus(_) | Act::Widget));
+            .filter(|a| !matches!(a, Act::Focus(_) | Act::Widget | Act::Row(_)));
         if hover != sh.hover {
             sh.hover = hover;
             sh.session.redraw();
@@ -37,9 +37,10 @@ impl Stage {
         let Some(hit) = self.hits.at(e.abs) else {
             return;
         };
-        // A hosted field under the click already took key focus through the
-        // forwarded event — stealing it back would kill the caret.
-        if hit.act != Act::Widget {
+        // A hosted field or row under the click already took key focus
+        // through the forwarded event — stealing it back would kill the
+        // caret, or hand a list's keyboard to nobody.
+        if !matches!(hit.act, Act::Widget | Act::Row(_)) {
             cx.set_key_focus(self.area);
         }
         // cmd (alt as a quiet alias): always a fresh, un-joined panel.
@@ -48,17 +49,20 @@ impl Stage {
     }
 
     /// Runs what a hit means.
+    ///
+    /// `fresh` is the workspace modifier: an entry that goes somewhere opens
+    /// it un-joined, like `cmd+click` anywhere else. Everything else ignores
+    /// it — there is no un-joined way to close a panel or to focus one.
     pub(super) fn resolve(&mut self, cx: &mut Cx, sh: &mut Shell, act: Act, fresh: bool) {
-        let _ = fresh;
         match act {
-            Act::Widget => {}
+            Act::Widget | Act::Row(_) => {}
             Act::Focus(slot) | Act::Tab(slot) => sh.session.nav(Nav::Focus(slot)),
             Act::Close(slot) => self.close_slot(sh, slot),
             Act::Verb(slot, id) => {
                 // A click on a bar takes the panel with it: the chords that
                 // bar answers to are the focused panel's from here on.
                 sh.session.nav(Nav::Focus(slot));
-                self.run_verb(sh, slot, id);
+                self.run_verb_fresh(sh, slot, id, fresh);
             }
             Act::WsRow(k) => self.switch_ws(sh, k),
             Act::LauncherOpen => self.open_launcher(cx, sh),

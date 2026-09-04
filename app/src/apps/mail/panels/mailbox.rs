@@ -110,6 +110,14 @@ impl Mailbox {
         Some(self.preview(row.target))
     }
 
+    /// Whether this list's rows may be archived: only the inbox's, which is
+    /// the same answer [`Mailbox::verbs`] gives the bar. A gesture asks it
+    /// too, so a finger and a button can never offer different verbs.
+    #[must_use]
+    pub fn archives(&self) -> bool {
+        self.role == Role::Inbox
+    }
+
     /// Marks the table again — what undo hands back after a batch verb took
     /// them off.
     pub fn restore_marks(&mut self, keys: &[i64]) {

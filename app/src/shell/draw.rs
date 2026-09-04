@@ -506,6 +506,16 @@ impl Stage {
         self.draw_tabs(cx, sh, &cam);
         self.draw_bridges(cx, sh, &cam);
 
+        // The drop preview: an ink insertion bar where a held panel would
+        // land — vertical in a gap (a fresh column), horizontal across a
+        // column (stacked at that row).
+        if let Some(h) = self.drag_hint {
+            let r = cam.to_screen(h, active);
+            self.draw_flat.new_draw_call(cx);
+            self.draw_flat.color = rgba_a(theme::INK, 0.85);
+            self.draw_flat.draw_abs(cx, r);
+        }
+
         // An empty workspace names itself, so a switch onto a blank screen
         // reads as a place, not a bug.
         if sh.session.ws().is_empty() && sh.anim.ghosts.is_empty() {
