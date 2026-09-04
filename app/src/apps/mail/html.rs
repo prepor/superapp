@@ -28,7 +28,7 @@ use simplecss::{AttributeOperator, Declaration, DeclarationTokenizer, PseudoClas
 /// is stored, so a reading is only as good as the build that wrote it:
 /// bump this whenever the narrowing changes what it keeps or how, and the
 /// store redoes every reading it holds from raw on its next open.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Input past this is cut before parsing: a letter is not a website, and a
 /// multi-megabyte one is a mistake or an attack.
@@ -580,11 +580,14 @@ impl Fmt {
     /// The inline tags this run needs, in the one order they are nested.
     /// Inside `<pre>` the widget is already in the fixed face, so `<code>`
     /// would only add its background.
+    ///
+    /// The link goes **innermost**, under every style the run carries. The
+    /// widget draws a link as a child widget and hands it the first text it
+    /// finds under the `<a>` — and a tag in between leaves an empty text
+    /// node there, so `<a><u>go</u></a>` would draw a link that says
+    /// nothing. `<u><a>go</a></u>` reads the same and says it.
     fn tags(&self, in_pre: bool) -> Vec<Tag> {
         let mut v = Vec::new();
-        if let Some(h) = &self.link {
-            v.push(Tag::Link(h.clone()));
-        }
         if self.bold {
             v.push(Tag::Bold);
         }
@@ -605,6 +608,9 @@ impl Fmt {
         }
         if self.sup {
             v.push(Tag::Sup);
+        }
+        if let Some(h) = &self.link {
+            v.push(Tag::Link(h.clone()));
         }
         v
     }

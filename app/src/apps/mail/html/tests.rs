@@ -180,6 +180,28 @@ fn links_are_scheme_filtered() {
     );
 }
 
+/// A styled link keeps its words. The widget hands a link the first text
+/// it finds under the `<a>`, and a tag in between leaves an empty text
+/// node there — so the styles wrap the link and not the other way round,
+/// and an underlined newsletter link still says what it links to.
+#[test]
+fn a_styled_link_keeps_its_text() {
+    assert_eq!(
+        sanitize(r#"<a href="https://x.dev" style="text-decoration: underline">go</a>"#),
+        r#"<u><a href="https://x.dev">go</a></u>"#
+    );
+    assert_eq!(
+        sanitize(r#"<b><a href="https://x.dev"><i>go</i></a></b>"#),
+        r#"<b><i><a href="https://x.dev">go</a></i></b>"#
+    );
+    // Style that changes inside the link splits it into two items, each
+    // holding its own words rather than one holding none.
+    assert_eq!(
+        sanitize(r#"<a href="https://x.dev">read <b>this</b></a>"#),
+        r#"<a href="https://x.dev">read</a> <b><a href="https://x.dev">this</a></b>"#
+    );
+}
+
 /// A link is one item to the widget: it cannot span lines, so a link
 /// around block content (a newsletter's button) is re-opened on each
 /// line, and one with no text at all vanishes.
