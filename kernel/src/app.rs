@@ -139,6 +139,16 @@ pub trait App: Any + Sync + Send + 'static {
         false
     }
 
+    /// The registry, finished, once for every app at the end of
+    /// [`Apps::new`]. An app that needs the *list* — the tools every app
+    /// offers, the data dictionaries — copies what it needs here.
+    ///
+    /// It may not keep the reference: a registry is built per boot and a
+    /// test builds several, so what an app holds on to is its own copy and
+    /// the last one wins. Nothing else may be done here — the store is not
+    /// open yet.
+    fn attach(&self, _apps: &Apps) {}
+
     /// For [`Apps::get_as`].
     fn as_any(&self) -> &dyn Any;
 }
@@ -208,7 +218,14 @@ impl Apps {
                 tools.push(tool);
             }
         }
-        Apps { list, kinds, tools }
+        let apps = Apps { list, kinds, tools };
+        // Last, with everything in it: an app that needs the list — the
+        // agent, whose request carries every tool and every `describe` —
+        // takes its copy here.
+        for app in list {
+            app.attach(&apps);
+        }
+        apps
     }
 
     /// An app by id, or `None` when it is not in this build. This is how
@@ -487,6 +504,16 @@ pub enum Step {
     Sql(&'static str),
     /// Applied once, in order.
     Run(fn(&Connection) -> rusqlite::Result<()>),
+    /// Run at **every** open, in its place in the ladder: what a crash left
+    /// behind is put right here, before any worker is asked for. An agent
+    /// run that was streaming when the process died has no worker coming
+    /// back for it and no job in the queue, so the open is the only moment
+    /// anyone can say so.
+    ///
+    /// Recorded like any other rung the first time it runs, so the ladder's
+    /// counter still says how far a store got — a step added after it is
+    /// still a step this store has not climbed.
+    Always(fn(&Connection) -> rusqlite::Result<()>),
     /// Data rebuilt from other rows (a search index, a narrowing, derived
     /// rows): runs whenever `meta[key]` is not `version`, then sets it.
     Derived {
@@ -517,8 +544,9 @@ impl Schema {
     }
 
     /// Climbs the ladder: every step not yet run, in order, plus every
-    /// [`Step::Derived`] whose version has moved. Runs at every store open,
-    /// after the kernel's own.
+    /// [`Step::Derived`] whose version has moved and every [`Step::Always`],
+    /// which runs whatever the counter says. Runs at every store open, after
+    /// the kernel's own.
     ///
     /// # Errors
     ///
@@ -539,6 +567,9 @@ impl Schema {
                         f(conn)?;
                     }
                 }
+                // Every open, however far the ladder has already got: the
+                // sweep is the point, not the climb.
+                Step::Always(f) => f(conn)?,
                 Step::Derived {
                     key,
                     version,
@@ -1117,6 +1148,43 @@ mod tests {
         let _ = Apps::new(CLASHING);
     }
 
+    /// An app that needs the finished list is handed it once, with every
+    /// other app's tools already in it.
+    struct Watcher;
+
+    /// What [`Watcher`] copied out of the registry it was attached to.
+    static ATTACHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    impl App for Watcher {
+        fn id(&self) -> &'static str {
+            "watcher"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn attach(&self, apps: &Apps) {
+            let mut seen = ATTACHED.lock().expect("what the watcher saw");
+            *seen = apps.tools().iter().map(|t| t.name.to_string()).collect();
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static WATCHER: Watcher = Watcher;
+    static WATCHING: &[&dyn App] = &[&TOOLBOX, &WATCHER];
+
+    #[test]
+    fn an_app_is_attached_to_the_finished_registry() {
+        let apps = Apps::new(WATCHING);
+        let seen = ATTACHED.lock().expect("what the watcher saw").clone();
+        assert_eq!(
+            seen,
+            vec!["toolbox.look".to_string(), "toolbox.touch".to_string()],
+            "the whole list, whoever offered it, and whatever order the apps came in"
+        );
+        assert_eq!(apps.tools().len(), 2);
+    }
+
     #[test]
     fn the_registry_answers_by_id_and_by_tag() {
         let apps = Apps::new(ONE_APP);
@@ -1270,6 +1338,34 @@ mod tests {
             .unwrap();
         assert_eq!(planted, 1, "the steps ran once");
         assert_eq!(meta(&store, "rebuilds"), 1, "and so did the rebuild");
+    }
+
+    /// A rung that runs at every open runs on the climb *and* on every open
+    /// after it, in its place in the ladder — and the counter still says how
+    /// far the ladder got.
+    #[test]
+    fn an_always_step_runs_at_every_open() {
+        static SWEEPING: Schema = Schema {
+            app: "one",
+            steps: &[
+                Step::Sql("CREATE TABLE one_thing(id INTEGER PRIMARY KEY, name TEXT)"),
+                Step::Always(|c| {
+                    c.execute(
+                        "INSERT INTO meta(key, value) VALUES('sweeps', 1)
+                         ON CONFLICT(key) DO UPDATE SET value = value + 1",
+                        [],
+                    )
+                    .map(|_| ())
+                }),
+            ],
+        };
+        let store = Store::open(None, &[&SWEEPING]).expect("store");
+        assert_eq!(meta(&store, "sweeps"), 1);
+        assert_eq!(meta(&store, "schema:one"), 2, "recorded like any rung");
+
+        store.write(|c| SWEEPING.apply(c)).expect("a second open");
+        assert_eq!(meta(&store, "sweeps"), 2, "and again on the next open");
+        assert_eq!(meta(&store, "schema:one"), 2, "with the counter standing");
     }
 
     /// A `Derived` step is versioned by the walk that made it, not by the

@@ -49,6 +49,11 @@ script_mod! {
                         // a card.
                         files_dir_tpl := mod.widgets.FilesDirPanel{}
                         files_card_tpl := mod.widgets.FilesCardPanel{}
+                        // The agent's two tags. Bare views until the chat
+                        // draws: phase 1 is the engine, and the shell
+                        // refuses a registered tag with no template.
+                        agent_chat_tpl := View{}
+                        agent_agents_tpl := View{}
                         sys_help_tpl := mod.widgets.SysHelpPanel{}
                         sys_about_tpl := mod.widgets.SysAboutPanel{}
                         sys_effects_tpl := mod.widgets.SysEffectsPanel{}
@@ -88,6 +93,8 @@ script_mod! {
                             mail_add_account_tpl := mod.widgets.MailAddAccountPanel{}
                             files_dir_tpl := mod.widgets.FilesDirPanel{}
                             files_card_tpl := mod.widgets.FilesCardPanel{}
+                            agent_chat_tpl := View{}
+                            agent_agents_tpl := View{}
                             sys_help_tpl := mod.widgets.SysHelpPanel{}
                             sys_about_tpl := mod.widgets.SysAboutPanel{}
                             sys_effects_tpl := mod.widgets.SysEffectsPanel{}

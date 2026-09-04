@@ -5,28 +5,49 @@
 //! around: a chat is rows like any other, a tool is a verb's own code path
 //! over ids, and `cmd+z` is the answer to a call that should not have run.
 //!
-//! This phase is the floor, and nothing draws yet. What is here is the
-//! outside of a chat: the [`wire`] types the chat-completions API speaks,
-//! the [`Gateway`] capability the model sits behind, the scripted
-//! [`FakeGateway`] every test and every suite gets instead, and the consts
-//! that say which model answers and where it is. Phase 1 adds the schema,
-//! the two panels, the worker and the token; phase 3 adds the tools, which
-//! is when [`App::tools`](kernel::app::App::tools) here stops being empty.
+//! **The store is the bus.** A run has three parties on three threads — the
+//! person in the chat panel, the [`worker`] talking to the gateway, and the
+//! one writer every write goes through — and they meet in [`model`]'s rows.
+//! A person sends; the worker asks the model and streams the answer into
+//! the live tail on this app's own static; where the model asks for tools,
+//! the worker files a call row apiece and sleeps, and the chat panel runs
+//! them ([`calls`]) and kicks it awake. Nothing in the kernel schedules
+//! anything for this app.
+//!
+//! What draws is two panels — a conversation and the list of them — and
+//! what leaves the process is one in-memory effect, [`run::Complete`],
+//! behind one capability, [`Gateway`]: the real one over `kernel::http` on
+//! a window's own run, the scripted [`FakeGateway`] in every test, every
+//! suite and every library mount.
 
-// Until a chat draws, the tests are the only caller of any of this: the app
-// registers a capability and no panel, and `apps` is a private module, so
-// every type below reads as dead to a build with no `cfg(test)`. Phase 1
-// takes this line out with the first widget that uses them.
+// The engine is whole and nothing draws it yet. What is left over is
+// exactly the half a widget calls — the composer's draft, the live tail,
+// the usage line, the pending calls a shown chat runs — plus the script
+// entries only a test plants. The widgets take this line out with them.
 #![allow(dead_code)]
 
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-use kernel::app::{App, Capabilities, Env, Mode};
+use kernel::app::{App, Apps, Capabilities, Env, Mode, ProblemSource, Root, Schema, Worker};
 use kernel::panel::PanelKind;
+use kernel::store::Store;
+use kernel::tool::Tool;
 
+pub mod calls;
 pub mod fake;
 pub mod gateway;
+pub mod model;
+pub mod panels;
+pub mod problems;
+pub mod prompt;
+pub mod real;
+pub mod run;
+pub mod schema;
+pub mod ui;
 pub mod wire;
+pub mod worker;
 
 #[cfg(test)]
 mod fixtures;
@@ -35,6 +56,10 @@ mod tests;
 
 pub use fake::FakeGateway;
 pub use gateway::{Gateway, Provider};
+pub use model::RunId;
+pub use panels::{Agents, Chat};
+pub use real::RealGateway;
+pub use ui::UI;
 
 /// The model behind every chat here: one of the models Cloudflare hosts
 /// itself, which the gateway reaches as the `workers-ai` provider. A
@@ -64,45 +89,118 @@ pub static PROVIDER: Provider = Provider {
     reasoning_effort: REASONING_EFFORT,
 };
 
-/// The app.
-pub struct Agent;
+/// The app, and the little it keeps in memory.
+///
+/// Three things, and each is here because a row would be the wrong place
+/// for it. A **tail** is what has arrived of an answer still being written:
+/// a token a row would be a thousand writes a turn. The **wake** hook is
+/// the shell's way of asking for a frame, which the kernel has no word for.
+/// The **tools** and the **describes** are copied out of the registry in
+/// [`App::attach`], because a request is built on a worker's thread with no
+/// registry in reach.
+pub struct Agent {
+    /// What is arriving, per run in flight. Ordered by run id, which costs
+    /// nothing and is what a `static` can be built with.
+    tails: Mutex<BTreeMap<RunId, run::Tail>>,
+    tools: Mutex<Vec<Tool>>,
+    describes: Mutex<Vec<(&'static str, &'static str)>>,
+    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
 
 /// The one in this build.
-pub static AGENT: Agent = Agent;
+pub static AGENT: Agent = Agent {
+    tails: Mutex::new(BTreeMap::new()),
+    tools: Mutex::new(Vec::new()),
+    describes: Mutex::new(Vec::new()),
+    wake: Mutex::new(None),
+};
+
+static CHAT_KIND: panels::ChatKind = panels::ChatKind;
+static AGENTS_KIND: panels::AgentsKind = panels::AgentsKind;
+static KINDS: &[&dyn PanelKind] = &[&CHAT_KIND, &AGENTS_KIND];
+
+static GATEWAY_PROBLEMS: problems::GatewayProblems = problems::GatewayProblems;
+static SOURCES: &[&dyn ProblemSource] = &[&GATEWAY_PROBLEMS];
 
 impl App for Agent {
     fn id(&self) -> &'static str {
         "agent"
     }
 
-    /// None yet: phase 1 registers `chat`, over one conversation, and
-    /// `agents`, the list of them.
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
-        &[]
+        KINDS
+    }
+
+    fn schema(&self) -> Option<&'static Schema> {
+        Some(&schema::SCHEMA)
+    }
+
+    /// The list, and a blank sheet: the two ways into a chat, in the order
+    /// the launcher offers them.
+    fn roots(&self) -> Vec<Root> {
+        vec![
+            Root::new(Agents::id(), "agents", "chats assistant model"),
+            Root::new(Chat::new_id(), "new chat", "ask assistant agent chat"),
+        ]
     }
 
     /// The model, for one world.
     ///
-    /// A scripted run, a test and a library mount get [`FakeGateway`],
-    /// registered under the trait *and* under its own type, so a test can
-    /// reach `get::<FakeGateway>()` to plant a script or read what the
-    /// model was told.
-    fn outside(&self, mode: Mode, _env: &Env, caps: &mut Capabilities) {
-        match mode {
-            // phase 0 follow-up: the real gateway over `kernel::http` and
-            // `kernel::sse`, behind `PROVIDER`, with the Cloudflare token
-            // device sync already holds. Until it lands a real run has no
-            // gateway, and a request through one fails in words.
-            Mode::Real | Mode::Deny => {}
-            Mode::Fake => {
-                let fake = FakeGateway::default_script();
-                caps.insert::<dyn Gateway>(Box::new(fake.clone()));
-                caps.insert::<FakeGateway>(Box::new(fake));
-            }
+    /// A window's own run, replaying nothing and on the wall clock, reaches
+    /// the real gateway; everything else — a scripted run, a test, a
+    /// library mount — gets [`FakeGateway`], registered under the trait
+    /// *and* under its own type, so a test can reach `get::<FakeGateway>()`
+    /// to plant a script or read what the model was told.
+    fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
+        if mode == Mode::Deny {
+            return;
         }
+        if mode == Mode::Real && !env.scripted && !env.clock.is_virtual() {
+            caps.insert::<dyn Gateway>(Box::new(RealGateway::new(env)));
+            return;
+        }
+        let fake = FakeGateway::default_script();
+        caps.insert::<dyn Gateway>(Box::new(fake.clone()));
+        caps.insert::<FakeGateway>(Box::new(fake));
+    }
+
+    fn problems(&self) -> &'static [&'static dyn ProblemSource] {
+        SOURCES
+    }
+
+    fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
+        worker::workers(store)
+    }
+
+    /// What every request carries: the tools this build offers, and each
+    /// app's data in its own words. Copied here, at the one moment the
+    /// finished registry exists, because the thread that builds a request
+    /// has no registry to ask.
+    fn attach(&self, apps: &Apps) {
+        let (tools, describes) = Agent::registry_of(apps);
+        self.learn(tools, describes);
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl Agent {
+    /// What a request carries, read off the finished registry: every tool
+    /// this build offers, in app-list order, and each app's data in its own
+    /// words under the app's id — apps that describe nothing say nothing.
+    ///
+    /// Split out of [`App::attach`] so it can be read without the static:
+    /// the copy is the app's, and a test that wanted to prove the copy
+    /// would otherwise be racing every other test that builds a registry.
+    #[must_use]
+    fn registry_of(apps: &Apps) -> (Vec<Tool>, Vec<(&'static str, &'static str)>) {
+        let describes = apps
+            .list()
+            .iter()
+            .filter_map(|a| Some((a.id(), a.describe()?)))
+            .collect();
+        (apps.tools().to_vec(), describes)
     }
 }

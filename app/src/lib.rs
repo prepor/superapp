@@ -32,7 +32,7 @@ use crate::shell::system;
 static APPS: &[&dyn App] = &[&mail::MAIL, &files::FILES, &agent::AGENT, &system::SYSTEM];
 
 /// Their Makepad halves, in the same order.
-static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &system::UI];
+static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &agent::UI, &system::UI];
 
 /// Hands the shell the app list.
 ///
