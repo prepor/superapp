@@ -602,6 +602,27 @@ fn the_list_says_what_is_open_where_and_what_is_joined_to_what() {
     );
 }
 
+// -- panels.context ---------------------------------------------------------------------
+
+#[test]
+fn the_context_of_a_slot_is_the_panel_rendered_for_the_model() {
+    let mut s = session();
+    let list = open_root(&mut s, list_id());
+    let out = call(&mut s, "panels.context", json!({"slot": list})).expect("the panel's text");
+    assert_eq!(out["slot"], json!(list));
+    assert_eq!(out["title"], json!("notes"));
+    let text = out["context"].as_str().expect("the rendered panel");
+    assert!(
+        text.starts_with("<panel id=\"notes\" title=\"notes\" workspace=\"1\">"),
+        "the header names the panel: {text}"
+    );
+    assert!(text.trim_end().ends_with("</panel>"), "a whole block: {text}");
+
+    // A slot nobody has open is refused by number, in words.
+    let err = call(&mut s, "panels.context", json!({"slot": 999})).expect_err("no such slot");
+    assert_eq!(err, "no panel in slot 999");
+}
+
 // -- panels.open ------------------------------------------------------------------------
 
 #[test]
@@ -647,12 +668,13 @@ fn the_kernels_tools_lead_the_list_and_read_their_arguments() {
     let s = session();
     let names: Vec<&str> = s.apps().tools().iter().map(|t| t.name).collect();
     assert_eq!(
-        &names[..5],
+        &names[..6],
         &[
             "sql.query",
             "sql.write",
             "sql.schema",
             "panels.list",
+            "panels.context",
             "panels.open"
         ]
     );

@@ -116,6 +116,25 @@ pub fn all() -> Vec<Tool> {
             list,
         ),
         Tool::new(
+            "panels.context",
+            "One open panel as the person sees it: what it is about in its \
+             app's words, the queries its last draw ran with their rows read \
+             again now, and its recent effects — the same text a panel chip \
+             carries into a chat. Call this with a slot from panels.list to \
+             look at what the person is looking at without asking them to \
+             paste it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "integer", "description": "the panel's slot, as panels.list spells it"}
+                },
+                "required": ["slot"],
+                "additionalProperties": false
+            }),
+            false,
+            context,
+        ),
+        Tool::new(
             "panels.open",
             "Open a panel beside the one that has focus, so the person can look \
              at what you are talking about. Focus stays where it is. Use the \
@@ -675,6 +694,24 @@ fn list(s: &mut Session, _input: &Value) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({"panels": panels}))
+}
+
+// -- panels.context ---------------------------------------------------------------
+
+/// One open panel rendered for the model — [`crate::context::render`] over
+/// the slot's identity, its `about`, and the trace of its last draw, the
+/// rows read again now. A slot nobody has open is refused by number.
+fn context(s: &mut Session, input: &Value) -> Result<Value, String> {
+    let slot = input
+        .get("slot")
+        .and_then(Value::as_i64)
+        .ok_or("`slot` must be an integer")?;
+    let slot = SlotId::try_from(slot).map_err(|_| format!("no panel in slot {slot}"))?;
+    let cx = crate::context::of(s, slot).ok_or_else(|| format!("no panel in slot {slot}"))?;
+    let store = s.store().clone();
+    let effects = crate::context::recent_effects(&store, &cx.id, crate::context::EFFECTS);
+    let text = crate::context::render(&store, &cx, &effects);
+    Ok(json!({"slot": slot, "title": cx.title, "context": text}))
 }
 
 // -- panels.open ------------------------------------------------------------------
