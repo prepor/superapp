@@ -3,7 +3,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use kernel::app::App;
+use kernel::app::{App, Worker};
 use kernel::caps::{Clipboard, Disk, FakeClipboard, Watcher};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
@@ -23,6 +23,7 @@ use kernel::caps::{
     image_format, mime_of, ImageFormat, IMAGE_PREVIEW_MAX, TEXT_PREVIEW_MAX,
 };
 use super::ops::copy_name;
+use super::run::{Runner, Task};
 use super::{Card, Dir, Op, FILES};
 
 static APPS: &[&dyn App] = &[&FILES];
@@ -32,13 +33,15 @@ static APPS: &[&dyn App] = &[&FILES];
 /// do take this first.
 static CLIP: Mutex<()> = Mutex::new(());
 
-/// The lock, and an empty clipboard to start from. A poisoned lock is
-/// still a lock: a test that panicked while holding it says so on its own.
+/// The lock, an empty clipboard and an empty queue to start from. A
+/// poisoned lock is still a lock: a test that panicked while holding it
+/// says so on its own.
 fn alone() -> MutexGuard<'static, ()> {
     let g = CLIP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     FILES.clear();
+    FILES.forget_runs();
     g
 }
 
@@ -1247,6 +1250,230 @@ fn a_panel_watches_its_directory_while_it_is_open_and_then_lets_go() {
         0,
         "and with the last of them the watch goes, count and all"
     );
+}
+
+// -- the run -------------------------------------------------------------------
+//
+// Everything above drives a session whose passes run inline, where one pass
+// is the whole run and a verb is over by the time it returns — which is what
+// keeps a test about *copying* about copying. These four are about the run
+// itself: a build with threads performs one path per pass, so they queue one
+// by hand and stand between the paths, where a person would be looking.
+
+/// Three files of `~/Downloads`, held for a verb.
+const THREE: [&str; 3] = [
+    "~/Downloads/README.txt",
+    "~/Downloads/report-q3.pdf",
+    "~/Downloads/logs.tar.gz",
+];
+
+/// The paths above, as the clipboard holds them.
+fn three() -> Vec<String> {
+    THREE.iter().map(|p| (*p).to_string()).collect()
+}
+
+#[test]
+fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let desk = open(&mut s, "~/Desktop").expect("the destination");
+    FILES.set(Op::Copy, three());
+    let clip = FILES.clipboard();
+    let was = nodes(&s);
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Here {
+            verb: Op::Copy,
+            clip,
+            dir: "~/Desktop".to_string(),
+        },
+        desk,
+    );
+    // Queued and not yet started: something is on, so every files panel
+    // offers to stop it — and none of them wears the verb otherwise.
+    assert!(FILES.busy());
+    assert!(bar(&s, desk).contains(&"files.cancel"));
+    assert_eq!(FILES.running(), None, "nothing has been taken in hand yet");
+
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    assert_eq!(
+        with_dir(&s, desk, |d| d.note()),
+        Some("copying 1 of 3 — “README.txt”".to_string()),
+        "the line under the header is the path in hand"
+    );
+    assert!(there(&s, "~/Desktop/README.txt"), "one path is on the disk");
+    assert_eq!(nodes(&s), was, "and nothing is recorded until the run is over");
+
+    runner.pass(&w);
+    runner.pass(&w);
+    assert_eq!(
+        FILES.running().map(|p| p.line()),
+        Some("copying 3 of 3 — “logs.tar.gz”".to_string())
+    );
+    // The pass that finds nothing left files the run for the UI thread, and
+    // the settle records it — one node for the batch, as it always was.
+    runner.pass(&w);
+    assert_eq!(FILES.running(), None);
+    s.settle();
+    assert_eq!(nodes(&s), was + 1, "one node for the batch");
+    assert!(there(&s, "~/Desktop/logs.tar.gz"));
+    assert!(!FILES.busy());
+    assert!(!bar(&s, desk).contains(&"files.cancel"), "nothing to stop");
+    assert_eq!(with_dir(&s, desk, |d| d.note()), None);
+    assert!(
+        s.notes()
+            .iter()
+            .any(|n| n.msg == "copied 3 files into Desktop — cmd+z undoes"),
+        "and the toast is the verb's own: {:?}",
+        s.notes()
+    );
+
+    assert!(s.undo());
+    assert!(!there(&s, "~/Desktop/README.txt"), "undo trashed the copies");
+    assert!(there(&s, "~/Downloads/README.txt"), "and left the originals");
+}
+
+#[test]
+fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    let was = nodes(&s);
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: three(),
+            own: false,
+        },
+        slot,
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    assert!(!there(&s, "~/Downloads/README.txt"), "the first one went");
+
+    // *cancel*, between two paths. The path in hand is finished — a
+    // half-copied file is nobody's — and the ones behind it are dropped.
+    FILES.stop();
+    runner.pass(&w);
+    assert_eq!(FILES.running(), None);
+    assert!(
+        there(&s, "~/Downloads/report-q3.pdf"),
+        "what it never reached is untouched"
+    );
+
+    s.settle();
+    assert_eq!(
+        nodes(&s),
+        was + 1,
+        "a change with no node behind it is a change nobody can undo"
+    );
+    assert!(
+        s.notes()
+            .iter()
+            .any(|n| n.msg == "1 of 3 files to the trash — stopped — cmd+z undoes"),
+        "and the toast says how far it got: {:?}",
+        s.notes()
+    );
+    assert_eq!(
+        with_dir(&s, slot, |d| d.note()),
+        None,
+        "a run that did something leaves no refusal behind"
+    );
+
+    assert!(s.undo());
+    assert!(there(&s, "~/Downloads/README.txt"), "undo takes back exactly what went");
+
+    // The stop was for that run and not for the app: the next one runs.
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/Downloads/fresh".to_string(),
+        },
+        slot,
+    );
+    runner.pass(&w);
+    runner.pass(&w);
+    s.settle();
+    assert!(there(&s, "~/Downloads/fresh"));
+}
+
+#[test]
+fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: three(),
+            own: false,
+        },
+        slot,
+    );
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/Downloads/never".to_string(),
+        },
+        slot,
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    FILES.stop();
+    runner.pass(&w);
+    s.settle();
+
+    assert!(!FILES.busy(), "one button, and everything stops");
+    assert!(!there(&s, "~/Downloads/never"));
+    assert!(
+        s.notes().iter().any(|n| n
+            .msg
+            .contains("stopped, and one more never started")),
+        "and the one line says what that cost: {:?}",
+        s.notes()
+    );
+}
+
+#[test]
+fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    let was = nodes(&s);
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: vec!["~/Downloads/README.txt".to_string()],
+            own: true,
+        },
+        slot,
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    // The panel goes while the run is out: nothing is left to write a line
+    // on, and nothing to close.
+    s.act(Action::new("close", "close the listing").moving(move |wm| {
+        wm.close(slot);
+    }))
+    .expect("the panel closed");
+    s.settle();
+    assert!(s.panel(slot).is_none());
+
+    runner.pass(&w);
+    s.settle();
+    assert!(!there(&s, "~/Downloads/README.txt"));
+    assert_eq!(nodes(&s), was + 2, "the close, then the delete");
+    assert!(s.undo(), "and the delete is still a node to walk back");
+    assert!(there(&s, "~/Downloads/README.txt"));
 }
 
 // -- the spellings a path travels in -------------------------------------------

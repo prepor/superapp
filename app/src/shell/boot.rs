@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
-use kernel::caps::{Clipboard, ClockSource, Disk, MemSecrets, Screen, SecretsFactory, Watcher};
+use kernel::caps::{
+    Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, SecretsFactory, Watcher,
+};
 use kernel::e2e;
 use kernel::layout::Grid;
 use kernel::repl::r2;
@@ -315,13 +317,37 @@ impl Boot {
             let dir = db_dir.clone();
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
+        // The machine's own filesystem, unless the run asked for the demo
+        // tree. It goes on the env for the same reason the keychain does: a
+        // files run works on its own thread with a world of its own, and the
+        // disk it writes must be the disk the panel is listing — one
+        // implementation, one set of refusals, one trash. Two `RealDisk`s
+        // are two doors onto the one filesystem, so each world builds its
+        // own; the demo tree *is* its own state, so every world of this run
+        // shares the one.
+        //
+        // A script against a real disk may read it and not write to it: a
+        // suite must no more delete a human's files than write to their
+        // keychain, and the refusal lands on the panel's line where a
+        // forgotten `--demo-disk` is a failing step.
+        let disk = Some(if c.demo_disk {
+            DiskFactory::shared(DemoDisk::new(clock.clone()))
+        } else {
+            DiskFactory::new(move || {
+                Box::new(if scripted {
+                    RealDisk::read_only()
+                } else {
+                    RealDisk::new()
+                })
+            })
+        });
         let env = Env {
             db_dir: db_dir.clone(),
             scripted,
             secrets: MemSecrets::new(),
             secrets_backend: keychain,
             clock: clock.clone(),
-            demo_disk: c.demo_disk,
+            disk,
             // Filled in by the mount that runs the passes: only a threaded
             // one has channels to wake anybody through.
             kicks: Kicks::default(),
@@ -374,29 +400,19 @@ impl Boot {
             if !scripted {
                 caps.insert::<dyn Clipboard>(Box::new(RealClipboard));
             }
-            // The disk is the machine's own unless the run asked for the
-            // demo tree. A script against a real disk may read it and not
-            // write to it: a suite must no more delete a human's files than
-            // write to their keychain, and the refusal lands on the panel's
-            // line where a forgotten `--demo-disk` is a failing step.
-            if !c.demo_disk {
-                caps.insert::<dyn Disk>(Box::new(if scripted {
-                    RealDisk::read_only()
-                } else {
-                    RealDisk::new()
-                }));
-                // And watched, on a run that is nobody's but this
-                // person's: a panel then refreshes after another
-                // program's write as it does after one of ours. Never
-                // under a script — a suite's frames may not depend on
-                // what the machine it runs on happens to be doing — and
-                // never over the demo tree, which nothing outside this
-                // process can write to anyway.
-                if !scripted {
-                    caps.insert::<dyn Watcher>(Box::new(RealWatcher::start(|| {
-                        SignalToUI::set_ui_signal();
-                    })));
-                }
+            // The disk came with the env, so that every world of this run
+            // is handed the same one; the watch is this world's alone.
+            //
+            // Watched on a run that is nobody's but this person's: a panel
+            // then refreshes after another program's write as it does after
+            // one of ours. Never under a script — a suite's frames may not
+            // depend on what the machine it runs on happens to be doing —
+            // and never over the demo tree, which nothing outside this
+            // process can write to anyway.
+            if !c.demo_disk && !scripted {
+                caps.insert::<dyn Watcher>(Box::new(RealWatcher::start(|| {
+                    SignalToUI::set_ui_signal();
+                })));
             }
         });
         let workers = if self.virtual_time {

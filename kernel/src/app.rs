@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::caps::{ClockSource, MemSecrets, SecretsFactory};
+use crate::caps::{ClockSource, DiskFactory, MemSecrets, SecretsFactory};
 use crate::effect::{Job, Registry, World};
 use crate::panel::{PanelId, PanelKind, Tag};
 use crate::search;
@@ -88,6 +88,20 @@ pub trait App: Any + Sync + Send + 'static {
     fn workers(&self, _store: &Store) -> Vec<Box<dyn Worker>> {
         Vec::new()
     }
+
+    /// What the app owes the UI thread: work it started elsewhere that has
+    /// finished, and now needs a session to land in.
+    ///
+    /// Called from [`Session::settle`](crate::session::Session::settle),
+    /// which is to say after every event and before anything reads the
+    /// slots — so a background pass may claim, close and toast exactly as a
+    /// verb does, on the one thread where that is allowed. Must be cheap:
+    /// it runs on quiet frames too, and the answer is usually *nothing
+    /// moved*.
+    ///
+    /// No app may open a session of its own here; this is the session it
+    /// already lives in.
+    fn poll(&self, _s: &mut crate::session::Session) {}
 
     /// The panels the launcher offers whether or not they are open, in
     /// the order the app wants them, each with the label and the words a
@@ -321,7 +335,12 @@ pub struct Env {
     /// so a password the settings form wrote is the one a sync pass reads.
     pub secrets_backend: Option<SecretsFactory>,
     pub clock: ClockSource,
-    pub demo_disk: bool,
+    /// The machine's filesystem, when the shell installed one. Every world
+    /// built from this env takes it — the window's and each runner's alike —
+    /// so a copy performed off the UI thread writes the very disk the panel
+    /// is listing. `None` is the kernel's demo tree, which is what a test
+    /// and a library mount get.
+    pub disk: Option<DiskFactory>,
     /// The wake channels of this build's background passes, so one may wake
     /// another — installed as the [`Kicker`](crate::caps::Kicker)
     /// capability. Empty in a world that runs none, where a kick does
@@ -339,7 +358,7 @@ impl Default for Env {
             secrets: MemSecrets::new(),
             secrets_backend: None,
             clock: ClockSource::default(),
-            demo_disk: true,
+            disk: None,
             kicks: Kicks::default(),
         }
     }

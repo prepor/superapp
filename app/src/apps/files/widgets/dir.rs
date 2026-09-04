@@ -110,6 +110,8 @@ struct Fields {
     naming: Option<String>,
     renaming: Option<String>,
     pathing: Option<String>,
+    /// The line under the header: [`Dir::note`] — a run in progress, or
+    /// what the last verb refused.
     status: Option<String>,
 }
 
@@ -284,7 +286,8 @@ impl Widget for DirPanel {
                 || self.rename_field.live(cx, &rename),
         );
         self.crumbs(cx, &props, &f);
-        // The status line: what the last verb refused, until the next one.
+        // The status line: what a run is doing, or what the last verb
+        // refused until the next one.
         let lbl = self.view.label(cx, STATUS);
         lbl.set_text(cx, f.status.as_deref().unwrap_or(""));
         lbl.set_visible(cx, f.status.is_some());
@@ -522,7 +525,7 @@ fn observe(props: &PanelProps, scope: &mut Scope) -> Option<Fields> {
         naming: d.naming().map(str::to_string),
         renaming: d.renaming().map(str::to_string),
         pathing: d.pathing().map(str::to_string),
-        status: d.status().map(str::to_string),
+        status: d.note(),
     })
 }
 

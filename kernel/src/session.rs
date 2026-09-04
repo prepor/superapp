@@ -637,7 +637,12 @@ impl Session {
     /// opened. `act` and `nav` never touch instances themselves, so a verb
     /// may hold its own `&mut self` across them; the shell calls this after
     /// every event, and a test calls it before looking at the slots.
+    ///
+    /// The apps are polled first, before the check for whether anything
+    /// moved: a background pass that has just finished *is* something
+    /// moving, and what it claims must be settled in the same breath.
     pub fn settle(&mut self) {
+        self.poll_apps();
         if !self.unsettled {
             return;
         }
@@ -650,6 +655,17 @@ impl Session {
         // both wait for this point too.
         self.relayout();
         self.save();
+    }
+
+    /// Every app's [`App::poll`](crate::app::App::poll), in list order:
+    /// what each has finished off this thread and now wants a session for.
+    ///
+    /// The list is `'static`, so nothing of this session is borrowed across
+    /// the calls and an app may act, claim and close from inside one.
+    fn poll_apps(&mut self) {
+        for a in self.apps.list() {
+            a.poll(self);
+        }
     }
 
     // -- actions ---------------------------------------------------------------

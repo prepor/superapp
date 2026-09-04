@@ -315,7 +315,7 @@ fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Chrome)> {
             },
         },
         Chrome {
-            status: c.status().map(str::to_string),
+            status: c.note(),
             renaming: c.renaming().map(str::to_string),
         },
     ))

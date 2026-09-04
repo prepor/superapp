@@ -17,7 +17,8 @@ use super::super::model::{
     basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural,
     real_path, stat_in, DirRow, DirSource, Entry, Watch, HOME, PAGE,
 };
-use super::super::ops::{self, Done, Plan};
+use super::super::ops::{self, Done};
+use super::super::run::{Landed, Task};
 use super::super::{Op, Seen, FILES};
 use super::Card;
 
@@ -215,6 +216,21 @@ impl Dir {
         self.status = line;
     }
 
+    /// The line the panel actually draws under its header: what a run is
+    /// doing, or — while nothing is running — what the last verb refused.
+    ///
+    /// The run wins because it is happening *now*, on the one disk every
+    /// files panel is looking at, and because it is what the *cancel* on
+    /// the bar is about. The refusal is not lost: it comes back when the
+    /// run is over.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        FILES
+            .running()
+            .map(|at| at.line())
+            .or_else(|| self.status().map(str::to_string))
+    }
+
     // -- where a row goes ------------------------------------------------------
 
     /// What a row names: a directory is a list of its own, a file is a
@@ -267,12 +283,15 @@ impl Dir {
     /// `new dir`: one directory, where nothing is yet — one undoable
     /// action, whose reversal trashes it while it is still empty.
     ///
-    /// The disk is written before the node is recorded, so the write gate
-    /// is asked first and the lease again after: a change with no node
-    /// behind it is a change nobody can undo.
+    /// The write gate is asked here and the lease again when the run lands:
+    /// a change with no node behind it is a change nobody can undo. What
+    /// happens in between is [`run`](super::super::run)'s — one `mkdir` is
+    /// hardly a freeze, but a directory on a volume that has gone to sleep
+    /// is, and there is no second way to write a disk in this app.
     ///
     /// The widget calls this from the field's submit, on the instance it is
-    /// already holding — the same `&mut self` a verb of the bar has.
+    /// already holding — the same `&mut self` a verb of the bar has. The
+    /// field stays up, with the name in it, until the disk has answered.
     pub fn new_dir(&mut self, s: &mut Session, name: &str) {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -282,29 +301,9 @@ impl Dir {
             s.notify("read-only — acquire the lease to write", true);
             return;
         }
-        let world = self.world.clone();
-        let path = join(&self.dir, &name);
-        if let Err(e) = ops::make_dir_in(&world, &path) {
-            // A name the directory already has, a directory that has gone:
-            // the panel's own line, where the field was.
-            self.status = Some(e.clone());
-            s.notify(e, true);
-            return;
-        }
-        let here = basename(&self.dir).to_string();
-        let intent: Box<dyn Intent> = Box::new(ops::MadeDir::of(&world, &path));
-        if let Some(why) = s.give_back(intent.as_ref()) {
-            s.notify(why, true);
-            self.refresh_all(s);
-            return;
-        }
-        s.act_done(
-            Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
-        );
-        self.naming = None;
         self.status = None;
-        s.notify(format!("created “{name}/” in {here} — cmd+z undoes"), false);
-        self.refresh_all(s);
+        let path = join(&self.dir, &name);
+        FILES.start(s, Task::MakeDir { path }, self.slot);
     }
 
     /// `rename`: the directory this panel shows, under a new name — one
@@ -327,13 +326,6 @@ impl Dir {
         self.relist();
     }
 
-    /// Every listing reads its directory again — every other panel through
-    /// [`refresh`](super::refresh), which skips the instance this verb is
-    /// running as, and this one by itself.
-    fn refresh_all(&mut self, s: &mut Session) {
-        super::refresh(s, Some(self.slot));
-        self.relist();
-    }
 }
 
 /// What a row of a listing names, given where the listing stands: a
@@ -426,6 +418,14 @@ impl Panel for Dir {
         if !clip.is_empty() {
             v.push(Verb::run("files.here", clip.verb.here_label(), Some('h')));
         }
+        // A run belongs to the app rather than to the panel that started it
+        // — it is one disk — so *cancel* is on every files bar while one is
+        // on, and stops it from wherever anybody is looking. It wears no
+        // letter: it is rare, it is the only verb here that undoes nothing,
+        // and no chord should be a keystroke away from stopping a copy.
+        if FILES.busy() {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
         v
     }
 
@@ -473,6 +473,7 @@ impl Panel for Dir {
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
             "files.here" => self.here(s),
+            "files.cancel" => cancel(s),
             // The two about the set itself. Neither writes anything, so
             // neither is an action: a mark is the panel's own context.
             "files.all" => {
@@ -582,31 +583,28 @@ impl Dir {
 
     /// `delete`, over the marked set or over what the panel shows. A batch
     /// takes rows, and the list stays; the directory this panel *is* takes
-    /// the panel with it.
+    /// the panel with it — when the run lands, which is the same node.
     fn delete(&mut self, s: &mut Session) {
         let own = self.list.marks().is_empty();
         let paths = self.objects();
-        let (slot, dir) = (self.slot, self.dir.clone());
-        let list = &mut self.list;
-        match delete_paths(s, slot, paths, own, |session, gone| {
-            take_marks(session, slot, &dir, list, gone)
-        }) {
-            Said::Went => self.status = None,
-            Said::Refused(line) => self.status = Some(line),
-            Said::Nothing => {}
+        if delete_paths(s, self.slot, paths, own) {
+            // A run is on its way; the line it will write is its own. One
+            // that was never queued leaves the line standing as it was.
+            self.status = None;
         }
-        self.relist();
     }
 
     /// `copy here` / `move here`: the held set performed into the directory
     /// this panel shows.
     ///
-    /// The plan is made first, against the disk as it is right now — the
-    /// clipboard may have waited while another program moved things, and a
-    /// watch says that a directory changed, never what is still in it.
-    /// What it refuses, it refuses path by path,
-    /// exactly as it does for one; what it can do becomes **one** undoable
-    /// action, so a single cmd+z takes the whole batch back.
+    /// What is held is snapshotted here and planned when the run reaches
+    /// the front of the queue, against the disk as it is *then* — the
+    /// clipboard may have waited while another program moved things, or
+    /// while an earlier run wrote the very directory this one lands in, and
+    /// a watch says that a directory changed, never what is still in it.
+    /// What the plan refuses, it refuses path by path, exactly as it does
+    /// for one; what it can do becomes **one** undoable action, so a single
+    /// cmd+z takes the whole batch back.
     fn here(&mut self, s: &mut Session) {
         let clip = FILES.clipboard();
         if clip.is_empty() {
@@ -616,79 +614,13 @@ impl Dir {
             s.notify("read-only — acquire the lease to write", true);
             return;
         }
-        let world = s.world().clone();
-        let Plan { steps, mut refused } = ops::plan_here(&world, &clip, &self.dir);
-        // Performed one at a time, and a path the disk refuses at the last
-        // moment joins the refusals rather than failing the batch: what is
-        // left is exactly what happened.
-        let mut done: Vec<Done> = Vec::new();
-        for step in steps {
-            let r = match clip.verb {
-                Op::Copy => ops::copy_in(&world, &step.from, &step.to),
-                Op::Move => ops::move_in(&world, &step.from, &step.to),
-            };
-            match r {
-                // Read back the moment after the write: what undo will
-                // compare against before it takes anything away.
-                Ok(()) => done.push(Done::of(&world, &step.from, &step.to)),
-                Err(e) => refused.push(e),
-            }
-        }
-        let here = basename(&self.dir).to_string();
-        if done.is_empty() {
-            // Nothing could be done: the refusal is the word, and the
-            // clipboard stands as it was.
-            let msg = if refused.len() == 1 {
-                refused.remove(0)
-            } else {
-                format!(
-                    "nothing to {} into {here} — {} refused",
-                    clip.verb.verb(),
-                    refused.len()
-                )
-            };
-            self.status = Some(msg.clone());
-            s.notify(msg, true);
-            return;
-        }
-        let landed: Vec<String> = done.iter().map(|d| d.to.clone()).collect();
-        let what = tally(&landed, &refused);
-        let but = but(&refused);
-        let intent: Box<dyn Intent> = match clip.verb {
-            Op::Copy => Box::new(ops::Copied::new(done)),
-            Op::Move => Box::new(ops::Moved::new(done)),
-        };
-        if let Some(why) = s.give_back(intent.as_ref()) {
-            s.notify(why, true);
-            self.refresh_all(s);
-            return;
-        }
-        s.act_done(
-            // No coalescing scope: a verb that wrote a disk is its own node,
-            // however fast the next one follows. Two copies into one
-            // directory are two things that happened, and cmd+z takes them
-            // back one at a time.
-            //
-            // Nothing closes: a move empties the paths it came from, and a
-            // panel elsewhere that was showing one of them keeps showing it
-            // and says so — that is its own business, not this verb's.
-            Action::new(
-                clip.verb.verb(),
-                format!("{} {what} into {here}", clip.verb.verb()),
-            )
-            .claiming(vec![intent]),
-        );
         self.status = None;
-        s.notify(
-            format!("{} {what} into {here}{but} — cmd+z undoes", clip.verb.done()),
-            false,
-        );
-        // A move consumes the clipboard; a copy keeps it, so the same set
-        // can be laid down in another directory too.
-        if clip.verb == Op::Move {
-            FILES.clear();
-        }
-        self.refresh_all(s);
+        let task = Task::Here {
+            verb: clip.verb,
+            clip,
+            dir: self.dir.clone(),
+        };
+        FILES.start(s, task, self.slot);
     }
 }
 
@@ -749,87 +681,245 @@ pub(super) enum Said {
     Nothing,
 }
 
-/// `delete`, from a card or from a listing: to the trash, never `rm`. One
-/// node for the whole set, so one cmd+z puts all of it back — and the
-/// reversal expires honestly, on a trash that was emptied or a name
-/// something else has taken since.
+/// `delete`, from a card or from a listing: to the trash, never `rm`.
+///
+/// The paths are handed to [`run`](super::super::run) and performed off
+/// this thread; what comes back is [`land`]ed as **one** node, so one cmd+z
+/// puts all of it back — and the reversal expires honestly, on a trash that
+/// was emptied or a name something else has taken since.
 ///
 /// `own` is whether `by` is the panel showing what went, and so closes with
-/// the action. `marks` takes the marks this delete consumed off the panel
-/// that ran it and answers the intent that puts them back; a card has none.
-pub(super) fn delete_paths(
-    s: &mut Session,
-    by: SlotId,
-    paths: Vec<String>,
-    own: bool,
-    marks: impl FnOnce(&Session, &[String]) -> Option<Box<dyn Intent>>,
-) -> Said {
+/// the action. Answers whether a run was queued at all — a panel clears its
+/// own line for one that was, and leaves it standing for one that was not.
+pub(super) fn delete_paths(s: &mut Session, by: SlotId, paths: Vec<String>, own: bool) -> bool {
     if paths.is_empty() {
-        return Said::Nothing;
+        return false;
     }
     if !s.writable() {
         s.notify("read-only — acquire the lease to write", true);
-        return Said::Nothing;
+        return false;
     }
-    let world = s.world().clone();
-    let mut trashed: Vec<Done> = Vec::new();
-    let mut refused: Vec<String> = Vec::new();
-    for path in &paths {
-        // A root is where the browser starts: nothing takes one away, and
-        // saying so here means no disk is ever asked to.
-        if is_root(path) {
-            refused.push(format!("“{path}” is a root"));
-            continue;
-        }
-        match ops::trash_in(&world, path) {
-            // Where it went, and what it is there: undo compares both
-            // before it moves anything back out.
-            Ok(landed) => trashed.push(Done::of(&world, path, &landed)),
-            Err(e) => refused.push(e),
-        }
+    FILES.start(s, Task::Delete { paths, own }, by);
+    true
+}
+
+/// *cancel*: the run in hand stops where it is, and what was waiting behind
+/// it never starts. What it managed is still recorded — see [`land`].
+pub(super) fn cancel(s: &mut Session) {
+    FILES.stop();
+    s.redraw();
+}
+
+// -- what a run leaves behind --------------------------------------------------
+
+/// A run that is over, recorded.
+///
+/// This is the other half of every verb above, and the *whole* of what they
+/// used to do after the disk: the history node with its intents, the lease
+/// check, the marks a delete consumed, the panel a delete closes, the
+/// clipboard a move lets go of, the toast, and the listings that went stale.
+/// It runs on the UI thread from [`Files::poll`](super::super::Files::poll),
+/// which is [`Session::settle`] — so a background pass claims, closes and
+/// toasts exactly where a verb did, one frame later.
+///
+/// The panel that ran the verb may have closed while the run was going. Its
+/// line is then nobody's to write, and the run lands all the same: what
+/// matters is that what happened can be undone.
+pub fn land(s: &mut Session, l: Landed) {
+    match l.run.task {
+        Task::Here { .. } => landed_here(s, l),
+        Task::Delete { .. } => landed_delete(s, l),
+        Task::MakeDir { .. } => landed_dir(s, l),
     }
-    if trashed.is_empty() {
-        let msg = if refused.len() == 1 {
-            refused.remove(0)
-        } else {
-            format!("nothing deleted — {} refused", refused.len())
+}
+
+/// `copy here` / `move here`, landed.
+fn landed_here(s: &mut Session, l: Landed) {
+    let Task::Here { verb, dir, .. } = &l.run.task else {
+        return;
+    };
+    let (verb, by, here) = (*verb, l.run.by, basename(dir).to_string());
+    let missed = l.missed();
+    let Landed {
+        done,
+        refused,
+        stopped,
+        dropped,
+        ..
+    } = l;
+    if done.is_empty() {
+        // Nothing could be done: the refusal is the word, and the
+        // clipboard stands as it was.
+        let msg = match (stopped, refused.len()) {
+            (true, _) => format!("nothing {} into {here} — stopped", verb.done()),
+            (false, 1) => refused[0].clone(),
+            (false, n) => format!("nothing to {} into {here} — {n} refused", verb.verb()),
         };
-        s.notify(msg.clone(), true);
-        return Said::Refused(msg);
+        say(s, by, Some(msg.clone()));
+        s.notify(msg, true);
+        super::refresh(s, None);
+        return;
     }
-    let gone: Vec<String> = trashed.iter().map(|d| d.from.clone()).collect();
-    let what = tally(&gone, &refused);
-    let but = but(&refused);
-    let trashed: Box<dyn Intent> = Box::new(ops::Deleted::new(trashed));
+    let landed: Vec<String> = done.iter().map(|d| d.to.clone()).collect();
+    let what = tally(&landed, missed);
+    let tail = format!("{}{}", but(&refused), halted(stopped, dropped));
+    let intent: Box<dyn Intent> = match verb {
+        Op::Copy => Box::new(ops::Copied::new(done)),
+        Op::Move => Box::new(ops::Moved::new(done)),
+    };
+    if let Some(why) = s.give_back(intent.as_ref()) {
+        s.notify(why, true);
+        super::refresh(s, None);
+        return;
+    }
+    s.act_done(
+        // No coalescing scope: a verb that wrote a disk is its own node,
+        // however fast the next one follows. Two copies into one
+        // directory are two things that happened, and cmd+z takes them
+        // back one at a time.
+        //
+        // Nothing closes: a move empties the paths it came from, and a
+        // panel elsewhere that was showing one of them keeps showing it
+        // and says so — that is its own business, not this verb's.
+        Action::new(verb.verb(), format!("{} {what} into {here}", verb.verb()))
+            .claiming(vec![intent]),
+    );
+    say(s, by, None);
+    s.notify(
+        format!("{} {what} into {here}{tail} — cmd+z undoes", verb.done()),
+        false,
+    );
+    // A move consumes the clipboard; a copy keeps it, so the same set
+    // can be laid down in another directory too.
+    if verb == Op::Move {
+        FILES.clear();
+    }
+    super::refresh(s, None);
+}
+
+/// `delete`, landed.
+fn landed_delete(s: &mut Session, l: Landed) {
+    let Task::Delete { own, .. } = &l.run.task else {
+        return;
+    };
+    let by = l.run.by;
+    // A panel that closed while the run was going closes nothing now.
+    let own = *own && s.panel(by).is_some();
+    let missed = l.missed();
+    let Landed {
+        done,
+        refused,
+        stopped,
+        dropped,
+        ..
+    } = l;
+    if done.is_empty() {
+        let msg = match (stopped, refused.len()) {
+            (true, _) => "nothing deleted — stopped".to_string(),
+            (false, 1) => refused[0].clone(),
+            (false, n) => format!("nothing deleted — {n} refused"),
+        };
+        say(s, by, Some(msg.clone()));
+        s.notify(msg, true);
+        super::refresh(s, None);
+        return;
+    }
+    let gone: Vec<String> = done.iter().map(|d| d.from.clone()).collect();
+    let what = tally(&gone, missed);
+    let tail = format!("{}{}", but(&refused), halted(stopped, dropped));
+    let trashed: Box<dyn Intent> = Box::new(ops::Deleted::new(done));
     if let Some(why) = s.give_back(trashed.as_ref()) {
         s.notify(why, true);
-        super::refresh(s, Some(by));
-        return Said::Nothing;
+        super::refresh(s, None);
+        return;
     }
     // The marks this delete consumed — the ones whose row went, never one
     // that stayed because its path refused. Taken only once the action is
     // certain, and undo puts exactly these back.
     let mut intents: Vec<Box<dyn Intent>> = vec![trashed];
-    intents.extend(marks(s, &gone));
+    intents.extend(take_marks(s, by, &gone));
     s.act_done(
         Action::new("delete", format!("delete {what}"))
             .claiming(intents)
             // The layout half of the same node: the panel that was showing
             // this goes with it, and its joined chain goes with the panel.
-            // The instance runs to the end of its verb all the same, and is
-            // dropped at the settle.
             .moving(move |wm| {
                 if own {
                     wm.close(by);
                 }
             }),
     );
-    prune_clipboard(&world);
-    s.notify(format!("{what} to the trash{but} — cmd+z undoes"), false);
-    // Every other listing reads its directory again; the panel that ran the
-    // verb is holding itself, and relists when its own method returns.
-    super::refresh(s, Some(by));
-    Said::Went
+    // What a verb took away is not there to be held any more.
+    prune_clipboard(&s.world().clone());
+    say(s, by, None);
+    s.notify(format!("{what} to the trash{tail} — cmd+z undoes"), false);
+    super::refresh(s, None);
+}
+
+/// `new dir`, landed: the field closes when the directory is there, and
+/// keeps what was typed when it is not.
+fn landed_dir(s: &mut Session, l: Landed) {
+    let Task::MakeDir { path } = &l.run.task else {
+        return;
+    };
+    let by = l.run.by;
+    let name = basename(path).to_string();
+    let here = basename(parent(path).unwrap_or(HOME)).to_string();
+    let Some(made) = l.done.first() else {
+        // A name the directory already has, a directory that has gone, a
+        // run that was stopped before it started: the panel's own line,
+        // where the field is.
+        let msg = l
+            .refused
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("“{name}/” was not created — stopped"));
+        say(s, by, Some(msg.clone()));
+        s.notify(msg, true);
+        return;
+    };
+    let intent: Box<dyn Intent> = Box::new(ops::MadeDir::made(made));
+    if let Some(why) = s.give_back(intent.as_ref()) {
+        s.notify(why, true);
+        super::refresh(s, None);
+        return;
+    }
+    s.act_done(
+        Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
+    );
+    with_panel(s, by, |p| {
+        if let Some(d) = p.as_any().downcast_mut::<Dir>() {
+            d.set_naming(None);
+            d.set_status(None);
+        }
+    });
+    s.notify(format!("created “{name}/” in {here} — cmd+z undoes"), false);
+    super::refresh(s, None);
+}
+
+/// Runs `f` on the panel in a slot, if it is still open and nobody else has
+/// it. Nothing here is worth a panic: a line that cannot be written is a
+/// line, and the node is recorded either way.
+fn with_panel(s: &Session, slot: SlotId, f: impl FnOnce(&mut dyn Panel)) {
+    let Some(inst) = s.panel(slot) else {
+        return;
+    };
+    let Ok(mut p) = inst.try_borrow_mut() else {
+        return;
+    };
+    f(&mut **p);
+}
+
+/// The line under the header of the panel that ran the verb: what the run
+/// refused, or nothing where it went through.
+fn say(s: &Session, slot: SlotId, line: Option<String>) {
+    with_panel(s, slot, |p| {
+        if let Some(d) = p.as_any().downcast_mut::<Dir>() {
+            d.set_status(line);
+        } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
+            c.set_status(line);
+        }
+    });
 }
 
 /// `rename`, from a listing or from a card: one path under a new name, in
@@ -971,24 +1061,23 @@ fn prune_clipboard(world: &World) {
 }
 
 /// Takes the marks a verb consumed off the table it ran on, and answers the
-/// intent that puts them back. `None` when it consumed none.
-fn take_marks(
-    s: &Session,
-    slot: SlotId,
-    dir: &str,
-    list: &mut ListState<DirSource>,
-    gone: &[String],
-) -> Option<Box<dyn Intent>> {
+/// intent that puts them back. `None` when it consumed none, and none when
+/// the panel has closed — there is nowhere left for a mark to be.
+fn take_marks(s: &Session, slot: SlotId, gone: &[String]) -> Option<Box<dyn Intent>> {
     let inst = s.panel(slot)?;
+    let mut p = inst.try_borrow_mut().ok()?;
+    let d = p.as_any().downcast_mut::<Dir>()?;
+    let dir = d.dir.clone();
     let taken: Vec<String> = gone
         .iter()
-        .filter(|g| parent(g) == Some(dir))
+        .filter(|g| parent(g) == Some(dir.as_str()))
         .map(|g| basename(g).to_string())
-        .filter(|n| list.marks().has(n))
+        .filter(|n| d.list.marks().has(n))
         .collect();
     for n in &taken {
-        list.marks_mut().remove(n);
+        d.list.marks_mut().remove(n);
     }
+    drop(p);
     (!taken.is_empty()).then(|| {
         Box::new(Marked {
             panel: Rc::downgrade(&inst),
@@ -998,12 +1087,13 @@ fn take_marks(
 }
 
 /// The row's own wording where the set is one, as a batch has it:
-/// *“notes.txt”*, *3 files*, *2 of 3 files*.
-fn tally(done: &[String], refused: &[String]) -> String {
+/// *“notes.txt”*, *3 files*, *2 of 3 files*. `missed` is everything that
+/// did not go — refused, or never reached because the run was stopped.
+fn tally(done: &[String], missed: usize) -> String {
     match done {
-        [one] if refused.is_empty() => format!("“{}”", basename(one)),
-        many if refused.is_empty() => plural(many.len()),
-        many => format!("{} of {}", many.len(), plural(many.len() + refused.len())),
+        [one] if missed == 0 => format!("“{}”", basename(one)),
+        many if missed == 0 => plural(many.len()),
+        many => format!("{} of {}", many.len(), plural(many.len() + missed)),
     }
 }
 
@@ -1013,6 +1103,17 @@ fn but(refused: &[String]) -> String {
         String::new()
     } else {
         format!(" — {}", refused.join(", "))
+    }
+}
+
+/// The other tail: that somebody pressed *cancel*, and what that cost the
+/// runs waiting behind this one.
+fn halted(stopped: bool, dropped: usize) -> String {
+    match (stopped, dropped) {
+        (false, _) => String::new(),
+        (true, 0) => " — stopped".to_string(),
+        (true, 1) => " — stopped, and one more never started".to_string(),
+        (true, n) => format!(" — stopped, and {n} more never started"),
     }
 }
 

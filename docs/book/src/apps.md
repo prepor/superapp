@@ -50,6 +50,7 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `search_providers` | the sources the search panel puts a question to |
 | `problems` | the standing conditions the app can be in |
 | `workers` | the background passes the app wants running now, derived from the store |
+| `poll` | what the app owes the UI thread: work it started elsewhere that has finished and now needs a session |
 | `roots` | the panels the launcher offers whether or not they are open |
 
 `AppUi`, in `app/src/shell/app_ui.rs`, is the Makepad half: `script_mod` for
@@ -178,7 +179,15 @@ supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`.
 the in-memory versions, `Deny` nothing but the clock, which is the default for
 a library mount. `Env` carries what an implementation needs to be built: the
 store directory, whether this is a scripted run, the secrets backend and the
-shared in-memory secrets, the clock, and whether the disk is the demo tree.
+shared in-memory secrets, the clock, and the disk.
+
+The last two of those are *factories*, not values: a worker builds its own
+world on its own thread, so it cannot be handed one. Each world asks for a
+secret store and a disk, and the shell installs the machine's own through the
+env — which is what makes the password a settings form wrote the one a sync
+pass reads, and the disk a background copy writes the one the panel is
+listing. The kernel's fallbacks are the shared in-memory secrets and a demo
+tree per world, so nothing a test builds can reach a human's files.
 
 The kernel installs its own capabilities before the apps', so an app or the
 shell may replace one. `Ctx::cap::<dyn Imap>()` is how an effect asks for one
@@ -226,6 +235,13 @@ every tick.
 What a world holds is a weak handle. The set holds each pass's own channel,
 so a strong one would be a ring through the very thread it stops, and a
 session that let go of its passes would close no channel and end nothing.
+
+`App::poll(session)` is the other side of a pass: it runs on the UI thread from
+`Session::settle`, which is after every event and before anything reads the
+slots, so a pass that has finished may claim, close a panel and toast exactly
+as a verb does — on the one thread where that is allowed. It must be cheap: it
+runs on quiet frames too, and the answer is usually that nothing moved. Files'
+[runs](./files.md#runs) are what it was written for.
 
 ## Problems
 

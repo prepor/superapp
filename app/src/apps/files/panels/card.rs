@@ -205,6 +205,19 @@ impl Card {
         self.status = line;
     }
 
+    /// The line the card draws under its header: what a run is doing, or —
+    /// while nothing is running — what the last verb refused. As a
+    /// listing's [`Dir::note`](super::Dir::note), and for the same reason:
+    /// the run is the app's, not the panel's.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        FILES
+            .running()
+            .map(|at| at.line())
+            .or_else(|| self.status().map(str::to_string))
+    }
+
+
     // -- keeping up ------------------------------------------------------------
 
     /// Reads the file again: what it is, and what it shows.
@@ -282,14 +295,20 @@ impl Panel for Card {
     /// widget's — a caret in one of its runs keeps the text chords, and the
     /// bar has the letter the rest of the time.
     fn verbs(&self) -> Vec<Verb> {
-        vec![
+        let mut v = vec![
             Verb::run("files.open", "open", Some('o')),
             Verb::run("files.copy", "copy", Some('p')),
             Verb::run("files.move", "move", Some('m')),
             Verb::run("files.rename", "rename", Some('r')),
             Verb::run("files.delete", "delete", Some('d')),
             Verb::run("files.copy_path", "copy path", Some('c')),
-        ]
+        ];
+        // As a listing's: a run is the app's, and stops from wherever
+        // anybody is looking.
+        if FILES.busy() {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
+        v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
@@ -300,6 +319,7 @@ impl Panel for Card {
             "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
+            "files.cancel" => dir::cancel(s),
             _ => {}
         }
     }
@@ -370,18 +390,15 @@ impl Card {
     }
 
     /// `delete`: the file to the trash, and this card closed in the layout
-    /// half of the same action — it would be showing nothing. The instance
-    /// runs to the end of this method all the same, and the settle drops
-    /// it. No other panel is looked for: one somewhere else showing the
-    /// same path keeps showing it, and says so.
+    /// half of the same action — it would be showing nothing. The trash is
+    /// a run like any other, so the card stands until it lands, and the
+    /// settle that records the node is what drops it. No other panel is
+    /// looked for: one somewhere else showing the same path keeps showing
+    /// it, and says so.
     fn delete(&mut self, s: &mut Session) {
-        let (slot, path) = (self.slot, self.path.clone());
-        match dir::delete_paths(s, slot, vec![path], true, |_, _| None) {
-            dir::Said::Went => self.status = None,
-            dir::Said::Refused(line) => self.status = Some(line),
-            dir::Said::Nothing => {}
+        if dir::delete_paths(s, self.slot, vec![self.path.clone()], true) {
+            self.status = None;
         }
-        self.restat();
     }
 }
 

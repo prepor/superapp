@@ -2,11 +2,16 @@
 //! the intents that give each one back.
 //!
 //! Each verb is an effect ([`kernel::effect::Effect`]) — the store cannot
-//! reproduce what happens on a disk — performed where the click is: the
-//! wait for a copy is the wait for the listing that follows it. No path
-//! anyone ever *had* is removed: what a delete takes goes to the trash, and
-//! undo moves it back; even the reversal of a copy trashes what the copy
-//! made.
+//! reproduce what happens on a disk. One path at a time, and none of them
+//! on the thread that draws: a verb hands its paths to
+//! [`run`](super::run), which performs exactly these functions off the UI
+//! thread and hands back the [`Done`] records below. No path anyone ever
+//! *had* is removed: what a delete takes goes to the trash, and undo moves
+//! it back; even the reversal of a copy trashes what the copy made.
+//!
+//! The reversals *are* run where they are asked, on the UI thread: an undo
+//! walks a history node, which is one gesture over what one run left, and
+//! nothing may be half-walked.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -527,12 +532,14 @@ pub struct MadeDir {
 }
 
 impl MadeDir {
-    /// The record of a directory just made.
+    /// The record of a directory just made, off what the run read the
+    /// moment after the write — which is the only moment the answer is
+    /// certainly about the directory this made.
     #[must_use]
-    pub fn of(world: &World, path: &str) -> MadeDir {
+    pub fn made(done: &Done) -> MadeDir {
         MadeDir {
-            path: path.to_string(),
-            landed: RefCell::new(id_in(world, path)),
+            path: done.to.clone(),
+            landed: RefCell::new(done.landed),
         }
     }
 }
