@@ -1291,19 +1291,31 @@ pub enum MarkSlot<R> {
 /// panels over one component is where three copies of the same 350 lines
 /// become one.
 ///
-/// The cursor is `(key, index)` and resolves in that order: the remembered
-/// row if it still holds the key, else the key's rank (something landed
-/// above it), else the row clamped into the table (the row left; carry on
-/// from where it stood). Without the index a row filed out from under the
-/// cursor would snap the walk back to the top of the list.
+/// The cursor is the row it stands on — that row, its key, and the index it
+/// was put at — and resolves in that order: the remembered index while it
+/// still holds the key, else the key's rank (something landed above it),
+/// else the *row's* rank, which is where the order would put a row like it
+/// now: past every row that outlived it, and no further. The last rule is
+/// what a batch verb walks on — the rows it took from above the cursor are
+/// rows the rank no longer counts, so the walk lands on the one that took
+/// the cursor's place rather than one row per deletion below it.
 pub struct ListState<D: Datasource> {
     table: Table<D>,
-    cursor: Option<(D::Key, usize)>,
+    cursor: Option<Cursor<D>>,
     marks: Marks<D::Key>,
     /// The marked rows the filter hides, as the last [`ListState::sync`]
     /// read them. Held rather than re-queried, because a draw asks for them
     /// per row.
     hidden: Vec<D::Row>,
+}
+
+/// Where the cursor stands: the row it is *of*, that row's key, and the
+/// index it was put at. All three, because each answers a different way for
+/// the list to move under it — the row stayed put, it moved, it left.
+struct Cursor<D: Datasource> {
+    key: D::Key,
+    index: usize,
+    row: D::Row,
 }
 
 impl<D: Datasource> ListState<D> {
@@ -1373,25 +1385,37 @@ impl<D: Datasource> ListState<D> {
     /// The key the cursor is *of*, whatever row it now sits on.
     #[must_use]
     pub fn cursor_key(&self) -> Option<&D::Key> {
-        self.cursor.as_ref().map(|(k, _)| k)
+        self.cursor.as_ref().map(|c| &c.key)
     }
 
     /// Where the cursor stands now, by the three rules above.
     #[must_use]
     pub fn cursor_index(&self, store: &Store) -> Option<usize> {
-        let (key, idx) = self.cursor.as_ref()?;
+        let c = self.cursor.as_ref()?;
         if self
             .table
-            .row(store, *idx)
-            .is_some_and(|r| self.table.key(&r) == *key)
+            .row(store, c.index)
+            .is_some_and(|r| self.table.key(&r) == c.key)
         {
-            return Some(*idx);
+            return Some(c.index);
         }
-        if let Some(i) = self.index_of_key(store, key) {
+        if let Some(i) = self.index_of_key(store, &c.key) {
             return Some(i);
         }
         let n = self.table.len(store);
-        (n > 0).then(|| (*idx).min(n - 1))
+        if n == 0 {
+            return None;
+        }
+        // The row left. The order still knows where it belonged, and the
+        // rows that went with it are gone from that count: the rank of the
+        // row the cursor remembers is the row that took its place. A source
+        // that cannot rank falls back on the index it was put at.
+        let i = self
+            .table
+            .source()
+            .index_of(store, self.table.ast(), &c.row)
+            .unwrap_or(c.index);
+        Some(i.min(n - 1))
     }
 
     /// A key's row, when the source can find one for it.
@@ -1410,7 +1434,11 @@ impl<D: Datasource> ListState<D> {
     /// disagree.
     pub fn set_cursor(&mut self, store: &Store, i: usize) -> Option<D::Row> {
         let row = self.table.row(store, i)?;
-        self.cursor = Some((self.table.key(&row), i));
+        self.cursor = Some(Cursor {
+            key: self.table.key(&row),
+            index: i,
+            row: row.clone(),
+        });
         Some(row)
     }
 
@@ -2326,8 +2354,9 @@ mod tests {
     }
 
     /// The cursor's three rules: the remembered row while it still holds
-    /// the key, the key's rank when something landed above it, and the row
-    /// clamped into the list when the key left altogether.
+    /// the key, the key's rank when something landed above it, and the
+    /// row's own rank when the key left altogether — the row that took its
+    /// place, however many went with it.
     #[test]
     fn the_cursor_holds_its_row_then_its_key_then_its_place() {
         let s = store_with(25);
@@ -2356,14 +2385,31 @@ mod tests {
         assert_eq!(l.cursor_index(&s), Some(4), "the key found its new rank");
         assert_eq!(l.cursor_key(), Some(&held));
 
-        // The row leaves altogether: the walk carries on where it stood.
+        // The row leaves altogether: the walk carries on where it stood,
+        // which is the row that took its place — the rank of the row it
+        // remembers, not the index it was put at four rows ago.
+        let below = l.row(&s, 5).expect("the row under the cursor").id;
         s.write(move |c| c.execute("DELETE FROM item WHERE id = ?1", [held]))
             .unwrap();
-        assert_eq!(
-            l.cursor_index(&s),
-            Some(3),
-            "clamped into the list, from where the cursor was put"
-        );
+        assert_eq!(l.cursor_index(&s), Some(4), "where the row stood");
+        assert_eq!(l.row(&s, 4).map(|r| r.id), Some(below), "the row below it");
+
+        // A batch takes the cursor's row *and* rows above it: the rank
+        // counts what outlived them, so the walk lands on the next row
+        // rather than one further down per row that left.
+        let mut l = ListState::new(&SOURCE, 10);
+        l.set_cursor(&s, 3);
+        let gone: Vec<i64> = l.table().rows(&s, 0, 4).iter().map(|r| r.id).collect();
+        let next = l.row(&s, 4).expect("the row under the batch").id;
+        s.write(move |c| {
+            for id in &gone {
+                c.execute("DELETE FROM item WHERE id = ?1", [id])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(l.cursor_index(&s), Some(0), "four rows left from above it");
+        assert_eq!(l.row(&s, 0).map(|r| r.id), Some(next));
 
         // …and clamped to the end when the list is shorter than the index.
         l.set_cursor(&s, 20);
