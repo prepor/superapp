@@ -260,13 +260,18 @@ impl Panel for Card {
 
     /// Every verb acts on the file the card shows: `open` hands it to the
     /// OS, `copy` and `move` hold it for a `… here`, `rename` raises a field
-    /// under the name, and `delete` puts it in the trash and takes this card
-    /// with it — it would be showing nothing. Reads *open copy move rename
-    /// delete*: the destructive one last, as on a message.
+    /// under the name, `delete` puts it in the trash and takes this card
+    /// with it — it would be showing nothing — and `copy path` puts what it
+    /// is called on this machine on the system clipboard. Reads *open copy
+    /// move rename delete copy path*: the destructive one before the
+    /// harmless one, as on a message.
     ///
     /// `copy` wears the `p` of "copy", not the `c`: a card's path is
     /// selectable, so cmd+c copies the path — the file clipboard is not the
-    /// text one.
+    /// text one. Which is why `c` is exactly the letter `copy path` wears:
+    /// the chord copies a path either way. Which of the two answers is the
+    /// widget's — a caret in one of its runs keeps the text chords, and the
+    /// bar has the letter the rest of the time.
     fn verbs(&self) -> Vec<Verb> {
         vec![
             Verb::run("files.open", "open", Some('o')),
@@ -274,6 +279,7 @@ impl Panel for Card {
             Verb::run("files.move", "move", Some('m')),
             Verb::run("files.rename", "rename", Some('r')),
             Verb::run("files.delete", "delete", Some('d')),
+            Verb::run("files.copy_path", "copy path", Some('c')),
         ]
     }
 
@@ -284,6 +290,7 @@ impl Panel for Card {
             "files.move" => dir::hold(s, Op::Move, vec![self.path.clone()]),
             "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
+            "files.copy_path" => self.copy_path(s),
             _ => {}
         }
     }
@@ -340,6 +347,17 @@ impl Card {
             dir::Said::Nothing => {}
         }
         self.restat();
+    }
+
+    /// `copy path`: what this file is called on the machine, onto the
+    /// system clipboard. Nothing is read and nothing written, so the card
+    /// stands as it was.
+    fn copy_path(&mut self, s: &mut Session) {
+        match dir::copy_paths(s, vec![self.path.clone()]) {
+            dir::Said::Went => self.status = None,
+            dir::Said::Refused(line) => self.status = Some(line),
+            dir::Said::Nothing => {}
+        }
     }
 
     /// `delete`: the file to the trash, and this card closed in the layout

@@ -11,15 +11,15 @@
 //! of which file is on the card and writes again only when that moves.
 //!
 //! The bar is the instance's: *open*, *copy*, *move*, the *rename* that
-//! raises a field where the name is drawn, and the *delete* that takes the
-//! card with the file.
+//! raises a field where the name is drawn, the *delete* that takes the card
+//! with the file, and the *copy path* that takes nothing at all.
 
 use kernel::panel::PanelId;
 use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::Letters;
+use crate::shell::keys::{key_char, Letters};
 use crate::shell::widgets::card::{self, CardData, Preview};
 
 use super::super::model::{fmt_size, FileKind, Preview as Read};
@@ -92,11 +92,15 @@ impl Widget for CardPanel {
         self.sync(cx, &props, &rename);
         self.rename_field.land(cx, &rename, true);
         let live = self.rename_field.live(cx, &rename);
-        keeps(&props, live);
+        let in_run = !live && selecting(cx, &self.view);
+        keeps(&props, live, in_run);
         if let Event::KeyDown(k) = event {
             // A live field keeps the chords it needs: `cmd+a` is select-all
-            // here, not a verb on the bar.
-            if live && k.modifiers.logo {
+            // here, not a verb on the bar. A caret in one of the selectable
+            // runs keeps only the four text chords — `cmd+c` copies what is
+            // selected rather than running the bar's `copy path`, and every
+            // other letter is still the bar's.
+            if k.modifiers.logo && (live || (in_run && text_chord(k))) {
                 props.chord.take();
             }
         }
@@ -156,7 +160,8 @@ impl Widget for CardPanel {
         self.view
             .widget(cx, NAME)
             .set_visible(cx, !self.rename_field.up());
-        keeps(&props, self.rename_field.live(cx, &rename));
+        let live = self.rename_field.live(cx, &rename);
+        keeps(&props, live, !live && selecting(cx, &self.view));
 
         let step = self.view.draw_walk(cx, scope, walk);
 
@@ -245,6 +250,24 @@ fn renaming(props: &PanelProps) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether one of the card's selectable runs has the keyboard: the path
+/// line, or a text preview. Either is a makepad field, read-only.
+///
+/// The keyboard has to be *somewhere* first: a field that has never been
+/// drawn — the preview box a card without one folds away — has an empty
+/// area, and an empty key focus reads as that field's own. Without this a
+/// pdf's card would answer yes with nothing focused at all, and swallow
+/// the `cmd+c` its bar was drawing.
+fn selecting(cx: &mut Cx, view: &View) -> bool {
+    cx.key_focus() != Area::Empty
+        && (view.text_input(cx, DETAIL).key_focus(cx) || view.text_input(cx, PREVIEW).key_focus(cx))
+}
+
+/// Whether a chord is one of the four a caret keeps wherever one blinks.
+fn text_chord(k: &KeyEvent) -> bool {
+    key_char(k.key_code).is_some_and(|c| Letters::TEXT.has(c))
+}
+
 /// Which reading of which file the instance is holding right now.
 fn shown(props: &PanelProps) -> Option<Shown> {
     // The identity off the instance as a panel, the reading off it as a
@@ -305,13 +328,20 @@ fn edit(props: &PanelProps, f: impl FnOnce(&mut Card)) {
     }
 }
 
-/// What the field keeps from the bars while it has the keyboard: every
-/// letter, because the keydown above answers *any* cmd chord while a caret
-/// blinks in it — so no bar's letter would fire and none may be drawn as if
-/// it would. Said nothing at all when the caret is elsewhere.
-fn keeps(props: &PanelProps, live: bool) {
+/// What this widget's keyboard keeps from the bars, said on every draw and
+/// every event.
+///
+/// Every letter while the `rename` field is live, because the keydown above
+/// answers *any* cmd chord while a caret blinks in it — so no bar's letter
+/// would fire and none may be drawn as if it would. Only the four text
+/// chords while a caret sits in one of the selectable runs instead: those
+/// are read-only, and answer nothing else. Nothing at all when the keyboard
+/// is elsewhere.
+fn keeps(props: &PanelProps, live: bool, in_run: bool) {
     if live {
         props.chord.field(Letters::ALL);
+    } else if in_run {
+        props.chord.field(Letters::NONE);
     }
 }
 

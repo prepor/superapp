@@ -1,9 +1,10 @@
 # Files
 
 The files app browses this machine's disk: a directory is a list, a file is a
-card, and five verbs write. It stores nothing, because the disk is the state, so it has
-no schema, no seed, no queued jobs, and no workers. What it adds is two
-panel kinds, one launcher root, and a clipboard other apps may read.
+card, five verbs write, and one copies a name. It stores nothing, because the
+disk is the state, so it has no schema, no seed, no queued jobs, and no workers.
+What it adds is two panel kinds, one launcher root, and a clipboard other apps
+may read.
 
 It reaches the disk through the kernel's `Disk` [capability](./apps.md#capabilities),
 in the display spelling the panels use, and the kernel translates `~` to a real
@@ -83,18 +84,23 @@ answer.
 Every files verb is a button; the links in this app are the breadcrumbs and the
 rows.
 
-A card wears `open` (`o`), `copy` (`p`), `move` (`m`), `rename` (`r`), and
-`delete` (`d`). `copy` wears `p` rather than `c` because the card's path line is
-selectable and `cmd+c` copies the text.
+A card wears `open` (`o`), `copy` (`p`), `move` (`m`), `rename` (`r`), `delete`
+(`d`), and `copy path` (`c`). `copy` wears `p` rather than `c` because the
+card's path line is selectable and `cmd+c` copies the text there — which is why
+`c` is exactly the letter `copy path` takes: the chord copies a path either way.
+A caret in one of the card's two selectable runs keeps the four text chords and
+nothing more, so while a path is selected `cmd+c` is the selection's and `cmd+d`
+is still *delete*. The `rename` field keeps every letter, as any field with a
+caret in it does.
 
 A directory wears `new dir` (`n`) and `go to` (`g`) always. It wears `copy`,
-`move`, `rename`, and `delete` when it has an object to act on: either a marked
-set, or the directory itself when the panel hangs under a list, drives no
-preview of its own, and is not a root. That is why a root or a parent directory
-offers only `new dir` and `go to`, and why `cmd+d` in a walk means the directory
-under the cursor. While marks exist it also wears `mark all` (`a`) and `clear`,
-which has no letter because `esc` is the table's — and drops `rename`, since a
-name is a name and two things cannot both wear it.
+`move`, `rename`, `delete`, and `copy path` when it has an object to act on:
+either a marked set, or the directory itself when the panel hangs under a list,
+drives no preview of its own, and is not a root. That is why a root or a parent
+directory offers only `new dir` and `go to`, and why `cmd+d` in a walk means the
+directory under the cursor. While marks exist it also wears `mark all` (`a`) and
+`clear`, which has no letter because `esc` is the table's — and drops `rename`,
+since a name is a name and two things cannot both wear it.
 
 While the clipboard holds something, a directory wears `copy here` or `move
 here` (`h`).
@@ -115,6 +121,21 @@ The clipboard is ordinary public API on the app, found through
 `Apps::get_as::<Files>()`. Mail's compose panel reads it to offer
 [attach](./mail.md#carrying-a-file); take files out of the build and that verb
 never appears.
+
+## Copying the path
+
+`copy path` (`cmd+c`) is the one verb that leaves the app without touching a
+disk: it puts what the object is called on *this* machine — the real spelling,
+not the `~/` one the panels draw — on the system clipboard, through the kernel's
+`Clip` [effect](./data-substrate.md#effects). Over a marked set it is one path
+to a line, and the label counts them: `copy 3 paths`.
+
+Nothing of ours changes, so there is no history node, no listing goes stale, and
+the write gate is not asked: a clipboard is not a device's to lease. What
+happened is the toast, and the
+[effect log](./data-substrate.md#effects-and-job-panels) has the row. It is the
+system clipboard and not the app's own — a `copy path` never fills a
+`copy here`.
 
 ## Writing to the disk
 

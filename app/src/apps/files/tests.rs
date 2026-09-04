@@ -4,7 +4,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use kernel::app::App;
-use kernel::caps::Disk;
+use kernel::caps::{Clipboard, Disk, FakeClipboard};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, VerbAct};
@@ -205,6 +205,15 @@ fn bar(s: &Session, slot: SlotId) -> Vec<&'static str> {
         .iter()
         .map(|v| v.id)
         .collect()
+}
+
+/// A system clipboard the test can read back, over the one the fake world
+/// came with.
+fn clipboard(s: &Session) -> FakeClipboard {
+    let clip = FakeClipboard::new();
+    s.world()
+        .caps(|c| c.insert::<dyn Clipboard>(Box::new(clip.clone())));
+    clip
 }
 
 /// Whether the disk has this path.
@@ -591,6 +600,37 @@ fn a_delete_closes_its_own_slot_and_the_chain_under_it_and_nothing_else() {
 }
 
 #[test]
+fn copy_path_puts_the_real_spelling_on_the_system_clipboard() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    let clip = clipboard(&s);
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+
+    let (was, wrote) = (nodes(&s), FILES.writes());
+    run(&mut s, card, "files.copy_path");
+    assert_eq!(
+        clip.last(),
+        Some(real_path("~/notes.md").display().to_string()),
+        "what the file is called on this machine, not what the panel calls it"
+    );
+    assert_eq!(nodes(&s), was, "nothing to undo");
+    assert_eq!(FILES.writes(), wrote, "and no listing has gone stale");
+    assert!(
+        FILES.clipboard().is_empty(),
+        "the file clipboard is not the text one"
+    );
+    assert!(
+        s.notes().iter().any(|n| n.msg.starts_with("copied")),
+        "and it said so: {:?}",
+        s.notes()
+    );
+}
+
+#[test]
 fn a_root_is_nobody_s_object() {
     let _alone = alone();
     let (mut s, slot) = home();
@@ -613,7 +653,8 @@ fn a_root_is_nobody_s_object() {
             "files.copy",
             "files.move",
             "files.rename",
-            "files.delete"
+            "files.delete",
+            "files.copy_path"
         ]
     );
 
@@ -978,6 +1019,38 @@ fn a_batch_keeps_the_mark_it_could_not_take() {
             .any(|n| n.msg.contains("1 of 2 files to the trash")),
         "and the toast says how many of how many: {:?}",
         s.notes()
+    );
+}
+
+#[test]
+fn copy_path_over_a_marked_set_is_one_path_to_a_line() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    let clip = clipboard(&s);
+    mark(&s, slot, ["README.txt", "report-q3.pdf"]);
+
+    let labelled = inst(&s, slot)
+        .borrow()
+        .verbs()
+        .into_iter()
+        .find(|v| v.id == "files.copy_path")
+        .map(|v| (v.label, v.accel));
+    assert_eq!(labelled, Some(("copy 2 paths".to_string(), Some('c'))));
+
+    run(&mut s, slot, "files.copy_path");
+    assert_eq!(
+        clip.last(),
+        Some(format!(
+            "{}\n{}",
+            real_path("~/Downloads/README.txt").display(),
+            real_path("~/Downloads/report-q3.pdf").display()
+        ))
+    );
+    assert_eq!(
+        marks(&s, slot).len(),
+        2,
+        "nothing was consumed: a copy of a name takes nothing away"
     );
 }
 

@@ -199,6 +199,28 @@ click "~/Downloads/README.txt"
 wait 400
 shot p14-rename-undone
 
+# -- a caret, and the letters it does not keep -----------------------------------
+
+# A click on the card's own path line puts a caret in it and moves no
+# focus: the line is a read-only field, and a click on a widget's element
+# is none of the panel's business. That caret keeps the four text chords —
+# `cmd+c` there copies what is selected rather than running the bar's `copy
+# path` — and nothing else, so every other letter still walks to the bar of
+# the panel under the cursor. `cmd+d` is the assertion: it deletes the file
+# this card is on, from a keyboard a caret is holding, and cmd+z brings
+# both the file and the card back.
+click "~/Downloads/README.txt"
+wait 500
+key cmd+c
+wait 500
+key cmd+d
+wait 900
+shot p15-deleted-by-the-chord
+key cmd+z
+wait 900
+click "~/Downloads/README.txt"
+wait 400
+
 # -- delete ---------------------------------------------------------------------
 
 # The card is the object again: `delete` takes the file to the trash and
@@ -207,12 +229,12 @@ shot p14-rename-undone
 # brings both back: the card onto the file, and the row into the listing.
 click "delete"
 wait 900
-shot p15-deleted
+shot p16-deleted
 key cmd+z
 wait 900
 click "~/Downloads/README.txt"
 wait 400
 click "README.txt"
 wait 700
-shot p16-restored
+shot p17-restored
 quit

@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use kernel::caps::{CopyPath, MakeDir, MovePath, OpenPath, Trash};
+use kernel::caps::{Clip, CopyPath, MakeDir, MovePath, OpenPath, Trash};
 use kernel::effect::World;
 use kernel::history::Intent;
 
@@ -21,7 +21,7 @@ use super::model::{
 };
 use super::{Clipboard, Op, FILES};
 
-// -- the five verbs ------------------------------------------------------------
+// -- the verbs -----------------------------------------------------------------
 
 /// `open`: the path handed to the OS — whatever opens that kind of file.
 /// Nothing is executed by us, and nothing of ours changes, so no listing
@@ -91,6 +91,33 @@ pub fn trash_in(world: &World, path: &str) -> Result<String, String> {
         .map(|p| display_path(&p));
     FILES.touched();
     r
+}
+
+/// `copy path`: what the paths are called on *this* machine, one to a
+/// line, onto the system clipboard — the real spelling and not the
+/// panels', because what is pasted lands somewhere that never heard of
+/// `~`.
+///
+/// Nothing of ours changes and no disk is touched, so no listing goes
+/// stale behind it and there is nothing to give back.
+///
+/// # Errors
+///
+/// Whatever the clipboard said.
+pub fn clip_paths(world: &World, paths: &[String]) -> Result<(), String> {
+    let text = paths
+        .iter()
+        .map(|p| real_path(p).to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    world.run(&Clip {
+        text: &text,
+        what: if paths.len() == 1 {
+            "the path"
+        } else {
+            "the paths"
+        },
+    })
 }
 
 // -- what a name may be ------------------------------------------------------

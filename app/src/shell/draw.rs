@@ -638,14 +638,21 @@ impl Stage {
         ));
         self.draw_chrome(cx, r, &title, focused, alpha, Some(slot), hover.as_ref());
 
-        let bar_h = if verbs.is_empty() { 0.0 } else { bar::BAR_H };
+        // As tall as the wrap needs, which is what the body is drawn under.
+        let bar_h = bar::height(&verbs, &self.cell, r);
         if !verbs.is_empty() {
             // Where this bar stands in the chord routing order, and so what
             // it may promise: the focused panel's own letters less what its
             // widget keeps, the previewed panel's less what the focused bar
             // wears too, and nothing at all anywhere else.
             let focus = sh.session.focus();
-            let kept = self.field_letters(focus);
+            // What a caret keeps never reaches a bar. The focused panel's
+            // widget holds the keyboard for its own bar — and for a
+            // previewed one, whose widget may hold it instead: a click in a
+            // preview puts a caret there without moving focus.
+            let kept = self
+                .field_letters(focus)
+                .plus(self.field_letters(Some(slot)));
             let driver = sh.session.join_parent_of(slot);
             let driving = driver.filter(|d| Some(*d) == focus && !focused);
             let driver_verbs = driving
@@ -660,7 +667,7 @@ impl Stage {
                 },
                 (false, false) => bar::Reach::Away,
             };
-            let strip = bar::strip(r);
+            let strip = bar::strip(r, bar_h);
             let bold = bar::bold(&verbs, reach);
             self.draw_bar(cx, slot, &verbs, strip, alpha, bold, hover.as_ref());
         }
