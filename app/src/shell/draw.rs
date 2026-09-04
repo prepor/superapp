@@ -112,6 +112,11 @@ impl Style {
     }
 }
 
+/// What the close box wears. The one glyph in the chrome that is not a
+/// letter, and so the one its line box does not centre — see
+/// [`CellFont::ink_drop`].
+pub const CLOSE: &str = "×";
+
 /// The mono face as this display renders it: measured once per scale, so
 /// the char grid and the layout agree about how wide a column is.
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +158,28 @@ impl CellFont {
             return 0.0;
         }
         chars as f64 * self.label_step() - self.label_adv() * theme::LABEL_TRACK
+    }
+
+    /// How far below the middle of its line box a label's ink sits, and so
+    /// how far up the label goes to centre the ink itself.
+    ///
+    /// Zero for every word the shell draws. Geist Mono puts a capital's
+    /// middle exactly on the line box's — cap height 710 against an
+    /// ascender of 1005 and a descender of 295 — so centring the box
+    /// centres the letters, which is the whole of why the rest of the
+    /// chrome needs no such correction.
+    ///
+    /// [`CLOSE`] is the one glyph the chrome draws that is not a letter. A
+    /// maths glyph rides the maths axis: its ink spans 84 to 506, a middle
+    /// 60 units of the em under the box's own, and in a box 18 pt tall that
+    /// is a visible drop.
+    #[must_use]
+    pub fn ink_drop(&self, label: &str) -> f64 {
+        if label == CLOSE {
+            self.label_line() * (60.0 / 1300.0)
+        } else {
+            0.0
+        }
     }
 
     /// Natural line height at label size, for vertical centring.
@@ -293,7 +320,7 @@ impl Stage {
             self.draw_box_btn(
                 cx,
                 br,
-                "×",
+                CLOSE,
                 "close",
                 focused,
                 alpha,
@@ -333,7 +360,9 @@ impl Stage {
         self.draw_panel.draw_abs(cx, r);
         let tw = self.cell.label_w(label.chars().count());
         let tx = r.pos.x + (r.size.x - tw) / 2.0;
-        let ty = r.pos.y + (r.size.y - self.cell.label_line()) / 2.0;
+        // The ink goes in the middle of the box, which for a word is the
+        // line box in the middle and for `×` is not.
+        let ty = r.pos.y + (r.size.y - self.cell.label_line()) / 2.0 - self.cell.ink_drop(label);
         self.draw_label_accel(cx, tx, ty, label, fg, alpha, accel);
         self.hits
             .push(Hit::act(hit_label, r, MouseCursor::Hand, act));
