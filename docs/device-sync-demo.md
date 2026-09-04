@@ -88,10 +88,23 @@ object store itself.
 ### 1. The bucket and a key
 
 In the Cloudflare dashboard: **R2 → Create bucket**, then **Manage R2 API
-Tokens → Create API token**, *Object Read & Write*, scoped to that bucket.
+Tokens → Create API token**, *Object Read & Write*, scoped to that bucket. Add
+**AI Gateway Run** and **Workers AI Read** to the same token while you are
+there: one Cloudflare token opens the bucket and the
+[agent](./book/src/agents.md#one-cloudflare-token-shared-with-r2)'s gateway
+both, and the app has no second credential anywhere.
+
 The token page shows three things worth keeping: the **access key id**, the
-**secret access key** (once), and the S3 endpoint,
+**token's value** (once), and the S3 endpoint,
 `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+
+Keep the **value**, not the *secret access key* the page prints beside it. By
+Cloudflare's own definition that key is the SHA-256 of the value, and the app
+computes it on the way to a signature — so the value opens both doors and the
+hash opens only one. A device that filed the hash before this was true keeps
+syncing on it (it is recognised by its shape: 64 hex digits, which a token
+never is), but it cannot open the gateway until the value is filed in its
+place.
 
 The bucket URL the app wants is that endpoint plus the bucket, and optionally
 a prefix — a lineage can live in a subdirectory, so one bucket can hold
@@ -104,8 +117,8 @@ https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>[/<PREFIX>]
 ### 2. Prove the credentials before trusting them
 
 ```sh
-export SUPERAPP_R2_ACCESS_KEY_ID=…
-export SUPERAPP_R2_SECRET_ACCESS_KEY=…
+export SUPERAPP_R2_ACCESS_KEY_ID=…      # the access key id
+export SUPERAPP_R2_SECRET_ACCESS_KEY=…  # the token's value
 mise exec -- cargo run -p superapp --bin sync-demo -- \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>
 ```
@@ -125,7 +138,7 @@ mise exec -- cargo run -p superapp -- --db /tmp/superapp-A.db \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
 ```
 
-The access key id and its secret are resolved, in order, from:
+The access key id and the token's value are resolved, in order, from:
 
 1. `SUPERAPP_R2_ACCESS_KEY_ID` / `SUPERAPP_R2_SECRET_ACCESS_KEY`,
 2. lines 2 and 3 of the `bucket` file beside the store,
@@ -133,19 +146,22 @@ The access key id and its secret are resolved, in order, from:
    keychain, written by:
 
 ```sh
-mise exec -- cargo run -p superapp -- --r2-login    # reads the secret from stdin, then exits
+mise exec -- cargo run -p superapp -- --r2-login    # reads the token's value from stdin, then exits
 ```
 
 Stdin, not a flag: an argument is in `ps` and in the shell's history, and this
 one key can write the whole lineage. `--r2-login` needs the key id (from the
-environment or the file); it stores only the secret. Secrets never go in the
-store — same rule as mail passwords (`app/src/platform/secret.rs`).
+environment or the file); it stores only the secret. Whichever of the three it
+comes from, it is the token's value that is filed, and R2 hashes it as it signs
+— so the same entry is what the gateway bears. Secrets never go in the store —
+same rule as mail passwords (`app/src/platform/secret.rs`).
 
 ### 4. The form, not the cable
 
 A device with no environment, no shell and no keychain command still has the
 **device-sync panel**: the launcher root *device sync*, with three fields (the
-bucket URL, the access key id, the secret) and a *connect* verb on its bar.
+bucket URL, the access key id, the secret — again, the token's value) and a
+*connect* verb on its bar.
 
 What connect does is the whole point of the panel:
 
@@ -169,7 +185,7 @@ to hand one a secret without typing it:
 cat > /tmp/superapp-B/bucket <<EOF
 https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
 <ACCESS_KEY_ID>
-<SECRET_ACCESS_KEY>
+<CLOUDFLARE_API_TOKEN>
 EOF
 ```
 

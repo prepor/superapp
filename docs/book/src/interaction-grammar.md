@@ -117,11 +117,16 @@ Cmd is the workspace modifier. The reserved chords are:
   panel, which reads it as *open un-joined*;
 - `shift+cmd+l`: raise or lower the panels library over the workspace;
 - `shift+cmd+s`: go to the search panel, wherever it stands;
+- `shift+cmd+a`: offer the focused panel to the apps as context — the first
+  one that takes a panel answers it, which today means a
+  [chat](./agents.md#getting-a-panel-into-a-chat) joined to it;
 - a double tap of `cmd`: the launcher.
 
-All other Cmd letters may be used by the focused panel's bar. Only the shifted
-`s` is reserved: plain `cmd+s` still belongs to whatever bar wears it, and a
-bar is only ever reached without Shift.
+All other Cmd letters may be used by the focused panel's bar. **A shifted chord
+reserves no letter**: only `shift+l`, `shift+s` and `shift+a` are taken, so
+plain `cmd+l`, `cmd+s` and `cmd+a` still belong to whatever bar or field wears
+them — mail's *sync* and *archive n*, and the select-all of every text input —
+and a bar is only ever reached without Shift.
 
 In a list, arrows move the cursor and keep it visible, `enter` opens the row
 and goes to it, `/` focuses the filter, `space` toggles the current mark unless
@@ -143,6 +148,16 @@ the line, `^B` and `^F` move by a character, `^P` and `^N` by a row, `^H` and
 the caret already at its end, the break, which pulls the line below up. Shift
 with any of the six that move extends the selection, as it does with the
 arrows.
+
+### A pasted panel
+
+`cmd+i` copies the focused panel's context to the clipboard, and its first line
+is that panel's identity: `superapp-panel: message ["42"]`. A paste into a
+chat's composer whose **first line** is that becomes a
+[chip](./agents.md#the-chip) — the panel as a thing — and any other paste is
+text. It is read as a paste and not as typing, because the text input says
+which it was, so a typed line that happens to start with those words stays
+typed.
 
 ## Workspaces
 

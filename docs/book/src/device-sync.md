@@ -96,8 +96,9 @@ This is the road a device with no shell and no cable has: a phone is still a
 device that has to be given a credential, and typing one in is the only way it
 can be. Connect does three things:
 
-- the secret goes to the platform's secret store through the effect boundary,
-  so a scripted run writes to memory and never to a human's keychain;
+- the secret — the token's value — goes to the platform's secret store through
+  the effect boundary, so a scripted run writes to memory and never to a
+  human's keychain;
 - the URL and the key id, and only those two, are written to a `bucket` file
   beside the store, so a file that carried a secret on its third line is
   rewritten without it;
@@ -115,6 +116,27 @@ The access key id and its secret come from `SUPERAPP_R2_ACCESS_KEY_ID` and
 platform's secret store. `superapp --r2-login` reads a secret from stdin and
 files it, because an argument is in `ps` and in the shell's history and this one
 key can write the whole lineage.
+
+## One token, two doors
+
+What is filed as the secret is the **Cloudflare API token's value**, not the S3
+secret access key the dashboard shows beside it. By Cloudflare's own definition
+the second is the SHA-256 of the first, so R2 hashes on the way to a signature
+and sees exactly the credentials it saw before, computed one line earlier —
+and the same entry can be borne whole by whatever else the account owns. The
+[agent](./agents.md#one-cloudflare-token-shared-with-r2)'s gateway is what
+asks for that: it reads this entry and no other, and takes its account from the
+first label of the bucket's host, so a device that syncs has a gateway and a
+device that does not has neither.
+
+The token wants three permissions in the dashboard: *Workers R2 Storage Edit*
+for the bucket, and *AI Gateway Run* and *Workers AI Read* for the gateway.
+
+A device configured before this change filed the hash, and from a hash no token
+can be recovered. It is recognised by its shape — 64 hex digits, which a
+40-character Cloudflare token can never be — so that device keeps syncing on
+what it holds; only the gateway asks for anything, and what it says is to run
+`superapp --r2-login` again, with the token's value.
 
 ## What is proven
 

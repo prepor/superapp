@@ -7,8 +7,8 @@
 - **Shell**: everything generic that draws or takes input. The stage, the
   chrome, the bar, animation, the overlays, the shared widgets, and the
   hosting of panel widgets. It uses Makepad and never names an app.
-- **App**: mail, files, or the shell's own `system` app. It implements the
-  kernel's interfaces and supplies its widgets to the shell. See
+- **App**: mail, files, agents, or the shell's own `system` app. It implements
+  the kernel's interfaces and supplies its widgets to the shell. See
   [Apps](./apps.md).
 - **Panel**: one focused view. What it shows is its **panel identity**; where
   it sits is its **slot**.
@@ -53,5 +53,23 @@
 - **Job**: an effect saved in the database so it can be retried. The Effects
   panel shows jobs together with recent effects that were not saved.
 - **Worker**: one background pass with its own thread and its own world: a
-  mail account's sync, the sender, the device-sync lease driver. An app says
-  which it wants running, and the kernel keeps the set in step with the store.
+  mail account's sync, the sender, the device-sync lease driver, a chat's run.
+  An app says which it wants running, and the kernel keeps the set in step with
+  the store.
+- **Agent**: what answers in a chat — a model behind the gateway, a system
+  prompt, and the tools this build offers it. There is one, the assistant. See
+  [Agents](./agents.md).
+- **Chat**: one conversation with the agent: a row and a panel.
+- **Turn**: one message of a chat, a person's or the agent's. The wire's own
+  message, kept verbatim, and what the next request is built from.
+- **Chip**: a piece of context put into a chat as a thing rather than as text.
+  A panel, today: its identity, not a snapshot, so its rows are read again when
+  the request goes out.
+- **Run**: one round of the agent working on a chat — a request, the tool calls
+  it asks for, their results — until it stops. A row, driven by a worker.
+- **Tool**: one thing an app lets an agent do, by name, with a JSON schema:
+  the verb's own code path over ids instead of over a cursor.
+- **Call**: one use of a tool inside a run. A row, so the chat panel can run it
+  on the UI thread and the transcript can show what it came to.
+- **Gateway**: where a request goes — a Cloudflare AI Gateway in front of the
+  model, opened with the token device sync already holds.

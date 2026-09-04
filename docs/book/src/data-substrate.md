@@ -29,6 +29,24 @@ session and the action's data in one transaction, records a history node with
 the layout before and after plus the intents that reverse it, then kicks the
 workers and replication. See [Apps](./apps.md#the-session).
 
+### The changeset's inverse
+
+An intent is normally an app's own sentence about its own rows — *mail:7
+archived*, *renamed “a” to “b”* — because the app knows what it did. One
+caller cannot say that: the [agent](./agents.md#the-kernels-own)'s `sql.write`
+ran a statement somebody wrote, and all it knows is which rows moved.
+
+So it claims the transaction's **changeset**, the very bytes the session
+extension recorded for device sync. Undo applies the inverse and redo applies
+the original, both through the one writer, so the reversal replicates to the
+other device and invalidates the queries that drew the rows. Before it applies
+anything it rehearses in a transaction that is always rolled back: a row that
+has since changed is replaced, a row that has gone is skipped, and anything
+else — a constraint, a foreign key — is refused, so a node that could not be
+undone cleanly expires rather than half-applying. A table with no primary key
+records nothing in a changeset, so writing one is refused outright instead of
+promising an undo that would do nothing.
+
 ## Effects
 
 An effect is work whose result cannot be recreated from the database. Network
@@ -54,9 +72,10 @@ modes:
 The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, `Disk`, and the
 `Watcher` over it, because the harness, attachments, and a file browser all use
 them. An app defines its own and supplies them in `App::outside`; mail's are
-`Imap`, `Smtp`, and `OAuth`. The kernel installs its own first, so an app or the
-shell may replace one: `app/src/shell/boot.rs` puts the real screen, the real
-clipboard, this machine's disk, and a watcher over it in place of the fakes on a
+`Imap`, `Smtp`, and `OAuth`, and the agent's is `Gateway`. The kernel installs
+its own first, so an app or the shell may replace one: `app/src/shell/boot.rs`
+puts the real screen, the real clipboard, this machine's disk, and a watcher
+over it in place of the fakes on a
 windowed run.
 
 ### Queued jobs
@@ -87,6 +106,13 @@ latest `KEPT` (200) of them in a memory-only ring. It records the kind, owner,
 short description, and any error. Clock reads are excluded because they happen
 many times per frame.
 
+An [agent](./agents.md)'s request to its gateway is one of these and never a
+row: a request costs money, nobody would retry one blindly, and the run's own
+row is its state, so there is nothing for the queue to claim. It goes through
+the one door all the same, so the log shows *ask the model for chat 7, turn
+12* with its error beside the mail reads, and it says it wrote, because a
+request costs something.
+
 The Effects panel combines the database queue and this ring with `UNION ALL`.
 Memory rows use negative IDs, database rows use positive IDs, and both are
 ordered by time. `@memory` and `@filed` select the two sources.
@@ -99,6 +125,17 @@ worker adds an entry.
 Memory IDs are valid only for the current process. A job panel on a memory row
 saves as the parent Effects panel instead, through `Panel::persist`. This
 avoids opening an unrelated row with the same ID after restart.
+
+### The live tail
+
+The ring's rule — what is transient and needs no restart lives in memory, not
+in a row — has one more instance. While a model is writing an answer, what has
+arrived of it is kept on the agent app's own static, per run, with a counter a
+widget can compare instead of comparing strings. A token a row would be a
+thousand writes a turn. The chat draws it under the last turn, and the engine
+asks for a frame after every chunk; when the answer is whole it becomes one
+`agent_turn` row and the tail is dropped. A run the person stopped keeps what
+had arrived, as a turn of its own.
 
 ### Effects and job panels
 
@@ -145,6 +182,8 @@ every store open, the kernel's first, then the apps' in app-list order.
 rebuilt from other rows (a search index, an HTML narrowing, attachment rows)
 and is versioned by the walk that made it rather than by the ladder's counter:
 bump the version and every store rebuilds on its next open, however old it is.
+`Step::Always` runs at every open, in its place in the ladder, which is where a
+crash is put right before any worker is asked for.
 
 An app never alters another app's tables, and a new app prefixes its table
 names with its id. The kernel's schema is at version 1 and a store of any other
@@ -167,6 +206,12 @@ Each panel draw opens a trace, so the queries and parameters it used are
 recorded by construction rather than declared. `cmd+i` copies the focused
 panel's identity, arguments, and query trace to the clipboard. The copy is an
 effect, so a world that may not touch a human's clipboard refuses it out loud.
+
+The trace is also what an [agent](./agents.md#the-chip) is handed: the panel's
+own paragraph, then each traced query with the rows re-read now, off the same
+parameters the draw bound. The copy's first line is the panel's identity, which
+is what makes it reversible — pasted into a chat it is read back as the panel
+it came from.
 
 ## Data kept outside SQLite
 

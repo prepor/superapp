@@ -22,9 +22,10 @@ mise exec -- cargo test --workspace
 ```
 
 Both crates, no window, no network, no keychain. The kernel's tests are the
-panel mechanics, springs, the store, effects, history, and device sync; the
-app's are the mail engine, the files model, the bar, the catalogue, and the
-platform's own disk and keychain code. Everything runs against fakes.
+panel mechanics, springs, the store, effects, history, device sync, the HTTP
+reader and the SSE parser; the app's are the mail engine, the files model, the
+agent's wire and run loop, the bar, the catalogue, and the platform's own disk
+and keychain code. Everything runs against fakes.
 
 A test drives a `Session` with no widget at all. `Session::fake(apps)` opens an
 in-memory store, seeds it, builds a `Fake` world, and mounts the workers
@@ -33,6 +34,28 @@ inline, so a scripted action is followed by its consequences in the same call.
 panels-library mount takes. A test navigates with `Nav`, files an `Action`,
 calls `settle`, and reads the slots back; it reaches a fake capability through
 the world to plant a row or take a server offline.
+
+### The fake gateway
+
+Every test, every scripted run and every library mount gets `FakeGateway` in
+place of the [agent](./agents.md)'s model, registered under the capability and
+under its own type, so a test reaches it to plant a script or to read what the
+model was told. Nothing under a script can reach a network, and there is no
+token to find.
+
+A **script** is a list of replies, each either a text, a tool call with the
+text that follows its result, a failure, a text that runs out of room, or a
+filter. A reply is chosen by a keyword in the person's latest message, or in
+order where it names none, and each answers once; a request whose last message
+is a tool result takes the `then` of the call that asked for it. Two things it
+does not shortcut: it streams, in word-sized chunks through the same assembler
+a real answer goes through, so a live tail, a stop and a tool call's argument
+fragments are all exercised; and it records every request it was given.
+
+What a run with no test behind it gets is the **default script**, since a suite
+cannot plant one: today it answers anything with `Hello. I am the assistant.`
+A `{panel}` in a scripted text is filled with the title of the first panel chip
+in the prompt and a `{user}` with the person's latest message.
 
 ### The boundary tests
 
@@ -86,11 +109,11 @@ them.
 
 ### Where a suite lives, and what it says about itself
 
-The shell's own suites are `e2e/*.txt` and an app's are `e2e/<app>/*.txt`. A
-suite is named by the path it is at, so `mail/basic` and a shell suite of the
-same name never collide. `e2e/sync/` is the one directory left out: those walks
-are two devices over one bucket, so each needs a second process and a
-`bucketd`.
+The shell's own suites are `e2e/*.txt` and an app's are `e2e/<app>/*.txt` —
+`e2e/mail/`, `e2e/files/`, `e2e/agent/`. A suite is named by the path it is at,
+so `mail/basic` and a shell suite of the same name never collide. `e2e/sync/`
+is the one directory left out: those walks are two devices over one bucket, so
+each needs a second process and a `bucketd`.
 
 What a suite needs beyond the defaults it says in two header lines of its own
 file:
@@ -161,8 +184,15 @@ key cmd+shift+left
 key down 45
 key cmd 2
 type "hello"
+paste "superapp-panel: inbox []\n\n# superapp panel context"
 quit
 ```
+
+`paste` is `type` with the event saying it was a paste, which is the only way
+to drive a field that reads one for what it is — a panel context becoming a
+[chip](./agents.md#getting-a-panel-into-a-chat). It is also the one step whose
+argument is a document rather than a word: `\n` is a newline in it and nowhere
+else.
 
 Commands use labels from links, buttons, fields, rows, and panel titles. Labels
 match without case. Exact matches rank above prefixes, which rank above other
@@ -233,7 +263,7 @@ walk, local and against a real bucket.
 | `--grid WxH` | force the unit grid |
 | `--window WxH` | force the window size |
 | `--library [NAME…]` | open on the panels-library canvas, filtered by name |
-| `--r2-login` | read a device-sync secret from stdin, file it, and exit |
+| `--r2-login` | read the Cloudflare API token's value from stdin, file it, and exit |
 
 ## Environment knobs
 
@@ -249,7 +279,9 @@ The shell's own:
 An app's own knobs are environment variables it reads itself, because argv
 belongs to the shell: `SUPERAPP_SEND_DELAY`, `SUPERAPP_MAIL_DOWN`,
 `SUPERAPP_GOOGLE_CLIENT_ID`, and `SUPERAPP_GOOGLE_CLIENT_SECRET` are all
-[mail's](./mail.md#environment-knobs).
+[mail's](./mail.md#environment-knobs), and
+[`SUPERAPP_AGENT_LOG_PAYLOAD`](./agents.md#environment-knobs) is the agent's:
+with it the gateway is allowed to keep what a chat sends.
 
 Makepad's own: `MAKEPAD=headless` at build time, `MAKEPAD_HEADLESS_OUT_DIR` for
 the rasterizer's frames, and `MAKEPAD_HEADLESS_DPI` to fix the geometry.
@@ -322,7 +354,8 @@ delete the change request when the implementation is complete.
    half beside each other.
 2. Implement `kernel::app::App`: an `id`, the panel kinds it owns, and whatever
    else it needs: a `Schema`, a `seed`, deferred `effects`, `outside`
-   capabilities, `search_providers`, `problems`, `workers`, and `roots`. Prefix
+   capabilities, `search_providers`, `problems`, `workers`, `roots`, and — for
+   an [agent](./agents.md) — a `describe` and the `tools` it offers. Prefix
    every table name with the app's id.
 3. Implement a `PanelKind` and a `Panel` per tag. Give each tag a typed view
    that spells its arguments once. Verb ids are stable and prefixed.
