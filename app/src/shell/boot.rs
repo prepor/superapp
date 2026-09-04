@@ -361,6 +361,7 @@ impl Boot {
             secrets_backend: keychain,
             clock: clock.clone(),
             disk,
+            bucket: self.bucket.clone(),
             // Filled in by the mount that runs the passes: only a threaded
             // one has channels to wake anybody through.
             kicks: Kicks::default(),

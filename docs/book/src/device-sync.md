@@ -115,7 +115,10 @@ The access key id and its secret come from `SUPERAPP_R2_ACCESS_KEY_ID` and
 `SUPERAPP_R2_SECRET_ACCESS_KEY`, from lines 2 and 3 of that file, or from the
 platform's secret store. `superapp --r2-login` reads a secret from stdin and
 files it, because an argument is in `ps` and in the shell's history and this one
-key can write the whole lineage.
+key can write the whole lineage. It takes the key id from
+`SUPERAPP_R2_ACCESS_KEY_ID` or the file the first time and remembers it in the
+secret store beside the token, so a device that never joined a bucket still
+knows which token it holds.
 
 ## One token, two doors
 

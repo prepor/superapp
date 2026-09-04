@@ -174,10 +174,15 @@ Read*.
 That works because an R2 token's S3 secret access key is, by Cloudflare's own
 definition, the SHA-256 of the token's value. So what is filed is the
 **value**, and R2 hashes it on the way to a signature; the gateway reads the
-same entry and bears it whole. Where the gateway is comes out of R2 as well:
-the account is the first label of the bucket's host, and the gateway's name is
-one more const, `superapp`, made once in the dashboard. A device with no R2
-bucket has no account to ask and therefore no gateway.
+same entry and bears it whole. Where the gateway is comes out of R2 when there
+is one: the account is the first label of the bucket's host — `--bucket`,
+`SUPERAPP_BUCKET`, or the `bucket` file, in that order — and the gateway's
+name is one more const, `superapp`, made once in the dashboard. A device with
+no bucket on R2 asks Cloudflare whose token it holds instead, once per process
+(`GET /accounts` with the same token), and a token that opens more than one
+account is told to name one with `--bucket`. The key id the token is filed
+under is remembered by `--r2-login` in the secret store, so a laptop that never
+joined a bucket needs neither a file nor an environment variable to find it.
 
 A device configured before this existed filed the hash the dashboard showed it,
 and from a hash no token can be recovered. Such a secret is recognised by its
@@ -498,8 +503,9 @@ showing and makes it a chip; `esc` puts the field away.
 - **No token, or the old hash.** A request with no Cloudflare token to be found
   fails at once, in R2's own sentences, naming the places it looked. A keychain
   holding the S3 hash from before this change is told to run `--r2-login` again
-  with the token's value. A device with no bucket has no account to read and
-  gets the same kind of row.
+  with the token's value. A device with no bucket asks Cloudflare for the
+  account, and when that fails too the row says why, with the three places a
+  bucket goes.
 - **The gateway refuses** (401, 403, an account that is nobody's): the run
   fails with the gateway's own sentence, and a 401 or 403 wears *unauthorized*,
   because a bad token is a standing condition and not one round's bad luck.

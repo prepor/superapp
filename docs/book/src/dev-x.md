@@ -274,7 +274,7 @@ walk, local and against a real bucket.
 | `--grid WxH` | force the unit grid |
 | `--window WxH` | force the window size |
 | `--library [NAME…]` | open on the panels-library canvas, filtered by name |
-| `--r2-login` | read the Cloudflare API token's value from stdin, file it, and exit |
+| `--r2-login` | read the Cloudflare API token's value from stdin, file it under the key id (`SUPERAPP_R2_ACCESS_KEY_ID` the first time; remembered after), and exit |
 
 ## Environment knobs
 

@@ -127,6 +127,13 @@ pub fn creds(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<Creds, Str
     })
 }
 
+/// Where the secret store remembers which key id `--r2-login` last filed a
+/// token for, so a device with no `bucket` file and no environment — a
+/// laptop that never joined a bucket — still finds its token by the id it
+/// was filed under. Not a secret, but the store is the one place every
+/// platform has.
+const KEY_ID_KEY: &str = "r2/key_id";
+
 /// The key id and the secret exactly as they were filed, in the one order
 /// every reader of them uses.
 ///
@@ -137,6 +144,7 @@ fn filed(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<(String, Strin
     let file = from_file(dir);
     let key_id = env(ENV_KEY)
         .or_else(|| file.get(1).cloned())
+        .or_else(|| secrets.get(KEY_ID_KEY).and_then(clean_secret))
         .ok_or_else(|| {
             format!("no access key id — set {ENV_KEY}, or put it on line 2 of the `bucket` file")
         })?;
@@ -235,30 +243,74 @@ fn host_of(url: &str) -> &str {
     }
 }
 
+/// The Cloudflare account a run's bucket belongs to, when a bucket is known
+/// and it is R2's. `url` is what the shell resolved — argv's `--bucket`
+/// first — and the environment and the `bucket` file are read behind it, so
+/// a run pointed at a bucket by flag alone finds its account here too.
+///
+/// `None` for a device with no bucket, or one whose bucket is not on R2 —
+/// the local `bucketd`. Neither is a device without a gateway: the app then
+/// asks Cloudflare whose token it holds, over [`gateway_token`].
+#[must_use]
+pub fn account_from(url: Option<&str>, dir: Option<&Path>) -> Option<String> {
+    let url = url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| env(ENV_BUCKET))
+        .or_else(|| url_from_file(dir))?;
+    account_of(&url)
+}
+
+/// The token the gateway bears — the one device sync files, by value — with
+/// the key id it was filed under. The same lookup in the same order
+/// [`creds`] uses, so the gateway and the bucket can never be opened by two
+/// different tokens.
+///
+/// # Errors
+///
+/// If no key id or no secret can be found, or if what is filed is the old S3
+/// hash — from which no token can be recovered. Each sentence says where to
+/// put what is missing.
+pub fn gateway_token(
+    dir: Option<&Path>,
+    secrets: &mut dyn Secrets,
+) -> Result<(String, String), String> {
+    let (key_id, token) = filed(dir, secrets)?;
+    if is_hash(&token) {
+        return Err(format!(
+            "the secret for {key_id} is the S3 hash, not the token — \
+             run `superapp --r2-login` again, with the token's value"
+        ));
+    }
+    Ok((key_id, token))
+}
+
 /// The gateway's credentials, out of what device sync is already configured
 /// with: the account off the bucket's host, and the same API token, borne
-/// whole this time.
-///
-/// The URL is read the way the kernel reads it — the environment, then the
-/// `bucket` file's first line. The shell's `--bucket` flag is argv's, and
-/// argv is the shell's; a run pointed at a bucket by flag alone still finds
-/// its account here only if the environment or the file names one too. The
-/// token comes through [`filed`], the same lookup in the same order [`creds`]
-/// uses, so the gateway and the bucket can never be opened by two different
-/// tokens.
+/// whole this time. `url` is the bucket the shell resolved, read as
+/// [`account_from`] reads it; the token comes through [`gateway_token`].
 ///
 /// # Errors
 ///
 /// If there is no bucket to read an account off, if its host is not R2's, if
-/// no secret is filed, or if what is filed is the old S3 hash — from which no
-/// token can be recovered. Each says where to put what is missing.
-pub fn gateway(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<GatewayCreds, String> {
-    let url = env(ENV_BUCKET)
+/// no secret is filed, or if what is filed is the old S3 hash. Each says
+/// where to put what is missing.
+pub fn gateway(
+    url: Option<&str>,
+    dir: Option<&Path>,
+    secrets: &mut dyn Secrets,
+) -> Result<GatewayCreds, String> {
+    let url = url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| env(ENV_BUCKET))
         .or_else(|| url_from_file(dir))
         .ok_or_else(|| {
             format!(
                 "no bucket — the gateway's account is read off the bucket's host: \
-                 set {ENV_BUCKET}, or put it on line 1 of the `bucket` file"
+                 run with `--bucket URL`, set {ENV_BUCKET}, or put it on line 1 of the `bucket` file"
             )
         })?;
     let account = account_of(&url).ok_or_else(|| {
@@ -268,13 +320,7 @@ pub fn gateway(dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<GatewayC
             host_of(&url)
         )
     })?;
-    let (key_id, token) = filed(dir, secrets)?;
-    if is_hash(&token) {
-        return Err(format!(
-            "the secret for {key_id} is the S3 hash, not the token — \
-             run `superapp --r2-login` again, with the token's value"
-        ));
-    }
+    let (_key_id, token) = gateway_token(dir, secrets)?;
     Ok(GatewayCreds { account, token })
 }
 
@@ -926,12 +972,15 @@ pub fn login_from_argv(secrets: &mut dyn Secrets) -> Option<i32> {
         .map(std::path::PathBuf::from)
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
-    let key_id = match env(ENV_KEY).or_else(|| from_file(dir.as_deref()).get(1).cloned()) {
+    let key_id = match env(ENV_KEY)
+        .or_else(|| from_file(dir.as_deref()).get(1).cloned())
+        .or_else(|| secrets.get(KEY_ID_KEY).and_then(clean_secret))
+    {
         Some(k) => k,
         None => {
             eprintln!(
-                "--r2-login: no access key id — set {ENV_KEY}, or put it on line 2 of the \
-                 `bucket` file beside the store"
+                "--r2-login: no access key id — set {ENV_KEY} (once: it is remembered), \
+                 or put it on line 2 of the `bucket` file beside the store"
             );
             return Some(2);
         }
@@ -947,13 +996,20 @@ pub fn login_from_argv(secrets: &mut dyn Secrets) -> Option<i32> {
         eprintln!("--r2-login: the token is empty — nothing stored");
         return Some(2);
     }
-    if secrets.set(&secret_key(&key_id), secret) {
+    if file_login(secrets, &key_id, secret) {
         eprintln!("--r2-login: stored the token for {key_id}");
         Some(0)
     } else {
         eprintln!("--r2-login: the platform refused to store it");
         Some(2)
     }
+}
+
+/// Files a token under its key id, and the key id under [`KEY_ID_KEY`], so
+/// the next run — and the next login — need neither the environment nor the
+/// `bucket` file to know which token this device holds.
+pub fn file_login(secrets: &mut dyn Secrets, key_id: &str, token: &str) -> bool {
+    secrets.set(&secret_key(key_id), token) && secrets.set(KEY_ID_KEY, key_id)
 }
 
 #[cfg(test)]
@@ -1148,7 +1204,7 @@ mod tests {
         assert_eq!(c.secret, sha256_hex(TOKEN.as_bytes()));
         assert_ne!(c.secret, TOKEN);
 
-        let g = gateway(Some(&dir), &mut secrets).unwrap();
+        let g = gateway(None, Some(&dir), &mut secrets).unwrap();
         assert_eq!(g.token, TOKEN);
         assert_eq!(g.account, "acc7");
         // And it is not the sort of thing that lands in a log.
@@ -1167,7 +1223,7 @@ mod tests {
 
         assert_eq!(creds(Some(&dir), &mut secrets).unwrap().secret, hash);
         assert_eq!(
-            gateway(Some(&dir), &mut secrets).unwrap_err(),
+            gateway(None, Some(&dir), &mut secrets).unwrap_err(),
             "the secret for AK is the S3 hash, not the token — run `superapp --r2-login` \
              again, with the token's value"
         );
@@ -1183,15 +1239,15 @@ mod tests {
         // No bucket at all: no host, so no account.
         let none = bucket_dir("no-bucket", &[]);
         assert_eq!(
-            gateway(Some(&none), &mut secrets).unwrap_err(),
+            gateway(None, Some(&none), &mut secrets).unwrap_err(),
             "no bucket — the gateway's account is read off the bucket's host: \
-             set SUPERAPP_BUCKET, or put it on line 1 of the `bucket` file"
+             run with `--bucket URL`, set SUPERAPP_BUCKET, or put it on line 1 of the `bucket` file"
         );
 
         // The local daemon is a bucket, but it is nobody's Cloudflare account.
         let local = bucket_dir("local", &["http://127.0.0.1:9299", "AK", TOKEN]);
         assert_eq!(
-            gateway(Some(&local), &mut secrets).unwrap_err(),
+            gateway(None, Some(&local), &mut secrets).unwrap_err(),
             "the gateway's account cannot be read off \"127.0.0.1\" — it is the first \
              label of an R2 host, <account>.r2.cloudflarestorage.com"
         );
@@ -1199,10 +1255,32 @@ mod tests {
         // A real bucket, and nothing filed for its key.
         let bare = bucket_dir("bare", &[URL, "AK"]);
         assert_eq!(
-            gateway(Some(&bare), &mut secrets).unwrap_err(),
+            gateway(None, Some(&bare), &mut secrets).unwrap_err(),
             "no secret for AK — run `superapp --r2-login`, set \
              SUPERAPP_R2_SECRET_ACCESS_KEY, or put it on line 3 of the `bucket` file"
         );
+    }
+
+    /// A laptop that never joined a bucket: `--r2-login` remembered the key
+    /// id beside the token, so the token is found with no file and no
+    /// environment, and the account comes off whatever bucket the shell was
+    /// pointed at — `--bucket` included — or off nothing, which is the app's
+    /// cue to ask Cloudflare.
+    #[test]
+    fn a_login_remembers_its_key_id_for_a_device_with_no_bucket() {
+        let mut secrets = MemSecrets::new();
+        assert!(file_login(&mut secrets, "AK", TOKEN));
+        let none = bucket_dir("no-file-at-all", &[]);
+        let (k, t) = gateway_token(Some(&none), &mut secrets).unwrap();
+        assert_eq!((k.as_str(), t.as_str()), ("AK", TOKEN));
+        assert_eq!(creds(Some(&none), &mut secrets).unwrap().key_id, "AK");
+
+        assert_eq!(account_from(None, Some(&none)), None);
+        assert_eq!(account_from(Some(""), Some(&none)), None);
+        assert_eq!(account_from(Some(URL), Some(&none)).as_deref(), Some("acc7"));
+        assert_eq!(account_from(Some("http://127.0.0.1:9299"), Some(&none)), None);
+        let g = gateway(Some(URL), Some(&none), &mut secrets).unwrap();
+        assert_eq!((g.account.as_str(), g.token.as_str()), ("acc7", TOKEN));
     }
 
     /// The account is the first label of an R2 host, and nothing else is an

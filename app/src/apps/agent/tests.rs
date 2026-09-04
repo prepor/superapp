@@ -1473,6 +1473,40 @@ fn a_refusal_reads_as_its_sentence_and_a_bad_token_says_so() {
     assert_eq!(why.message, r#"{"oops":true}"#);
 }
 
+/// A device with no bucket learns its account from Cloudflare's own answer
+/// to `GET /accounts` — one account is the account; none, several, or a
+/// refusal are each a sentence, because a chat must not guess whom to bill.
+#[test]
+fn the_account_is_read_off_cloudflares_answer_when_there_is_no_bucket() {
+    let one = r#"{"success":true,"errors":[],"result":[{"id":"acc7","name":"Andrey"}]}"#;
+    assert_eq!(real::account_named(200, one), Ok("acc7".to_string()));
+
+    let two = r#"{"success":true,"result":[{"id":"a1","name":"Home"},{"id":"a2","name":"Work"}]}"#;
+    assert_eq!(
+        real::account_named(200, two),
+        Err("the token opens 2 accounts (Home, Work) — name one with \
+             `--bucket https://<account>.r2.cloudflarestorage.com/…`"
+            .to_string())
+    );
+
+    let none = r#"{"success":true,"result":[]}"#;
+    assert_eq!(
+        real::account_named(200, none),
+        Err("the token opens no account".to_string())
+    );
+
+    let refused = r#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"result":null}"#;
+    assert_eq!(
+        real::account_named(401, refused),
+        Err("status 401: Authentication error".to_string())
+    );
+
+    assert_eq!(
+        real::account_named(502, "<html>bad gateway</html>"),
+        Err("status 502, and the answer was not JSON".to_string())
+    );
+}
+
 #[test]
 fn an_answer_that_ran_out_of_room_wears_continue_and_asking_is_a_turn() {
     let mut s = session();

@@ -422,6 +422,10 @@ pub struct Env {
     /// is listing. `None` is the kernel's demo tree, which is what a test
     /// and a library mount get.
     pub disk: Option<DiskFactory>,
+    /// Device sync's bucket, as the shell resolved it — `--bucket`, the
+    /// environment, the `bucket` file — for whatever else reads a Cloudflare
+    /// account off its host. `None` for a device with no bucket.
+    pub bucket: Option<String>,
     /// The wake channels of this build's background passes, so one may wake
     /// another — installed as the [`Kicker`](crate::caps::Kicker)
     /// capability. Empty in a world that runs none, where a kick does
@@ -440,6 +444,7 @@ impl Default for Env {
             secrets_backend: None,
             clock: ClockSource::default(),
             disk: None,
+            bucket: None,
             kicks: Kicks::default(),
         }
     }
