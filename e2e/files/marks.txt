@@ -1,0 +1,216 @@
+# args: --demo-disk --window 1920x1080
+# env:
+#
+# Marks over a directory: the same set, the same bar and the same batch as
+# the inbox's, made with the walk's own keys. The verbs the bar grows are
+# the panel's single-row ones over more than one thing, so they wear the
+# same letters and say how many, and behind them the two about the set
+# itself.
+#
+# Run with `--demo-disk`, so the tree is the fixture rather than whatever
+# this machine's ~ holds — and in a wide window, because a bar is a row and
+# never a wrap: at the default width the last entries of a full one are
+# dropped rather than folded, and this suite reads the whole of it.
+#
+# Assertions are the clicks — `delete` is the panel's own object verb,
+# `copy 3` and `delete 3` are the bar's over the marked set, and each
+# resolves only while it is drawn. The actions are real, so every write is
+# followed by the cmd+z that puts the fixture back.
+
+wait 900
+
+# The launcher opens the files root; ~ lists the demo tree.
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+
+# The cursor walks to Downloads, previewing as it goes; enter *goes*, which
+# hands focus to what it opened. That panel is joined under ~ and drives
+# nothing, so it is the object — and wears the verbs of the directory it
+# shows, `delete` among them.
+key down 3
+wait 700
+click "Downloads/"
+wait 500
+key enter
+wait 800
+click "delete"
+wait 700
+shot k1-object-verbs
+key cmd+z
+wait 900
+
+# -- the set ---------------------------------------------------------------------
+
+# One step down puts the cursor on the first row and previews it. Space
+# marks that row without moving the cursor, and the panel's own verbs stand
+# down while the bar carries the batch.
+key down
+wait 600
+type " "
+wait 500
+shot k2-one-mark
+
+# A range by the walk's own keys: shift+↓ marks the row it leaves and the
+# row it lands on, twice — three marked, and the labels say so.
+key shift+down 2
+wait 700
+shot k3-range
+
+# `copy 3` holds every marked path and lets the marks stand: nothing has
+# been consumed, and the destination is still to be walked to. Every files
+# panel then offers `copy here`.
+click "copy 3"
+wait 700
+shot k4-holding
+
+# -- the batch --------------------------------------------------------------------
+
+# `delete 3` is the same door the panel's own `delete` uses, over the whole
+# marked set, and one node: one cmd+z takes all of it back.
+click "delete 3"
+wait 900
+shot k5-deleted
+
+# It closed nothing. The card that was showing the last of the three is
+# still there — saying the file is not there any more, which is its own
+# business and not the verb's — and its path line still carries the path.
+click "~/Downloads/logs.tar.gz"
+wait 500
+
+# And the listing is still the listing: what went was its rows, not what it
+# shows. A row it still has previews as it always did.
+click "README.txt"
+wait 800
+shot k6-still-there
+
+# cmd+z takes back the preview that click opened, and the one under it takes
+# back the batch — the three files, and the marks the batch consumed with
+# them. Marks are context, not data: they go back on the very panel they
+# were taken from.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+shot k7-undone
+
+# The bar says three again, which is the assertion that the marks came
+# back: this label is drawn only while three rows are marked.
+click "copy 3"
+wait 700
+shot k8-marks-restored
+
+# -- a filter that hides a mark ----------------------------------------------------
+
+# A mark is an identity, not a row, so narrowing the list does not drop one.
+# `/` puts the caret in the filter; `@hidden` adds the dot-files, and the one
+# it adds is marked like any other row.
+key /
+wait 300
+key cmd+a
+type "@hidden"
+wait 600
+key esc
+wait 500
+click ".DS_Store"
+wait 700
+type " "
+wait 500
+shot k9-dot-marked
+
+# `@kind:pdf` leaves none of the four: they ride above the rows under their
+# own caption, and the bar still counts them — which is what this label
+# resolving says. The hidden row is a row: it previews what it names.
+key /
+wait 300
+key cmd+a
+type "@kind:pdf"
+wait 700
+key esc
+wait 600
+shot k10-hidden-by-the-filter
+click "copy 4"
+wait 600
+click ".DS_Store"
+wait 700
+shot k11-hidden-row-alive
+
+# -- the letter the bar promises ---------------------------------------------------
+
+# Esc lets the whole set go, and the rows answer with no bar in the way.
+key esc
+wait 500
+key /
+wait 300
+key cmd+a
+key backspace
+wait 400
+key esc
+wait 600
+click "README.txt"
+wait 700
+type " "
+wait 400
+click "report-q3.pdf"
+wait 700
+type " "
+wait 500
+shot k12-two-marks
+
+# A batch verb wears the letter its single-row twin wears, and a bold letter
+# is a promise that the chord fires it now: cmd+p holds both marked paths
+# exactly as pressing `copy 2` would, and the marks stand — nothing has been
+# consumed.
+key cmd+p
+wait 700
+shot k13-held-by-the-chord
+
+# A move into the directory the paths are already in refuses, per path,
+# exactly as it does for one: the line under the rows says so, nothing is
+# written, and the set is still there to be laid down somewhere else.
+click "move 2"
+wait 500
+click "move here"
+wait 800
+shot k14-refused
+click "move 2"
+wait 600
+key esc
+wait 500
+shot k15-let-go
+click "README.txt"
+wait 700
+
+# -- the two verbs about the set itself ---------------------------------------
+
+# The last two on the bar are about the marked set rather than about what it
+# names. Neither writes anything — a mark is the panel's own context, not a
+# claim on the world — so neither is an action and there is nothing to undo
+# behind them.
+#
+# One space brings the bar up on the cursor's row; `mark all` then takes
+# every row the filter shows. `copy 7` resolves only while seven rows are
+# marked, which is what says the verb took the listing and not the row.
+type " "
+wait 500
+click "mark all"
+wait 700
+shot k16-mark-all
+click "copy 7"
+wait 700
+
+# `clear` empties the set — it wears no letter, because `esc` is the table's
+# own — and the next space starts a set of one, which `copy 1` says.
+click "clear"
+wait 600
+shot k17-cleared
+type " "
+wait 500
+click "copy 1"
+wait 700
+key esc
+wait 500
+quit

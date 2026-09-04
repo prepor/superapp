@@ -1,0 +1,59 @@
+[package]
+name = "superapp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "My personal app for everyday work in one scrolling panel workspace."
+publish = false
+# Make `cargo run` start the app rather than asking which binary to use.
+default-run = "superapp"
+
+# A library with a binary on it, which is the shape android needs: its
+# activity loads a shared object and calls a JNI symbol, so everything above
+# the entry point lives in the library and `main.rs` is one line.
+[lib]
+name = "superapp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "superapp"
+path = "src/main.rs"
+
+[dependencies]
+superapp-kernel = { path = "../kernel" }
+
+# An app writes its own tables and files its own effects, so it names the two
+# crates the kernel's interfaces are spelled in: `App::seed` hands back a
+# `rusqlite::Result`, and a `Deferred` effect is a serde payload.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+
+# Mail's real protocols. `Mode::Real` outside a script reaches a server
+# through these; every scripted run keeps the fake.
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
+mail-parser = "0.11"
+
+# The HTML reading of a letter: parse it the way a browser would, read the
+# author's stylesheet for what it hides, and narrow the result to what the
+# `Html` widget draws (`apps/mail/html.rs`).
+html5ever = "0.39"
+markup5ever_rcdom = "0.39.0"
+simplecss = "0.2"
+
+# The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
+# POST the token endpoint takes.
+serde_json = "1"
+base64 = "0.22"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-connector = "0.19"
+webpki-roots = "1"
+
+# Pin Makepad for repeatable builds. The fork's fixes are listed in the
+# workspace manifest's patch block.
+makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

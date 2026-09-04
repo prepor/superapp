@@ -5,4 +5,4 @@ window_*.png
 
 # TLC model-checker scratch
 formal/states/
-/next/e2e/out
+.DS_Store

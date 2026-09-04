@@ -1,54 +1,6 @@
-# Keep this package separate from any Cargo workspace above it.
 [workspace]
-
-[package]
-name = "superapp"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.87"
-description = "My personal app for everyday work in one scrolling panel workspace."
-publish = false
-# Make `cargo run` start the app instead of asking which binary to use.
-default-run = "superapp"
-
-[lib]
-name = "superapp"
-path = "src/lib.rs"
-
-[[bin]]
-name = "superapp"
-path = "src/main.rs"
-
-[dependencies]
-imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
-lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
-mail-parser = "0.11"
-# Parse and clean the limited HTML and CSS shown in message bodies.
-html5ever = "0.39"
-markup5ever_rcdom = "0.39.0"
-simplecss = "0.2"
-# Pin Makepad for repeatable builds. Local fixes are listed below.
-makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
-
-# Bundle SQLite so macOS and Android use the same version. Hooks refresh cached
-# queries; sessions record changes for device sync.
-rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "session"] }
-
-# Deferred effects use JSON payloads in the `effect` table.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Gmail sign-in and R2 device sync use these directly. They provide encoding,
-# signing, secure connections, and trusted certificate roots.
-base64 = "0.22"
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-connector = "0.19"
-webpki-roots = "1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
-makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+members = ["kernel", "app"]
+resolver = "2"
 
 # The Makepad fork adds five fixes. Rebase them when updating the pin:
 #

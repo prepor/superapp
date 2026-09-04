@@ -1,0 +1,63 @@
+# args:
+# env:
+#
+# A correspondent, found and read: the launcher's mail source answers a
+# question with the people who wrote before the letters they wrote, the card
+# says how much they have written, and the one link off it opens the inbox
+# filtered to their address.
+#
+# Assertions are the clicks. "Vera Kovac" resolving in the launcher is proof
+# the sender source answered; the card's address resolving is proof the card
+# opened on it; and the filtered list's title is what proves the argument
+# reached the panel rather than the field alone.
+
+wait 900
+
+# The launcher asks every app's source. Mail answers with the person first —
+# a contact is a fact about the mailbox, not a document in it — and then with
+# the letters, as the index ranks them.
+key cmd 2
+wait 400
+type "kovac"
+wait 700
+shot c1-launcher
+click "Vera Kovac"
+wait 800
+shot c2-card
+click "vera@kovac.io"
+wait 300
+
+# The card's link: the inbox, filtered to the address. Its title carries the
+# filter, which is what proves the panel's own argument arrived — the field
+# is seeded from it and is the person's from then on.
+click "messages from vera"
+wait 900
+shot c3-from
+click "Q3 infra"
+wait 700
+shot c4-previewed
+
+# The filter is a filter, not a wall: emptying the field brings the rest of
+# the inbox back, and the letters that were hidden resolve again.
+key /
+wait 300
+key cmd+a
+key backspace
+wait 500
+key esc
+wait 500
+click "that airport book"
+wait 700
+shot c5-cleared
+
+# A letter's own words reach it too — the index reads the body, which the
+# headers alone never did.
+key cmd 2
+wait 400
+type "thermos"
+wait 700
+shot c6-body-search
+click "Sat hike"
+wait 800
+shot c7-found
+quit

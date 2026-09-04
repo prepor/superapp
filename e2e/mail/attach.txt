@@ -1,0 +1,124 @@
+# args: --demo-disk
+# env:
+#
+# What a letter carries, both ways: the parts of a mail as links and a card,
+# and a file from the browser becoming part of a draft.
+#
+# This is the one place two apps meet. The card over a part is the *shell's*,
+# the same one a file browser draws a path with — what tells them apart is the
+# selectable line under the three: a path there, a media type here. And mail
+# asks the registry for the files app when it builds a compose's bar, offering
+# *attach* only while that app is in the build and holding something.
+#
+# Run with `--demo-disk`: the browser half walks the demo tree rather than
+# whatever this machine's ~ holds, so the file can be addressed by name, and
+# the part written out by `open` lands on a disk no test owns.
+#
+# Assertions are the clicks: a label that does not resolve fails the run, so
+# "the letter lists its part" is checked by clicking the part, and "the
+# compose carries it" by clicking the file the CARRIES line names. A run can
+# assert what is drawn and not what is gone, so an undo is checked by the redo
+# that puts the line back.
+
+wait 900
+
+# -- reading: the seeded letter that carries a spreadsheet -------------------
+
+# The inbox opens on the demo world; the first thread is Vera's budget draft,
+# and the seed gave that letter a real multipart raw — so its parts are rows
+# the ingest path's own walk derived, not a fixture.
+click "Q3 infra"
+wait 900
+shot a1-thread
+
+# The open message lists its part under the reading: name and size, as a link.
+# Clicking it opens the card, joined to the right.
+click "q3-budget.csv · 140 B"
+wait 900
+shot a2-card
+
+# The card is the shell's own over the letter's bytes: the kind and size line,
+# the media type where a path would be, and — the part being text — the
+# preview under the rule. The bytes came off the reader thread, never off the
+# frame that drew them.
+click "text/csv"
+wait 400
+click "preview"
+wait 400
+shot a3-preview
+
+# `open` writes the part out to the app's scratch directory and hands that
+# path to the OS. The fake outside records both, so this proves the verb
+# answers rather than photographing a button.
+click "open"
+wait 700
+shot a4-opened
+
+# -- writing: a file from the browser becomes part of a draft ---------------
+
+# The reply replaces the card in the joined chain — the reader's bar opens it
+# from the reader's own slot — so nothing is left on screen wearing `open`.
+click "reply"
+wait 900
+shot a5-compose
+
+# A files panel in a column of its own (cmd+enter from the launcher is always
+# un-joined), and a walk to the file. `go to` completes one segment at a time,
+# and a click on the row previews the card that wears the object verbs.
+key cmd 2
+wait 400
+type "files"
+wait 500
+key cmd+enter
+wait 900
+click "go to"
+wait 500
+type "Down"
+wait 600
+key tab
+wait 400
+key enter
+wait 900
+click "report-q3.pdf"
+wait 900
+shot a6-picked
+click "copy"
+wait 700
+
+# The browser is walked away before the letter is asked to carry anything, so
+# the only thing on screen wearing that name afterwards is the letter's own
+# line. The card, joined under the panel that was replaced, goes with it.
+click "go to"
+wait 500
+type "~/Documents/"
+wait 600
+key enter
+wait 900
+
+# The sheet wears `attach` now: it asked the registry for the files app and
+# found it holding one file. Clicking it is one undoable action.
+click "attach"
+wait 900
+shot a7-carrying
+
+# The CARRIES line names the file and how big it was when it was picked — the
+# row records both, because the send reads the file again and refuses one that
+# has grown past the limit since.
+#
+# An attach is one undoable action: cmd+z takes it straight back off the
+# letter, and cmd+shift+z puts it back — which is how a run asserts a line
+# that went away, by the one that brings it again. The undo goes first, while
+# the newest node is still the attach: opening a panel is a node too, and one
+# press of cmd+z would close a card rather than empty the line.
+key cmd+z
+wait 900
+shot a8-undone
+key cmd+shift+z
+wait 900
+shot a9-carrying-again
+
+# And the name is a link to the file's own card, addressed in full.
+click "report-q3.pdf · 1.2 MB"
+wait 900
+shot a10-carried-card
+quit

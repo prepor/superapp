@@ -110,9 +110,9 @@ is the inline drive under virtual time, bounded so a job that files another
 job shows as a backlog rather than a hang; a `Replace` counts as a read when
 the new instance claimed anything at all; `Session::settle` re-derives the
 wishes and writes the session as well as placing and dropping instances,
-because all three read them, and `Nav::Close` labels its node with what the
-slot shows rather than with the instance's title, because `nav` touches no
-instance. Instances are built just before the action and their claims folded
+because all three read them, and `Nav::Close` carries an optional label
+that the shell reads off the instance's title before calling `nav`, because
+`nav` touches no instance. Instances are built just before the action and their claims folded
 into it, which lands them on the same node and in the same transaction as
 the layout change.
 
@@ -459,7 +459,9 @@ pub enum Nav {
     /// shows the child once. Where the pair cannot share the screen, the
     /// open simply goes.
     Preview { from: SlotId, id: PanelId },
-    Close(SlotId),
+    /// The label is the panel's title, read by the caller: `nav` touches
+    /// no instance.
+    Close { slot: SlotId, label: Option<String> },
     Focus(SlotId),
 }
 ```

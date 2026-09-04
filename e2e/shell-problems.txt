@@ -1,0 +1,47 @@
+# args:
+# env: SUPERAPP_MAIL_DOWN=no-route-to-host
+#
+# The problems mark: while anything stands, a count in the one red box in the
+# chrome's bottom corner, with the toasts stacked above it.
+#
+# The mark is the shell's and knows nothing about what is wrong — a problem is
+# a key, two lines and its own controls, derived from rows by whichever app
+# listed it, and the mark counts them. Something does have to be standing
+# wrong for it to draw, though, and the app in this build that can be told to
+# fail is mail: `SUPERAPP_MAIL_DOWN` takes its fake servers offline for the
+# whole run, so the account's first sync pass really cannot connect and the
+# row it writes is really what is being counted. Nothing is mimed.
+#
+# The clicks are the assertions. "problems" resolves to the mark — no panel of
+# that name is open yet — and where it goes is checked by the node the close
+# of that panel leaves on the history, which carries the panel's own title.
+
+wait 900
+shot q1-mark
+
+# -- the mark goes to the panel that lists them ------------------------------
+
+# The same door the menu bar's problem items use: focused wherever it already
+# is, opened beside what has focus otherwise.
+click "problems"
+wait 900
+shot q2-panel
+
+# …and it really is that panel. A close names what it closed, so the history
+# has a node only a caller that read the instance's title could have written.
+key cmd+w
+wait 800
+key cmd+u
+wait 700
+click "close “problems"
+wait 800
+shot q3-history
+
+# -- and it stands until it is fixed -----------------------------------------
+
+# The account still cannot sync, so the mark is still there: a problem is
+# derived from rows, and nothing dismisses one.
+click "problems"
+wait 900
+shot q4-still
+quit

@@ -1,0 +1,62 @@
+# args:
+# env:
+#
+# A device gives *itself* a bucket. No `--bucket` flag, no file pushed over a
+# cable — the URL is typed into the device-sync form and the bar's own
+# *connect* is pressed, which is the only road a phone has.
+#
+# The clicks are the assertions: "bucket" only resolves if the form is really
+# open and its field really drew, and "connect" only if the panel's bar
+# carries its verb. What happens outside the app — the `bucket` file beside
+# the store, and a lineage in the daemon's directory that only a holder ever
+# writes — is proven by e2e/sync/bucket.sh, which starts a daemon on the port
+# this walk types.
+
+wait 600
+
+# -- the form ----------------------------------------------------------------
+
+# Device sync is the shell's own panel, a launcher root like any other.
+key cmd 2
+wait 500
+type "device sync"
+wait 500
+key enter
+wait 800
+shot bp1-form
+
+# The three fields. Only the two public ones are ever seeded; the secret is
+# write-only, so it comes up blank on a configured device too.
+click "bucket"
+type "http://127.0.0.1:9299"
+wait 300
+click "key id"
+wait 300
+click "secret"
+wait 300
+shot bp2-filled
+
+# -- connecting --------------------------------------------------------------
+
+# The bar's verb: it checks the credentials, writes the `bucket` file, and
+# starts the lease driver onto it.
+click "connect"
+wait 2500
+shot bp3-connected
+
+# -- and it comes back configured -------------------------------------------
+
+# Closed and opened again, the form shows what the device is now configured
+# with: the url off the `bucket` file, and never the secret.
+key cmd+w
+wait 700
+key cmd 2
+wait 500
+type "device sync"
+wait 500
+key enter
+wait 900
+click "bucket"
+wait 400
+shot bp4-prefilled
+quit

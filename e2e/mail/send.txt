@@ -1,0 +1,77 @@
+# args:
+# env: SUPERAPP_SEND_DELAY=1
+#
+# The send walk, under a one-second window: file a send, take it back inside
+# the window, file it again, and watch the sender pass carry it out — all on
+# virtual time, so the window runs out in exactly as many frames as the
+# script says and no wall clock is waited on.
+#
+# The assertion at the end is the letter itself: the copy the transport filed
+# to Sent comes back through the sync pass and threads with the letter it
+# answered, so its row resolving is the whole round trip.
+
+wait 900
+
+# A conversation, and the reply its bar opens. The sheet starts in the body:
+# a reply has its recipient already.
+click "superapp panel model"
+wait 900
+click "reply"
+wait 900
+type "Agreed — the join rule is what keeps a preview honest."
+wait 500
+shot s1-compose
+
+# Send is a side effect: a toast saying how long the window is, and the
+# sheet closes behind it.
+click "send"
+wait 700
+shot s2-filed
+
+# Undo inside the window takes the letter back — the outbox row goes, and
+# the sheet comes back with its text, because the draft row was written by
+# the send that closed it.
+key cmd+z
+wait 900
+shot s3-cancelled
+
+# Filed again, and this time the window is allowed to run out. The sender
+# claims the row, hands it to the submission server, and the outbox row is
+# `sent`.
+click "send"
+wait 700
+wait 2000
+shot s4-sent
+
+# The copy the transport filed to Sent comes back on the next pass — which
+# is what the list's own *sync* asks for — and threads with the letter it
+# answered, at the foot of the conversation that is still open beside it.
+click "sync"
+wait 1500
+click "me@prepor.dev: Agreed — the join rule"
+wait 600
+shot s5-back-in-the-thread
+
+# -- and the other way out of a letter ----------------------------------------
+
+# *forward* is a link like *reply*: opening a sheet claims nothing. What is
+# passed on is decided when the letter actually leaves — the send's own
+# settle writes the `$Forwarded` keyword, and the push pass tells the server.
+click "forward"
+wait 900
+type "vera@kovac.io"
+wait 400
+shot s6-forward
+click "send"
+wait 700
+wait 2000
+
+# The letter it passed on wears the mark now — the muted arrow beside its
+# date, which is a hit of its own so this is an assertion and not a
+# photograph. The push pass tells the server on the same turn.
+click "sync"
+wait 1500
+click "passed on"
+wait 600
+shot s7-forwarded
+quit

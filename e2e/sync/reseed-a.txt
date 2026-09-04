@@ -1,0 +1,11 @@
+# Holder: bootstrap + seed the demo world, open a reply compose, type the
+# draft "alpha", let it publish. Quits holding.
+wait 1500
+click "Q3 infra"
+wait 800
+click "reply"
+wait 900
+type "alpha"
+wait 3000
+shot rs-a-alpha
+quit

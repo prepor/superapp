@@ -1,0 +1,65 @@
+# args:
+# env:
+#
+# The undo walk. Every action is one node of a tree: the layout before and
+# after it, plus what it claimed of the world, so `cmd+z` puts both halves
+# back — the panels where they stood and the rows as they were. `cmd+shift+z`
+# goes forward again.
+#
+# A focus walk and a workspace switch are attention, not actions, and record
+# nothing; a move between workspaces is an action, and one `cmd+z` teleports
+# the panel and the viewport together.
+#
+# The clicks are the assertions: a label that only resolves in the state the
+# undo restored is the proof that it was restored.
+
+wait 900
+
+# Opening a conversation is an action — it marks the mail read — and the
+# reader lands joined to the right.
+click "Q3 infra"
+wait 900
+shot u1-opened
+
+# Archive: the conversation leaves the inbox and the reader closes behind it,
+# and the list carries on to the next mail and previews it. Filing something
+# and then reading the next are two things a person did, so they are two nodes.
+click "archive"
+wait 900
+shot u2-archived
+
+# Two steps back — the preview the list moved on to, then the archive under it
+# — and the reader is on the same letter again, which is what the click proves.
+key cmd+z 2
+wait 900
+shot u3-undone
+click "Vera Kovac · aug 31 09:14"
+wait 700
+
+# Redo walks the same two forward: filed again, and the list moved on again.
+key cmd+shift+z 2
+wait 900
+shot u4-redone
+
+# Back once more, then close the list — which takes its joined reader with it
+# — and take that back too.
+key cmd+z 2
+wait 900
+key cmd+w
+wait 900
+key cmd+z
+wait 900
+click "Sat hike"
+wait 900
+shot u5-close-undone
+
+# A move between workspaces is one node: undo brings the panel and the
+# viewport back together.
+key cmd+shift+3
+wait 900
+key cmd+z
+wait 900
+click "that airport book"
+wait 900
+shot u6-move-undone
+quit

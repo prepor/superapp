@@ -1,4 +1,0 @@
-# One target directory for the whole repository, so Makepad is compiled once
-# for both the shipping tree and this prototype.
-[build]
-target-dir = "../target"

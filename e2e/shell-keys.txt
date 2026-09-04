@@ -1,0 +1,87 @@
+# args:
+# env:
+#
+# The workspace's reserved chords, and the first rung of the routing order.
+#
+# Cmd is the workspace modifier. A chord is offered to the reserved set first
+# — arrows and digits with and without shift, `w`, `z`, `u`, `t`, `i`, `l`, the
+# column keys and `enter` — and only then to the focused widget, the focused
+# panel's bar, and the bar of what it previews. A panel with four letters on
+# its bar still loses `cmd+u` to the workspace, and that is the rule this
+# suite walks.
+#
+# The bold letters and the last two rungs are `shell-accels`; the digits are
+# `shell-workspaces`; the column keys are `shell-tabs`; `cmd+z` is `shell-undo`
+# and `cmd+i` is `shell-context`.
+
+wait 900
+
+# -- `cmd+u`: the history, wherever the caret is ------------------------------
+
+key cmd+u
+wait 700
+shot k1-history
+key esc
+wait 600
+
+# -- the arrows walk focus ----------------------------------------------------
+
+# A press on a row previews the conversation joined to the right and leaves
+# focus on the list.
+click "Q3 infra"
+wait 900
+
+# `cmd+right` moves focus onto the reader; `cmd+w` then closes *that* panel.
+# Had focus stayed on the list, the list would have gone and taken its joined
+# chain with it, and the row below would resolve nowhere.
+key cmd+right
+wait 700
+key cmd+w
+wait 900
+click "Sat hike"
+wait 900
+shot k2-focus-walked
+
+# -- shift walks the panel instead --------------------------------------------
+
+# Moving the joined reader away un-joins it: it lands in a column of its own,
+# still on its letter.
+key cmd+right
+wait 700
+key cmd+shift+left
+wait 900
+click "Elena Petrova · aug 30 18:20"
+wait 700
+shot k3-panel-moved
+
+# -- a reserved letter never reaches a bar ------------------------------------
+
+# The reader has focus and wears four letters of its own, none of them the
+# workspace's. `cmd+u` is the workspace's: the history goes up over the reader
+# rather than the reader hearing a `u` at all. `esc` puts it away again and the
+# reader is where it was, still on the same letter — nothing on that bar ever
+# saw the chord. (The click above folded that letter shut, so the line it
+# answers to now is the folded one.)
+key cmd+u
+wait 700
+shot k4-history-over-a-bar
+key esc
+wait 700
+click "Elena Petrova: Weather looks fine"
+wait 700
+
+# -- a plain key is typing, and belongs to the panel --------------------------
+
+# `/` puts the caret in the list's filter; what follows narrows the list, which
+# is what the row that still resolves proves.
+key cmd+right
+wait 700
+key /
+wait 600
+type "vera"
+wait 900
+shot k5-filtered
+click "Q3 infra"
+wait 900
+shot k6-opened-from-the-filter
+quit

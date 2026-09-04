@@ -1,0 +1,69 @@
+# args:
+# env:
+#
+# Nine numbered workspaces, one vertical stack: `cmd+№` switches with a slide,
+# `cmd+shift+№` moves the focused panel and follows it there, and a space with
+# nothing on it says which one it is rather than showing a blank screen.
+#
+# The macOS menu bar carries the same roster — the occupied spaces and the
+# first empty one, each with *switch here* and *move panel here* — but AppKit
+# draws those titles itself, so there is no label in the window to click and
+# the menu's half is asserted by `cargo test`, not here.
+#
+# The two-finger swipe that lists the workspaces is touch, which is out of
+# the prototype: those steps are dropped rather than written against
+# something that would silently do nothing.
+
+wait 900
+shot ws-1
+
+# An empty workspace names itself, so a switch onto a blank screen reads as a
+# place.
+key cmd+2
+wait 700
+shot ws-2-empty
+
+# Coming back finds what was left: the inbox is still the panel that boots.
+key cmd+1
+wait 700
+click "Sat hike"
+wait 800
+shot ws-1-again
+
+# -- moving a panel, and following it ----------------------------------------
+
+# A row click previews and keeps focus on the list, so the panel that moves is
+# the inbox — with the conversation it is showing riding along beside it.
+key cmd+shift+3
+wait 900
+shot ws-3-moved
+
+# It really is here: a row only that list has resolves on workspace 3.
+click "that airport book"
+wait 800
+shot ws-3-alive
+
+# Workspace 1 kept nothing, and says so.
+key cmd+1
+wait 800
+shot ws-1-after-move
+
+# -- and back ----------------------------------------------------------------
+
+key cmd+3
+wait 800
+key cmd+shift+1
+wait 900
+click "Q3 infra"
+wait 800
+shot ws-1-back
+
+# Two steps back: the read the click above recorded, and the move under it.
+# A move between workspaces is one node, so undoing it teleports the panel and
+# the viewport together — which is what the row resolving over there proves.
+key cmd+z 2
+wait 900
+click "that airport book"
+wait 900
+shot ws-3-undone
+quit

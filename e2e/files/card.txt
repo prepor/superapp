@@ -1,0 +1,114 @@
+# args: --demo-disk
+# env:
+#
+# What a card shows under the rule: the first 64 KiB of a text file, a
+# picture decoded from its own bytes, or neither — and the rows each of them
+# asks for, which is why a picture opens a taller panel than a pdf.
+#
+# Run with `--demo-disk`, so the tree is the fixture rather than whatever
+# this machine's ~ holds. The fixture's pictures are one real PNG, whatever
+# their names say, which is the point of the third act below.
+#
+# Assertions are the clicks. The card's own path line carries its text as
+# its label — the one thing two cards can never both be right about — and
+# the two previews are labelled runs: `preview` is registered only while the
+# text box has a rectangle, `picture` only while the image box has one. So
+# "this card decoded that picture" is a label resolving, not a human reading
+# a screenshot.
+#
+# One listing at a time, walked with `go to`: a card wears none of a
+# listing's labels, but two listings wear each other's.
+
+wait 900
+
+# The launcher opens the files root; ~ lists the demo tree.
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+
+# -- a text file ------------------------------------------------------------------
+
+# The cursor previews the card beside the list. The reading is the file's own
+# first bytes, in the app's one face, and the card asks for the rows it needs
+# rather than scrolling them.
+click "notes.md"
+wait 900
+click "~/notes.md"
+wait 400
+click "preview"
+wait 500
+shot c1-text
+
+# -- a picture --------------------------------------------------------------------
+
+# `go to` carries the one listing into Pictures; the card that hung under it
+# closes with the panel it hung from.
+click "go to"
+wait 500
+type "~/Pictures/"
+wait 600
+key enter
+wait 900
+
+# A PNG: read because the name says it is worth reading, decoded because the
+# bytes say what it is. `picture` resolves only once the decoder has answered
+# and the box it draws in has a rectangle — so this click is the assertion
+# that the card really drew it.
+click "fold-cover.png"
+wait 900
+click "~/Pictures/fold-cover.png"
+wait 400
+click "picture"
+wait 500
+shot c2-picture
+
+# -- the name is not the evidence ---------------------------------------------------
+
+# The fixture's `.jpg` is a PNG. The name decides only whether to read the
+# file at all; what decodes it is the first eight bytes — a picture saved
+# under the wrong extension is still shown.
+click "go to"
+wait 500
+type "~/Downloads/2026/"
+wait 600
+key enter
+wait 900
+click "photo-lisbon.jpg"
+wait 900
+click "~/Downloads/2026/photo-lisbon.jpg"
+wait 400
+click "picture"
+wait 500
+shot c3-sniffed
+
+# -- neither ------------------------------------------------------------------------
+
+# A pdf is never read: pulling 1.2 MB into a panel to be told it is a pdf is
+# a pause for nothing. The card is its four lines, and it says that `open`
+# shows the rest — so the panel stands at its floor of three rows, where the
+# picture above stood taller.
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+click "report-q3.pdf"
+wait 900
+click "~/Downloads/report-q3.pdf"
+wait 400
+shot c4-no-preview
+
+# -- open ---------------------------------------------------------------------------
+
+# The card's own verb: the path handed to whatever the OS opens it with, and
+# nothing of ours changed — the listing under it does not even go stale.
+click "open"
+wait 700
+click "report-q3.pdf"
+wait 700
+shot c5-opened
+quit

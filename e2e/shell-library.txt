@@ -1,0 +1,71 @@
+# args: --library
+# env:
+#
+# The panels library: the catalogue's scenes on one canvas, every node live.
+# Run with `--library`, which makes the canvas — not a workspace — the thing
+# the window opens on, and hands it this script.
+#
+# The first wait lets the stage nodes replay their steps, one node at a time,
+# so it grows with the catalogue and the run's `--draws` with it. Assertions
+# are the clicks: a label that does not resolve fails the run, so "the canvas
+# laid this scene out" is checked by clicking its title, and "the entered
+# node is a live panel" by typing into it and clicking what that leaves.
+#
+# Rendered, to look at it rather than only assert on it:
+#   MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames MAKEPAD_HEADLESS_DPI=1 \
+#   mise exec -- ./target/debug/superapp --library \
+#     --e2e e2e/shell-library.txt --e2e-out /tmp/shots --draws 4000
+
+wait 14000
+shot lib-01-overview
+
+# -- a scene fits its block --------------------------------------------------
+
+# A scene's title is a hit: clicking it flies the camera to that block.
+click "inbox row"
+wait 700
+shot lib-02-scene
+
+# -- the zoom ----------------------------------------------------------------
+
+# ⌘- and ⌘= step the zoom about the middle of the viewport; ⌘0 fits the whole
+# canvas again.
+key cmd+-
+wait 500
+key cmd+=
+wait 500
+key cmd+0
+wait 900
+shot lib-03-fit
+
+# -- entering a node ---------------------------------------------------------
+
+# A node is addressed as scene/node. Clicking one enters it: the camera flies
+# to 1:1 and the keyboard and the pointer go to that mount alone.
+click "mailbox/fresh"
+wait 900
+shot lib-04-entered
+
+# It is a live panel, not a picture: `/` puts the caret in its filter, what is
+# typed narrows the list, and the row that is left resolves — inside the
+# mount's own hit table, which only a mount that really drew has.
+key /
+wait 400
+type "github"
+wait 800
+click "[stelaxis]"
+wait 600
+shot lib-05-typed
+
+# -- and leaving -------------------------------------------------------------
+
+# ⌘esc leaves the node; ⌘0 fits everything again, and the scene titles are
+# back on offer.
+key cmd+esc
+wait 500
+key cmd+0
+wait 900
+click "files row"
+wait 700
+shot lib-06-left
+quit

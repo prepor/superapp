@@ -1,0 +1,64 @@
+# args:
+# env:
+#
+# The compose sheet's TO field completes the people this mailbox has heard
+# from — the rich table's own box, over the mail world instead of the filter
+# grammar. A row that does not resolve fails the run, so the click is what
+# checks that Elena was offered.
+
+wait 900
+
+# A blank compose from the launcher's root; it starts in the body, because a
+# sheet is a letter to write and a reply has its recipient already.
+key cmd 2
+wait 400
+type "new mail"
+wait 400
+key enter
+wait 900
+shot c1-new-mail
+
+# Into TO by tab — the ring wraps from the body. Not by a press: a
+# synthesized press captures the field and the harness has no way to release
+# it. A fragment of the name offers the sender; enter takes the address and
+# the box closes behind it, since an address typed out in full needs no
+# completing.
+key tab
+wait 400
+type "kov"
+wait 500
+shot c2-offer
+key enter
+wait 500
+shot c3-taken
+
+# A second address after the comma: the first is not offered again — the
+# token under the caret is matched, and every other token's address is left
+# out of the offer — and the click on the row is the assertion.
+type ", pet"
+wait 500
+shot c4-second-offer
+click "Elena Petrova"
+wait 500
+shot c5-two-recipients
+
+# Esc puts the offer away and keeps what was typed; tab then walks on to the
+# subject with nothing taken, because the box owns tab only while it is up.
+type ", max"
+wait 500
+key esc
+wait 400
+shot c6-dismissed
+key tab
+wait 400
+type "Egress numbers"
+wait 400
+shot c7-subject
+
+# The sheet is a sheet still: what the three fields hold is the draft, and
+# the send window is one click away. Discard takes the letter back rather
+# than sending three people a test.
+click "discard"
+wait 700
+shot c8-discarded
+quit

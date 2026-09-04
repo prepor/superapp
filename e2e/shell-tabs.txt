@@ -1,0 +1,77 @@
+# args:
+# env:
+#
+# niri's column operations, and tabs. A column is a stack of panels; `cmd+[`
+# and `cmd+]` consume and expel sideways, `cmd+,` and `cmd+.` pull from and
+# push to the column on the right, and `cmd+t` turns a column into a stack of
+# tabs — one panel at full height under a strip of title segments.
+#
+# The clicks are the assertions: only the active tab is hittable, so a label
+# that belongs to one panel of the column resolves exactly when that panel is
+# the tab on top.
+
+wait 900
+
+# The inbox that boots is closed first: the two panels below are the whole
+# workspace.
+key cmd+w
+wait 700
+
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 900
+
+# The manual's bar opens the colophon joined to the right, and it takes focus.
+click "about"
+wait 900
+
+# `cmd+[` consumes it into the manual's column: two panels stacked, the height
+# shared between them.
+key cmd+bracketleft
+wait 900
+shot t1-consumed
+
+# `cmd+t` turns the column tabbed. The colophon is the tab on top, so its own
+# link resolves and the manual's does not.
+key cmd+t
+wait 900
+click "back to help"
+wait 800
+shot t2-tabbed
+
+# -- switching tabs ----------------------------------------------------------
+
+# The tab strip is drawn over the panels, so a segment takes a click from a bar
+# that happens to wear the same word.
+click "about"
+wait 900
+shot t3-tab-clicked
+
+# Focus up inside a tabbed column is the tab above: the same crossfade, from
+# the keyboard.
+key cmd+up
+wait 900
+shot t4-tab-by-key
+
+# -- back to a split, and across columns -------------------------------------
+
+# `cmd+t` again is an even split — both panels are on screen, so both bars
+# answer.
+key cmd+t
+wait 900
+click "try it"
+wait 700
+shot t5-split
+
+# `cmd+.` pushes the bottom panel out into a column of its own, and `cmd+,`
+# pulls it back in.
+key cmd+period
+wait 900
+shot t6-expelled
+key cmd+comma
+wait 900
+shot t7-pulled-back
+quit

@@ -1,17 +1,18 @@
 #!/bin/bash
-# Every single-process suite, in parallel, in the fast `--no-draw` mode —
-# the whole battery in a couple of seconds, and the gate CI runs.
+# Every suite, in parallel, in the fast `--no-draw` mode.
 #
 # The binary must be built headless (`MAKEPAD=headless cargo build`):
 # build.rs turns that into cfg(headless), which is what gives a run its
-# virtual clock and its inline pump. `--no-draw` then runs the full widget
+# virtual clock and its inline passes. `--no-draw` then runs the full widget
 # draw pass — so hit resolution and label matching work exactly as they do
 # with pictures — while rasterizing nothing, and `shot` steps are skipped.
 # A failure here is a label that did not resolve: a real one.
 #
-# The device-sync suites are not here. They need a bucketd — and a second
-# device, or assertions made outside the app; e2e/sync-demo.sh, e2e/reseed.sh
-# and e2e/bucket.sh drive those.
+# What a suite needs beyond the defaults it says itself, in two header
+# lines of its own file:
+#
+#   # args: --grid 4x3 --window 380x780
+#   # env:  SUPERAPP_SOMETHING=1
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -19,44 +20,33 @@ BIN=${BIN:-./target/debug/superapp}
 DRAWS=${DRAWS:-4000}
 
 if [ ! -x "$BIN" ]; then
-  echo "no binary at $BIN — MAKEPAD=headless cargo build" >&2
+  echo "no binary at $BIN — MAKEPAD=headless mise exec -- cargo build -p superapp" >&2
   exit 2
 fi
 
 LOGS=$(mktemp -d)
 trap 'rm -rf "$LOGS"' EXIT
 
-# What a suite needs beyond the defaults, from its own header comment.
-extra_args() {
-  case "$1" in
-    phone)    echo "--window 380x780 --grid 4x3" ;;  # the cover display
-    send)     echo "--send-delay 1" ;;               # a one-second undo window
-    problems) echo "--send-delay 1" ;;               # the same, for its failing send
-    effects)  echo "--send-delay 1" ;;               # …so a job reaches the queue
-    library)  echo "--library" ;;                    # the canvas, not a workspace
-    files | files-marks) echo "--demo-disk" ;;       # the demo tree, not this machine's ~
-    attach)   echo "--demo-disk" ;;                  # …and the file a draft carries
-    *)        echo "" ;;
-  esac
-}
-
-# A suite that waits out a retry backoff needs a draw budget to match: the
-# virtual clock only advances on a draw, so too small a budget leaves it
-# short of its own `quit`. Never below what $DRAWS asks for.
-suite_draws() {
-  case "$1" in
-    problems) [ "$DRAWS" -gt 100000 ] && echo "$DRAWS" || echo 100000 ;;
-    *)        echo "$DRAWS" ;;
-  esac
-}
-
 names=()
-for f in e2e/*.txt; do
-  n=$(basename "$f" .txt)
-  case "$n" in sync-a | sync-b | reseed-a | reseed-b | bucket) continue ;; esac
+# The shell's own suites sit in `e2e/`; an app's live in `e2e/<app>/`, and a
+# suite is named by the path it is at, so `mail/basic` and a shell suite of
+# the same name never collide.
+#
+# `e2e/sync/` is the exception and stays out: those walks are two devices
+# over one bucket, so each needs a second process and a `bucketd` beside it.
+# Their own scripts run them — `e2e/sync/sync-demo.sh`, `reseed.sh`,
+# `bucket.sh`.
+for f in e2e/*.txt e2e/*/*.txt; do
+  [ -f "$f" ] || continue
+  case "$f" in e2e/sync/*) continue ;; esac
+  n=${f#e2e/}
+  n=${n%.txt}
   names+=("$n")
-  # shellcheck disable=SC2046 # word-splitting is how the extra args arrive
-  "$BIN" --e2e "$f" --no-draw --draws "$(suite_draws "$n")" $(extra_args "$n") \
+  mkdir -p "$LOGS/$(dirname "$n")"
+  args=$(sed -n 's/^# args:[[:space:]]*//p' "$f" | head -1)
+  envs=$(sed -n 's/^# env:[[:space:]]*//p' "$f" | head -1)
+  # shellcheck disable=SC2086 # word-splitting is how the header's args arrive
+  env $envs "$BIN" --e2e "$f" --e2e-out e2e/out --no-draw --draws "$DRAWS" $args \
     >"$LOGS/$n.log" 2>&1 &
 done
 
@@ -66,14 +56,14 @@ fails=0
 for n in "${names[@]}"; do
   done_line=$(grep 'e2e: done' "$LOGS/$n.log" | tail -1)
   if [ -z "$done_line" ]; then
-    printf 'FAIL %-14s never reached quit\n' "$n"
+    printf 'FAIL %-16s never reached quit\n' "$n"
     sed -n '$p' "$LOGS/$n.log" | sed 's/^/       /'
     fails=$((fails + 1))
   # The comma and the space matter: "10 failure(s)" ends in "0 failure(s)".
   elif case "$done_line" in *", 0 failure"*) true ;; *) false ;; esac; then
-    printf 'ok   %-14s %s\n' "$n" "${done_line#e2e: done — }"
+    printf 'ok   %-16s %s\n' "$n" "${done_line#e2e: done — }"
   else
-    printf 'FAIL %-14s %s\n' "$n" "${done_line#e2e: done — }"
+    printf 'FAIL %-16s %s\n' "$n" "${done_line#e2e: done — }"
     grep 'e2e: FAIL' "$LOGS/$n.log" | sed 's/^/       /'
     fails=$((fails + 1))
   fi
