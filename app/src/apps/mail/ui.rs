@@ -346,6 +346,13 @@ script_mod! {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
+            // A finger drags the thread; a mouse button on it is a
+            // selection, never a scroll. The list would otherwise take the
+            // drag a letter's own text is selected with — and turn a press
+            // that lands while a coast is still live into one too, pulling
+            // the letter out from under a selection begun a moment after
+            // scrolling.
+            drag_scrolling: #(cfg!(target_os = "android"))
             msg := mod.widgets.MailThreadRow {}
         }
     }
