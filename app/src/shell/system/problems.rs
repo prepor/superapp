@@ -7,6 +7,9 @@
 //!
 //! No chords: a panel with a control per row would have to invent a letter
 //! per row, so its verbs are clicked and tabbed, never chorded.
+//!
+//! Its three lines are selectable runs: an error one cannot copy out is one
+//! that gets retyped by hand into whatever is going to be searched.
 
 use std::any::Any;
 
@@ -72,6 +75,11 @@ const SLOTS: usize = 2;
 const BTNS: [&[LiveId]; SLOTS] = [ids!(head.b0), ids!(head.b1)];
 const BTN_LBLS: [&[LiveId]; SLOTS] = [ids!(head.b0.lbl), ids!(head.b1.lbl)];
 const LINKS: [&[LiveId]; SLOTS] = [ids!(foot.l0), ids!(foot.l1)];
+
+/// A row's selectable runs: what it concerns, what is wrong, and the muted
+/// detail. A problem is a sentence someone carries elsewhere, so all three
+/// are text and not labels.
+const RUNS: [&[LiveId]; 3] = [ids!(head.label_lbl), ids!(line_lbl), ids!(foot.detail_lbl)];
 
 /// The widget. Its buttons are answered here, by the rectangles of the last
 /// draw, because a portal-list item's own area goes stale the moment a
@@ -165,6 +173,17 @@ impl Widget for ProblemsPanel {
             let Some(p) = problems.iter().find(|p| p.key == key) else {
                 continue;
             };
+            // The three lines first: a run answers a press itself, and the
+            // hit is what puts the I-beam over it and lets a script name it.
+            // Each is addressed by what it says, which is the only thing
+            // that tells one row's line from another's.
+            for path in RUNS {
+                let w = row.text_input(cx, path);
+                let r = w.area().rect(cx);
+                if r.size.x > 0.0 && !w.text().is_empty() {
+                    props.hits.add(w.text(), r, MouseCursor::Text, props.slot);
+                }
+            }
             for (v, path) in p
                 .verbs
                 .iter()
@@ -201,9 +220,11 @@ impl Widget for ProblemsPanel {
 /// One row: what it concerns, what is wrong, the muted line under it, and
 /// the controls the source gave it.
 fn populate(cx: &mut Cx, row: &WidgetRef, p: &Problem) {
-    row.label(cx, ids!(head.label_lbl)).set_text(cx, &p.label);
-    row.label(cx, ids!(line_lbl)).set_text(cx, &p.line);
-    row.label(cx, ids!(foot.detail_lbl)).set_text(cx, &p.detail);
+    row.text_input(cx, ids!(head.label_lbl))
+        .set_text(cx, &p.label);
+    row.text_input(cx, ids!(line_lbl)).set_text(cx, &p.line);
+    row.text_input(cx, ids!(foot.detail_lbl))
+        .set_text(cx, &p.detail);
 
     let mut buttons = p.verbs.iter().filter(|v| v.act.button());
     for (i, path) in BTNS.into_iter().enumerate() {

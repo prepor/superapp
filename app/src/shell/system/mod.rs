@@ -357,7 +357,12 @@ script_mod! {
     }
 
     /** One standing problem: what it concerns and its buttons, what is
-        wrong under them, then the muted detail and its links. */
+        wrong under them, then the muted detail and its links.
+
+        All three lines are selectable runs and not labels. What is wrong is
+        the sentence a person carries somewhere else — into a search, into a
+        bug report — and a row nobody can copy out of makes them retype an
+        error by hand. */
     mod.widgets.SysProblemRow = View {
         width: Fill, height: Fit
         flow: Down
@@ -365,15 +370,25 @@ script_mod! {
         head := View {
             width: Fill, height: Fit
             align: Align{y: 0.5}
-            label_lbl := mod.widgets.SBoldLabel { width: Fit, text: "" }
+            label_lbl := mod.widgets.SText {
+                width: Fit, is_multiline: false, text: ""
+                draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
+            }
             View { width: Fill, height: 1 }
             b0 := mod.widgets.SysRowBtn {}
             b1 := mod.widgets.SysRowBtn {}
         }
-        line_lbl := mod.widgets.SLabel {
-            width: Fill
+        line_lbl := mod.widgets.SText {
+            width: Fill, is_multiline: true
             margin: Inset{top: 6}
-            text: "", draw_text +: { color: #a01500 }
+            text: ""
+            draw_text +: {
+                color: #a01500
+                color_hover: #a01500
+                color_focus: #a01500
+                color_down: #a01500
+                color_empty: #a01500
+            }
         }
         foot := View {
             width: Fill, height: Fit
@@ -381,8 +396,15 @@ script_mod! {
             align: Align{y: 0.5}
             margin: Inset{top: 5}
             // Fill, so a long detail wraps rather than running under a link.
-            detail_lbl := mod.widgets.SLabel {
-                width: Fill, text: "", draw_text +: { color: #909090 }
+            detail_lbl := mod.widgets.SText {
+                width: Fill, is_multiline: true, text: ""
+                draw_text +: {
+                    color: #909090
+                    color_hover: #909090
+                    color_focus: #909090
+                    color_down: #909090
+                    color_empty: #909090
+                }
             }
             l0 := mod.widgets.SLink { margin: Inset{left: 12} }
             l1 := mod.widgets.SLink { margin: Inset{left: 12} }
