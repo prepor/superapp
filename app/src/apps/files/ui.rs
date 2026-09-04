@@ -5,7 +5,7 @@
 //! the shell's — the table's filter and row twins, the completion box, the
 //! file card, the field, the link, the rule — so an app declares what is its
 //! own and nothing else: a listing's three columns, the crumb line, and the
-//! two fields that stand in it.
+//! three fields that stand in it.
 
 use kernel::panel::Tag;
 use kernel::scene::Scene;
@@ -68,8 +68,8 @@ script_mod! {
     }
 
     /** A directory as a column: where the panel stands as crumbs, the
-        filter, the two fields that stand in for the crumb line while they
-        are up, the header over the rows, the status line under them.
+        filter, the three fields a verb raises among them, the header over
+        the rows, the status line under them.
 
         A rich table like any other — what files adds is the row body above,
         the four functions beside it, and the chrome around the list. */
@@ -133,6 +133,22 @@ script_mod! {
                 autocorrect: AutoCorrect.Disabled
             }
         }
+        /* `rename`: the directory this panel shows, under a new name. Up
+           while the verb asked for it; enter renames, esc puts it away. */
+        rename_row := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            margin: Inset{top: 6}
+            mod.widgets.SSection { width: 82, text: "RENAME" }
+            rename_input := mod.widgets.SField {
+                empty_text: "name"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
         View { width: Fill, height: 6 }
         // Header cells for the three columns a row draws.
         View {
@@ -178,8 +194,9 @@ script_mod! {
 
     // ---- the card -----------------------------------------------------------
 
-    /** One file, shown: the shell's own card, and under it the line a
-        refused verb leaves.
+    /** One file, shown: the shell's own card — whose name row carries the
+        `rename` field this app raises — and under it the line a refused verb
+        leaves.
 
         Everything the card draws — the name, what it is, when it changed,
         the path, the preview, the picture — is filled from the instance

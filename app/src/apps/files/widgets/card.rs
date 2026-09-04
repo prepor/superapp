@@ -10,21 +10,30 @@
 //! decoded into a texture of its own, so the widget remembers which reading
 //! of which file is on the card and writes again only when that moves.
 //!
-//! The bar is the instance's: *open*, *copy*, *move*, and the *delete* that
-//! takes the card with the file.
+//! The bar is the instance's: *open*, *copy*, *move*, the *rename* that
+//! raises a field where the name is drawn, and the *delete* that takes the
+//! card with the file.
 
 use kernel::panel::PanelId;
 use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
+use crate::shell::keys::Letters;
 use crate::shell::widgets::card::{self, CardData, Preview};
 
 use super::super::model::{fmt_size, FileKind, Preview as Read};
 use super::super::panels::Card;
+use super::field::Raised;
 
 /// The children the card's template adds to the shell's own.
 const STATUS: &[LiveId] = ids!(status_lbl);
+
+/// The name, and the `rename` field that stands in its place: the shell's
+/// card carries the row, this app is what raises it.
+const NAME: &[LiveId] = ids!(name_lbl);
+const RENAME_ROW: &[LiveId] = ids!(rename_row);
+const RENAME: &[LiveId] = ids!(rename_row.rename_input);
 
 /// The selectable line under the three: the path, and the run the preview
 /// is. Both are addressed by a script — the path by its own text, which is
@@ -45,7 +54,16 @@ struct Shown {
     at: u64,
 }
 
-/// The widget: the card, and the line a refused verb leaves.
+/// What the card draws around the file: the line a refused verb leaves, and
+/// the `rename` field's text while that field is up. Both are the
+/// instance's — a verb that closes the field takes what was typed with it.
+struct Chrome {
+    status: Option<String>,
+    renaming: Option<String>,
+}
+
+/// The widget: the card, the field it raises over the name, and the line a
+/// refused verb leaves.
 #[derive(Script, ScriptHook, Widget)]
 pub struct CardPanel {
     #[source]
@@ -55,6 +73,9 @@ pub struct CardPanel {
     /// What the card was last filled for.
     #[rust]
     shown: Option<Shown>,
+    /// The `rename` field: up while the instance holds a name for it.
+    #[rust]
+    rename_field: Raised,
 }
 
 impl Widget for CardPanel {
@@ -63,7 +84,39 @@ impl Widget for CardPanel {
         // written one — on an event as well as on a draw, since a verb's
         // write lands between the two.
         observe(scope);
+        let Some(props) = scope.props.get::<PanelProps>().cloned() else {
+            self.view.handle_event(cx, event, scope);
+            return;
+        };
+        let rename = self.view.text_input(cx, RENAME);
+        self.sync(cx, &props, &rename);
+        self.rename_field.land(cx, &rename, true);
+        let live = self.rename_field.live(cx, &rename);
+        keeps(&props, live);
+        if let Event::KeyDown(k) = event {
+            // A live field keeps the chords it needs: `cmd+a` is select-all
+            // here, not a verb on the bar.
+            if live && k.modifiers.logo {
+                props.chord.take();
+            }
+        }
         self.view.handle_event(cx, event, scope);
+
+        let Event::Actions(actions) = event else {
+            return;
+        };
+        if rename.key_focus_lost(actions) {
+            rename.set_cursor(cx, rename.cursor(), false);
+        }
+        if rename.changed(actions).is_some() {
+            edit(&props, |c| c.set_renaming(Some(rename.text())));
+        }
+        if rename.returned(actions).is_some() {
+            self.rename(cx, &props, scope, &rename.text());
+        }
+        if rename.escaped(actions) {
+            self.close(cx, &props, scope);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -79,7 +132,7 @@ impl Widget for CardPanel {
         // nothing may still be borrowing the panel by then. The preview
         // comes along only when it is going to be written — a reading is up
         // to 64 KiB and a picture rather more.
-        let Some((data, status)) = read(&props, fresh) else {
+        let Some((data, chrome)) = read(&props, fresh) else {
             return self.view.draw_walk(cx, scope, walk);
         };
         if fresh {
@@ -87,10 +140,35 @@ impl Widget for CardPanel {
             self.shown = Some(shown);
         }
         let lbl = self.view.label(cx, STATUS);
-        lbl.set_text(cx, status.as_deref().unwrap_or(""));
-        lbl.set_visible(cx, status.is_some());
+        lbl.set_text(cx, chrome.status.as_deref().unwrap_or(""));
+        lbl.set_visible(cx, chrome.status.is_some());
+        // The field stands where the name is drawn, so exactly one of the
+        // two is up. Said on the draw as well as on the event: a bar is
+        // drawn before the body that reports.
+        let rename = self.view.text_input(cx, RENAME);
+        self.rename_field.sync(
+            cx,
+            &self.view,
+            RENAME_ROW,
+            &rename,
+            chrome.renaming.as_deref(),
+        );
+        self.view
+            .widget(cx, NAME)
+            .set_visible(cx, !self.rename_field.up());
+        keeps(&props, self.rename_field.live(cx, &rename));
 
         let step = self.view.draw_walk(cx, scope, walk);
+
+        // The field, addressable by name — that is all a script needs to put
+        // a caret in one. Only while its row is up: a hidden widget keeps
+        // its last rectangle.
+        if self.rename_field.up() {
+            let r = self.view.widget(cx, RENAME).area().rect(cx);
+            if r.size.x > 0.0 {
+                props.hits.add("new name", r, MouseCursor::Text, props.slot);
+            }
+        }
 
         // The path line carries its own text as its label, the way a row
         // does, so a script can say which file this card is on.
@@ -106,6 +184,65 @@ impl Widget for CardPanel {
         }
         step
     }
+}
+
+impl CardPanel {
+    /// Raises and lowers the field with the instance's own state, seeding it
+    /// the once. Called from the draw as well as from the event, so the verb's
+    /// field is up in the very frame it asked for.
+    fn sync(&mut self, cx: &mut Cx, props: &PanelProps, rename: &TextInputRef) {
+        let text = renaming(props);
+        self.rename_field
+            .sync(cx, &self.view, RENAME_ROW, rename, text.as_deref());
+    }
+
+    /// Enter in the field: the instance's own verb, on the instance the
+    /// widget is holding. The card is pointed at the new name in the layout
+    /// half of that same action, so this instance is on its way out — what it
+    /// does with the keyboard is only for the frames in between.
+    fn rename(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, name: &str) {
+        let Some(session) = scope.data.get_mut::<Session>() else {
+            return;
+        };
+        let closed = {
+            let mut borrow = props.panel.borrow_mut();
+            let Some(c) = borrow.as_any().downcast_mut::<Card>() else {
+                return;
+            };
+            c.rename(session, name);
+            // The field closes itself where the rename went through; a
+            // refusal keeps it, with the name still in it.
+            c.renaming().is_none()
+        };
+        if closed {
+            cx.set_key_focus(self.view.area());
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Esc: the field goes away and the name comes back, with nothing
+    /// renamed.
+    fn close(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
+        edit(props, |c| {
+            c.set_renaming(None);
+            c.set_status(None);
+        });
+        cx.set_key_focus(self.view.area());
+        self.view.redraw(cx);
+        if let Some(session) = scope.data.get_mut::<Session>() {
+            session.redraw();
+        }
+    }
+}
+
+/// The `rename` field's text, off the instance; `None` while it is down.
+fn renaming(props: &PanelProps) -> Option<String> {
+    let mut borrow = props.panel.borrow_mut();
+    borrow
+        .as_any()
+        .downcast_mut::<Card>()?
+        .renaming()
+        .map(str::to_string)
 }
 
 /// Which reading of which file the instance is holding right now.
@@ -127,7 +264,7 @@ fn shown(props: &PanelProps) -> Option<Shown> {
 ///
 /// A file that has gone says so in its own line rather than reading as a
 /// nought-byte one, and the date line says the same thing again.
-fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Option<String>)> {
+fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Chrome)> {
     let mut borrow = props.panel.borrow_mut();
     let c = borrow.as_any().downcast_mut::<Card>()?;
     let (kind_word, size) = if c.gone() {
@@ -153,8 +290,29 @@ fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Option<String>)>
                 _ => Preview::None,
             },
         },
-        c.status().map(str::to_string),
+        Chrome {
+            status: c.status().map(str::to_string),
+            renaming: c.renaming().map(str::to_string),
+        },
     ))
+}
+
+/// Runs `f` on the instance, where there is nothing to answer.
+fn edit(props: &PanelProps, f: impl FnOnce(&mut Card)) {
+    let mut borrow = props.panel.borrow_mut();
+    if let Some(c) = borrow.as_any().downcast_mut::<Card>() {
+        f(c);
+    }
+}
+
+/// What the field keeps from the bars while it has the keyboard: every
+/// letter, because the keydown above answers *any* cmd chord while a caret
+/// blinks in it — so no bar's letter would fire and none may be drawn as if
+/// it would. Said nothing at all when the caret is elsewhere.
+fn keeps(props: &PanelProps, live: bool) {
+    if live {
+        props.chord.field(Letters::ALL);
+    }
 }
 
 /// Hands the instance the one fact it cannot ask for itself: that the disk

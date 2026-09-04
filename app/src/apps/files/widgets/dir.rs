@@ -4,20 +4,18 @@
 //! Everything a list does — the filter and its completion, the cursor walk
 //! that previews, the marks, the band the filter hides them in, the keys —
 //! is the table widget's. What files supplies is the four short functions of
-//! a [`RowSpec`] and the chrome around the rows: the crumbs, the two fields
-//! that stand in their place while they are up, and the line a refused verb
-//! leaves.
+//! a [`RowSpec`] and the chrome around the rows: the crumbs, the three
+//! fields a verb raises among them, and the line a refused verb leaves.
 //!
 //! The bar is the instance's: *new dir*, *go to*, the verbs of the directory
-//! this panel is the object of, the batch verbs while there are marks, and
-//! `… here` while another panel is holding something.
+//! this panel is the object of — *rename* among them — the batch verbs while
+//! there are marks, and `… here` while another panel is holding something.
 
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
 use kernel::richtable::ListState;
 use kernel::session::Session;
 use kernel::time::fmt_date;
-use makepad_widgets::text::selection::Cursor;
 use makepad_widgets::*;
 
 use crate::shell::dsl::LinkViewExt;
@@ -30,6 +28,7 @@ use super::super::completion::PathCompletion;
 use super::super::model::{fmt_size, is_dir_in, normalize, DirRow, DirSource, ROOT};
 use super::super::panels::dir::row_target;
 use super::super::panels::Dir;
+use super::field::Raised;
 
 /// The children a listing's chrome expects in its template.
 const CRUMBS: &[LiveId] = ids!(crumbs);
@@ -38,6 +37,8 @@ const PATH_ROW: &[LiveId] = ids!(path_row);
 const PATH: &[LiveId] = ids!(path_row.path_input);
 const NAME_ROW: &[LiveId] = ids!(newdir_row);
 const NAME: &[LiveId] = ids!(newdir_row.newdir_input);
+const RENAME_ROW: &[LiveId] = ids!(rename_row);
+const RENAME: &[LiveId] = ids!(rename_row.rename_input);
 const STATUS: &[LiveId] = ids!(status_lbl);
 
 /// The crumb slots, and the separator that follows each. Four: a deeper
@@ -103,12 +104,21 @@ impl RowSpec for DirRows {
 }
 
 /// What the widget reads off its instance at the top of every draw and
-/// every event. The two fields are the instance's text, not the widget's:
+/// every event. The three fields are the instance's text, not the widget's:
 /// a verb that closes one takes what was typed with it.
 struct Fields {
     naming: Option<String>,
+    renaming: Option<String>,
     pathing: Option<String>,
     status: Option<String>,
+}
+
+/// Which field an esc or a submit is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Path,
+    Name,
+    Rename,
 }
 
 /// The widget: the shared table, and the chrome around it.
@@ -130,18 +140,14 @@ pub struct DirPanel {
     /// The path field's completion: one segment at a time, like a shell.
     #[rust]
     pac: Suggest<PathCompletion>,
-    /// Whether each field's row was up at the last look, so its text is
-    /// seeded once — when it opens — and not written over as it is typed.
+    /// The three fields the panel raises, each with its own memory of
+    /// whether it is up and whether it is still waiting for the keyboard.
     #[rust]
-    path_up: bool,
+    path_field: Raised,
     #[rust]
-    name_up: bool,
-    /// A field just raised wants the keyboard, once it has been drawn where
-    /// it will stand: focus on a field with no rectangle lands nowhere.
+    name_field: Raised,
     #[rust]
-    focus_path: bool,
-    #[rust]
-    focus_name: bool,
+    rename_field: Raised,
     /// The path box's rows of the last draw, in the order it offers them: a
     /// press on one is a pick, and it must not reach the row underneath.
     #[rust]
@@ -158,13 +164,13 @@ impl Widget for DirPanel {
         };
         let path = self.view.text_input(cx, PATH);
         let name = self.view.text_input(cx, NAME);
-        self.sync(cx, &f, &path, &name);
-        self.land(cx, &path, &name);
-        // A hidden field that has never been drawn reads makepad's "nothing
-        // has focus" as its own, so a field counts only while its row is up.
-        let path_live = f.pathing.is_some() && path.key_focus(cx);
-        let name_live = f.naming.is_some() && name.key_focus(cx);
-        keeps(&props, path_live || name_live);
+        let rename = self.view.text_input(cx, RENAME);
+        self.sync(cx, &f, &path, &name, &rename);
+        self.land(cx, &path, &name, &rename);
+        let path_live = self.path_field.live(cx, &path);
+        let field_live =
+            path_live || self.name_field.live(cx, &name) || self.rename_field.live(cx, &rename);
+        keeps(&props, field_live);
         self.pac.track(cx, &path);
 
         // The path box is drawn over the rows, so its rows answer first: the
@@ -183,7 +189,7 @@ impl Widget for DirPanel {
         if let Event::KeyDown(k) = event {
             // A live field keeps the chords it needs: `cmd+a` is select-all
             // here, not a verb on the bar.
-            if (path_live || name_live) && k.modifiers.logo {
+            if field_live && k.modifiers.logo {
                 props.chord.take();
             }
             if path_live {
@@ -207,8 +213,8 @@ impl Widget for DirPanel {
             }
         }
 
-        if (path_live || name_live) && matches!(event, Event::KeyDown(_) | Event::TextInput(_)) {
-            // While one of the two fields has the keyboard the rows' keys
+        if field_live && matches!(event, Event::KeyDown(_) | Event::TextInput(_)) {
+            // While one of the three fields has the keyboard the rows' keys
             // are not the panel's to take: `/` is a slash, space is a space,
             // and the arrows walk the text.
             self.view.handle_event(cx, event, scope);
@@ -220,7 +226,7 @@ impl Widget for DirPanel {
         let Event::Actions(actions) = event else {
             return;
         };
-        for t in [&path, &name] {
+        for t in [&path, &name, &rename] {
             if t.key_focus_lost(actions) {
                 t.set_cursor(cx, t.cursor(), false);
             }
@@ -231,17 +237,26 @@ impl Widget for DirPanel {
         if name.changed(actions).is_some() {
             edit(&props, |d| d.set_naming(Some(name.text())));
         }
+        if rename.changed(actions).is_some() {
+            edit(&props, |d| d.set_renaming(Some(rename.text())));
+        }
         if path.returned(actions).is_some() {
             self.go_to(cx, &props, scope, &path.text());
         }
         if path.escaped(actions) {
-            self.close(cx, &props, scope, true);
+            self.close(cx, &props, scope, Field::Path);
         }
         if name.returned(actions).is_some() {
             self.new_dir(cx, &props, scope, &name.text());
         }
         if name.escaped(actions) {
-            self.close(cx, &props, scope, false);
+            self.close(cx, &props, scope, Field::Name);
+        }
+        if rename.returned(actions).is_some() {
+            self.rename(cx, &props, scope, &rename.text());
+        }
+        if rename.escaped(actions) {
+            self.close(cx, &props, scope, Field::Rename);
         }
     }
 
@@ -257,14 +272,16 @@ impl Widget for DirPanel {
         };
         let path = self.view.text_input(cx, PATH);
         let name = self.view.text_input(cx, NAME);
-        self.sync(cx, &f, &path, &name);
+        let rename = self.view.text_input(cx, RENAME);
+        self.sync(cx, &f, &path, &name, &rename);
         // Said on the draw as well as on the event: a bar is drawn before
         // the body that reports, and the promise a bold letter makes is
         // about now.
         keeps(
             &props,
-            (f.pathing.is_some() && path.key_focus(cx))
-                || (f.naming.is_some() && name.key_focus(cx)),
+            self.path_field.live(cx, &path)
+                || self.name_field.live(cx, &name)
+                || self.rename_field.live(cx, &rename),
         );
         self.crumbs(cx, &props, &f);
         // The status line: what the last verb refused, until the next one.
@@ -289,6 +306,7 @@ impl Widget for DirPanel {
         for (up, path_ids, label) in [
             (f.pathing.is_some(), PATH, "path"),
             (f.naming.is_some(), NAME, "new dir name"),
+            (f.renaming.is_some(), RENAME, "new name"),
         ] {
             if !up {
                 continue;
@@ -318,62 +336,43 @@ impl Widget for DirPanel {
 }
 
 impl DirPanel {
-    /// Raises and lowers the two fields with the instance's own state, and
+    /// Raises and lowers the three fields with the instance's own state, and
     /// seeds each one when it opens. Called from the draw as well as from
     /// the event, so a verb's field is up in the very frame it asked for.
-    fn sync(&mut self, cx: &mut Cx, f: &Fields, path: &TextInputRef, name: &TextInputRef) {
-        let up = f.pathing.is_some();
-        if up != self.path_up {
-            self.path_up = up;
-            self.view.widget(cx, PATH_ROW).set_visible(cx, up);
-            if up {
-                path.set_text(cx, f.pathing.as_deref().unwrap_or(""));
-                // A fresh field, a fresh offer: nothing of the last walk.
-                self.pac = Suggest::default();
-                self.focus_path = true;
-            } else if path.key_focus(cx) {
-                // The keyboard goes back to the rows, never to a field that
-                // is no longer there.
-                cx.set_key_focus(self.view.area());
-            }
+    fn sync(
+        &mut self,
+        cx: &mut Cx,
+        f: &Fields,
+        path: &TextInputRef,
+        name: &TextInputRef,
+        rename: &TextInputRef,
+    ) {
+        if self
+            .path_field
+            .sync(cx, &self.view, PATH_ROW, path, f.pathing.as_deref())
+        {
+            // A fresh field, a fresh offer: nothing of the last walk.
+            self.pac = Suggest::default();
         }
-        let up = f.naming.is_some();
-        if up != self.name_up {
-            self.name_up = up;
-            self.view.widget(cx, NAME_ROW).set_visible(cx, up);
-            if up {
-                name.set_text(cx, f.naming.as_deref().unwrap_or(""));
-                self.focus_name = true;
-            } else if name.key_focus(cx) {
-                cx.set_key_focus(self.view.area());
-            }
-        }
+        self.name_field
+            .sync(cx, &self.view, NAME_ROW, name, f.naming.as_deref());
+        self.rename_field
+            .sync(cx, &self.view, RENAME_ROW, rename, f.renaming.as_deref());
     }
 
     /// The deferred focus: a field takes the keyboard once it has been drawn
     /// where it will stand. The path field keeps its seed and puts the caret
     /// at the end; a name is a value to type over, so it lands selected.
-    fn land(&mut self, cx: &mut Cx, path: &TextInputRef, name: &TextInputRef) {
-        if self.focus_path && self.path_up && path.area().rect(cx).size.y > 0.0 {
-            self.focus_path = false;
-            path.set_key_focus(cx);
-            let end = path.text().len();
-            path.set_cursor(
-                cx,
-                Cursor {
-                    index: end,
-                    prefer_next_row: false,
-                },
-                false,
-            );
-        }
-        if self.focus_name && self.name_up && name.area().rect(cx).size.y > 0.0 {
-            self.focus_name = false;
-            name.set_key_focus(cx);
-            if let Some(mut t) = name.borrow_mut() {
-                t.select_all(cx);
-            }
-        }
+    fn land(
+        &mut self,
+        cx: &mut Cx,
+        path: &TextInputRef,
+        name: &TextInputRef,
+        rename: &TextInputRef,
+    ) {
+        self.path_field.land(cx, path, false);
+        self.name_field.land(cx, name, true);
+        self.rename_field.land(cx, rename, true);
     }
 
     /// The crumb line: the last four ancestors as dotted links — each
@@ -464,14 +463,38 @@ impl DirPanel {
         self.view.redraw(cx);
     }
 
-    /// Esc: the field goes away and the crumbs come back, with nothing
-    /// created and nothing gone to.
-    fn close(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, path: bool) {
+    /// Enter in the `rename` field: the instance's own verb, on the instance
+    /// the widget is holding. The panel is replaced with the new name in the
+    /// layout half of the same action, so this one is on its way out — what
+    /// it does with the keyboard is only for the frames in between.
+    fn rename(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, name: &str) {
+        let Some(session) = scope.data.get_mut::<Session>() else {
+            return;
+        };
+        let closed = {
+            let mut borrow = props.panel.borrow_mut();
+            let Some(d) = borrow.as_any().downcast_mut::<Dir>() else {
+                return;
+            };
+            d.rename(session, name);
+            // The field closes itself where the rename went through; a
+            // refusal keeps it, with the name still in it.
+            d.renaming().is_none()
+        };
+        if closed {
+            cx.set_key_focus(self.view.area());
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Esc: the field goes away and what stood in its place comes back, with
+    /// nothing created, nothing gone to, and nothing renamed.
+    fn close(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, which: Field) {
         edit(props, |d| {
-            if path {
-                d.set_pathing(None);
-            } else {
-                d.set_naming(None);
+            match which {
+                Field::Path => d.set_pathing(None),
+                Field::Name => d.set_naming(None),
+                Field::Rename => d.set_renaming(None),
             }
             d.set_status(None);
         });
@@ -497,20 +520,21 @@ fn observe(props: &PanelProps, scope: &mut Scope) -> Option<Fields> {
     d.observe(session);
     Some(Fields {
         naming: d.naming().map(str::to_string),
+        renaming: d.renaming().map(str::to_string),
         pathing: d.pathing().map(str::to_string),
         status: d.status().map(str::to_string),
     })
 }
 
-/// What the two fields keep from the bars while one of them has the
+/// What the three fields keep from the bars while one of them has the
 /// keyboard: every letter, because the keydown above answers *any* cmd
-/// chord while a caret blinks in `go to` or `new dir` — so no bar's letter
-/// would fire and none may be drawn as if it would.
+/// chord while a caret blinks in `go to`, `new dir` or `rename` — so no
+/// bar's letter would fire and none may be drawn as if it would.
 ///
-/// The table says the same of its filter; this is the other two fields,
-/// which are files' own. Said on every draw and every event, and said
-/// nothing at all when neither is live: the frame after the caret leaves
-/// must not still be drawn as if it were there.
+/// The table says the same of its filter; this is the other three, which
+/// are files' own. Said on every draw and every event, and said nothing at
+/// all when none is live: the frame after the caret leaves must not still
+/// be drawn as if it were there.
 fn keeps(props: &PanelProps, live: bool) {
     if live {
         props.chord.field(Letters::ALL);

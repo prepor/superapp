@@ -48,6 +48,8 @@ pub struct Dir {
     chain: Chain,
     /// The `new dir` field, while it is open: the name as typed.
     naming: Option<String>,
+    /// The `rename` field, while it is open: the new name as typed.
+    renaming: Option<String>,
     /// The `go to` field, while it is open: the path as typed.
     pathing: Option<String>,
     /// The line under the header: what a verb refused, until the next one.
@@ -160,7 +162,7 @@ impl Dir {
             .retarget(DirSource::new(&self.dir, entries));
     }
 
-    // -- the two fields --------------------------------------------------------
+    // -- the three fields ------------------------------------------------------
 
     /// The `new dir` field's text, while it is open.
     #[must_use]
@@ -171,6 +173,16 @@ impl Dir {
     /// Opens, closes, or edits it. `None` closes.
     pub fn set_naming(&mut self, text: Option<String>) {
         self.naming = text;
+    }
+
+    /// The `rename` field's text, while it is open.
+    #[must_use]
+    pub fn renaming(&self) -> Option<&str> {
+        self.renaming.as_deref()
+    }
+
+    pub fn set_renaming(&mut self, text: Option<String>) {
+        self.renaming = text;
     }
 
     /// The `go to` field's text, while it is open.
@@ -285,6 +297,26 @@ impl Dir {
         self.refresh_all(s);
     }
 
+    /// `rename`: the directory this panel shows, under a new name — one
+    /// undoable action, whose reversal puts the old name back. The panel
+    /// goes with it: its identity is the path, so the layout half of the
+    /// same node points this slot at the new one.
+    ///
+    /// The widget calls this from the field's submit, on the instance it is
+    /// already holding — the same `&mut self` a verb of the bar has.
+    pub fn rename(&mut self, s: &mut Session, name: &str) {
+        let (slot, path) = (self.slot, self.dir.clone());
+        match rename_path(s, slot, &path, name, Dir::id) {
+            Said::Went => {
+                self.renaming = None;
+                self.status = None;
+            }
+            Said::Refused(line) => self.status = Some(line),
+            Said::Nothing => {}
+        }
+        self.relist();
+    }
+
     /// Every listing reads its directory again — every other panel through
     /// [`refresh`](super::refresh), which skips the instance this verb is
     /// running as, and this one by itself.
@@ -332,12 +364,17 @@ impl Panel for Dir {
         self.slot = slot;
     }
 
-    /// `new dir` and `go to` open the two fields; the object verbs act on
-    /// the directory this panel shows, or — while rows are marked — on the
-    /// marked set, which is the same verb over more than one thing and so
-    /// wears the same letter; then the two verbs about the set itself; and
-    /// while the clipboard holds something, `copy here` or `move here` names
-    /// what will happen to it.
+    /// `new dir` and `go to` open two of the three fields; the object verbs
+    /// act on the directory this panel shows, or — while rows are marked —
+    /// on the marked set, which is the same verb over more than one thing
+    /// and so wears the same letter; then the two verbs about the set
+    /// itself; and while the clipboard holds something, `copy here` or `move
+    /// here` names what will happen to it.
+    ///
+    /// `rename` is the exception to the batch rule: a name is a name, and
+    /// two things cannot both wear it — so it is offered over the one
+    /// directory this panel shows and never over a marked set. It opens the
+    /// third field.
     ///
     /// *mark all* wears `a` rather than the obvious `l` — this shell keeps
     /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
@@ -363,6 +400,7 @@ impl Panel for Dir {
         } else if self.object() {
             v.push(Verb::run("files.copy", "copy", Some('p')));
             v.push(Verb::run("files.move", "move", Some('m')));
+            v.push(Verb::run("files.rename", "rename", Some('r')));
             v.push(Verb::run("files.delete", "delete", Some('d')));
         }
         let clip = FILES.clipboard();
@@ -393,6 +431,22 @@ impl Panel for Dir {
                     None => Some(format!("{}/", self.dir.trim_end_matches('/'))),
                 };
                 self.status = None;
+                s.redraw();
+            }
+            "files.rename" => {
+                // Seeded with the name the directory has, which the field
+                // lands with all of it selected: a rename is a value typed
+                // over, not one typed after. Focus follows the field,
+                // because this verb reaches a previewed panel through the
+                // list above it and a caret needs the keyboard.
+                self.renaming = match self.renaming {
+                    Some(_) => None,
+                    None => Some(basename(&self.dir).to_string()),
+                };
+                self.status = None;
+                if self.renaming.is_some() {
+                    s.nav(Nav::Focus(self.slot));
+                }
                 s.redraw();
             }
             "files.copy" => self.hold(s, Op::Copy),
@@ -450,6 +504,7 @@ impl PanelKind for DirKind {
                 driving: false,
             },
             naming: None,
+            renaming: None,
             pathing: None,
             status,
             listed: FILES.writes(),
@@ -707,26 +762,120 @@ pub(super) fn delete_paths(
                 }
             }),
     );
-    // What was held is not there any more; a clipboard with nothing left
-    // in it is no clipboard.
-    let clip = FILES.clipboard();
-    if !clip.is_empty() {
-        let left: Vec<String> = clip
-            .paths
-            .into_iter()
-            .filter(|p| stat_in(&world, p).is_some())
-            .collect();
-        if left.is_empty() {
-            FILES.clear();
-        } else {
-            FILES.set(clip.verb, left);
-        }
-    }
+    prune_clipboard(&world);
     s.notify(format!("{what} to the trash{but} — cmd+z undoes"), false);
     // Every other listing reads its directory again; the panel that ran the
     // verb is holding itself, and relists when its own method returns.
     super::refresh(s, Some(by));
     Said::Went
+}
+
+/// `rename`, from a listing or from a card: one path under a new name, in
+/// the directory it is already in.
+///
+/// The one verb that never takes a set — a name is a name, and two things
+/// cannot both wear it — so it acts on the panel's own object and never on
+/// the marks. `by` is the panel showing that object and `id_of` is what its
+/// identity is for a path, so the layout half of the same node points the
+/// slot at the new name: a panel is on the thing, not on the spelling.
+/// Every *other* panel on the old name keeps it and says so, exactly as one
+/// does after a delete.
+///
+/// Nothing is copied and nothing is trashed: the disk verb is the move that
+/// undo reverses, and the reversal is the move back.
+pub(super) fn rename_path(
+    s: &mut Session,
+    by: SlotId,
+    path: &str,
+    name: &str,
+    id_of: fn(&str) -> PanelId,
+) -> Said {
+    let name = name.trim();
+    // Nothing typed: the field stands as it was, with nothing said.
+    if name.is_empty() {
+        return Said::Nothing;
+    }
+    let was = basename(path).to_string();
+    // The name it already has: the field has done its work, which was
+    // nothing at all. No disk is asked and no node is made.
+    if name == was {
+        return Said::Went;
+    }
+    // A root is where the browser starts, and a name that is a path would
+    // carry the thing off somewhere else under the word *rename*: both are
+    // refused before any disk is asked.
+    if is_root(path) {
+        return refuse(s, format!("“{path}” is a root"));
+    }
+    if let Err(e) = ops::check_name(name) {
+        return refuse(s, e);
+    }
+    if !s.writable() {
+        s.notify("read-only — acquire the lease to write", true);
+        return Said::Nothing;
+    }
+    let world = s.world().clone();
+    let Some(dir) = parent(path) else {
+        return refuse(s, format!("“{path}” is a root"));
+    };
+    let to = join(dir, name);
+    // The disk as it is right now: nothing watches one, so this is the
+    // first look since the field went up.
+    if stat_in(&world, path).is_none() {
+        return refuse(s, format!("“{was}” is no longer there"));
+    }
+    if stat_in(&world, &to).is_some() {
+        return refuse(s, format!("“{name}” is already here"));
+    }
+    if let Err(e) = ops::move_in(&world, path, &to) {
+        return refuse(s, e);
+    }
+    // Read back the moment after the write: what undo will compare against
+    // before it moves anything back.
+    let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(Done::of(&world, path, &to)));
+    if let Some(why) = s.give_back(intent.as_ref()) {
+        s.notify(why, true);
+        super::refresh(s, Some(by));
+        return Said::Nothing;
+    }
+    let id = id_of(&to);
+    s.act_done(
+        Action::new("rename", format!("rename “{was}” to “{name}”"))
+            .claiming(vec![intent])
+            .moving(move |wm| wm.replace(by, id)),
+    );
+    // A path that has just changed its name is not the path that was held.
+    prune_clipboard(&world);
+    s.notify(format!("renamed “{was}” to “{name}” — cmd+z undoes"), false);
+    super::refresh(s, Some(by));
+    Said::Went
+}
+
+/// A refusal said twice: once as the toast every verb gives, once as the
+/// line the panel keeps under its header until the next verb.
+fn refuse(s: &mut Session, why: String) -> Said {
+    s.notify(why.clone(), true);
+    Said::Refused(why)
+}
+
+/// What is held after a verb took a path away from where it was: whatever
+/// is still on the disk. A clipboard with nothing left in it is no
+/// clipboard.
+fn prune_clipboard(world: &World) {
+    let clip = FILES.clipboard();
+    if clip.is_empty() {
+        return;
+    }
+    let left: Vec<String> = clip
+        .paths
+        .into_iter()
+        .filter(|p| stat_in(world, p).is_some())
+        .collect();
+    if left.is_empty() {
+        FILES.clear();
+    } else {
+        FILES.set(clip.verb, left);
+    }
 }
 
 /// Takes the marks a verb consumed off the table it ran on, and answers the

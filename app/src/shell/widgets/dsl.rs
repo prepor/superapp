@@ -241,6 +241,21 @@ script_mod! {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
             draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
         }
+        /* The name, edited where it is drawn: a panel that offers to rename
+           what its card shows raises this in the name's place. Hidden until
+           one does, which is every card that offers no such verb. */
+        rename_row := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            rename_input := mod.widgets.SField {
+                empty_text: "name"
+                return_key_type: ReturnKeyType.Done
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
         kind_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #5a5a5a } }
         when_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
         // Selectable: a path is something one copies into a report.
