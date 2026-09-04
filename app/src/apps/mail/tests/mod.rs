@@ -245,6 +245,58 @@ fn a_reader_asks_for_the_rows_its_letter_needs() {
     assert!(narrow.1 >= long.1, "{narrow:?} vs {long:?}");
 }
 
+/// A reader unfolds from the first unread letter down: the read run above it
+/// folds to header lines, and a letter already read *under* an unread one
+/// opens with the rest of the catching up.
+#[test]
+fn a_reader_unfolds_from_the_first_unread_letter() {
+    /// One of the CI conversation's letters, by the run it reports.
+    fn ci(s: &Session, run: u32) -> MailId {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT id FROM message WHERE message_id = ?1",
+                [format!("ci-{run}@github.com")],
+                |r| r.get(0),
+            )
+            .expect("a seeded CI mail")
+    }
+
+    let (mut s, _clock) = session();
+    // The CI conversation: five archived runs, read, and the inbox
+    // notification that continues them, unread. Another client has flagged
+    // the third run unread again, so the catching up starts in the middle of
+    // the thread rather than at its end.
+    let runs: Vec<MailId> = [4116, 4119, 4121, 4124, 4126, 4128]
+        .iter()
+        .map(|r| ci(&s, *r))
+        .collect();
+    let third = runs[2];
+    s.store()
+        .write(move |c| {
+            c.execute("UPDATE message SET unread = 1 WHERE id = ?1", [third])
+                .map(|_| ())
+        })
+        .expect("the flag goes back on");
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    go(&mut s, Nav::Open {
+        from: list,
+        id: Message::id(runs[5]),
+        fresh: true,
+    });
+    let reader = s.showing(&Message::id(runs[5]))[0];
+    let inst = s.panel(reader).expect("the reader");
+    let mut b = inst.borrow_mut();
+    let m = b.as_any().downcast_mut::<Message>().expect("a reader");
+    let open: Vec<bool> = runs.iter().map(|id| m.is_open(*id)).collect();
+    assert_eq!(
+        open,
+        vec![false, false, true, true, true, true],
+        "folded above the first unread letter, open from it down"
+    );
+}
+
 /// Every bar mail wears: no letter twice, and none of the ones the workspace
 /// keeps for itself.
 #[test]
