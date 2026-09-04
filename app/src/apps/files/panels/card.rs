@@ -237,7 +237,6 @@ impl Card {
             .or_else(|| self.status().map(str::to_string))
     }
 
-
     // -- keeping up ------------------------------------------------------------
 
     /// Reads the file again: what it is, and what it shows.
@@ -331,7 +330,7 @@ impl Panel for Card {
         // As a listing's, and first for the same reason: a run is the
         // app's, it stops from wherever anybody is looking, and the one
         // control with no chord behind it may not be the one a narrow
-        // panel drops off the end of its row.
+        // panel drops off the end of its last row.
         if FILES.busy(run::whose_world(&self.world)) {
             v.push(Verb::run("files.cancel", "cancel", None));
         }
@@ -408,6 +407,12 @@ impl Card {
                 self.status = None;
             }
             dir::Said::Refused(line) => self.status = Some(line),
+            // The field holds what is being made until the run comes back
+            // to close it — as a listing's does.
+            dir::Said::Doing => {
+                self.renaming = Some(name.trim().to_string());
+                self.status = None;
+            }
             dir::Said::Nothing => {}
         }
         self.restat();
@@ -420,7 +425,7 @@ impl Card {
         match dir::copy_paths(s, vec![self.path.clone()]) {
             dir::Said::Went => self.status = None,
             dir::Said::Refused(line) => self.status = Some(line),
-            dir::Said::Nothing => {}
+            dir::Said::Doing | dir::Said::Nothing => {}
         }
     }
 

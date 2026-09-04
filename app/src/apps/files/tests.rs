@@ -1879,6 +1879,60 @@ fn a_run_that_did_nothing_still_says_what_it_took_with_it() {
 }
 
 #[test]
+fn a_rename_is_a_run_like_any_other_and_the_panel_follows_the_name() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+    run(&mut s, card, "files.rename");
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Rename {
+            path: "~/notes.md".to_string(),
+            to: "~/reading.md".to_string(),
+            becomes: Card::id("~/reading.md"),
+        },
+        card,
+        showing(&s, card),
+    );
+    with_card(&s, card, |c| c.set_renaming(Some("reading.md".to_string())));
+    let was = nodes(&s);
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+    assert!(there(&s, "~/reading.md"), "the move is the run's");
+    assert_eq!(nodes(&s), was, "and nothing is recorded until it lands");
+
+    // The field stands there, holding the name being made, for as long as
+    // the run is out.
+    assert_eq!(
+        with_card(&s, card, |c| c.renaming().map(str::to_string)),
+        Some("reading.md".to_string())
+    );
+
+    runner.pass(&w);
+    s.settle();
+    assert_eq!(nodes(&s), was + 1, "one node");
+    assert_eq!(
+        showing(&s, card),
+        Card::id("~/reading.md"),
+        "the card is on the file, not on the spelling"
+    );
+    assert!(
+        with_card(&s, card, |c| c.renaming().is_none()),
+        "and the field went with the instance the slot was pointed away from"
+    );
+
+    assert!(s.undo());
+    assert!(there(&s, "~/notes.md"), "undo put the old name back");
+    assert_eq!(showing(&s, card), Card::id("~/notes.md"), "one node, both halves");
+}
+
+#[test]
 fn a_new_dir_that_lands_keeps_a_name_typed_since() {
     let _alone = alone();
     let (mut s, slot) = home();

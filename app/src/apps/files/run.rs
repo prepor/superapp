@@ -7,8 +7,8 @@
 //! loop is the thread performing the copy, so nothing draws, nothing
 //! scrolls, and the one thing a person wants (to stop it) cannot be pressed.
 //!
-//! So the four verbs that write — `new dir`, `copy here`, `move here` and
-//! `delete` — hand a [`Run`] to this queue instead, and a
+//! So the five verbs that write — `new dir`, `rename`, `copy here`,
+//! `move here` and `delete` — hand a [`Run`] to this queue instead, and a
 //! [`Worker`](kernel::app::Worker) performs it a path at a time. Four things
 //! hold:
 //!
@@ -98,6 +98,18 @@ pub enum Task {
     },
     /// `new dir`: one directory, where nothing is yet.
     MakeDir { path: String },
+    /// `rename`: one path under a new name, in the directory it is already
+    /// in. A move on the disk, and never a copy.
+    Rename {
+        path: String,
+        to: String,
+        /// What the panel that ran it will be showing afterwards, worked
+        /// out where the verb was — a listing is on a directory and a card
+        /// on a file, and only the panel knows which it is. The layout half
+        /// of the node points the slot at this: a panel is on the thing,
+        /// not on the spelling.
+        becomes: PanelId,
+    },
 }
 
 impl Task {
@@ -109,6 +121,7 @@ impl Task {
             Task::Here { verb: Op::Move, .. } => "moving",
             Task::Delete { .. } => "deleting",
             Task::MakeDir { .. } => "creating",
+            Task::Rename { .. } => "renaming",
         }
     }
 }
@@ -407,6 +420,13 @@ impl Working {
                 }],
                 Vec::new(),
             ),
+            Task::Rename { path, to, .. } => (
+                vec![Step {
+                    from: path.clone(),
+                    to: to.clone(),
+                }],
+                Vec::new(),
+            ),
         };
         Working {
             run,
@@ -450,6 +470,12 @@ impl Working {
             Task::MakeDir { .. } => {
                 self.name = format!("{}/", basename(&step.to));
                 ops::make_dir_in(w, &step.to).map(|()| Done::of(w, &step.from, &step.to))
+            }
+            // A rename is the move, and undo's reversal is the move back:
+            // nothing is copied and nothing is trashed.
+            Task::Rename { .. } => {
+                self.name = basename(&step.to).to_string();
+                ops::move_in(w, &step.from, &step.to).map(|()| Done::of(w, &step.from, &step.to))
             }
         };
         match r {

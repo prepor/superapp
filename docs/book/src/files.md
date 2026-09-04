@@ -4,8 +4,8 @@ The files app browses this machine's disk: a directory is a list, a file is a
 card, five verbs write, and one copies a name. It stores nothing, because the
 disk is the state, so it has no schema, no seed and no queued jobs. What it
 adds is two panel kinds, one launcher root, a clipboard other apps may read,
-and one worker: the pass that performs the verbs that write, off the thread
-that draws — see [Runs](#runs).
+and one worker: the pass that performs the five verbs that write, off the
+thread that draws — see [Runs](#runs).
 
 It reaches the disk through the kernel's `Disk` [capability](./apps.md#capabilities),
 in the display spelling the panels use, and the kernel translates `~` to a real
@@ -217,9 +217,15 @@ over in between, the write is reversed and the panel says so. See
 
 A directory of forty thousand files is a copy that takes minutes. Performed on
 the frame of the click it would be minutes with nothing drawn, nothing
-scrolled, and no way to press the one button a person wants — so the four verbs
+scrolled, and no way to press the one button a person wants — so the five verbs
 that write queue a run instead, and a background pass performs it a path at a
-time.
+time. `new dir` and `rename` are one syscall each and hardly a freeze, but they
+go the same way: a path on a volume that has gone to sleep is exactly as slow
+as a tree, and there is no second way to write a disk in this app.
+
+A verb still asks everything it can answer before it queues — a name that is a
+path, a root, a destination that is taken, the write lease — because a person
+is waiting on that answer. What goes to the run is the write.
 
 Four things hold, and they are what the design is for:
 
@@ -238,8 +244,7 @@ Four things hold, and they are what the design is for:
   run is on, and stops it from wherever anybody is looking. It carries no
   letter: it is the only verb here that undoes nothing, and no chord should be a
   keystroke away from stopping a copy — which is also why it goes first, since a
-  bar is a row and never a wrap, and a verb past the right edge is not drawn at
-  all. The path in hand is finished — a half-copied file is nobody's — the runs
+  bar wraps only so far and a verb past the last row is not drawn at all. The path in hand is finished — a half-copied file is nobody's — the runs
   waiting behind it are dropped, and the toast says how far it got and what that
   cost — even a run that managed nothing of its own still answers for what it
   took with it. A stop that finds nothing started yet drops what was queued and

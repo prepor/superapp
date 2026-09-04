@@ -17,7 +17,7 @@ use super::super::model::{
     basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural,
     real_path, stat_in, DirRow, DirSource, Entry, Watch, HOME, PAGE,
 };
-use super::super::ops::{self, Done};
+use super::super::ops;
 use super::super::run::{self, Landed, Run, Task};
 use super::super::{Op, Seen, FILES};
 use super::Card;
@@ -351,11 +351,17 @@ impl Dir {
                 self.status = None;
             }
             Said::Refused(line) => self.status = Some(line),
+            // The field holds what is being made, for as long as the run
+            // is out: that is what it says on screen, and what the run
+            // compares against when it comes back to close it.
+            Said::Doing => {
+                self.renaming = Some(name.trim().to_string());
+                self.status = None;
+            }
             Said::Nothing => {}
         }
         self.relist();
     }
-
 }
 
 /// What a row of a listing names, given where the listing stands: a
@@ -424,10 +430,10 @@ impl Panel for Dir {
         // letter: it is rare, it is the only verb here that undoes nothing,
         // and no chord should be a keystroke away from stopping a copy.
         //
-        // First, and not last, for exactly that reason: a bar is a row and
-        // never a wrap, so a verb past the right edge is a verb that is not
-        // drawn — and the one control with no chord behind it may not be
-        // the one a narrow panel drops.
+        // First, and not last, for exactly that reason: a bar wraps only so
+        // far, and past that a verb that would run off the end is a verb
+        // that is not drawn — and the one control with no chord behind it
+        // may not be the one a narrow panel drops.
         if FILES.busy(run::whose_world(&self.world)) {
             v.push(Verb::run("files.cancel", "cancel", None));
         }
@@ -613,7 +619,7 @@ impl Dir {
         match copy_paths(s, self.objects()) {
             Said::Went => self.status = None,
             Said::Refused(line) => self.status = Some(line),
-            Said::Nothing => {}
+            Said::Doing | Said::Nothing => {}
         }
     }
 
@@ -715,6 +721,11 @@ pub(super) enum Said {
     Refused(String),
     /// Nothing was attempted, and the line stands as it was.
     Nothing,
+    /// It is on its way. The disk is a [run](super::super::run)'s to write,
+    /// so the field stays out holding the name that is being made until the
+    /// run comes back to close it — and what closes it is that it still
+    /// holds *that* name.
+    Doing,
 }
 
 /// `delete`, from a card or from a listing: to the trash, never `rm`.
@@ -781,6 +792,7 @@ pub fn land(s: &mut Session, l: Landed) {
         Task::Here { .. } => landed_here(s, l),
         Task::Delete { .. } => landed_delete(s, l),
         Task::MakeDir { .. } => landed_dir(s, l),
+        Task::Rename { .. } => landed_rename(s, l),
     }
 }
 
@@ -1099,6 +1111,9 @@ impl Ran {
 /// Every *other* panel on the old name keeps it and says so, exactly as one
 /// does after a delete.
 ///
+/// Everything it can answer is answered here, where a person is waiting on
+/// it; the move is a [run](super::super::run)'s, like every other write.
+///
 /// Nothing is copied and nothing is trashed: the disk verb is the move that
 /// undo reverses, and the reversal is the move back.
 pub(super) fn rename_path(
@@ -1155,28 +1170,64 @@ pub(super) fn rename_path(
     if stat_in(&world, &to).is_some() && !only_the_case(&world, path, &to) {
         return refuse(s, format!("“{name}” is already here"));
     }
-    if let Err(e) = ops::move_in(&world, path, &to) {
-        return refuse(s, e);
-    }
-    // Read back the moment after the write: what undo will compare against
-    // before it moves anything back.
-    let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(Done::of(&world, path, &to)));
+    // Everything above is asked here, where a person is waiting on the
+    // answer; the move itself is a run's, like every other write. One
+    // `rename(2)` is hardly a freeze — but a path on a volume that has gone
+    // to sleep is, and there is no second way to write a disk in this app.
+    let task = Task::Rename {
+        becomes: id_of(&to),
+        path: path.to_string(),
+        to,
+    };
+    FILES.start(s, task, by, id_of(path));
+    Said::Doing
+}
+
+/// `rename`, landed.
+fn landed_rename(s: &mut Session, l: Landed) {
+    let Task::Rename { path, to, becomes } = &l.run.task else {
+        return;
+    };
+    let (was, name) = (basename(path).to_string(), basename(to).to_string());
+    let ran = Ran::of(&l.run);
+    let Some(done) = l.done.first() else {
+        let msg = l
+            .refused
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("“{was}” was not renamed{}", halted(true, l.dropped)));
+        ran.say(s, Some(msg.clone()));
+        s.notify(msg, true);
+        return;
+    };
+    let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(done.clone()));
     if let Some(why) = s.give_back(intent.as_ref()) {
         s.notify(why, true);
-        super::refresh(s, Some(by));
-        return Said::Nothing;
+        super::refresh(s, None);
+        return;
     }
-    let id = id_of(&to);
+    // The layout half of the same node: a panel is on the thing and not on
+    // the spelling, so the slot that ran this points at the new name — as
+    // long as it is still the slot that ran it.
+    let (by, id) = (ran.by, becomes.clone());
+    let moves = ran.still(s).is_some();
     s.act_done(
         Action::new("rename", format!("rename “{was}” to “{name}”"))
             .claiming(vec![intent])
-            .moving(move |wm| wm.replace(by, id)),
+            .moving(move |wm| {
+                if moves {
+                    wm.replace(by, id);
+                }
+            }),
     );
     // A path that has just changed its name is not the path that was held.
-    prune_clipboard(&world);
+    prune_clipboard(&s.world().clone());
+    // The field needs no closing: the panel is on the thing and not on the
+    // spelling, so the slot is pointed at the new name and the instance
+    // that held the field — and whatever was typed into it while the run
+    // was out — goes with the old one.
     s.notify(format!("renamed “{was}” to “{name}” — cmd+z undoes"), false);
-    super::refresh(s, Some(by));
-    Said::Went
+    super::refresh(s, None);
 }
 
 /// Whether the name a rename asks for is no clash at all but the source
