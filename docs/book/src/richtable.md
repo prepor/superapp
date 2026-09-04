@@ -8,9 +8,9 @@ component.
 ## The kernel half: state the panel owns
 
 `ListState<D>` is the whole of what a panel that shows a list holds: the
-`Table<D>` over a `Datasource`, the cursor as a key and an index, the `Marks`,
-and the marked rows the filter currently hides. The panel owns it; nothing
-about a list reaches the shell.
+`Table<D>` over a `Datasource`, the cursor as a row, its key and an index, the
+`Marks`, and the marked rows the filter currently hides. The panel owns it;
+nothing about a list reaches the shell.
 
 A `Datasource` supplies rows, a count, stable row keys and their text spelling,
 filter tags, and completion values. `Table<D>` owns the typed filter and the
@@ -79,12 +79,15 @@ needs them. A commit invalidates stale pages, but only visible pages are loaded
 again. Sources that cannot count grow their loaded window by one page when the
 end becomes visible.
 
-The cursor is a key and an index, and resolves in that order: the remembered
-row if it still holds the key, else the key's rank in the current order (a row
-landed above it), else the row clamped into the table (the row went; carry on
-from where it stood). Without the index a row filed out from under the cursor
-would snap the walk back to the top. A mailbox cursor identifies the
-conversation, not whichever message that conversation currently opens.
+The cursor is the row it stands on — the row, its key and an index — and
+resolves in that order: the remembered index while it still holds the key, else
+the key's rank in the current order (a row landed above it), else the row's own
+rank: where the order would put a row like it now, which is past every row that
+outlived it and no further. Without the index a row filed out from under the
+cursor would snap the walk back to the top; without the row's rank a batch that
+took rows from above the cursor as well as under it would carry on from a stale
+index, one row further down for each row that left. A mailbox cursor identifies
+the conversation, not whichever message that conversation currently opens.
 
 ## Marks
 

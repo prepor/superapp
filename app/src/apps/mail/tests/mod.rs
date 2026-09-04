@@ -454,8 +454,8 @@ fn the_batch_archive_is_one_node_and_undo_restores_the_marks() {
             .unwrap()
             .borrow()
             .title(),
-        "Sat hike — early start?",
-        "the cursor stood still, and the row that took its place is previewed"
+        "superapp panel model",
+        "the row under the two that left, not one further down for each of them"
     );
 
     // The walk first, then the batch it followed.
