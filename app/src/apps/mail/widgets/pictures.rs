@@ -44,6 +44,11 @@ pub struct Pictures {
     /// The reader thread, started with the first letter that has a picture
     /// in it.
     reader: Option<mpsc::Sender<Job>>,
+    /// Where the pictures that stood in a link were drawn, this draw. An
+    /// item is minted from a template and can reach neither the panel around
+    /// it nor the hit table, so it leaves its rectangle here and the reader
+    /// takes it (see [`link_rects`]).
+    links: Vec<Rect>,
 }
 
 /// One piece of work for the reader thread — the two ways a picture's bytes
@@ -338,6 +343,16 @@ fn want_data_bytes(cx: &mut Cx, k: &str, src: &str) {
     }
     let ready = data_bytes(k.to_string(), src);
     cx.global::<Pictures>().take(&ready);
+}
+
+/// Where the pictures that stood in a link were drawn, taken: the reader
+/// asks once its rows have landed, and the next draw fills the list again.
+///
+/// A picture that is a link is a control, and the panel it sits in owns
+/// where the controls of a letter are — that is what the pointer is painted
+/// from.
+pub fn link_rects(cx: &mut Cx) -> Vec<Rect> {
+    std::mem::take(&mut cx.global::<Pictures>().links)
 }
 
 /// Files what finished off the frame: bytes the reader thread found, and
@@ -650,7 +665,16 @@ impl Widget for HtmlImage {
                     .or(self.nat)
                     .unwrap_or((1.0, 1.0));
                 let walk = self.box_walk(cx, nat);
-                self.image.draw_walk_image(cx, walk)
+                let step = self.image.draw_walk_image(cx, walk);
+                // A picture that is a link is a control, so the panel around
+                // the letter is told where it landed: it registers the
+                // rectangles a letter's controls wear a hand on, and an item
+                // can reach nothing itself.
+                if !self.href.is_empty() {
+                    let r = self.image.area().rect(cx);
+                    cx.global::<Pictures>().links.push(r);
+                }
+                step
             }
             // Bytes in hand, decoding: hold the box the picture will fill
             // rather than lay out the alt text and reflow a frame later.

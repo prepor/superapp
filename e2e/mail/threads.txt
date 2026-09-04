@@ -54,6 +54,13 @@ shot h5-quote-unfolded
 click "mail html"
 wait 500
 
+# A link in that tail is a link of the letter: every run one drew is a
+# rectangle of its own, so the pointer over it is a hand and not the
+# reading's I-beam. Folded, there is no such rectangle — the letter Max
+# wrote has no link in it — so this is the quote's.
+drag "link" 30 0
+wait 400
+
 # The whole conversation files as one: both of Max's inbox letters go, the row
 # goes with them, and undo brings all of it back.
 click "archive"

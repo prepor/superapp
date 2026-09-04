@@ -24,6 +24,13 @@ shot h2-html-body
 click "mail html"
 wait 400
 
+# Every run a link drew is a rectangle of its own over the reading's, which
+# is how the pointer over a link is a hand and not the letter's I-beam. A
+# drag resolves the label without following the link: a press that moves is
+# a selection, not a tap.
+drag "link" 30 0
+wait 400
+
 # A plain-text sender takes the plain path, in the same panel slot. This is
 # the step that matters: one reading must replace the other, not stack on top
 # of it. Hiding a widget that carries no `visible` is a silent no-op, and the
