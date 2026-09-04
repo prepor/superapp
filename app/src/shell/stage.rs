@@ -598,6 +598,25 @@ impl Stage {
         self.redraw_scoped(cx);
     }
 
+    /// What happened outside this thread since the last look: a worker's
+    /// commit, and the disk moving under a panel.
+    ///
+    /// Both are pulled rather than pushed. A commit lands on another
+    /// connection, and a change to a directory is somebody else's write —
+    /// so the store is polled and the watcher asked, and a redraw is what
+    /// lets every panel notice. Which panel it was for is the panels' own
+    /// business: they compare what they read against what the disk is at
+    /// on the very draw this asks for.
+    pub(super) fn outside(&mut self, sh: &mut Shell) {
+        if sh.session.store().poll_external() {
+            sh.session.announce_problems();
+            sh.session.redraw();
+        }
+        if sh.session.world().disk_moved() {
+            sh.session.redraw();
+        }
+    }
+
     /// `SUPERAPP_FRAME_LOG`: what this event was and how long it took.
     /// Counted always, printed only past a millisecond — the interesting
     /// ones are the ones that cost something.
@@ -885,21 +904,16 @@ impl Stage {
                     self.e2e_tick(cx, sh, E2E_TICK_MS);
                 }
                 if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
-                    if sh.session.store().poll_external() {
-                        sh.session.announce_problems();
-                        sh.session.redraw();
-                    }
+                    self.outside(sh);
                     self.tick_repl(cx, sh);
                 }
             }
 
-            // A worker committed. The platform already consumed the signal
-            // flag before delivering this, so never re-check it — just poll.
+            // A worker committed, a search answered, or the disk moved.
+            // The platform already consumed the signal flag before
+            // delivering this, so never re-check it — just poll.
             Event::Signal => {
-                if sh.session.store().poll_external() {
-                    sh.session.announce_problems();
-                    sh.session.redraw();
-                }
+                self.outside(sh);
                 self.tick_repl(cx, sh);
             }
 

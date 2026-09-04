@@ -15,10 +15,10 @@ use kernel::session::{Action, Session};
 use super::super::completion::PathCompletion;
 use super::super::model::{
     basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural,
-    real_path, stat_in, DirRow, DirSource, Entry, HOME, PAGE,
+    real_path, stat_in, DirRow, DirSource, Entry, Watch, HOME, PAGE,
 };
 use super::super::ops::{self, Done, Plan};
-use super::super::{Op, FILES};
+use super::super::{Op, Seen, FILES};
 use super::Card;
 
 /// Where the panel stands in the join chain, as of the last look.
@@ -37,8 +37,9 @@ pub struct Chain {
 /// One directory, listed.
 ///
 /// The listing is read through the disk when the panel opens and again
-/// whenever a verb — anyone's — writes; the filter, the cursor and the
-/// marks are the rich table's, owned here.
+/// whenever a verb — anyone's — writes, or the watcher says another
+/// program has; the filter, the cursor and the marks are the rich table's,
+/// owned here.
 pub struct Dir {
     id: PanelId,
     dir: String,
@@ -54,8 +55,11 @@ pub struct Dir {
     pathing: Option<String>,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
-    /// The disk's write count when this listing was read.
-    listed: u64,
+    /// What the listing was read at, on both counts.
+    seen: Seen,
+    /// The directory watched for as long as this panel shows it. Held, not
+    /// read: dropping it is what lets the watcher go.
+    _watch: Watch,
 }
 
 impl Dir {
@@ -110,18 +114,20 @@ impl Dir {
     // -- what the widget tells it ---------------------------------------------
 
     /// Called on every draw and every event: where the panel stands in the
-    /// join chain, and whether the disk has been written since this
-    /// listing was read.
+    /// join chain, and whether the disk has moved since this listing was
+    /// read — by a verb of the app's, or under it.
     ///
     /// Neither answer can be had from inside [`Panel::verbs`], which has no
-    /// session, and nothing watches a disk — so both are pushed in from
-    /// where a session is at hand.
+    /// session — so both are pushed in from where a session is at hand.
+    /// The watcher is asked here rather than pushed from outside for the
+    /// same reason it is asked at all: a draw is the one signal, and this
+    /// runs on every one of them.
     pub fn observe(&mut self, s: &Session) {
         self.chain = Chain {
             under: s.join_parent_of(self.slot).is_some(),
             driving: s.joined_child(self.slot).is_some(),
         };
-        if self.listed != FILES.writes() {
+        if self.seen != FILES.seen(&self.world, &self.dir) {
             self.relist();
         }
     }
@@ -150,7 +156,10 @@ impl Dir {
     /// what a verb leaves marked is exactly what it could not do, until
     /// the next draw reads the listing under it.
     pub fn relist(&mut self) {
-        self.listed = FILES.writes();
+        // Stamped before the directory is read, not after: a change that
+        // lands while it is being read then leaves the panel one reading
+        // behind rather than believing it is up to date.
+        self.seen = FILES.seen(&self.world, &self.dir);
         let entries = match list_in(&self.world, &self.dir) {
             Ok(v) => v,
             Err(e) => {
@@ -498,6 +507,11 @@ impl PanelKind for DirKind {
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let dir = Dir::of(id).unwrap_or(HOME).to_string();
         let world = cx.session().world().clone();
+        // Watched before it is read, and stamped in between: a change that
+        // lands while the directory is being listed is one this panel will
+        // look again for.
+        let _watch = Watch::on(&world, &dir);
+        let seen = FILES.seen(&world, &dir);
         let (entries, status) = match list_in(&world, &dir) {
             Ok(v) => (v, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -518,7 +532,8 @@ impl PanelKind for DirKind {
             renaming: None,
             pathing: None,
             status,
-            listed: FILES.writes(),
+            seen,
+            _watch,
         })
     }
 }

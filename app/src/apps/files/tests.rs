@@ -4,7 +4,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use kernel::app::App;
-use kernel::caps::{Clipboard, Disk, FakeClipboard};
+use kernel::caps::{Clipboard, Disk, FakeClipboard, Watcher};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, VerbAct};
@@ -14,7 +14,7 @@ use kernel::store::Store;
 
 use super::model::{
     crumbs, fmt_size, image_lines, image_size, normalize, preview_of, real_path, stat_in,
-    text_lines, Entry, FileKind, Preview, HOME,
+    text_lines, watched_at, Entry, FileKind, Preview, HOME,
 };
 // The kernel's, beside `FileKind`: what a name claims and how much of it a
 // card reads are questions mail asks of a part of a letter too, so the app
@@ -238,6 +238,39 @@ fn vanish(s: &Session, path: &str) {
         .with_cap::<dyn Disk, _>(|d| d.trash(&real_path(path)))
         .expect("a disk")
         .expect("the trash took it");
+}
+
+/// What a watching platform would say: a round of change landed on this
+/// directory. No test has FSEvents behind it, so this is the machine.
+fn watcher_saw(s: &Session, dir: &str) {
+    s.world()
+        .with_cap::<dyn Watcher, _>(|w| w.changed(&real_path(dir)))
+        .expect("a watcher");
+}
+
+/// How many rounds the watcher has counted for a directory — nothing at
+/// all for one no panel is looking at.
+fn rounds(s: &Session, dir: &str) -> u64 {
+    watched_at(s.world(), dir)
+}
+
+/// Hands a panel what a draw hands it: the session, and with it whatever
+/// has happened to the disk since it last read.
+fn drawn(s: &Session, slot: SlotId) {
+    let i = inst(s, slot);
+    let mut p = i.borrow_mut();
+    if let Some(d) = p.as_any().downcast_mut::<Dir>() {
+        d.observe(s);
+    } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
+        c.observe(s);
+    }
+}
+
+/// Closes a slot, as the shell's own close does.
+fn close(s: &mut Session, slot: SlotId) {
+    s.act(Action::new("close", "close").moving(move |wm| wm.close(slot)))
+        .expect("the panel closed");
+    s.settle();
 }
 
 /// How many nodes the history has.
@@ -1089,6 +1122,131 @@ fn a_here_that_can_do_nothing_says_so_and_holds_on() {
         Some("“notes.md” is already here".to_string())
     );
     assert!(!FILES.clipboard().is_empty(), "and the clipboard stands");
+}
+
+// -- the disk under the panels -------------------------------------------------
+
+/// The panels' own writes are one half of staying up to date; this is the
+/// other. A listing goes stale silently — the row is still drawn — until
+/// the watcher says that directory changed, and the next draw reads it
+/// again, keeping the filter, the cursor and the marks.
+#[test]
+fn a_listing_reads_again_when_the_watcher_says_its_directory_changed() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let slot = open(&mut s, "~/Downloads").expect("the listing");
+    with_dir(&s, slot, |d| {
+        d.list_mut().marks_mut().add("report-q3.pdf".to_string());
+    });
+    assert!(labels(&s, slot).contains(&"README.txt".to_string()));
+
+    // Another program takes it. Nothing has said so yet, and a draw of
+    // its own does not go looking.
+    vanish(&s, "~/Downloads/README.txt");
+    drawn(&s, slot);
+    assert!(
+        labels(&s, slot).contains(&"README.txt".to_string()),
+        "a listing is what it read, until something says otherwise"
+    );
+
+    watcher_saw(&s, "~/Downloads");
+    drawn(&s, slot);
+    assert!(
+        !labels(&s, slot).contains(&"README.txt".to_string()),
+        "and the next draw reads the directory again"
+    );
+    assert_eq!(
+        marks(&s, slot),
+        ["report-q3.pdf".to_string()],
+        "a mark on a row that is still there survives the reading"
+    );
+}
+
+/// One directory each: a round on somebody else's is not this listing's
+/// business, and does not cost it a reading.
+#[test]
+fn a_listing_reads_again_for_its_own_directory_and_nobody_else_s() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let downloads = open(&mut s, "~/Downloads").expect("the listing");
+    let desktop = open(&mut s, "~/Desktop").expect("the other listing");
+
+    vanish(&s, "~/Downloads/README.txt");
+    watcher_saw(&s, "~/Desktop");
+    drawn(&s, downloads);
+    drawn(&s, desktop);
+    assert!(
+        labels(&s, downloads).contains(&"README.txt".to_string()),
+        "what happened on the desktop says nothing about downloads"
+    );
+
+    watcher_saw(&s, "~/Downloads");
+    drawn(&s, downloads);
+    assert!(!labels(&s, downloads).contains(&"README.txt".to_string()));
+}
+
+/// A card is told through the directory its file is in — that is what a
+/// watcher can be asked about — so another program's delete leaves it
+/// saying the file has gone.
+#[test]
+fn a_card_reads_again_when_the_watcher_says_its_directory_changed() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+    assert!(!with_card(&s, card, |c| c.gone()));
+
+    vanish(&s, "~/notes.md");
+    drawn(&s, card);
+    assert!(
+        !with_card(&s, card, |c| c.gone()),
+        "the card shows the reading it took"
+    );
+
+    watcher_saw(&s, HOME);
+    drawn(&s, card);
+    assert!(
+        with_card(&s, card, |c| c.gone()),
+        "and reads again once the directory it is in has changed"
+    );
+}
+
+/// A panel watches the one directory it shows, for exactly as long as it
+/// shows it: two panels on a directory are two holds, and what nobody is
+/// looking at is counted for nobody.
+#[test]
+fn a_panel_watches_its_directory_while_it_is_open_and_then_lets_go() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let one = open(&mut s, "~/Downloads").expect("the listing");
+    let two = open(&mut s, "~/Downloads").expect("another on the same directory");
+
+    watcher_saw(&s, "~/Downloads");
+    assert_eq!(rounds(&s, "~/Downloads"), 1, "a directory being looked at");
+    assert_eq!(
+        rounds(&s, "~/Desktop"),
+        0,
+        "and one nobody has open is not watched at all"
+    );
+
+    close(&mut s, one);
+    watcher_saw(&s, "~/Downloads");
+    assert_eq!(
+        rounds(&s, "~/Downloads"),
+        2,
+        "the other panel is still looking"
+    );
+
+    close(&mut s, two);
+    watcher_saw(&s, "~/Downloads");
+    assert_eq!(
+        rounds(&s, "~/Downloads"),
+        0,
+        "and with the last of them the watch goes, count and all"
+    );
 }
 
 // -- the spellings a path travels in -------------------------------------------

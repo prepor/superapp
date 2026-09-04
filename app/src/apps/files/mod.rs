@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use kernel::app::{App, Root};
+use kernel::effect::World;
 use kernel::panel::PanelKind;
 
 pub mod completion;
@@ -24,7 +25,7 @@ pub mod widgets;
 #[cfg(test)]
 mod tests;
 
-use model::{basename, plural, HOME};
+use model::{basename, plural, watched_at, HOME};
 pub use panels::{Card, Dir};
 pub use ui::UI;
 
@@ -34,11 +35,13 @@ pub struct Files {
     /// `Sync`; it is only ever taken on the UI thread, and never across a
     /// call that could take it again.
     clip: Mutex<Clipboard>,
-    /// How many times the disk has been written through this app. Nothing
-    /// watches a disk, so a panel compares this against what it last
-    /// listed at and lists again when they differ — which is how an undo,
-    /// whose reversal is the history's and not a verb's, still reaches
-    /// every open listing.
+    /// How many times the disk has been written through this app. A panel
+    /// compares this against what it last listed at and lists again when
+    /// they differ — which is how an undo, whose reversal is the history's
+    /// and not a verb's, still reaches every open listing.
+    ///
+    /// It answers for this app's own writes only. What another program
+    /// does is the watcher's to count, and [`Seen`] is the pair.
     writes: AtomicU64,
 }
 
@@ -198,9 +201,35 @@ impl Files {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// What a panel compares its listing against.
+    /// What a panel compares its listing against, for this app's own
+    /// writes. [`Files::seen`] is the whole of it.
     #[must_use]
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }
+
+    /// What a reading of `dir` is taken at.
+    ///
+    /// A panel keeps the answer beside what it read and reads again when
+    /// it differs, which is one comparison for the three ways a listing
+    /// goes stale: a verb of this app's, an undo the history ran, and
+    /// another program.
+    #[must_use]
+    pub fn seen(&self, world: &World, dir: &str) -> Seen {
+        Seen {
+            writes: self.writes(),
+            outside: watched_at(world, dir),
+        }
+    }
+}
+
+/// When a panel last read a directory, counted from both sides: this app's
+/// own writes, and the rounds of somebody else's the watcher had seen for
+/// that directory.
+///
+/// Neither number means anything by itself — only that it moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen {
+    writes: u64,
+    outside: u64,
 }

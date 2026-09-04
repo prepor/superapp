@@ -11,11 +11,11 @@ use kernel::session::Session;
 use kernel::time::fmt_date;
 
 use super::super::model::{
-    basename, image_lines, image_size, preview_of, read_in, stat_in, text_lines, Entry, FileKind,
-    Preview,
+    basename, image_lines, image_size, parent, preview_of, read_in, stat_in, text_lines, Entry,
+    FileKind, Preview, Watch,
 };
 use super::super::ops;
-use super::super::{Op, FILES};
+use super::super::{Op, Seen, FILES};
 use super::dir;
 
 /// What the card spends on everything that is not the preview: the name,
@@ -35,11 +35,15 @@ const ROWS: (u32, u32) = (3, 6);
 /// One file, shown.
 ///
 /// Everything the card draws is read when the panel opens and again
-/// whenever a verb writes the disk: the entry, and — for a text file or a
-/// picture small enough to be worth it — the preview under the rule.
+/// whenever a verb writes the disk or the watcher says another program
+/// has: the entry, and — for a text file or a picture small enough to be
+/// worth it — the preview under the rule.
 pub struct Card {
     id: PanelId,
     path: String,
+    /// The directory the file is in, which is what a watcher can be asked
+    /// about: a file is told about through the directory that holds it.
+    dir: String,
     slot: SlotId,
     world: Rc<World>,
     /// What the disk had when it was last asked; `None` once the path
@@ -56,8 +60,11 @@ pub struct Card {
     renaming: Option<String>,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
-    /// The disk's write count when this was read.
-    listed: u64,
+    /// What this reading was taken at, on both counts.
+    seen: Seen,
+    /// The file's directory, watched for as long as this card shows it.
+    /// Held, not read.
+    _watch: Watch,
 }
 
 impl Card {
@@ -162,12 +169,12 @@ impl Card {
         self.pixels
     }
 
-    /// What the card last read, as the disk's write count. The widget
-    /// decodes a picture once per reading rather than once a frame, so it
-    /// needs to know when the reading changed.
+    /// What the card last read, as the two counts it was read at. The
+    /// widget decodes a picture once per reading rather than once a frame,
+    /// so it needs to know when the reading changed.
     #[must_use]
-    pub fn read_at(&self) -> u64 {
-        self.listed
+    pub fn read_at(&self) -> Seen {
+        self.seen
     }
 
     /// Whether the disk still has it.
@@ -207,7 +214,9 @@ impl Card {
     /// same bytes the card will draw, so the header is read once and not
     /// again on every wish.
     pub fn restat(&mut self) {
-        self.listed = FILES.writes();
+        // Stamped before the file is read, as a listing is: what lands in
+        // between leaves the card one reading behind, never wrongly fresh.
+        self.seen = FILES.seen(&self.world, &self.dir);
         self.entry = stat_in(&self.world, &self.path);
         let (world, path) = (self.world.clone(), self.path.clone());
         self.preview = match &self.entry {
@@ -219,11 +228,11 @@ impl Card {
         self.pixels = self.image().and_then(image_size);
     }
 
-    /// Called on every draw and every event, as a list's is: nothing
-    /// watches a disk, so the card asks again once anything has written
-    /// one.
+    /// Called on every draw and every event, as a list's is: the card asks
+    /// again once anything has written the disk — a verb of the app's, or
+    /// another program in the directory this file is in.
     pub fn observe(&mut self, _s: &Session) {
-        if self.listed != FILES.writes() {
+        if self.seen != FILES.seen(&self.world, &self.dir) {
             self.restat();
         }
     }
@@ -386,17 +395,24 @@ impl PanelKind for CardKind {
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let path = Card::of(id).unwrap_or_default().to_string();
+        let world = cx.session().world().clone();
+        // A path with no parent is a root, which is a directory itself:
+        // watch it rather than nothing.
+        let dir = parent(&path).unwrap_or(&path).to_string();
+        let _watch = Watch::on(&world, &dir);
         let mut card = Card {
             id: id.clone(),
             path,
+            dir,
             slot: 0,
-            world: cx.session().world().clone(),
+            world,
             entry: None,
             preview: Preview::None,
             pixels: None,
             renaming: None,
             status: None,
-            listed: 0,
+            seen: Seen::default(),
+            _watch,
         };
         card.restat();
         Box::new(card)

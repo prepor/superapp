@@ -48,8 +48,8 @@
 - **Effect**: work outside the database, such as using the network, keychain,
   clipboard, clock, or disk.
 - **Capability**: the trait an effect reaches the outside through: `Clock`,
-  `Secrets`, `Clipboard`, `Screen`, `Disk`, and whatever an app defines for
-  itself. A world is given one implementation of each.
+  `Secrets`, `Clipboard`, `Screen`, `Disk`, `Watcher`, and whatever an app
+  defines for itself. A world is given one implementation of each.
 - **Job**: an effect saved in the database so it can be retried. The Effects
   panel shows jobs together with recent effects that were not saved.
 - **Worker**: one background pass with its own thread and its own world: a

@@ -3,7 +3,7 @@
 //! The card does no reading. What a file *is* — its size, its date, whether
 //! there is a preview worth attempting and what those bytes are — the
 //! [`Card`] instance worked out through the disk when it opened, and again
-//! whenever a verb wrote one; this hands the answer to
+//! whenever anybody wrote one; this hands the answer to
 //! [`card::fill`](crate::shell::widgets::card::fill).
 //!
 //! Filled when the reading changes and not once a frame: a picture is
@@ -24,6 +24,7 @@ use crate::shell::widgets::card::{self, CardData, Preview};
 
 use super::super::model::{fmt_size, FileKind, Preview as Read};
 use super::super::panels::Card;
+use super::super::Seen;
 use super::field::Raised;
 
 /// The children the card's template adds to the shell's own.
@@ -49,9 +50,9 @@ const PICTURE: &[LiveId] = ids!(img_box.img_prev);
 #[derive(Clone, PartialEq, Eq)]
 struct Shown {
     id: PanelId,
-    /// The disk's write count when the instance last read: a verb that
-    /// wrote is a new reading of the same path.
-    at: u64,
+    /// What the instance last read at: a write — anybody's — is a new
+    /// reading of the same path.
+    at: Seen,
 }
 
 /// What the card draws around the file: the line a refused verb leaves, and

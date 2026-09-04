@@ -51,12 +51,13 @@ modes:
 - `Deny` gives nothing but the clock, which is what a panels-library mount
   gets, so an effect it files fails out loud instead of quietly working.
 
-The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, and `Disk`,
-because the harness, attachments, and a file browser all use them. An app
-defines its own and supplies them in `App::outside`; mail's are `Imap`, `Smtp`,
-and `OAuth`. The kernel installs its own first, so an app or the shell may
-replace one: `app/src/shell/boot.rs` puts the real screen, the real clipboard,
-and this machine's disk in place of the fakes on a windowed run.
+The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, `Disk`, and the
+`Watcher` over it, because the harness, attachments, and a file browser all use
+them. An app defines its own and supplies them in `App::outside`; mail's are
+`Imap`, `Smtp`, and `OAuth`. The kernel installs its own first, so an app or the
+shell may replace one: `app/src/shell/boot.rs` puts the real screen, the real
+clipboard, this machine's disk, and a watcher over it in place of the fakes on a
+windowed run.
 
 ### Queued jobs
 

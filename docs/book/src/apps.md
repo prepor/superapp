@@ -169,10 +169,10 @@ the one signal.
 ## Capabilities
 
 A capability is a trait an effect reaches the outside through. The kernel owns
-the five every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
-`Clipboard`, `Screen`, and `Disk`, because the harness, attachments, and a file
-browser all use them. An app defines its own and supplies them in
-`App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`.
+the six every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
+`Clipboard`, `Screen`, `Disk`, and the `Watcher` over it, because the harness,
+attachments, and a file browser all use them. An app defines its own and
+supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`.
 
 `Mode` says which outside a world gets: `Real` the network and the OS, `Fake`
 the in-memory versions, `Deny` nothing but the clock, which is the default for

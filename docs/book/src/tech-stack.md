@@ -34,6 +34,10 @@ The pieces:
 - **Makepad's macOS APIs** provide the menu bar. Small gaps such as screen
   geometry, the trash, and window screenshots use `makepad-apple-sys` and
   `makepad-objc-sys`, in `app/src/platform/mac.rs`.
+- **The system's own file watch** tells the file panels about writes that were
+  not ours: FSEvents through CoreServices on macOS, inotify on android, both
+  declared where they are used in `app/src/platform/watch/`. No crate — the
+  whole of each is a handful of foreign functions.
 - **mise** selects the stable Rust toolchain. The application has no other
   runtime dependency.
 

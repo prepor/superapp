@@ -971,6 +971,17 @@ impl World {
         }
     }
 
+    /// Whether the disk has moved under this world since the last ask —
+    /// somebody else's write, seen by the
+    /// [`Watcher`](crate::caps::Watcher) and not by a verb of ours. The
+    /// shell asks on a signal and on its poll and redraws when it is true;
+    /// which panel it was for is the panels' own business. A world with
+    /// nothing watching answers *no*, which is what a scripted run wants.
+    pub fn disk_moved(&self) -> bool {
+        self.with_cap::<dyn crate::caps::Watcher, _>(crate::caps::Watcher::moved)
+            .unwrap_or(false)
+    }
+
     /// The whole bag, for arranging a world (planting a secret) or reading
     /// what a fake captured.
     pub fn caps<T>(&self, f: impl FnOnce(&mut Capabilities) -> T) -> T {
