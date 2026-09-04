@@ -81,9 +81,9 @@ pub struct CardPanel {
 
 impl Widget for CardPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        // Nothing watches a disk, so the card asks again once anybody has
-        // written one — on an event as well as on a draw, since a verb's
-        // write lands between the two.
+        // The card asks again once anybody has written the disk — on an
+        // event as well as on a draw, since a verb's write lands between
+        // the two.
         observe(scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             self.view.handle_event(cx, event, scope);

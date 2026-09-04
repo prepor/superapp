@@ -796,8 +796,8 @@ fn rename_refuses_a_path_a_taken_name_and_a_file_that_has_gone() {
         "and the field closes behind it"
     );
 
-    // The file may have gone while the field stood: nothing watches a disk,
-    // so the write is the first look since the verb opened it.
+    // The file may have gone while the field stood, watcher or no
+    // watcher: what the write finds is what decides.
     run(&mut s, card, "files.rename");
     vanish(&s, "~/notes.md");
     rename_card(&mut s, card, "reading.md");

@@ -284,8 +284,8 @@ pub struct DirRow {
 
 /// One directory as a rich-table datasource: the listing in memory — read
 /// through the disk when the panel opened on the directory — and the
-/// filter evaluated over it. Nothing watches the disk, so a panel re-lists
-/// when a verb says the disk changed.
+/// filter evaluated over it. A panel re-lists when a verb says the disk
+/// changed, or the watcher says another program did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirSource {
     pub dir: String,

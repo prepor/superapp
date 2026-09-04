@@ -6,10 +6,10 @@
 //! crumb line, the three fields and the status line around it; the card is
 //! the shell's own, filled from what the instance read off the disk.
 //!
-//! Nothing watches a disk, so both call
-//! [`observe`](super::panels::Dir::observe) at the top of every draw and
-//! every event: that is where a panel learns where it stands in the join
-//! chain and that somebody has written.
+//! Both call [`observe`](super::panels::Dir::observe) at the top of every
+//! draw and every event: that is where a panel learns where it stands in
+//! the join chain, and that somebody has written — a verb of the app's, or
+//! another program the watcher saw.
 //!
 //! Both raise fields — the listing three, the card one — and what a raised
 //! field costs a widget is in [`field`].

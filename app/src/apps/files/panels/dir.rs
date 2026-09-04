@@ -602,8 +602,9 @@ impl Dir {
     /// this panel shows.
     ///
     /// The plan is made first, against the disk as it is right now — the
-    /// clipboard may have waited while another program moved things, and
-    /// nothing watches the disk. What it refuses, it refuses path by path,
+    /// clipboard may have waited while another program moved things, and a
+    /// watch says that a directory changed, never what is still in it.
+    /// What it refuses, it refuses path by path,
     /// exactly as it does for one; what it can do becomes **one** undoable
     /// action, so a single cmd+z takes the whole batch back.
     fn here(&mut self, s: &mut Session) {
