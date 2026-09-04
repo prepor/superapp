@@ -337,7 +337,18 @@ impl Stage {
                     }
                     // The last step is what lets a list act on the thing
                     // under its cursor without moving focus.
+                    //
+                    // A caret in that panel's own widget keeps its letters
+                    // there as surely as one on the focused panel does —
+                    // and a click puts a caret in a previewed panel without
+                    // moving focus at all, so this is the only place that
+                    // hears of it. The chord goes to the widget, its bar
+                    // never sees it, and `bar::bold` drew exactly that.
                     if let Some(child) = sh.session.joined_child(f) {
+                        if self.field_letters(Some(child)).has(c) {
+                            self.forward_to_slot(cx, sh, child, &Event::KeyDown(*k));
+                            return;
+                        }
                         if self.bar_chord(sh, child, c) {
                             return;
                         }

@@ -69,7 +69,10 @@ A chord is offered in one order and stops at the first taker:
 2. the **focused widget**, which may take one (a live text field takes
    `cmd+a`) and says so in the same event;
 3. the **focused panel's bar**;
-4. the bar of the panel it **previews**, if it drives one.
+4. the **previewed panel's own widget**, where a caret of its own is
+   blinking — a click on a widget's element moves no focus, so a caret can
+   sit in a preview while the list beside it is focused;
+5. the bar of the panel it **previews**, if it drives one.
 
 The last step is what lets a list act on the thing under its cursor without
 moving focus. Nothing in that order names a panel kind.
@@ -78,9 +81,9 @@ A bold letter is a promise that the chord fires that verb *now*, so the bars
 draw exactly what this order would reach: the focused panel's bar shows its
 letters except those the focused widget is keeping while one of its fields has
 the keyboard; the bar of the panel it previews shows only the letters the
-focused bar leaves free; every other bar shows no letter at all. There is no
-lending rule and nothing to keep in step, because the drawing and the routing
-read the same order.
+focused bar leaves free, less whatever a caret in its *own* widget keeps; every
+other bar shows no letter at all. There is no lending rule and nothing to keep
+in step, because the drawing and the routing read the same order.
 
 Two more rules hold, and a debug build asserts both on every draw:
 
