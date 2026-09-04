@@ -43,8 +43,8 @@ impl Stage {
         if !matches!(hit.act, Act::Widget | Act::Row(_)) {
             cx.set_key_focus(self.area);
         }
-        // cmd (alt as a quiet alias): always a fresh, un-joined panel.
-        let fresh = e.modifiers.logo || e.modifiers.alt;
+        // cmd: always a fresh, un-joined panel.
+        let fresh = e.modifiers.logo;
         self.resolve(cx, sh, hit.act, fresh);
     }
 

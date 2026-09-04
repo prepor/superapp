@@ -11,7 +11,7 @@
 //! mouse "filter"      — the same through the shell's real mouse path (a
 //!                       MouseDown/MouseUp pair into the stage), for what a
 //!                       resolved click cannot show: focus stealing, hits
-//! altclick "subject"  — the same, with alt held (fresh un-joined panel)
+//! cmdclick "subject"  — the same, with cmd held (fresh un-joined panel)
 //! drag "body" 200 0   — mouse press-drag-release from the element's left
 //!                       edge: selects text under the pointer
 //! selectall "mail html" — select the whole run under the label, no keys,
@@ -173,8 +173,8 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             label: quoted()?,
             fresh: false,
         },
-        // cmd+click: always a fresh, un-joined panel (altclick = old alias).
-        "cmdclick" | "altclick" => Step::Click {
+        // cmd+click: always a fresh, un-joined panel.
+        "cmdclick" => Step::Click {
             label: quoted()?,
             fresh: true,
         },
@@ -330,7 +330,7 @@ mod tests {
             wait 600
             shot inbox
             click "reply"
-            altclick "Q3 infra"
+            cmdclick "Q3 infra"
             key cmd+shift+left
             type "hello world"
             quit
