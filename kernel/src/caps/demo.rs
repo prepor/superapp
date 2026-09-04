@@ -193,12 +193,6 @@ const TREE: &[Fx] = &[
         size: 24 * MB,
         at: (2026, 9, 2, 7, 30),
     },
-    Fx {
-        path: "~/superapp/panel-context.md",
-        dir: false,
-        size: 3 * KB,
-        at: (2026, 9, 1, 23, 8),
-    },
     // Beyond home: what a typed path reaches.
     Fx {
         path: "/Applications",
@@ -545,7 +539,6 @@ pub fn text_of(path: &str) -> Option<String> {
         "todo.txt" => "- files: the card previews\n- files: move here / copy here\n- attachments: save a part where I choose\n- rename?".into(),
         "notes.txt" => "Lisbon, August.\n\nInvoice 0817 is for the flat; the photos are from the last evening.".into(),
         "notes.md" => "# notes\n\n- a directory is a list panel\n- a file is a card\n- enter goes, the cursor previews\n\nThe join is the only relation.".into(),
-        "panel-context.md" => "# panel: files ~/Downloads\n\nfilter: @kind:image\nentries: 8 (1 shown)\nlisted: 0.4 s ago".into(),
         _ => format!("{}\n\n(the first 64 KB of the file, in the app's one face)", e.name),
     })
 }
