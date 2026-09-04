@@ -15,6 +15,7 @@ use super::super::model::{
     FileKind, Preview, Watch,
 };
 use super::super::ops;
+use super::super::run;
 use super::super::{Op, Seen, FILES};
 use super::dir;
 
@@ -212,7 +213,7 @@ impl Card {
     #[must_use]
     pub fn note(&self) -> Option<String> {
         FILES
-            .running()
+            .running(run::whose_world(&self.world))
             .map(|at| at.line())
             .or_else(|| self.status().map(str::to_string))
     }
@@ -295,19 +296,22 @@ impl Panel for Card {
     /// widget's — a caret in one of its runs keeps the text chords, and the
     /// bar has the letter the rest of the time.
     fn verbs(&self) -> Vec<Verb> {
-        let mut v = vec![
+        let mut v = Vec::new();
+        // As a listing's, and first for the same reason: a run is the
+        // app's, it stops from wherever anybody is looking, and the one
+        // control with no chord behind it may not be the one a narrow
+        // panel drops off the end of its row.
+        if FILES.busy(run::whose_world(&self.world)) {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
+        v.extend([
             Verb::run("files.open", "open", Some('o')),
             Verb::run("files.copy", "copy", Some('p')),
             Verb::run("files.move", "move", Some('m')),
             Verb::run("files.rename", "rename", Some('r')),
             Verb::run("files.delete", "delete", Some('d')),
             Verb::run("files.copy_path", "copy path", Some('c')),
-        ];
-        // As a listing's: a run is the app's, and stops from wherever
-        // anybody is looking.
-        if FILES.busy() {
-            v.push(Verb::run("files.cancel", "cancel", None));
-        }
+        ]);
         v
     }
 
@@ -319,7 +323,7 @@ impl Panel for Card {
             "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
-            "files.cancel" => dir::cancel(s),
+            "files.cancel" => dir::cancel(s, &self.world),
             _ => {}
         }
     }
@@ -396,7 +400,7 @@ impl Card {
     /// looked for: one somewhere else showing the same path keeps showing
     /// it, and says so.
     fn delete(&mut self, s: &mut Session) {
-        if dir::delete_paths(s, self.slot, vec![self.path.clone()], true) {
+        if dir::delete_paths(s, self.slot, &self.id, vec![self.path.clone()], true) {
             self.status = None;
         }
     }

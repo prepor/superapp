@@ -10,7 +10,7 @@ use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Open, Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::richtable::ListState;
-use kernel::session::{Action, Session};
+use kernel::session::{Action, Instance, Session};
 
 use super::super::completion::PathCompletion;
 use super::super::model::{
@@ -18,7 +18,7 @@ use super::super::model::{
     real_path, stat_in, DirRow, DirSource, Entry, Watch, HOME, PAGE,
 };
 use super::super::ops::{self, Done};
-use super::super::run::{Landed, Task};
+use super::super::run::{self, Landed, Run, Task};
 use super::super::{Op, Seen, FILES};
 use super::Card;
 
@@ -226,7 +226,7 @@ impl Dir {
     #[must_use]
     pub fn note(&self) -> Option<String> {
         FILES
-            .running()
+            .running(run::whose_world(&self.world))
             .map(|at| at.line())
             .or_else(|| self.status().map(str::to_string))
     }
@@ -303,7 +303,7 @@ impl Dir {
         }
         self.status = None;
         let path = join(&self.dir, &name);
-        FILES.start(s, Task::MakeDir { path }, self.slot);
+        FILES.start(s, Task::MakeDir { path }, self.slot, self.id.clone());
     }
 
     /// `rename`: the directory this panel shows, under a new name — one
@@ -387,10 +387,22 @@ impl Panel for Dir {
     /// that copies text wherever text is selected — which is what this verb
     /// does with a path.
     fn verbs(&self) -> Vec<Verb> {
-        let mut v = vec![
-            Verb::run("files.new_dir", "new dir", Some('n')),
-            Verb::run("files.go_to", "go to", Some('g')),
-        ];
+        let mut v = Vec::new();
+        // A run belongs to the app rather than to the panel that started it
+        // — it is one disk — so *cancel* is on every files bar while one is
+        // on, and stops it from wherever anybody is looking. It wears no
+        // letter: it is rare, it is the only verb here that undoes nothing,
+        // and no chord should be a keystroke away from stopping a copy.
+        //
+        // First, and not last, for exactly that reason: a bar is a row and
+        // never a wrap, so a verb past the right edge is a verb that is not
+        // drawn — and the one control with no chord behind it may not be
+        // the one a narrow panel drops.
+        if FILES.busy(run::whose_world(&self.world)) {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
+        v.push(Verb::run("files.new_dir", "new dir", Some('n')));
+        v.push(Verb::run("files.go_to", "go to", Some('g')));
         let marked = self.list.marks().len();
         if marked > 0 {
             v.push(Verb::run("files.copy", format!("copy {marked}"), Some('p')));
@@ -417,14 +429,6 @@ impl Panel for Dir {
         let clip = FILES.clipboard();
         if !clip.is_empty() {
             v.push(Verb::run("files.here", clip.verb.here_label(), Some('h')));
-        }
-        // A run belongs to the app rather than to the panel that started it
-        // — it is one disk — so *cancel* is on every files bar while one is
-        // on, and stops it from wherever anybody is looking. It wears no
-        // letter: it is rare, it is the only verb here that undoes nothing,
-        // and no chord should be a keystroke away from stopping a copy.
-        if FILES.busy() {
-            v.push(Verb::run("files.cancel", "cancel", None));
         }
         v
     }
@@ -473,7 +477,7 @@ impl Panel for Dir {
             "files.delete" => self.delete(s),
             "files.copy_path" => self.copy_path(s),
             "files.here" => self.here(s),
-            "files.cancel" => cancel(s),
+            "files.cancel" => cancel(s, &self.world),
             // The two about the set itself. Neither writes anything, so
             // neither is an action: a mark is the panel's own context.
             "files.all" => {
@@ -587,7 +591,7 @@ impl Dir {
     fn delete(&mut self, s: &mut Session) {
         let own = self.list.marks().is_empty();
         let paths = self.objects();
-        if delete_paths(s, self.slot, paths, own) {
+        if delete_paths(s, self.slot, &self.id, paths, own) {
             // A run is on its way; the line it will write is its own. One
             // that was never queued leaves the line standing as it was.
             self.status = None;
@@ -620,7 +624,7 @@ impl Dir {
             clip,
             dir: self.dir.clone(),
         };
-        FILES.start(s, task, self.slot);
+        FILES.start(s, task, self.slot, self.id.clone());
     }
 }
 
@@ -691,7 +695,13 @@ pub(super) enum Said {
 /// `own` is whether `by` is the panel showing what went, and so closes with
 /// the action. Answers whether a run was queued at all — a panel clears its
 /// own line for one that was, and leaves it standing for one that was not.
-pub(super) fn delete_paths(s: &mut Session, by: SlotId, paths: Vec<String>, own: bool) -> bool {
+pub(super) fn delete_paths(
+    s: &mut Session,
+    by: SlotId,
+    showing: &PanelId,
+    paths: Vec<String>,
+    own: bool,
+) -> bool {
     if paths.is_empty() {
         return false;
     }
@@ -699,14 +709,22 @@ pub(super) fn delete_paths(s: &mut Session, by: SlotId, paths: Vec<String>, own:
         s.notify("read-only — acquire the lease to write", true);
         return false;
     }
-    FILES.start(s, Task::Delete { paths, own }, by);
+    FILES.start(s, Task::Delete { paths, own }, by, showing.clone());
     true
 }
 
 /// *cancel*: the run in hand stops where it is, and what was waiting behind
 /// it never starts. What it managed is still recorded — see [`land`].
-pub(super) fn cancel(s: &mut Session) {
-    FILES.stop();
+///
+/// A run that had not begun leaves nothing to record and so nothing to say
+/// for itself; this says it instead, rather than dropping work in silence.
+pub(super) fn cancel(s: &mut Session, world: &World) {
+    let dropped = FILES.stop(run::whose_world(world));
+    match dropped {
+        0 => {}
+        1 => s.notify("one run dropped — it had not started", false),
+        n => s.notify(format!("{n} runs dropped — they had not started"), false),
+    }
     s.redraw();
 }
 
@@ -735,10 +753,16 @@ pub fn land(s: &mut Session, l: Landed) {
 
 /// `copy here` / `move here`, landed.
 fn landed_here(s: &mut Session, l: Landed) {
-    let Task::Here { verb, dir, .. } = &l.run.task else {
+    let Task::Here { verb, clip, dir } = &l.run.task else {
         return;
     };
-    let (verb, by, here) = (*verb, l.run.by, basename(dir).to_string());
+    let (verb, here) = (*verb, basename(dir).to_string());
+    // What the clipboard held when the verb ran. A move lets go of it at
+    // the end — but only of the one it was carrying: somebody may have
+    // pressed `copy` on something else while this was going, and that
+    // clipboard is not this run's to empty.
+    let held = clip.clone();
+    let ran = Ran::of(&l.run);
     let missed = l.missed();
     let Landed {
         done,
@@ -755,7 +779,7 @@ fn landed_here(s: &mut Session, l: Landed) {
             (false, 1) => refused[0].clone(),
             (false, n) => format!("nothing to {} into {here} — {n} refused", verb.verb()),
         };
-        say(s, by, Some(msg.clone()));
+        ran.say(s, Some(msg.clone()));
         s.notify(msg, true);
         super::refresh(s, None);
         return;
@@ -784,14 +808,16 @@ fn landed_here(s: &mut Session, l: Landed) {
         Action::new(verb.verb(), format!("{} {what} into {here}", verb.verb()))
             .claiming(vec![intent]),
     );
-    say(s, by, None);
+    ran.say(s, None);
     s.notify(
         format!("{} {what} into {here}{tail} — cmd+z undoes", verb.done()),
         false,
     );
     // A move consumes the clipboard; a copy keeps it, so the same set
-    // can be laid down in another directory too.
-    if verb == Op::Move {
+    // can be laid down in another directory too. Only the one it carried,
+    // though — a clipboard filled since this started is somebody else's
+    // gesture, and it stands.
+    if verb == Op::Move && FILES.clipboard() == held {
         FILES.clear();
     }
     super::refresh(s, None);
@@ -802,9 +828,10 @@ fn landed_delete(s: &mut Session, l: Landed) {
     let Task::Delete { own, .. } = &l.run.task else {
         return;
     };
-    let by = l.run.by;
-    // A panel that closed while the run was going closes nothing now.
-    let own = *own && s.panel(by).is_some();
+    let ran = Ran::of(&l.run);
+    // A panel that closed — or walked somewhere else — while the run was
+    // going closes nothing now.
+    let own = *own && ran.still(s).is_some();
     let missed = l.missed();
     let Landed {
         done,
@@ -819,7 +846,7 @@ fn landed_delete(s: &mut Session, l: Landed) {
             (false, 1) => refused[0].clone(),
             (false, n) => format!("nothing deleted — {n} refused"),
         };
-        say(s, by, Some(msg.clone()));
+        ran.say(s, Some(msg.clone()));
         s.notify(msg, true);
         super::refresh(s, None);
         return;
@@ -837,7 +864,8 @@ fn landed_delete(s: &mut Session, l: Landed) {
     // that stayed because its path refused. Taken only once the action is
     // certain, and undo puts exactly these back.
     let mut intents: Vec<Box<dyn Intent>> = vec![trashed];
-    intents.extend(take_marks(s, by, &gone));
+    intents.extend(ran.take_marks(s, &gone));
+    let closes = ran.by;
     s.act_done(
         Action::new("delete", format!("delete {what}"))
             .claiming(intents)
@@ -845,13 +873,13 @@ fn landed_delete(s: &mut Session, l: Landed) {
             // this goes with it, and its joined chain goes with the panel.
             .moving(move |wm| {
                 if own {
-                    wm.close(by);
+                    wm.close(closes);
                 }
             }),
     );
     // What a verb took away is not there to be held any more.
     prune_clipboard(&s.world().clone());
-    say(s, by, None);
+    ran.say(s, None);
     s.notify(format!("{what} to the trash{tail} — cmd+z undoes"), false);
     super::refresh(s, None);
 }
@@ -862,7 +890,7 @@ fn landed_dir(s: &mut Session, l: Landed) {
     let Task::MakeDir { path } = &l.run.task else {
         return;
     };
-    let by = l.run.by;
+    let ran = Ran::of(&l.run);
     let name = basename(path).to_string();
     let here = basename(parent(path).unwrap_or(HOME)).to_string();
     let Some(made) = l.done.first() else {
@@ -874,7 +902,7 @@ fn landed_dir(s: &mut Session, l: Landed) {
             .first()
             .cloned()
             .unwrap_or_else(|| format!("“{name}/” was not created — stopped"));
-        say(s, by, Some(msg.clone()));
+        ran.say(s, Some(msg.clone()));
         s.notify(msg, true);
         return;
     };
@@ -887,7 +915,7 @@ fn landed_dir(s: &mut Session, l: Landed) {
     s.act_done(
         Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
     );
-    with_panel(s, by, |p| {
+    ran.with(s, |p| {
         if let Some(d) = p.as_any().downcast_mut::<Dir>() {
             d.set_naming(None);
             d.set_status(None);
@@ -897,29 +925,86 @@ fn landed_dir(s: &mut Session, l: Landed) {
     super::refresh(s, None);
 }
 
-/// Runs `f` on the panel in a slot, if it is still open and nobody else has
-/// it. Nothing here is worth a panic: a line that cannot be written is a
-/// line, and the node is recorded either way.
-fn with_panel(s: &Session, slot: SlotId, f: impl FnOnce(&mut dyn Panel)) {
-    let Some(inst) = s.panel(slot) else {
-        return;
-    };
-    let Ok(mut p) = inst.try_borrow_mut() else {
-        return;
-    };
-    f(&mut **p);
+/// The panel that ran the verb, as the run remembers it: a slot, and what
+/// stood in it at the time.
+///
+/// Every reach back into the panel goes through here, because a slot is a
+/// place and not a panel. While a long run is going, the listing that
+/// started it may have walked somewhere else — a crumb and `go to` both
+/// replace what a slot shows, in place, and neither closes anything — and
+/// the panel standing there when the run lands is a stranger. It gets no
+/// status line of ours, none of its marks taken, and above all no close.
+struct Ran {
+    by: SlotId,
+    showing: PanelId,
 }
 
-/// The line under the header of the panel that ran the verb: what the run
-/// refused, or nothing where it went through.
-fn say(s: &Session, slot: SlotId, line: Option<String>) {
-    with_panel(s, slot, |p| {
-        if let Some(d) = p.as_any().downcast_mut::<Dir>() {
-            d.set_status(line);
-        } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
-            c.set_status(line);
+impl Ran {
+    fn of(run: &Run) -> Ran {
+        Ran {
+            by: run.by,
+            showing: run.showing.clone(),
         }
-    });
+    }
+
+    /// The instance, if that slot is still showing what ran the verb.
+    fn still(&self, s: &Session) -> Option<Instance> {
+        let inst = s.panel(self.by)?;
+        let same = inst.try_borrow().is_ok_and(|p| *p.id() == self.showing);
+        same.then_some(inst)
+    }
+
+    /// Runs `f` on it, if it is still there and nobody else has it. Nothing
+    /// here is worth a panic: a line that cannot be written is a line, and
+    /// the node is recorded either way.
+    fn with(&self, s: &Session, f: impl FnOnce(&mut dyn Panel)) {
+        let Some(inst) = self.still(s) else {
+            return;
+        };
+        let Ok(mut p) = inst.try_borrow_mut() else {
+            return;
+        };
+        f(&mut **p);
+    }
+
+    /// The line under its header: what the run refused, or nothing where it
+    /// went through.
+    fn say(&self, s: &Session, line: Option<String>) {
+        self.with(s, |p| {
+            if let Some(d) = p.as_any().downcast_mut::<Dir>() {
+                d.set_status(line);
+            } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
+                c.set_status(line);
+            }
+        });
+    }
+
+    /// Takes the marks the run consumed off the table it ran on, and
+    /// answers the intent that puts them back. `None` when it consumed
+    /// none, and none where the panel has gone — there is nowhere left for
+    /// a mark to be.
+    fn take_marks(&self, s: &Session, gone: &[String]) -> Option<Box<dyn Intent>> {
+        let inst = self.still(s)?;
+        let mut p = inst.try_borrow_mut().ok()?;
+        let d = p.as_any().downcast_mut::<Dir>()?;
+        let dir = d.dir.clone();
+        let taken: Vec<String> = gone
+            .iter()
+            .filter(|g| parent(g) == Some(dir.as_str()))
+            .map(|g| basename(g).to_string())
+            .filter(|n| d.list.marks().has(n))
+            .collect();
+        for n in &taken {
+            d.list.marks_mut().remove(n);
+        }
+        drop(p);
+        (!taken.is_empty()).then(|| {
+            Box::new(Marked {
+                panel: Rc::downgrade(&inst),
+                keys: taken,
+            }) as Box<dyn Intent>
+        })
+    }
 }
 
 /// `rename`, from a listing or from a card: one path under a new name, in
@@ -1058,32 +1143,6 @@ fn prune_clipboard(world: &World) {
     } else {
         FILES.set(clip.verb, left);
     }
-}
-
-/// Takes the marks a verb consumed off the table it ran on, and answers the
-/// intent that puts them back. `None` when it consumed none, and none when
-/// the panel has closed — there is nowhere left for a mark to be.
-fn take_marks(s: &Session, slot: SlotId, gone: &[String]) -> Option<Box<dyn Intent>> {
-    let inst = s.panel(slot)?;
-    let mut p = inst.try_borrow_mut().ok()?;
-    let d = p.as_any().downcast_mut::<Dir>()?;
-    let dir = d.dir.clone();
-    let taken: Vec<String> = gone
-        .iter()
-        .filter(|g| parent(g) == Some(dir.as_str()))
-        .map(|g| basename(g).to_string())
-        .filter(|n| d.list.marks().has(n))
-        .collect();
-    for n in &taken {
-        d.list.marks_mut().remove(n);
-    }
-    drop(p);
-    (!taken.is_empty()).then(|| {
-        Box::new(Marked {
-            panel: Rc::downgrade(&inst),
-            keys: taken,
-        }) as Box<dyn Intent>
-    })
 }
 
 /// The row's own wording where the set is one, as a batch has it:

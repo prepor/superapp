@@ -1260,6 +1260,11 @@ fn a_panel_watches_its_directory_while_it_is_open_and_then_lets_go() {
 // itself: a build with threads performs one path per pass, so they queue one
 // by hand and stand between the paths, where a person would be looking.
 
+/// Whose runs a session's are — what every reader of the queue is keyed by.
+fn key(s: &Session) -> usize {
+    super::run::whose(s.store())
+}
+
 /// Three files of `~/Downloads`, held for a verb.
 const THREE: [&str; 3] = [
     "~/Downloads/README.txt",
@@ -1289,12 +1294,19 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
             dir: "~/Desktop".to_string(),
         },
         desk,
+        showing(&s, desk),
     );
     // Queued and not yet started: something is on, so every files panel
     // offers to stop it — and none of them wears the verb otherwise.
-    assert!(FILES.busy());
-    assert!(bar(&s, desk).contains(&"files.cancel"));
-    assert_eq!(FILES.running(), None, "nothing has been taken in hand yet");
+    assert!(FILES.busy(key(&s)));
+    assert_eq!(
+        bar(&s, desk).first(),
+        Some(&"files.cancel"),
+        "first on the bar: a bar is a row and never a wrap, and the one \
+         control with no chord behind it may not be the one a narrow panel \
+         drops off the end"
+    );
+    assert_eq!(FILES.running(key(&s)), None, "nothing has been taken in hand yet");
 
     let w = s.world().clone();
     let mut runner = Runner::new();
@@ -1310,17 +1322,17 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
     runner.pass(&w);
     runner.pass(&w);
     assert_eq!(
-        FILES.running().map(|p| p.line()),
+        FILES.running(key(&s)).map(|p| p.line()),
         Some("copying 3 of 3 — “logs.tar.gz”".to_string())
     );
     // The pass that finds nothing left files the run for the UI thread, and
     // the settle records it — one node for the batch, as it always was.
     runner.pass(&w);
-    assert_eq!(FILES.running(), None);
+    assert_eq!(FILES.running(key(&s)), None);
     s.settle();
     assert_eq!(nodes(&s), was + 1, "one node for the batch");
     assert!(there(&s, "~/Desktop/logs.tar.gz"));
-    assert!(!FILES.busy());
+    assert!(!FILES.busy(key(&s)));
     assert!(!bar(&s, desk).contains(&"files.cancel"), "nothing to stop");
     assert_eq!(with_dir(&s, desk, |d| d.note()), None);
     assert!(
@@ -1350,6 +1362,7 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
             own: false,
         },
         slot,
+        showing(&s, slot),
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
@@ -1358,9 +1371,9 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
 
     // *cancel*, between two paths. The path in hand is finished — a
     // half-copied file is nobody's — and the ones behind it are dropped.
-    FILES.stop();
+    FILES.stop(key(&s));
     runner.pass(&w);
-    assert_eq!(FILES.running(), None);
+    assert_eq!(FILES.running(key(&s)), None);
     assert!(
         there(&s, "~/Downloads/report-q3.pdf"),
         "what it never reached is untouched"
@@ -1395,6 +1408,7 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
             path: "~/Downloads/fresh".to_string(),
         },
         slot,
+        showing(&s, slot),
     );
     runner.pass(&w);
     runner.pass(&w);
@@ -1415,6 +1429,7 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
             own: false,
         },
         slot,
+        showing(&s, slot),
     );
     FILES.queue_by_hand(
         &s,
@@ -1422,15 +1437,16 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
             path: "~/Downloads/never".to_string(),
         },
         slot,
+        showing(&s, slot),
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
     runner.pass(&w);
-    FILES.stop();
+    FILES.stop(key(&s));
     runner.pass(&w);
     s.settle();
 
-    assert!(!FILES.busy(), "one button, and everything stops");
+    assert!(!FILES.busy(key(&s)), "one button, and everything stops");
     assert!(!there(&s, "~/Downloads/never"));
     assert!(
         s.notes().iter().any(|n| n
@@ -1455,6 +1471,7 @@ fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
             own: true,
         },
         slot,
+        showing(&s, slot),
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
@@ -1474,6 +1491,157 @@ fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
     assert_eq!(nodes(&s), was + 2, "the close, then the delete");
     assert!(s.undo(), "and the delete is still a node to walk back");
     assert!(there(&s, "~/Downloads/README.txt"));
+}
+
+#[test]
+fn a_run_is_performed_and_recorded_only_by_the_session_that_asked() {
+    let _alone = alone();
+    let (mut mine, slot) = home();
+    // Another session of the same process — what a mounted scene in the
+    // panels library is. Its own store, its own world, and under
+    // `--demo-disk` its own tree.
+    let mut theirs = Session::fake(APPS);
+    let was = nodes(&theirs);
+
+    FILES.queue_by_hand(
+        &mine,
+        Task::Delete {
+            paths: vec!["~/Downloads/README.txt".to_string()],
+            own: false,
+        },
+        slot,
+        showing(&mine, slot),
+    );
+    assert!(FILES.busy(key(&mine)));
+    assert!(!FILES.busy(key(&theirs)), "nobody else has anything to do");
+
+    // Their pass takes nothing: it would perform this against their world,
+    // which is not the disk this panel is listing.
+    let w = theirs.world().clone();
+    let mut stranger = Runner::new();
+    stranger.pass(&w);
+    assert!(there(&mine, "~/Downloads/README.txt"), "nothing happened");
+    assert_eq!(FILES.running(key(&theirs)), None);
+    assert!(FILES.busy(key(&mine)), "and the run is still ours to do");
+
+    // And their settle records nothing: a node belongs in the history of
+    // the session whose verb it was.
+    theirs.settle();
+    assert_eq!(nodes(&theirs), was);
+
+    // The session that asked performs it and records it.
+    let w = mine.world().clone();
+    let mut ours = Runner::new();
+    ours.pass(&w);
+    ours.pass(&w);
+    mine.settle();
+    assert!(!there(&mine, "~/Downloads/README.txt"));
+    assert!(mine.undo());
+    assert!(there(&mine, "~/Downloads/README.txt"));
+}
+
+#[test]
+fn a_move_lets_go_only_of_the_clipboard_it_carried() {
+    let _alone = alone();
+    let (mut s, _) = home();
+    let desk = open(&mut s, "~/Desktop").expect("the destination");
+    FILES.set(Op::Move, vec!["~/notes.md".to_string()]);
+    let clip = FILES.clipboard();
+    FILES.queue_by_hand(
+        &s,
+        Task::Here {
+            verb: Op::Move,
+            clip,
+            dir: "~/Desktop".to_string(),
+        },
+        desk,
+        showing(&s, desk),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+
+    // While the run was out, somebody held something else.
+    FILES.set(Op::Copy, vec!["~/Documents/Lease.tla".to_string()]);
+    runner.pass(&w);
+    s.settle();
+
+    assert!(there(&s, "~/Desktop/notes.md"), "the move went through");
+    assert_eq!(
+        FILES.clipboard().paths,
+        ["~/Documents/Lease.tla".to_string()],
+        "and the newer hold stands: a move consumes what it carried, not \
+         whatever is there when it lands"
+    );
+    assert_eq!(FILES.clipboard().verb, Op::Copy);
+}
+
+#[test]
+fn a_delete_closes_the_panel_that_ran_it_and_not_what_took_its_place() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+
+    FILES.queue_by_hand(
+        &s,
+        Task::Delete {
+            paths: vec!["~/notes.md".to_string()],
+            own: true,
+        },
+        card,
+        showing(&s, card),
+    );
+    let w = s.world().clone();
+    let mut runner = Runner::new();
+    runner.pass(&w);
+
+    // While the run was out, that slot went somewhere else — which is what
+    // a crumb and `go to` do, in place, closing nothing.
+    go(&mut s, Nav::Replace {
+        slot: card,
+        id: Card::id("~/Desktop/todo.txt"),
+    });
+    assert_eq!(showing(&s, card), Card::id("~/Desktop/todo.txt"));
+
+    runner.pass(&w);
+    s.settle();
+    assert!(!there(&s, "~/notes.md"), "the delete happened");
+    assert!(
+        s.panel(card).is_some(),
+        "and took nothing that was not its own: a slot is a place, not a panel"
+    );
+    assert_eq!(showing(&s, card), Card::id("~/Desktop/todo.txt"));
+}
+
+#[test]
+fn a_stop_with_nothing_in_hand_says_what_it_dropped() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    FILES.queue_by_hand(
+        &s,
+        Task::MakeDir {
+            path: "~/never".to_string(),
+        },
+        slot,
+        showing(&s, slot),
+    );
+    s.take_notes();
+    // Nothing has been taken in hand, so there is no run to record and no
+    // toast of its own: the *cancel* says it instead.
+    run(&mut s, slot, "files.cancel");
+    assert!(!FILES.busy(key(&s)));
+    assert!(!there(&s, "~/never"));
+    assert!(
+        s.notes()
+            .iter()
+            .any(|n| n.msg == "one run dropped — it had not started"),
+        "work is never dropped in silence: {:?}",
+        s.notes()
+    );
 }
 
 // -- the spellings a path travels in -------------------------------------------

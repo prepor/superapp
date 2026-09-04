@@ -234,21 +234,37 @@ Four things hold, and they are what the design is for:
   *copying 12 of 340 — "report.pdf"* under its header, in place of the line a
   refusal leaves. The line is the app's, not the panel's: it is one disk, and a
   run started in one panel writes into directories others are showing.
-- **It can be stopped.** *cancel* appears on every files bar while a run is on,
-  and stops it from wherever anybody is looking. It carries no letter: it is the
-  only verb here that undoes nothing, and no chord should be a keystroke away
-  from stopping a copy. The path in hand is finished — a half-copied file is
-  nobody's — the runs waiting behind it are dropped, and the toast says how far
-  it got and what that cost.
+- **It can be stopped.** *cancel* is the first verb on every files bar while a
+  run is on, and stops it from wherever anybody is looking. It carries no
+  letter: it is the only verb here that undoes nothing, and no chord should be a
+  keystroke away from stopping a copy — which is also why it goes first, since a
+  bar is a row and never a wrap, and a verb past the right edge is not drawn at
+  all. The path in hand is finished — a half-copied file is nobody's — the runs
+  waiting behind it are dropped, and the toast says how far it got and what that
+  cost. A stop that finds nothing started yet drops what was queued and says so
+  itself: work is never dropped in silence.
 - **Undo is unchanged.** The run records nothing. It collects what it performed
   and hands it back; the history node, its intents, the lease check, the marks a
   delete consumed, the panel a delete closes and the toast are all the UI
   thread's, one frame later. A run that was stopped halfway lands what it
   managed, because a change with no node behind it is a change nobody can undo.
 
+A run carries the panel that asked for it — the slot *and* what stood in it —
+because a slot is a place and not a panel: a crumb and `go to` both replace
+what a slot shows, in place, without closing anything. A run that lands after
+that writes no line on the stranger standing there, takes none of its marks,
+and above all does not close it. The same holds for the clipboard: a move lets
+go of the set it carried, and a set held while it was running stands.
+
 Runs are performed one at a time in the order they were asked for, and each is
 planned when it reaches the front — the disk may have moved on while it waited,
-and nothing watches a disk. A run is *not* a queued
+and nothing watches a disk. Every run is stamped with the session that asked
+for it, by the address of the one database that session and its workers share:
+a process may be running several sessions — the window's, and one per mounted
+scene in the [panels library](./panel-model.md) — and a run performed by
+another session's pass would write another session's disk, while a node
+recorded there would be a node in the wrong history, on a slot number that
+means nothing. A run is *not* a queued
 [job](./data-substrate.md#effects): the store's queue is for work that is
 retried and outlives the process, and a copy is neither. Nobody may replay a
 trash on the next boot; if the process goes away mid-run, what it had already

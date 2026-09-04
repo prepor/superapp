@@ -97,8 +97,8 @@ impl App for Files {
     /// there is something to perform. It is asked for here — rather than
     /// derived from a row, as a sync pass is — because this app stores
     /// nothing: what calls for the thread is the queue itself.
-    fn workers(&self, _store: &Store) -> Vec<Box<dyn Worker>> {
-        if self.busy() {
+    fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
+        if self.busy(run::whose(store)) {
             vec![Box::new(run::Runner::new())]
         } else {
             Vec::new()
@@ -113,7 +113,7 @@ impl App for Files {
         // Its own runs, whatever anyone else's are doing; then whether
         // anything at all has moved since the last look, which is what a
         // quiet frame costs.
-        let landed = self.take_landed(s);
+        let landed = self.take_landed(run::whose(s.store()));
         let moved = self.moved.load(Ordering::Relaxed);
         let quiet = self.seen.swap(moved, Ordering::Relaxed) == moved;
         if landed.is_empty() && quiet {

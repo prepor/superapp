@@ -186,8 +186,10 @@ world on its own thread, so it cannot be handed one. Each world asks for a
 secret store and a disk, and the shell installs the machine's own through the
 env — which is what makes the password a settings form wrote the one a sync
 pass reads, and the disk a background copy writes the one the panel is
-listing. The kernel's fallbacks are the shared in-memory secrets and a demo
-tree per world, so nothing a test builds can reach a human's files.
+listing. Both are installed for `Mode::Real` and no other: a library mount is
+somebody's scene catalogue, and a scene may no more reach a human's files than
+their passwords. The kernel's fallbacks are the shared in-memory secrets and a
+demo tree per world, so nothing a mount or a test builds can reach either.
 
 The kernel installs its own capabilities before the apps', so an app or the
 shell may replace one. `Ctx::cap::<dyn Imap>()` is how an effect asks for one

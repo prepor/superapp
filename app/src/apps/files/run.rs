@@ -24,6 +24,8 @@
 //! * **It can be stopped.** [`Files::stop`](super::Files::stop) is read
 //!   between steps: the path in hand finishes (a half-copied file is
 //!   nobody's), the ones behind it are dropped, and what was done is kept.
+//!   The stop names the run it is for, and reaches only the session that
+//!   pressed it.
 //! * **Undo is unchanged.** Nothing here records anything. The worker
 //!   collects [`Done`] exactly as the verb did and hands them back at the
 //!   end; the node, its intents, the lease check and the toast are the UI
@@ -31,6 +33,13 @@
 //!   to run inline, moved one frame later. A run that is stopped halfway
 //!   lands what it managed, because a change with no node behind it is a
 //!   change nobody can undo.
+//!
+//! The queue is one and the sessions may be several — the window's, and one
+//! per mounted scene in the panels library — so every run is stamped with
+//! whose it is ([`Run::db`]) and read back only by that session's pass and
+//! that session's poll. Performed anywhere else it would write another
+//! world's disk; recorded anywhere else it would be a node in the wrong
+//! history.
 //!
 //! What this is deliberately **not** is a [`Deferred`](kernel::effect::Deferred)
 //! effect. The queue in the store is for work that is retried and outlives
@@ -44,7 +53,9 @@ use std::time::Duration;
 use kernel::app::{Wake, Worker};
 use kernel::effect::{Job, World};
 use kernel::layout::SlotId;
+use kernel::panel::PanelId;
 use kernel::session::Session;
+use kernel::store::Store;
 
 use super::model::{basename, is_root};
 use super::ops::{self, Done, Plan, Step};
@@ -102,26 +113,46 @@ pub struct Run {
     /// well have closed by the time the run lands, and then the run lands
     /// all the same — the node matters more than the line.
     pub by: SlotId,
+    /// What that panel was showing when it ran the verb. A slot is a place
+    /// and not a panel: a crumb replaces what stands in one, and `go to`
+    /// walks a listing somewhere else without ever closing it. A run that
+    /// lands afterwards has no business writing on — let alone closing —
+    /// whatever is there now, so the identity is carried and compared.
+    pub showing: PanelId,
     /// Whether the passes of this build run on the caller's thread. Where
     /// they do — virtual time, and every test — one pass is the whole run,
     /// so a scripted tick is followed by its consequences in the same tick,
     /// as everything else inline is.
     pub inline: bool,
-    /// Which session asked, as the address of the world it holds.
+    /// Whose run it is, as the address of the one database that session
+    /// reads.
     ///
     /// This app is a `static` and a process may be running more than one
     /// session — the window's, and one per mounted scene in the panels
-    /// library — so a queue shared between them needs to know whose run it
-    /// has. A node belongs in the history of the session whose verb it was,
-    /// and a slot number means nothing anywhere else.
-    pub world: usize,
+    /// library — each with a world of its own and, under `--demo-disk`, a
+    /// tree of its own. A queue shared between them must hand each run to
+    /// the session that asked for it: performed anywhere else it would
+    /// write the wrong disk, and recorded anywhere else it would be a node
+    /// in the wrong history, on a slot number that means nothing there.
+    ///
+    /// The database rather than the world, because a session and the worker
+    /// it spawns hold *different* worlds over the *same* store — which is
+    /// exactly the pair that must agree.
+    pub db: usize,
 }
 
-/// The address of a session's world: what a run is stamped with, and what
-/// the poll compares it against.
+/// Whose runs these are: the address of the one database a session and its
+/// workers share. What a run is stamped with, and what every reader of the
+/// queue compares against.
 #[must_use]
-fn whose(s: &Session) -> usize {
-    std::rc::Rc::as_ptr(s.world()) as usize
+pub fn whose(store: &Store) -> usize {
+    std::sync::Arc::as_ptr(&store.db()) as usize
+}
+
+/// The same, off a world — what a panel and a pass both have to hand.
+#[must_use]
+pub fn whose_world(w: &World) -> usize {
+    whose(w.store())
 }
 
 /// How far the run in hand has got: what the panels draw under their header
@@ -196,6 +227,9 @@ pub struct Runs {
     pub(super) now: Option<Progress>,
     /// Which run that is, by [`Run::id`]. Only meaningful while `now` is.
     pub(super) now_id: u64,
+    /// And whose, by [`Run::db`] — so the line a panel draws is its own
+    /// session's run and not somebody else's.
+    pub(super) now_db: usize,
     /// How many runs this process has queued: the last [`Run::id`] given
     /// out.
     pub(super) minted: u64,
@@ -211,6 +245,7 @@ impl Runs {
             queue: Vec::new(),
             now: None,
             now_id: 0,
+            now_db: 0,
             minted: 0,
             landed: Vec::new(),
         }
@@ -256,12 +291,16 @@ impl Worker for Runner {
     }
 
     fn pass(&mut self, w: &World) -> Wake {
+        // Whose pass this is. A world knows its own store, so a worker
+        // takes only the runs of the session it was spawned for — the one
+        // whose disk this world was built with.
+        let db = whose_world(w);
         loop {
             if self.work.is_none() {
                 // Planned here rather than where it was asked for: the
                 // clipboard may have waited behind another run, and nothing
                 // watches the disk.
-                let Some(run) = FILES.next_run() else {
+                let Some(run) = FILES.next_run(db) else {
                     return Wake::OnKick;
                 };
                 self.work = Some(Working::plan(w, run));
@@ -276,7 +315,7 @@ impl Worker for Runner {
                 let work = self.work.take().expect("the run in hand");
                 // A stop is a stop: what was waiting behind this goes too,
                 // and the one line that lands says how much.
-                let dropped = if stopped { FILES.drop_queued() } else { 0 };
+                let dropped = if stopped { FILES.drop_queued(db) } else { 0 };
                 FILES.land(work.over(stopped, dropped));
                 // Whatever is left in the queue is taken on the next turn
                 // of this loop, planned then; an empty queue parks the
@@ -423,9 +462,9 @@ impl super::Files {
     ///
     /// Where the passes run inline this *is* the run: the kick performs it
     /// on this very thread, and it is over by the time the call returns.
-    pub(super) fn start(&self, s: &Session, task: Task, by: SlotId) {
+    pub(super) fn start(&self, s: &Session, task: Task, by: SlotId, showing: PanelId) {
         let inline = s.workers().is_inline();
-        let world = whose(s);
+        let db = whose(s.store());
         if let Ok(mut g) = self.runs.lock() {
             g.minted += 1;
             let id = g.minted;
@@ -433,8 +472,9 @@ impl super::Files {
                 id,
                 task,
                 by,
+                showing,
                 inline,
-                world,
+                db,
             });
         }
         self.moved();
@@ -447,8 +487,8 @@ impl super::Files {
     /// single path, so a test can stand between two of them and look at
     /// what a person would have seen.
     #[cfg(test)]
-    pub(super) fn queue_by_hand(&self, s: &Session, task: Task, by: SlotId) {
-        let world = whose(s);
+    pub(super) fn queue_by_hand(&self, s: &Session, task: Task, by: SlotId, showing: PanelId) {
+        let db = whose(s.store());
         if let Ok(mut g) = self.runs.lock() {
             g.minted += 1;
             let id = g.minted;
@@ -456,25 +496,30 @@ impl super::Files {
                 id,
                 task,
                 by,
+                showing,
                 inline: false,
-                world,
+                db,
             });
         }
         self.moved();
     }
 
-    /// The next run to perform, taken off the queue and marked as the one
-    /// in hand. `None` when there is nothing waiting.
-    pub(super) fn next_run(&self) -> Option<Run> {
+    /// The next run **this session** asked for, taken off the queue and
+    /// marked as the one in hand. `None` when it has nothing waiting.
+    ///
+    /// Keyed, because the queue is one and the sessions may be several: a
+    /// mount's pass that took the window's run would perform it against the
+    /// mount's own world, which under `--demo-disk` is not even the same
+    /// tree.
+    pub(super) fn next_run(&self, db: usize) -> Option<Run> {
         let mut g = self.runs.lock().ok()?;
-        if g.queue.is_empty() {
-            return None;
-        }
-        let run = g.queue.remove(0);
+        let at = g.queue.iter().position(|r| r.db == db)?;
+        let run = g.queue.remove(at);
         // Marked as running before a single path is attempted: this is what
         // keeps the worker from being retired between two of its own passes,
         // and what a stop reaches for.
         g.now_id = run.id;
+        g.now_db = run.db;
         g.now = Some(Progress {
             doing: run.task.doing(),
             at: 0,
@@ -496,33 +541,33 @@ impl super::Files {
     pub(super) fn land(&self, l: Landed) {
         if let Ok(mut g) = self.runs.lock() {
             g.now = None;
+            g.now_db = 0;
             g.landed.push(l);
         }
         self.moved();
     }
 
-    /// Empties the queue, answering how many runs went — what a stop does
-    /// to everything waiting behind the one it stopped.
-    pub(super) fn drop_queued(&self) -> usize {
+    /// Drops this session's waiting runs, answering how many went — what a
+    /// stop does to everything behind the one it stopped.
+    pub(super) fn drop_queued(&self, db: usize) -> usize {
         let Ok(mut g) = self.runs.lock() else {
             return 0;
         };
-        let n = g.queue.len();
-        g.queue.clear();
+        let n = g.queue.iter().filter(|r| r.db == db).count();
+        g.queue.retain(|r| r.db != db);
         n
     }
 
     /// The runs that are over and belong to this session, taken for
     /// recording. Another session's are left where they are: its own poll
     /// is the one that may record them.
-    pub(super) fn take_landed(&self, s: &Session) -> Vec<Landed> {
+    pub(super) fn take_landed(&self, db: usize) -> Vec<Landed> {
         let Ok(mut g) = self.runs.lock() else {
             return Vec::new();
         };
-        let mine = whose(s);
         let (ours, theirs) = std::mem::take(&mut g.landed)
             .into_iter()
-            .partition(|l| l.run.world == mine);
+            .partition(|l| l.run.db == db);
         g.landed = theirs;
         ours
     }
@@ -534,44 +579,58 @@ impl super::Files {
         self.moved.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How far the run in hand has got, or `None` when nothing is running.
-    /// What every files panel draws under its header.
+    /// How far this session's run in hand has got, or `None` when it has
+    /// none. What every one of its files panels draws under its header.
     ///
     /// # Panics
     ///
     /// If a previous holder panicked while it had the queue.
     #[must_use]
-    pub fn running(&self) -> Option<Progress> {
-        self.runs.lock().expect("the files runs").now.clone()
+    pub fn running(&self, db: usize) -> Option<Progress> {
+        let g = self.runs.lock().expect("the files runs");
+        (g.now_db == db).then(|| g.now.clone()).flatten()
     }
 
-    /// Whether anything is running or waiting to. The worker exists exactly
-    /// while this is true.
+    /// Whether this session has anything running or waiting to. Its worker
+    /// exists exactly while this is true.
     ///
     /// # Panics
     ///
     /// As [`Files::running`](super::Files::running).
     #[must_use]
-    pub fn busy(&self) -> bool {
+    pub fn busy(&self, db: usize) -> bool {
         let g = self.runs.lock().expect("the files runs");
-        g.now.is_some() || !g.queue.is_empty()
+        (g.now.is_some() && g.now_db == db) || g.queue.iter().any(|r| r.db == db)
     }
 
     /// Stop: the path in hand finishes, the ones behind it are dropped, and
-    /// what was done is recorded. What the *cancel* button does.
+    /// what was done is recorded. What the *cancel* button does. Answers
+    /// how many runs it dropped that had not started, since nothing else
+    /// will say so — a run that never began leaves no record to say it in.
     ///
-    /// The stop names the run it is for, so it can never reach a later one.
-    /// Where nothing has been taken in hand yet there is nothing to name and
-    /// nothing to record: what was waiting simply never starts.
-    pub fn stop(&self) {
-        if let Ok(mut g) = self.runs.lock() {
-            if g.now.is_some() {
+    /// The stop names the run it is for, so it can never reach a later one,
+    /// and it reaches only this session's.
+    pub fn stop(&self, db: usize) -> usize {
+        let dropped = {
+            let Ok(mut g) = self.runs.lock() else {
+                return 0;
+            };
+            if g.now.is_some() && g.now_db == db {
+                // The one in hand answers for the ones behind it: it drops
+                // them itself when it lands, and its toast is where they
+                // are counted.
                 self.stopping.store(g.now_id, Ordering::Relaxed);
+                0
             } else {
-                g.queue.clear();
+                // Nothing of this session's has been taken in hand, so
+                // there is nothing to keep and no record to keep it on.
+                let n = g.queue.iter().filter(|r| r.db == db).count();
+                g.queue.retain(|r| r.db != db);
+                n
             }
-        }
+        };
         self.moved();
+        dropped
     }
 
     /// Whether *this* run has been told to stop.
