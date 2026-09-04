@@ -1769,7 +1769,9 @@ fn a_watch_parks_where_the_server_offers_no_idle() {
     assert!(!news.load(Ordering::Relaxed));
 
     // …holding nothing. A server that counts connections gets the one this
-    // watch opened back, for the pass that does the fetching.
+    // watch opened back, for the pass that does the fetching. (This world's
+    // session: inline, every pass shares one, which is why the fake keeps
+    // them by world — see `caps::tests`.)
     let mut server: FakeServers = servers(&s);
     assert_eq!(
         server.folders(seed::ACCOUNT).unwrap_err(),

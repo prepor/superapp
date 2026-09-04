@@ -8,6 +8,7 @@
 //! `get::<FakeServers>()` to plant a mail or take the server offline.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -451,7 +452,20 @@ impl FakeServer {
 /// world, and a mail moved on the sync thread must be there for the panel
 /// that reads it back.
 #[derive(Clone, Default)]
-pub struct FakeServers(Arc<Mutex<Servers>>);
+pub struct FakeServers {
+    servers: Arc<Mutex<Servers>>,
+    /// Which world's sessions these are. The real backend keeps its session
+    /// map in the world that opened them, so one world's `disconnect` leaves
+    /// another's session standing; a single account-wide flag would make the
+    /// fake disagree, and a watch handing its own session back would take
+    /// the sync pass's with it. Under an inline mount every pass shares one
+    /// world, and so — truthfully — one session.
+    world: u64,
+}
+
+/// The next world's number. Minted per [`install`], which is once per world,
+/// and carried by every clone of that world's capability.
+static WORLDS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct Servers {
@@ -460,9 +474,9 @@ struct Servers {
     secrets: HashMap<String, String>,
     /// `address → access token`, as a Google grant would mint it.
     grants: HashMap<String, String>,
-    /// Accounts with a live session. A verb that reaches a server without
-    /// one is a bug in the pass, and this catches it.
-    connected: HashSet<i64>,
+    /// The live sessions, as `(world, account)`. A verb that reaches a
+    /// server without one is a bug in the pass, and this catches it.
+    connected: HashSet<(u64, i64)>,
     /// When set, every verb fails with this — the offline test.
     down: Option<String>,
 }
@@ -479,7 +493,19 @@ impl std::fmt::Debug for FakeServers {
 impl FakeServers {
     #[must_use]
     pub fn new() -> FakeServers {
-        FakeServers::default()
+        FakeServers {
+            servers: Arc::default(),
+            world: WORLDS.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The same servers as another world sees them: the same mail, sessions
+    /// of its own. What [`install`] hands each world it builds.
+    fn for_world(&self) -> FakeServers {
+        FakeServers {
+            servers: self.servers.clone(),
+            world: WORLDS.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     /// The demo account's server, filled from the same list the store's seed
@@ -490,7 +516,7 @@ impl FakeServers {
     pub fn demo() -> FakeServers {
         let s = FakeServers::new();
         {
-            let mut g = s.0.lock().expect("the fake servers");
+            let mut g = s.servers.lock().expect("the fake servers");
             g.secrets
                 .insert(seed::ADDRESS.to_string(), seed::PASSWORD.to_string());
             let mut server = FakeServer {
@@ -521,7 +547,7 @@ impl FakeServers {
 
     /// Takes every server offline with this reason, or brings them back.
     pub fn set_down(&self, why: Option<&str>) {
-        if let Ok(mut g) = self.0.lock() {
+        if let Ok(mut g) = self.servers.lock() {
             g.down = why.map(str::to_string);
         }
     }
@@ -529,20 +555,20 @@ impl FakeServers {
     /// Why the servers are refusing, if they are.
     #[must_use]
     pub fn why(&self) -> Option<String> {
-        self.0.lock().ok()?.down.clone()
+        self.servers.lock().ok()?.down.clone()
     }
 
     /// How many accounts have a server.
     #[must_use]
     pub fn accounts(&self) -> usize {
-        self.0.lock().map(|g| g.by_account.len()).unwrap_or(0)
+        self.servers.lock().map(|g| g.by_account.len()).unwrap_or(0)
     }
 
     /// Plants an OAuth grant, as a finished sign-in would: the address, and
     /// the access token [`OAuth::access_token`] hands back for it.
     #[cfg(test)]
     pub fn grant(&self, email: &str, token: &str) {
-        if let Ok(mut g) = self.0.lock() {
+        if let Ok(mut g) = self.servers.lock() {
             g.grants.insert(email.to_string(), token.to_string());
             // A bearer session compares the token the same way a password
             // session compares a password.
@@ -553,7 +579,7 @@ impl FakeServers {
     /// Reaches one account's server — what a test plants a mail through.
     #[cfg(test)]
     pub fn with<T>(&self, account: i64, f: impl FnOnce(&mut FakeServer) -> T) -> Option<T> {
-        let mut g = self.0.lock().ok()?;
+        let mut g = self.servers.lock().ok()?;
         Some(f(g.by_account.entry(account).or_default()))
     }
 
@@ -561,7 +587,7 @@ impl FakeServers {
     #[cfg(test)]
     #[must_use]
     pub fn submitted(&self) -> Vec<Outgoing> {
-        let Ok(g) = self.0.lock() else {
+        let Ok(g) = self.servers.lock() else {
             return Vec::new();
         };
         let mut all: Vec<(i64, Outgoing)> = g
@@ -579,11 +605,11 @@ impl FakeServers {
         account: i64,
         f: impl FnOnce(&mut FakeServer) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut g = self.0.lock().map_err(|_| "the servers are poisoned")?;
+        let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
         }
-        if !g.connected.contains(&account) {
+        if !g.connected.contains(&(self.world, account)) {
             return Err("not connected".into());
         }
         f(g.by_account.entry(account).or_default())
@@ -592,14 +618,14 @@ impl FakeServers {
 
 impl Imap for FakeServers {
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
-        let mut g = self.0.lock().map_err(|_| "the servers are poisoned")?;
+        let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
         }
         if g.secrets.get(&c.user).map(String::as_str) != Some(c.secret()) {
             return Err("authentication failed".into());
         }
-        g.connected.insert(account);
+        g.connected.insert((self.world, account));
         Ok(())
     }
 
@@ -674,8 +700,8 @@ impl Imap for FakeServers {
     }
 
     fn disconnect(&mut self, account: i64) -> Result<(), String> {
-        let mut g = self.0.lock().map_err(|_| "the servers are poisoned")?;
-        g.connected.remove(&account);
+        let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
+        g.connected.remove(&(self.world, account));
         Ok(())
     }
 
@@ -780,7 +806,7 @@ impl Imap for FakeServers {
 
 impl Smtp for FakeServers {
     fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
-        let mut g = self.0.lock().map_err(|_| "the servers are poisoned")?;
+        let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
         }
@@ -844,7 +870,7 @@ impl OAuth for FakeServers {
     /// The grant a test planted, or the refusal a real one gives when there
     /// is none.
     fn access_token(&mut self, email: &str) -> Result<String, String> {
-        let g = self.0.lock().map_err(|_| "the servers are poisoned")?;
+        let g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
         }
@@ -870,7 +896,9 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
         super::real::install(env, caps);
         return;
     }
-    let servers = servers_for(env);
+    // A world of its own: its sessions are its own, as the real backend's
+    // are — one world's disconnect leaves another's session standing.
+    let servers = servers_for(env).for_world();
     env.secrets.plant(seed::ADDRESS, seed::PASSWORD);
     caps.insert::<dyn Imap>(Box::new(servers.clone()));
     caps.insert::<dyn Smtp>(Box::new(servers.clone()));
@@ -918,4 +946,35 @@ fn demo_servers() -> FakeServers {
         s.set_down(Some(&why));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session belongs to the world that opened it. The watch and the pass
+    /// that fetches run on their own threads with their own worlds, so a
+    /// watch handing its own connection back must not take the other's with
+    /// it — which one account-wide flag, shared by every world, would have.
+    #[test]
+    fn one_worlds_disconnect_leaves_anothers_session_standing() {
+        let servers = FakeServers::demo();
+        let mut pass = servers.for_world();
+        let mut watch = servers.for_world();
+        let creds = Creds::password("imap.demo", seed::ADDRESS, seed::PASSWORD);
+        pass.connect(seed::ACCOUNT, &creds).expect("the pass connects");
+        watch.connect(seed::ACCOUNT, &creds).expect("the watch connects");
+
+        watch
+            .disconnect(seed::ACCOUNT)
+            .expect("the watch hands its own back");
+        assert!(
+            watch.folders(seed::ACCOUNT).is_err(),
+            "the watch has no session left"
+        );
+        assert!(
+            pass.folders(seed::ACCOUNT).is_ok(),
+            "and the pass still has the one it opened"
+        );
+    }
 }
