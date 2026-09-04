@@ -25,7 +25,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
-use super::{Watching, TURN};
+use super::{resolve, Watching, TURN};
 
 // -- what linux calls it -------------------------------------------------------
 
@@ -164,18 +164,26 @@ impl Thread {
     }
 }
 
+/// One directory a panel is looking at: the path as it asked for it, what
+/// that path led to when the watch was taken, and the descriptor it is
+/// watched under — [`NONE`] for one that is wanted and not watched.
+struct Held {
+    asked: PathBuf,
+    canon: PathBuf,
+    wd: c_int,
+}
+
 fn watch_loop(w: &Watching, knocks: c_int) {
     let fd = unsafe { inotify_init1(O_CLOEXEC | O_NONBLOCK) };
     if fd < 0 {
         eprintln!("watch: the disk is not being watched — inotify would not open");
         return;
     }
-    // Every directory wanted, with the descriptor it is being watched
-    // under — `NONE` for one that is wanted and not watched, which is a
-    // directory that was not there when the panel opened, or that has
-    // gone since. Those are asked for again on every turn: a watch lost
-    // is a watch the kernel will not restore, and a path can come back.
-    let mut have: Vec<(PathBuf, c_int)> = Vec::new();
+    // Every directory wanted, watched or not. A watch that is not there
+    // is asked for again on every turn — a directory may not have existed
+    // when the panel opened, and a watch the kernel closed it will not
+    // reopen.
+    let mut have: Vec<Held> = Vec::new();
     while !w.stopped() {
         let want = w.want();
         if !same(&have, &want) {
@@ -184,29 +192,48 @@ fn watch_loop(w: &Watching, knocks: c_int) {
             // and no descriptor is freed only to be handed straight back,
             // which is how a queued `IN_IGNORED` would land on the wrong
             // watch.
-            have.retain(|(dir, wd)| {
-                let keep = want.binary_search(dir).is_ok();
-                if !keep && *wd != NONE {
-                    unsafe { inotify_rm_watch(fd, *wd) };
+            have.retain(|h| {
+                let keep = want.binary_search(&h.asked).is_ok();
+                if !keep && h.wd != NONE {
+                    unsafe { inotify_rm_watch(fd, h.wd) };
                 }
                 keep
             });
             for dir in want {
-                if !have.iter().any(|(d, _)| *d == dir) {
-                    have.push((dir, NONE));
+                if !have.iter().any(|h| h.asked == dir) {
+                    have.push(Held {
+                        asked: dir,
+                        canon: PathBuf::new(),
+                        wd: NONE,
+                    });
                 }
             }
-            have.sort_by(|(a, _), (b, _)| a.cmp(b));
+            have.sort_by(|a, b| a.asked.cmp(&b.asked));
         }
-        for (dir, wd) in have.iter_mut().filter(|(_, wd)| *wd == NONE) {
-            *wd = add(fd, dir);
+        // A watch is on the inode a path led to, so a path that leads
+        // somewhere else now is being watched in the wrong place: the old
+        // watch goes, the new one is taken here, and the panel is owed a
+        // reading of what its path names today.
+        let mut moved: Vec<PathBuf> = Vec::new();
+        for h in &mut have {
+            let canon = resolve(&h.asked);
+            if h.wd != NONE && canon != h.canon {
+                unsafe { inotify_rm_watch(fd, h.wd) };
+                h.wd = NONE;
+                moved.push(h.asked.clone());
+            }
+            if h.wd == NONE {
+                h.wd = add(fd, &h.asked);
+                h.canon = canon;
+            }
         }
+        w.report(&moved);
         wait(fd, knocks, TURN);
         let hit = drain(fd, &mut have);
         w.report(&hit);
     }
-    for (_, wd) in have.drain(..).filter(|(_, wd)| *wd != NONE) {
-        unsafe { inotify_rm_watch(fd, wd) };
+    for h in have.drain(..).filter(|h| h.wd != NONE) {
+        unsafe { inotify_rm_watch(fd, h.wd) };
     }
     unsafe { close(fd) };
 }
@@ -217,8 +244,8 @@ const NONE: c_int = -1;
 /// Whether the directories being kept are the ones wanted. Both are
 /// sorted — the books answer in key order and the list is kept in it — so
 /// this is the comparison and not a search.
-fn same(have: &[(PathBuf, c_int)], want: &[PathBuf]) -> bool {
-    have.len() == want.len() && have.iter().zip(want).all(|((d, _), w)| d == w)
+fn same(have: &[Held], want: &[PathBuf]) -> bool {
+    have.len() == want.len() && have.iter().zip(want).all(|(h, w)| h.asked == *w)
 }
 
 /// One directory watched, or [`NONE`] where it cannot be: a directory that
@@ -258,18 +285,34 @@ fn wait(fd: c_int, knocks: c_int, turn: f64) {
 /// Everything inotify has to say right now, as the set of directories it
 /// happened in — one round however many events carried it.
 ///
-/// A watch the kernel has closed is taken back here rather than left
-/// standing dead, so the loop's next turn asks for that directory again.
-fn drain(fd: c_int, have: &mut [(PathBuf, c_int)]) -> Vec<PathBuf> {
+/// A watch that is over — the kernel closed it, or the directory moved
+/// and took the watch with it to a place the path no longer names — is
+/// given up here rather than left standing, so the loop's next turn asks
+/// for that directory again by name.
+fn drain(fd: c_int, have: &mut [Held]) -> Vec<PathBuf> {
     // Aligned, because what is read into it is a run of C structs.
     #[repr(C, align(8))]
     struct Buf([u8; 4096]);
     let mut buf = Buf([0; 4096]);
     let mut hit: Vec<PathBuf> = Vec::new();
+    let mut lost = false;
     loop {
         let n = unsafe { read(fd, buf.0.as_mut_ptr().cast::<c_void>(), buf.0.len()) };
         if n <= 0 {
-            return hit; // nothing left, or nothing at all
+            if !lost {
+                return hit; // nothing left, or nothing at all
+            }
+            // Every directory reported, because what was dropped cannot
+            // be known — and every watch given up with them, because an
+            // `IN_IGNORED` may have been among what was dropped and a
+            // watch believed live that is not is a panel that never
+            // refreshes again. Asking for one that is still live answers
+            // with the descriptor it already has, so this costs a syscall
+            // and not a watch.
+            for h in have.iter_mut() {
+                h.wd = NONE;
+            }
+            return have.iter().map(|h| h.asked.clone()).collect();
         }
         let n = n as usize;
         let mut at = 0;
@@ -278,19 +321,25 @@ fn drain(fd: c_int, have: &mut [(PathBuf, c_int)]) -> Vec<PathBuf> {
             // as the one before it left it.
             let head = unsafe { buf.0.as_ptr().add(at) }.cast::<inotify_event>();
             let e = unsafe { head.read_unaligned() };
-            if e.mask & IN_Q_OVERFLOW != 0 {
-                // What was lost cannot be known: everything is stale.
-                return have.iter().map(|(d, _)| d.clone()).collect();
-            }
+            lost |= e.mask & IN_Q_OVERFLOW != 0;
             // Every directory under that descriptor, not the first: one
             // inode reached by two paths is watched once, and both panels
             // are looking at what changed.
-            for (dir, wd) in have.iter_mut().filter(|(_, wd)| *wd == e.wd) {
-                if !hit.contains(dir) {
-                    hit.push(dir.clone());
+            for h in have.iter_mut().filter(|h| h.wd == e.wd) {
+                if !hit.contains(&h.asked) {
+                    hit.push(h.asked.clone());
                 }
-                if e.mask & IN_IGNORED != 0 {
-                    *wd = NONE;
+                // The watch is over, or it is about to be watching the
+                // wrong place: a moved directory keeps its watch, and the
+                // watch follows the inode rather than the name. Either
+                // way the descriptor is given up and the path asked for
+                // again on the next turn — where the `IN_IGNORED` our own
+                // removal queues is read by this same drain, before that.
+                if e.mask & (IN_IGNORED | IN_MOVE_SELF) != 0 {
+                    if e.mask & IN_MOVE_SELF != 0 {
+                        unsafe { inotify_rm_watch(fd, h.wd) };
+                    }
+                    h.wd = NONE;
                 }
             }
             at += HEAD + e.len as usize;

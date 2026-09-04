@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::{Watching, TURN};
+use super::{resolve, Watching, TURN};
 
 // -- what CoreServices calls it ------------------------------------------------
 
@@ -228,14 +228,39 @@ fn watch_loop(w: &Watching, run_loop: &Arc<AtomicUsize>, idle: &Park) {
     let rl = unsafe { CFRunLoopGetCurrent() };
     run_loop.store(rl as usize, Ordering::SeqCst);
 
-    let mut have: Vec<PathBuf> = Vec::new();
+    // Each wanted directory as the panel asked for it and as it resolves
+    // now — the pair the callback matches on, and the pair a rebuild is
+    // decided by: a link repointed at another directory is a change to
+    // the path a panel is showing, with nothing having happened in either
+    // place for FSEvents to report.
+    let mut have: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut stream: Option<Stream> = None;
     while !w.stopped() {
-        let want = w.want();
+        let want: Vec<(PathBuf, PathBuf)> = w
+            .want()
+            .into_iter()
+            .map(|dir| {
+                let canon = resolve(&dir);
+                (dir, canon)
+            })
+            .collect();
         if want != have {
+            // What a path leads to now, where it led somewhere else
+            // before: a reading is owed on that path, and the panel that
+            // has just opened — not in `have` at all — is owed nothing,
+            // since it read the directory itself a moment ago.
+            let moved: Vec<PathBuf> = want
+                .iter()
+                .filter(|(asked, canon)| {
+                    have.iter()
+                        .any(|(was, before)| was == asked && before != canon)
+                })
+                .map(|(asked, _)| asked.clone())
+                .collect();
             drop(stream.take()); // the old one goes before the new one is made
             stream = Stream::open(&want, w, rl);
             have = want;
+            w.report(&moved);
         }
         if stream.is_some() {
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, TURN, 0) };
@@ -268,13 +293,11 @@ struct Stream {
 }
 
 impl Stream {
-    /// A stream over these directories, or `None` for none to watch and
-    /// for a stream the system would not start.
-    fn open(dirs: &[PathBuf], w: &Watching, rl: CFRunLoopRef) -> Option<Stream> {
-        let dirs: Vec<(PathBuf, PathBuf)> = dirs
-            .iter()
-            .map(|d| (d.clone(), std::fs::canonicalize(d).unwrap_or(d.clone())))
-            .collect();
+    /// A stream over these directories — each as the panel asked for it
+    /// and as it resolves right now — or `None` for none to watch and for
+    /// a stream the system would not start.
+    fn open(dirs: &[(PathBuf, PathBuf)], w: &Watching, rl: CFRunLoopRef) -> Option<Stream> {
+        let dirs = dirs.to_vec();
         if dirs.is_empty() {
             return None;
         }

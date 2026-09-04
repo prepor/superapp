@@ -254,9 +254,12 @@ leaves a panel refreshing on its own writes alone. Watching is per directory
 and never recursive, so a build running three levels down is not a listing's
 business. A directory taken out from under a panel — moved, renamed or deleted
 — is a change to that directory and reported as one, so a listing never goes on
-drawing a path that is not there. When the platform says only that events were
-lost, every watched directory is reported: a listing that may be stale and one
-known to be stale are worth the same reading. Events are otherwise grouped
+drawing a path that is not there. So is a path that leads somewhere else than
+it did: both instruments watch what a path resolved to, so what each path leads
+to is asked again on every turn, and a repointed link is a change to the panel
+showing it. When the platform says only that events were lost, every watched
+directory is reported and every watch retaken: a listing that may be stale and
+one known to be stale are worth the same reading. Events are otherwise grouped
 twice: the platform coalesces a burst into one delivery, and a delivery bumps a
 directory once however many paths it carried — a thousand-file copy is one
 reading, not a thousand. The watching thread rings the UI thread's bell, and

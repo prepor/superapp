@@ -154,6 +154,20 @@ impl Watching {
     }
 }
 
+/// What a path resolves to right now: the directory both instruments
+/// actually end up watching, since FSEvents is given a resolved path and
+/// inotify watches the inode a path led to.
+///
+/// Asked on every turn and not once, because a link is a name for
+/// somewhere else and a link can be repointed: `~/latest` is a different
+/// directory after a build, with nothing whatever having happened in the
+/// one it named before. A path with nothing at the end of it answers as
+/// itself, which is stable — a directory that is not there does not keep
+/// looking as though it had just moved.
+pub(crate) fn resolve(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     //! The one thing no fake can answer for: that this machine actually
@@ -168,10 +182,16 @@ mod tests {
 
     use super::{RealWatcher, Watcher};
 
-    /// A directory of this run's own, swept before it is used.
+    /// A path of this run's own — the pid is in the name, because two
+    /// checkouts of this tree run their suites side by side and a
+    /// temporary directory is shared by every one of them.
+    fn spot(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("superapp-watch-{}-{name}", std::process::id()))
+    }
+
+    /// One of those, made, and swept first if a run before this left it.
     fn scratch(name: &str) -> PathBuf {
-        let mine = format!("superapp-watch-{}-{name}", std::process::id());
-        let dir = std::env::temp_dir().join(mine);
+        let dir = spot(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a directory to watch");
         dir
@@ -243,7 +263,7 @@ mod tests {
         // would never mention, and the panel would draw a listing of a
         // path that is not there for as long as it stayed open.
         w.watch(&watched);
-        let gone = next_door.with_file_name("superapp-watch-gone");
+        let gone = spot("gone");
         let _ = std::fs::remove_dir_all(&gone);
         std::thread::sleep(patience);
         std::fs::rename(&watched, &gone).expect("the directory moves away");
@@ -258,6 +278,65 @@ mod tests {
 
         drop(w); // the thread stops with the watcher, and joins
         for dir in [next_door, gone] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A link is a name for somewhere else, and repointing it changes
+    /// what a panel is showing without anything happening in either
+    /// directory. FSEvents is given a resolved path, so it would go on
+    /// reporting the place the name used to lead to and say nothing about
+    /// the swap: what answers for it is asking what the path leads to on
+    /// every turn.
+    #[test]
+    fn a_link_pointed_somewhere_else_is_a_change_to_the_path() {
+        let (here, there) = (scratch("link-here"), scratch("link-there"));
+        let link = spot("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&here, &link).expect("a link to watch through");
+
+        let mut w = RealWatcher::start(|| {});
+        w.watch(&link);
+        // Watched where it leads now, which is proved by a write landing
+        // through it before anything is repointed.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut n = 0;
+        while w.revision(&link) == 0 && Instant::now() < deadline {
+            n += 1;
+            std::fs::write(here.join(format!("{n}.txt")), b"hello").expect("a file");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(w.revision(&link) > 0, "a write through the link lands");
+
+        let before = w.revision(&link);
+        std::fs::remove_file(&link).expect("the link goes");
+        std::os::unix::fs::symlink(&there, &link).expect("and leads somewhere else");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while w.revision(&link) == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            w.revision(&link) > before,
+            "the path leading somewhere else is a change to it"
+        );
+
+        // And it is the new place that is watched now.
+        let before = w.revision(&link);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut n = 0;
+        while w.revision(&link) == before && Instant::now() < deadline {
+            n += 1;
+            std::fs::write(there.join(format!("{n}.txt")), b"hello").expect("a file");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            w.revision(&link) > before,
+            "a write where the link leads now lands too"
+        );
+
+        drop(w);
+        let _ = std::fs::remove_file(&link);
+        for dir in [here, there] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
