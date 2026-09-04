@@ -58,7 +58,19 @@ impl RealServers {
 }
 
 impl Imap for RealServers {
+    /// The session this account already has, if the server still has it —
+    /// a `NOOP` is one round trip and says so. A pass a minute, and the
+    /// batches a backfill takes, must not be a sign-in each: providers
+    /// count logins, and Gmail counts them narrowly.
     fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+        if self
+            .sessions
+            .get_mut(&account)
+            .is_some_and(session::Imap::alive)
+        {
+            return Ok(());
+        }
+        self.sessions.remove(&account);
         let s = session::connect(&c.host, &c.user, &c.auth)?;
         self.sessions.insert(account, s);
         Ok(())
@@ -419,6 +431,12 @@ mod session {
             })
         }
 
+        /// Whether the server still has this session. A dead one answers
+        /// with an error rather than a lie, which is what makes reuse safe.
+        pub fn alive(&mut self) -> bool {
+            self.session.noop().is_ok()
+        }
+
         fn ensure(&mut self, name: &str) -> Result<(), String> {
             if self.selected.as_deref() != Some(name) {
                 self.select(name)?;
@@ -452,11 +470,17 @@ mod session {
 
         /// One `UID FETCH` over any sequence set — `12:*` for new mail,
         /// `1:200` and its like for the backfill.
+        ///
+        /// `BODY.PEEK[]` rather than `RFC822`, which is the same bytes
+        /// without the `\Seen` a plain fetch sets: mirroring a folder is
+        /// not reading it, and a backfill that walked a mailbox's whole
+        /// past would otherwise mark every unread letter in it read — on
+        /// the server, for every client the person owns.
         pub fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
             self.ensure(name)?;
             let fetches = self
                 .session
-                .uid_fetch(set, "(UID FLAGS RFC822)")
+                .uid_fetch(set, "(UID FLAGS BODY.PEEK[])")
                 .map_err(s)?;
             let mut out: Vec<RemoteMail> = fetches
                 .iter()

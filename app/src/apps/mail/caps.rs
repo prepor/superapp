@@ -343,6 +343,10 @@ pub struct FakeServer {
     /// How many letters this account has handed to a fetch — what a test
     /// counts to see that a folder already mirrored costs no round trip.
     pub fetched: usize,
+    /// The backfill batches it was asked for, in order: `(folder, uids)`.
+    /// A test reads them to see a folder arrive newest-first, a batch at a
+    /// time.
+    pub backfills: Vec<(String, Vec<u32>)>,
 }
 
 impl FakeServer {
@@ -601,6 +605,7 @@ impl Imap for FakeServers {
                     .cloned()
                     .collect();
             s.fetched += out.len();
+            s.backfills.push((folder.to_string(), uids.to_vec()));
             Ok(out)
         })
     }

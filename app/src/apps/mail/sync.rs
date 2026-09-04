@@ -35,10 +35,17 @@ pub const BACKFILL: usize = 200;
 /// before it looks outside again (see [`SyncPass`]).
 const POLL: Duration = Duration::from_secs(60);
 
-/// The wait between backfill batches, which is not [`POLL`]: a folder still
-/// filling in its past has somewhere to go, and the pause is only there so
-/// the rest of the process gets a turn.
-const REACH: Duration = Duration::from_millis(200);
+/// How long one pass spends reaching into a folder's past before it hands
+/// the thread back. The batches themselves are cheap; what is not cheap is
+/// keeping this account's own jobs — an archive, a mark read — waiting
+/// behind the first sync of fifty thousand letters.
+const REACH_BUDGET: Duration = Duration::from_secs(20);
+
+/// How soon a pass that ran out of budget comes back for the rest. Not
+/// [`POLL`], because there is somewhere to go; not at once either, because
+/// the folder discovery and the three searches a batch sits behind are
+/// round trips of their own.
+const REACH: Duration = Duration::from_secs(5);
 
 // -- one account's pass -----------------------------------------------------------
 
@@ -260,8 +267,6 @@ struct Gathered {
     reset: bool,
     uidvalidity: u32,
     uidnext: u32,
-    /// What to ingest: the new mail, then whatever the backfill reached
-    /// back for.
     mails: Vec<RemoteMail>,
     server: HashSet<u32>,
     unseen: HashSet<u32>,
@@ -383,27 +388,6 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             HashSet::new()
         };
 
-        // Reach back. The `ALL` search above is the folder entire, so what
-        // this store is missing is a set difference rather than a guess:
-        // take the newest BACKFILL of them, and the next pass takes the
-        // next. A folder already mirrored whole leaves this empty and costs
-        // no round trip at all.
-        let batch = missing(w.store(), fid, reset, &server, &mails);
-        if !batch.is_empty() {
-            let asked = batch.len();
-            let got = w.run(&Backfill {
-                account,
-                folder: rf.name.clone(),
-                uids: batch,
-            })?;
-            // Another turn at once only while letters are actually
-            // arriving: a uid the server lists and then will not hand over
-            // costs a round trip a minute, never a pass every fifth of a
-            // second for as long as the account exists.
-            more |= asked == BACKFILL && !got.is_empty();
-            mails.extend(got);
-        }
-
         // Commit. One transaction, no network.
         let g = Gathered {
             fid,
@@ -411,7 +395,9 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             uidvalidity: meta.uidvalidity,
             uidnext: meta.uidnext,
             mails,
-            server,
+            // The loop below reads it too: the folder entire, as the
+            // server just listed it.
+            server: server.clone(),
             unseen,
             forwarded,
             keywords: meta.keywords,
@@ -419,30 +405,58 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
         w.store()
             .write(move |tx| land(tx, account, &g))
             .map_err(err)?;
+
+        // Reach back, over the session this pass already holds. The `ALL`
+        // search above is the folder entire, so what this store is missing
+        // is a set difference rather than a guess: one fetch and one commit
+        // a batch, which is what keeps a whole mailbox out of memory while
+        // still mirroring it in one sitting. A folder already whole asks
+        // for nothing and costs no round trip at all.
+        let until = w.now() + REACH_BUDGET.as_secs_f64();
+        loop {
+            let batch = missing(w.store(), fid, &server);
+            if batch.is_empty() {
+                break;
+            }
+            if w.now() >= until {
+                more = true;
+                break;
+            }
+            let got = w.run(&Backfill {
+                account,
+                folder: rf.name.clone(),
+                uids: batch,
+            })?;
+            // Listed by the search and then not handed over: nothing this
+            // pass can do about it, and asking again in a loop is a spin.
+            if got.is_empty() {
+                break;
+            }
+            w.store()
+                .write(move |tx| {
+                    for m in &got {
+                        ingest_message(tx, account, fid, m)?;
+                    }
+                    Ok(())
+                })
+                .map_err(err)?;
+        }
     }
     Ok(more)
 }
 
 /// The uids the server still has and this store does not, newest first,
-/// capped at one batch — what the backfill asks for next. A folder whose
-/// uidvalidity changed counts as holding nothing: its rows are about to be
-/// deleted, so the whole folder is missing.
-fn missing(
-    store: &Store,
-    fid: i64,
-    reset: bool,
-    server: &HashSet<u32>,
-    fetched: &[RemoteMail],
-) -> Vec<u32> {
-    let mut have: HashSet<u32> = fetched.iter().map(|m| m.uid).collect();
-    if !reset {
-        if let Ok(mut stmt) = store
-            .conn()
-            .prepare("SELECT uid FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL")
-        {
-            if let Ok(rows) = stmt.query_map([fid], |r| r.get::<_, i64>(0)) {
-                have.extend(rows.filter_map(Result::ok).map(|u| u as u32));
-            }
+/// capped at one batch — what the backfill asks for next. Read back out of
+/// the store after each commit, so a folder that was just reset counts as
+/// holding nothing and a batch already landed is never asked for twice.
+fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
+    let mut have: HashSet<u32> = HashSet::new();
+    if let Ok(mut stmt) = store
+        .conn()
+        .prepare("SELECT uid FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL")
+    {
+        if let Ok(rows) = stmt.query_map([fid], |r| r.get::<_, i64>(0)) {
+            have.extend(rows.filter_map(Result::ok).map(|u| u as u32));
         }
     }
     let mut batch: Vec<u32> = server
