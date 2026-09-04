@@ -223,6 +223,7 @@ impl Widget for MessagePanel {
             if let Some(q) = quote {
                 props.hits.add("› quoted", q, MouseCursor::Hand, props.slot);
             }
+            let mut letter = None;
             if is_open {
                 let path = if t.mail.html.is_some() {
                     ids!(body.html_wrap.body_html)
@@ -236,6 +237,7 @@ impl Widget for MessagePanel {
                 };
                 if let Some(r) = rect(path) {
                     props.hits.add(label, r, MouseCursor::Text, props.slot);
+                    letter = t.mail.html.is_some().then_some(r);
                 }
             }
             // The `$Forwarded` mark is a fact about the letter and not a
@@ -246,6 +248,16 @@ impl Widget for MessagePanel {
                     props
                         .hits
                         .add("passed on", r, MouseCursor::Default, props.slot);
+                }
+            }
+            // What a letter carries that answers a press — a link, the
+            // summary line of a fold, a picture that is a link — as
+            // rectangles of its own over the reading's. The pointer is
+            // painted from the hit table, so without them a link would wear
+            // the I-beam the letter around it is read with.
+            if let Some(letter) = letter {
+                for r in link_runs(cx, &row, letter) {
+                    props.hits.add("link", r, MouseCursor::Hand, props.slot);
                 }
             }
             self.rows.push(RowHit { mail, head, quote });
@@ -276,6 +288,30 @@ impl MessagePanel {
             }
         }
     }
+}
+
+/// Where an open letter's own controls landed: every run the `Html` widget
+/// tracked as it drew, kept inside the letter.
+///
+/// A rect goes on that list so something *in* the letter can answer a press
+/// — the runs of a link, the summary line of a fold, and a picture that
+/// stood in a link, which [`pictures`] puts there for the same reason.
+/// Nothing else in a letter is tracked, so the list is exactly what a press
+/// means something to.
+fn link_runs(cx: &Cx2d, row: &WidgetRef, letter: Rect) -> Vec<Rect> {
+    let html = row.widget(cx, ids!(body.html_wrap.body_html)).as_html();
+    let Some(html) = html.borrow() else {
+        return Vec::new();
+    };
+    let bounds = (letter.pos, letter.pos + letter.size);
+    html.text_flow
+        .areas_tracker
+        .areas
+        .iter()
+        .filter(|a| a.is_valid(cx))
+        .map(|a| a.rect(cx).clip(bounds))
+        .filter(|r| r.size.x > 0.0 && r.size.y > 0.0)
+        .collect()
 }
 
 /// What a script addresses a row by: sender and the line it previews while it

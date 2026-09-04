@@ -632,7 +632,7 @@ impl Widget for HtmlImage {
         }
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         // Asked again while it decodes, not once: re-asking is an early return
         // inside makepad's cache while the job is still on the pool, and the
         // one way back when a *finished* texture is evicted under the cache's
@@ -650,7 +650,19 @@ impl Widget for HtmlImage {
                     .or(self.nat)
                     .unwrap_or((1.0, 1.0));
                 let walk = self.box_walk(cx, nat);
-                self.image.draw_walk_image(cx, walk)
+                let step = self.image.draw_walk_image(cx, walk);
+                // A picture that is a link is a control, and the panel around
+                // the letter reads the runs its text links left on the flow's
+                // tracker to know where a hand belongs. This is one of them.
+                if !self.href.is_empty() {
+                    if let Some(tf) = scope.data.get_mut::<TextFlow>() {
+                        let r = self.image.area().rect(cx);
+                        tf.areas_tracker.push_tracker();
+                        tf.areas_tracker.track_rect(cx, r);
+                        tf.areas_tracker.pop_tracker();
+                    }
+                }
+                step
             }
             // Bytes in hand, decoding: hold the box the picture will fill
             // rather than lay out the alt text and reflow a frame later.
