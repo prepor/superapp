@@ -1052,6 +1052,82 @@ fn a_keywordless_server_is_never_told_about_the_mark() {
     );
 }
 
+// -- the backfill ------------------------------------------------------------------
+
+/// A folder bigger than one batch arrives whole. The pass reaches back
+/// [`BACKFILL`](super::super::sync::BACKFILL) letters a turn and says there
+/// is more to come; the turn that finds nothing missing says so, and asks
+/// the server for no letters at all.
+#[test]
+fn a_folder_larger_than_a_batch_arrives_whole() {
+    use super::sync::{self, BACKFILL};
+
+    let (s, _clock) = session();
+    let n = BACKFILL + 40;
+    // The demo account's INBOX, renumbered and refilled: uidvalidity moved,
+    // so nothing local means anything and the whole folder is missing.
+    servers(&s)
+        .with(1, |srv| {
+            srv.folder("INBOX", 9);
+            for i in 0..n {
+                srv.deliver_flagged(
+                    "INBOX",
+                    true,
+                    false,
+                    &format!(
+                        "Message-ID: <bulk{i}@kovac.io>\r\n\
+                         From: Vera Kovac <vera@kovac.io>\r\n\
+                         Subject: bulk {i}\r\n\
+                         Date: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+                         \r\n\
+                         letter {i}\r\n"
+                    ),
+                );
+            }
+        })
+        .expect("the demo account's server");
+
+    let held = || -> i64 {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message
+                  WHERE folder = (SELECT id FROM folder WHERE name = 'INBOX')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1)
+    };
+
+    let more = sync::sync_account(s.world(), 1).expect("a pass");
+    assert!(more, "a full batch means there is more of the folder to come");
+    assert_eq!(held(), BACKFILL as i64, "one batch, newest first");
+    // …and it is the newest end of the folder: the batch reaches back from
+    // the top, so the last letter planted is already here.
+    let newest: i64 = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE subject = ?1",
+            [format!("bulk {}", n - 1)],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(newest, 1, "the newest letter came in the first batch");
+
+    let more = sync::sync_account(s.world(), 1).expect("a second pass");
+    assert!(!more, "the rest was less than a batch");
+    assert_eq!(held(), n as i64, "the folder entire");
+
+    // A mirrored folder costs no letters at all: the pass looks, finds
+    // nothing missing, and asks for none.
+    let handed = || servers(&s).with(1, |srv| srv.fetched).unwrap_or_default();
+    let before = handed();
+    assert!(!sync::sync_account(s.world(), 1).expect("a third pass"));
+    assert_eq!(held(), n as i64);
+    assert_eq!(handed(), before, "nothing was fetched a second time");
+}
+
 // -- the accounts -----------------------------------------------------------------
 
 // -- reopening a failed send -------------------------------------------------------

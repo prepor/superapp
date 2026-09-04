@@ -231,12 +231,26 @@ pub trait Imap {
     /// If there is no such folder.
     fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String>;
 
-    /// Messages with `uid >= from`, ascending.
+    /// Messages with `uid >= from`, ascending — what a pass receives new
+    /// mail with.
     ///
     /// # Errors
     ///
     /// If there is no such folder.
     fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String>;
+
+    /// Exactly these uids, ascending — what the backfill reaches into a
+    /// folder's past with. `uids` is sorted and holds no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such folder.
+    fn fetch_uids(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<RemoteMail>, String>;
 
     /// The uids in the folder: every one, those without `\Seen`, or those
     /// wearing `$Forwarded`.
@@ -326,6 +340,9 @@ pub struct FakeServer {
     pub keywords: bool,
     /// Mail this account handed to SMTP.
     pub submitted: Vec<Outgoing>,
+    /// How many letters this account has handed to a fetch — what a test
+    /// counts to see that a folder already mirrored costs no round trip.
+    pub fetched: usize,
 }
 
 impl FakeServer {
@@ -564,7 +581,27 @@ impl Imap for FakeServers {
     fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
         self.live(account, |s| {
             let f = s.get(folder)?;
-            Ok(f.2.iter().filter(|m| m.uid >= from).cloned().collect())
+            let out: Vec<RemoteMail> = f.2.iter().filter(|m| m.uid >= from).cloned().collect();
+            s.fetched += out.len();
+            Ok(out)
+        })
+    }
+
+    fn fetch_uids(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<RemoteMail>, String> {
+        self.live(account, |s| {
+            let f = s.get(folder)?;
+            let out: Vec<RemoteMail> =
+                f.2.iter()
+                    .filter(|m| uids.contains(&m.uid))
+                    .cloned()
+                    .collect();
+            s.fetched += out.len();
+            Ok(out)
         })
     }
 
