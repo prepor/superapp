@@ -214,6 +214,19 @@ Under virtual time there are no threads. Every pass runs inline from the frame
 loop and the queue is then drained until it stops moving, bounded, so a job that
 files another job shows as a backlog rather than a hang.
 
+A pass may wake another by address, through the `Kicker` capability every world
+of a threaded mount carries. That is how a pass which learns something another
+one owns hands it over instead of doing the work on the wrong thread: mail's
+watch is told by a server that a letter arrived, and only the account's own
+sync pass holds the session that may fetch it. It is not an effect and not in
+the log — nothing leaves the process. In a build that runs no passes, a kick
+does nothing, which is what an inline mount wants: every pass already runs
+every tick.
+
+What a world holds is a weak handle. The set holds each pass's own channel,
+so a strong one would be a ring through the very thread it stops, and a
+session that let go of its passes would close no channel and end nothing.
+
 ## Problems
 
 `ProblemSource::list(store)` is asked on every poll. A `Problem` carries a

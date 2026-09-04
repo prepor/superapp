@@ -6,11 +6,12 @@
 //! begins.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kernel::app::{Wake, Worker};
-use kernel::caps::Secrets;
+use kernel::caps::{Kicker, Secrets};
 use kernel::effect::{Job, World};
 use kernel::store::Store;
 use kernel::time::fmt_date;
@@ -18,9 +19,10 @@ use rusqlite::Transaction;
 
 use super::accounts;
 use super::parts;
-use super::caps::{Creds, OAuth, RemoteMail, UidSet};
+use super::caps::{Creds, OAuth, RemoteMail, UidSet, Watched};
 use super::effects::{
-    account_entity, Backfill, Connect, Fetch, Folders, Forwarded, Meta, Move, Seen, Submit, Uids,
+    account_entity, Backfill, Connect, Disconnect, Fetch, Folders, Forwarded, Meta, Move, Seen,
+    Submit, Uids, Watch,
 };
 use super::model::{self, topic_of};
 
@@ -46,6 +48,17 @@ const REACH_BUDGET: Duration = Duration::from_secs(20);
 /// the folder discovery and the three searches a batch sits behind are
 /// round trips of their own.
 const REACH: Duration = Duration::from_secs(5);
+
+/// How long one [`Watch`] waits before it is re-issued. RFC 2177 puts the
+/// ceiling at 29 minutes — a server may log out a client that idles longer —
+/// and this is well under it on purpose: the wait cannot be interrupted, so
+/// it is also how long a watch takes to notice that it has been retired,
+/// that the machine woke with a dead socket, or that the account is gone.
+pub(super) const WATCH: Duration = Duration::from_secs(5 * 60);
+
+/// How long a watch holds off after a refusal. The interval is still
+/// running underneath, so this costs latency, never mail.
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 
 // -- one account's pass -----------------------------------------------------------
 
@@ -976,23 +989,29 @@ pub struct SyncPass {
     due: f64,
     /// The [`PULL`] generation this pass has answered.
     seen: u64,
+    /// What this account's [`IdleWatch`] heard: the server said something
+    /// arrived. Set there, consumed here, and one account's own, which is
+    /// what keeps a letter for one mailbox from pulling every other.
+    news: Arc<AtomicBool>,
 }
 
 impl SyncPass {
     #[must_use]
-    pub fn new(account: i64) -> SyncPass {
+    pub fn new(account: i64, news: Arc<AtomicBool>) -> SyncPass {
         SyncPass {
             account,
             due: 0.0,
             seen: PULL.load(Ordering::Relaxed),
+            news,
         }
     }
 
-    /// Whether this turn looks outside: the interval has run out, or
-    /// somebody asked. Consumes the request either way.
+    /// Whether this turn looks outside: the interval has run out, somebody
+    /// asked, or the watch heard something. Consumes the request either way.
     fn pull_due(&mut self, w: &World) -> bool {
         let asked = PULL.load(Ordering::Relaxed);
-        let due = asked != self.seen || w.now() >= self.due;
+        let heard = self.news.swap(false, Ordering::Relaxed);
+        let due = heard || asked != self.seen || w.now() >= self.due;
         if due {
             self.seen = asked;
             self.due = w.now() + POLL.as_secs_f64();
@@ -1096,9 +1115,148 @@ impl Worker for SenderPass {
     }
 }
 
-/// The passes mail wants running now: one per configured account, and the
-/// sender. Derived from the store, so an account added later starts a worker
-/// without a restart.
+/// One account's watch: a second session, sitting in `IDLE` on the inbox so
+/// the server can say that a letter arrived instead of being asked once a
+/// minute.
+///
+/// It fetches nothing. The account's own [`SyncPass`] holds the session that
+/// may write, and two threads ingesting one mailbox would race for the same
+/// uids — so a watch that hears something sets the account's [`NEWS`] flag,
+/// wakes that pass, and goes back to waiting.
+///
+/// The second connection is what buys the first one's manners: a wait cannot
+/// be cut short, and a pass that spent five minutes inside `IDLE` could not
+/// push a mark the moment a verb made one.
+pub struct IdleWatch {
+    account: i64,
+    /// What the sync pass reads: the server said something arrived.
+    news: Arc<AtomicBool>,
+    /// Not before this, on the world's clock — a backoff after a refusal,
+    /// and the rest of a window a watch came back from early.
+    next: f64,
+    /// Whether this session is open. A failed wait drops it.
+    connected: bool,
+    /// This server offers no `IDLE`, so there is nothing to wait on and the
+    /// watch is over: the session is handed back and the pass sleeps until
+    /// kicked, holding nothing. The interval carries the account, as it
+    /// always did.
+    parked: bool,
+}
+
+impl IdleWatch {
+    #[must_use]
+    pub fn new(account: i64, news: Arc<AtomicBool>) -> IdleWatch {
+        IdleWatch {
+            account,
+            news,
+            next: 0.0,
+            connected: false,
+            parked: false,
+        }
+    }
+
+    /// The wait left before the next attempt.
+    fn holding(&self, w: &World) -> Wake {
+        Wake::After(Duration::from_secs_f64(
+            (self.next - w.now()).clamp(0.0, WATCH.as_secs_f64()),
+        ))
+    }
+
+    /// Which folder this watch sits on: the inbox, once a pass has mirrored
+    /// the folders. `IDLE` reports on the selected mailbox and no other, and
+    /// the inbox is the one whose latency anybody feels.
+    fn inbox(&self, w: &World) -> Option<String> {
+        w.store()
+            .conn()
+            .query_row(
+                "SELECT name FROM folder WHERE account = ?1 AND role = 'inbox'",
+                [self.account],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+}
+
+impl Worker for IdleWatch {
+    fn name(&self) -> String {
+        format!("watch-{}", self.account)
+    }
+
+    fn entity(&self) -> Option<String> {
+        Some(account_entity(self.account))
+    }
+
+    /// Nothing. The session this one holds is for waiting, and every job an
+    /// account has needs the session that may write.
+    fn claims(&self, _job: &Job) -> bool {
+        false
+    }
+
+    fn pass(&mut self, w: &World) -> Wake {
+        if self.parked {
+            return Wake::OnKick;
+        }
+        if w.now() < self.next {
+            return self.holding(w);
+        }
+        let account = self.account;
+        // Before the first pass has mirrored them there is no inbox to sit
+        // on, and nothing to hear about it either.
+        let Some(folder) = self.inbox(w) else {
+            self.next = w.now() + WATCH_RETRY.as_secs_f64();
+            return self.holding(w);
+        };
+        if !self.connected {
+            if connect(w, account).is_err() {
+                self.next = w.now() + WATCH_RETRY.as_secs_f64();
+                return self.holding(w);
+            }
+            self.connected = true;
+        }
+        let started = w.now();
+        match w.run(&Watch {
+            account,
+            folder,
+            window: WATCH,
+        }) {
+            Ok(Watched::Changed) => {
+                // The pass that may fetch is asleep on its interval, so it
+                // is told what was heard and then woken to act on it.
+                self.news.store(true, Ordering::Relaxed);
+                let _ = w.with_cap::<dyn Kicker, _>(|k| k.kick(&account_entity(account)));
+                Wake::After(Duration::ZERO)
+            }
+            // A wait that came back before its window was up did not wait:
+            // a fake, which cannot block, or a link that hung up. Hold the
+            // rest of the window rather than ask again at once — with a
+            // server that really waited, that remainder is already spent.
+            Ok(Watched::Quiet) => {
+                self.next = started + WATCH.as_secs_f64();
+                self.holding(w)
+            }
+            Ok(Watched::Unsupported) => {
+                // Nothing to wait on is nothing to hold open. A server that
+                // offers no `IDLE` may well be one that counts connections,
+                // and the pass that fetches needs one more than a watch with
+                // no work left does.
+                let _ = w.run(&Disconnect { account });
+                self.connected = false;
+                self.parked = true;
+                Wake::OnKick
+            }
+            Err(_) => {
+                self.connected = false;
+                self.next = w.now() + WATCH_RETRY.as_secs_f64();
+                self.holding(w)
+            }
+        }
+    }
+}
+
+/// The passes mail wants running now: one per configured account — the sync
+/// pass and its watch, which share what the watch hears — and the sender.
+/// Derived from the store, so an account added later starts a worker without
+/// a restart.
 #[must_use]
 pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
     let mut v: Vec<Box<dyn Worker>> = vec![Box::new(SenderPass)];
@@ -1113,7 +1271,15 @@ pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
         .map(|it| it.filter_map(Result::ok).collect())
         .unwrap_or_default();
     for a in accounts {
-        v.push(Box::new(SyncPass::new(a)));
+        // The pair's own flag, made here where the pair is: an account id
+        // means something to one store and this process may hold several,
+        // so nothing about a watch is kept anywhere a second store could
+        // reach. The two halves are always answered for together, and the
+        // kernel spawns a name it does not already have — so the running
+        // pair is one answer's pair.
+        let news = Arc::new(AtomicBool::new(false));
+        v.push(Box::new(SyncPass::new(a, news.clone())));
+        v.push(Box::new(IdleWatch::new(a, news)));
     }
     v
 }

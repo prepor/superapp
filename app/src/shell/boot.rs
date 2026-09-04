@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use kernel::app::{Apps, Env, Mode, Workers};
+use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{Clipboard, ClockSource, Disk, MemSecrets, Screen, SecretsFactory};
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -321,6 +321,9 @@ impl Boot {
             secrets_backend: keychain,
             clock: clock.clone(),
             demo_disk: c.demo_disk,
+            // Filled in by the mount that runs the passes: only a threaded
+            // one has channels to wake anybody through.
+            kicks: Kicks::default(),
         };
         // A library mount: its own store, in memory, with the demo rows and
         // the outside its scene asked for. Nothing it does can reach the

@@ -13,13 +13,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kernel::app::{Capabilities, Env};
 use kernel::caps::{ClockSource, MemSecrets, Secrets};
 
 use super::caps::{
     Auth, Creds, FolderMeta, Imap, MailFlag, OAuth, Outgoing, RemoteFolder, RemoteMail, Smtp,
-    UidSet,
+    UidSet, Watched,
 };
 #[cfg(test)]
 use super::caps::Part;
@@ -102,6 +103,19 @@ impl Imap for RealServers {
 
     fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
         self.session(account)?.uids(folder, which)
+    }
+
+    fn disconnect(&mut self, account: i64) -> Result<(), String> {
+        // Removed first: whatever `LOGOUT` says, this world is done with the
+        // session, and dropping it closes the socket.
+        match self.sessions.remove(&account) {
+            Some(mut s) => s.logout(),
+            None => Ok(()),
+        }
+    }
+
+    fn idle(&mut self, account: i64, folder: &str, window: Duration) -> Result<Watched, String> {
+        self.session(account)?.idle(folder, window)
     }
 
     fn move_uid(
@@ -321,14 +335,21 @@ fn seq_set(uids: &[u32]) -> String {
 /// The `imap` crate, wrapped. Stateful (a selected mailbox), so `ensure`
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod session {
-    use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet};
+    use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet, Watched};
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    use imap::extensions::idle::WaitOutcome;
+    use imap::types::UnsolicitedResponse;
 
     type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
 
     pub struct Imap {
         session: ImapSession,
         selected: Option<String>,
+        /// Whether this server offers `IDLE`, asked once. `CAPABILITY` is a
+        /// round trip, and the answer does not change inside a session.
+        idle: Option<bool>,
     }
 
     fn s<E: std::fmt::Display>(e: E) -> String {
@@ -354,6 +375,25 @@ mod session {
             Flag::Custom(k) => k.eq_ignore_ascii_case(FORWARDED),
             _ => false,
         })
+    }
+
+    /// Whether a remark the server made while idling is worth ending the
+    /// wait for. `false` keeps waiting — the callback's sense is the crate's.
+    ///
+    /// `EXISTS` and `RECENT` are mail arriving, `EXPUNGE` is mail going, and
+    /// `BYE` is the session ending, which the next round trip must find out
+    /// about anyway. A `FETCH` is a flag: another client marked something
+    /// read, or *this* app just did — its own `STORE` comes back on this
+    /// connection — and a pass for that would be a pull per mark. The
+    /// interval carries flags, as it did before there was a watch.
+    pub(super) fn worth_a_pass(r: &UnsolicitedResponse) -> bool {
+        matches!(
+            r,
+            UnsolicitedResponse::Exists(_)
+                | UnsolicitedResponse::Recent(_)
+                | UnsolicitedResponse::Expunge(_)
+                | UnsolicitedResponse::Bye { .. }
+        )
     }
 
     /// The SASL exchange for `AUTHENTICATE XOAUTH2`.
@@ -417,10 +457,17 @@ mod session {
         Ok(Imap {
             session,
             selected: None,
+            idle: None,
         })
     }
 
     impl Imap {
+        /// `LOGOUT`, so the server is told rather than left to time the
+        /// connection out itself.
+        pub fn logout(&mut self) -> Result<(), String> {
+            self.session.logout().map_err(s)
+        }
+
         pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
             let mb = self.session.select(name).map_err(s)?;
             self.selected = Some(name.to_string());
@@ -515,6 +562,36 @@ mod session {
                 UidSet::Forwarded => format!("KEYWORD {FORWARDED}"),
             };
             self.session.uid_search(query).map_err(s)
+        }
+
+        /// One `IDLE`, at most `window` long. The selected mailbox is what
+        /// the server reports on, so the folder is selected first and stays
+        /// selected after — the next fetch on this session skips its own
+        /// `SELECT`.
+        pub fn idle(&mut self, folder: &str, window: Duration) -> Result<Watched, String> {
+            if !self.offers_idle()? {
+                return Ok(Watched::Unsupported);
+            }
+            self.ensure(folder)?;
+            let mut handle = self.session.idle();
+            // Ours, not the crate's: it re-issues in the background and
+            // never comes back, and a wait that never returns is a thread
+            // that cannot notice it has been retired.
+            handle.timeout(window).keepalive(false);
+            let outcome = handle.wait_while(|r| !worth_a_pass(&r)).map_err(s)?;
+            Ok(match outcome {
+                WaitOutcome::MailboxChanged => Watched::Changed,
+                WaitOutcome::TimedOut => Watched::Quiet,
+            })
+        }
+
+        fn offers_idle(&mut self) -> Result<bool, String> {
+            if let Some(known) = self.idle {
+                return Ok(known);
+            }
+            let yes = self.session.capabilities().map_err(s)?.has_str("IDLE");
+            self.idle = Some(yes);
+            Ok(yes)
         }
 
         pub fn move_uid(
@@ -621,6 +698,27 @@ mod tests {
         assert!(session::keeps_keywords(&[Flag::Custom("$forwarded".into())]));
         assert!(!session::keeps_keywords(&[]));
         assert!(!session::keeps_keywords(&[Flag::Seen, Flag::Deleted]));
+    }
+
+    /// What ends a wait, and what does not. Mail arriving or going is worth
+    /// a pass; a flag is not — the `STORE` this app just pushed comes back
+    /// on the watch's own connection, and a pull for each would be one per
+    /// mark.
+    #[test]
+    fn a_wait_ends_on_mail_and_not_on_a_flag() {
+        use imap::types::UnsolicitedResponse as Said;
+        assert!(session::worth_a_pass(&Said::Exists(3)));
+        assert!(session::worth_a_pass(&Said::Recent(1)));
+        assert!(session::worth_a_pass(&Said::Expunge(2)));
+        assert!(session::worth_a_pass(&Said::Bye {
+            code: None,
+            information: None
+        }));
+        assert!(!session::worth_a_pass(&Said::Fetch {
+            id: 4,
+            attributes: Vec::new()
+        }));
+        assert!(!session::worth_a_pass(&Said::Flags(Vec::new())));
     }
 
     /// The message a draft goes out as: the threading headers a reply and a

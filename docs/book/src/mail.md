@@ -238,17 +238,17 @@ services.
 
 Each account with an IMAP host gets one [worker](./apps.md#workers), named
 `sync-<account>`, kicked at `account:<id>`, claiming only that account's jobs.
-It pushes local changes every turn and pulls about once a minute or on
-**sync**. A pass discovers special-use folders, receives new mail, and
-reconciles flags and deletions. A folder is mirrored **whole**: after the new
-mail lands, the pass compares the server's uid list against what the store
-holds and reaches back for the missing ones 200 at a time, newest first — one
-fetch and one commit a batch, over the session it already holds. Nothing is
-dropped for being old; the batches only keep a whole mailbox out of memory. A
-pass reaches back for at most twenty seconds, so this account's own jobs are
-not left waiting behind a first sync, and comes back five seconds later for
-the rest. A UIDVALIDITY reset re-ingests that folder from scratch, the same
-way.
+It pushes local changes every turn and pulls when the watch below says so, on
+**sync**, or about once a minute anyway. A pass discovers special-use folders,
+receives new mail, and reconciles flags and deletions. A folder is mirrored
+**whole**: after the new mail lands, the pass compares the server's uid list
+against what the store holds and reaches back for the missing ones 200 at a
+time, newest first — one fetch and one commit a batch, over the session it
+already holds. Nothing is dropped for being old; the batches only keep a whole
+mailbox out of memory. A pass reaches back for at most twenty seconds, so this
+account's own jobs are not left waiting behind a first sync, and comes back
+five seconds later for the rest. A UIDVALIDITY reset re-ingests that folder
+from scratch, the same way.
 
 Letters are fetched with `BODY.PEEK[]`, not `RFC822`: mirroring a folder is
 not reading it, and a plain fetch would mark every unread letter it walked
@@ -273,6 +273,35 @@ the next pass reverses a change with no compensation logic.
 
 An account whose last sync failed is a [problem](./apps.md#problems) with two
 controls: *sync*, and a link to settings.
+
+## The watch
+
+Beside each sync pass runs `watch-<account>`: a second session, sitting in
+RFC 2177 `IDLE` on the inbox so the server can say that a letter arrived
+instead of being asked once a minute. It fetches nothing — the sync pass holds
+the session that may write, and two threads ingesting one mailbox would race
+for the same uids — so a watch that hears something sets what that pass reads
+and [wakes it](./apps.md#workers).
+
+The second connection is what buys the first one's manners: a wait cannot be
+cut short, and a pass that spent five minutes inside `IDLE` could not push a
+mark the moment a verb made one. Five minutes is well under the 29 the RFC
+allows, because that window is also how long a watch takes to notice that it
+has been retired, that the machine woke with a dead socket, or that the
+account is gone.
+
+`IDLE` reports on the selected mailbox and no other, and the inbox is the one
+whose latency anybody feels; the interval carries the rest. What ends a wait is
+mail arriving or going, never a flag: a `STORE` this app just pushed comes back
+on the watch's own connection, and a pull for each would be one per mark. A
+server that offers no `IDLE` parks its watch for good — handing the session
+back, because a connection nobody waits on is one the account cannot spend
+elsewhere — and the minute is the cadence it had before.
+
+A fake cannot block, so a wait that came back before its window was up is
+treated as one that did not wait: the watch holds the remainder itself rather
+than ask again on the next tick. That is what keeps a scripted run — where
+every pass runs sixty times a second — from turning the log into a torrent.
 
 ## Sending
 
