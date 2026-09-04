@@ -205,6 +205,15 @@ impl Disk for RealDisk {
         if inside(from, to) {
             return Err(format!("{} cannot go inside itself", from.display()));
         }
+        // The one destination that is nobody else's: the source itself,
+        // spelled in another case, on a volume that does not tell the two
+        // apart. No exclusion can let `notes.md` become `Notes.md` there —
+        // `RENAME_EXCL` finds a file at the name and refuses — and nothing
+        // is overwritten by allowing it, because the thing at that name *is*
+        // the thing being moved.
+        if case_only(from, to) {
+            return std::fs::rename(from, to).map_err(|e| format!("{}: {e}", from.display()));
+        }
         // The check is for the sentence; the exclusion is the kernel's.
         free(to)?;
         match rename_excl(from, to) {
@@ -280,6 +289,29 @@ fn free(to: &Path) -> Result<(), String> {
         Ok(_) => Err(format!("{} is already there", to.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("{}: {e}", to.display())),
+    }
+}
+
+/// Whether `to` names the very object `from` does under another case —
+/// which is the whole of what a case-only rename is, and the one time a
+/// destination that stats is not somebody else's.
+///
+/// Both halves are required. Two hard links to one inode are two names, and
+/// renaming one onto the other would take a name away; two paths that
+/// differ only in case on a volume that *does* tell them apart are two
+/// files, and the exclusion below is what keeps them so. Only ASCII case is
+/// folded here, so this errs towards the refusal it is relaxing.
+fn case_only(from: &Path, to: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if from == to || !from.as_os_str().eq_ignore_ascii_case(to.as_os_str()) {
+        return false;
+    }
+    match (
+        std::fs::symlink_metadata(from),
+        std::fs::symlink_metadata(to),
+    ) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -519,6 +551,50 @@ mod tests {
         assert!(d.file_id(&moved).unwrap().is_some());
         assert_eq!(d.file_id(&dir.join("nothing")).unwrap(), None);
         assert_eq!(d.read_file(&moved, 2).unwrap(), b"fl");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A case-only rename goes through on either kind of volume: on a
+    /// case-sensitive one the destination is simply free, and on the
+    /// case-insensitive one macOS formats by default it is the source
+    /// itself, which no exclusion would ever let past.
+    #[test]
+    fn a_name_may_change_only_its_case() {
+        let dir = scratch("case");
+        let mut d = RealDisk::new();
+
+        let lower = dir.join("notes.md");
+        let upper = dir.join("Notes.md");
+        std::fs::write(&lower, b"notes").unwrap();
+        d.move_path(&lower, &upper).unwrap();
+        assert_eq!(std::fs::read(&upper).unwrap(), b"notes");
+        let names: Vec<String> = d
+            .list_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["Notes.md"], "one file, under the new spelling");
+        // …and back again, which is what undo does with it.
+        d.move_path(&upper, &lower).unwrap();
+        assert_eq!(
+            d.list_dir(&dir)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<String>>(),
+            ["notes.md"]
+        );
+
+        // The relaxation is exactly that and no wider: a name that differs
+        // in more than case is somebody else's, and is refused.
+        std::fs::write(dir.join("other.md"), b"other").unwrap();
+        assert!(d
+            .move_path(&lower, &dir.join("other.md"))
+            .unwrap_err()
+            .contains("already there"));
+        assert_eq!(std::fs::read(dir.join("other.md")).unwrap(), b"other");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

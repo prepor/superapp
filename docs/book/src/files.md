@@ -1,7 +1,7 @@
 # Files
 
 The files app browses this machine's disk: a directory is a list, a file is a
-card, and four verbs write. It stores nothing, because the disk is the state, so it has
+card, and five verbs write. It stores nothing, because the disk is the state, so it has
 no schema, no seed, no queued jobs, and no workers. What it adds is two
 panel kinds, one launcher root, and a clipboard other apps may read.
 
@@ -52,7 +52,7 @@ restarts the path, so `~/Downloads//tmp` means `/tmp`.
 
 Rows carry the same marks as any other table: `space` toggles, `shift+up/down`
 extends a range, `esc` clears. While marks exist the bar's verbs act on the
-marked set and say how many.
+marked set and say how many — all but `rename`, which no set wears.
 
 ## The file card
 
@@ -70,6 +70,10 @@ wish costs no read per frame.
 `open` (`cmd+o`) hands the path to the operating system. Superapp does not
 execute the file.
 
+`rename` (`cmd+r`) stands a field where the name is drawn, with the name in it
+selected, and takes the keyboard: the verb usually arrives through the chord of
+the list above, and a caret on an unfocused panel would never see a letter.
+
 The same card widget draws a mail [attachment](./mail.md#attachments): what a
 file *is* is the panel instance's to work out, and the card is handed the
 answer.
@@ -79,17 +83,18 @@ answer.
 Every files verb is a button; the links in this app are the breadcrumbs and the
 rows.
 
-A card wears `open` (`o`), `copy` (`p`), `move` (`m`), and `delete` (`d`).
-`copy` wears `p` rather than `c` because the card's path line is selectable and
-`cmd+c` copies the text.
+A card wears `open` (`o`), `copy` (`p`), `move` (`m`), `rename` (`r`), and
+`delete` (`d`). `copy` wears `p` rather than `c` because the card's path line is
+selectable and `cmd+c` copies the text.
 
 A directory wears `new dir` (`n`) and `go to` (`g`) always. It wears `copy`,
-`move`, and `delete` when it has an object to act on: either a marked set, or
-the directory itself when the panel hangs under a list, drives no preview of
-its own, and is not a root. That is why a root or a parent directory offers
-only `new dir` and `go to`, and why `cmd+d` in a walk means the directory under
-the cursor. While marks exist it also wears `mark all` (`a`) and `clear`, which
-has no letter because `esc` is the table's.
+`move`, `rename`, and `delete` when it has an object to act on: either a marked
+set, or the directory itself when the panel hangs under a list, drives no
+preview of its own, and is not a root. That is why a root or a parent directory
+offers only `new dir` and `go to`, and why `cmd+d` in a walk means the directory
+under the cursor. While marks exist it also wears `mark all` (`a`) and `clear`,
+which has no letter because `esc` is the table's — and drops `rename`, since a
+name is a name and two things cannot both wear it.
 
 While the clipboard holds something, a directory wears `copy here` or `move
 here` (`h`).
@@ -135,6 +140,31 @@ name held from two directories clash with each other, not only with the disk.
 one directory; a typo is a refusal, not a tree. `delete` (`cmd+d`) always moves
 items to the system trash, and refuses a root before any disk is asked.
 
+`rename` (`cmd+r`) is the same disk verb as a move, with the destination in the
+directory the thing is already in. It never takes a set. It refuses a root, a
+name containing `/` (*a name is not a path*), `.` and `..`, a name the
+directory already has, and a path that has gone since the field went up —
+each before or instead of writing, and each on the panel's own status line. The
+name it already has closes the field and does nothing at all: no disk is asked
+and no history node is made, and the text is compared as typed as well as
+trimmed, so a name that itself ends in a space is not shortened by a submit
+that changed nothing.
+
+Changing only the case of a name is a rename and not a clash. On the
+case-insensitive volume macOS formats by default, `notes.md` to `Notes.md` finds
+the destination already stats — it is the same file — so the check is of the
+**object** and not the path, at each of the three places that ask: the verb's
+own refusal, the exclusive claim the real disk makes on a destination, and the
+undo that asks whether something else has taken the old name. Two paths must
+differ only in case *and* be one object for any of them to relax; two hard links
+to one inode are still two names, and moving one onto the other is refused.
+
+The panel that ran it is pointed at the new name in the layout half of the same
+action, because a panel is on the thing and not on the spelling: the card
+becomes the card on the renamed file, the listing the listing of the renamed
+directory. Every *other* panel on the old name keeps it and says so, exactly as
+one does after a delete.
+
 Every path in a batch is attempted. The toast says what went and appends what
 did not, and what a verb leaves marked is exactly what it could not do. If
 nothing succeeded, the panel's status line carries the refusal and no history
@@ -142,13 +172,14 @@ node is created.
 
 The real disk never overwrites. A copy and a move claim their destination
 exclusively, because `std::fs::rename` and `std::fs::copy` both replace
-silently. A copy that fails removes only the destination it created itself, and
+silently; the one destination exempt from the claim is the source itself under
+another case, which is not an overwrite at all. A copy that fails removes only the destination it created itself, and
 an existing destination is never touched. A move across filesystems copies
 first and trashes the source second, and takes its own copy back off the disk
 if the source cannot be trashed. A symbolic link is copied as a link; a FIFO,
 socket, or device node is refused by name.
 
-The three writing verbs and `open` are refused outright on a scripted run
+Every writing verb and `open` are refused outright on a scripted run
 against a real disk, in one sentence, because a suite must no more delete a
 human's files than write to their keychain. `--demo-disk` gives a run the
 kernel's writable demo tree instead, which is what the file suites use.
@@ -160,8 +191,9 @@ over in between, the write is reversed and the panel says so. See
 
 ## Undo
 
-Copy, move, new directory, and delete are each one undoable action, including
-when they act on marked rows. Undo restores the marks the batch consumed.
+Copy, move, rename, new directory, and delete are each one undoable action,
+including when they act on marked rows. Undo restores the marks the batch
+consumed.
 
 Every reversal asks the disk before it acts rather than trusting what it
 remembers, and it asks about the **object**, not the path: a name is cheap to
@@ -171,8 +203,9 @@ will not say, or when the id has changed. A node that cannot be reversed
 expires and history moves past it instead of pretending.
 
 Undoing a copy trashes what the copy made; undoing a delete moves the item back
-out of the trash; undoing a new directory refuses while the directory is no
-longer empty. Nothing here ever removes a path a person had: the only true
+out of the trash; undoing a rename moves the old name back, and refuses when
+something else has taken it; undoing a new directory refuses while the
+directory is no longer empty. Nothing here ever removes a path a person had: the only true
 removal in the app is sweeping away a half-made copy nobody has seen.
 
 A reversal over a batch attempts every path and then names the ones that would

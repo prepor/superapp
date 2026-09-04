@@ -1,10 +1,10 @@
 # args: --demo-disk
 # env:
 #
-# The four verbs that write. `new dir`, `copy here`, `move here` and
-# `delete` reach the disk through the world's own capability, and every one
-# of them is an undoable action whose reversal is another one: a delete is a
-# move to the trash, and undo is the move back.
+# The five verbs that write. `new dir`, `copy here`, `move here`, `rename`
+# and `delete` reach the disk through the world's own capability, and every
+# one of them is an undoable action whose reversal is another one: a delete
+# is a move to the trash, and undo is the move back.
 #
 # Run with `--demo-disk`, so the tree is the fixture rather than whatever
 # this machine's ~ holds: a suite must no more delete a human's files than
@@ -161,6 +161,44 @@ click "~/Downloads/README.txt"
 wait 400
 shot p10-move-undone
 
+# -- rename ---------------------------------------------------------------------
+
+# The card is the object again: `rename` stands a field where the name is
+# drawn, with the name already in it to type over. Enter renames the file
+# where it is — a move whose destination is the directory it is already in —
+# and the card follows it, because a panel is on the thing and not on the
+# spelling. The card's own path line is the proof.
+click "rename"
+wait 500
+type "readme-renamed.txt"
+wait 500
+shot p11-renaming
+key enter
+wait 900
+shot p12-renamed
+click "~/Downloads/readme-renamed.txt"
+wait 400
+
+# A name the directory already has is refused where the field was — the
+# card's own line, under the name — and the field keeps what was typed. Esc
+# puts it away, with nothing renamed.
+click "rename"
+wait 500
+type "2026"
+wait 500
+key enter
+wait 800
+shot p13-name-taken
+key esc
+wait 500
+
+# cmd+z puts the old name back and the card with it: one node, both halves.
+key cmd+z
+wait 900
+click "~/Downloads/README.txt"
+wait 400
+shot p14-rename-undone
+
 # -- delete ---------------------------------------------------------------------
 
 # The card is the object again: `delete` takes the file to the trash and
@@ -169,12 +207,12 @@ shot p10-move-undone
 # brings both back: the card onto the file, and the row into the listing.
 click "delete"
 wait 900
-shot p11-deleted
+shot p15-deleted
 key cmd+z
 wait 900
 click "~/Downloads/README.txt"
 wait 400
 click "README.txt"
 wait 700
-shot p12-restored
+shot p16-restored
 quit

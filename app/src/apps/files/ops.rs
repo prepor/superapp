@@ -93,6 +93,25 @@ pub fn trash_in(world: &World, path: &str) -> Result<String, String> {
     r
 }
 
+// -- what a name may be ------------------------------------------------------
+
+/// What a name has to be before any disk is asked: one segment, and a
+/// segment that names something. `rename` renames a thing where it already
+/// is — a path typed into the field would carry it off somewhere else under
+/// the word *rename*, and `.` and `..` name the directory rather than
+/// anything in it.
+///
+/// # Errors
+///
+/// The sentence the status line carries.
+pub fn check_name(name: &str) -> Result<(), String> {
+    match name {
+        n if n.contains('/') => Err("a name is not a path".to_string()),
+        "." | ".." => Err(format!("“{name}” is not a name")),
+        _ => Ok(()),
+    }
+}
+
 // -- what a `… here` plans -----------------------------------------------------
 
 /// The one clash a copy is allowed to make is into the file's own
@@ -353,6 +372,58 @@ impl Intent for Moved {
             d.landed = id_in(w, &d.to);
             Ok(())
         }))
+    }
+}
+
+/// `rename`: undo puts the old name back.
+///
+/// The disk verb is a move — what makes it a rename is that only the last
+/// segment changes — so the record and the reversal are a move's, and only
+/// the words are the rename's. One [`Done`], never a set: a new name is a
+/// name, and two things cannot both wear it.
+pub struct Renamed {
+    pub done: RefCell<Done>,
+}
+
+impl Renamed {
+    #[must_use]
+    pub fn new(done: Done) -> Renamed {
+        Renamed {
+            done: RefCell::new(done),
+        }
+    }
+}
+
+impl Intent for Renamed {
+    fn describe(&self) -> String {
+        let d = self.done.borrow();
+        format!("renamed “{}” to “{}”", basename(&d.from), basename(&d.to))
+    }
+
+    /// [`occupied`] asks whether anything is at the old name, which is the
+    /// right question for a move and the wrong one here: where the disk
+    /// does not tell two cases apart, what stats at the old name after a
+    /// case-only rename is this very file. So the question is asked of the
+    /// **object** — is what is there somebody else? — as every other
+    /// reversal asks it, and a disk that will not say refuses.
+    fn blocked(&self, w: &World) -> Option<String> {
+        let d = self.done.borrow();
+        ours(w, &d.to, d.landed).or_else(|| {
+            let stranger = id_in(w, &d.from).is_some_and(|there| Some(there) != d.landed);
+            stranger.then(|| format!("something else is at “{}” now", basename(&d.from)))
+        })
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let d = self.done.borrow();
+        move_in(w, &d.to, &d.from)
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let mut d = self.done.borrow_mut();
+        move_in(w, &d.from, &d.to)?;
+        d.landed = id_in(w, &d.to);
+        Ok(())
     }
 }
 

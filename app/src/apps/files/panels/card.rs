@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use kernel::effect::World;
 use kernel::layout::SlotId;
+use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::time::fmt_date;
@@ -51,6 +52,8 @@ pub struct Card {
     /// Kept because [`Panel::wish`] is asked on every relayout, and reading
     /// a header on each of them would be a read a frame.
     pixels: Option<(u32, u32)>,
+    /// The `rename` field, while it is open: the new name as typed.
+    renaming: Option<String>,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
     /// The disk's write count when this was read.
@@ -173,10 +176,26 @@ impl Card {
         self.entry.is_none()
     }
 
+    /// The `rename` field's text, while it is open — the field the card
+    /// raises under its own name.
+    #[must_use]
+    pub fn renaming(&self) -> Option<&str> {
+        self.renaming.as_deref()
+    }
+
+    /// Opens, closes, or edits it. `None` closes.
+    pub fn set_renaming(&mut self, text: Option<String>) {
+        self.renaming = text;
+    }
+
     /// What the last verb refused, until the next one.
     #[must_use]
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub fn set_status(&mut self, line: Option<String>) {
+        self.status = line;
     }
 
     // -- keeping up ------------------------------------------------------------
@@ -240,10 +259,10 @@ impl Panel for Card {
     }
 
     /// Every verb acts on the file the card shows: `open` hands it to the
-    /// OS, `copy` and `move` hold it for a `… here`, and `delete` puts it
-    /// in the trash and takes this card with it — it would be showing
-    /// nothing. Reads *open copy move delete*: the destructive one last, as
-    /// on a message.
+    /// OS, `copy` and `move` hold it for a `… here`, `rename` raises a field
+    /// under the name, and `delete` puts it in the trash and takes this card
+    /// with it — it would be showing nothing. Reads *open copy move rename
+    /// delete*: the destructive one last, as on a message.
     ///
     /// `copy` wears the `p` of "copy", not the `c`: a card's path is
     /// selectable, so cmd+c copies the path — the file clipboard is not the
@@ -253,6 +272,7 @@ impl Panel for Card {
             Verb::run("files.open", "open", Some('o')),
             Verb::run("files.copy", "copy", Some('p')),
             Verb::run("files.move", "move", Some('m')),
+            Verb::run("files.rename", "rename", Some('r')),
             Verb::run("files.delete", "delete", Some('d')),
         ]
     }
@@ -262,6 +282,7 @@ impl Panel for Card {
             "files.open" => self.open(s),
             "files.copy" => dir::hold(s, Op::Copy, vec![self.path.clone()]),
             "files.move" => dir::hold(s, Op::Move, vec![self.path.clone()]),
+            "files.rename" => self.start_rename(s),
             "files.delete" => self.delete(s),
             _ => {}
         }
@@ -283,6 +304,42 @@ impl Card {
                 s.notify(e, true);
             }
         }
+    }
+
+    /// `rename`: the field under the name, seeded with the name it has and
+    /// landing with all of it selected — a rename is a value typed over,
+    /// not one typed after.
+    ///
+    /// Focus follows the field. A card is usually the thing under a list's
+    /// cursor, so this verb arrives through that list's chord — and a caret
+    /// on an unfocused panel would never see a letter typed at it.
+    fn start_rename(&mut self, s: &mut Session) {
+        self.renaming = match self.renaming {
+            Some(_) => None,
+            None => Some(self.name()),
+        };
+        self.status = None;
+        if self.renaming.is_some() {
+            s.nav(Nav::Focus(self.slot));
+        }
+        s.redraw();
+    }
+
+    /// The name the field submitted: the file under it, in the directory it
+    /// is already in. The card goes with the file — its identity is the
+    /// path — so the layout half of the same action points this slot at the
+    /// new one, and cmd+z brings back both the old name and the card on it.
+    pub fn rename(&mut self, s: &mut Session, name: &str) {
+        let (slot, path) = (self.slot, self.path.clone());
+        match dir::rename_path(s, slot, &path, name, Card::id) {
+            dir::Said::Went => {
+                self.renaming = None;
+                self.status = None;
+            }
+            dir::Said::Refused(line) => self.status = Some(line),
+            dir::Said::Nothing => {}
+        }
+        self.restat();
     }
 
     /// `delete`: the file to the trash, and this card closed in the layout
@@ -319,6 +376,7 @@ impl PanelKind for CardKind {
             entry: None,
             preview: Preview::None,
             pixels: None,
+            renaming: None,
             status: None,
             listed: 0,
         };
