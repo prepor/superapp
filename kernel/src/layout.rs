@@ -433,7 +433,15 @@ impl Ws {
     /// travels, its joins stay behind and die with the lost adjacency.
     pub fn detach(&mut self, sid: SlotId) -> Option<Slot> {
         let (c, r) = self.locate(sid)?;
+        let cols = self.columns.len();
         self.remove_from_layout(sid);
+        // A tab strip over a single tab is a label, not a choice: a column
+        // thinned to one slot by a close drops back to plain. Only here —
+        // a lone column someone tabs on purpose stays tabbed, and a drag
+        // that passes through the same column keeps its strip.
+        if self.columns.len() == cols && self.columns[c].slots.len() == 1 {
+            self.columns[c].tabbed = false;
+        }
         let slot = self.slots.remove(&sid);
         self.joins.retain(|&a, &mut b| a != sid && b != sid);
         self.validate_joins();
@@ -1827,6 +1835,40 @@ mod tests {
         ws.focus = Some(help_id);
         ws.focus_dir(Dir::Right, VP, opts());
         assert_eq!(ws.focus, Some(inbox_id));
+    }
+
+    /// A tabbed column a close thins down to one slot drops back to plain: a
+    /// tab strip over a single tab is a label, not a choice. A lone column
+    /// tabbed on purpose keeps its strip — a close next door is not about it.
+    #[test]
+    fn a_close_that_leaves_one_tab_untabs_the_column() {
+        let (mut ws, _help, inbox_id) = boot();
+        let m1 = open(&mut ws, msg(1), Some(inbox_id), false);
+        let m2 = open(&mut ws, msg(2), Some(m1), false);
+        let m3 = open(&mut ws, msg(3), Some(m2), false);
+        ws.consume_or_expel(m2, Dir::Left);
+        ws.consume_or_expel(m3, Dir::Left);
+        ws.toggle_tabbed(m1);
+        assert_eq!(
+            tags(&ws),
+            [vec!["help"], vec!["inbox"], vec!["msg", "msg", "msg"]]
+        );
+        assert!(ws.columns[2].tabbed);
+
+        // Three tabs down to two: still a choice, still a strip.
+        ws.close(m3);
+        assert!(ws.columns[2].tabbed);
+        // Down to one: plain.
+        ws.close(m2);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
+        assert!(!ws.columns[2].tabbed);
+
+        // Tabbed on purpose while alone, it stays that way — and a close
+        // that empties the column to its LEFT must not be read as its own.
+        ws.toggle_tabbed(m1);
+        ws.close(inbox_id);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["msg"]]);
+        assert!(ws.columns[1].tabbed);
     }
 
     /// Workspaces: switching remembers focus and camera per space; a move
