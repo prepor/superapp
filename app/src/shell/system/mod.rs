@@ -12,6 +12,7 @@ use std::any::Any;
 
 use kernel::app::{App, Root};
 use kernel::panel::{PanelKind, Tag};
+use kernel::tool::Tool;
 use makepad_widgets::*;
 
 use crate::shell::app_ui::AppUi;
@@ -25,6 +26,7 @@ mod missing;
 mod problems;
 mod scenes;
 mod search;
+mod tools;
 
 pub use about::{About, AboutPanel};
 pub use bucket::{Bucket, BucketPanel};
@@ -627,6 +629,10 @@ impl App for System {
 
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         KINDS
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        tools::all()
     }
 
     /// Help leads, so an empty store comes up on the manual. A `job` is

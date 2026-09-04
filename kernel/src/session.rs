@@ -186,6 +186,11 @@ pub struct Session {
     /// into its node — set for the length of one
     /// [`Session::nav_within`].
     merge_next: bool,
+    /// The changeset the last [`Session::act`] recorded, until somebody
+    /// takes it ([`Session::take_changeset`]). An agent's `sql.write` is
+    /// the one caller: it has no intent of its own to claim, so what it
+    /// claims is the inverse of these bytes.
+    last_changeset: Option<Vec<u8>>,
     /// Device sync, when a bucket is configured. `None` means replication
     /// is off and the store is a plain local one.
     repl: Option<Repl>,
@@ -236,6 +241,7 @@ impl Session {
             cols: DEFAULT_COLS,
             show_once: None,
             merge_next: false,
+            last_changeset: None,
             repl: None,
             repl_mount: None,
             lease: repl::Status::default(),
@@ -709,13 +715,19 @@ impl Session {
         // saved: an instance whose `persist` differs is written by the
         // `save` that follows the settle.
         let snap = after.clone();
-        let out = self.store.write(move |tx| {
+        let out = self.store.write_recorded(move |tx| {
             let r = data(tx)?;
             save_wm_tx(tx, &snap)?;
             Ok(r)
         });
         let out = match out {
-            Ok(v) => v,
+            Ok((v, cs)) => {
+                // Kept for the one caller that undoes rows rather than an
+                // intent of its own; every other action leaves it standing
+                // and nobody looks.
+                self.last_changeset = (!cs.is_empty()).then_some(cs);
+                v
+            }
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
                 // too: half an action is not an action.
@@ -785,6 +797,13 @@ impl Session {
     /// claim needs the row id [`Session::act`] returned.
     pub fn claim(&mut self, intent: Box<dyn Intent>) {
         self.history.claim(intent);
+    }
+
+    /// The changeset the last [`Session::act`] recorded, handed out once.
+    /// `None` when nothing replicated moved — and `None` again on the
+    /// second ask, so two calls cannot claim one write.
+    pub fn take_changeset(&mut self) -> Option<Vec<u8>> {
+        self.last_changeset.take()
     }
 
     /// Reconcile what has been announced now rather than at the next poll,

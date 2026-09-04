@@ -29,6 +29,7 @@ use super::MAIL;
 mod accounts;
 mod carries;
 mod context;
+mod tools;
 
 static APPS: &[&dyn App] = &[&MAIL];
 

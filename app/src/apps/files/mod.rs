@@ -16,6 +16,7 @@ use kernel::effect::World;
 use kernel::panel::PanelKind;
 use kernel::session::Session;
 use kernel::store::Store;
+use kernel::tool::Tool;
 
 pub mod completion;
 pub mod model;
@@ -23,6 +24,7 @@ pub mod ops;
 pub mod panels;
 pub mod run;
 pub mod scenes;
+pub mod tools;
 pub mod ui;
 pub mod widgets;
 
@@ -81,6 +83,10 @@ impl App for Files {
 
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         KINDS
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        tools::all()
     }
 
     /// One root: home. Everywhere else is a walk or a typed path away.

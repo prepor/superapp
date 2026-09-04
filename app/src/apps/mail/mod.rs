@@ -18,6 +18,7 @@ use kernel::app::{App, Capabilities, Env, Mode, ProblemSource, Root, Schema, Wor
 use kernel::effect::Registry;
 use kernel::panel::PanelKind;
 use kernel::store::Store;
+use kernel::tool::Tool;
 
 pub mod accounts;
 pub mod caps;
@@ -37,6 +38,7 @@ pub mod schema;
 pub mod search;
 pub mod seed;
 pub mod sync;
+pub mod tools;
 pub mod ui;
 pub mod widgets;
 
@@ -118,6 +120,10 @@ impl App for Mail {
 
     fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
         sync::workers(store)
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        tools::all()
     }
 
     /// The four mailboxes lead, then a blank sheet, then the accounts: the

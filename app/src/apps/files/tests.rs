@@ -13,7 +13,7 @@ use kernel::session::{Action, Instance, Session};
 use kernel::store::Store;
 
 use super::model::{
-    crumbs, fmt_size, image_lines, image_size, normalize, preview_of, real_path, stat_in,
+    crumbs, fmt_size, image_lines, image_size, normalize, preview_of, read_in, real_path, stat_in,
     text_lines, watched_at, Entry, FileKind, Preview, HOME,
 };
 // The kernel's, beside `FileKind`: what a name claims and how much of it a
@@ -2486,4 +2486,383 @@ fn a_bar_wears_no_letter_twice() {
         }
     }
     FILES.clear();
+}
+
+// -- the tools ------------------------------------------------------------------
+//
+// Each one is the verb's own code path over a path: the same disk write, the
+// same intent, the same undo. The tests are the verbs' tests asked again by
+// name.
+
+/// One call, checked against the tool's own schema first and settled after —
+/// what the chat panel will do per `agent_call` row.
+fn call(s: &mut Session, name: &str, input: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let t = s
+        .apps()
+        .tool(name)
+        .unwrap_or_else(|| panic!("no tool {name}"))
+        .clone();
+    t.check(input)?;
+    let out = (t.run)(s, input);
+    s.settle();
+    out
+}
+
+#[test]
+fn the_list_tool_reads_home_the_way_the_panel_does() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    let out = call(&mut s, "files.list", &serde_json::json!({"dir": "~"})).expect("a listing");
+    assert_eq!(out["dir"], serde_json::json!("~"));
+    assert_eq!(out["truncated"], serde_json::json!(false));
+    let names: Vec<String> = out["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    // The panel hides the dot-files until its filter asks; the disk hands
+    // over everything, and so does the tool.
+    for name in ["Downloads", "Desktop", "Documents", "notes.md"] {
+        assert!(names.contains(&name.to_string()), "{names:?}");
+    }
+    let dir = out["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|e| e["name"] == serde_json::json!("Downloads"))
+        .expect("the Downloads row");
+    assert_eq!(dir["is_dir"], serde_json::json!(true));
+    assert!(dir["modified"].as_str().is_some_and(|d| !d.is_empty()));
+    // Every row the panel draws is here, whatever the panel does with it.
+    assert!(labels(&s, slot)
+        .iter()
+        .all(|l| names.contains(&l.trim_end_matches('/').to_string())));
+
+    assert!(
+        call(&mut s, "files.list", &serde_json::json!({"dir": "~/nowhere"})).is_err(),
+        "a directory that is not there"
+    );
+}
+
+#[test]
+fn the_read_tool_reads_a_demo_file() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let out = call(&mut s, "files.read", &serde_json::json!({"path": "~/notes.md"}))
+        .expect("the file");
+    assert_eq!(out["truncated"], serde_json::json!(false));
+    let text = out["text"].as_str().expect("its text");
+    assert!(text.starts_with("# notes"), "{text}");
+    assert!(text.contains("The join is the only relation."), "{text}");
+    assert!(
+        call(&mut s, "files.read", &serde_json::json!({"path": "~/nothing.md"})).is_err(),
+        "a file that is not there"
+    );
+}
+
+#[test]
+fn the_rename_tool_renames_and_undo_puts_the_name_back() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    // A card on the file, so the panel that was on it follows the rename.
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+
+    let was = nodes(&s);
+    let out = call(
+        &mut s,
+        "files.rename",
+        &serde_json::json!({"path": "~/notes.md", "name": "notes-2026.md"}),
+    )
+    .expect("renamed");
+    assert_eq!(out["path"], serde_json::json!("~/notes-2026.md"));
+    assert!(there(&s, "~/notes-2026.md"));
+    assert!(!there(&s, "~/notes.md"));
+    assert_eq!(nodes(&s), was + 1, "one node");
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").label,
+        "rename “notes.md” to “notes-2026.md”"
+    );
+    assert_eq!(
+        showing(&s, card),
+        Card::id("~/notes-2026.md"),
+        "a panel is on the thing, not on the spelling"
+    );
+    assert!(labels(&s, slot).contains(&"notes-2026.md".to_string()));
+
+    assert!(s.undo());
+    assert!(there(&s, "~/notes.md"));
+    assert_eq!(showing(&s, card), Card::id("~/notes.md"));
+    assert!(s.redo());
+    assert!(there(&s, "~/notes-2026.md"));
+
+    // The refusals are the verb's: a path is not a name, a taken name is
+    // taken, and a file that has gone has no name to change.
+    for (path, name, said) in [
+        ("~/notes-2026.md", "a/b", "a name is not a path"),
+        ("~/notes-2026.md", "Downloads", "already here"),
+        ("~/gone.md", "x.md", "no longer there"),
+        ("~", "home", "is a root"),
+    ] {
+        let e = call(
+            &mut s,
+            "files.rename",
+            &serde_json::json!({"path": path, "name": name}),
+        )
+        .expect_err("refused");
+        assert!(e.contains(said), "{path} → {name}: {e}");
+    }
+}
+
+#[test]
+fn the_mkdir_tool_makes_one_directory_and_undo_trashes_it() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    let was = nodes(&s);
+    let out = call(
+        &mut s,
+        "files.mkdir",
+        &serde_json::json!({"dir": "~", "name": "reports"}),
+    )
+    .expect("made");
+    assert_eq!(out["path"], serde_json::json!("~/reports"));
+    assert!(there(&s, "~/reports"));
+    assert_eq!(nodes(&s), was + 1);
+    assert!(
+        labels(&s, slot).contains(&"reports/".to_string()),
+        "and every listing re-read"
+    );
+
+    assert!(s.undo());
+    assert!(!there(&s, "~/reports"), "undo trashed it");
+    assert!(there(&s, "~/.Trash/reports"), "never an rm");
+    assert!(s.redo());
+    assert!(there(&s, "~/reports"));
+
+    // A name the directory already has, and a name that is a path.
+    assert!(call(
+        &mut s,
+        "files.mkdir",
+        &serde_json::json!({"dir": "~", "name": "reports"})
+    )
+    .is_err());
+    assert_eq!(
+        call(
+            &mut s,
+            "files.mkdir",
+            &serde_json::json!({"dir": "~", "name": "a/b"})
+        )
+        .expect_err("not a name"),
+        "a name is not a path"
+    );
+}
+
+#[test]
+fn the_trash_tool_takes_a_file_to_the_trash_and_undo_brings_it_back() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(&mut s, Nav::Preview {
+        from: slot,
+        id: Card::id("~/notes.md"),
+    });
+    let card = s.joined_child(slot).expect("the card");
+
+    let out = call(&mut s, "files.trash", &serde_json::json!({"path": "~/notes.md"}))
+        .expect("trashed");
+    assert_eq!(out["trashed"], serde_json::json!("~/.Trash/notes.md"));
+    assert!(!there(&s, "~/notes.md"));
+    assert!(there(&s, "~/.Trash/notes.md"), "never an rm");
+    assert!(
+        s.panel(card).is_none(),
+        "the card had nothing left to show"
+    );
+    assert!(!labels(&s, slot).contains(&"notes.md".to_string()));
+
+    assert!(s.undo());
+    assert!(there(&s, "~/notes.md"));
+    // Undo is the history's, not a verb's, so a listing catches up the way
+    // it does after any walk: at its next look.
+    with_dir(&s, slot, |d| d.observe(&s));
+    assert!(labels(&s, slot).contains(&"notes.md".to_string()));
+
+    assert!(
+        call(&mut s, "files.trash", &serde_json::json!({"path": "~"}))
+            .expect_err("a root is nobody's object")
+            .contains("is a root")
+    );
+}
+
+#[test]
+fn the_move_and_copy_tools_lay_a_path_down_where_a_here_would() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let out = call(
+        &mut s,
+        "files.copy",
+        &serde_json::json!({"path": "~/notes.md", "dir": "~/Downloads"}),
+    )
+    .expect("copied");
+    assert_eq!(out["path"], serde_json::json!("~/Downloads/notes.md"));
+    assert!(there(&s, "~/Downloads/notes.md"));
+    assert!(there(&s, "~/notes.md"), "a copy leaves the source");
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").label,
+        "copy “notes.md” into Downloads"
+    );
+    assert!(s.undo());
+    assert!(!there(&s, "~/Downloads/notes.md"));
+    assert!(there(&s, "~/.Trash/notes.md"), "even undo trashes");
+
+    // A copy into its own directory takes the next free name.
+    let out = call(
+        &mut s,
+        "files.copy",
+        &serde_json::json!({"path": "~/notes.md", "dir": "~"}),
+    )
+    .expect("copied beside itself");
+    assert_eq!(out["path"], serde_json::json!("~/notes copy.md"));
+
+    // A move takes the path with it, and undo moves it back.
+    let out = call(
+        &mut s,
+        "files.move",
+        &serde_json::json!({"path": "~/notes copy.md", "dir": "~/Desktop"}),
+    )
+    .expect("moved");
+    assert_eq!(out["path"], serde_json::json!("~/Desktop/notes copy.md"));
+    assert!(!there(&s, "~/notes copy.md"));
+    assert!(s.undo());
+    assert!(there(&s, "~/notes copy.md"));
+
+    // The refusals are the plan's, one path at a time.
+    assert!(call(
+        &mut s,
+        "files.move",
+        &serde_json::json!({"path": "~/notes.md", "dir": "~/notes.md"})
+    )
+    .is_err());
+    assert!(call(
+        &mut s,
+        "files.move",
+        &serde_json::json!({"path": "~/gone.md", "dir": "~/Desktop"})
+    )
+    .expect_err("no such path")
+    .contains("no longer there"));
+}
+
+#[test]
+fn the_write_tool_writes_a_file_whole_and_undo_puts_back_what_was_there() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let was = read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file");
+
+    let out = call(
+        &mut s,
+        "files.write",
+        &serde_json::json!({"path": "~/notes.md", "text": "# notes\n\nrewritten."}),
+    )
+    .expect("written");
+    assert_eq!(out["path"], serde_json::json!("~/notes.md"));
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        b"# notes\n\nrewritten."
+    );
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").label,
+        "write “notes.md”"
+    );
+
+    assert!(s.undo());
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        was,
+        "what was there came back"
+    );
+    assert!(s.redo());
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        b"# notes\n\nrewritten."
+    );
+
+    // A directory is not a file, and a root is nobody's object.
+    assert!(call(
+        &mut s,
+        "files.write",
+        &serde_json::json!({"path": "~/Downloads", "text": "x"})
+    )
+    .expect_err("a directory")
+    .contains("is a directory"));
+}
+
+/// A write whose file somebody else has moved on from is not this node's to
+/// take back: the claim expires rather than writing over a stranger.
+#[test]
+fn undoing_a_write_over_a_file_that_changed_since_is_refused() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    call(
+        &mut s,
+        "files.write",
+        &serde_json::json!({"path": "~/notes.md", "text": "mine"}),
+    )
+    .expect("written");
+    // Somebody else, behind the panels' backs.
+    s.world()
+        .with_cap::<dyn Disk, _>(|d| d.write_file(&real_path("~/notes.md"), b"theirs"))
+        .expect("a disk")
+        .expect("the disk wrote it");
+
+    // The walk still moves — it goes transparently past a claim the world
+    // will not take back, to the node under it — but the file is not
+    // touched.
+    assert!(s.undo());
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        b"theirs",
+        "it did not write over what is there now"
+    );
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").state,
+        "expired",
+        "expired, not undone"
+    );
+}
+
+/// The tools are read against their own schemas, and every one of them is
+/// there under its own name.
+#[test]
+fn the_app_offers_its_tools_by_name() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let names: Vec<&str> = s
+        .apps()
+        .tools()
+        .iter()
+        .filter(|t| t.name.starts_with("files."))
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "files.list",
+            "files.read",
+            "files.rename",
+            "files.move",
+            "files.copy",
+            "files.trash",
+            "files.mkdir",
+            "files.write"
+        ]
+    );
+    assert!(s.apps().tool("files.trash").expect("the verb").writes);
+    assert!(!s.apps().tool("files.list").expect("the reading").writes);
+    assert_eq!(
+        call(&mut s, "files.rename", &serde_json::json!({"path": "~/notes.md"}))
+            .expect_err("no name"),
+        "missing `name`"
+    );
 }

@@ -206,8 +206,11 @@ impl Apps {
         // The kernel's own tools — `sql.*` and `panels.*` — are chained in
         // ahead of these, the way `problem_sources` chains its bucket
         // problem: every build has them, whatever apps it was given.
-        let mut tools: Vec<Tool> = Vec::new();
+        let mut tools: Vec<Tool> = crate::tools::all();
         let mut offers: HashMap<&'static str, &'static str> = HashMap::new();
+        for tool in &tools {
+            offers.insert(tool.name, "the kernel");
+        }
         for app in list {
             for tool in app.tools() {
                 let name = tool.name;
@@ -1129,7 +1132,9 @@ mod tests {
     fn the_registry_lists_every_tool_in_app_order() {
         let apps = Apps::new(TOOLED);
         let names: Vec<&str> = apps.tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["toolbox.look", "toolbox.touch"]);
+        // The kernel's own lead, whatever apps the build was given.
+        assert_eq!(names[0], "sql.query");
+        assert_eq!(&names[names.len() - 2..], &["toolbox.look", "toolbox.touch"]);
         assert!(apps.tool("toolbox.touch").is_some_and(|t| t.writes));
         assert!(!apps.tool("toolbox.look").expect("the tool").writes);
         assert!(
@@ -1137,7 +1142,8 @@ mod tests {
             "a name no app in this build offers"
         );
         // An app with nothing to offer says so by saying nothing.
-        assert!(Apps::new(ONE_APP).tools().is_empty());
+        let bare = Apps::new(ONE_APP);
+        assert_eq!(bare.tools().len(), crate::tools::all().len());
         assert_eq!(ONE.describe(), None);
         assert!(TOOLBOX.describe().is_some());
     }

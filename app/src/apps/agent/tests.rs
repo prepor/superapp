@@ -587,10 +587,11 @@ fn the_agent_app_is_in_this_build_and_offers_no_tools_yet() {
         vec![super::Agents::TAG, super::Chat::TAG],
         "two kinds, and nobody else's in a build of this app alone"
     );
-    assert!(
-        s.apps().tools().is_empty(),
-        "phase 3 fills this; the registry is here for it"
-    );
+    // The agent app offers no tools of its own — it is the one that *calls*
+    // them. What the registry holds in a build of one is the kernel's own.
+    assert!(kernel::app::App::tools(&AGENT).is_empty());
+    assert_eq!(s.apps().tools().len(), kernel::tools::all().len());
+    assert!(s.apps().tool("sql.query").is_some());
     assert!(s.apps().tool("agent.nothing").is_none());
 }
 
