@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
-use kernel::caps::{Clipboard, ClockSource, Disk, MemSecrets, Screen, SecretsFactory};
+use kernel::caps::{Clipboard, ClockSource, Disk, MemSecrets, Screen, SecretsFactory, Watcher};
 use kernel::e2e;
 use kernel::layout::Grid;
 use kernel::repl::r2;
@@ -20,6 +20,7 @@ use makepad_widgets::*;
 
 use crate::platform::disk::RealDisk;
 use crate::platform::secret::Keychain;
+use crate::platform::watch::RealWatcher;
 
 /// On virtual time — which is every headless build — one draw cycle is one
 /// frame of exactly this long, for both the springs and the e2e runner.
@@ -384,6 +385,18 @@ impl Boot {
                 } else {
                     RealDisk::new()
                 }));
+                // And watched, on a run that is nobody's but this
+                // person's: a panel then refreshes after another
+                // program's write as it does after one of ours. Never
+                // under a script — a suite's frames may not depend on
+                // what the machine it runs on happens to be doing — and
+                // never over the demo tree, which nothing outside this
+                // process can write to anyway.
+                if !scripted {
+                    caps.insert::<dyn Watcher>(Box::new(RealWatcher::start(|| {
+                        SignalToUI::set_ui_signal();
+                    })));
+                }
             }
         });
         let workers = if self.virtual_time {

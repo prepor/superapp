@@ -12,9 +12,11 @@ pub use dir::Dir;
 /// Lists every files panel again — every one but `by`, which is the
 /// instance that is calling and is borrowed by whoever called it.
 ///
-/// Nothing watches the disk, so a verb that wrote it says so itself — and
-/// it says it to all of them, since a copy changes the directory it came
-/// from as well as the one it landed in.
+/// A verb that wrote says so itself rather than waiting to be told: the
+/// answer is here, now, and on every platform, where a watch is a round
+/// later and only on the two that have one. It says it to all of them,
+/// since a copy changes the directory it came from as well as the one it
+/// landed in.
 pub fn refresh(s: &mut Session, by: Option<SlotId>) {
     for (slot, inst) in s.panels() {
         if by == Some(slot) {

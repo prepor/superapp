@@ -2,13 +2,15 @@
 //! them.
 //!
 //! A capability is a trait an effect reaches through [`Ctx::cap`]. The kernel
-//! owns the five every build needs — the clock, secrets, the clipboard, the
-//! screen and the disk — because the harness, attachments and a file browser
-//! all use them; an app defines its own and supplies them in `App::outside`.
+//! owns the six every build needs — the clock, secrets, the clipboard, the
+//! screen, the disk and the watcher over it — because the harness,
+//! attachments and a file browser all use them; an app defines its own and
+//! supplies them in `App::outside`.
 //!
-//! What the kernel installs are the fakes: the clipboard, the screen and the
-//! disk are the shell's to replace with the machine's own, and a world it
-//! left alone reads the demo tree, so no test can reach a human's files.
+//! What the kernel installs are the fakes: the clipboard, the screen, the
+//! disk and its watcher are the shell's to replace with the machine's own,
+//! and a world it left alone reads the demo tree, so no test can reach a
+//! human's files.
 //!
 //! Two of the answers are long enough to live beside this file: [`demo`] is
 //! the fixture tree the disk reads, and `preview` is what a file *is* — the
@@ -704,6 +706,141 @@ impl Disk for DemoDisk {
 // machine-independent `~` a suite can address a row of by name, written as
 // well as read.
 
+// -- the disk, watched ---------------------------------------------------------
+
+/// Somebody else's writes: what the disk does when this app is not the one
+/// doing it.
+///
+/// A files panel lists a directory once and keeps the listing, and the
+/// verbs that write say so themselves — this is the other half, the change
+/// no verb of ours made. What a panel shows is one directory's entries, so
+/// watching is per directory and never recursive: a build running three
+/// levels down is not a listing's business.
+///
+/// Every world has one. Without a platform behind it the books below are
+/// the whole of it: nothing ever changes, which is exactly right for a
+/// scripted run, and a test says what changed itself.
+pub trait Watcher {
+    /// Watch this directory. Refcounted: two panels on one directory are
+    /// two calls, and it is watched until both have let go.
+    fn watch(&mut self, dir: &Path);
+
+    /// One [`Watcher::watch`] undone. The directory's count goes with the
+    /// last of them: a directory nobody is looking at is one nobody has to
+    /// be told about.
+    fn unwatch(&mut self, dir: &Path);
+
+    /// A round of change landed on this directory. What a watching thread
+    /// calls when the platform tells it so, and what a test calls to be
+    /// the other program.
+    fn changed(&mut self, dir: &Path);
+
+    /// How many rounds this directory has seen. A panel keeps the answer
+    /// beside its listing and reads the directory again when it differs;
+    /// the number itself means nothing, only that it moved.
+    fn revision(&mut self, dir: &Path) -> u64;
+
+    /// Whether anything at all has changed since this was last asked, and
+    /// clears the flag. The shell asks on a signal and on its poll: a
+    /// redraw is what lets every panel notice, and the panels sort out
+    /// between them whose directory it was.
+    fn moved(&mut self) -> bool;
+}
+
+/// A watcher's books: which directories somebody is looking at, how many
+/// rounds of foreign change each has seen, and whether anything has
+/// changed since the shell last asked.
+///
+/// A clone shares one set of them, so the thread that watches and the
+/// capability the panels hold are two handles on the same state. On its
+/// own — no thread, no platform — it is the fake, and a world keeps it
+/// until the shell hands over one with a machine behind it.
+#[derive(Clone, Default, Debug)]
+pub struct Watched(Arc<Mutex<Books>>);
+
+/// What [`Watched`] keeps. A directory leaves both maps together, so a
+/// long session's books stay the size of what is open.
+#[derive(Default, Debug)]
+struct Books {
+    /// How many panels are looking at each directory.
+    held: BTreeMap<PathBuf, usize>,
+    /// Rounds of change counted per directory, since it was first held.
+    rev: BTreeMap<PathBuf, u64>,
+    /// Something changed, and the shell has not been told yet.
+    moved: bool,
+}
+
+impl Watched {
+    #[must_use]
+    pub fn new() -> Watched {
+        Watched::default()
+    }
+
+    /// Every directory somebody is looking at right now — what a watching
+    /// thread rebuilds its platform's watch from.
+    #[must_use]
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        self.0
+            .lock()
+            .map(|b| b.held.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The books, or nothing at all where a holder panicked with them. A
+    /// watcher that has lost count is a panel that stops refreshing, which
+    /// is what the app did before any of this — never a panic of its own.
+    fn books(&self) -> Option<std::sync::MutexGuard<'_, Books>> {
+        self.0.lock().ok()
+    }
+}
+
+impl Watcher for Watched {
+    fn watch(&mut self, dir: &Path) {
+        if let Some(mut b) = self.books() {
+            *b.held.entry(dir.to_path_buf()).or_default() += 1;
+            b.rev.entry(dir.to_path_buf()).or_default();
+        }
+    }
+
+    fn unwatch(&mut self, dir: &Path) {
+        let Some(mut b) = self.books() else { return };
+        // Saturating, so a hold let go of twice is a hold let go of: the
+        // books lose count, which is a panel that stops refreshing —
+        // never a panic in the middle of a draw.
+        let gone = match b.held.get_mut(dir) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                *n == 0
+            }
+            None => false,
+        };
+        if gone {
+            b.held.remove(dir);
+            b.rev.remove(dir);
+        }
+    }
+
+    /// Counted only for a directory somebody is looking at: what nobody
+    /// asked about is not news, and a count nobody will read is a leak.
+    fn changed(&mut self, dir: &Path) {
+        let Some(mut b) = self.books() else { return };
+        if let Some(n) = b.rev.get_mut(dir) {
+            *n += 1;
+            b.moved = true;
+        }
+    }
+
+    fn revision(&mut self, dir: &Path) -> u64 {
+        self.books()
+            .and_then(|b| b.rev.get(dir).copied())
+            .unwrap_or(0)
+    }
+
+    fn moved(&mut self) -> bool {
+        self.books().is_some_and(|mut b| std::mem::take(&mut b.moved))
+    }
+}
+
 // -- the capabilities of one world ---------------------------------------------
 
 /// The capabilities the kernel itself supplies, installed before the apps'
@@ -729,6 +866,7 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Clipboard>(Box::new(FakeClipboard::new()));
     caps.insert::<dyn Screen>(Box::new(FakeScreen::new()));
     caps.insert::<dyn Disk>(Box::new(DemoDisk::new(env.clock.clone())));
+    caps.insert::<dyn Watcher>(Box::new(Watched::new()));
 }
 
 // -- the in-memory effects that wrap them --------------------------------------
@@ -1144,5 +1282,58 @@ mod tests {
         assert!(caps.get::<dyn Disk>().is_some());
         assert!(caps.get::<dyn Secrets>().is_some());
         assert!(caps.get::<dyn Screen>().is_some());
+        assert!(caps.get::<dyn Watcher>().is_some());
+    }
+
+    /// The books: a directory is watched while somebody is looking at it,
+    /// counted per directory, and dropped — count and all — when the last
+    /// of them lets go. A change nobody asked about is nobody's news.
+    #[test]
+    fn the_books_count_a_round_per_directory_for_as_long_as_it_is_held() {
+        let (downloads, desktop) = (Path::new("/u/Downloads"), Path::new("/u/Desktop"));
+        let mut w = Watched::new();
+        assert_eq!(w.dirs(), Vec::<PathBuf>::new());
+
+        w.watch(downloads);
+        w.watch(downloads);
+        w.watch(desktop);
+        assert_eq!(w.dirs(), vec![desktop.to_path_buf(), downloads.to_path_buf()]);
+
+        w.changed(downloads);
+        w.changed(downloads);
+        assert_eq!(w.revision(downloads), 2);
+        assert_eq!(w.revision(desktop), 0, "a round is one directory's");
+        assert!(w.moved(), "and the shell is told once");
+        assert!(!w.moved(), "and only once");
+
+        // Two holds, two lets-go: the first leaves it watched.
+        w.unwatch(downloads);
+        w.changed(downloads);
+        assert_eq!(w.revision(downloads), 3);
+        assert!(w.moved());
+        w.unwatch(downloads);
+        assert_eq!(w.dirs(), vec![desktop.to_path_buf()]);
+
+        // What nobody is looking at is not counted, and a directory that
+        // comes back starts from nothing.
+        w.changed(downloads);
+        assert_eq!(w.revision(downloads), 0);
+        assert!(!w.moved());
+        w.watch(downloads);
+        assert_eq!(w.revision(downloads), 0);
+    }
+
+    /// Two handles on one set of books: what a watching thread reports is
+    /// what the capability answers.
+    #[test]
+    fn a_clone_of_the_books_is_the_same_books() {
+        let dir = Path::new("/u/Downloads");
+        let mut theirs = Watched::new();
+        let mut ours = theirs.clone();
+        ours.watch(dir);
+        theirs.changed(dir);
+        assert_eq!(ours.revision(dir), 1);
+        assert!(ours.moved());
+        assert!(!theirs.moved(), "the flag was taken by the first to ask");
     }
 }

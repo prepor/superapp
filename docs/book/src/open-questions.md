@@ -57,12 +57,7 @@ belongs to.
     background runner must use the same disk capability as the panel, report
     progress, support cancellation, and preserve the current undo rules.
 
-13. **Watching the disk.** *(Files)* File panels refresh after Superapp changes
-    the disk or enters another directory, but not after another program makes a
-    change. macOS could use FSEvents, with events grouped to avoid repeated
-    refreshes.
-
-14. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
+13. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
     covers the tap, the scroll, the workspace pan, the workspaces overlay, the
     panel drag and the row's mark and sweep. Four moves still have no gesture:
     sending a panel to another workspace, moving it between columns, toggling
@@ -70,10 +65,11 @@ belongs to.
     joins. Possible homes include a long press on a link and a menu on the
     header.
 
-15. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
+14. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
     the shell's own half of it is written: touch, the grid the screen picks,
-    the safe-area insets, and the soft keyboard's occlusion and full text
-    state. There is no SDK in this tree, so none of it has run on a device.
+    the safe-area insets, the soft keyboard's occlusion and full text state,
+    and the inotify watch the file panels refresh on. There is no SDK in this
+    tree, so none of it has run on a device.
     What is not written is what needs one: a secrets backend that is not a
     private file, and, for the file browser, access outside the app directory,
     the system opener and the system trash, which mean the Storage Access

@@ -203,8 +203,9 @@ pub fn plan_here(world: &World, clip: &Clipboard, dir: &str) -> Plan {
     for path in &clip.paths {
         let name = basename(path).to_string();
         let same_dir = parent(path) == Some(dir);
-        // The source may have gone while the clipboard waited — nothing
-        // watches the disk, so this is the first time anyone has looked.
+        // The source may have gone while the clipboard waited: a watch
+        // says that a directory changed, not that this path is still
+        // there, so this is the first look at the path itself.
         if is_root(path) {
             plan.refused.push(format!("“{path}” is a root"));
         } else if stat_in(world, path).is_none() {
@@ -240,8 +241,8 @@ pub fn plan_here(world: &World, clip: &Clipboard, dir: &str) -> Plan {
 // What a verb claimed of the disk, and how to give it back. In memory, on a
 // history node, never serialized — what survives a restart is the disk
 // itself. Each one asks the disk before it reverses rather than trusting
-// what it remembers: nothing watches the disk, so the world may well have
-// moved on, and a reversal that has to be refused says so
+// what it remembers: watched or not, the world may well have moved on, and
+// a reversal that has to be refused says so
 // ([`Intent::blocked`]) instead of writing over whatever is there now.
 
 /// One path a verb performed, and what it left where it put it. A [`Step`]

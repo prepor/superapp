@@ -85,7 +85,7 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `root.rs` | The window, and the app root that hangs every app's templates on the stage |
 | `apps/mail/` | [Mail](./mail.md): ten panel kinds, a schema, a seed, four deferred effects, three capabilities, a search source, two problem sources, and its workers |
 | `apps/files/` | [Files](./files.md): two panel kinds, one root, and a clipboard other apps may read |
-| `platform/` | What this machine gives the shell that Makepad does not: the disk, the keychain, the trash, and a window-layer screenshot |
+| `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, and a window-layer screenshot |
 | `bin/` | `bucketd`, `sync-demo`, and `reseed-edit`, the programs the device-sync walks are driven with |
 
 `app/src/platform/` is below the shell rather than beside it, and the same rule

@@ -9,7 +9,8 @@ may read.
 It reaches the disk through the kernel's `Disk` [capability](./apps.md#capabilities),
 in the display spelling the panels use, and the kernel translates `~` to a real
 path at the boundary. A restored panel therefore points at the current device's
-home directory.
+home directory. It hears about somebody else's writes through `Watcher`, the
+capability beside it.
 
 ## Tags and roots
 
@@ -239,6 +240,31 @@ its filter, cursor, and marks, and each card restats. Undo and redo are covered
 differently: the app keeps a count of its own writes, and each panel compares
 it on every draw and event, so a reversal that no verb ran still lands.
 
-The app does not watch the disk. A change another program makes is not noticed
-until something else refreshes the panel; see
-[Open Questions](./open-questions.md).
+Another program's write is the other half, and the kernel's `Watcher`
+[capability](./apps.md#capabilities) is how it arrives. A panel watches the one
+directory it shows for as long as it shows it — a card watches the directory
+its file is in — and lets go when it closes; the watcher counts rounds of
+change per directory. What a panel compares on every draw and event is
+therefore a pair: this app's writes, and the rounds counted for its own
+directory. A change in one directory never costs another a reading.
+
+The machine behind the capability is `app/src/platform/watch/`: FSEvents on
+macOS, inotify on android, and on any other platform nothing at all, which
+leaves a panel refreshing on its own writes alone. Watching is per directory
+and never recursive, so a build running three levels down is not a listing's
+business. A directory taken out from under a panel — moved, renamed or deleted
+— is a change to that directory and reported as one, so a listing never goes on
+drawing a path that is not there. So is a path that leads somewhere else than
+it did: both instruments watch what a path resolved to, so what each path leads
+to is asked again on every turn, and a repointed link is a change to the panel
+showing it. When the platform says only that events were lost, every watched
+directory is reported and every watch retaken: a listing that may be stale and
+one known to be stale are worth the same reading. Events are otherwise grouped
+twice: the platform coalesces a burst into one delivery, and a delivery bumps a
+directory once however many paths it carried — a thousand-file copy is one
+reading, not a thousand. The watching thread rings the UI thread's bell, and
+the shell redraws; each panel then works out for itself whether the round was
+its own directory's.
+
+A scripted run is never watched, real disk or demo tree: a suite's frames may
+not depend on what the machine it runs on happens to be doing.

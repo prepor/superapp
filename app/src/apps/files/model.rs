@@ -5,10 +5,15 @@
 //! capability, in the display spelling the panels use (`~/Downloads`), and
 //! the kernel translates. Nothing here writes: the four verbs that do are
 //! in [`ops`](super::ops).
+//!
+//! Watching is the other half of reading, and [`Watch`] is where a panel
+//! asks for it: somebody else's write is a listing that has gone stale,
+//! and a panel that is not open is a directory nobody has to be told
+//! about.
 
 use std::rc::Rc;
 
-use kernel::caps::Disk;
+use kernel::caps::{Disk, Watcher};
 use kernel::effect::World;
 use kernel::filter::{Ast, Op};
 use kernel::richtable::{self, Datasource, Suggestion, TagDef, TagType, Values};
@@ -170,6 +175,54 @@ pub fn id_in(world: &World, path: &str) -> Option<FileId> {
         .flatten()
 }
 
+// -- the disk, watched ---------------------------------------------------------
+
+/// A directory watched for as long as this is held.
+///
+/// What a panel wants to be told about is the one directory it shows, and
+/// only while it is showing it — so the instance keeps one of these, and
+/// closing the panel drops it and lets the watcher go. Two panels on one
+/// directory are two holds, and it is watched until both have let go.
+///
+/// A world with no machine behind its watcher — every test, every scripted
+/// run — takes the hold and never reports anything, which is the app as it
+/// was before anything watched: a panel refreshes on the writes it knows
+/// about.
+pub struct Watch {
+    world: Rc<World>,
+    dir: String,
+}
+
+impl Watch {
+    /// Starts watching `dir`, in the display spelling the panels use.
+    #[must_use]
+    pub fn on(world: &Rc<World>, dir: &str) -> Watch {
+        let _ = world.with_cap::<dyn Watcher, _>(|w| w.watch(&real_path(dir)));
+        Watch {
+            world: world.clone(),
+            dir: dir.to_string(),
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self
+            .world
+            .with_cap::<dyn Watcher, _>(|w| w.unwatch(&real_path(&self.dir)));
+    }
+}
+
+/// How many rounds of somebody else's writing this directory has seen. The
+/// number says nothing by itself; a panel keeps the one its listing was
+/// read at and looks again when they differ.
+#[must_use]
+pub fn watched_at(world: &World, dir: &str) -> u64 {
+    world
+        .with_cap::<dyn Watcher, _>(|w| w.revision(&real_path(dir)))
+        .unwrap_or(0)
+}
+
 // -- the datasource ------------------------------------------------------------
 
 /// The tags a files panel's filter accepts.
@@ -231,8 +284,8 @@ pub struct DirRow {
 
 /// One directory as a rich-table datasource: the listing in memory — read
 /// through the disk when the panel opened on the directory — and the
-/// filter evaluated over it. Nothing watches the disk, so a panel re-lists
-/// when a verb says the disk changed.
+/// filter evaluated over it. A panel re-lists when a verb says the disk
+/// changed, or the watcher says another program did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirSource {
     pub dir: String,
