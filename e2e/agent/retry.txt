@@ -1,0 +1,35 @@
+# args:
+# env:
+#
+# A round that came to nothing, and the one that follows it. The fake
+# gateway refuses a message with *fail* in it, so the run fails with the
+# gateway's own sentence — drawn where the answer would have been, in the
+# colour errors get — and the bar offers *retry*.
+#
+# The assertion is the click: the sentence resolves only if the transcript
+# drew it, and the answer after the retry resolves only if the second round
+# went out.
+
+wait 900
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+
+type "please fail"
+wait 500
+key enter
+wait 900
+click "the gateway is down"
+wait 400
+shot r1-failed
+
+click "retry"
+wait 900
+click "Hello. I am the assistant."
+wait 400
+shot r2-retried
+quit

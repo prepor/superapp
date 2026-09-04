@@ -38,14 +38,8 @@ impl Agents {
         PanelId::bare(Self::TAG)
     }
 
-    /// The table, its cursor and its marks, read-only — the tests' door
-    /// onto what the widget did.
-    #[cfg(test)]
-    #[must_use]
-    pub fn list(&self) -> &ChatList {
-        &self.list
-    }
-
+    /// The table, its cursor and its marks — what the widget draws and
+    /// walks, and the tests' door onto what it did.
     pub fn list_mut(&mut self) -> &mut ChatList {
         &mut self.list
     }

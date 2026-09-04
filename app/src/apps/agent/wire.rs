@@ -19,6 +19,11 @@
 //! type as the real one, so a scripted run exercises the assembly a real
 //! answer will go through.
 
+// The wire is a whole shape, not the half this build happens to read: a
+// message of every role, a call's arguments parsed, the assembler's two
+// halves apart. What no code path here asks for, a fixture's test does.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

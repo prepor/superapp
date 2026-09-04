@@ -1,0 +1,48 @@
+# args:
+# env:
+#
+# A panel as context. `cmd+shift+a` on the inbox opens a chat joined to it
+# with the inbox's chip in the composer; the chip is a reference, so a press
+# on it goes to the panel it points at. What is sent renders the chip for the
+# model, which is what the fake reads back — *You are looking at inbox.*
+# resolves only if the panel's own context reached the request.
+#
+# In the chat, the same chord adds the chip of the panel the chat is joined
+# from — the second half of the rule — and its `×` takes it off again. A chip
+# that has gone with a turn wears no `×`: there is no unasking it.
+
+wait 900
+
+key cmd+shift+a
+wait 900
+shot c1-chip
+click "chip inbox"
+wait 500
+
+# The caret goes back to the composer by its own name.
+click "ask"
+wait 500
+type "what am I looking at"
+wait 500
+key enter
+wait 900
+click "You are looking at inbox."
+wait 400
+
+# The chip went with the turn: it stands over the words that carried it, and
+# the composer is empty of chips.
+click "chip inbox"
+wait 400
+shot c2-sent
+
+# The chord again, from inside the chat: the panel it is joined from. The
+# press above left the keyboard on the inbox, so the chat takes it back
+# first — the chord is about the focused panel.
+click "ask"
+wait 500
+key cmd+shift+a
+wait 700
+click "× inbox"
+wait 500
+shot c3-dropped
+quit

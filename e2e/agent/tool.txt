@@ -1,0 +1,39 @@
+# args:
+# env:
+#
+# A tool call, and its card. The fake asks for `files.rename` when the
+# message says *rename*; the call runs on the UI thread the moment it
+# arrives, and this build offers no such tool — so the card says what was
+# asked for and, under it, why it could not be done, in the colour errors
+# get. The model reads that sentence back and answers.
+#
+# When the files app offers the tool, the only thing that changes here is
+# what the card's error line says: the card, the click and the answer are the
+# same.
+
+wait 900
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+
+type "rename the readme"
+wait 500
+key enter
+wait 900
+
+# The card's first line: the tool by name, with what the model wrote for it.
+click "files.rename"
+wait 400
+click "no such tool in this build"
+wait 400
+shot t1-card
+
+# The run went on: the model read the failure and said what it had to say.
+click "Renamed it."
+wait 400
+shot t2-answered
+quit

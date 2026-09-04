@@ -21,7 +21,8 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
 
-use super::super::model::{self, ChatId, Run, Turn};
+use super::super::chip::Chip;
+use super::super::model::{self, Carried, ChatId, Run, Turn};
 use super::Agents;
 
 /// The argument a chat panel carries when there is no row behind it yet.
@@ -39,6 +40,10 @@ pub struct Chat {
     /// edit, as the compose sheet does with a draft — but nothing is
     /// written down: an unsent message is not a row.
     draft: String,
+    /// What the composer is carrying beside its words. They go with the
+    /// next send and leave the composer with it; like the draft, they are
+    /// not a row until then.
+    chips: Vec<Chip>,
 }
 
 impl Chat {
@@ -86,6 +91,31 @@ impl Chat {
         }
     }
 
+    /// The context the composer is holding, in the order it was given.
+    #[must_use]
+    pub fn chips(&self) -> &[Chip] {
+        &self.chips
+    }
+
+    /// One more — unless this panel is already carrying it. A chip is a
+    /// reference, and two references to one panel say the same thing twice;
+    /// which of them is which is settled by what a turn would keep of them,
+    /// so no kind of chip is named here.
+    pub fn add_chip(&mut self, chip: Chip) {
+        let json = chip.to_json();
+        if self.chips.iter().any(|c| c.to_json() == json) {
+            return;
+        }
+        self.chips.push(chip);
+    }
+
+    /// The `i`-th taken off — the × on a pill.
+    pub fn remove_chip(&mut self, i: usize) {
+        if i < self.chips.len() {
+            self.chips.remove(i);
+        }
+    }
+
     /// The newest round of the agent in this chat, whatever it is doing —
     /// its id, its status, its error and what it cost.
     #[must_use]
@@ -127,7 +157,8 @@ impl Chat {
         ))
     }
 
-    /// Sends what is in the composer.
+    /// Sends what is in the composer: the words, and the chips rendered for
+    /// the model as they stand now.
     ///
     /// A blank chat's send makes the row and then replaces the slot with
     /// the real conversation's identity, so the layout the session saves
@@ -135,8 +166,20 @@ impl Chat {
     /// the only copy.
     pub fn send(&mut self, s: &mut Session) {
         let said = std::mem::take(&mut self.draft);
-        let Some((chat, _)) = model::send(s, self.chat, &said) else {
+        let chips = std::mem::take(&mut self.chips);
+        let carried = Carried {
+            chips: chips.iter().map(Chip::to_json).collect(),
+            context: (!chips.is_empty()).then(|| {
+                chips
+                    .iter()
+                    .map(|c| c.render(s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        };
+        let Some((chat, _)) = model::send(s, self.chat, &said, carried) else {
             self.draft = said;
+            self.chips = chips;
             return;
         };
         let was_blank = self.chat.is_none();
@@ -202,7 +245,7 @@ impl Panel for Chat {
         let run = self.latest_run();
         let going = run.as_ref().is_some_and(Run::live);
         let mut v = Vec::new();
-        if !going && !self.draft.trim().is_empty() {
+        if !going && (!self.draft.trim().is_empty() || !self.chips.is_empty()) {
             v.push(Verb::run("agent.send", "send", Some('s')));
         }
         if going {
@@ -275,6 +318,10 @@ impl PanelKind for ChatKind {
             store: cx.session().store().clone(),
             slot: 0,
             draft: String::new(),
+            // What `cmd+shift+a` left for it: the panel it was opened
+            // about, offered on the app's own static because a navigation
+            // carries an identity and nothing else.
+            chips: super::super::AGENT.take_offered().into_iter().collect(),
         })
     }
 }

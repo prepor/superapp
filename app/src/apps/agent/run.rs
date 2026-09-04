@@ -187,7 +187,11 @@ impl Effect for Complete {
         let turns = model::turns_conn(db, self.chat);
         let tools = AGENT.tools();
         let describes = AGENT.describes();
-        let req = prompt::request(&chat, &turns, &tools, &describes, None);
+        // The panel in context is the newest one the person named: a chip
+        // rendered at send time and kept on its turn, because rendering one
+        // takes a session and this thread has a reader.
+        let context = turns.iter().rev().find_map(|t| t.context.as_deref());
+        let req = prompt::request(&chat, &turns, &tools, &describes, context);
         let run = self.run;
         let gateway = cx.cap::<dyn Gateway>()?;
         let mut on = |chunk: &Chunk| {

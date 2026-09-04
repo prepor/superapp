@@ -1,0 +1,71 @@
+# args:
+# env:
+#
+# A chat, from nothing: the launcher opens a blank one, the caret is already
+# in the composer, and what is typed goes with `enter`. Every scripted run
+# has the fake gateway behind it, so the answer is the default script's and
+# the assertion is a click on it — a label that does not resolve fails the
+# run.
+#
+# Then the list: the bar's *agents* link replaces the chat with the roster of
+# them, and the chat's own row previews it back.
+
+wait 900
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+shot a1-empty
+
+# The caret is in the field already: a chat one has just opened is a chat one
+# can type in, with nothing to click first.
+type "hello"
+wait 500
+shot a2-typed
+key enter
+wait 900
+click "Hello. I am the assistant."
+wait 400
+shot a3-answered
+
+# The person's turn is addressed by its own first line, which resolves only
+# if the transcript drew it.
+click "hello"
+wait 400
+
+# -- an answer that ran out of room ------------------------------------------
+
+# The model stopping on `length` is a mark in the muted line under the turn,
+# beside what the round cost — and that line is addressable, so this is an
+# assertion and not a screenshot.
+click "ask"
+wait 400
+type "cut it short"
+wait 400
+key enter
+wait 900
+click "This answer is long and it"
+wait 400
+click "cut short"
+wait 400
+shot a3b-cut-short
+
+# -- the list ----------------------------------------------------------------
+
+# A dotted link: the roster replaces the chat in place. The chat is titled by
+# the first line of the first thing said in it.
+click "agents"
+wait 900
+shot a4-list
+
+# The row previews the conversation beside the list, and the answer is there
+# to click again.
+click "hello"
+wait 900
+shot a5-preview
+click "Hello. I am the assistant."
+wait 500
+quit

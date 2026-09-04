@@ -20,20 +20,19 @@
 //! a window's own run, the scripted [`FakeGateway`] in every test, every
 //! suite and every library mount.
 
-// The engine is whole and nothing draws it yet. What is left over is
-// exactly the half a widget calls — the composer's draft, the live tail,
-// the usage line, the pending calls a shown chat runs — plus the script
-// entries only a test plants. The widgets take this line out with them.
-#![allow(dead_code)]
-
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kernel::app::{App, Apps, Capabilities, Env, Mode, ProblemSource, Root, Schema, Worker};
+use kernel::layout::SlotId;
+use kernel::nav::Nav;
 use kernel::panel::PanelKind;
+use kernel::session::Session;
 use kernel::store::Store;
 use kernel::tool::Tool;
+
+use chip::Chip;
 
 pub mod calls;
 pub mod chip;
@@ -47,6 +46,7 @@ pub mod real;
 pub mod run;
 pub mod schema;
 pub mod ui;
+pub mod widgets;
 pub mod wire;
 pub mod worker;
 
@@ -92,13 +92,15 @@ pub static PROVIDER: Provider = Provider {
 
 /// The app, and the little it keeps in memory.
 ///
-/// Three things, and each is here because a row would be the wrong place
-/// for it. A **tail** is what has arrived of an answer still being written:
-/// a token a row would be a thousand writes a turn. The **wake** hook is
-/// the shell's way of asking for a frame, which the kernel has no word for.
-/// The **tools** and the **describes** are copied out of the registry in
+/// Four things, and each is here because a row would be the wrong place for
+/// it. A **tail** is what has arrived of an answer still being written: a
+/// token a row would be a thousand writes a turn. The **wake** hook is the
+/// shell's way of asking for a frame, which the kernel has no word for. The
+/// **tools** and the **describes** are copied out of the registry in
 /// [`App::attach`], because a request is built on a worker's thread with no
-/// registry in reach.
+/// registry in reach. And the **offered** chip is what `cmd+shift+a` leaves
+/// for the chat it opens, a navigation carrying an identity and nothing
+/// else.
 pub struct Agent {
     /// What is arriving, per run in flight. Ordered by run id, which costs
     /// nothing and is what a `static` can be built with.
@@ -106,6 +108,7 @@ pub struct Agent {
     tools: Mutex<Vec<Tool>>,
     describes: Mutex<Vec<(&'static str, &'static str)>>,
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    offered: Mutex<Option<Chip>>,
 }
 
 /// The one in this build.
@@ -114,6 +117,7 @@ pub static AGENT: Agent = Agent {
     tools: Mutex::new(Vec::new()),
     describes: Mutex::new(Vec::new()),
     wake: Mutex::new(None),
+    offered: Mutex::new(None),
 };
 
 static CHAT_KIND: panels::ChatKind = panels::ChatKind;
@@ -165,6 +169,28 @@ impl App for Agent {
         caps.insert::<FakeGateway>(Box::new(fake));
     }
 
+    /// `cmd+shift+a`, taken: a chat that carries the panel as context.
+    ///
+    /// In a chat already, the chord adds the chip of the panel the chat is
+    /// joined from — asking about what one is looking at, from where one is
+    /// asking. Anywhere else it opens a chat joined to the panel, with that
+    /// panel's chip in its composer.
+    fn ask(&self, s: &mut Session, about: SlotId) -> bool {
+        if self.add_to_chat(s, about) {
+            return true;
+        }
+        let Some(chip) = Chip::panel(s, about) else {
+            return false;
+        };
+        self.offer(chip);
+        s.nav(Nav::Open {
+            from: about,
+            id: Chat::new_id(),
+            fresh: false,
+        });
+        true
+    }
+
     fn problems(&self) -> &'static [&'static dyn ProblemSource] {
         SOURCES
     }
@@ -188,6 +214,53 @@ impl App for Agent {
 }
 
 impl Agent {
+    /// The chip `cmd+shift+a` made, kept until the chat it opened takes it.
+    /// One at a time: the chord opens one chat, and the tick that opens it
+    /// takes the offer with it.
+    ///
+    /// # Panics
+    ///
+    /// If a previous holder panicked with the offer locked.
+    pub fn offer(&self, chip: Chip) {
+        *self.offered.lock().expect("the agent's offered chip") = Some(chip);
+    }
+
+    /// The offer, taken — so a chat opened by any other road starts empty.
+    ///
+    /// # Panics
+    ///
+    /// As [`Agent::offer`].
+    #[must_use]
+    pub fn take_offered(&self) -> Option<Chip> {
+        self.offered.lock().expect("the agent's offered chip").take()
+    }
+
+    /// The chord inside a chat: the panel the chat is joined from, added to
+    /// its composer. Answers whether this slot was a chat at all.
+    fn add_to_chat(&self, s: &mut Session, about: SlotId) -> bool {
+        let Some(inst) = s.panel(about) else {
+            return false;
+        };
+        if inst.borrow_mut().as_any().downcast_mut::<Chat>().is_none() {
+            return false;
+        }
+        // Made before the chat is borrowed to write: a chip reads the panel
+        // it points at, and this walk starts at one that is open.
+        let chip = s.join_parent_of(about).and_then(|p| Chip::panel(s, p));
+        match chip {
+            Some(chip) => {
+                if let Some(c) = inst.borrow_mut().as_any().downcast_mut::<Chat>() {
+                    c.add_chip(chip);
+                }
+                s.redraw();
+            }
+            // A chat standing on its own has no panel to speak of, and says
+            // so rather than opening a second chat about itself.
+            None => s.notify("this chat is joined to nothing", false),
+        }
+        true
+    }
+
     /// What a request carries, read off the finished registry: every tool
     /// this build offers, in app-list order, and each app's data in its own
     /// words under the app's id — apps that describe nothing say nothing.

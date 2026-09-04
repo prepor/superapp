@@ -18,6 +18,11 @@
 //! production world gives each worker its own world, and the run being
 //! scripted is one conversation.
 
+// A script is a vocabulary, and this module is where the whole of it is
+// spelled: what no suite in this build plants — a filtered answer, the
+// record of what the model was told — a test does.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -121,14 +126,32 @@ impl FakeGateway {
         fake
     }
 
-    /// What a build with nobody's script in it says. Later phases add the
-    /// entries the e2e suites need; every one of them is a keyword, so an
-    /// ordered script stays predictable.
+    /// What a build with nobody's script in it says: the answers the e2e
+    /// suites ask for, and the greeting for anything else.
+    ///
+    /// Every entry but the last is a keyword, so a suite says which answer
+    /// it wants in the words it types and the order of the list never
+    /// matters. The last has no word on it and takes whatever is left,
+    /// which is what an unscripted question gets.
     #[must_use]
     pub fn default_script() -> FakeGateway {
-        FakeGateway::new(vec![Reply::always(Answer::Text(
-            "Hello. I am the assistant.".into(),
-        ))])
+        FakeGateway::new(vec![
+            Reply::when("fail", Answer::Fail("the gateway is down".into())),
+            Reply::when("cut", Answer::Cut("This answer is long and it".into())),
+            Reply::when(
+                "rename",
+                Answer::Call {
+                    name: "files.rename".into(),
+                    arguments: serde_json::json!({
+                        "path": "~/Downloads/README.txt",
+                        "name": "readme-renamed.txt",
+                    }),
+                    then: "Renamed it.".into(),
+                },
+            ),
+            Reply::when("looking", Answer::Text("You are looking at {panel}.".into())),
+            Reply::always(Answer::Text("Hello. I am the assistant.".into())),
+        ])
     }
 
     /// Puts a script in and starts it over: nothing spent, no call waiting

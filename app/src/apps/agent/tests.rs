@@ -690,7 +690,7 @@ use kernel::nav::Nav;
 use kernel::panel::{PanelId, PanelKind, VerbAct};
 use kernel::session::Action;
 
-use super::model::{self, Chat as ChatRow, ChatId, Cost, Turn};
+use super::model::{self, Carried, Chat as ChatRow, ChatId, Cost, Turn};
 use super::panels::{Agents, Chat};
 use super::problems::GatewayProblems;
 use super::{calls, prompt, real, schema, worker, Agent};
@@ -779,7 +779,7 @@ fn transcript(s: &Session, chat: ChatId) -> Vec<(Role, String)> {
 
 /// Sends in a fresh chat and answers which chat it made.
 fn send_new(s: &mut Session, text: &str) -> ChatId {
-    let (chat, _) = model::send(s, None, text).expect("the send landed");
+    let (chat, _) = model::send(s, None, text, Carried::default()).expect("the send landed");
     s.settle();
     chat
 }

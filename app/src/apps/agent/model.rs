@@ -87,13 +87,26 @@ pub struct Chat {
     pub updated: f64,
 }
 
+/// What a turn carries besides its words.
+///
+/// Two readings of one thing: `chips` is how the transcript draws the
+/// context back, and `context` is how the model was told it. They are kept
+/// apart because different halves read them — a widget the first, a request
+/// the second — and because a chip renders through a session, which the
+/// thread that builds a request has not got.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Carried {
+    pub chips: Vec<Value>,
+    pub context: Option<String>,
+}
+
 /// One message, as its row keeps it and as the next request sends it.
 ///
 /// The wire's own message is flattened in, because that is what `body`
 /// holds — verbatim, so the next request is built from the rows and a
-/// `sqlite3` reader can still read them — with the app's two keys beside
-/// it: `chips`, the context a turn carried (empty until phase two), and
-/// `finish`, the word the model stopped on.
+/// `sqlite3` reader can still read them — with the app's own keys beside
+/// it: `chips` and `context`, what a turn carried and what it rendered to,
+/// and `finish`, the word the model stopped on.
 ///
 /// The five fields above them are the **row's**, not the body's: serde
 /// skips them both ways, and they are filled in by the read.
@@ -113,10 +126,19 @@ pub struct Turn {
     pub created: f64,
     #[serde(flatten)]
     pub message: Message,
-    /// The context this turn carried, as chips. Reserved for phase two; an
-    /// empty array until then, and left out of the JSON while it is empty.
+    /// The context this turn carried, as chips — what the transcript draws
+    /// back as pills, one [`Chip::to_json`](super::chip::Chip::to_json)
+    /// apiece.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chips: Vec<Value>,
+    /// What those chips rendered to for the model, as the request carries
+    /// it. Kept on the turn rather than rebuilt per request, because a chip
+    /// renders through a [`Session`] — the open panels, the effect registry
+    /// — and the thread that builds a request has neither: it has a reader.
+    /// So the render happens once, on the UI thread, at send time, with the
+    /// rows the panel was showing then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     /// Why the model stopped, on an agent's turn: `stop`, `length`,
     /// `content_filter`, `stopped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,8 +157,18 @@ impl Turn {
             created: 0.0,
             message,
             chips: Vec::new(),
+            context: None,
             finish: None,
         }
+    }
+
+    /// The same, carrying context: the chips as the transcript reads them
+    /// back, and what they rendered to for the model.
+    #[must_use]
+    pub fn carrying(mut self, carried: &Carried) -> Turn {
+        self.chips.clone_from(&carried.chips);
+        self.context.clone_from(&carried.context);
+        self
     }
 
     /// The same, said by a run.
@@ -519,17 +551,6 @@ pub fn run_conn(c: &Connection, run: RunId) -> Option<Run> {
     .ok()
 }
 
-/// Every call of a run, off a connection.
-#[must_use]
-pub fn calls_conn(c: &Connection, run: RunId) -> Vec<Call> {
-    let Ok(mut stmt) = c.prepare(Q_RUN_CALLS.sql) else {
-        return Vec::new();
-    };
-    stmt.query_map([run], call_row)
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-}
-
 /// The calls of the run's newest assistant turn: the round it is waiting on,
 /// off a connection.
 ///
@@ -746,17 +767,26 @@ fn cut_back_tx(c: &Connection, chat: ChatId, seq: i64, run: RunId) -> rusqlite::
 /// and a run nobody has asked for. One action, and [`Session::act`] kicks
 /// the workers, which is what starts it.
 ///
-/// Answers the chat and the run, or `None` for an empty message and for a
-/// device that may not write.
-pub fn send(s: &mut Session, chat: Option<ChatId>, text: &str) -> Option<(ChatId, RunId)> {
+/// `carried` is the context the composer held — the chips, and the text
+/// they rendered to at this moment, which is what the request carries.
+///
+/// Answers the chat and the run, or `None` for a message with neither words
+/// nor context in it, and for a device that may not write.
+pub fn send(
+    s: &mut Session,
+    chat: Option<ChatId>,
+    text: &str,
+    carried: Carried,
+) -> Option<(ChatId, RunId)> {
     let said = text.trim().to_string();
-    if said.is_empty() {
+    if said.is_empty() && carried.chips.is_empty() {
         return None;
     }
     let now = s.now();
     let title = title_of(&said);
     let label = format!("send “{title}”");
     let (model, body) = (MODEL.to_string(), said.clone());
+    let held = carried.clone();
     let mut act = Action::writing("agent.send", label, move |tx| {
         let chat = match chat {
             Some(id) => id,
@@ -765,7 +795,8 @@ pub fn send(s: &mut Session, chat: Option<ChatId>, text: &str) -> Option<(ChatId
         // The run before the turn, so the person's message records which
         // round it started — which is what the transcript groups by.
         let run = new_run_tx(tx, chat, now)?;
-        let (_, seq) = add_turn_tx(tx, chat, &Turn::new(Message::user(body)).by(run), now)?;
+        let turn = Turn::new(Message::user(body)).carrying(&held).by(run);
+        let (_, seq) = add_turn_tx(tx, chat, &turn, now)?;
         Ok((chat, run, seq))
     });
     if let Some(id) = chat {
@@ -776,6 +807,7 @@ pub fn send(s: &mut Session, chat: Option<ChatId>, text: &str) -> Option<(ChatId
         chat,
         seq,
         text: said,
+        carried,
         run: Cell::new(run),
     }));
     Some((chat, run))
@@ -883,6 +915,10 @@ struct Sent {
     chat: ChatId,
     seq: i64,
     text: String,
+    /// What the composer held when it went. Redo files the same turn,
+    /// context and all: rendering the chips again would ask the model about
+    /// a workspace that has moved on since.
+    carried: Carried,
     run: Cell<RunId>,
 }
 
@@ -913,11 +949,13 @@ impl Intent for Sent {
 
     fn reapply(&self, w: &World) -> Result<(), String> {
         let (chat, text, now) = (self.chat, self.text.clone(), w.now());
+        let carried = self.carried.clone();
         let run = w
             .store()
             .write(move |c| {
                 let run = new_run_tx(c, chat, now)?;
-                add_turn_tx(c, chat, &Turn::new(Message::user(text)).by(run), now)?;
+                let turn = Turn::new(Message::user(text)).carrying(&carried).by(run);
+                add_turn_tx(c, chat, &turn, now)?;
                 Ok(run)
             })
             .map_err(|e| e.to_string())?;
