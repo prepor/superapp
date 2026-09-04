@@ -582,6 +582,121 @@ fn archiving_a_mail_already_in_the_archive_says_so() {
     assert!(s.panel(reader).is_some(), "and closes nothing");
 }
 
+/// The spam list wears *not spam* where the inbox wears *archive*, and it
+/// puts the marked conversation back in the inbox: one undoable action, one
+/// `move` job, and the server agrees.
+#[test]
+fn the_spam_list_puts_a_conversation_back_in_the_inbox() {
+    let (mut s, _clock) = session();
+    let spam = open_root(&mut s, Role::Spam.id());
+    let mail = with_mailbox(&s, spam, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    assert_eq!(role_of(s.store(), mail), "spam");
+
+    let labels: Vec<String> = s
+        .panel(spam)
+        .unwrap()
+        .borrow()
+        .verbs()
+        .iter()
+        .map(|v| v.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["sync", "not spam 1", "delete 1", "mark all", "clear"],
+        "the junk keeps a conversation the way the inbox archives one"
+    );
+
+    let before = kinds(&s).len();
+    verb(&mut s, spam, "mail.not_spam");
+    assert_eq!(role_of(s.store(), mail), "inbox", "it came out of the junk");
+    assert_eq!(
+        with_mailbox(&s, spam, |m| m.len()),
+        2,
+        "the list is shorter"
+    );
+    assert_eq!(with_mailbox(&s, spam, |m| m.list().marks().len()), 0);
+    // One node for the whole gesture: the walk it left behind is the batch
+    // arriving at its consequence, folded into its node.
+    assert_eq!(kinds(&s).len(), before + 1, "{:?}", kinds(&s));
+    assert_eq!(kinds(&s).last().map(String::as_str), Some("file"));
+
+    // The push pass turned the move into a job, and the letter is where the
+    // list says it is on the server too.
+    let moves: Vec<_> = s
+        .world()
+        .jobs()
+        .into_iter()
+        .filter(|j| j.kind == "move")
+        .collect();
+    assert_eq!(moves.len(), 1, "{:?}", s.world().jobs());
+    assert_eq!(moves[0].status, "done");
+    let n = servers(&s)
+        .with(1, |srv| {
+            (srv.folders["INBOX"].2.len(), srv.folders["Spam"].2.len())
+        })
+        .expect("the demo account's server");
+    assert_eq!(n, (71, 2), "one letter left Spam for INBOX");
+
+    // One press takes the whole gesture back: the mail goes to the junk and
+    // the mark goes back on its row.
+    assert!(s.undo());
+    assert_eq!(role_of(s.store(), mail), "spam");
+    assert_eq!(
+        with_mailbox(&s, spam, |m| m.list().marks().len()),
+        1,
+        "the mark came back with the mail"
+    );
+}
+
+/// The reader's *not spam* is the one button on it that comes and goes: a
+/// letter read out of the junk wears it, one read out of the inbox does not,
+/// and pressing it files the conversation and closes the reader like any
+/// other filing.
+#[test]
+fn the_reader_wears_not_spam_over_a_letter_in_the_junk() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, inbox, |m| m.go(0)).expect("the inbox's first row");
+    go(&mut s, nav);
+    let reader = s.joined_child(inbox).expect("a reader");
+    assert!(
+        !verb_ids(&s, reader).contains(&"mail.not_spam"),
+        "nothing in the inbox is junk to begin with"
+    );
+
+    let spam = open_root(&mut s, Role::Spam.id());
+    let nav = with_mailbox(&s, spam, |m| m.go(1)).expect("the junk's second row");
+    go(&mut s, nav);
+    let reader = s.joined_child(spam).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    assert_eq!(
+        verb_ids(&s, reader),
+        vec![
+            "mail.archive",
+            "mail.not_spam",
+            "mail.delete",
+            "mail.reply",
+            "mail.forward"
+        ]
+    );
+
+    verb(&mut s, reader, "mail.not_spam");
+    assert_eq!(role_of(s.store(), mail), "inbox");
+    assert!(s.panel(reader).is_none(), "the reader closed with it");
+    assert!(
+        s.joined_child(spam).is_some(),
+        "and the list it was read from moved on to the next row"
+    );
+}
+
 // -- the send flow ---------------------------------------------------------------
 
 /// A reply written, sent after its window, handed to the submission server,

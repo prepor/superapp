@@ -37,10 +37,13 @@ shape, and one query written out four times so the folder role is a SQL
 literal. They share rows, filtering, marks, cursor movement, and message
 previews.
 
-What differs is one verb: only the inbox offers **archive**, because everywhere
-else the mail is already out of it. **delete** is the move every mailbox has,
-and it means moving to the account's trash folder. Trash is a role a folder
-plays, not a mailbox panel; nothing lists it.
+What differs is one verb: the verb that *keeps* a conversation. Only the inbox
+offers **archive**, because everywhere else the mail is already out of it, and
+only spam offers **not spam**, which puts a conversation back in the inbox —
+the same move in the other direction. The archive and Sent offer neither.
+**delete** is the move every mailbox has, and it means moving to the account's
+trash folder. Trash is a role a folder plays, not a mailbox panel; nothing
+lists it.
 
 The filter tags are `@unread`, `@html`, `@from:`, `@subject:`, `@date`, and
 `@account:`. Free text matches the sender's name, the sender's address, and the
@@ -53,9 +56,9 @@ link opens: the panel is filtered from its first draw, and the field shows
 `@from:vera@kovac.io` so the next edit is the person's.
 
 The bar is `sync` (`cmd+s`), and while rows are marked, `archive n` (`cmd+a`,
-inbox only), `delete n` (`cmd+d`), `mark all` (`cmd+m`), and `clear`. *mark
-all* wears `m` rather than `l` because the shell keeps `cmd+l`; *clear* wears
-no letter because `esc` is the table's.
+inbox only), `not spam n` (`cmd+n`, spam only), `delete n` (`cmd+d`), `mark
+all` (`cmd+m`), and `clear`. *mark all* wears `m` rather than `l` because the
+shell keeps `cmd+l`; *clear* wears no letter because `esc` is the table's.
 
 ## Threads: the row is the conversation, the panel is the whole of it
 
@@ -98,8 +101,10 @@ one undo gives both back. A cursor walk that previews a row at a time coalesces
 into one node, so one undo closes the whole walk.
 
 The reader's bar is `archive` (`cmd+a`), `delete` (`cmd+d`), `reply` (`cmd+r`),
-and `forward` (`cmd+f`). The first two are buttons; reply and forward are
-links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
+and `forward` (`cmd+f`), plus `not spam` (`cmd+n`) over a letter read out of
+the spam folder and nowhere else: archiving and deleting are moves any letter
+has, while a letter is junk or it is not. The filing verbs are buttons; reply
+and forward are links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
 and open a draft joined to the reader. Filing closes the reader's own slot and
 nothing else: another panel reading the same conversation stays where it is and
 says what it shows. The list driving that reader then walks on to the row that

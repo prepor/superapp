@@ -1,5 +1,5 @@
-//! One mailbox: a rich table of conversations, and the two batch verbs over
-//! what is marked in it.
+//! One mailbox: a rich table of conversations, and the batch verbs over what
+//! is marked in it.
 //!
 //! One instance type for both tags. The role is what the source, the base
 //! condition and the bar are picked by; nothing else about a list of mail
@@ -110,12 +110,12 @@ impl Mailbox {
         Some(self.preview(row.target))
     }
 
-    /// Whether this list's rows may be archived: only the inbox's, which is
-    /// the same answer [`Mailbox::verbs`] gives the bar. A gesture asks it
-    /// too, so a finger and a button can never offer different verbs.
+    /// The verb this list wears beside *delete*, by id — the same answer
+    /// [`Mailbox::verbs`] gives the bar. A gesture asks it too, so a finger
+    /// and a button can never offer different verbs.
     #[must_use]
-    pub fn archives(&self) -> bool {
-        self.role == Role::Inbox
+    pub fn keeps(&self) -> Option<&'static str> {
+        keep_verb(self.role).map(|(id, ..)| id)
     }
 
     /// Marks the table again — what undo hands back after a batch verb took
@@ -163,10 +163,10 @@ impl Panel for Mailbox {
     /// *sync* always; the batch verbs while there are marks, with their
     /// count, and the two verbs about the set itself.
     ///
-    /// Only the inbox archives: everywhere else the mail is already out of it,
-    /// and a bar may not wear a verb that would do nothing (or, from Sent,
-    /// something nobody asked for). Delete is the one move every mailbox has —
-    /// the trash is where mail goes from anywhere.
+    /// Which verb keeps a conversation is [`keep_verb`]'s answer, and a bar
+    /// may not wear a verb that would do nothing (or, from Sent, something
+    /// nobody asked for). Delete is the one move every mailbox has — the
+    /// trash is where mail goes from anywhere.
     ///
     /// *mark all* wears `m` rather than the obvious `l`: this shell keeps
     /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
@@ -178,8 +178,8 @@ impl Panel for Mailbox {
         if n == 0 {
             return v;
         }
-        if self.role == Role::Inbox {
-            v.push(Verb::run("mail.archive", format!("archive {n}"), Some('a')));
+        if let Some((id, word, key)) = keep_verb(self.role) {
+            v.push(Verb::run(id, format!("{word} {n}"), Some(key)));
         }
         v.push(Verb::run("mail.delete", format!("delete {n}"), Some('d')));
         v.push(Verb::run("mail.all", "mark all", Some('m')));
@@ -200,6 +200,7 @@ impl Panel for Mailbox {
                 s.notify("syncing", false);
             }
             "mail.archive" => self.file_marked(s, "archive"),
+            "mail.not_spam" => self.file_marked(s, "inbox"),
             "mail.delete" => self.file_marked(s, "trash"),
             "mail.all" => {
                 let store = self.store.clone();
@@ -277,7 +278,7 @@ impl Mailbox {
             }
         }
         if moving.is_empty() {
-            s.notify(format!("nothing to {}", word_of(role)), false);
+            s.notify(nothing_said(role), false);
             return;
         }
 
@@ -339,12 +340,38 @@ fn folder_mails(store: &Store, role: Role, thread: i64) -> Vec<MailId> {
     model::thread_siblings(store, head.target)
 }
 
-/// The verb's own word for a role.
+/// The verb a mailbox wears beside *delete* — its id, the word its button
+/// says, and the letter it wears — or `None` for a list that has none.
+///
+/// The inbox archives; the spam list takes a conversation back out of the
+/// junk, which is the same move in the other direction. The archive has
+/// neither, because the mail is already out of the inbox, and Sent has
+/// neither, because filing what you wrote is not what anybody asked for.
+fn keep_verb(role: Role) -> Option<(&'static str, &'static str, char)> {
+    match role {
+        Role::Inbox => Some(("mail.archive", "archive", 'a')),
+        Role::Spam => Some(("mail.not_spam", "not spam", 'n')),
+        Role::Archive | Role::Sent => None,
+    }
+}
+
+/// The verb's own word for a role — what its button says, and what history
+/// calls the node it recorded.
 pub(super) fn word_of(role: &str) -> &'static str {
-    if role == "trash" {
-        "delete"
+    match role {
+        "trash" => "delete",
+        "inbox" => "not spam",
+        _ => "archive",
+    }
+}
+
+/// What a verb with nothing left to move says instead. *not spam* is the odd
+/// one out: "nothing to not spam" is not a sentence.
+pub(super) fn nothing_said(role: &str) -> String {
+    if role == "inbox" {
+        "nothing to take out of the spam".to_string()
     } else {
-        "archive"
+        format!("nothing to {}", word_of(role))
     }
 }
 

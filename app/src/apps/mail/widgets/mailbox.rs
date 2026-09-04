@@ -78,15 +78,15 @@ impl RowSpec for MailboxRows {
         }
     }
 
-    /// Triage under a finger: left archives, right deletes — the same two
-    /// verbs the bar wears over the marks, and asked of the same panel, so
-    /// only the inbox offers the archive. Sweeping left brings *archive* in
-    /// from the right, which is the side of the bar its button sits on.
+    /// Triage under a finger: left keeps the conversation, right deletes —
+    /// the same two verbs the bar wears over the marks, and asked of the
+    /// same panel, so a finger and a button can never offer different ones.
+    /// Only the inbox archives and only the spam list takes a conversation
+    /// out of the junk; the other two sweep one way alone. Sweeping left
+    /// brings the keeping verb in from the right, which is the side of the
+    /// bar its button sits on.
     fn swipe_verbs(panel: &Mailbox) -> [Option<&'static str>; 2] {
-        [
-            panel.archives().then_some("mail.archive"),
-            Some("mail.delete"),
-        ]
+        [panel.keeps(), Some("mail.delete")]
     }
 }
 

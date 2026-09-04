@@ -584,7 +584,7 @@ impl Stage {
             };
             let ty = row.pos.y + (row.size.y - self.cell.label_line()) / 2.0;
             self.draw_mono.new_draw_call(cx);
-            self.draw_label(cx, tx, ty, word, fg, 1.0);
+            self.draw_label(cx, tx, ty, &word, fg, 1.0);
         }
     }
 
