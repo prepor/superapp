@@ -400,9 +400,18 @@ impl Intent for Renamed {
         format!("renamed “{}” to “{}”", basename(&d.from), basename(&d.to))
     }
 
+    /// [`occupied`] asks whether anything is at the old name, which is the
+    /// right question for a move and the wrong one here: where the disk
+    /// does not tell two cases apart, what stats at the old name after a
+    /// case-only rename is this very file. So the question is asked of the
+    /// **object** — is what is there somebody else? — as every other
+    /// reversal asks it, and a disk that will not say refuses.
     fn blocked(&self, w: &World) -> Option<String> {
         let d = self.done.borrow();
-        ours(w, &d.to, d.landed).or_else(|| occupied(w, &d.from))
+        ours(w, &d.to, d.landed).or_else(|| {
+            let stranger = id_in(w, &d.from).is_some_and(|there| Some(there) != d.landed);
+            stranger.then(|| format!("something else is at “{}” now", basename(&d.from)))
+        })
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {

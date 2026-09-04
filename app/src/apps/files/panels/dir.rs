@@ -14,7 +14,7 @@ use kernel::session::{Action, Session};
 
 use super::super::completion::PathCompletion;
 use super::super::model::{
-    basename, crumbs, is_dir_in, is_root, join, list_in, normalize, parent, plural, stat_in,
+    basename, crumbs, id_in, is_dir_in, is_root, join, list_in, normalize, parent, plural, stat_in,
     DirRow, DirSource, Entry, HOME, PAGE,
 };
 use super::super::ops::{self, Done, Plan};
@@ -790,14 +790,24 @@ pub(super) fn rename_path(
     name: &str,
     id_of: fn(&str) -> PanelId,
 ) -> Said {
+    let was = basename(path).to_string();
+    // The name it already has: the field has done its work, which was
+    // nothing at all. No disk is asked and no node is made.
+    //
+    // Asked of the text exactly as typed, before the trim below, because
+    // the field was seeded with this name: a file whose name really does
+    // end in a space would otherwise be shortened by a submit that changed
+    // nothing.
+    if name == was {
+        return Said::Went;
+    }
     let name = name.trim();
     // Nothing typed: the field stands as it was, with nothing said.
     if name.is_empty() {
         return Said::Nothing;
     }
-    let was = basename(path).to_string();
-    // The name it already has: the field has done its work, which was
-    // nothing at all. No disk is asked and no node is made.
+    // The same, once the trim has had it: a stray space either side of the
+    // name it already has is not a rename either.
     if name == was {
         return Said::Went;
     }
@@ -824,7 +834,7 @@ pub(super) fn rename_path(
     if stat_in(&world, path).is_none() {
         return refuse(s, format!("“{was}” is no longer there"));
     }
-    if stat_in(&world, &to).is_some() {
+    if stat_in(&world, &to).is_some() && !only_the_case(&world, path, &to) {
         return refuse(s, format!("“{name}” is already here"));
     }
     if let Err(e) = ops::move_in(&world, path, &to) {
@@ -849,6 +859,26 @@ pub(super) fn rename_path(
     s.notify(format!("renamed “{was}” to “{name}” — cmd+z undoes"), false);
     super::refresh(s, Some(by));
     Said::Went
+}
+
+/// Whether the name a rename asks for is no clash at all but the source
+/// under another case — `notes.md` to `Notes.md` on a volume that does not
+/// tell the two apart, which is what macOS formats by default. There the
+/// destination *stats*, because it is the very file being renamed, and a
+/// plain “is it there” would refuse the one rename nobody else can make.
+///
+/// Both halves are needed: the two spellings must differ only in case, and
+/// the disk must call them one object. A name that is genuinely somebody
+/// else's is a clash however it is spelt, and two hard links to one inode
+/// are two names — moving one onto the other would take a name away.
+fn only_the_case(world: &World, from: &str, to: &str) -> bool {
+    if !from.eq_ignore_ascii_case(to) {
+        return false;
+    }
+    match (id_in(world, from), id_in(world, to)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// A refusal said twice: once as the toast every verb gives, once as the

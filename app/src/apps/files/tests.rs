@@ -212,6 +212,16 @@ fn there(s: &Session, path: &str) -> bool {
     stat_in(s.world(), path).is_some()
 }
 
+/// Puts a directory there behind the panels' backs, under exactly the name
+/// given: `new dir` trims what it is handed, and a name with a space at
+/// either end is the thing being tested.
+fn conjure_dir(s: &Session, path: &str) {
+    s.world()
+        .with_cap::<dyn Disk, _>(|d| d.make_dir(&real_path(path)))
+        .expect("a disk")
+        .expect("the disk made it");
+}
+
 /// Takes a path away behind the panels' backs — another program, while
 /// nothing was watching.
 fn vanish(s: &Session, path: &str) {
@@ -722,6 +732,54 @@ fn rename_refuses_a_path_a_taken_name_and_a_file_that_has_gone() {
         Some("“notes.md” is no longer there".to_string())
     );
     assert!(!there(&s, "~/reading.md"));
+}
+
+/// The field is seeded with the name the file has, so enter on that seed
+/// means *nothing*, whatever the name holds. A file whose name really does
+/// end in a space would otherwise be quietly shortened by a submit that
+/// changed nothing — and a stray space either side of a name is not a
+/// rename either.
+#[test]
+fn a_submit_that_changed_nothing_renames_nothing() {
+    let _alone = alone();
+    let (mut s, slot) = home();
+    go(
+        &mut s,
+        Nav::Preview {
+            from: slot,
+            id: Card::id("~/notes.md"),
+        },
+    );
+    let card = s.joined_child(slot).expect("the card");
+    let was = nodes(&s);
+
+    run(&mut s, card, "files.rename");
+    rename_card(&mut s, card, "  notes.md  ");
+    assert_eq!(nodes(&s), was, "a stray space is not a new name");
+    assert!(there(&s, "~/notes.md"));
+    assert!(!there(&s, "~/notes.md  "));
+
+    // And the same for a name that is itself spaced — made behind the
+    // panels' backs, since `new dir` trims what it is given. The seed comes
+    // back exactly as the disk spells it, and enter on it writes nothing.
+    let spaced = "~/notes .md ";
+    conjure_dir(&s, spaced);
+    assert!(there(&s, spaced));
+    go(
+        &mut s,
+        Nav::Preview {
+            from: slot,
+            id: Card::id(spaced),
+        },
+    );
+    let spaced_card = s.joined_child(slot).expect("the card");
+    run(&mut s, spaced_card, "files.rename");
+    let seed = with_card(&s, spaced_card, |c| c.renaming().map(str::to_string));
+    assert_eq!(seed, Some("notes .md ".to_string()), "the name as it is");
+    let was = nodes(&s);
+    rename_card(&mut s, spaced_card, "notes .md ");
+    assert_eq!(nodes(&s), was, "no node");
+    assert!(there(&s, spaced), "and the trailing space is still there");
 }
 
 #[test]

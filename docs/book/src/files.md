@@ -146,7 +146,18 @@ name containing `/` (*a name is not a path*), `.` and `..`, a name the
 directory already has, and a path that has gone since the field went up —
 each before or instead of writing, and each on the panel's own status line. The
 name it already has closes the field and does nothing at all: no disk is asked
-and no history node is made.
+and no history node is made, and the text is compared as typed as well as
+trimmed, so a name that itself ends in a space is not shortened by a submit
+that changed nothing.
+
+Changing only the case of a name is a rename and not a clash. On the
+case-insensitive volume macOS formats by default, `notes.md` to `Notes.md` finds
+the destination already stats — it is the same file — so the check is of the
+**object** and not the path, at each of the three places that ask: the verb's
+own refusal, the exclusive claim the real disk makes on a destination, and the
+undo that asks whether something else has taken the old name. Two paths must
+differ only in case *and* be one object for any of them to relax; two hard links
+to one inode are still two names, and moving one onto the other is refused.
 
 The panel that ran it is pointed at the new name in the layout half of the same
 action, because a panel is on the thing and not on the spelling: the card
@@ -161,7 +172,8 @@ node is created.
 
 The real disk never overwrites. A copy and a move claim their destination
 exclusively, because `std::fs::rename` and `std::fs::copy` both replace
-silently. A copy that fails removes only the destination it created itself, and
+silently; the one destination exempt from the claim is the source itself under
+another case, which is not an overwrite at all. A copy that fails removes only the destination it created itself, and
 an existing destination is never touched. A move across filesystems copies
 first and trashes the source second, and takes its own copy back off the disk
 if the source cannot be trashed. A symbolic link is copied as a link; a FIFO,
