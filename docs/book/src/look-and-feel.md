@@ -16,6 +16,11 @@ Liberation Mono and Noto as fallbacks for what Geist does not cover. Titles,
 table headers, and buttons use smaller uppercase text with extra letter
 spacing.
 
+A label in a box is centred by its line box, which is where Geist Mono puts a
+capital's middle exactly. The close button's `×` is the one glyph the chrome
+draws that is not a letter: it rides the maths axis, lower, and so is centred
+on its own ink instead.
+
 Bold text has two uses: emphasis in prose, and the one bold letter that marks a
 control's [keyboard shortcut](./interaction-grammar.md#accelerators-and-the-bar).
 Geist Mono is monospaced at every weight, so that letter is drawn in the bold
