@@ -44,6 +44,11 @@ pub struct Pictures {
     /// The reader thread, started with the first letter that has a picture
     /// in it.
     reader: Option<mpsc::Sender<Job>>,
+    /// Where the pictures that stood in a link were drawn, this draw. An
+    /// item is minted from a template and can reach neither the panel around
+    /// it nor the hit table, so it leaves its rectangle here and the reader
+    /// takes it (see [`link_rects`]).
+    links: Vec<Rect>,
 }
 
 /// One piece of work for the reader thread — the two ways a picture's bytes
@@ -340,6 +345,16 @@ fn want_data_bytes(cx: &mut Cx, k: &str, src: &str) {
     cx.global::<Pictures>().take(&ready);
 }
 
+/// Where the pictures that stood in a link were drawn, taken: the reader
+/// asks once its rows have landed, and the next draw fills the list again.
+///
+/// A picture that is a link is a control, and the panel it sits in owns
+/// where the controls of a letter are — that is what the pointer is painted
+/// from.
+pub fn link_rects(cx: &mut Cx) -> Vec<Rect> {
+    std::mem::take(&mut cx.global::<Pictures>().links)
+}
+
 /// Files what finished off the frame: bytes the reader thread found, and
 /// textures makepad's decode pool finished. True when anything landed, so the
 /// panel redraws — a picture that arrives has to be placed, and the item that
@@ -632,7 +647,7 @@ impl Widget for HtmlImage {
         }
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
         // Asked again while it decodes, not once: re-asking is an early return
         // inside makepad's cache while the job is still on the pool, and the
         // one way back when a *finished* texture is evicted under the cache's
@@ -651,16 +666,13 @@ impl Widget for HtmlImage {
                     .unwrap_or((1.0, 1.0));
                 let walk = self.box_walk(cx, nat);
                 let step = self.image.draw_walk_image(cx, walk);
-                // A picture that is a link is a control, and the panel around
-                // the letter reads the runs its text links left on the flow's
-                // tracker to know where a hand belongs. This is one of them.
+                // A picture that is a link is a control, so the panel around
+                // the letter is told where it landed: it registers the
+                // rectangles a letter's controls wear a hand on, and an item
+                // can reach nothing itself.
                 if !self.href.is_empty() {
-                    if let Some(tf) = scope.data.get_mut::<TextFlow>() {
-                        let r = self.image.area().rect(cx);
-                        tf.areas_tracker.push_tracker();
-                        tf.areas_tracker.track_rect(cx, r);
-                        tf.areas_tracker.pop_tracker();
-                    }
+                    let r = self.image.area().rect(cx);
+                    cx.global::<Pictures>().links.push(r);
                 }
                 step
             }

@@ -203,6 +203,10 @@ impl Widget for MessagePanel {
         // The hits, once the rows have landed: the header a press toggles,
         // and — while a letter is open — its reading as a selectable run and
         // the fold over its quote. A part's link registers its own.
+        //
+        // The pictures that stood in a link left their rectangles behind as
+        // they drew; which letter each belongs to is what its rows say.
+        let pics = pictures::link_rects(cx);
         self.rows.clear();
         for (idx, row) in drawn {
             let Some(t) = msgs.get(idx) else { continue };
@@ -217,6 +221,13 @@ impl Widget for MessagePanel {
                 .add(head_label(t, is_open), head, MouseCursor::Hand, props.slot);
             let quote = if is_open && row.widget(cx, ids!(body.quote_fold)).visible() {
                 rect(ids!(body.quote_fold))
+            } else {
+                None
+            };
+            // The quoted tail, while it is unfolded and is an HTML reading:
+            // its links are the letter's too.
+            let tail = if is_open && row.widget(cx, ids!(body.quote_html)).visible() {
+                rect(ids!(body.quote_html.quote_body))
             } else {
                 None
             };
@@ -250,13 +261,17 @@ impl Widget for MessagePanel {
                         .add("passed on", r, MouseCursor::Default, props.slot);
                 }
             }
-            // What a letter carries that answers a press — a link, the
+            // What a reading carries that answers a press — a link, the
             // summary line of a fold, a picture that is a link — as
             // rectangles of its own over the reading's. The pointer is
             // painted from the hit table, so without them a link would wear
             // the I-beam the letter around it is read with.
-            if let Some(letter) = letter {
-                for r in link_runs(cx, &row, letter) {
+            for (path, area) in [
+                (ids!(body.html_wrap.body_html), letter),
+                (ids!(body.quote_html.quote_body), tail),
+            ] {
+                let Some(area) = area else { continue };
+                for r in link_runs(cx, &row, path, area, &pics) {
                     props.hits.add("link", r, MouseCursor::Hand, props.slot);
                 }
             }
@@ -290,26 +305,30 @@ impl MessagePanel {
     }
 }
 
-/// Where an open letter's own controls landed: every run the `Html` widget
-/// tracked as it drew, kept inside the letter.
+/// Where one reading's own controls landed: every run the `Html` widget
+/// tracked as it drew, and the pictures that stood in a link, kept inside
+/// the reading `area`.
 ///
-/// A rect goes on that list so something *in* the letter can answer a press
-/// — the runs of a link, the summary line of a fold, and a picture that
-/// stood in a link, which [`pictures`] puts there for the same reason.
-/// Nothing else in a letter is tracked, so the list is exactly what a press
-/// means something to.
-fn link_runs(cx: &Cx2d, row: &WidgetRef, letter: Rect) -> Vec<Rect> {
-    let html = row.widget(cx, ids!(body.html_wrap.body_html)).as_html();
+/// The widget tracks a rect so something *in* it can answer a press — the
+/// runs of a link, the summary line of a fold — so that list is exactly what
+/// wants a hand. A picture stays off it: a summary takes its own click
+/// target from the runs tracked while it is open, and a picture tracked
+/// there would hand it the tap the picture's link should have. It leaves its
+/// rectangle with [`pictures`] instead, and `pics` is what that came to.
+fn link_runs(cx: &Cx2d, row: &WidgetRef, path: &[LiveId], area: Rect, pics: &[Rect]) -> Vec<Rect> {
+    let html = row.widget(cx, path).as_html();
     let Some(html) = html.borrow() else {
         return Vec::new();
     };
-    let bounds = (letter.pos, letter.pos + letter.size);
+    let bounds = (area.pos, area.pos + area.size);
     html.text_flow
         .areas_tracker
         .areas
         .iter()
         .filter(|a| a.is_valid(cx))
-        .map(|a| a.rect(cx).clip(bounds))
+        .map(|a| a.rect(cx))
+        .chain(pics.iter().copied())
+        .map(|r| r.clip(bounds))
         .filter(|r| r.size.x > 0.0 && r.size.y > 0.0)
         .collect()
 }
