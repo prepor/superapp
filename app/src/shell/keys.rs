@@ -432,8 +432,7 @@ impl Stage {
                 true
             }
             // The focused panel's identity, what it was asked for, and the
-            // queries its last draw ran — to the clipboard and to a file
-            // beside the store.
+            // queries its last draw ran — to the clipboard.
             KeyCode::KeyI => {
                 self.copy_panel_context(sh);
                 true

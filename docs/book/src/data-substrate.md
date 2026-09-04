@@ -161,10 +161,9 @@ the one exception, because it is not a database table, and `rows_sql_deps` is
 where it says so.
 
 Each panel draw opens a trace, so the queries and parameters it used are
-recorded by construction rather than declared. `cmd+i` writes the focused
-panel's identity, arguments, and query trace to the clipboard and to
-`panel-context.md` beside the database. Both deliveries are effects, so a world
-that may not touch a human's clipboard or disk refuses them out loud.
+recorded by construction rather than declared. `cmd+i` copies the focused
+panel's identity, arguments, and query trace to the clipboard. The copy is an
+effect, so a world that may not touch a human's clipboard refuses it out loud.
 
 ## Data kept outside SQLite
 
