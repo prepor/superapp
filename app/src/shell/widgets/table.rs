@@ -147,6 +147,9 @@ pub struct TableView<S: RowSpec> {
     /// Whether the default filter has been typed in. Once, before the first
     /// draw; after that the field is the operator's, empty included.
     primed: bool,
+    /// The filter the last draw drew under. A new one is a new list, and
+    /// the viewport the old one left behind means nothing in it.
+    query: String,
 }
 
 impl<S: RowSpec> Default for TableView<S> {
@@ -157,6 +160,7 @@ impl<S: RowSpec> Default for TableView<S> {
             picks: Vec::new(),
             picking: false,
             primed: false,
+            query: String::new(),
         }
     }
 }
@@ -562,15 +566,55 @@ impl<S: RowSpec> TableView<S> {
         }
     }
 
-    /// Keeps the cursor's row on screen as the walk moves it.
+    /// Keeps the cursor's row on screen as the walk moves it: the least
+    /// scroll that brings the whole row inside the list's own rectangle.
+    ///
+    /// Drawn is not visible. A portal list draws the row that straddles
+    /// either edge and stops there, so "the walk landed on a row the last
+    /// draw touched" is true of the row half under the panel's foot as
+    /// well as of the ones in plain sight — which is how the cursor used to
+    /// walk off the bottom, and then jump a whole page when the row after
+    /// it was the first that had not been drawn. The rectangles of the last
+    /// draw settle it instead, the same ones a press resolves against, and
+    /// the list is nudged by the overlap alone.
+    ///
+    /// A row that was not drawn at all is a jump rather than a step, and
+    /// that one keeps the animation, which lands it at the top.
     fn follow(&self, cx: &mut Cx, view: &View, li: usize) {
-        let list = view.widget(cx, LIST).as_portal_list();
-        let visible = list
-            .borrow()
-            .is_some_and(|l| l.items().iter().any(|(i, _)| *i == li));
-        if !visible {
+        let w = view.widget(cx, LIST);
+        let clip = w.area().rect(cx);
+        let list = w.as_portal_list();
+        // Two ways to be a jump: a row the last draw never drew — the
+        // cursor is somewhere the eye is not — and an animation already
+        // under way, whose next frame would undo a nudge made beneath it.
+        // Both are the animation's, which re-aims rather than fights.
+        let row = list.get_item(li).map(|(_, w)| w.area().rect(cx));
+        let (Some(row), None) = (row, list.is_smooth_scrolling()) else {
             list.smooth_scroll_to(cx, li, 90.0, None, 0.0);
+            return;
+        };
+        if row.size.y <= 0.0 || clip.size.y <= 0.0 {
+            return;
         }
+        // How far the content has to travel, signed the way `first_scroll`
+        // is: down to uncover a row above, up to uncover one below. A row
+        // taller than the viewport shows its head.
+        let (top, bot) = (clip.pos.y, clip.pos.y + clip.size.y);
+        let shift = if row.pos.y < top {
+            top - row.pos.y
+        } else if row.pos.y + row.size.y > bot {
+            bot - (row.pos.y + row.size.y)
+        } else {
+            return;
+        };
+        if shift.abs() < 0.5 {
+            return;
+        }
+        let Some((first, scroll)) = list.borrow().map(|l| (l.first_id(), l.first_scroll())) else {
+            return;
+        };
+        list.set_first_id_and_scroll(first, scroll + shift);
+        list.redraw(cx);
     }
 
     // -- the draw --------------------------------------------------------------
@@ -612,6 +656,11 @@ impl<S: RowSpec> TableView<S> {
         let text = field.text();
         let focused = field.key_focus(cx);
         filter_keeps(&props, focused);
+        // A new query is a new list; the rows under the old one are gone.
+        let requery = self.query != text;
+        if requery {
+            self.query = text.clone();
+        }
 
         // The instance's list, borrowed for the length of the draw. Nothing
         // reached from here runs a verb, so nothing else wants it.
@@ -657,6 +706,19 @@ impl<S: RowSpec> TableView<S> {
                 continue;
             };
             pl.set_item_range(cx, 0, n + pre);
+            // Where the viewport stands is about the rows it was left on.
+            // A new query answers with other rows — often fewer — and a
+            // viewport parked past the end of them draws nothing at all:
+            // a blank panel with the answer scrolled above it. So a new
+            // query starts at the top, where an answer starts; and rows
+            // that go out from under an unchanged one — a batch verb
+            // files forty at once — pin it to the last row instead.
+            let last = (n + pre).saturating_sub(1);
+            if requery {
+                pl.set_first_id_and_scroll(0, 0.0);
+            } else if pl.first_id() > last {
+                pl.set_first_id_and_scroll(last, 0.0);
+            }
             while let Some(idx) = pl.next_visible_item(cx) {
                 let (row, marked, at) = match list.slot(idx) {
                     // The band above the rows: its caption, and the rule
