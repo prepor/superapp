@@ -21,14 +21,21 @@ const FTS_LIMIT: i64 = 100;
 /// a rank; the join is what turns them into rows to show, and it reads no
 /// further into `message` than a list may — everything it asks for sits
 /// before the letter's own bytes.
+///
+/// The trash is left out, as it is left out of every mailbox and of every
+/// conversation ([`model::thread`]): a deleted letter is no longer part of
+/// the thread it was in, so a reader opened on one has nothing to show and
+/// draws an empty card. A source may only offer what can be read.
 static Q_FTS: Q = Q {
     id: "mail search",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject
           FROM message_fts JOIN message m ON m.id = message_fts.rowid
+                           JOIN folder f ON f.id = m.folder
           WHERE message_fts MATCH ?1
+            AND f.role IS NOT 'trash'
           ORDER BY message_fts.rank
           LIMIT ?2",
-    describe: "the letters a query matches, best first, out of the FTS5 index",
+    describe: "the letters a query matches, best first, out of the FTS5 index, trash left out",
 };
 
 /// The mail world as a search source.
