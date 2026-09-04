@@ -528,7 +528,7 @@ fn styled_spans_become_emphasis() {
     );
     assert_eq!(sanitize(r#"<u style="text-decoration:none">x</u>"#), "x");
     assert_eq!(
-        sanitize(r#"<span style="font-family: Menlo, monospace">x</span>"#),
+        sanitize(r#"<span style="font-family: Consolas, monospace">x</span>"#),
         "<code>x</code>"
     );
     assert_eq!(

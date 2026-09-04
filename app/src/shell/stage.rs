@@ -160,6 +160,9 @@ pub struct Stage {
     pub draw_flat: DrawFlat,
     #[live]
     pub draw_mono: DrawText,
+    /// Geist Mono at 700, for the one bold letter an accelerator marks.
+    #[live]
+    pub draw_mono_bold: DrawText,
 
     #[rust]
     pub area: Area,

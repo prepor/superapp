@@ -484,6 +484,10 @@ script_mod! {
             text_style: mod.widgets.SMonoStyle{}
             color: #141414ff
         }
+        draw_mono_bold +: {
+            text_style: mod.widgets.SMonoBoldStyle{}
+            color: #141414ff
+        }
     }
 }
 
