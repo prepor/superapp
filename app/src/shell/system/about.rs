@@ -35,6 +35,15 @@ impl Panel for About {
         "about".into()
     }
 
+    /// The colophon.
+    fn about(&self) -> String {
+        "The colophon: what this build is, what it was made of, and where it \
+         keeps its one database. It takes no arguments and reads nothing but \
+         the constants it was compiled with, so there is nothing here that can \
+         be out of date. Its one link goes back to the manual."
+            .into()
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 3)
     }

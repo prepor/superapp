@@ -4,8 +4,10 @@
 //! at the first taker:
 //!
 //! 1. the workspace's **reserved** chords — arrows and digits with and
-//!    without shift, `w`, `z`, `u`, the column keys, `enter`, and
-//!    `shift+l`, which puts the panels library up over the workspace;
+//!    without shift, `w`, `z`, `u`, `i`, the column keys, `enter`, and the
+//!    three shifted letters: `shift+l`, which puts the panels library up
+//!    over the workspace, `shift+s`, the search panel, and `shift+a`, which
+//!    offers the focused panel to whichever app takes one as context;
 //! 2. the **focused widget**, which may take one (a live text field takes
 //!    `cmd+a`) and says so in the same event;
 //! 3. the **focused panel's bar**;
@@ -374,11 +376,26 @@ impl Stage {
     /// Text into whatever owns the keyboard: the launcher's field while it
     /// is up, the focused panel otherwise.
     pub(super) fn handle_text(&mut self, cx: &mut Cx, sh: &mut Shell, input: &str) {
-        if input.is_empty() || input.chars().any(char::is_control) {
+        self.text_in(cx, sh, input, false);
+    }
+
+    /// The same door, for text that arrived as a **paste**. Two differences,
+    /// and both matter to a widget that reads one: the event says
+    /// `was_paste`, so a composer can take a pasted panel context as a chip
+    /// while a typed line that happens to read the same stays typed; and the
+    /// control characters are kept, because a pasted document is one with
+    /// newlines in it.
+    pub(super) fn handle_paste(&mut self, cx: &mut Cx, sh: &mut Shell, input: &str) {
+        self.text_in(cx, sh, input, true);
+    }
+
+    fn text_in(&mut self, cx: &mut Cx, sh: &mut Shell, input: &str, was_paste: bool) {
+        if input.is_empty() || (!was_paste && input.chars().any(char::is_control)) {
             return;
         }
         let ev = Event::TextInput(TextInputEvent {
             input: input.to_string(),
+            was_paste,
             ..Default::default()
         });
         if sh.overlay == Overlay::Launcher {
@@ -505,6 +522,16 @@ impl Stage {
                 self.go_to(sh, super::search_panel());
                 true
             }
+            // A panel as context for an agent: the focused slot is offered
+            // to the apps and the first one that answers a panel takes it.
+            //
+            // Only the shifted chord is taken, for the reason `shift+s` is:
+            // plain `cmd+a` belongs to whatever bar wears it — mail's
+            // *archive n* does — and to the select-all of every field.
+            KeyCode::KeyA if k.modifiers.shift => {
+                self.ask_about_focused(sh);
+                true
+            }
             // Reserved so that no bar may claim it: a list reads it as
             // *open un-joined*, which the shell leaves to the panel.
             KeyCode::ReturnKey => {
@@ -564,6 +591,31 @@ impl Stage {
             Some(VerbAct::Go(nav)) => sh.session.nav(un_join(nav, fresh)),
             None => {}
         }
+    }
+
+    /// Offers the focused panel to the apps as context, in list order, and
+    /// stops at the first taker. Shared with the menu, which offers the same
+    /// move as an item.
+    ///
+    /// Nothing here names an app or knows what taking one means: an app that
+    /// answers a panel with a chat opens it joined to the panel and says so,
+    /// and a build with nothing that does says that instead of doing
+    /// nothing.
+    pub(super) fn ask_about_focused(&mut self, sh: &mut Shell) {
+        let Some(slot) = sh.session.focus() else {
+            sh.session.notify("no focused panel", false);
+            return;
+        };
+        // The list outlives the session it came from, so it is read out
+        // before the session is borrowed to act on.
+        let apps = sh.session.apps().list();
+        for app in apps {
+            if app.ask(&mut sh.session, slot) {
+                return;
+            }
+        }
+        sh.session
+            .notify("nothing takes a panel as context in this build", false);
     }
 
     /// One step back through the history, and one step forward. Shared with

@@ -151,6 +151,39 @@ impl Panel for Mailbox {
         }
     }
 
+    /// The folder, what a row stands for, and the filter this one opened
+    /// under.
+    fn about(&self) -> String {
+        let role = self.role.as_str();
+        let what = match self.role {
+            Role::Inbox => "the letters that arrived and have not been filed away",
+            Role::Archive => "the letters that were kept",
+            Role::Sent => "the letters this account has sent",
+            Role::Spam => "the letters a provider called junk",
+        };
+        let narrowed = match Role::sender_of(&self.id) {
+            Some(who) => format!(
+                "Its argument is a sender, {who}, so it came up filtered to that \
+                 address; the field above the rows is the person's from then on \
+                 and may say something else by now."
+            ),
+            None => "It carries no argument, so it came up unfiltered: whatever \
+                     is in the field above the rows is all that narrows it."
+                .to_string(),
+        };
+        format!(
+            "{role}: {what}, one row a conversation rather than a letter — who \
+             is in it with this account's own address written as `me`, how many \
+             letters it holds, the subject of the oldest with its reply \
+             prefixes stripped, and the date of the newest one in this folder; \
+             a row is bold while anything in it is unread. The rows are \
+             `message` joined to `folder` where the folder's role is \
+             '{role}', grouped by `message.thread`. {narrowed} Here a person \
+             walks the rows, opens one to read the whole conversation, and \
+             marks some to archive, un-junk or delete them together."
+        )
+    }
+
     /// Four wide, six tall: a list is the one panel that wants the column.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 6)

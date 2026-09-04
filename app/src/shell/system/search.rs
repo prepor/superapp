@@ -348,6 +348,21 @@ impl Panel for Search {
         "search".into()
     }
 
+    /// One question, every app's sources, and why a list may be early.
+    fn about(&self) -> String {
+        "One question put to every app's search sources at once, as a list: \
+         the words go out to the sources, which is where the reading of them \
+         lives (mail's index reads a letter's body; nothing here could), and \
+         the `@` tags narrow the answers that come back. It takes no arguments \
+         — the question is the field above the rows — and the rows are not a \
+         query on this store but whatever the sources have answered, always in \
+         the order the sources were registered, so one question gives one \
+         list; a list that is empty may only be early. A person types, walks \
+         the answers, previews one beside the list, and opens the ones they \
+         marked."
+            .into()
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 5)
     }

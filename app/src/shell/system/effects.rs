@@ -78,6 +78,22 @@ impl Panel for Effects {
         "effects".into()
     }
 
+    /// One list over two streams, and why it is read-only.
+    fn about(&self) -> String {
+        "The effect log: everything that has left this process, newest first — \
+         the queue's own rows (`effect`: a kind, a payload, a status, the \
+         attempts and the reply) and the in-memory ring of effects that ran at \
+         the call and never became rows, joined as one list, the ring's ids \
+         negated so the two streams cannot collide. It takes no arguments; the \
+         field above the rows is what narrows it, and it comes up on `@wrote`, \
+         which is the effects that changed something out there rather than the \
+         dozen questions a background pass asks for every answer it acts on. \
+         Nothing here writes — the queue is the executor's and the ring is the \
+         past's — so what a person does is read a row, open one in full, or \
+         copy a marked set out."
+            .into()
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 5)
     }

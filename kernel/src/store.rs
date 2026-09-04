@@ -124,6 +124,10 @@ pub struct TraceEntry {
     pub sql: String,
     pub describe: &'static str,
     pub params: String,
+    /// The parameters as they were bound — what a re-run binds again. The
+    /// display form above is what `cmd+i` prints; this is what the panel
+    /// context re-reads the rows with.
+    pub values: Vec<Val>,
     pub rows: usize,
 }
 
@@ -890,6 +894,7 @@ impl Store {
                         sql: sql.to_string(),
                         describe,
                         params: pkey,
+                        values: params.to_vec(),
                         rows: rows.len(),
                     });
                 }

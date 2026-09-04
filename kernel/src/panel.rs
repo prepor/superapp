@@ -398,6 +398,25 @@ impl Panel for Missing {
         self.id.to_string()
     }
 
+    /// The one panel whose paragraph is about the build rather than about
+    /// the rows: there are none to describe.
+    fn about(&self) -> String {
+        format!(
+            "a panel this build cannot open: no app here owns the tag `{}`. \
+             The slot is kept rather than dropped, because another build has \
+             the app and the session is shared between them; its arguments \
+             ({}) mean whatever that app means by them. There is nothing to \
+             read here and nothing to do — open it on a build that has the \
+             app.",
+            self.id.tag.as_str(),
+            if self.id.args.is_empty() {
+                "none".to_string()
+            } else {
+                self.id.args.join(", ")
+            }
+        )
+    }
+
     fn as_any(&mut self) -> &mut dyn Any {
         self
     }
@@ -474,8 +493,31 @@ mod tests {
     /// not written its own paragraph yet.
     #[test]
     fn a_panel_that_says_nothing_is_still_about_something() {
-        let m = Missing::new(PanelId::new(T, ["42"]));
-        assert_eq!(m.about(), "message(42) — message(42)");
+        struct Silent(PanelId);
+        impl Panel for Silent {
+            fn id(&self) -> &PanelId {
+                &self.0
+            }
+            fn title(&self) -> String {
+                "a note".into()
+            }
+            fn as_any(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+        let p = Silent(PanelId::new(T, ["42"]));
+        assert_eq!(p.about(), "a note — message(42)");
+    }
+
+    /// The panel with no app says so, in the words the card says it in: the
+    /// tag, why the slot is kept, and that there is nothing to read.
+    #[test]
+    fn the_panel_with_no_app_is_about_the_build() {
+        let m = Missing::new(PanelId::new(Tag("from_the_future"), ["7"]));
+        let about = m.about();
+        assert!(about.contains("from_the_future"), "{about}");
+        assert!(about.contains("no app here owns the tag"), "{about}");
+        assert_ne!(about, format!("{} — {}", m.title(), m.id()), "not the default");
     }
 
     #[test]

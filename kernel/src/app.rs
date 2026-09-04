@@ -127,6 +127,18 @@ pub trait App: Any + Sync + Send + 'static {
         Vec::new()
     }
 
+    /// Takes a panel as context: opens whatever this app answers a panel
+    /// with — a chat carrying the panel's chip — joined to `about`, and
+    /// answers whether it did.
+    ///
+    /// The shell offers the focused slot to the apps in list order on
+    /// `cmd+shift+a` and stops at the first taker; an app with no answer
+    /// leaves the default, so a build with nothing that takes a panel says
+    /// so instead of doing nothing.
+    fn ask(&self, _s: &mut crate::session::Session, _about: crate::layout::SlotId) -> bool {
+        false
+    }
+
     /// For [`Apps::get_as`].
     fn as_any(&self) -> &dyn Any;
 }
@@ -1126,6 +1138,62 @@ mod tests {
     #[should_panic(expected = "two apps claim the tag beep: one and two")]
     fn two_apps_claiming_one_tag_stop_the_boot() {
         let _ = Apps::new(BOTH);
+    }
+
+    // -- an app that takes a panel as context --------------------------------
+
+    /// Which slot [`Taker`] was last asked about.
+    static ASKED: Mutex<Option<crate::layout::SlotId>> = Mutex::new(None);
+
+    struct Taker;
+    impl App for Taker {
+        fn id(&self) -> &'static str {
+            "taker"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn ask(&self, s: &mut crate::session::Session, about: crate::layout::SlotId) -> bool {
+            *ASKED.lock().expect("the slot last asked about") = Some(about);
+            s.notify("asked", false);
+            true
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static TAKER: Taker = Taker;
+    static TAKING: &[&dyn App] = &[&ONE, &TAKER];
+
+    /// The hook the workspace's `cmd+shift+a` runs down the app list: an app
+    /// that answers a panel takes the slot and says so, and an app with
+    /// nothing to answer with leaves the default.
+    #[test]
+    fn an_app_can_take_a_panel_as_context() {
+        let mut s = crate::session::Session::fake(TAKING);
+        s.act(
+            crate::session::Action::new("open", "open").moving(|wm| {
+                wm.open(PanelId::bare(Tag("beep")), None, false);
+            }),
+        );
+        s.settle();
+        let slot = s.focus().expect("the new slot");
+
+        assert!(!ONE.ask(&mut s, slot), "an app with no answer leaves it");
+        assert!(ASKED.lock().expect("the slot").is_none());
+
+        assert!(TAKER.ask(&mut s, slot), "and one with an answer takes it");
+        assert_eq!(*ASKED.lock().expect("the slot"), Some(slot));
+        assert_eq!(s.notes().len(), 1, "the app acted on the session it was handed");
+
+        // What the shell does with the answers: the list in order, the first
+        // taker wins.
+        let taken = Apps::new(TAKING)
+            .list()
+            .iter()
+            .find(|a| a.ask(&mut s, slot))
+            .map(|a| a.id());
+        assert_eq!(taken, Some("taker"));
     }
 
     // -- the ladder ----------------------------------------------------------

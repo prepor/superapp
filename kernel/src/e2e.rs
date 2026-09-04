@@ -21,6 +21,11 @@
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
 //! type "hello"        — text into the focused field / panel keys
+//! paste "a\\nb"        — the same text, but as a paste: the event says so
+//!                       (`was_paste`), and `\\n` is a newline, so a whole
+//!                       document goes in whole. A composer reading a paste
+//!                       for what it is — a panel context becoming a chip —
+//!                       cannot be driven by `type`
 //! swipe "inbox" 0 -120 — one-finger touch drag from the element's centre;
 //!                       sideways on a mail row triages it. `… hold` keeps
 //!                       the finger down (shoot the gesture, then `drop`)
@@ -64,6 +69,11 @@ pub enum Step {
     Key { chord: String, times: u32 },
     /// Text input into whatever owns the keyboard.
     Type(String),
+    /// The same, delivered as a **paste**: the text input event carries
+    /// `was_paste`, and control characters go through rather than being
+    /// refused, because a pasted document keeps its newlines. What a
+    /// composer that reads a paste for what it is needs to be driven by.
+    Paste(String),
     /// Select everything in the selectable run under the labelled element,
     /// straight on the widget: a synthesized drag never selects (see the
     /// module doc), so this is how a wash gets photographed.
@@ -206,6 +216,9 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             }
         }
         "type" => Step::Type(quoted()?),
+        // `\n` is a newline here and nowhere else: a paste is the one step
+        // whose argument is a document rather than a word.
+        "paste" => Step::Paste(unescape(&quoted()?)),
         "drag" | "swipe" | "holdmove" => {
             let label = quoted()?;
             let after = &rest[rest.rfind('"').unwrap() + 1..];
@@ -253,6 +266,33 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
         "quit" => Step::Quit,
         _ => return Err(err("unknown command")),
     }))
+}
+
+/// The escapes a script argument has, in the one step that needs them: `\n`
+/// is a newline, `\t` a tab, `\"` a quote and `\\` a backslash. Anything
+/// else stands for itself, backslash and all — a Windows path in a paste is
+/// not an escape sequence.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// A run in progress.
@@ -375,6 +415,30 @@ mod tests {
         );
         assert_eq!(s[5], Step::Type("hello world".into()));
         assert_eq!(s[6], Step::Quit);
+    }
+
+    /// A paste is its own step because it is its own event: the text goes
+    /// in whole, newlines and all, and the widget is told it was pasted.
+    #[test]
+    fn a_paste_parses_and_keeps_its_newlines() {
+        let s = parse("paste \"superapp-panel: inbox []\"").unwrap();
+        assert_eq!(s[0], Step::Paste("superapp-panel: inbox []".into()));
+        // The argument runs from the first quote to the last, so the JSON
+        // arguments inside it need no escaping at all.
+        let s = parse(r#"paste "superapp-panel: message ["42"]\n\n# superapp panel context""#)
+            .unwrap();
+        assert_eq!(
+            s[0],
+            Step::Paste(
+                "superapp-panel: message [\"42\"]\n\n# superapp panel context".into()
+            )
+        );
+        // A backslash that spells nothing stands for itself.
+        assert_eq!(
+            parse(r#"paste "c:\\notes""#).unwrap()[0],
+            Step::Paste("c:\\notes".into())
+        );
+        assert!(parse("paste hello").is_err(), "a paste is quoted");
     }
 
     #[test]

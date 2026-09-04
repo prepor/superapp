@@ -1,5 +1,6 @@
-//! The macOS menu bar: the workspaces, the launcher, undo and redo, the
-//! history, the panels library, and what stands wrong.
+//! The macOS menu bar: the workspaces, the launcher, search, the focused
+//! panel offered to an agent, undo and redo, the history, the panels
+//! library, and what stands wrong.
 //!
 //! The bar mirrors the workspaces — one menu per roster entry, the current
 //! one bracketed — and, while anything stands, one more menu holding the
@@ -28,6 +29,7 @@ const WS_MENU_SWITCH: u64 = 0x5753_0100;
 const WS_MENU_MOVE: u64 = 0x5753_0200;
 const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_SEARCH: u64 = 0x5753_0301;
+const MENU_ASK: u64 = 0x5753_0302;
 const MENU_UNDO: u64 = 0x5753_0400;
 const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
@@ -138,6 +140,7 @@ impl Stage {
         let mut items = vec![app_menu(vec![
             item(MENU_LAUNCHER, "Launcher — ⌘ ⌘", true, false),
             item(MENU_SEARCH, "Search — ⇧⌘S", true, false),
+            item(MENU_ASK, "Ask About This Panel — ⇧⌘A", true, false),
             item(MENU_UNDO, "Undo — ⌘Z", true, false),
             item(MENU_REDO, "Redo — ⇧⌘Z", true, false),
             item(MENU_HISTORY, "History — ⌘U", true, false),
@@ -196,6 +199,8 @@ impl Stage {
             self.open_launcher(cx, sh);
         } else if id == MENU_SEARCH {
             self.go_to(sh, super::search_panel());
+        } else if id == MENU_ASK {
+            self.ask_about_focused(sh);
         } else if id == MENU_UNDO {
             self.do_undo(sh);
         } else if id == MENU_REDO {

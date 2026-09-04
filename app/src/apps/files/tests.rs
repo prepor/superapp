@@ -2430,6 +2430,42 @@ fn the_app_owns_two_tags_and_one_root() {
     assert!(apps.get("mail").is_none());
 }
 
+/// Both kinds say what they are about in their own words — not the default,
+/// which is the title and the identity and tells an agent nothing it could
+/// not read off the tag — and the app says the one thing there is to say
+/// about its data: that there is none.
+#[test]
+fn both_panels_say_what_they_are_about_and_the_app_says_it_has_no_tables() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    for id in [Dir::id(HOME), Card::id("~/notes.md")] {
+        let slot = open_id(&mut s, id.clone());
+        let (title, about) = {
+            let b = inst(&s, slot);
+            let b = b.borrow();
+            (b.title(), b.about())
+        };
+        assert!(!about.is_empty(), "{id} says nothing");
+        assert_ne!(about, format!("{title} — {id}"), "{id} is on the default");
+        assert!(about.len() > 120, "{id}: “{about}”");
+        assert!(about.contains("disk"), "{id} never says where its state is");
+    }
+    let describe = FILES.describe().expect("files describes itself");
+    assert!(describe.contains("stores nothing"), "{describe}");
+    assert!(describe.contains("no rows to query"), "{describe}");
+    assert!(describe.lines().count() < 60, "a dictionary, not a dump");
+}
+
+/// Any panel of this app's, opened as the launcher would.
+fn open_id(s: &mut Session, id: PanelId) -> SlotId {
+    let show = id.clone();
+    s.act(Action::new("open", format!("open “{id}”")).moving(move |wm| {
+        wm.open(show, None, false);
+    }));
+    s.settle();
+    s.focus().expect("the new slot has focus")
+}
+
 #[test]
 fn a_bar_wears_no_letter_twice() {
     let _alone = alone();
