@@ -36,6 +36,7 @@ use kernel::store::Store;
 use kernel::tool::Tool;
 
 pub mod calls;
+pub mod chip;
 pub mod fake;
 pub mod gateway;
 pub mod model;
