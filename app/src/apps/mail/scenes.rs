@@ -154,7 +154,7 @@ fn mailbox() -> Scene<Setup> {
 /// A conversation as a page.
 fn message() -> Scene<Setup> {
     Scene::new("message", (560.0, 640.0))
-        .note("A conversation as a page: every message of it, the one it opened on and the unread ones open, the rest collapsed to their header lines.")
+        .note("A conversation as a page: every message of it, open from the first unread one down, and the read run above it collapsed to header lines.")
         .node(
             "thread",
             panel(|s| Message::id(mail_like(s, "[stelaxis] CI")), ""),

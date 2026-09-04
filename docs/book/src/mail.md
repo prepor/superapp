@@ -83,10 +83,14 @@ A message panel shows the whole conversation oldest first, deduplicated by
 `Message-ID` so a reply that exists both in Sent and in the list appears once.
 The account's address is at the top. Each message is one row that folds open in
 place: closed, it shows the sender, the first content line or error, and the
-date. Quoted text is folded behind the reading rules, because in a conversation
-the quote is the message above. These open states are the instance's own
-context and are not part of undo history; after a restart only the message the
-panel names starts open.
+date. It opens unfolded from its first unread message down — the read run above
+that message is what folds, so catching up on a conversation is one read from
+where you left it, and a message under an unread one stays open whether or not
+another client already flagged it. A conversation with nothing unread opens on
+the message the panel names alone — from a mailbox row, its newest. Quoted text is folded behind
+the reading rules, because in a conversation the quote is the message above.
+These open states are the instance's own context and are not part of undo
+history; after a restart only the message the panel names starts open.
 
 Opening a conversation marks its unread messages as read. That write is claimed
 by the open, so it lands on the same undoable node as the panel appearing and

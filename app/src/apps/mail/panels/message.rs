@@ -41,7 +41,8 @@ pub struct Message {
     store: Rc<Store>,
     slot: SlotId,
     /// Which of the thread's letters are unfolded. Opening seeds it with
-    /// every unread one and the mail the panel was opened on.
+    /// the conversation from its first unread letter on, and the mail the
+    /// panel was opened on.
     open: BTreeSet<MailId>,
     /// Which of them are showing the quoted tail they were written over.
     /// Panel context like [`Message::open`], and folded to begin with: in a
@@ -192,8 +193,8 @@ impl Panel for Message {
 }
 
 /// The factory. Opening a mail reads its whole conversation: every unread
-/// letter of it is marked, one intent each, and the panel opens with exactly
-/// those unfolded.
+/// letter of it is marked, one intent each, and the panel opens unfolded from
+/// the first unread one down.
 pub struct MessageKind;
 
 impl PanelKind for MessageKind {
@@ -205,7 +206,22 @@ impl PanelKind for MessageKind {
         let store = cx.session().store().clone();
         let mail = Message::of(id).unwrap_or_default();
         let unread = model::thread_unread(&store, mail);
-        let open: BTreeSet<MailId> = unread.iter().copied().chain(Some(mail)).collect();
+        // Where the catching up starts: the conversation from its first
+        // unread letter down, and the mail the panel was opened on. Only the
+        // read run above that letter folds — a letter *under* an unread one
+        // belongs to the same sitting, whether or not another client has
+        // already flagged it. Read before the claim below, which is what
+        // makes them all read.
+        let msgs = model::thread(&store, mail);
+        let first = msgs
+            .iter()
+            .position(|t| t.mail.head.unread)
+            .unwrap_or(msgs.len());
+        let open: BTreeSet<MailId> = msgs[first..]
+            .iter()
+            .map(|t| t.mail.head.id)
+            .chain(Some(mail))
+            .collect();
         if !unread.is_empty() {
             let marks = unread.clone();
             cx.claim(
