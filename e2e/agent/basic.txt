@@ -73,11 +73,16 @@ shot a5-preview
 click "Hello. I am the assistant."
 wait 500
 
-# *new* lives on the list: a blank chat, joined to it, with the caret in its
-# field — the same place the row's preview stood.
+# *new* lives on the list: a blank chat, joined to it, where the row's
+# preview stood — and focus follows: the caret is in its field without a
+# click, so what is typed next is the new chat's first turn.
 click "new"
 wait 900
-click "ask"
+type "again"
+wait 400
+key enter
+wait 900
+click "again"
 wait 400
 shot a6-new
 quit

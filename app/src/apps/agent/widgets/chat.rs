@@ -145,6 +145,15 @@ pub struct AgentChatPanel {
     /// never been drawn is nowhere to put a caret.
     #[rust]
     mounted: bool,
+    /// Whether this slot was the session's focus at the last event: the
+    /// moment it becomes so is when the caret is owed to the field.
+    #[rust]
+    was_focused: bool,
+    /// The caret is owed to the field, and goes there on the first event
+    /// that is not a press — a press decides for itself — once the field
+    /// has a rectangle.
+    #[rust]
+    want_caret: bool,
     /// The instance's draft as this widget last wrote it into the field.
     /// Between a keystroke and the action that reports it the field is
     /// ahead of the instance, which is why the comparison is against this
@@ -269,6 +278,7 @@ impl Widget for AgentChatPanel {
 
         self.view.handle_event(cx, event, scope);
         self.mount(cx, &props, scope);
+        self.follow_focus(cx, &props, scope, event);
         if matches!(event, Event::MouseUp(_)) && std::mem::take(&mut self.caret) {
             field.set_key_focus(cx);
         }
@@ -692,6 +702,45 @@ impl AgentChatPanel {
         }
     }
 
+    /// Focus follows the panel: the moment this slot becomes the session's
+    /// focus — a chord, the launcher, a fresh open — the caret goes into the
+    /// field, or into the picker's while that is up, so a chat one has just
+    /// reached is a chat one can type in. Applied on the first event that is
+    /// not a press, because a press decides for itself where the caret goes
+    /// ([`press`](Self::press)), and held until the field has a rectangle.
+    fn follow_focus(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, event: &Event) {
+        let focused = scope
+            .data
+            .get_mut::<Session>()
+            .and_then(|s| s.focus())
+            .is_some_and(|f| f == props.slot);
+        if focused && !self.was_focused {
+            self.want_caret = true;
+        }
+        self.was_focused = focused;
+        if !focused {
+            self.want_caret = false;
+            return;
+        }
+        let pressing = matches!(
+            event,
+            Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseMove(_) | Event::Scroll(_)
+        );
+        if !self.want_caret || pressing {
+            return;
+        }
+        let target = if self.pick_up {
+            self.view.text_input(cx, ids!(pick_input))
+        } else {
+            self.view.text_input(cx, ids!(ask_input))
+        };
+        if target.area().rect(cx).size.x <= 0.0 {
+            return;
+        }
+        target.set_key_focus(cx);
+        self.want_caret = false;
+    }
+
     /// The field changed: the panel keeps the text, and the bar is drawn
     /// again — *send* comes and goes with it.
     fn edited(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
@@ -944,12 +993,23 @@ impl AgentChatPanel {
                 }
             }
             // Anywhere else in the panel: the keyboard is this chat's, so
-            // the next `enter` sends into it — and a press in the composer
-            // is a press on the caret.
+            // the next `enter` sends into it, and the caret goes in the
+            // field — except on a run of text, where a press is a selection
+            // starting, which must not have the caret taken from it a frame
+            // later.
             None => {
-                if self.field.contains(e.abs) {
+                let on_text = props
+                    .hits
+                    .at(e.abs)
+                    .is_some_and(|h| matches!(h.cursor, MouseCursor::Text))
+                    && !self.field.contains(e.abs);
+                if on_text {
+                    self.want_caret = false;
+                } else {
                     self.caret = true;
-                    self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+                    if self.field.contains(e.abs) {
+                        self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+                    }
                 }
                 if let Some(session) = scope.data.get_mut::<Session>() {
                     session.nav(Nav::Focus(props.slot));
