@@ -83,7 +83,9 @@ impl Session {
     /// child once. `Close` closes the slot and its joined chain, and names
     /// its history node with the label the caller read off the instance —
     /// the identity, when the caller had none. `Focus` is not an action:
-    /// nothing is claimed, so there is nothing to undo.
+    /// nothing is claimed, so there is nothing to undo — and where it names
+    /// the panel that already holds focus it still brings that panel on
+    /// screen, since *go to* is a promise about what can be seen.
     ///
     /// The history kind is `open` for an open, `read` for a preview and for
     /// a replace whose new instance claimed something of the world, and
@@ -95,6 +97,17 @@ impl Session {
             Nav::Focus(slot) => {
                 if self.focus_slot(slot) {
                     self.unsettle();
+                } else if self.focus() == Some(slot) {
+                    // Already the focus, so nothing moved — but *go to*
+                    // promises the panel on screen, and a freely panned
+                    // camera pulls nothing back. The camera is asked for
+                    // the way a preview asks, rather than laid out here:
+                    // this may be running inside a verb that still holds
+                    // its own instance, and a layout reads every one of
+                    // them. The redraw is owed whatever asked, since
+                    // nothing else about this frame changed.
+                    self.show_camera_at(slot);
+                    self.redraw();
                 }
             }
             Nav::Close { slot, label } => {
@@ -654,6 +667,45 @@ mod tests {
         // …and going where you already are changes nothing either.
         go(&mut s, Nav::Focus(list_slot));
         assert_eq!(s.history().rows().0.len(), before);
+    }
+
+    /// *Go to* is a promise about what can be seen, so naming the panel that
+    /// already holds focus is not a no-op: it moves no focus, but it pulls a
+    /// camera the person dragged off that panel back onto it — and marks the
+    /// frame stale, which is what takes the launcher that asked down with it.
+    #[test]
+    fn focusing_the_focused_panel_still_brings_it_back_on_screen() {
+        let (mut s, list_slot) = session();
+        s.set_viewport((1200.0, 800.0));
+        // Enough panels beside it that the strip runs off the screen.
+        for i in 1..=5 {
+            go(&mut s, Nav::Open {
+                from: list_slot,
+                id: card(i),
+                fresh: true,
+            });
+        }
+        go(&mut s, Nav::Focus(list_slot));
+        assert_eq!(s.focus(), Some(list_slot));
+        let at = s.scene().camera_x;
+
+        // The strip is dragged off it. A pan asks to be nowhere in
+        // particular, so nothing pulls the camera back by itself.
+        s.pan(4000.0);
+        assert!(s.scene().camera_x > at, "the strip moved off the panel");
+        s.take_dirty();
+
+        // The same panel again: no focus to move, and everything to show.
+        go(&mut s, Nav::Focus(list_slot));
+        assert_eq!(s.focus(), Some(list_slot));
+        assert!(s.take_dirty().redraw, "the screen was told all the same");
+
+        // The camera is asked for rather than moved, because a verb running
+        // this may still hold its own instance; the shell hands it over on
+        // the way out, exactly as it does a preview's.
+        let asked = s.take_show_once().expect("the camera was asked for it");
+        s.reveal(asked);
+        assert_eq!(s.scene().camera_x, at, "and it came back to the panel");
     }
 
     /// `Nav` says what it is about, which is what the routing reads.

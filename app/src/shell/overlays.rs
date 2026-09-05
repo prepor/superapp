@@ -117,6 +117,10 @@ impl Stage {
             Go::Focus(slot) => sh.session.nav(Nav::Focus(slot)),
             Go::Open(id) => self.open_root(sh, id),
         }
+        // The overlay coming down is a change of its own, as it is wherever
+        // else one is put away: a hit that moves nothing marks nothing, and
+        // the launcher would be left standing on a screen nobody redraws.
+        sh.session.redraw();
     }
 
     /// Goes to a panel: focused wherever it already is — another workspace

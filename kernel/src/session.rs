@@ -586,7 +586,9 @@ impl Session {
     }
 
     /// Asks the camera to show a slot once. A preview does this for its
-    /// child, because focus stayed behind and nothing else would.
+    /// child, because focus stayed behind and nothing else would; a *go to*
+    /// that found the panel already focused does it for the same reason,
+    /// there being no move for the layout to follow.
     pub(crate) fn show_camera_at(&mut self, slot: SlotId) {
         self.show_once = Some(slot);
     }
