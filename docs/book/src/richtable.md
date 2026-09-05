@@ -130,6 +130,13 @@ list: the arrows and their preview, `enter`, `/`, `space`, `shift`+arrows,
 `esc`, and `tab`. While the caret is in the filter it tells the shell that it
 keeps every letter, so no bar draws a bold letter that would not fire.
 
+`/` and `space` are read off the **press**, never off the text a key would
+otherwise arrive as. A platform only feeds its input context while a text field
+has the keyboard — macOS hands a key to `NSTextInputContext` on that condition
+alone — so with the rows holding it the press is the whole of what a list is
+given. Read as text they would work only for as long as some field somewhere
+had left that context up, and would go quiet the moment one submitted.
+
 A walk keeps its cursor in sight. The row the arrow lands on is brought whole
 into the panel by the overlap alone — a step scrolls by a row, never by a page
 — and it is the rectangles of the last draw that say so, because a portal list

@@ -59,7 +59,7 @@ wait 600
 # row it lands on.
 click "Q3 infra"
 wait 700
-type " "
+key space
 wait 400
 key shift+down
 wait 700

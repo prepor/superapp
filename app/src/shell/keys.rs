@@ -157,8 +157,13 @@ pub fn key_char(k: KeyCode) -> Option<char> {
 }
 
 /// How a scripted `key` chord executes: as a synthesized key event, as text
-/// (plain letters reach panels the way real typing does), or as a bare
+/// (a plain letter reaches a panel the way real typing does), or as a bare
 /// modifier tap.
+///
+/// Which of the first two a key takes is the split the platforms make. A key
+/// with a name of its own goes as a press, because that is all a platform
+/// sends while no field has the keyboard; a letter goes as text, because that
+/// is how one reaches the field that does.
 pub enum ChordExec {
     Ev(KeyEvent),
     Text(String),
@@ -195,6 +200,8 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
         "tab" => Some(KeyCode::Tab),
         "comma" | "," => Some(KeyCode::Comma),
         "period" | "." => Some(KeyCode::Period),
+        "slash" | "/" => Some(KeyCode::Slash),
+        "space" => Some(KeyCode::Space),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
         "bracketright" | "]" => Some(KeyCode::RBracket),
         "1" => Some(KeyCode::Key1),
@@ -227,7 +234,14 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
                 | KeyCode::Escape
                 | KeyCode::Backspace
                 | KeyCode::Delete
-                | KeyCode::Tab),
+                | KeyCode::Tab
+                // The two plain keys of the list grammar. A press, not
+                // text: a platform only feeds its input context while a
+                // field has the keyboard, so with the rows holding it this
+                // is the whole of what a list is given. A script that wants
+                // either *in* a field spells it `type`.
+                | KeyCode::Slash
+                | KeyCode::Space),
             ),
             true,
             _,

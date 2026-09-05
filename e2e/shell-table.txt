@@ -72,7 +72,27 @@ wait 400
 # under the cursor, and the panel's bar grows the batch verbs.
 key down
 wait 500
-type " "
+
+# `copy 1` is a label the bar draws over exactly one mark — and the copy
+# takes the set with it, leaving the rows bare again.
+key space
+wait 400
+click "copy 1"
+wait 500
+
+# It toggles: on, off, on. Were the middle press to leave the mark standing,
+# the third would clear it and no batch verb would be drawn to click.
+key space
+wait 400
+key space
+wait 400
+key space
+wait 400
+click "copy 1"
+wait 500
+
+# One mark again, for the range below.
+key space
 wait 400
 shot c2-one-mark
 
@@ -89,9 +109,11 @@ shot c3-range
 # A mark is an identity, so narrowing the list does not drop one: the marks
 # the filter hides ride above the rows, under their own caption, and the
 # batch verb still counts them.
-click "filter"
+#
+# `/` is the way into the field this time, and it takes what is in the field
+# with it, so the tag below replaces rather than appends — no `cmd+a`.
+key /
 wait 300
-key cmd+a
 type "@filed"
 wait 500
 key esc
@@ -114,7 +136,7 @@ key esc
 wait 400
 key down
 wait 400
-type " "
+key space
 wait 400
 key shift+down
 wait 400

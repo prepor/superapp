@@ -36,7 +36,7 @@ shot m3-archive-previews
 # Its bar carries no `archive`: the mail is already out of the inbox. Space
 # marks the row under the cursor and the batch verbs come up — `delete` and
 # the two that close every bar. `clear` resolves only while the bar is up.
-type " "
+key space
 wait 500
 shot m4-archive-marked
 click "clear"
@@ -98,7 +98,7 @@ shot m10-spam-whole
 # only while something is marked, is the proof.
 click "Your 4.2 BTC withdrawal"
 wait 700
-type " "
+key space
 wait 500
 shot m11-spam-marked
 click "not spam 1"
@@ -129,7 +129,7 @@ key enter
 wait 800
 click "Q3 infra"
 wait 700
-type " "
+key space
 wait 500
 shot m14-inbox-marked
 click "archive 1"

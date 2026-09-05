@@ -29,7 +29,7 @@ shot b1-unmarked
 
 # Space marks the row under the cursor; the walk carries on, so the mark is
 # on one conversation and the reader is on the next.
-type " "
+key space
 wait 600
 key down
 wait 800
@@ -62,7 +62,7 @@ shot b3-filed
 # answers every cmd chord itself — the shell's table says so on every draw —
 # so the whole bar goes plain, the marked set's letters with it, and the
 # reader below is left with nothing to promise either.
-type " "
+key space
 wait 500
 key /
 wait 400

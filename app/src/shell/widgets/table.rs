@@ -274,18 +274,6 @@ impl<S: RowSpec> TableView<S> {
 
         view.handle_event(cx, event, scope);
 
-        // `/` focuses the filter and space marks the cursor's row — the two
-        // plain keys the grammar keeps, arriving as text the way a letter
-        // does. In a live field they are a slash and a space.
-        if let Event::TextInput(t) = event {
-            if !focused && t.input == "/" {
-                focus_field(cx, &field);
-            } else if !focused && t.input == " " {
-                with_list::<S, _>(&props, |l| l.toggle_mark(&store));
-                view.redraw(cx);
-            }
-        }
-
         if let Event::KeyDown(k) = event {
             if !focused {
                 self.row_key(cx, &props, &store, view, k, &mut navs);
@@ -324,6 +312,24 @@ impl<S: RowSpec> TableView<S> {
         navs: &mut Vec<Nav>,
     ) {
         match k.key_code {
+            // The two plain keys of the list grammar: `/` puts the caret in
+            // the filter, space marks the row under the cursor.
+            //
+            // Both are read off the **press**, never off text. A platform
+            // only feeds its input context while a text field has the
+            // keyboard — macOS hands a key to `NSTextInputContext` on that
+            // condition alone — so with the rows holding it the press is
+            // the whole of what a list is given. Read as text, these two
+            // would work only for as long as some field somewhere had left
+            // the context up, and would go quiet the moment one submitted.
+            KeyCode::Slash if bare(k) => {
+                let field = view.text_input(cx, FILTER);
+                focus_field(cx, &field);
+            }
+            KeyCode::Space if bare(k) => {
+                with_list::<S, _>(props, |l| l.toggle_mark(store));
+                view.redraw(cx);
+            }
             // Enter *goes*: unlike the walk's preview it hands focus to
             // what it opened, which is the solid-link rule.
             KeyCode::ReturnKey => {
@@ -849,13 +855,15 @@ fn focus_field(cx: &mut Cx, field: &TextInputRef) {
     }
 }
 
+/// Whether the key is bare — no modifier at all. A modified one is somebody
+/// else's: `cmd+↓` is the shell's focus walk, `shift+↓` a field's selection,
+/// `shift+/` a question mark, `cmd+space` the platform's own.
+fn bare(k: &KeyEvent) -> bool {
+    !k.modifiers.shift && !k.modifiers.control && !k.modifiers.alt && !k.modifiers.logo
+}
+
 /// Whether this key is the plain `↓` that leaves a filter for the rows
-/// under it. Modified downs are not: `cmd+↓` is the shell's focus walk and
-/// `shift+↓` is the field's own selection.
+/// under it.
 fn leaves_filter_down(k: &KeyEvent) -> bool {
-    k.key_code == KeyCode::ArrowDown
-        && !k.modifiers.shift
-        && !k.modifiers.control
-        && !k.modifiers.alt
-        && !k.modifiers.logo
+    k.key_code == KeyCode::ArrowDown && bare(k)
 }

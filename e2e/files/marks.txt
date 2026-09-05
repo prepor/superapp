@@ -51,7 +51,7 @@ wait 900
 # down while the bar carries the batch.
 key down
 wait 600
-type " "
+key space
 wait 500
 shot k2-one-mark
 
@@ -126,7 +126,7 @@ key esc
 wait 500
 click ".DS_Store"
 wait 700
-type " "
+key space
 wait 500
 shot k9-dot-marked
 
@@ -161,11 +161,11 @@ key esc
 wait 600
 click "README.txt"
 wait 700
-type " "
+key space
 wait 400
 click "report-q3.pdf"
 wait 700
-type " "
+key space
 wait 500
 shot k12-two-marks
 
@@ -203,7 +203,7 @@ wait 700
 # One space brings the bar up on the cursor's row; `mark all` then takes
 # every row the filter shows. `copy 7` resolves only while seven rows are
 # marked, which is what says the verb took the listing and not the row.
-type " "
+key space
 wait 500
 click "mark all"
 wait 700
@@ -216,7 +216,7 @@ wait 700
 click "clear"
 wait 600
 shot k17-cleared
-type " "
+key space
 wait 500
 click "copy 1"
 wait 700
