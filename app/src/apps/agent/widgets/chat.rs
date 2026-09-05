@@ -356,6 +356,15 @@ impl Widget for AgentChatPanel {
         // bar is being drawn, and its field is up in that very frame.
         let pick = self.view.text_input(cx, ids!(pick_input));
         self.raise(cx, &props, &pick);
+        // And what the caret keeps is said here too: the shell files a
+        // widget's answer at the end of its draw, and one that says nothing
+        // there is taken to keep every chord — which would put out every
+        // letter on this bar, and swallow every chord, while the person
+        // types. This composer keeps exactly the text chords.
+        let field = self.view.text_input(cx, ids!(ask_input));
+        if field.key_focus(cx) || (self.pick_up && pick.key_focus(cx)) {
+            props.chord.field(Letters::NONE);
+        }
 
         // The widest a person's block may be: most of the column, and the
         // block takes as much of that as its longest line asks for. The

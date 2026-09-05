@@ -45,7 +45,9 @@ click "ask"
 wait 400
 type "cut it short"
 wait 400
-key enter
+# The bar's chord fires from the field: a caret keeps only the text chords,
+# so cmd+s is *send* here, with the letter drawn bold to promise it.
+key cmd+s
 wait 900
 click "This answer is long and it"
 wait 400
