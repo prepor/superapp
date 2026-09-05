@@ -24,8 +24,19 @@
 // halves apart. What no code path here asks for, a fixture's test does.
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// A list the wire may spell as `null`: Workers AI's deltas carry
+/// `"tool_calls": null` on every chunk that has none, and serde's `default`
+/// covers only a key that is *absent*. Read as empty either way.
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
 
 // -- what goes out -------------------------------------------------------------
 
@@ -36,7 +47,7 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     /// The tools this build offers, as function definitions. Left out when
     /// there are none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "null_as_empty", skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDef>,
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,7 +113,7 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// What the assistant asked to run. Empty on every other role.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "null_as_empty", skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Which call this message answers. Only on a `tool` message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,7 +256,7 @@ impl ToolCall {
 pub struct Chunk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "null_as_empty", skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<Choice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -274,7 +285,7 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "null_as_empty", skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDelta>,
 }
 

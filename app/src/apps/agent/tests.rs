@@ -1443,6 +1443,26 @@ fn the_request_says_what_the_model_is_told() {
     assert!(system.contains("<panel id=\"inbox\""));
 }
 
+/// Workers AI spells an empty list as `null` on every delta once a request
+/// carries tools — the chunk that stopped a real chat on 2026-09-05. A
+/// `null` list is an empty list, wherever the wire puts one.
+#[test]
+fn a_null_list_on_the_wire_reads_as_empty() {
+    let chunk = r#"{"id":"id-1788627406362","created":1788627406,"model":"@cf/zai-org/glm-5.3-flash","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hi","reasoning_content":null,"role":null,"tool_calls":null},"finish_reason":null,"index":0,"logprobs":null,"matched_stop":null}]}"#;
+    let c: Chunk = serde_json::from_str(chunk).expect("a delta with a null list");
+    assert_eq!(c.choices[0].delta.content.as_deref(), Some("Hi"));
+    assert!(c.choices[0].delta.tool_calls.is_empty());
+
+    let usage_only = r#"{"id":"x","object":"chat.completion.chunk","choices":null,"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+    let c: Chunk = serde_json::from_str(usage_only).expect("a usage chunk with null choices");
+    assert!(c.choices.is_empty());
+    assert_eq!(c.usage.map(|u| u.total_tokens), Some(3));
+
+    let msg = r#"{"role":"assistant","content":"Hi","tool_calls":null,"function_call":null}"#;
+    let m: Message = serde_json::from_str(msg).expect("a message with a null list");
+    assert!(m.tool_calls.is_empty());
+}
+
 // -- the real gateway's refusals ------------------------------------------------
 
 #[test]
@@ -1543,6 +1563,38 @@ fn the_real_gateway_answers_a_real_request() {
         "{answer:?}"
     );
     assert!(answer.usage.is_some(), "usage rides the last chunk");
+
+    // And a round with a tool on the wire: the deltas then spell every
+    // empty list as `null`, and the call comes back assembled from
+    // fragments — the two things a fixture cannot promise about a live model.
+    let rename = Tool::new(
+        "files.rename",
+        "Rename a file in place. Call this when asked to rename a file.",
+        json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["path", "name"],
+            "additionalProperties": false
+        }),
+        true,
+        |_, _| Ok(Value::Null),
+    );
+    let mut req = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("You are the assistant inside superapp. Use tools when asked to act."),
+            Message::user("Rename the file ~/Downloads/README.txt to readme-old.txt."),
+        ],
+    );
+    req.tools = vec![ToolDef::from(&rename)];
+    let answer = gateway
+        .complete(&req, &mut |_| Flow::Go)
+        .expect("the gateway answers a tool round");
+    assert_eq!(answer.finish, Finish::ToolCalls, "{answer:?}");
+    assert_eq!(answer.message.tool_calls.len(), 1);
+    assert_eq!(answer.message.tool_calls[0].function.name, "files.rename");
+    let input = answer.message.tool_calls[0].input().expect("json arguments");
+    assert_eq!(input["name"], json!("readme-old.txt"));
 }
 
 #[test]
