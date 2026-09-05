@@ -202,24 +202,32 @@ impl Gateway for RealGateway {
 /// What a status that is not 200 comes to, in words.
 ///
 /// The providers answer a refusal as `{"error": {"message": …}}` when they
-/// answer JSON at all, and as an HTML page when the account in the URL is
-/// nobody's — so the body is read either way, and what a person sees is
-/// the sentence if there is one and the page if there is not.
+/// answer JSON at all, Workers AI as `{"name": "AiError", "message": …}`,
+/// and the gateway as an HTML page when the account in the URL is nobody's
+/// — so the body is read every way, and what a person sees is the sentence
+/// if there is one and the page if there is not.
 ///
-/// A 401 or a 403 is the *token*, which is a standing condition and not one
-/// run's bad luck: it wears the `gateway: unauthorized` the problem source
-/// looks for.
+/// A 401 is the *token*, which is a standing condition and not one run's
+/// bad luck: it wears the `gateway: unauthorized` the problem source looks
+/// for. A 403 is a refusal of something — a model the plan does not carry,
+/// a gateway that wants its own header — and says so without guessing which.
 #[must_use]
 pub fn refused(status: u16, body: String) -> Failure {
     let said = serde_json::from_str::<Value>(&body)
         .ok()
-        .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
+        .and_then(|v| {
+            let nested = v.get("error").and_then(|e| e.get("message"));
+            nested
+                .or_else(|| v.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or(body);
     let said = said.trim().to_string();
-    let message = if status == 401 || status == 403 {
-        format!("gateway: unauthorized — {said}")
-    } else {
-        said
+    let message = match status {
+        401 => format!("gateway: unauthorized — {said}"),
+        403 => format!("gateway: refused — {said}"),
+        _ => said,
     };
     Failure {
         status: Some(status),

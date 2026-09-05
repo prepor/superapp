@@ -507,12 +507,13 @@ showing and makes it a chip; `esc` puts the field away.
   account, and when that fails too the row says why, with the three places a
   bucket goes.
 - **The gateway refuses** (401, 403, an account that is nobody's): the run
-  fails with the gateway's own sentence, and a 401 or 403 wears *unauthorized*,
-  because a bad token is a standing condition and not one round's bad luck.
-  Providers answer a refusal as JSON when they answer JSON at all and as an
-  HTML page when the account in the URL does not exist, so both are read and
-  what a person sees is the sentence if there is one and the page if there is
-  not.
+  fails with the gateway's own sentence. A 401 wears *unauthorized*, because a
+  bad token is a standing condition and not one round's bad luck; a 403 wears
+  *refused*, since it is as often the plan — *this model is not available on
+  the Workers Free plan* — as the token. Providers answer a refusal as JSON
+  when they answer JSON at all and as an HTML page when the account in the
+  URL does not exist, so both are read and what a person sees is the sentence
+  if there is one and the page if there is not.
 - **The network is down**: the run fails and the chat offers *retry*. Nothing
   retries by itself: six blind retries of a paid request is not a policy
   anyone wants, and the gateway does its own retrying.

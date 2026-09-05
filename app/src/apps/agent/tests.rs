@@ -1455,11 +1455,16 @@ fn a_refusal_reads_as_its_sentence_and_a_bad_token_says_so() {
         "401 and 403 are the token, and the problem source keys on the word"
     );
 
-    let why = real::refused(403, "no".to_string());
-    assert!(
-        why.message.starts_with("gateway: unauthorized — "),
-        "{why:?}"
+    // A 403 is a refusal of something, not necessarily the token: the plan
+    // that does not carry the model, said in Workers AI's own shape.
+    let ai = r#"{"name":"AiError","httpCode":403,"message":"Model x is not available on the Workers Free plan"}"#;
+    let why = real::refused(403, ai.to_string());
+    assert_eq!(
+        why.message,
+        "gateway: refused — Model x is not available on the Workers Free plan"
     );
+    let why = real::refused(403, "no".to_string());
+    assert_eq!(why.message, "gateway: refused — no");
 
     // A body that is not JSON is the body, which is what an HTML page from
     // a bad account id comes to.
