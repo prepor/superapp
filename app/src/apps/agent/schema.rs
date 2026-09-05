@@ -85,9 +85,12 @@ CREATE TABLE agent_call(
   tool         TEXT NOT NULL,
   -- The arguments, as JSON.
   input        TEXT NOT NULL,
-  -- pending · done · failed
+  -- pending · asked · done · failed · refused. A call of a tool that asks
+  -- waits at `asked` until the person allows or refuses it.
   status       TEXT NOT NULL,
-  -- What it came to, or why it did not, whichever the model reads back.
+  -- What it came to, or why it did not, whichever the model reads back. A
+  -- call the person refused has none: the sentence it answers with is the
+  -- app's own word for a refusal.
   output       TEXT,
   -- The sentence the history shows for what a writing tool did — *rename
   -- “README.txt” to “readme-renamed.txt”* — read off the node the tool

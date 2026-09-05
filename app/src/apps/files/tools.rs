@@ -119,7 +119,10 @@ pub fn all() -> Vec<Tool> {
             }),
             true,
             trash,
-        ),
+        )
+        // What a person means by *delete*: the file leaves the listing, and
+        // undo is the only way back. That is a thing to be asked about.
+        .asking(),
         Tool::new(
             "files.mkdir",
             "Make one directory, where nothing is yet. A name the parent \
@@ -152,7 +155,11 @@ pub fn all() -> Vec<Tool> {
             }),
             true,
             write,
-        ),
+        )
+        // Writing over a file is the one verb here that destroys what was
+        // there; what undo holds for it is memory, and the person's word
+        // comes first.
+        .asking(),
     ]
 }
 

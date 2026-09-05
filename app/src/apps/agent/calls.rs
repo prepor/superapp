@@ -6,41 +6,115 @@
 //! every event while its run is waiting; a run whose chat is shown nowhere
 //! pauses at its next call and picks up when the chat is opened again.
 //!
-//! Every call runs as soon as it arrives; nothing asks first. Undo is the
-//! net, and it is one chord away — each tool files its own action, so what
-//! `cmd+z` takes back is the thing the tool did and not this bookkeeping.
+//! Nearly every call runs as soon as it arrives: undo is the net, and it is
+//! one chord away — each tool files its own action, so what `cmd+z` takes
+//! back is the thing the tool did and not this bookkeeping. The exception
+//! is a tool that [asks](kernel::tool::Tool::asks): what cannot be undone
+//! or has left the machine stops the walk at a card that waits, and
+//! [`allow`] or [`refuse`] is what starts it again. The walk stops there
+//! rather than running on, because order can matter — a draft before its
+//! send.
 
 use kernel::history::NodeId;
 use kernel::session::Session;
 
-use super::model::{self, Call, ChatId};
+use super::model::{self, Call, CallId, ChatId, RunId};
 
 /// Runs every call the chat's waiting run is holding, in the order the
-/// model asked for them, and kicks the run when they are done. Answers how
-/// many ran — nought for a chat with no run waiting, which is the common
-/// case and costs one cached query.
+/// model asked for them, up to the first that asks, and kicks the run when
+/// they are done. Answers how many rows moved — nought for a chat with no
+/// run waiting, which is the common case and costs one cached query, and
+/// nought again while a call stands asked.
 pub fn run_pending_calls(s: &mut Session, chat: ChatId) -> usize {
-    let Some(run) = model::latest_run(s.store(), chat) else {
+    let Some(run) = waiting_run(s, chat) else {
         return 0;
     };
-    if run.status != model::WAITING {
+    // A round stopped at a question stays stopped: the calls behind an
+    // asked one are its own to release.
+    if !model::asked_calls(s.store(), run).is_empty() {
         return 0;
     }
-    let pending = model::pending_calls(s.store(), run.id);
-    if pending.is_empty() {
-        return 0;
+    let moved = walk(s, run);
+    if moved > 0 {
+        s.workers().kick(&model::run_entity(run));
     }
-    for call in &pending {
-        let (status, said, label) = outcome(s, call);
-        let (id, now) = (call.id, s.now());
-        // Bookkeeping, not a node: the tool's own `act` is what history
-        // shows and what undo takes back.
-        let _ = s
-            .store()
-            .write(move |c| model::set_call_tx(c, id, status, &said, label.as_deref(), now));
+    moved
+}
+
+/// The person's word, on the call that was waiting for it: it runs, exactly
+/// as an arriving call would have, and the round goes on to the next one.
+/// Answers whether there was such a call to allow.
+pub fn allow(s: &mut Session, chat: ChatId, call: CallId) -> bool {
+    let Some(call) = asked(s, chat, call) else {
+        return false;
+    };
+    ran(s, &call);
+    // The rest of the round, up to the next question — and the kick, which
+    // the worker needs whether anything else moved or not.
+    run_pending_calls(s, chat);
+    s.workers().kick(&model::run_entity(call.run));
+    true
+}
+
+/// The other word: the call never runs, and *refused by the person* is what
+/// the model reads back, so it can say what it could not do. The walk goes
+/// on — the next call may itself be one that asks.
+pub fn refuse(s: &mut Session, chat: ChatId, call: CallId) -> bool {
+    let Some(call) = asked(s, chat, call) else {
+        return false;
+    };
+    let (id, now) = (call.id, s.now());
+    let _ = s
+        .store()
+        .write(move |c| model::set_call_tx(c, id, model::CALL_REFUSED, "", None, now));
+    run_pending_calls(s, chat);
+    s.workers().kick(&model::run_entity(call.run));
+    true
+}
+
+/// The round's pending calls in the model's own order, each run where its
+/// tool runs on arrival and asked where it does not — and there the walk
+/// stops, with everything behind it left pending. Answers how many rows
+/// moved.
+fn walk(s: &mut Session, run: RunId) -> usize {
+    let mut moved = 0;
+    for call in model::pending_calls(s.store(), run) {
+        moved += 1;
+        if s.apps().tool(&call.tool).is_some_and(|t| t.asks) {
+            let id = call.id;
+            let _ = s.store().write(move |c| model::ask_call_tx(c, id));
+            break;
+        }
+        ran(s, &call);
     }
-    s.workers().kick(&model::run_entity(run.id));
-    pending.len()
+    moved
+}
+
+/// One call, run and written down. Bookkeeping, not a node: the tool's own
+/// `act` is what history shows and what undo takes back.
+fn ran(s: &mut Session, call: &Call) {
+    let (status, said, label) = outcome(s, call);
+    let (id, now) = (call.id, s.now());
+    let _ = s
+        .store()
+        .write(move |c| model::set_call_tx(c, id, status, &said, label.as_deref(), now));
+}
+
+/// The chat's newest run, if it is one holding calls.
+fn waiting_run(s: &Session, chat: ChatId) -> Option<RunId> {
+    model::latest_run(s.store(), chat)
+        .filter(|r| r.status == model::WAITING)
+        .map(|r| r.id)
+}
+
+/// The call an *allow* or a *refuse* is about: one of this chat's own, and
+/// one that is really waiting to be answered. A word for anything else is
+/// a word for a card that has moved on.
+fn asked(s: &Session, chat: ChatId, call: CallId) -> Option<Call> {
+    let run = waiting_run(s, chat)?;
+    model::asked_calls(s.store(), run)
+        .into_iter()
+        .find(|c| c.id == call)
 }
 
 /// One call: what it came to, the word its row takes, and the sentence its

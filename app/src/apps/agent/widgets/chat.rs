@@ -64,6 +64,15 @@ const BLOCK_PAD: f64 = 18.0;
 /// How much of a card's output is drawn. A JSON blob is read, not audited.
 const OUTPUT_MAX: usize = 2000;
 
+/// The muted line under a card whose call is waiting to be allowed. It says
+/// whose move it is, which is the whole of what a person needs to know from
+/// across the room.
+const WAITING_LINE: &str = "waiting for you";
+
+/// And under one the person would not have: the word, in the colour a
+/// failure gets, because a refusal is how this call ended.
+const REFUSED_LINE: &str = "refused";
+
 /// The cursor block at the end of a live tail.
 const CARET: &str = "\u{258d}";
 
@@ -90,6 +99,10 @@ struct Shown {
     /// Whether each of those calls was a tool that changes something.
     writes: Vec<bool>,
     items: Vec<Item>,
+    /// The calls waiting on the person: `asked`, in a round that is still
+    /// waiting for them. A round the person stopped strands whatever it was
+    /// holding, and a card must not offer a word that would do nothing.
+    asking: HashSet<CallId>,
     /// The muted line under an agent's turn — what the round cost, and the
     /// word it stopped on — by turn.
     foots: Vec<String>,
@@ -113,6 +126,11 @@ enum Spot {
     Card(CallId),
     /// The agent's folded reasoning.
     Reason(TurnId),
+    /// *allow* on a card that is waiting: the call runs, and the round goes
+    /// on.
+    Allow(CallId),
+    /// *refuse*: it never runs, and the model is told so.
+    Refuse(CallId),
 }
 
 /// The widget: the chat read fresh on every draw, so an answer that lands
@@ -502,7 +520,8 @@ impl AgentChatPanel {
 
     /// One tool call's card: what it did on the first line, and behind it
     /// what it came to — or, where it failed, why, in the colour errors
-    /// get.
+    /// get. A call still waiting for the person says so in the muted line
+    /// and wears the two buttons that answer it.
     fn fill_card(&self, cx: &mut Cx, row: &WidgetRef, shown: &Shown, item: Item) {
         let call = match item {
             Item::Card(i) => shown.calls.get(i).map(|c| (i, c)),
@@ -512,24 +531,29 @@ impl AgentChatPanel {
         let folded = call.is_some_and(|(i, c)| self.folded(i, c, shown));
         row.label(cx, ids!(card.card_line.card_lbl))
             .set_text(cx, &call.map_or(String::new(), |(_, c)| line_of(c, folded)));
-        let output = call
-            .map(|(_, c)| c)
-            .filter(|c| c.status == model::CALL_DONE && !folded)
-            .map(|c| clip(&c.said(), OUTPUT_MAX))
-            .unwrap_or_default();
+        let asked = call.is_some_and(|(_, c)| shown.asking.contains(&c.id));
+        let output = if asked {
+            WAITING_LINE.to_string()
+        } else {
+            call.map(|(_, c)| c)
+                .filter(|c| c.status == model::CALL_DONE && !folded)
+                .map(|c| clip(&c.said(), OUTPUT_MAX))
+                .unwrap_or_default()
+        };
         row.widget(cx, ids!(card.card_out))
             .set_visible(cx, !output.is_empty());
         row.text_input(cx, ids!(card.card_out.card_out_txt))
             .set_text(cx, &output);
-        let failed = call
-            .map(|(_, c)| c)
-            .filter(|c| c.status == model::CALL_FAILED)
-            .map(|c| clip(&c.said(), OUTPUT_MAX))
-            .unwrap_or_default();
+        let failed = call.map(|(_, c)| err_of(c)).unwrap_or_default();
         row.widget(cx, ids!(card.card_err))
             .set_visible(cx, !failed.is_empty());
         row.text_input(cx, ids!(card.card_err.card_err_txt))
             .set_text(cx, &failed);
+        row.widget(cx, ids!(card.card_btns)).set_visible(cx, asked);
+        row.label(cx, ids!(card.card_btns.card_allow.btn_lbl))
+            .set_text(cx, if asked { "allow" } else { "" });
+        row.label(cx, ids!(card.card_btns.card_refuse.btn_lbl))
+            .set_text(cx, if asked { "refuse" } else { "" });
     }
 
     /// How wide a person's block wants to be: its longest line, its widest
@@ -631,13 +655,29 @@ impl AgentChatPanel {
                         props.hits.add(label, r, MouseCursor::Hand, props.slot);
                         self.spots.push((r, Spot::Card(call.id)));
                     }
-                    if call.status == model::CALL_FAILED {
-                        let said = call.said();
-                        if let (Some(r), Some(line)) =
-                            (at(cx, ids!(card.card_err.card_err_txt)), first_line(&said))
-                        {
-                            props.hits.add(line, r, MouseCursor::Text, props.slot);
+                    // The two words on a call that is waiting, and the line
+                    // saying it is: what a person presses, and what a
+                    // script addresses the wait by.
+                    if shown.asking.contains(&call.id) {
+                        if let Some(r) = at(cx, ids!(card.card_out.card_out_txt)) {
+                            props
+                                .hits
+                                .add(WAITING_LINE, r, MouseCursor::Text, props.slot);
                         }
+                        if let Some(r) = at(cx, ids!(card.card_btns.card_allow)) {
+                            props.hits.add("allow", r, MouseCursor::Hand, props.slot);
+                            self.spots.push((r, Spot::Allow(call.id)));
+                        }
+                        if let Some(r) = at(cx, ids!(card.card_btns.card_refuse)) {
+                            props.hits.add("refuse", r, MouseCursor::Hand, props.slot);
+                            self.spots.push((r, Spot::Refuse(call.id)));
+                        }
+                    }
+                    let err = err_of(call);
+                    if let (Some(r), Some(line)) =
+                        (at(cx, ids!(card.card_err.card_err_txt)), first_line(&err))
+                    {
+                        props.hits.add(line, r, MouseCursor::Text, props.slot);
                     }
                 }
                 Item::Tail => {
@@ -976,6 +1016,11 @@ impl AgentChatPanel {
                     self.open_reasons.insert(id);
                 }
             }
+            // The person's word on a call that cannot be undone. The same
+            // two actions the bar's *allow* and *refuse* run, because the
+            // card is where the call is.
+            Some(Spot::Allow(id)) => self.answer(props, scope, id, true),
+            Some(Spot::Refuse(id)) => self.answer(props, scope, id, false),
             Some(Spot::Drop(i)) => {
                 let mut borrow = props.panel.borrow_mut();
                 if let Some(c) = borrow.as_any().downcast_mut::<Chat>() {
@@ -1018,6 +1063,29 @@ impl AgentChatPanel {
             }
         }
         self.view.redraw(cx);
+    }
+
+    /// *allow* or *refuse* on the card of a call that is waiting for one.
+    /// The allowed call runs here, on the UI thread with the session, like
+    /// any other; the refused one never runs and answers the model in
+    /// words.
+    fn answer(&self, props: &PanelProps, scope: &mut Scope, call: CallId, allow: bool) {
+        let chat = {
+            let mut borrow = props.panel.borrow_mut();
+            borrow
+                .as_any()
+                .downcast_mut::<Chat>()
+                .and_then(|c| c.chat())
+        };
+        let (Some(chat), Some(session)) = (chat, scope.data.get_mut::<Session>()) else {
+            return;
+        };
+        if allow {
+            calls::allow(session, chat, call);
+        } else {
+            calls::refuse(session, chat, call);
+        }
+        session.redraw();
     }
 
     /// Runs the calls the chat's run is waiting on, and draws the answer a
@@ -1123,9 +1191,15 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
     // hangs off the turn that asked for it, and a run goes round as many
     // times as the model wants tools.
     let mut calls: Vec<Call> = Vec::new();
+    let mut asking: HashSet<CallId> = HashSet::new();
     if let Some(id) = id {
         for r in model::runs(&store, id).iter() {
-            calls.extend(model::calls(&store, r.id).iter().cloned());
+            for c in model::calls(&store, r.id).iter() {
+                if c.status == model::CALL_ASKED && r.status == model::WAITING {
+                    asking.insert(c.id);
+                }
+                calls.push(c.clone());
+            }
         }
     }
     // Which of them changed something — the one thing a card asks of the
@@ -1147,6 +1221,7 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
         calls,
         writes,
         items,
+        asking,
         foots,
         run,
         streaming,
@@ -1249,6 +1324,17 @@ pub fn card_line(call: &Call) -> String {
         call.tool.clone()
     } else {
         format!("{} {args}", call.tool)
+    }
+}
+
+/// What a card says under its line in the colour errors get: why a call
+/// failed, or the one word for a call the person would not have. Empty for
+/// every other card.
+fn err_of(call: &Call) -> String {
+    match call.status.as_str() {
+        model::CALL_REFUSED => REFUSED_LINE.to_string(),
+        model::CALL_FAILED => clip(&call.said(), OUTPUT_MAX),
+        _ => String::new(),
     }
 }
 

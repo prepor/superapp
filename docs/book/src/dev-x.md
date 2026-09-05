@@ -61,6 +61,7 @@ asks for the answer it wants in the words it types and the order never matters:
 | *fail* | the gateway refusing — *the gateway is down* |
 | *cut* | *This answer is long and it*, finishing `length` |
 | *rename* | a call of `files.rename` on `~/Downloads/README.txt`, then *Renamed it.* |
+| *delete* | a call of `files.trash` on `~/Downloads/README.txt`, then *Deleted it.* — twice over, because that tool [asks first](./agents.md#the-gate-what-asks-first) and the gate's suite sends the same words twice |
 | *looking* | *You are looking at {panel}.* |
 | *continue* | *… and here is the rest.* |
 | anything else | *Hello. I am the assistant.* |

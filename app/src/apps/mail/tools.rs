@@ -96,7 +96,10 @@ pub fn all() -> Vec<Tool> {
             one("the conversation to delete"),
             true,
             delete,
-        ),
+        )
+        // The trash is not the archive: what a person means by *delete* is
+        // the one filing they would want to be asked about.
+        .asking(),
         Tool::new(
             "mail.not_spam",
             "Take a conversation out of the junk and back into the inbox. It \
@@ -155,7 +158,10 @@ pub fn all() -> Vec<Tool> {
             }),
             true,
             send,
-        ),
+        )
+        // A letter that has gone has left the machine: the undo window is
+        // seconds, and the person's word comes before it.
+        .asking(),
     ]
 }
 

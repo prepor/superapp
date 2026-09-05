@@ -8,8 +8,9 @@ launcher roots. It stores no secret and adds no dependency.
 One rule holds the whole of it up: **an agent acts only through what a person
 could do, and every one of its acts is an ordinary undoable action.** A tool is
 the verb's own code path over ids instead of over a cursor, so a tool and the
-button beside it cannot disagree; nothing asks before a call runs, because
-`cmd+z` is the answer to a call that should not have.
+button beside it cannot disagree; `cmd+z` is the answer to a call that should
+not have run, and only the handful of calls undo cannot take back — a send, a
+delete, a raw write — [ask first](#the-gate-what-asks-first).
 
 ## Tags and roots
 
@@ -82,9 +83,10 @@ a chat continued on the phone is the same chat only if its turns travel.
 | `agent_call` | one tool call: `run`, `turn`, `tool_call_id`, `tool`, `input`, `status`, `output`, `label`, `created`, `ended` |
 
 A run's status is `pending`, `streaming`, `waiting`, `done`, `failed`, or
-`stopped`; a call's is `pending`, `done`, or `failed`. A turn's `body` is the
-wire's own message, stored verbatim as text, because the next request is built
-from the rows and `sqlite3` can still read them; the app's own two keys ride in
+`stopped`; a call's is `pending`, `asked` — waiting for the person's word —
+`done`, `failed`, or `refused`. A turn's `body` is the wire's own message,
+stored verbatim as text, because the next request is built from the rows and
+`sqlite3` can still read them; the app's own two keys ride in
 the same object — `chips`, the context the turn carried, and `finish`, the word
 the model stopped on. The role is a column as well as a key of the JSON, so a
 query can ask without parsing.
@@ -98,7 +100,9 @@ never goes in the store: it is the one thing that must not replicate.
 `agent-run-42`, kick address `run:42`, from one cached query — so a run starts
 the moment its row exists and retires when it ends. It claims no queued
 [job](./data-substrate.md#queued-jobs): it has none. A pending run is asked; a
-waiting one is asked again once every call of the round has answered.
+waiting one is asked again once no call of the round is `pending` or `asked` —
+a call the person refused counts as answered, because a refusal is what the
+model reads back.
 
 A device that may not write runs **none of them**. A run row replicates like
 any other, so the follower would otherwise start a second worker for a round
@@ -295,9 +299,10 @@ a turn; the trace is not, because a chip points at a panel and not at a moment.
 
 A `Tool` is a stable name prefixed with the app id, a description written for
 the model — what it does and *when* to call it — a JSON Schema for its input,
-a `writes` flag in the same word an effect uses, and the behaviour itself: a
-function of the session, run on the UI thread, filing one action labelled by
-the tool so that it is one undo.
+a `writes` flag in the same word an effect uses, an `asks` flag for the few
+whose call [waits for the person](#the-gate-what-asks-first), and the
+behaviour itself: a function of the session, run on the UI thread, filing one
+action labelled by the tool so that it is one undo.
 
 `Apps::tools()` is the list a request carries and the registry a call is run by
 name from: the kernel's own first, then each app's in app-list order. Two apps
@@ -388,12 +393,12 @@ without the person going to look.
 
 ### Running a call
 
-Every call runs as soon as it arrives; nothing asks first. Three refusals come
-before the tool, each a sentence the model can act on: a name no app in this
-build offers, arguments the schema will not have, and a writing tool on a
-device that may not write — which gets the same words a person's own verb gets,
-as the error the model reads. The run goes on either way, and the model says
-what it could not do.
+Nearly every call runs as soon as it arrives, because undo is the net. Three
+refusals come before the tool, each a sentence the model can act on: a name no
+app in this build offers, arguments the schema will not have, and a writing
+tool on a device that may not write — which gets the same words a person's own
+verb gets, as the error the model reads. The run goes on either way, and the
+model says what it could not do.
 
 The call's row takes `done` or `failed` and the text the model reads back; the
 tool's own action is what the history shows and what `cmd+z` takes back, and
@@ -406,16 +411,45 @@ and kept on the call's `label`, which is the one thing the card says. The model
 never sees it: what the model reads back is the tool's own JSON. So the card
 and the undo tree say one thing in one voice, and neither quotes the other.
 
+### The gate: what asks first
+
+Five calls in this build do not run on arrival: `sql.write`, `mail.send`,
+`mail.delete`, `files.trash` and `files.write`. What they have in common is
+what `cmd+z` cannot honestly promise — a letter that has gone has left the
+machine, a file written over is memory, a statement nobody's app is speaking
+for. `Tool::asks` is the flag, and it is a flag of its own rather than
+`writes`, because a rename, an archive or a mark-read is one undo away and a
+gate on all of them would be a dialog box on everything.
+
+Such a call becomes a **card that waits**: the tool and what the model wrote
+for it on its line, *waiting for you* under it, and two buttons — **allow** and
+**refuse** — drawn as the bar draws its own. The chat's bar wears the same two
+words while it waits, *refuse* on `f` and *allow* on no letter at all, because
+every letter of that word is a chord the workspace or the composer already
+keeps.
+
+**The walk stops there.** The calls the model asked for after it stay
+`pending` until this one is answered, since order can matter — a draft before
+its send. *allow* runs it exactly as an arriving call would have run, then goes
+on to the next; *refuse* never runs it, and *refused by the person* is the
+`tool` message's content, so the model reads what it was not allowed to do and
+says so. A refusal is an answer, not a hang: the round is settled when no call
+of it is `pending` or `asked`, and the run goes round again either way.
+
+*allow all for this run* is [not built](#not-done-on-purpose).
+
 ### What the model is told
 
 The system prompt, in this order: what superapp is — one person's workspace,
 where everything is panels over a single SQLite database on their own machine;
 that `sql.query` reads it and `sql.write` writes it, and that an app's own tool
 is preferred wherever there is one, because a tool is the same code the
-person's own button runs; that every act is an ordinary undoable action and
-nothing asks the person first, so do what was asked and say plainly what was
-done. Then each app's `describe` under its id, then the panel in context if
-there is one, then a short word on style: answer in the language the person
+person's own button runs; that every act is an ordinary undoable action, so
+most calls simply run, and that the few that cannot be undone wait for the
+person's word and answer *refused by the person* when it does not come — so do
+what was asked and say plainly what was done. Then each app's `describe` under
+its id, then the panel in context if there is one, then a short word on style:
+answer in the language the person
 wrote in, name things by what a person calls them rather than by row id, keep
 it short — this is a panel in a workspace, not a page. No chords, and no
 picture of the workspace: the model acts through tools, not through the
@@ -437,7 +471,8 @@ A transcript above, the composer below. The person's turns are on one side and
 the agent's on the other, chips in the person's; the model's reasoning, where
 it sends any, is one folded muted line; a tool call is a card, saying on its
 first line what it did — a writing tool's own undo sentence, a reading tool's
-name and arguments — and, folded behind it, what it came to; the live tail
+name and arguments — and, folded behind it, what it came to, or, while it is
+waiting to be allowed, the two buttons that answer it; the live tail
 streams into the last turn while the answer is being written. A long transcript
 is a list of turns, so a thousand-turn chat costs what it shows, and everything
 the agent wrote is a selectable run, because an answer is something one copies
@@ -452,8 +487,11 @@ The bar is **send** (`cmd+s`) while there is something to send and nothing
 going, **stop** (`cmd+k`) while something is, **retry** (`cmd+r`) on a round
 that failed or was stopped, and **continue** (`cmd+o`) on an answer the model
 ran out of room for, so a bar with none of the four is a chat waiting to be
-written in. Then **add panel** (`cmd+p`), which is always there because it is
-the phone's way into context and harmless where the chord exists. Nothing on
+written in. Then **allow** (no letter) and **refuse** (`cmd+f`) while a call is
+[waiting for a word](#the-gate-what-asks-first) — the same two the card wears,
+because the bar is where a panel's verbs live and a card is not always in
+view. Then **add panel** (`cmd+p`), which is always there because it is the
+phone's way into context and harmless where the chord exists. Nothing on
 the bar leaves the conversation: a fresh chat and the list of them belong to
 the agents list, which the launcher opens.
 
@@ -542,11 +580,10 @@ row carries the sentence and, under it, the chat and the date.
 
 ## Not done, on purpose
 
-- **Asking before a call.** Every call runs on arrival and undo is the net. A
-  gate — a card that waits, with *allow*, *refuse*, *allow all for this run* —
-  is the obvious next step once it is clear which tools want one;
-  `agent_call.status` has room for the words and `Tool::writes` is what it
-  would key on.
+- **Allow all for this run.** The [gate](#the-gate-what-asks-first) asks once
+  per call, and a round with three sends in it is answered three times. A
+  third button, remembered on the run, is the obvious next step; what it must
+  not become is a setting that turns the gate off for good.
 - **Agent profiles**: named system prompts and tool subsets. The chat carries a
   `model` and nothing else; a `profile` column is a later ladder step.
 - **Other chips**: a file, a letter, a selection. The enum has the room.

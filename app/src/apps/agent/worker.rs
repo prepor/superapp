@@ -163,10 +163,13 @@ impl RunWorker {
     /// when they were the latest.
     fn answered(&mut self, w: &World) -> Wake {
         let calls = model::round_calls_conn(w.store().conn(), self.run);
+        // Answered is *not* run: a call the person refused never ran, and
+        // the refusal is its answer. What the round is still owed is a call
+        // nobody has run and a call nobody has said a word about.
         let settled = !calls.is_empty()
-            && calls
+            && !calls
                 .iter()
-                .all(|c| matches!(c.status.as_str(), model::CALL_DONE | model::CALL_FAILED));
+                .any(|c| matches!(c.status.as_str(), model::CALL_PENDING | model::CALL_ASKED));
         if !settled {
             return Wake::OnKick;
         }

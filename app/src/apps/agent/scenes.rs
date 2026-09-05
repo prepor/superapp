@@ -8,7 +8,8 @@
 //!
 //! Which answer comes back is chosen by a word in what is typed, which is why
 //! each of these states is one line of script and no setup at all: *fail* is
-//! refused, *cut* runs out of room, *rename* asks for a tool.
+//! refused, *cut* runs out of room, *rename* asks for a tool, and *delete*
+//! asks for one that waits to be allowed.
 //!
 //! The list is the other way round — its rows are seeded through the scene's
 //! own `open`, because two chats with two different rounds behind them are
@@ -54,6 +55,8 @@ fn chat() -> Scene<Setup> {
         .about("the gateway's own sentence where the answer would have been, and *retry*")
         .node("a call", said(&ask("rename the readme")))
         .about("a tool call is a card, and it says the sentence its own undo node wears")
+        .node("a call that asks", said(&ask("delete the readme")))
+        .about("a call undo cannot take back waits at its card: *allow* or *refuse*")
         .node(
             "chip",
             workspace_on(|_| Agents::id(), "key cmd+shift+a\nwait 900"),
@@ -74,6 +77,7 @@ fn chat() -> Scene<Setup> {
         .edge("empty", "cut short", "cut it short")
         .edge("empty", "failed", "please fail")
         .edge("empty", "a call", "rename the readme")
+        .edge("empty", "a call that asks", "delete the readme")
         .edge("chip", "add panel", "the same chip, without the chord")
 }
 

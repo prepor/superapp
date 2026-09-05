@@ -54,7 +54,7 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `poll` | what the app owes the UI thread: work it started elsewhere that has finished and now needs a session |
 | `roots` | the panels the launcher offers whether or not they are open |
 | `describe` | the app's data in its own words: each table, what a row is, the columns that matter, and what must never be written directly. Prose, not a schema dump, because it is read into an [agent](./agents.md#what-a-panel-says-about-itself)'s system prompt |
-| `tools` | the things this app lets an agent do, by name. Collected into one list at boot; two apps offering one name stop the process, naming both |
+| `tools` | the things this app lets an agent do, by name. Collected into one list at boot; two apps offering one name stop the process, naming both. Each says whether it `writes`, and whether it `asks` — the few whose call waits for the person's word before it runs, because undo cannot take it back |
 | `ask` | takes a panel as context: opens whatever this app answers a panel with, joined to it, and says whether it did. The shell offers the focused slot to the apps in list order on `cmd+shift+a` and stops at the first taker |
 | `attach` | the finished registry, once, at the end of boot. An app that needs the *list* — every tool, every data dictionary — copies what it needs here, and may not keep the reference |
 
@@ -186,8 +186,9 @@ apps' the way the registry chains in the bucket's problem source. `sql.query`,
 `sql.write` and `sql.schema` are the store itself, read and written and
 described; `panels.list`, `panels.context` and `panels.open` are the workspace
 — what is open, what one open panel says of itself, and a way to put a panel
-beside the chat. Two rules hold over the writing one: the kernel's own tables
-are refused by name, and a write is undoable or it does not happen. See
+beside the chat. Three rules hold over the writing one: the kernel's own tables
+are refused by name, a write is undoable or it does not happen, and it `asks` —
+a statement no app is speaking for waits for the person's word. See
 [Agents](./agents.md#the-kernels-own).
 
 ## Capabilities

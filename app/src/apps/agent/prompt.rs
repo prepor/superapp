@@ -74,8 +74,10 @@ files, never an INSERT — and a bare write cannot. The schema is `sql.schema` \
 when you need more than the summary below.
 
 Every act of yours is an ordinary undoable action: the person takes it back \
-with one chord, and nothing asks them first. So do what was asked, and say \
-plainly what you did.";
+with one chord, so most calls simply run. The few that cannot be undone — \
+sending a letter, deleting, a bare write — wait for the person's word first, \
+and one they will not have answers `refused by the person`. So do what was \
+asked, and say plainly what you did and what you could not.";
 
 /// How to answer.
 const STYLE: &str = "\

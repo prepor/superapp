@@ -61,10 +61,23 @@ pub const LIVE: [&str; 3] = [PENDING, STREAMING, WAITING];
 
 /// A call nobody has run yet.
 pub const CALL_PENDING: &str = "pending";
+/// A call of a tool that [asks](kernel::tool::Tool::asks), waiting for the
+/// person's word: its card wears *allow* and *refuse*, and the calls behind
+/// it in the round wait with it.
+pub const CALL_ASKED: &str = "asked";
 /// A call that answered.
 pub const CALL_DONE: &str = "done";
-/// A call that refused, whose error is what the model reads.
+/// A call the *tool* would not have — a name no app offers, arguments the
+/// schema refuses, a verb that could not do it — whose error is what the
+/// model reads. What the *person* would not have is [`CALL_REFUSED`].
 pub const CALL_FAILED: &str = "failed";
+/// A call the person would not have. It never ran, and what the model reads
+/// back is [`REFUSED_SAID`].
+pub const CALL_REFUSED: &str = "refused";
+
+/// What a refused call answers the model with — the whole of the sentence,
+/// because nothing was done and there is nothing else to say about it.
+pub const REFUSED_SAID: &str = "refused by the person";
 
 /// What a chat is called before the person has said anything in it.
 pub const UNTITLED: &str = "chat";
@@ -279,9 +292,14 @@ impl Call {
     }
 
     /// What the `tool` message this call answers with carries: the output
-    /// where it worked, the error where it did not.
+    /// where it worked, the error where it did not, and — for a call the
+    /// person would not have — [`REFUSED_SAID`], so the model reads that it
+    /// was refused rather than that nothing happened.
     #[must_use]
     pub fn said(&self) -> String {
+        if self.status == CALL_REFUSED {
+            return REFUSED_SAID.to_string();
+        }
         self.output.clone().unwrap_or_default()
     }
 }
@@ -517,6 +535,19 @@ pub fn pending_calls(store: &Store, run: RunId) -> Vec<Call> {
         .collect()
 }
 
+/// The ones waiting on the person: a tool that asks, standing at its card
+/// until it is allowed or refused. One at a time in practice — the walk
+/// stops at the first — but a list, because the round is what the panel
+/// reads.
+#[must_use]
+pub fn asked_calls(store: &Store, run: RunId) -> Vec<Call> {
+    calls(store, run)
+        .iter()
+        .filter(|c| c.status == CALL_ASKED)
+        .cloned()
+        .collect()
+}
+
 /// The runs that want a worker, each with its chat: one that has not been
 /// asked for yet, and one holding calls the chat panel will run.
 #[must_use]
@@ -724,6 +755,23 @@ pub fn add_call_tx(
         ],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+/// A call put to the person: the status alone moves.
+///
+/// Nothing else about the row does, because nothing else has happened —
+/// it has run nothing, claimed nothing, and has not ended: `ended` is the
+/// moment the person answers, which [`set_call_tx`] writes then.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn ask_call_tx(c: &Connection, call: CallId) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE agent_call SET status = ?2 WHERE id = ?1",
+        rusqlite::params![call, CALL_ASKED],
+    )?;
+    Ok(())
 }
 
 /// What a call came to, or why it did not.

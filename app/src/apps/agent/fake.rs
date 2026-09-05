@@ -149,12 +149,33 @@ impl FakeGateway {
                     then: "Renamed it.".into(),
                 },
             ),
+            // Twice over, because a reply is spent once it has answered and
+            // the gate's suite asks the same thing twice: once to refuse
+            // it, once to allow it.
+            Self::delete_the_readme(),
+            Self::delete_the_readme(),
             Reply::when("looking", Answer::Text("You are looking at {panel}.".into())),
             // What *continue* asks for, and what it is worth: the rest of
             // the sentence the `cut` reply above stopped in the middle of.
             Reply::when("continue", Answer::Text("… and here is the rest.".into())),
             Reply::always(Answer::Text("Hello. I am the assistant.".into())),
         ])
+    }
+
+    /// One call of a tool that asks before it runs — what the gate's own
+    /// suite sends for. The `then` is what the model says once the call has
+    /// answered, whatever it answered: this fake does not read the result,
+    /// so *Deleted it.* follows a refusal as readily as it follows a
+    /// deletion.
+    fn delete_the_readme() -> Reply {
+        Reply::when(
+            "delete",
+            Answer::Call {
+                name: "files.trash".into(),
+                arguments: serde_json::json!({"path": "~/Downloads/README.txt"}),
+                then: "Deleted it.".into(),
+            },
+        )
     }
 
     /// Puts a script in and starts it over: nothing spent, no call waiting

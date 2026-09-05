@@ -21,8 +21,9 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
 
+use super::super::calls;
 use super::super::chip::Chip;
-use super::super::model::{self, Carried, ChatId, Run, Turn};
+use super::super::model::{self, Call, Carried, ChatId, Run, Turn};
 
 /// The argument a chat panel carries when there is no row behind it yet.
 const NEW: &str = "new";
@@ -223,6 +224,19 @@ impl Chat {
         self.latest_run().map(|r| r.status)
     }
 
+    /// The call standing at its card waiting for the person's word, if the
+    /// round has one: a tool that cannot be undone does not run until it is
+    /// allowed, and the calls behind it wait with it. The first, because
+    /// the walk stops at one.
+    #[must_use]
+    pub fn asked_call(&self) -> Option<Call> {
+        // Only while the round is still waiting for it: a run the person
+        // stopped strands whatever it was holding, and a bar must not offer
+        // a word that would do nothing.
+        let run = self.latest_run().filter(|r| r.status == model::WAITING)?;
+        model::asked_calls(&self.store, run.id).into_iter().next()
+    }
+
     /// The transcript, in order.
     #[must_use]
     pub fn turns(&self) -> Rc<Vec<Turn>> {
@@ -310,12 +324,22 @@ impl Panel for Chat {
             .chat
             .and_then(|c| model::chat(&self.store, c))
             .map_or_else(|| super::super::MODEL.to_string(), |c| c.model);
+        // A call standing at its card is the one thing about this panel a
+        // reader has to act on, so it is said and named.
+        let asked = self.asked_call().map_or_else(String::new, |c| {
+            format!(
+                " A call of {} is waiting for the person's word before it runs: \
+                 the card wears *allow* and *refuse*, and the round stands still \
+                 until one of them is pressed.",
+                c.tool
+            )
+        });
         format!(
             "{}: one conversation with the assistant, running on {model_name}, \
              {n} turn{} so far. The person writes at the foot and the agent answers \
              above; the agent reads and changes this workspace through the tools \
              this build offers, and every act of its own is an ordinary undoable \
-             action.",
+             action.{asked}",
             self.title(),
             if n == 1 { "" } else { "s" }
         )
@@ -333,9 +357,10 @@ impl Panel for Chat {
 
     /// *send* while there is something to send and nothing going, *stop*
     /// while something is, *retry* on a round that came to nothing,
-    /// *continue* on an answer that ran out of room — then *add panel*, the
-    /// one that is always there. A fresh chat and the list of them are the
-    /// agents panel's business, not a conversation's.
+    /// *continue* on an answer that ran out of room, *allow* and *refuse*
+    /// while a call is waiting to be one or the other — then *add panel*,
+    /// the one that is always there. A fresh chat and the list of them are
+    /// the agents panel's business, not a conversation's.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
         let going = run.as_ref().is_some_and(Run::live);
@@ -354,6 +379,23 @@ impl Panel for Chat {
         }
         if !going && self.cut_short() {
             v.push(Verb::run("agent.continue", "continue", Some('o')));
+        }
+        // The word on a call that cannot be undone. *allow* wears no
+        // letter: `a` is the caret's own select-all, `l` and `w` are the
+        // workspace's, and the composer is live nearly always — so a letter
+        // of that word would be a promise the bar could not keep.
+        //
+        // Closures rather than `Run` verbs: allowing a call runs the tool,
+        // and a tool reaches every panel there is — files' own refresh
+        // borrows each of them — while `Panel::run` still holds this one.
+        if let (Some(chat), Some(call)) = (self.chat, self.asked_call()) {
+            let id = call.id;
+            v.push(Verb::call("agent.allow", "allow", None, move |s| {
+                calls::allow(s, chat, id);
+            }));
+            v.push(Verb::call("agent.refuse", "refuse", Some('f'), move |s| {
+                calls::refuse(s, chat, id);
+            }));
         }
         // The phone's way into the context a chord opens on the desktop, and
         // harmless where the chord is there: a field over the panels that

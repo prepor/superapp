@@ -94,7 +94,11 @@ pub fn all() -> Vec<Tool> {
             }),
             true,
             write,
-        ),
+        )
+        // A statement of the person's own writing, over rows no app is
+        // speaking for: the one call in the kernel's six that waits to be
+        // allowed.
+        .asking(),
         Tool::new(
             "sql.schema",
             "The store's data dictionary: every table and index this build has, \

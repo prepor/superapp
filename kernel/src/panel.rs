@@ -319,8 +319,11 @@ impl Verb {
         }
     }
 
-    /// A button that belongs to no panel: a problem row's *retry*. The
-    /// closure is the whole behaviour.
+    /// A button that belongs to no panel — a problem row's *retry* — or one
+    /// whose behaviour must run with nothing borrowed: [`Panel::run`] holds
+    /// its own instance for as long as it is on the stack, and a verb that
+    /// runs an agent's tool reaches every panel there is. The closure is
+    /// the whole behaviour.
     #[must_use]
     pub fn call(
         id: &'static str,

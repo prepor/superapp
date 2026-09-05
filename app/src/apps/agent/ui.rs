@@ -116,6 +116,35 @@ script_mod! {
         }
     }
 
+    /** A button on a card, drawn as the bar draws one: a lowercase label in
+        INK inside a rule of the same colour.
+
+        A view rather than a `ButtonFlat` because it lives inside the
+        transcript's list, where an item's area goes stale on any redraw —
+        so the press is answered by the rectangles of the last draw, like
+        every other pressable thing here. */
+    mod.widgets.AgentCardBtn = View {
+        width: Fit, height: Fit
+        show_bg: true
+        cursor: MouseCursor.Hand
+        padding: Inset{left: 12, right: 12, top: 3, bottom: 3}
+        draw_bg +: {
+            color: #ffffff
+            pixel: fn() {
+                let px = 1.0 / self.rect_size.x
+                let py = 1.0 / self.rect_size.y
+                if self.pos.x < px || self.pos.x > 1.0 - px || self.pos.y < py || self.pos.y > 1.0 - py {
+                    return vec4(0.078, 0.078, 0.078, 1.0)
+                }
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        btn_lbl := mod.widgets.SLabel {
+            width: Fit, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25} }
+        }
+    }
+
     /** A muted run of text: the model's own reasoning, and what a call came
         to. Selectable like everything else the agent writes. */
     mod.widgets.AgentMuted = mod.widgets.SText {
@@ -201,7 +230,8 @@ script_mod! {
         }
 
         /* One tool call: what it did on the first line, and behind it what
-           it came to — or why it did not. */
+           it came to — or why it did not, or, while it waits for the
+           person's word, the two buttons that give it. */
         card := mod.widgets.AgentBox {
             visible: false
             width: Fill, height: Fit
@@ -225,6 +255,17 @@ script_mod! {
                 visible: false
                 width: Fill, height: Fit
                 card_err_txt := mod.widgets.AgentErr {}
+            }
+            /* Up only while the call is asked: the person's two words,
+               under the line saying what it would do. */
+            card_btns := View {
+                visible: false
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 8
+                margin: Inset{top: 2}
+                card_allow := mod.widgets.AgentCardBtn {}
+                card_refuse := mod.widgets.AgentCardBtn {}
             }
         }
 

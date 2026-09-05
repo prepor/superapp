@@ -122,4 +122,34 @@ mod tests {
             assert!(!t.description.is_empty(), "{}", t.name);
         }
     }
+
+    /// Which calls wait for the person's word, said in one place. The set
+    /// is what cannot be undone or has left the machine; a rename, an
+    /// archive and a mark-read are one chord away and must never ask, or
+    /// the gate is a dialog box on everything.
+    #[test]
+    fn only_what_cannot_be_undone_asks_before_it_runs() {
+        let apps = Apps::new(APPS);
+        let asking: Vec<&str> = apps
+            .tools()
+            .iter()
+            .filter(|t| t.asks)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            asking,
+            vec![
+                "sql.write",
+                "mail.delete",
+                "mail.send",
+                "files.trash",
+                "files.write"
+            ]
+        );
+        for name in ["mail.archive", "mail.read", "files.rename", "files.move"] {
+            let tool = apps.tool(name).expect("the tool");
+            assert!(tool.writes, "{name} writes");
+            assert!(!tool.asks, "{name} is one undo away, so it must not ask");
+        }
+    }
 }

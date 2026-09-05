@@ -7,6 +7,11 @@
 //! type and collects the list ([`Apps::tools`](crate::app::Apps::tools)); the
 //! apps fill it and the chat runs a call by name.
 //!
+//! Undo is the net for nearly all of them, which is why nothing asks the
+//! person first. [`Tool::asks`] is the exception: a call of a tool that
+//! cannot be taken back — a send, a delete, a raw write — waits on its own
+//! card until the person allows or refuses it.
+//!
 //! The schema is the other half of the contract. A model's arguments are a
 //! claim, not a promise: [`Tool::check`] reads them against the tool's own
 //! JSON Schema before `run` sees them, and its refusal is a sentence the
@@ -29,9 +34,14 @@ pub struct Tool {
     /// arrival — required keys, types — before `run` sees them.
     pub input: Value,
     /// Whether the world changes. The same word as an effect's; it is what
-    /// the card's look, the log, and a later gate key on. Today every call
-    /// runs on arrival either way.
+    /// the card's look and the log key on. It is **not** what the gate keys
+    /// on: see [`Tool::asks`].
     pub writes: bool,
+    /// Whether the call waits for the person's word before it runs: what
+    /// cannot be undone, or leaves the machine — a send, a delete, a raw
+    /// write. Every such call is a card that waits; `writes` alone does not
+    /// ask, because a rename or an archive is one undo away.
+    pub asks: bool,
     /// The whole behaviour, on the UI thread, with the session: one `act`
     /// per call, labelled by the tool, so it is one undo.
     pub run: fn(&mut Session, &Value) -> Result<Value, String>,
@@ -53,8 +63,19 @@ impl Tool {
             description,
             input,
             writes,
+            asks: false,
             run,
         }
+    }
+
+    /// The same tool, asking first: a call of it waits on the person's
+    /// word — *allow* or *refuse* on its own card — rather than running the
+    /// moment it arrives. What earns it is a thing undo cannot take back or
+    /// that has already left the machine.
+    #[must_use]
+    pub fn asking(mut self) -> Tool {
+        self.asks = true;
+        self
     }
 
     /// Reads the arguments a call arrived with against [`Tool::input`].
@@ -399,5 +420,15 @@ mod tests {
         assert_eq!(c.name, t.name);
         assert_eq!(c.input, t.input);
         assert!(c.writes);
+    }
+
+    #[test]
+    fn a_tool_runs_on_arrival_unless_it_says_it_asks() {
+        let plain = rename();
+        assert!(!plain.asks, "a rename is one undo away, so it does not ask");
+        let asking = rename().asking();
+        assert!(asking.asks);
+        assert!(asking.writes, "and it is still a write");
+        assert!(asking.clone().asks, "which travels with the clone");
     }
 }

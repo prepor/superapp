@@ -786,6 +786,13 @@ fn send_new(s: &mut Session, text: &str) -> ChatId {
     chat
 }
 
+/// The call standing at its card waiting for the person, if this chat's
+/// newest round has one.
+fn asked_call(s: &Session, chat: ChatId) -> Option<model::Call> {
+    let run = model::latest_run(s.store(), chat)?;
+    model::asked_calls(s.store(), run.id).into_iter().next()
+}
+
 #[test]
 fn a_send_makes_the_chat_the_turn_and_the_answer() {
     let mut s = session();
@@ -1354,8 +1361,13 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let open = open_root(&mut s, Chat::id(chat));
     with_chat(&s, open, |c| c.set_draft("more"));
     let blank = open_root(&mut s, Chat::new_id());
+    // And the fullest bar a chat wears: a run waiting on a call nobody has
+    // allowed yet, which is *stop*, *allow*, *refuse* and *add panel* at
+    // once.
+    let waiting = asking_chat(&mut s);
+    let asking = open_root(&mut s, Chat::id(waiting));
 
-    for slot in [list, open, blank] {
+    for slot in [list, open, blank, asking] {
         let verbs = s.panel(slot).expect("the panel").borrow().verbs();
         assert!(!verbs.is_empty(), "slot {slot} wears nothing");
         let mut seen: Vec<char> = Vec::new();
@@ -1693,7 +1705,9 @@ fn add_panel_offers_the_panels_that_are_open_and_a_pick_is_a_chip() {
 
 // -- what a card says a call did -----------------------------------------------
 
-/// Plants one call, sends for it, runs it, and answers the row it left.
+/// Plants one call, sends for it, runs it, and answers the row it left. A
+/// tool that asks first is allowed here: what these tests are about is what
+/// a card says a call did, and the gate has its own below.
 fn one_call(s: &mut Session, ask: &str, name: &str, arguments: Value) -> model::Call {
     plant(
         s,
@@ -1704,7 +1718,10 @@ fn one_call(s: &mut Session, ask: &str, name: &str, arguments: Value) -> model::
         })],
     );
     let chat = send_new(s, ask);
-    assert_eq!(calls::run_pending_calls(s, chat), 1, "the one call ran");
+    assert_eq!(calls::run_pending_calls(s, chat), 1, "the one call moved");
+    if let Some(asked) = asked_call(s, chat) {
+        assert!(calls::allow(s, chat, asked.id), "the person allowed it");
+    }
     s.settle();
     let run = model::runs(s.store(), chat)
         .first()
@@ -1770,6 +1787,278 @@ fn a_call_that_refused_keeps_the_tool_on_its_line() {
     assert_eq!(call.said(), "missing `name`");
     assert_eq!(call.label, None, "nothing was done, so nothing is claimed");
     assert_eq!(card_line(&call), "files.rename ~");
+}
+
+// -- the gate: a call that cannot be undone asks first ---------------------------
+
+/// A chat whose newest round is standing at a call nobody has allowed yet:
+/// *delete the readme*, which the default script answers with `files.trash`.
+fn asking_chat(s: &mut Session) -> ChatId {
+    let chat = send_new(s, "delete the readme");
+    assert_eq!(
+        calls::run_pending_calls(s, chat),
+        1,
+        "the call moved — to `asked`, not to `done`"
+    );
+    s.settle();
+    chat
+}
+
+/// Whether the demo disk still has this path on it.
+fn on_disk(s: &Session, path: &str) -> bool {
+    crate::apps::files::model::stat_in(s.world(), path).is_some()
+}
+
+#[test]
+fn a_call_that_cannot_be_undone_waits_for_the_person_instead_of_running() {
+    let mut s = session();
+    let chat = asking_chat(&mut s);
+    let call = asked_call(&s, chat).expect("a call waiting for the person");
+    assert_eq!(call.tool, "files.trash");
+    assert_eq!(call.status, model::CALL_ASKED);
+    assert!(call.output.is_none(), "it came to nothing: it has not run");
+    assert!(
+        call.ended.is_none(),
+        "and it has not ended, because it waits"
+    );
+    assert!(
+        on_disk(&s, "~/Downloads/README.txt"),
+        "nothing was done: the file is where it was"
+    );
+    assert_eq!(
+        model::latest_run(s.store(), chat).expect("the run").status,
+        model::WAITING,
+        "and the round is not answered, so the worker does not go on"
+    );
+
+    // The panel serving the run again changes nothing: a round stopped at a
+    // question stays stopped until the question is answered.
+    assert_eq!(calls::run_pending_calls(&mut s, chat), 0);
+    s.settle();
+    assert_eq!(
+        asked_call(&s, chat).map(|c| c.id),
+        Some(call.id),
+        "the same call, still waiting"
+    );
+
+    // The bar is where the two words live, beside the *stop* a waiting run
+    // keeps. *allow* wears no letter: every letter of the word is a chord
+    // the workspace or the composer keeps.
+    let slot = open_root(&mut s, Chat::id(chat));
+    assert_eq!(
+        verb_ids(&s, slot),
+        vec![
+            "agent.stop",
+            "agent.allow",
+            "agent.refuse",
+            "agent.add_panel"
+        ]
+    );
+    let verbs = s.panel(slot).expect("the panel").borrow().verbs();
+    let allow = verbs.iter().find(|v| v.id == "agent.allow").expect("allow");
+    assert_eq!(allow.label, "allow");
+    assert_eq!(allow.accel, None);
+    assert_eq!(
+        verbs
+            .iter()
+            .find(|v| v.id == "agent.refuse")
+            .and_then(|v| v.accel),
+        Some('f')
+    );
+    assert!(
+        s.panel(slot)
+            .expect("the panel")
+            .borrow()
+            .about()
+            .contains("waiting for the person's word"),
+        "the panel says what it is holding"
+    );
+}
+
+#[test]
+fn allow_runs_the_call_and_the_round_goes_on() {
+    let mut s = session();
+    let chat = asking_chat(&mut s);
+    let call = asked_call(&s, chat).expect("a call waiting for the person");
+    let slot = open_root(&mut s, Chat::id(chat));
+
+    verb(&mut s, slot, "agent.allow");
+    let call = model::calls(s.store(), call.run)
+        .iter()
+        .find(|c| c.id == call.id)
+        .cloned()
+        .expect("the call");
+    assert_eq!(call.status, model::CALL_DONE, "{}", call.said());
+    assert!(!on_disk(&s, "~/Downloads/README.txt"), "it was trashed");
+    assert_eq!(
+        call.label.as_deref(),
+        Some("delete “README.txt”"),
+        "the tool's own node is the card's line, as for any other call"
+    );
+    assert_eq!(
+        s.history().rows().0.last().expect("the node").label,
+        "delete “README.txt”",
+        "and one cmd+z takes it back"
+    );
+    // The worker read the result and the model said its piece.
+    assert_eq!(
+        transcript(&s, chat).last().cloned(),
+        Some((Role::Assistant, "Deleted it.".to_string()))
+    );
+    assert_eq!(
+        model::latest_run(s.store(), chat).expect("the run").status,
+        model::DONE
+    );
+    assert_eq!(
+        verb_ids(&s, slot),
+        vec!["agent.add_panel"],
+        "and the bar is a bar again"
+    );
+}
+
+#[test]
+fn refuse_never_runs_the_call_and_tells_the_model_so() {
+    let mut s = session();
+    let chat = asking_chat(&mut s);
+    let call = asked_call(&s, chat).expect("a call waiting for the person");
+    let slot = open_root(&mut s, Chat::id(chat));
+
+    verb(&mut s, slot, "agent.refuse");
+    let call = model::calls(s.store(), call.run)
+        .iter()
+        .find(|c| c.id == call.id)
+        .cloned()
+        .expect("the call");
+    assert_eq!(call.status, model::CALL_REFUSED);
+    assert_eq!(call.said(), model::REFUSED_SAID);
+    assert!(call.ended.is_some(), "a refusal is an ending");
+    assert!(
+        call.label.is_none(),
+        "nothing was done, so nothing is claimed"
+    );
+    assert!(
+        on_disk(&s, "~/Downloads/README.txt"),
+        "the file is where it was"
+    );
+
+    // The refusal is the tool's answer, so the run goes on rather than
+    // hanging on a call that will never run.
+    assert_eq!(
+        transcript(&s, chat)
+            .iter()
+            .map(|(r, said)| (*r, said.clone()))
+            .filter(|(r, _)| *r == Role::Tool)
+            .collect::<Vec<_>>(),
+        vec![(Role::Tool, model::REFUSED_SAID.to_string())]
+    );
+    assert_eq!(
+        model::latest_run(s.store(), chat).expect("the run").status,
+        model::DONE
+    );
+}
+
+#[test]
+fn the_walk_stops_at_a_call_that_asks_and_the_ones_behind_it_wait() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    // Two calls in one turn, written by hand: the fake asks for one call a
+    // reply, and what this is about is the order of several.
+    let run = s
+        .act(Action::writing("test", "a round of two calls", move |tx| {
+            let run = model::new_run_tx(tx, chat, 0.0)?;
+            let (turn, _) = model::add_turn_tx(
+                tx,
+                chat,
+                &Turn::new(Message::of(Role::Assistant)).by(run),
+                0.0,
+            )?;
+            for (i, (tool, args)) in [
+                ("files.trash", r#"{"path": "~/Downloads/README.txt"}"#),
+                ("files.list", r#"{"dir": "~/Downloads"}"#),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let call = ToolCall {
+                    id: format!("hand_{i}"),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: tool.into(),
+                        arguments: args.into(),
+                    },
+                };
+                model::add_call_tx(tx, run, turn, &call, 0.0)?;
+            }
+            model::set_run_status_tx(tx, run, model::WAITING, None, 0.0).map(|()| run)
+        }))
+        .expect("the round");
+    s.settle();
+
+    assert_eq!(
+        calls::run_pending_calls(&mut s, chat),
+        1,
+        "the walk stopped at the first call, which asks"
+    );
+    s.settle();
+    let rows = model::calls(s.store(), run);
+    assert_eq!(rows[0].status, model::CALL_ASKED);
+    assert_eq!(
+        rows[1].status,
+        model::CALL_PENDING,
+        "the call behind it waits its turn: order can matter"
+    );
+    assert_eq!(
+        calls::run_pending_calls(&mut s, chat),
+        0,
+        "and keeps waiting"
+    );
+
+    assert!(calls::allow(&mut s, chat, rows[0].id));
+    s.settle();
+    let rows = model::calls(s.store(), run);
+    assert_eq!(rows[0].status, model::CALL_DONE, "{}", rows[0].said());
+    assert_eq!(
+        rows[1].status,
+        model::CALL_DONE,
+        "and the rest of the round ran on the same word"
+    );
+}
+
+#[test]
+fn a_round_the_person_stopped_offers_no_word_on_what_it_was_holding() {
+    let mut s = session();
+    let chat = asking_chat(&mut s);
+    let slot = open_root(&mut s, Chat::id(chat));
+    assert!(with_chat(&s, slot, |c| c.asked_call()).is_some());
+
+    verb(&mut s, slot, "agent.stop");
+    assert_eq!(
+        with_chat(&s, slot, |c| c.status()).as_deref(),
+        Some(model::STOPPED)
+    );
+    assert!(
+        with_chat(&s, slot, |c| c.asked_call()).is_none(),
+        "the round is over: a word on what it was holding would do nothing"
+    );
+    assert_eq!(verb_ids(&s, slot), vec!["agent.retry", "agent.add_panel"]);
+}
+
+#[test]
+fn a_word_for_a_call_that_is_not_waiting_is_no_word_at_all() {
+    let mut s = session();
+    let chat = asking_chat(&mut s);
+    let call = asked_call(&s, chat).expect("a call waiting for the person");
+    assert!(!calls::allow(&mut s, chat, call.id + 999), "no such call");
+    assert!(calls::refuse(&mut s, chat, call.id));
+    s.settle();
+    assert!(
+        !calls::allow(&mut s, chat, call.id),
+        "a call already answered is not one to answer again"
+    );
+    assert_eq!(
+        model::calls(s.store(), call.run)[0].status,
+        model::CALL_REFUSED
+    );
 }
 
 // -- what `attach` copies out of the registry -----------------------------------
