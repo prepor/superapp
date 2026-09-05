@@ -177,6 +177,36 @@ fn the_inbox_lists_the_seeded_threads() {
     assert_eq!(ci.n, 6, "five archived runs and the one in the inbox");
 }
 
+/// Free text reaches the letter itself, not only the line above it: a word
+/// that was written in a body and appears in no subject and in no address
+/// still finds the conversation it was written in.
+#[test]
+fn the_filter_reads_the_letters() {
+    let (s, _clock) = session();
+    let store = s.store();
+
+    // "thermos" is one word of Elena's note about Saturday, and of nothing
+    // else in the world.
+    let hike = model::mailbox_filtered(store, Role::Inbox, "thermos");
+    assert_eq!(hike.len(), 1, "{:?}", hike.iter().map(|t| &t.topic));
+    assert_eq!(hike[0].topic, "Sat hike — early start?");
+
+    // What the sender and the subject already matched still matches, and
+    // the two reach the same row rather than two: a conversation matches
+    // when any letter of it does, on any of the columns.
+    let budget = model::mailbox_filtered(store, Role::Inbox, "budget");
+    assert_eq!(budget.len(), 1);
+    assert_eq!(budget[0].topic, "Q3 infra budget draft");
+
+    // A tag narrows the body search like any other: the letter about the
+    // trail is read, so this is the body's word AND the sender's.
+    assert_eq!(
+        model::mailbox_filtered(store, Role::Inbox, "thermos @from:elena").len(),
+        1
+    );
+    assert!(model::mailbox_filtered(store, Role::Inbox, "thermos @from:max").is_empty());
+}
+
 /// The four mailboxes are four panels over one list, and each shows what its
 /// own folder holds.
 #[test]

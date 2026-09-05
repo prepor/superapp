@@ -420,7 +420,13 @@ macro_rules! mailbox_spec {
             ),
             from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
             base: concat!("f.role = '", $role, "'"),
-            text: &["m.from_name", "m.from_email", "m.subject"],
+            // The letter itself is in it, and last: SQLite short-circuits
+            // the OR left to right, so the three cheap columns answer for
+            // every row that matches on who wrote or what it is called, and
+            // the body is read only for the rest. It is also the widest
+            // column a list may touch — `html` and `raw` sit behind it, and
+            // nothing reads those per row.
+            text: &["m.from_name", "m.from_email", "m.subject", "m.body"],
             tags: &[
                 ("unread", TagSql::Where("m.unread = 1")),
                 ("html", TagSql::Where("m.html IS NOT NULL")),

@@ -46,10 +46,12 @@ trash folder. Trash is a role a folder plays, not a mailbox panel; nothing
 lists it.
 
 The filter tags are `@unread`, `@html`, `@from:`, `@subject:`, `@date`, and
-`@account:`. Free text matches the sender's name, the sender's address, and the
-subject. `@from:` suggestions come from the current mailbox: the three ordinary
-mailboxes offer correspondents with spam left out, and spam offers its own
-senders, because a spammer is not a correspondent.
+`@account:`. Free text matches the sender's name, the sender's address, the
+subject, and the letter's own text — a word you remember from a body finds the
+conversation it was written in, and a conversation matches when any of its
+letters does. `@from:` suggestions come from the current mailbox: the three
+ordinary mailboxes offer correspondents with spam left out, and spam offers its
+own senders, because a spammer is not a correspondent.
 
 A mailbox panel may carry a sender as its argument, which is what a contact's
 link opens: the panel is filtered from its first draw, and the field shows

@@ -71,4 +71,19 @@ wait 800
 click "GitHub · aug 31 08:02"
 wait 500
 shot g7-walked
+
+# Free text reaches the letter itself. "thermos" is one word of Elena's note
+# about Saturday and is in no subject and in no address in this world, so the
+# only way the row can be here is that the filter read the body — and the
+# click on it is what says it is.
+key /
+wait 400
+key cmd+a
+type "thermos"
+wait 900
+click "Sat hike"
+wait 800
+click "Elena Petrova · aug 30 18:20"
+wait 500
+shot g8-body-word
 quit
