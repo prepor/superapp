@@ -153,6 +153,8 @@ shot inbox
 click "reply"
 cmdclick "Q3"
 mouse "filter"
+dblclick "job facts"
+tripleclick "job facts"
 selectall "mail html"
 drag "mail body" 420 0
 key cmd+shift+left
@@ -179,6 +181,18 @@ because Makepad's private capture and delayed focus state cannot be reset by the
 harness; reach later fields with `tab`. A scripted `drag` does not prove that
 text became selected, because Makepad starts a selection only for a
 platform-captured pointer; `selectall` is the assertion for that.
+
+`dblclick` and `tripleclick` press two and three times at the label's near
+corner, close enough together to be one gesture. The multi-press run lives in
+`Cx` and is fed by each platform's event loop, which a synthesized press never
+reaches, so the harness folds its own presses in — without that every press
+would be a first click. That loop is also where a capture is handed back, so a
+gesture that means to select hands the pointer back before it starts;
+otherwise a widget pressed earlier is dealt the press as well, and a second
+letter selects a word under a click nowhere near it. A press selects with no
+pointer to capture, so unlike a scripted drag what these leave *is* provable:
+the wash in the picture is the assertion, a word for two presses and a line
+for three.
 
 `swipe`, `pan2`, `holdmove`, and `drop` are the fingers, and they go down the
 stage's own touch path, the one Android drives, so a suite that asks for a

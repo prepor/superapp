@@ -55,6 +55,10 @@ pub enum Step {
     /// the stage's own event handling rather than the resolved action —
     /// the path a physical click takes, key-focus side effects included.
     Mouse { label: String },
+    /// Two or three presses at the labelled element's near corner, close
+    /// enough in time to read as one gesture: what takes the word under the
+    /// pointer, and what takes its line.
+    MultiClick { label: String, clicks: u32 },
     /// A key chord: `cmd+shift+left`, `enter`, `j`, … with a repeat count
     /// (`key j 5`).
     Key { chord: String, times: u32 },
@@ -117,6 +121,7 @@ impl Step {
             self,
             Step::Click { .. }
                 | Step::Mouse { .. }
+                | Step::MultiClick { .. }
                 | Step::Drag { .. }
                 | Step::Swipe { .. }
                 | Step::HoldMove { .. }
@@ -179,6 +184,14 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             fresh: true,
         },
         "mouse" => Step::Mouse { label: quoted()? },
+        "dblclick" => Step::MultiClick {
+            label: quoted()?,
+            clicks: 2,
+        },
+        "tripleclick" => Step::MultiClick {
+            label: quoted()?,
+            clicks: 3,
+        },
         "selectall" => Step::SelectAll(quoted()?),
         "key" => {
             let mut it = rest.split_whitespace();
@@ -362,6 +375,25 @@ mod tests {
         );
         assert_eq!(s[5], Step::Type("hello world".into()));
         assert_eq!(s[6], Step::Quit);
+    }
+
+    #[test]
+    fn multi_click_steps_parse() {
+        let s = parse("dblclick \"job facts\"\ntripleclick \"job facts\"").unwrap();
+        assert_eq!(
+            s[0],
+            Step::MultiClick {
+                label: "job facts".into(),
+                clicks: 2
+            }
+        );
+        assert_eq!(
+            s[1],
+            Step::MultiClick {
+                label: "job facts".into(),
+                clicks: 3
+            }
+        );
     }
 
     #[test]

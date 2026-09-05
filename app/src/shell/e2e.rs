@@ -140,6 +140,19 @@ impl Stage {
                 None => self.no_such(r, "mouse", &label),
             },
 
+            // Two presses or three, close enough together to be one
+            // gesture. From the near corner, so the word they take is the
+            // run's first — the middle of a long run is as often the space
+            // between two words.
+            Step::MultiClick { label, clicks } => match self.hits.by_label(&label) {
+                Some(h) => {
+                    eprintln!("e2e: click ×{clicks} {label:?}");
+                    let p = h.rect.pos + dvec2(4.0, 4.0);
+                    self.synth_clicks(cx, sh, p, false, clicks);
+                }
+                None => self.no_such(r, "multiclick", &label),
+            },
+
             Step::Key { chord, times } => match super::keys::parse_chord(&chord) {
                 Some(exec) => {
                     eprintln!("e2e: key {chord} ×{times}");
@@ -208,8 +221,8 @@ impl Stage {
                     // Two ways to select, because there are two kinds of
                     // selectable thing. A text flow or a page answers the
                     // widget call; a field does not — its selection is its
-                    // own, and `select_all` is what a human's triple-click
-                    // reaches too, so this is the wash a person would see.
+                    // own. This is the whole run either way, which is what
+                    // `cmd+a` in it reaches; a triple click takes the line.
                     for run in &runs {
                         run.selection_select_all();
                         if let Some(mut t) = run.as_text_input().borrow_mut() {

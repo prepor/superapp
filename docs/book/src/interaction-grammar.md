@@ -136,6 +136,14 @@ In forms, `tab` and `shift+tab` move through fields and buttons. `enter`
 advances and submits after the last field. `esc` leaves a text field. There is
 no Vim key layer; plain letters remain text input.
 
+A field answers the caret chords macOS puts on the control key, so a hand that
+learned them in any other app finds them here: `^A` and `^E` go to the ends of
+the line, `^B` and `^F` move by a character, `^P` and `^N` by a row, `^H` and
+`^D` delete backwards and forwards, and `^K` takes the rest of the line — with
+the caret already at its end, the break, which pulls the line below up. Shift
+with any of the six that move extends the selection, as it does with the
+arrows.
+
 ## Workspaces
 
 Nine numbered workspaces form a vertical stack. On macOS, the menu bar lists
@@ -226,10 +234,13 @@ listed first.
 
 ## Mouse and trackpad
 
-Clicking focuses panels and activates controls. Hover states and cursor shapes
-show hit areas. Horizontal trackpad movement pans the workspace directly;
-vertical movement scrolls the panel under the pointer. Scrollable content shows
-a small grey thumb.
+Clicking focuses panels and activates controls. Two presses take the word under
+them and three take the line, wherever text is selectable — a field, a run, a
+letter — and a drag that follows sweeps in whatever the press took, keeping the
+word or the line it began on whole. Hover states and cursor shapes show hit
+areas. Horizontal trackpad movement pans the workspace directly; vertical
+movement scrolls the panel under the pointer. Scrollable content shows a small
+grey thumb.
 
 ## Touch
 

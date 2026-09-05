@@ -1219,14 +1219,14 @@ impl Library {
         // Outside the inline path the mount's own coordinates are the
         // canvas's, scaled: the same remap a human's click takes.
         for ev in super::pointer::press_release(at, false) {
-            match if inline {
-                None
+            let ev = if inline {
+                ev
             } else {
-                remap(&ev, r.pos, zoom)
-            } {
-                Some(mapped) => self.send(cx, i, &mapped),
-                None => self.send(cx, i, &ev),
-            }
+                remap(&ev, r.pos, zoom).unwrap_or(ev)
+            };
+            // The same press bookkeeping a click outside a mount gets.
+            super::pointer::pointer_before(cx, &ev);
+            self.send(cx, i, &ev);
         }
     }
 }
