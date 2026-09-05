@@ -338,7 +338,10 @@ fn mkdir(s: &mut Session, input: &Value) -> Result<Value, String> {
     let world = s.world().clone();
     ready(s)?;
     ops::make_dir_in(&world, &path)?;
-    let intent: Box<dyn Intent> = Box::new(ops::MadeDir::of(&world, &path));
+    // What the disk has at the path the moment after the write — the one
+    // reading that is certainly about the directory this made.
+    let made = Done::of(&world, &path, &path);
+    let intent: Box<dyn Intent> = Box::new(ops::MadeDir::made(&made));
     let here = basename(&dir).to_string();
     node(
         s,
