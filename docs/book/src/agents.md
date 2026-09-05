@@ -497,7 +497,8 @@ the agents list, which the launcher opens.
 
 The title is the chat's own — the first line of the first thing said in it,
 clipped at sixty characters — and `chat` before anything has been. It wishes
-for six by six: a conversation wants a column of its own and room to read one.
+for four by six: a third of the desktop's width reads as a conversation
+should, and leaves room for what the chat opens beside it.
 
 ### The agents list
 

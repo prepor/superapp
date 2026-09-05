@@ -345,10 +345,10 @@ impl Panel for Chat {
         )
     }
 
-    /// Six by six: a conversation wants a column of its own and room to
-    /// read one.
+    /// Four by six: a third of the desktop's width reads as a conversation
+    /// should, and leaves room for what the chat opens beside it.
     fn wish(&self, _cols: usize) -> (u32, u32) {
-        (6, 6)
+        (4, 6)
     }
 
     fn placed(&mut self, slot: SlotId) {
