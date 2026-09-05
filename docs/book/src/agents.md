@@ -327,7 +327,7 @@ are direct access to SQLite, read and written, and the workspace itself.
 | `sql.schema` | no | the store's tables and indexes with the SQL that made them — the kernel's own bookkeeping and a virtual table's shadows left out — plus each app's `describe`: the data dictionary on demand |
 | `panels.list` | no | every panel open on every workspace: tag, arguments, title, workspace, which has focus, and what each is joined to |
 | `panels.context` | no | one open panel's chip text, by slot — what the person is looking at, without a paste |
-| `panels.open` | no | opens a panel beside the focused one, focus staying where it is: the same preview a cursor walk makes, and undoable the same way |
+| `panels.open` | no | opens a panel at the end of the focused panel's joined chain, so what is open stays open, focus staying where it is: the same preview a cursor walk makes, and undoable the same way; a panel already open there is answered, not opened twice |
 
 `sql.write` is the one tool that cannot promise the apps' invariants — a
 `message` row moved by hand reaches no server — so the system prompt says to

@@ -136,10 +136,12 @@ pub fn all() -> Vec<Tool> {
         ),
         Tool::new(
             "panels.open",
-            "Open a panel beside the one that has focus, so the person can look \
-             at what you are talking about. Focus stays where it is. Use the \
-             tags panels.list shows; a mailbox takes no arguments, a message or \
-             a directory takes one.",
+            "Open a panel so the person can look at what you are talking about. \
+             It joins the end of the chain of panels hanging off the one that \
+             has focus, so what is already open stays open; a panel already \
+             open there is answered, not opened twice. Focus stays where it is. \
+             Use the tags panels.list shows; a mailbox takes no arguments, a \
+             message or a directory takes one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -716,9 +718,12 @@ fn context(s: &mut Session, input: &Value) -> Result<Value, String> {
 
 // -- panels.open ------------------------------------------------------------------
 
-/// A panel beside the focused one, focus staying where it is — the same
-/// [`Nav::Preview`] a cursor walk makes, so it lands on the same kind of
-/// undoable node.
+/// A panel at the end of the focused panel's joined chain, focus staying
+/// where it is — the same [`Nav::Preview`] a cursor walk makes, so it lands
+/// on the same kind of undoable node. The *end* of the chain, because a
+/// preview from the focused slot would replace whatever is joined there,
+/// and a model that opens two panels in a row means both to stay. An
+/// identity already open in that chain is answered, not opened twice.
 fn open(s: &mut Session, input: &Value) -> Result<Value, String> {
     // Asked of the tags the build owns rather than interned first: a tag is
     // a `&'static str`, so interning a name nobody owns would leak one per
@@ -732,12 +737,22 @@ fn open(s: &mut Session, input: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("no panel kind `{name}` in this build"))?;
     let args = strings(input, "args")?;
     let id = PanelId::new(tag, args);
-    let from = s
+    let focus = s
         .focus()
         .ok_or("no panel has focus, so there is nothing to open beside")?;
-    // Which slot is the new one: this identity may well be open already, and
-    // the answer is the slot that was not there a moment ago.
-    let before: HashSet<SlotId> = s.showing(&id).into_iter().collect();
+    // The chain hanging off the focus, focus first. Joins never loop, and
+    // the bound is only there so a broken layout cannot spin this.
+    let chain: Vec<SlotId> = std::iter::successors(Some(focus), |&x| s.joined_child(x))
+        .take(64)
+        .collect();
+    let showing: HashSet<SlotId> = s.showing(&id).into_iter().collect();
+    if let Some(open) = chain.iter().copied().find(|x| showing.contains(x)) {
+        return Ok(json!({"slot": open}));
+    }
+    let from = chain.last().copied().unwrap_or(focus);
+    // Which slot is the new one: this identity may well be open elsewhere,
+    // and the answer is the slot that was not there a moment ago.
+    let before = showing;
     s.nav(Nav::Preview {
         from,
         id: id.clone(),

@@ -639,6 +639,21 @@ fn opening_a_panel_previews_it_beside_the_focus() {
         s.panel(slot).expect("the instance").borrow().title(),
         "note 1"
     );
+
+    // A second open joins the end of the chain rather than replacing the
+    // first: a model that opens two panels means both to stay.
+    let out = call(&mut s, "panels.open", json!({"tag": "note", "args": ["2"]}))
+        .expect("the second panel opened");
+    let second = out["slot"].as_u64().expect("a slot");
+    assert_eq!(s.focus(), Some(list), "focus still where it was");
+    assert_eq!(s.joined_child(list), Some(slot), "the first is still there");
+    assert_eq!(s.joined_child(slot), Some(second), "the second hangs off it");
+
+    // What is already open in the chain is answered, not opened twice.
+    let out = call(&mut s, "panels.open", json!({"tag": "note", "args": ["1"]}))
+        .expect("the panel is open already");
+    assert_eq!(out["slot"].as_u64(), Some(slot));
+    assert_eq!(s.joined_child(slot), Some(second), "and nothing moved");
 }
 
 #[test]
