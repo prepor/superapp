@@ -107,7 +107,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             // A row that scrolls out is kept for the next one that scrolls
@@ -342,17 +342,10 @@ script_mod! {
             }
         }
         mod.widgets.TblHairline {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
-            // A finger drags the thread; a mouse button on it is a
-            // selection, never a scroll. The list would otherwise take the
-            // drag a letter's own text is selected with — and turn a press
-            // that lands while a coast is still live into one too, pulling
-            // the letter out from under a selection begun a moment after
-            // scrolling.
-            drag_scrolling: #(cfg!(target_os = "android"))
             msg := mod.widgets.MailThreadRow {}
         }
     }
@@ -544,7 +537,7 @@ script_mod! {
             margin: Inset{top: 6}
             text: "no accounts yet", draw_text +: { color: #909090 }
         }
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             account_row := mod.widgets.MailAccountRow {}

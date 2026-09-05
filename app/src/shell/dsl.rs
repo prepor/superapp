@@ -93,6 +93,15 @@ script_mod! {
 
     // ---- the base widgets --------------------------------------------------
 
+    /** Lists leave mouse drags to their content: selecting text must not
+        start a scroll or suppress the rest of the gesture. Wheel and
+        trackpad scrolling are independent of this flag. Android keeps
+        drag scrolling for touch. All lists use this base so adding a
+        selectable run cannot silently reintroduce drag-to-scroll. */
+    mod.widgets.SList = PortalList {
+        drag_scrolling: #(cfg!(target_os = "android"))
+    }
+
     /** Body text with no padding. Its row controls spacing. */
     mod.widgets.SLabel = Label {
         width: Fit, height: Fit
@@ -414,7 +423,7 @@ script_mod! {
         ..mod.widgets.FadeView
         width: Fill, height: Fill
         flow: Down
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             row := mod.widgets.OverlayRow {}
@@ -455,7 +464,7 @@ script_mod! {
                 }
             }
         }
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             row := mod.widgets.OverlayRow {}

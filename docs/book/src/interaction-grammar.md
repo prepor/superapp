@@ -18,6 +18,11 @@ dotted links. Batch verbs act on marked rows and open nothing.
 on a row, or on an entry of a bar. Actions report short results in a
 bottom-right toast. Errors use red; other toasts do not.
 
+Desktop lists scroll with the wheel, trackpad, or scrollbar. A mouse drag
+belongs to the content under it, so selectable text keeps the gesture.
+Android lists also scroll by dragging. Every list uses the shell's `SList`
+base to share this input policy.
+
 ### Preview: the one open that does not go
 
 A list cursor previews the row it lands on in a joined panel, while focus stays

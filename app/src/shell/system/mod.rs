@@ -240,7 +240,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             // A row that scrolls out is kept for the next one that scrolls
@@ -403,7 +403,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
@@ -519,7 +519,7 @@ script_mod! {
             margin: Inset{top: 6}
             text: "nothing is wrong", draw_text +: { color: #909090 }
         }
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             problem_row := mod.widgets.SysProblemRow {}

@@ -66,3 +66,31 @@ fn the_shell_and_the_platform_name_no_app() {
         "code under shell/ and platform/ names no app; found: {offenders:?}"
     );
 }
+
+/// List input policy belongs to the shell's base widget. A panel that uses
+/// Makepad's raw list inherits mouse drag scrolling, which steals gestures
+/// from selectable text as soon as the panel adds any.
+#[test]
+fn lists_use_the_shared_input_policy() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let base = src.join("shell/dsl.rs");
+    let mut files = Vec::new();
+    sources(&src, &mut files);
+    let mut offenders = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read source");
+        for (n, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            let shared_base = path == base && code.contains("mod.widgets.SList = PortalList");
+            if (code.contains("PortalList {") && !shared_base)
+                || (code.contains("drag_scrolling:") && path != base)
+            {
+                offenders.push(format!("{}:{}", path.display(), n + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "lists must inherit mod.widgets.SList's input policy; found: {offenders:?}"
+    );
+}
