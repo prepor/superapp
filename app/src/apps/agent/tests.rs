@@ -1512,6 +1512,39 @@ fn the_account_is_read_off_cloudflares_answer_when_there_is_no_bucket() {
     );
 }
 
+/// The real gateway, once, against the real account: the token out of this
+/// machine's keychain, the account asked of Cloudflare, one streamed answer
+/// through the gateway. Ignored, because it opens a socket and costs a
+/// fraction of a cent; run it by hand with `-- --ignored` after
+/// `superapp --r2-login`.
+#[test]
+#[ignore]
+fn the_real_gateway_answers_a_real_request() {
+    use kernel::caps::SecretsFactory;
+    let env = kernel::app::Env {
+        scripted: false,
+        secrets_backend: Some(SecretsFactory::new(|| {
+            Box::new(crate::platform::secret::Keychain::new(None))
+        })),
+        ..kernel::app::Env::default()
+    };
+    let mut gateway = super::real::RealGateway::new(&env);
+    let req = ChatRequest::new(MODEL, vec![Message::user("Say hi in three words.")]);
+    let mut chunks = 0;
+    let answer = gateway
+        .complete(&req, &mut |_| {
+            chunks += 1;
+            Flow::Go
+        })
+        .expect("the gateway answers");
+    assert!(chunks > 1, "a stream, not one blob");
+    assert!(
+        !answer.message.text().is_empty() || answer.message.reasoning_content.is_some(),
+        "{answer:?}"
+    );
+    assert!(answer.usage.is_some(), "usage rides the last chunk");
+}
+
 #[test]
 fn an_answer_that_ran_out_of_room_wears_continue_and_asking_is_a_turn() {
     let mut s = session();
