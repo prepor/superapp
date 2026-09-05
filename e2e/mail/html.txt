@@ -31,6 +31,16 @@ wait 400
 drag "link" 30 0
 wait 400
 
+# A letter is read, and reading is where one reaches for a word without
+# sweeping it: two presses take the word under them, three the paragraph.
+# The wash in the picture is what says the reading answered them.
+dblclick "mail html"
+wait 500
+shot h3-html-word
+tripleclick "mail html"
+wait 500
+shot h4-html-paragraph
+
 # A plain-text sender takes the plain path, in the same panel slot. This is
 # the step that matters: one reading must replace the other, not stack on top
 # of it. Hiding a widget that carries no `visible` is a silent no-op, and the
@@ -38,14 +48,14 @@ wait 400
 # been given text.
 click "Q3 infra"
 wait 900
-shot h3-plain-body
+shot h5-plain-body
 click "mail body"
 wait 400
 
 # And back again.
 click "CI failed"
 wait 900
-shot h4-back-to-html
+shot h6-back-to-html
 click "mail html"
 wait 400
 
@@ -56,7 +66,7 @@ click "filter"
 wait 400
 type "@html"
 wait 700
-shot h5-html-filter
+shot h7-html-filter
 
 # Max's row is the other one, and his letter is HTML too — a composer's,
 # which is where the reading matters most.
@@ -64,5 +74,5 @@ click "superapp panel model"
 wait 900
 click "mail html"
 wait 400
-shot h6-html-rows
+shot h8-html-rows
 quit

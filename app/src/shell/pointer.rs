@@ -108,9 +108,30 @@ impl Stage {
     /// — the outer one has the shell borrowed out of `self` already, and a
     /// re-entrant call would find nothing there.
     pub(super) fn synth_click(&mut self, cx: &mut Cx, sh: &mut Shell, p: DVec2, cmd: bool) {
-        for ev in press_release(p, cmd) {
-            self.handle_with(cx, sh, &ev);
-            self.settle(cx, sh);
+        self.synth_clicks(cx, sh, p, cmd, 1);
+    }
+
+    /// `n` presses at one point, stamped close enough together to read as
+    /// one gesture: a double click, a triple one. See [`pointer_before`] for
+    /// what makes a synthesized press behave like a real one.
+    pub(super) fn synth_clicks(
+        &mut self,
+        cx: &mut Cx,
+        sh: &mut Shell,
+        p: DVec2,
+        cmd: bool,
+        n: u32,
+    ) {
+        if n > 1 {
+            hand_the_pointer_back(cx);
+        }
+        let t = next_gesture_time();
+        for i in 0..n.max(1) {
+            for ev in press_release_at(p, cmd, t + f64::from(i) * CLICK_GAP) {
+                pointer_before(cx, &ev);
+                self.handle_with(cx, sh, &ev);
+                self.settle(cx, sh);
+            }
         }
     }
 
@@ -125,6 +146,7 @@ impl Stage {
             handled: std::cell::Cell::new(Area::Empty),
             time: t,
         });
+        cx.fingers.process_tap_count(from, t);
         self.forward_to_hosted(cx, sh, &down);
         for i in 1..=8 {
             let f = f64::from(i) / 8.0;
@@ -164,6 +186,37 @@ fn next_gesture_time() -> f64 {
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64
 }
 
+/// The press bookkeeping the platform's own event loop does and a
+/// synthesized press skips: how many presses deep this one is. Without it
+/// every press a script makes is a first click, and no widget it drives is
+/// ever handed a double one.
+pub(super) fn pointer_before(cx: &mut Cx, ev: &Event) {
+    if let Event::MouseDown(e) = ev {
+        cx.fingers.process_tap_count(e.abs, e.time);
+    }
+}
+
+/// The other half of that loop, which a scripted run also skips: the pointer
+/// handed back on a release. A widget a script pressed keeps the capture and
+/// is dealt every later press wherever it lands — which is invisible while a
+/// press only moves a caret, and is a whole word washed in a letter nobody
+/// clicked once a press selects. A gesture that means to select hands the
+/// pointer back before it starts.
+///
+/// Only there. Handing it back after every scripted release would be truer
+/// to the platform, but it is not what the suites were written against: a
+/// press whose fresh hit test fails still reaches the widget holding the
+/// capture, and steps in `shell-table` lean on that.
+fn hand_the_pointer_back(cx: &mut Cx) {
+    cx.fingers.mouse_down(MouseButton::PRIMARY, CxWindowPool::id_zero());
+    cx.fingers.mouse_up(MouseButton::PRIMARY);
+}
+
+/// The gap between the presses of one multi-click gesture, seconds. Well
+/// under the platform's own multi-press window, and nothing waits it out:
+/// the clock here is a counter.
+const CLICK_GAP: f64 = 0.05;
+
 /// One press and its release at a point: what a scripted `click`
 /// synthesizes, here so the panels library can send the same pair into a
 /// mount it has entered.
@@ -172,11 +225,17 @@ fn next_gesture_time() -> f64 {
 /// so two clicks in a row are two clicks and not a double one.
 #[must_use]
 pub(super) fn press_release(p: DVec2, cmd: bool) -> [Event; 2] {
+    press_release_at(p, cmd, next_gesture_time())
+}
+
+/// The same pair at a time the caller chooses, which is how the presses of
+/// one double or triple click are stamped together.
+#[must_use]
+fn press_release_at(p: DVec2, cmd: bool, t: f64) -> [Event; 2] {
     let modifiers = KeyModifiers {
         logo: cmd,
         ..Default::default()
     };
-    let t = next_gesture_time();
     [
         Event::MouseDown(MouseDownEvent {
             abs: p,

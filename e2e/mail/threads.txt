@@ -37,11 +37,21 @@ selectall "mail body"
 wait 500
 shot h3-both-readings
 
+# And the presses a reader makes on a passage rather than sweeping it: two
+# take the word under them, three the paragraph. The plain reading is a run
+# of its own, and it answers the count as the flow above it does.
+dblclick "mail body"
+wait 500
+shot h4-plain-word
+tripleclick "mail body"
+wait 500
+shot h5-plain-paragraph
+
 # The same row, open, is addressed by sender and date; pressing it folds the
 # letter back and the panel asks for fewer rows again.
 click "Andrey Rudenko · aug 29 14:02"
 wait 700
-shot h4-closed
+shot h6-closed
 
 # The newest letter came open with the panel, and the quote it was written
 # over is folded behind one line. A composer writes that quote as a
@@ -50,7 +60,7 @@ shot h4-closed
 # reading the letter arrived in.
 click "› quoted"
 wait 700
-shot h5-quote-unfolded
+shot h7-quote-unfolded
 click "mail html"
 wait 500
 
@@ -65,12 +75,12 @@ wait 400
 # goes with them, and undo brings all of it back.
 click "archive"
 wait 900
-shot h6-archived
+shot h8-archived
 key cmd+z
 wait 900
 key cmd+z
 wait 900
 click "superapp panel model"
 wait 800
-shot h7-undone
+shot h9-undone
 quit

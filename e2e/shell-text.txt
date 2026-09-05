@@ -1,0 +1,118 @@
+# args:
+# env:
+#
+# What a text field and a text run answer besides typing: the caret chords
+# macOS puts on the control key, and the presses that take a word or a line.
+#
+# What each half checks:
+#
+#   The chords are proved by the filter they leave behind. Each one is asked
+#   to put the caret somewhere only it can reach, and the letter typed after
+#   it completes a tag the rows carry — miss the place and the filter reads
+#   as free text nothing matches, the list empties, and the row clicked next
+#   does not resolve.
+#
+#   The presses are proved by the pictures: a double click washes the word
+#   under it, a triple the whole line. Both resolve a label first, so a run
+#   that stopped being a real text run fails the run before the shot does.
+
+wait 900
+
+# The inbox that boots is closed: the panels below are the workspace.
+key cmd+w
+wait 700
+
+key cmd 2
+wait 500
+type "help"
+wait 500
+key enter
+wait 900
+
+# Something for the log to hold, and a row to look for later.
+click "try it"
+wait 700
+
+key cmd 2
+wait 500
+type "effects"
+wait 500
+key enter
+wait 900
+
+# -- the caret chords --------------------------------------------------------
+
+# The filter here is free text: one substring over the rows. Each chord is
+# asked to put the caret where only it can, and the letter typed after it
+# completes the word the row carries — miss the place and the substring is
+# one no row has, the list empties, and the click below does not resolve.
+
+# `^A` to the head of the line: the `d` typed after it goes in front of
+# `emo` and the filter reads `demo`. Without the chord it reads `emod`.
+click "filter"
+wait 300
+key cmd+a
+type "emo"
+wait 400
+key ctrl+a
+type "d"
+wait 500
+key esc
+wait 700
+shot t1-head
+click "copy the demo line"
+wait 700
+
+# `^E` back to the end. The caret is parked away from it first — `cmd+a`
+# takes the line and a plain `left` collapses to its head — so only `^E`
+# can put the last letter where the word needs it: `demo`, not `odem`.
+click "filter"
+wait 300
+key cmd+a
+type "dem"
+wait 400
+key cmd+a
+key left
+key ctrl+e
+type "o"
+wait 500
+key esc
+wait 700
+shot t2-end
+click "copy the demo line"
+wait 700
+
+# `^K` takes the rest of the line with it. The filter is a word no row
+# carries, so the list is empty until the chord — reached from the head, so
+# it takes the whole line — clears it.
+click "filter"
+wait 300
+key cmd+a
+type "zzz-nothing-carries-this"
+wait 600
+key ctrl+a
+key ctrl+k
+wait 600
+key esc
+wait 700
+shot t3-cleared
+click "copy the demo line"
+wait 900
+
+# -- the presses that select --------------------------------------------------
+
+# The job panel under the row: everything below the subject is a selectable
+# run, and a press on one is what a person makes to copy a word out of it.
+dblclick "job facts"
+wait 600
+shot t4-word
+
+tripleclick "job facts"
+wait 600
+shot t5-line
+
+# The panel is alive afterwards: the log beside it still answers.
+click "copy the demo line"
+wait 700
+shot t6-alive
+quit
