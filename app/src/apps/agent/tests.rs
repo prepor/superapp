@@ -684,7 +684,7 @@ fn what_a_model_wrote_is_checked_before_a_tool_runs_it() {
 
 use std::any::Any as StdAny;
 
-use kernel::app::{Apps, ProblemSource, Root};
+use kernel::app::{Apps, ProblemSource, Root, Worker};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, PanelKind, VerbAct};
@@ -2182,4 +2182,505 @@ fn answered_calls(s: &Session, chat: ChatId) -> Vec<String> {
         .filter(|t| t.message.role == Role::Tool)
         .map(|t| t.message.tool_call_id.clone().unwrap_or_default())
         .collect()
+}
+
+// -- the worker's set, its writes, and the ids it names them by -----------------
+
+/// The name a run's pass answers to.
+fn worker_name(run: model::RunId) -> String {
+    format!("agent-run-{run}")
+}
+
+/// A round put where a worker would find it mid-stream. A scripted fake
+/// answers whole, so this is the only honest way to stand one up.
+fn streaming_run(s: &mut Session, chat: ChatId) -> model::RunId {
+    let run = s
+        .act(Action::writing("test", "a round in flight", move |tx| {
+            let run = model::new_run_tx(tx, chat, 0.0)?;
+            model::set_run_status_tx(tx, run, model::STREAMING, None, 0.0)?;
+            Ok(run)
+        }))
+        .expect("the row");
+    s.settle();
+    run
+}
+
+#[test]
+fn an_action_during_a_round_leaves_the_streaming_run_its_worker() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    let run = streaming_run(&mut s, chat);
+    assert!(
+        s.workers().names().contains(&worker_name(run)),
+        "a run being answered is a run that wants its pass: {:?}",
+        s.workers().names()
+    );
+
+    // Anything at all, anywhere: every action re-asks the apps for the set,
+    // and a name that is not in the answer retires — taking with it the
+    // channel the round is woken through when its calls come back.
+    s.act(Action::writing("test", "something else entirely", |tx| {
+        tx.execute("UPDATE agent_chat SET updated = updated + 1", [])
+            .map(|_| ())
+    }));
+    s.settle();
+    assert!(
+        s.workers().names().contains(&worker_name(run)),
+        "and it keeps it: {:?}",
+        s.workers().names()
+    );
+}
+
+#[test]
+fn a_result_written_with_no_pass_live_still_carries_the_round_on() {
+    let mut s = session();
+    plant(
+        &s,
+        vec![Reply::always(Answer::Call {
+            name: "files.list".into(),
+            arguments: json!({"dir": "~"}),
+            then: "That is what is there.".into(),
+        })],
+    );
+    let chat = send_new(&mut s, "what is in my home directory");
+    let run = model::latest_run(s.store(), chat).expect("the round").id;
+    assert_eq!(
+        model::run(s.store(), run).expect("the round").status,
+        model::WAITING
+    );
+
+    // The pass, retired: a store write is not an action, so the status goes
+    // and comes back with nobody re-asking for the set — which is the state
+    // a diff during a stream used to leave.
+    s.store()
+        .write(move |c| model::set_run_status_tx(c, run, model::DONE, None, 0.0))
+        .expect("a word that wants no pass");
+    s.workers().kick_all();
+    s.store()
+        .write(move |c| model::set_run_status_tx(c, run, model::WAITING, None, 0.0))
+        .expect("and the round back where it was");
+    assert!(
+        !s.workers().names().contains(&worker_name(run)),
+        "nobody is listening on the round's address: {:?}",
+        s.workers().names()
+    );
+
+    assert_eq!(calls::run_pending_calls(&mut s, chat), 1, "the call ran");
+    s.settle();
+    assert_eq!(
+        transcript(&s, chat).last().cloned(),
+        Some((Role::Assistant, "That is what is there.".to_string())),
+        "and the round went on, because a written result asks for the set \
+         again rather than knocking at an address nobody answers"
+    );
+}
+
+/// A gateway that lets an undo land in the middle of the stream: the run's
+/// rows go the way a send's reversal takes them, and the chunk after that
+/// finds the run missing — which is what a stop reads as, and what routes
+/// the answer to the stopped tail.
+struct UndoMidStream {
+    db: std::sync::Arc<kernel::store::Db>,
+    run: model::RunId,
+    /// Whether the chat goes too, as a *delete* would take it.
+    chat: Option<ChatId>,
+}
+
+impl Gateway for UndoMidStream {
+    fn complete(
+        &mut self,
+        _req: &ChatRequest,
+        on: &mut dyn FnMut(&Chunk) -> Flow,
+    ) -> Result<Completion, Failure> {
+        let store = kernel::store::Store::with_db(self.db.clone()).expect("a second handle");
+        let (run, chat) = (self.run, self.chat);
+        store
+            .write(move |c| {
+                c.execute("DELETE FROM agent_turn WHERE run = ?1", [run])?;
+                c.execute("DELETE FROM agent_run WHERE id = ?1", [run])?;
+                if let Some(chat) = chat {
+                    c.execute("DELETE FROM agent_turn WHERE chat = ?1", [chat])?;
+                    c.execute("DELETE FROM agent_chat WHERE id = ?1", [chat])?;
+                }
+                Ok(())
+            })
+            .expect("the undo lands");
+        stream_completion(events(fixtures::TEXT).into_iter(), on)
+    }
+}
+
+#[test]
+fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
+    for take_the_chat in [false, true] {
+        let mut s = session();
+        // A chat and a round to answer, written straight to the store: an
+        // action would kick the inline passes into running it here.
+        let (chat, run) = s
+            .store()
+            .write(|c| {
+                let chat = model::new_chat_tx(c, "hello", MODEL, 0.0)?;
+                let run = model::new_run_tx(c, chat, 0.0)?;
+                let said = Turn::new(Message::user("hello")).by(run);
+                model::add_turn_tx(c, chat, &said, 0.0)?;
+                Ok((chat, run))
+            })
+            .expect("the rows a send would have written");
+
+        let db = s.store().db();
+        let chat_too = take_the_chat.then_some(chat);
+        s.world().caps(|c| {
+            c.insert::<dyn Gateway>(Box::new(UndoMidStream {
+                db,
+                run,
+                chat: chat_too,
+            }));
+        });
+
+        // The pass, by hand: it asks, and what comes back is an answer for a
+        // round the person has taken away from under it.
+        worker::RunWorker::new(run, chat).pass(s.world());
+        s.settle();
+
+        assert!(
+            model::run(s.store(), run).is_none(),
+            "the undo took the run"
+        );
+        assert_eq!(
+            transcript(&s, chat),
+            vec![],
+            "and the stopped tail was written nowhere"
+        );
+        assert_eq!(
+            s.store()
+                .conn()
+                .query_row("SELECT COUNT(*) FROM agent_turn", [], |r| r
+                    .get::<_, i64>(0))
+                .expect("count the turns"),
+            0,
+            "nor anywhere else"
+        );
+    }
+}
+
+#[test]
+fn a_run_id_is_never_handed_out_twice() {
+    let mut s = session();
+    let (chat, first) =
+        model::send(&mut s, None, "hello", Carried::default()).expect("the send landed");
+    s.settle();
+
+    assert!(s.undo(), "the send goes back");
+    assert!(
+        model::runs(s.store(), chat).is_empty(),
+        "and the run goes with it"
+    );
+
+    assert!(s.redo(), "and comes again");
+    let second = model::latest_run(s.store(), chat).expect("the run the redo filed");
+    assert_ne!(
+        second.id, first,
+        "under an id of its own: a worker still inside the gateway must never \
+         find the round that replaced the one it started"
+    );
+}
+
+#[test]
+fn the_new_rung_carries_the_runs_across_a_store_already_climbed() {
+    // A store as one that has been chatting for a week is: the tables of
+    // the first rung, rows in them, and the counter standing at the sweep.
+    let c = rusqlite::Connection::open_in_memory().expect("a store of its own");
+    c.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY);
+         CREATE TABLE agent_run(
+           id      INTEGER PRIMARY KEY,
+           chat    INTEGER NOT NULL,
+           status  TEXT NOT NULL,
+           error   TEXT,
+           started REAL NOT NULL,
+           ended   REAL,
+           usage   TEXT
+         );
+         CREATE INDEX idx_agent_run_chat ON agent_run(chat, id);
+         INSERT INTO agent_run(id, chat, status, error, started, ended, usage) VALUES
+           (4, 2, 'done', NULL, 1.0, 2.0, '{\"in\":9,\"out\":3,\"cached\":0}'),
+           (9, 2, 'streaming', NULL, 3.0, NULL, NULL);
+         INSERT INTO meta(key, value) VALUES('schema:agent', 2);",
+    )
+    .expect("a store at the rung before this one");
+
+    schema::SCHEMA
+        .apply(&c)
+        .expect("the ladder climbs the rest of the way");
+
+    assert_eq!(
+        c.query_row(
+            "SELECT value FROM meta WHERE key = 'schema:agent'",
+            [],
+            |r| { r.get::<_, i64>(0) }
+        )
+        .expect("the counter"),
+        3,
+        "one rung further along"
+    );
+    let rows: Vec<(i64, i64, String, Option<String>)> = c
+        .prepare("SELECT id, chat, status, usage FROM agent_run ORDER BY id")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .map(|it| it.filter_map(Result::ok).collect())
+        })
+        .expect("read the rebuilt table");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                4,
+                2,
+                "done".to_string(),
+                Some("{\"in\":9,\"out\":3,\"cached\":0}".to_string())
+            ),
+            // The sweep runs in its own place, before this rung, and what
+            // it wrote is carried across with everything else.
+            (9, 2, "failed".to_string(), None),
+        ],
+        "every row across, under its own id"
+    );
+    let sql: String = c
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'agent_run'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the table's own SQL");
+    assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+    assert!(
+        c.query_row(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idx_agent_run_chat'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .is_ok(),
+        "and its index with it"
+    );
+
+    // The counter follows the highest id carried across, so the next run
+    // follows the last — and the id of one that goes never comes back.
+    c.execute("DELETE FROM agent_run WHERE id = 9", [])
+        .expect("the newest run, undone");
+    c.execute(
+        "INSERT INTO agent_run(chat, status, started) VALUES(2, 'pending', 4.0)",
+        [],
+    )
+    .expect("and one filed in its place");
+    assert_eq!(
+        c.query_row("SELECT MAX(id) FROM agent_run", [], |r| r.get::<_, i64>(0))
+            .expect("the new run"),
+        10
+    );
+
+    // …and a second open changes nothing.
+    schema::SCHEMA.apply(&c).expect("the next open");
+    assert_eq!(
+        c.query_row("SELECT COUNT(*) FROM agent_run", [], |r| r.get::<_, i64>(0))
+            .expect("count"),
+        2
+    );
+}
+
+// -- what a request must never carry -------------------------------------------
+
+#[test]
+fn a_round_the_stop_caught_is_settled_before_the_next_request() {
+    let mut s = session();
+    plant(
+        &s,
+        vec![Reply::always(Answer::Call {
+            // A tool that asks: its call stands at its card, which is where
+            // a stop finds it.
+            name: "files.trash".into(),
+            arguments: json!({"path": "~/Downloads/README.txt"}),
+            then: "Deleted it.".into(),
+        })],
+    );
+    let chat = send_new(&mut s, "delete the readme");
+    assert_eq!(calls::run_pending_calls(&mut s, chat), 1, "the call moved");
+    let asked = asked_call(&s, chat).expect("standing at its card");
+    let run = model::latest_run(s.store(), chat).expect("the round").id;
+
+    model::stop(&mut s, run);
+    s.settle();
+    model::retry(&mut s, chat).expect("another round");
+    s.settle();
+
+    let call = model::calls(s.store(), run)
+        .first()
+        .cloned()
+        .expect("the call the stop caught");
+    assert_eq!(
+        call.status,
+        model::CALL_CANCELLED,
+        "nobody ran it and nobody refused it"
+    );
+
+    let req = fake(&s)
+        .requests()
+        .last()
+        .cloned()
+        .expect("the retry asked");
+    let at = req
+        .messages
+        .iter()
+        .position(|m| !m.tool_calls.is_empty())
+        .expect("the turn that asked for tools");
+    let owed: Vec<&str> = req.messages[at]
+        .tool_calls
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let answered: Vec<&str> = req.messages[at + 1..]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    assert_eq!(
+        answered, owed,
+        "one tool message per call, in the order the model asked"
+    );
+    assert_eq!(
+        req.messages[at + 1].text(),
+        model::CANCELLED_SAID,
+        "and it says what became of it"
+    );
+    assert_eq!(
+        asked.tool_call_id, owed[0],
+        "the very call that was standing at the card"
+    );
+}
+
+// -- what a stop and a retry undo to -------------------------------------------
+
+/// One node's state, by the label it wears.
+fn node_state(s: &Session, label: &str) -> Option<String> {
+    let (nodes, _) = s.history().rows();
+    nodes
+        .into_iter()
+        .find(|n| n.label == label)
+        .map(|n| n.state)
+}
+
+#[test]
+fn undoing_a_stop_says_a_stopped_round_cannot_be_resumed() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    let run = streaming_run(&mut s, chat);
+    model::stop(&mut s, run);
+    s.settle();
+    assert_eq!(
+        model::run(s.store(), run).expect("the run").status,
+        model::STOPPED
+    );
+
+    assert!(s.undo(), "the walk goes somewhere");
+    assert_eq!(
+        model::run(s.store(), run).map(|r| r.status),
+        Some(model::STOPPED.to_string()),
+        "and not to a round that is going again: there is no asking the \
+         gateway for the rest of an answer it already sent"
+    );
+    assert_eq!(
+        node_state(&s, "stop the agent").as_deref(),
+        Some("expired"),
+        "so the node says so and the walk goes past it"
+    );
+    assert!(
+        !s.notes().iter().any(|n| n.msg.contains("stop the agent")),
+        "and nothing claims to have undone it: {:?}",
+        s.notes()
+    );
+}
+
+#[test]
+fn undoing_a_retry_takes_back_the_run_and_everything_it_said() {
+    let mut s = session();
+    plant(
+        &s,
+        vec![
+            Reply::when("fail", Answer::Fail("the gateway is down".into())),
+            Reply::always(Answer::Text("Better luck this time.".into())),
+        ],
+    );
+    let chat = send_new(&mut s, "fail me");
+    assert_eq!(
+        model::latest_run(s.store(), chat)
+            .expect("the round")
+            .status,
+        model::FAILED
+    );
+    let before = transcript(&s, chat);
+
+    let again = model::retry(&mut s, chat).expect("another round");
+    s.settle();
+    assert_eq!(
+        transcript(&s, chat).last().cloned(),
+        Some((Role::Assistant, "Better luck this time.".to_string()))
+    );
+
+    assert!(s.undo(), "the retry goes back");
+    assert_eq!(transcript(&s, chat), before, "with the turns it wrote");
+    assert!(
+        model::run(s.store(), again).is_none(),
+        "and the run it filed"
+    );
+
+    assert!(s.redo(), "and comes again");
+    let third = model::latest_run(s.store(), chat).expect("a round of its own");
+    assert_ne!(third.id, again, "under an id of its own");
+    assert_ne!(
+        third.status,
+        model::FAILED,
+        "and it was asked: the walk's own kick re-asks for its pass"
+    );
+}
+
+#[test]
+fn a_deleted_chats_round_in_flight_comes_back_stopped() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    let (streaming, waiting, pending) = s
+        .act(Action::writing(
+            "test",
+            "three rounds in flight",
+            move |tx| {
+                let a = model::new_run_tx(tx, chat, 0.0)?;
+                model::set_run_status_tx(tx, a, model::STREAMING, None, 0.0)?;
+                let b = model::new_run_tx(tx, chat, 0.0)?;
+                model::set_run_status_tx(tx, b, model::WAITING, None, 0.0)?;
+                let c = model::new_run_tx(tx, chat, 0.0)?;
+                Ok((a, b, c))
+            },
+        ))
+        .expect("the rows");
+    s.settle();
+
+    assert!(model::delete_chats(&mut s, &[chat]), "the chat goes");
+    s.settle();
+    assert!(model::chat(s.store(), chat).is_none());
+
+    assert!(s.undo(), "and comes back");
+    assert_eq!(
+        model::run(s.store(), streaming).map(|r| r.status),
+        Some(model::STOPPED.to_string()),
+        "nobody owns a stream whose worker retired with the row, and there \
+         is no asking for the rest of an answer already sent"
+    );
+    assert_eq!(
+        model::run(s.store(), waiting).map(|r| r.status),
+        Some(model::WAITING.to_string()),
+        "a round holding calls is still one"
+    );
+    assert_eq!(
+        model::run(s.store(), pending).map(|r| r.status),
+        Some(model::DONE.to_string()),
+        "and one nobody had asked for yet was asked: the walk's own kick \
+         re-asks for its pass"
+    );
 }

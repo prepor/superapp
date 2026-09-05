@@ -4,7 +4,11 @@
 //! Every one of them has an `INTEGER PRIMARY KEY`, because device sync
 //! records a table by its primary key and a table without one replicates
 //! nothing — a chat continued on the phone is the same chat only if its
-//! turns actually travel.
+//! turns actually travel. A run's key is `AUTOINCREMENT` as well, which is
+//! the one place in this tree where the extra row of bookkeeping is worth
+//! it: a plain `INTEGER PRIMARY KEY` hands the highest deleted id out
+//! again, and a run id is what a worker still inside the gateway compares
+//! itself against.
 //!
 //! A turn's `body` is the wire's message, stored as text: the next request
 //! is built from the rows verbatim, and `sqlite3` can still read them. The
@@ -17,13 +21,20 @@
 
 use kernel::app::{Schema, Step};
 
-/// The agent's ladder. One rung of tables, and a sweep that runs at every
-/// open — a run that was streaming when the process died has no worker
-/// coming back for it and no job in the queue, so this is the only moment
-/// anybody can say so.
+/// The agent's ladder. One rung of tables, a sweep that runs at every open
+/// — a run that was streaming when the process died has no worker coming
+/// back for it and no job in the queue, so this is the only moment anybody
+/// can say so — and the rung that put the runs on a key that never comes
+/// back.
+///
+/// **A new rung goes at the foot, after the sweep, never before it.** The
+/// sweep holds a place on the ladder like any other rung and the counter
+/// records it: a store that has climbed to 2 would skip a step inserted at
+/// 2 for ever. [`Step::Always`] says as much — *a step added after it is
+/// still a step this store has not climbed*.
 pub static SCHEMA: Schema = Schema {
     app: "agent",
-    steps: &[Step::Sql(V1), Step::Always(sweep)],
+    steps: &[Step::Sql(V1), Step::Always(sweep), Step::Sql(V2)],
 };
 
 const V1: &str = "
@@ -101,6 +112,42 @@ CREATE TABLE agent_call(
   ended        REAL
 );
 CREATE INDEX idx_agent_call_run ON agent_call(run, id);
+";
+
+/// The runs, rebuilt on a key that never comes back.
+///
+/// A plain `INTEGER PRIMARY KEY` is `rowid`, and SQLite hands the highest
+/// deleted one out again: undo a send while its run is streaming, redo it,
+/// and the fresh run takes the id the old one had. The worker still inside
+/// the gateway reads that row for its stop check, finds a run that is very
+/// much alive, and appends its answer and its calls to the round that
+/// replaced it. `AUTOINCREMENT` is the whole of the fix — an id this store
+/// has once handed out is never handed out again.
+///
+/// The table is rebuilt rather than altered, because a key's kind is not
+/// something `ALTER TABLE` changes. Every row is carried across under its
+/// own id, and the insert leaves `sqlite_sequence` standing at the highest
+/// of them, so the next run follows the last. `sqlite_sequence` itself is
+/// SQLite's own: replication skips every `sqlite_*` name, so no device ever
+/// receives another's counter.
+const V2: &str = "
+CREATE TABLE agent_run_next(
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat    INTEGER NOT NULL,
+  -- pending · streaming · waiting · done · failed · stopped
+  status  TEXT NOT NULL,
+  -- The gateway's sentence, on a run that failed.
+  error   TEXT,
+  started REAL NOT NULL,
+  ended   REAL,
+  -- What the turn cost, as JSON: {in, out, cached}.
+  usage   TEXT
+);
+INSERT INTO agent_run_next(id, chat, status, error, started, ended, usage)
+  SELECT id, chat, status, error, started, ended, usage FROM agent_run;
+DROP TABLE agent_run;
+ALTER TABLE agent_run_next RENAME TO agent_run;
+CREATE INDEX idx_agent_run_chat ON agent_run(chat, id);
 ";
 
 /// What a crash left behind, put right.

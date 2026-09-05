@@ -379,6 +379,12 @@ fn batch(input: &Value) -> Result<(Vec<String>, Vec<SqlValue>), String> {
 /// The shape of a table is refused outright, whosever it is: a table's name
 /// and columns belong to the app's schema ladder, which is a commit and a
 /// migration, not a call.
+///
+/// So is **transaction control**. A call is one transaction, and
+/// [`Session::act`] owns it: a `COMMIT` in the middle of a batch ends the
+/// writer's transaction under it, so the statements before it stay written
+/// while the node, the changeset and replication's capture record none of
+/// them — a write nothing can take back.
 struct Guard {
     /// Every ordinary table `main` had, and whether it has a primary key.
     tables: Arc<HashMap<String, bool>>,
@@ -409,6 +415,16 @@ impl Guard {
                     "“{table_name}” is not a tool's to make, alter or drop: \
                      a table's name and shape are its app's schema ladder's"
                 ))
+            }
+            // The one refusal that is about no table at all: a `COMMIT`
+            // halfway through a batch would leave what came before it
+            // written and outside every record of the write.
+            AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                return Some(
+                    "a call is one transaction, and the session owns it — nothing inside it \
+                     may begin, commit, roll back or save a point"
+                        .to_string(),
+                )
             }
             _ => return None,
         };

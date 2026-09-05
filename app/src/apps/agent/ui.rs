@@ -297,7 +297,7 @@ script_mod! {
             color: #141414ff
         }
 
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
@@ -420,7 +420,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true

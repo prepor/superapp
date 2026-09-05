@@ -74,10 +74,17 @@ pub const CALL_FAILED: &str = "failed";
 /// A call the person would not have. It never ran, and what the model reads
 /// back is [`REFUSED_SAID`].
 pub const CALL_REFUSED: &str = "refused";
+/// A call the round was stopped out from under. Nobody refused it and
+/// nobody ran it; the next request settles it so the transcript it carries
+/// is one the wire will take, and what the model reads back is
+/// [`CANCELLED_SAID`].
+pub const CALL_CANCELLED: &str = "cancelled";
 
 /// What a refused call answers the model with — the whole of the sentence,
 /// because nothing was done and there is nothing else to say about it.
 pub const REFUSED_SAID: &str = "refused by the person";
+/// The same for a call the stop caught before anybody had a word about it.
+pub const CANCELLED_SAID: &str = "cancelled: the round was stopped";
 
 /// What a chat is called before the person has said anything in it.
 pub const UNTITLED: &str = "chat";
@@ -297,10 +304,11 @@ impl Call {
     /// was refused rather than that nothing happened.
     #[must_use]
     pub fn said(&self) -> String {
-        if self.status == CALL_REFUSED {
-            return REFUSED_SAID.to_string();
+        match self.status.as_str() {
+            CALL_REFUSED => REFUSED_SAID.to_string(),
+            CALL_CANCELLED => CANCELLED_SAID.to_string(),
+            _ => self.output.clone().unwrap_or_default(),
         }
-        self.output.clone().unwrap_or_default()
     }
 }
 
@@ -388,8 +396,10 @@ static Q_RUN_CALLS: Q = Q {
 
 static Q_LIVE_RUNS: Q = Q {
     id: "live runs",
-    sql: "SELECT id, chat FROM agent_run WHERE status IN ('pending', 'waiting') ORDER BY id",
-    describe: "the runs that want a worker: one not asked for yet, one holding calls",
+    sql: "SELECT id, chat FROM agent_run
+          WHERE status IN ('pending', 'streaming', 'waiting') ORDER BY id",
+    describe: "the runs that want a worker: one not asked for yet, one being answered, \
+               one holding calls",
 };
 
 static Q_CHAT_MODELS: Q = Q {
@@ -549,7 +559,13 @@ pub fn asked_calls(store: &Store, run: RunId) -> Vec<Call> {
 }
 
 /// The runs that want a worker, each with its chat: one that has not been
-/// asked for yet, and one holding calls the chat panel will run.
+/// asked for yet, one whose answer is arriving, and one holding calls the
+/// chat panel will run — [`LIVE`], in one query.
+///
+/// A `streaming` run is in the list because the set is diffed after **every**
+/// action: any write at all while the gateway streams would otherwise retire
+/// the very worker that is reading it, closing the kick channel it needs to
+/// be woken by when its calls come back.
 #[must_use]
 pub fn runs_wanting_workers(store: &Store) -> Rc<Vec<(RunId, ChatId)>> {
     store.rows(&Q_LIVE_RUNS, &[], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -626,6 +642,30 @@ pub fn is_stopped(c: &Connection, run: RunId) -> bool {
         Ok(status) => status == STOPPED,
         Err(_) => true,
     }
+}
+
+/// Whether the run a worker started for is still there, still this chat's,
+/// and its chat still there too — asked **inside** the worker's own write,
+/// which is the only place the answer cannot go stale between the asking
+/// and the writing.
+///
+/// A worker is inside the gateway for as long as an answer takes, and an
+/// undo or a *delete* on the UI thread can take its rows away while it is.
+/// Without this the answer lands anyway: an assistant turn for a run that no
+/// longer exists, in a chat that may not either. The id is enough to say so
+/// because a run id is `AUTOINCREMENT` and never comes back.
+///
+/// # Errors
+///
+/// If the read fails.
+pub fn run_alive_tx(c: &Connection, run: RunId, chat: ChatId) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_run r JOIN agent_chat c ON c.id = r.chat
+                        WHERE r.id = ?1 AND r.chat = ?2)",
+        rusqlite::params![run, chat],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n == 1)
 }
 
 // -- the writes ----------------------------------------------------------------
@@ -794,6 +834,79 @@ pub fn set_call_tx(
     Ok(())
 }
 
+/// The round the last request left open, closed off — one `tool` turn per
+/// call the newest assistant turn asked for, in the order it asked.
+///
+/// A stop lands between the calls being written and their results being
+/// written, and there is nothing to pick the round back up: the assistant
+/// turn with its `tool_calls` stays, and the `tool` turns that answer them
+/// never come. The next request would then carry a `tool_calls` message with
+/// no `tool` messages after it, which is invalid on the wire — and the
+/// results of the calls that *did* run would be lost from the model's
+/// context, so it would ask for them again.
+///
+/// So every request a person starts settles first. A call that ran answers
+/// with what it came to; a call that never got a word — `pending` or
+/// `asked` at the card — is [cancelled](CALL_CANCELLED), row and message
+/// both, because a person's stop is a fact the model should read rather than
+/// a silence it has to guess at.
+///
+/// Nothing to settle is the ordinary case and costs one walk of the turns.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn settle_round_tx(c: &Connection, chat: ChatId, now: f64) -> rusqlite::Result<()> {
+    let turns = turns_conn(c, chat);
+    let Some(at) = turns
+        .iter()
+        .rposition(|t| t.message.role == Role::Assistant && !t.message.tool_calls.is_empty())
+    else {
+        return Ok(());
+    };
+    let asked = &turns[at].message.tool_calls;
+    let answered: Vec<&str> = turns[at + 1..]
+        .iter()
+        .filter_map(|t| t.message.tool_call_id.as_deref())
+        .collect();
+    let run = turns[at].run;
+    for call in asked {
+        if answered.contains(&call.id.as_str()) {
+            continue;
+        }
+        // The row is where the outcome is: what a call that ran came to,
+        // and — for one nobody answered — the word for that, written now so
+        // the card and the message say the same thing. By the turn as well
+        // as the id, because a `tool_call_id` is the provider's own and two
+        // chats are handed the same one soon enough.
+        let row: Option<Call> = c
+            .query_row(
+                "SELECT id, run, turn, tool_call_id, tool, input, status, output, label,
+                        created, ended
+                 FROM agent_call WHERE turn = ?1 AND tool_call_id = ?2",
+                rusqlite::params![turns[at].id, call.id],
+                call_row,
+            )
+            .ok();
+        let said = match &row {
+            Some(r) if matches!(r.status.as_str(), CALL_PENDING | CALL_ASKED) => {
+                set_call_tx(c, r.id, CALL_CANCELLED, "", None, now)?;
+                CANCELLED_SAID.to_string()
+            }
+            Some(r) => r.said(),
+            // No row at all: the model asked and nothing was ever filed for
+            // it. The cancellation is still the truth of it.
+            None => CANCELLED_SAID.to_string(),
+        };
+        let mut turn = Turn::new(Message::tool(&call.id, said));
+        if let Some(run) = run {
+            turn = turn.by(run);
+        }
+        add_turn_tx(c, chat, &turn, now)?;
+    }
+    Ok(())
+}
+
 /// Everything of this chat from `seq` on: the later turns, and the runs and
 /// calls that came with them.
 ///
@@ -848,6 +961,10 @@ pub fn send(
             Some(id) => id,
             None => new_chat_tx(tx, &title, &model, now)?,
         };
+        // Whatever the last round left open is closed before this one
+        // starts: a request must not carry a `tool_calls` message with no
+        // answers behind it.
+        settle_round_tx(tx, chat, now)?;
         // The run before the turn, so the person's message records which
         // round it started — which is what the transcript groups by.
         let run = new_run_tx(tx, chat, now)?;
@@ -871,13 +988,17 @@ pub fn send(
 
 /// *stop*: the run's status, which the worker reads between chunks and the
 /// stream answers at its next one.
+///
+/// It claims [`Stopped`], which refuses: a stop is a node the history shows
+/// and undo walks past, because there is no request left to un-stop.
 pub fn stop(s: &mut Session, run: RunId) {
     let now = s.now();
     s.act(
         Action::writing("agent.stop", "stop the agent", move |tx| {
             set_run_status_tx(tx, run, STOPPED, None, now)
         })
-        .about(run_entity(run)),
+        .about(run_entity(run))
+        .claiming(vec![Box::new(Stopped { run }) as Box<dyn Intent>]),
     );
 }
 
@@ -892,12 +1013,20 @@ pub fn retry(s: &mut Session, chat: ChatId) -> Option<RunId> {
         return None;
     }
     let now = s.now();
-    s.act(
+    let run = s.act(
         Action::writing("agent.retry", "ask again", move |tx| {
+            // As a send does, and for the same reason: the round the stop
+            // or the failure left open is closed before this one is filed.
+            settle_round_tx(tx, chat, now)?;
             new_run_tx(tx, chat, now)
         })
         .about(chat_entity(chat)),
-    )
+    )?;
+    s.claim(Box::new(Retried {
+        chat,
+        run: Cell::new(run),
+    }));
+    Some(run)
 }
 
 /// *delete n*: the chats with their turns, their runs and their calls, one
@@ -1020,6 +1149,101 @@ impl Intent for Sent {
     }
 }
 
+/// A *stop*, which refuses to be given back.
+///
+/// The request is gone: the stream was cut, the gateway has been paid, and
+/// there is no way to ask for the rest of an answer it already sent. So the
+/// node is honest about it rather than silent — it claims something whose
+/// [`blocked`](Intent::blocked) always answers, the way mail's `Sent`
+/// refuses once the letter has left. `cmd+z` walks past it to the send
+/// underneath and says what it really undid; the history still shows that
+/// the round was stopped, which is worth reading.
+///
+/// The alternative was no node at all. This is the better one: a person who
+/// pressed *stop* did something, and an action that leaves no trace in the
+/// tree is the tree lying by omission.
+struct Stopped {
+    run: RunId,
+}
+
+impl Intent for Stopped {
+    fn describe(&self) -> String {
+        format!("run:{} stopped", self.run)
+    }
+
+    fn blocked(&self, _w: &World) -> Option<String> {
+        Some("a stopped round cannot be resumed — retry asks again".to_string())
+    }
+
+    /// Never reached: `blocked` answers first, for every walk in either
+    /// direction, and a blocked node is expired rather than reversed.
+    fn reverse(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn reapply(&self, _w: &World) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A *retry*: the round it filed, and everything that round went on to say.
+///
+/// Mirrors [`Sent`], because it is the same act with the question left out.
+/// Undoing it is *the chat as it was before you asked again* — the run goes,
+/// and with it the turns it wrote and the calls it asked for; redo files a
+/// fresh pending run, whose id is a new one, so the cell is what the next
+/// undo takes back.
+///
+/// What [`settle_round_tx`] wrote in the same transaction stays, exactly as
+/// it does under an undone send: those turns belong to the round *before*
+/// this one and answer for it, and taking them back would leave the
+/// transcript in the shape no request may carry.
+struct Retried {
+    chat: ChatId,
+    run: Cell<RunId>,
+}
+
+impl Intent for Retried {
+    fn describe(&self) -> String {
+        format!("chat:{} asked again", self.chat)
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let run = self.run.get();
+        // Two writes, as a send's are: the stop has to be visible to a
+        // worker mid-stream on another thread, and a status set and deleted
+        // inside one transaction never was.
+        w.store()
+            .write(move |c| {
+                c.execute(
+                    "UPDATE agent_run SET status = ?2 WHERE id = ?1
+                       AND status IN ('pending', 'streaming', 'waiting')",
+                    rusqlite::params![run, STOPPED],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.to_string())?;
+        w.store()
+            .write(move |c| {
+                c.execute("DELETE FROM agent_call WHERE run = ?1", [run])?;
+                c.execute("DELETE FROM agent_turn WHERE run = ?1", [run])?;
+                c.execute("DELETE FROM agent_run WHERE id = ?1", [run])?;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let (chat, now) = (self.chat, w.now());
+        let run = w
+            .store()
+            .write(move |c| new_run_tx(c, chat, now))
+            .map_err(|e| e.to_string())?;
+        self.run.set(run);
+        Ok(())
+    }
+}
+
 /// The chats a *delete* took, whole: the rows themselves, so undo puts them
 /// back under the ids the turns and the calls still name.
 struct Kept {
@@ -1096,13 +1320,31 @@ impl Intent for Kept {
                 }
                 for r in &runs {
                     let usage = r.usage.as_ref().and_then(|u| serde_json::to_string(u).ok());
+                    // A run that was streaming when the chat went comes
+                    // back stopped. Its worker retired with the row and
+                    // there is no asking the gateway for the rest of an
+                    // answer it already sent, so *streaming* would be a
+                    // word about nobody — the chat offers *retry* instead.
+                    // `pending` and `waiting` come back as they were: the
+                    // walk's own `kick_all` asks for their workers again.
+                    // The stamp is the run's own start, the only moment
+                    // this restore can honestly name.
+                    let streaming = r.status == STREAMING;
+                    let status: &str = if streaming {
+                        STOPPED
+                    } else {
+                        r.status.as_str()
+                    };
+                    let ended = if streaming {
+                        r.ended.or(Some(r.started))
+                    } else {
+                        r.ended
+                    };
                     c.execute(
                         "INSERT OR REPLACE INTO
                            agent_run(id, chat, status, error, started, ended, usage)
                          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![
-                            r.id, r.chat, r.status, r.error, r.started, r.ended, usage
-                        ],
+                        rusqlite::params![r.id, r.chat, status, r.error, r.started, ended, usage],
                     )?;
                 }
                 for call in &calls {

@@ -35,9 +35,11 @@ const MAX_TEXT: usize = 64 * 1024;
 /// it is a question for `files.list` on a subdirectory, or for the panel.
 const MAX_ENTRIES: usize = 500;
 
-/// How big a file `files.write` will write over. What was there is held on
-/// the history node so undo can put it back, and a node is memory: past
-/// this the honest answer is that the write could not be taken back.
+/// How big a file `files.write` will write over, and how long a text it
+/// will put there. Both are held on the history node so undo can put the
+/// file back and can tell that it is still the one this wrote, and a node
+/// is memory: past this the honest answer is that the write could not be
+/// taken back.
 const MAX_REWRITE: usize = 1024 * 1024;
 
 /// The files app's tools: the two that read, then the six that write.
@@ -142,8 +144,9 @@ pub fn all() -> Vec<Tool> {
         Tool::new(
             "files.write",
             "Write text to a file, making it if it is not there and writing \
-             over it if it is. What was there is kept so cmd+z puts it back; \
-             a file over a megabyte is refused for that reason.",
+             over it if it is. What was there is kept so cmd+z puts it back, \
+             and so is what this writes; a file over a megabyte, or a text \
+             over a megabyte, is refused for that reason.",
             json!({
                 "type": "object",
                 "properties": {
@@ -353,11 +356,25 @@ fn mkdir(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// A file written whole, with what was there kept so undo can put it back.
 /// The one verb here no button makes yet: a card reads a file and does not
 /// edit one.
+///
+/// Both sides of the write are held to [`MAX_REWRITE`], and for the one
+/// reason: the node keeps what was there *and* what this put there, and
+/// [`Wrote::blocked`] compares the second against the disk by reading back
+/// at most that much. A longer text would be a claim that could never
+/// match itself — undo would refuse the file it had just written, saying it
+/// had changed since.
 fn write(s: &mut Session, input: &Value) -> Result<Value, String> {
     let path = text(input, "path")?.to_string();
     let body = text(input, "text")?.to_string();
     if is_root(&path) {
         return Err(format!("“{path}” is a root"));
+    }
+    if body.len() > MAX_REWRITE {
+        return Err(format!(
+            "“{}” is too much to write: what this would put there would have to be \
+             kept in memory for cmd+z",
+            basename(&path)
+        ));
     }
     let world = s.world().clone();
     let was = match stat_in(&world, &path) {

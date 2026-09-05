@@ -36,7 +36,11 @@ pub fn run_pending_calls(s: &mut Session, chat: ChatId) -> usize {
     }
     let moved = walk(s, run);
     if moved > 0 {
-        s.workers().kick(&model::run_entity(run));
+        // `kick_all`, not `kick`: a worker whose channel was closed while
+        // the set was diffed answers no address at all, and only re-asking
+        // the apps brings it back. The run's own worker is among the ones
+        // woken either way.
+        s.workers().kick_all();
     }
     moved
 }
@@ -52,7 +56,7 @@ pub fn allow(s: &mut Session, chat: ChatId, call: CallId) -> bool {
     // The rest of the round, up to the next question — and the kick, which
     // the worker needs whether anything else moved or not.
     run_pending_calls(s, chat);
-    s.workers().kick(&model::run_entity(call.run));
+    s.workers().kick_all();
     true
 }
 
@@ -68,7 +72,7 @@ pub fn refuse(s: &mut Session, chat: ChatId, call: CallId) -> bool {
         .store()
         .write(move |c| model::set_call_tx(c, id, model::CALL_REFUSED, "", None, now));
     run_pending_calls(s, chat);
-    s.workers().kick(&model::run_entity(call.run));
+    s.workers().kick_all();
     true
 }
 

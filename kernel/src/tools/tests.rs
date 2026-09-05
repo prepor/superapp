@@ -431,6 +431,42 @@ fn a_tables_shape_is_the_schema_ladders_and_not_a_tools() {
 }
 
 #[test]
+fn transaction_control_is_the_sessions_and_not_a_tools() {
+    let mut s = session();
+    let e = call(
+        &mut s,
+        "sql.write",
+        json!({"statements": [
+            "UPDATE note SET done = 1 WHERE id = 1",
+            "COMMIT",
+            "UPDATE note SET body = 'after' WHERE id = 2"
+        ]}),
+    )
+    .expect_err("a commit inside the session's own transaction");
+    assert!(e.contains("a call is one transaction"), "{e}");
+    assert_eq!(
+        done(&s, 1),
+        0,
+        "and the statement before it went back with it"
+    );
+    assert!(head(&s).is_none(), "a refused write leaves no node");
+}
+
+#[test]
+fn a_savepoint_is_refused_the_same_way() {
+    let mut s = session();
+    for sql in ["SAVEPOINT x", "BEGIN", "ROLLBACK", "END", "RELEASE x"] {
+        match call(&mut s, "sql.write", json!({ "sql": sql })) {
+            Ok(v) => panic!("{sql} was allowed: {v}"),
+            Err(e) => assert!(
+                e.contains("a call is one transaction"),
+                "{sql} refused for the wrong reason: {e}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn a_syntax_error_comes_back_in_sqlites_own_words() {
     let mut s = session();
     let e = call(

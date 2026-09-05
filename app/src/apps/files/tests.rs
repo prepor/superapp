@@ -2866,3 +2866,53 @@ fn the_app_offers_its_tools_by_name() {
         "missing `name`"
     );
 }
+
+/// The write's own ceiling, on the other side of it. What undo holds is
+/// *two* copies — what was there and what this put there — and the second
+/// is what tells a reversal that the file on disk is still the one it
+/// wrote. A text past the ceiling would be a claim that could never match
+/// itself, so it never becomes one.
+#[test]
+fn a_text_too_long_to_keep_for_undo_is_refused_before_it_is_written() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let was = read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file");
+    let nodes = s.history().rows().0.len();
+
+    let too_much = "x".repeat(1024 * 1024 + 1);
+    let why = call(
+        &mut s,
+        "files.write",
+        &serde_json::json!({"path": "~/notes.md", "text": too_much}),
+    )
+    .expect_err("a megabyte and one byte");
+    assert!(
+        why.contains("notes.md") && why.contains("kept in memory for cmd+z"),
+        "{why}"
+    );
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        was,
+        "and nothing was written"
+    );
+    assert_eq!(
+        s.history().rows().0.len(),
+        nodes,
+        "nor was a node filed for a write that could not be taken back"
+    );
+
+    // One byte less is a write like any other.
+    let most = "x".repeat(1024 * 1024);
+    call(
+        &mut s,
+        "files.write",
+        &serde_json::json!({"path": "~/notes.md", "text": most.clone()}),
+    )
+    .expect("a megabyte exactly");
+    assert!(s.undo(), "and it goes back");
+    assert_eq!(
+        read_in(s.world(), "~/notes.md", 64 * 1024).expect("the file"),
+        was,
+        "which is the whole of why the ceiling is there"
+    );
+}

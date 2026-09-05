@@ -73,7 +73,17 @@ for this app.
 
 All prefixed `agent_`, all with an `INTEGER PRIMARY KEY`, because device sync
 records a table by its primary key and a table without one replicates nothing:
-a chat continued on the phone is the same chat only if its turns travel.
+a chat continued on the phone is the same chat only if its turns travel. A
+run's key is `AUTOINCREMENT` as well — the ladder's third rung rebuilds the
+table to make it so, carrying every row across under its own id. A plain
+`INTEGER PRIMARY KEY` is `rowid`, and SQLite hands the highest deleted one out
+again: undo a send while its run is streaming, redo it, and the fresh run takes
+the id the old one had, so the worker still inside the gateway finds a run very
+much alive and appends its answer to the round that replaced it. `AUTOINCREMENT`
+is the whole of the fix; `sqlite_sequence` is SQLite's own and replication skips
+every `sqlite_*` name, so no device receives another's counter. A new rung goes
+at the **foot** of the ladder, after the sweep, because the sweep holds a place
+on it like any other rung and the counter records it.
 
 | Table | What a row is |
 |---|---|
@@ -84,7 +94,8 @@ a chat continued on the phone is the same chat only if its turns travel.
 
 A run's status is `pending`, `streaming`, `waiting`, `done`, `failed`, or
 `stopped`; a call's is `pending`, `asked` — waiting for the person's word —
-`done`, `failed`, or `refused`. A turn's `body` is the wire's own message,
+`done`, `failed`, `refused`, or `cancelled`, the word for one a stop caught
+before anybody had run or refused it. A turn's `body` is the wire's own message,
 stored verbatim as text, because the next request is built from the rows and
 `sqlite3` can still read them; the app's own two keys ride in
 the same object — `chips`, the context the turn carried, and `finish`, the word
@@ -96,13 +107,30 @@ never goes in the store: it is the one thing that must not replicate.
 
 ### The workers
 
-`App::workers` answers one worker per run that is `pending` or `waiting`,
-`agent-run-42`, kick address `run:42`, from one cached query — so a run starts
-the moment its row exists and retires when it ends. It claims no queued
-[job](./data-substrate.md#queued-jobs): it has none. A pending run is asked; a
-waiting one is asked again once no call of the round is `pending` or `asked` —
-a call the person refused counts as answered, because a refusal is what the
-model reads back.
+`App::workers` answers one worker per **live** run — `pending`, `streaming` or
+`waiting` — `agent-run-42`, kick address `run:42`, from one cached query, so a
+run starts the moment its row exists and retires when it ends. It claims no
+queued [job](./data-substrate.md#queued-jobs): it has none. A pending run is
+asked; a waiting one is asked again once no call of the round is `pending` or
+`asked` — a call the person refused counts as answered, because a refusal is
+what the model reads back.
+
+`streaming` is in that list because the set is diffed after **every** action:
+any write at all while the gateway streams would otherwise retire the very
+worker reading it, closing the kick channel the round is woken through when its
+calls come back. A run keeps its worker for as long as it is going. A *second*
+worker that finds a run already `streaming` re-sends nothing and waits on a
+kick — the pass that is asking has not returned yet, a request costs money, and
+the only honest word about a stream nobody is holding is the sweep's at the next
+open. For the same reason a written call result asks for the whole set again
+rather than knocking at one address: a worker that is missing has to be asked
+for, not woken.
+
+Every write a worker makes checks, inside its own transaction, that the run it
+is writing for is still there and still its chat's. A worker is inside the
+gateway for as long as an answer takes, and an undo or a *delete* on the UI
+thread can take its rows away while it is; without the check the answer lands
+anyway, as a turn for a run that no longer exists in a chat that may not either.
 
 A device that may not write runs **none of them**. A run row replicates like
 any other, so the follower would otherwise start a second worker for a round
@@ -119,14 +147,42 @@ resumable.
 
 ### Undo
 
-*send*, *stop*, *retry* and *delete* are each one undoable action. Undoing a
-send is *the chat as it was before you sent it*: the turn goes, and everything
-that came after it goes with it, since an answer to a question nobody asked is
-not worth keeping — and a run still in flight is told to stop first, in a write
-of its own, so the worker mid-stream on another thread actually sees it. Redo
-files the turn again with a fresh pending run, which the kick sets going.
+*send*, *stop*, *retry* and *delete* are each one undoable action, and each says
+what it undoes to.
+
+Undoing a **send** is *the chat as it was before you sent it*: the turn goes,
+and everything that came after it goes with it, since an answer to a question
+nobody asked is not worth keeping — and a run still in flight is told to stop
+first, in a write of its own, so the worker mid-stream on another thread
+actually sees it. Redo files the turn again with a fresh pending run, which the
+kick sets going.
+
+A **stop** is a node that refuses. The request is gone: the stream was cut, the
+gateway has been paid, and there is no asking for the rest of an answer it
+already sent — so its claim answers *a stopped round cannot be resumed — retry
+asks again*, the way mail's send refuses once the letter has left. `cmd+z` walks
+transparently past it to the send underneath and says what it really undid. The
+node stays in the tree, because a person who pressed *stop* did something.
+
+Undoing a **retry** is the send's rule with the question left out: the run it
+filed goes, and the turns and calls that run produced go with it; redo files a
+fresh pending run under an id of its own.
+
 Deleting chats keeps their rows on the node, so undo puts the turns, runs and
-calls back under the ids they were named by.
+calls back under the ids they were named by — except that a run which was
+`streaming` when the chat went comes back **stopped**. Nobody owns that stream
+any more; the chat offers *retry*. `pending` and `waiting` come back as they
+were, because the walk's own kick asks for their workers again.
+
+One more thing happens before any new request: the round the last one left open
+is **settled**. A stop lands between a round's calls being written and their
+results being written, and nothing picks it back up — so the assistant turn with
+its `tool_calls` would still be there with no `tool` turns behind it, which is
+invalid on the wire, and the results of the calls that did run would be lost
+from the model's context. So *send*, *retry* and *continue* each write, inside
+their own transaction, one `tool` turn per call of that round: what a call that
+ran came to, and for one nobody got a word about, `cancelled: the round was
+stopped`.
 
 ## The gateway
 
@@ -350,7 +406,12 @@ reader, and then asked of every statement SQLite prepares:
   reason: what a `CREATE TABLE` in the same batch makes is outside the set the
   writer's session is attached to;
 - **the shape of a table**, whosever it is: a name and its columns belong to
-  the app's schema ladder, which is a commit and a migration, not a call.
+  the app's schema ladder, which is a commit and a migration, not a call;
+- **transaction control** — `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`,
+  `RELEASE`. A call is one transaction and the session owns it: a `COMMIT`
+  halfway through a batch ends that transaction under it, so the statements
+  before it stay written while the node, the changeset and replication's capture
+  record none of them.
 
 The authorizer that says all this stands only for the length of the call: the
 writer is one connection for the whole process, and one left in place would
@@ -385,8 +446,10 @@ that already exists, and the send's own window is what `cmd+z` is for.
 
 The files tools carry the app's own refusals with them: nothing is removed
 outright, a trash is a trash, a destination that exists is refused rather than
-written over, and `files.write` refuses a file over a megabyte because what it
-would have to keep for undo is memory. The system app changes nothing, so it
+written over, and `files.write` refuses a file over a megabyte — and a text over
+a megabyte — because what it would have to keep for undo is memory, both what
+was there and what it put there, the second being how a reversal tells that the
+file on disk is still the one it wrote. The system app changes nothing, so it
 offers nothing that writes: its two tools are the problems list and the effect
 log answered as rows, so a chat can say *the send to Vera failed, here is why*
 without the person going to look.
@@ -434,7 +497,10 @@ its send. *allow* runs it exactly as an arriving call would have run, then goes
 on to the next; *refuse* never runs it, and *refused by the person* is the
 `tool` message's content, so the model reads what it was not allowed to do and
 says so. A refusal is an answer, not a hang: the round is settled when no call
-of it is `pending` or `asked`, and the run goes round again either way.
+of it is `pending` or `asked`, and the run goes round again either way. A stop
+while a card is waiting is an answer too, written when the next request is:
+the call becomes `cancelled` and the model reads *cancelled: the round was
+stopped*.
 
 *allow all for this run* is [not built](#not-done-on-purpose).
 

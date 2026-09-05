@@ -1,9 +1,11 @@
 //! The pass that drives one run: ask, write what came back, and — where
 //! the model asked for tools — sleep until the chat has run them.
 //!
-//! One worker per run that is `pending` or `waiting`, derived from the
-//! store, so a run starts the moment its row exists and retires when it
-//! ends. It claims no queued job: it has none. Everything it learns it
+//! One worker per run that is still going — `pending`, `streaming` or
+//! `waiting` — derived from the store, so a run starts the moment its row
+//! exists and retires when it ends. `streaming` is in that list because the
+//! set is diffed after every action: any write at all while the gateway
+//! streams would otherwise retire the very pass that is reading it. It claims no queued job: it has none. Everything it learns it
 //! writes as rows, because the rows are the bus — the person is on the UI
 //! thread and this is not.
 
@@ -49,6 +51,13 @@ impl Worker for RunWorker {
     /// A pending run is asked; a waiting one is asked again once every call
     /// it is holding has answered. Anything else is a run that has ended,
     /// and the worker sleeps until the set is diffed and it retires.
+    ///
+    /// A run that says `streaming` is one **this** worker is inside the
+    /// gateway for — the pass that is asking has not returned yet, so a
+    /// pass that finds the word is a second worker, spawned because an
+    /// action re-asked for the set. It waits on a kick and re-sends
+    /// nothing: a request costs money, and the only honest word about a
+    /// stream nobody is holding is the sweep's at the next open.
     fn pass(&mut self, w: &World) -> Wake {
         let Some(run) = model::run_conn(w.store().conn(), self.run) else {
             return Wake::OnKick;
@@ -56,6 +65,7 @@ impl Worker for RunWorker {
         match run.status.as_str() {
             model::PENDING => self.ask(w),
             model::WAITING => self.answered(w),
+            // `streaming` among them, for the reason above.
             _ => Wake::OnKick,
         }
     }
@@ -65,10 +75,16 @@ impl RunWorker {
     /// One round: the request, and the row its answer becomes.
     fn ask(&mut self, w: &World) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
-        if w.store()
-            .write(move |c| set_run_status_tx(c, run, model::STREAMING, None, now))
-            .is_err()
-        {
+        let mine = w.store().write(move |c| {
+            if !model::run_alive_tx(c, run, chat)? {
+                return Ok(false);
+            }
+            set_run_status_tx(c, run, model::STREAMING, None, now)?;
+            Ok(true)
+        });
+        // Nothing to ask for: the run went between the pass reading it and
+        // this write, and a request costs money.
+        if !matches!(mine, Ok(true)) {
             return Wake::OnKick;
         }
         let turn = model::turns_conn(w.store().conn(), chat).len() as i64 + 1;
@@ -98,6 +114,9 @@ impl RunWorker {
             let turn = Turn::new(done.message.clone()).by(run);
             let calls = done.message.tool_calls.clone();
             let _ = w.store().write(move |c| {
+                if !model::run_alive_tx(c, run, chat)? {
+                    return Ok(());
+                }
                 let (turn_id, _) = add_turn_tx(c, chat, &turn, now)?;
                 for call in &calls {
                     add_call_tx(c, run, turn_id, call, now)?;
@@ -114,6 +133,9 @@ impl RunWorker {
             .by(run)
             .finishing(done.finish.word());
         let _ = w.store().write(move |c| {
+            if !model::run_alive_tx(c, run, chat)? {
+                return Ok(());
+            }
             add_turn_tx(c, chat, &turn, now)?;
             set_run_status_tx(c, run, model::DONE, None, now)?;
             if let Some(u) = usage {
@@ -126,6 +148,13 @@ impl RunWorker {
 
     /// The person cut it: what had arrived becomes a turn of its own,
     /// marked with the word for why it ends there.
+    ///
+    /// Unless there is nothing left to write it to. A missing run counts as
+    /// a stop ([`model::is_stopped`]), which is what an undo of the send
+    /// looks like from inside the stream — so this is the one ending that
+    /// reaches a run that has been taken away, and the tail goes with the
+    /// rows rather than becoming a turn nobody asked for in a chat that may
+    /// itself be gone.
     fn was_stopped(&mut self, w: &World, tail: Option<&Tail>) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
         let mut message = Message::of(Role::Assistant);
@@ -139,19 +168,27 @@ impl RunWorker {
         }
         let turn = Turn::new(message).by(run).finishing(model::STOPPED);
         let _ = w.store().write(move |c| {
+            if !model::run_alive_tx(c, run, chat)? {
+                return Ok(());
+            }
             add_turn_tx(c, chat, &turn, now)?;
             set_run_status_tx(c, run, model::STOPPED, None, now)
         });
+        // Whichever way it went, what had arrived is not arriving any more.
+        AGENT.clear_tail(run);
         Wake::OnKick
     }
 
     /// Nothing came back. The sentence is the gateway's, and the chat
     /// offers *retry*: nothing here retries by itself.
     fn failed(&mut self, w: &World, why: &str) -> Wake {
-        let (run, now, why) = (self.run, w.now(), why.to_string());
-        let _ = w
-            .store()
-            .write(move |c| set_run_status_tx(c, run, model::FAILED, Some(&why), now));
+        let (run, chat, now, why) = (self.run, self.chat, w.now(), why.to_string());
+        let _ = w.store().write(move |c| {
+            if !model::run_alive_tx(c, run, chat)? {
+                return Ok(());
+            }
+            set_run_status_tx(c, run, model::FAILED, Some(&why), now)
+        });
         Wake::OnKick
     }
 
@@ -178,23 +215,24 @@ impl RunWorker {
             .iter()
             .map(|c| Turn::new(Message::tool(&c.tool_call_id, c.said())).by(run))
             .collect();
-        if w.store()
-            .write(move |c| {
-                for turn in &results {
-                    add_turn_tx(c, chat, turn, now)?;
-                }
-                Ok(())
-            })
-            .is_err()
-        {
+        let wrote = w.store().write(move |c| {
+            if !model::run_alive_tx(c, run, chat)? {
+                return Ok(false);
+            }
+            for turn in &results {
+                add_turn_tx(c, chat, turn, now)?;
+            }
+            Ok(true)
+        });
+        if !matches!(wrote, Ok(true)) {
             return Wake::OnKick;
         }
         self.ask(w)
     }
 }
 
-/// The passes the agent wants running now: one per run that is `pending` or
-/// `waiting`, from one cached query.
+/// The passes the agent wants running now: one per [live](model::LIVE) run
+/// — `pending`, `streaming` or `waiting` — from one cached query.
 ///
 /// **None at all on a store that may not be written.** A run row replicates
 /// like any other, so the device that does not hold the lease would
