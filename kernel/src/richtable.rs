@@ -358,6 +358,30 @@ pub enum TagSql {
     Col(&'static str),
 }
 
+/// An index free text is answered by, for text a scan may not read.
+///
+/// A column in [`SqlSpec::text`] is read for every row the earlier ones did
+/// not answer for, which is what a `LIKE` over a mail body or a document
+/// costs: megabytes a keystroke. This is the other way to ask — a row test
+/// against something already built over the same words.
+///
+/// `sql` is that test, with a single `?` (`id IN (SELECT rowid FROM …
+/// MATCH ?)`), and `query` turns what was typed into what the index reads.
+/// `None` from it drops the arm, so a query no index can express falls back
+/// to the columns alone.
+///
+/// What this trades: an index knows words, and a scan knows substrings. The
+/// arm matches by word — with whatever prefix rule `query` writes — so it
+/// belongs beside the columns, not instead of them: the small columns stay
+/// a substring, and the wide text becomes a word.
+#[derive(Debug, Clone, Copy)]
+pub struct TextIndex {
+    /// The row test, one `?`.
+    pub sql: &'static str,
+    /// The typed text as the index reads it; `None` drops the arm.
+    pub query: fn(&str) -> Option<String>,
+}
+
 /// A SQL-backed table: the fixed parts of its query. The builder adds the
 /// filter's `WHERE`, the paging and the rank.
 #[derive(Debug, Clone, Copy)]
@@ -371,8 +395,10 @@ pub struct SqlSpec {
     pub from: &'static str,
     /// A `WHERE` fragment every query carries, or `""`.
     pub base: &'static str,
-    /// Columns free text searches.
+    /// Columns free text searches, each a substring.
     pub text: &'static [&'static str],
+    /// An index free text asks as well, for text too wide to scan.
+    pub index: Option<TextIndex>,
     /// Tag name → binding.
     pub tags: &'static [(&'static str, TagSql)],
     /// The order, which is also the rank key. Must be total (end with a
@@ -487,18 +513,24 @@ impl SqlSpec {
     fn expr(&self, tags: &[TagDef], ast: &Ast, params: &mut Vec<Val>) -> Option<String> {
         match ast {
             Ast::Text(t) => {
-                if self.text.is_empty() {
-                    return None;
+                let mut parts: Vec<String> = Vec::new();
+                // The index first, because SQLite short-circuits an OR left
+                // to right: the columns are then only read for the rows it
+                // did not already answer for.
+                if let Some(ix) = self.index {
+                    if let Some(q) = (ix.query)(t) {
+                        params.push(Val::S(q));
+                        parts.push(format!("({})", ix.sql));
+                    }
                 }
                 let pat = format!("%{}%", escape_like(t));
-                let parts: Vec<String> = self
-                    .text
-                    .iter()
-                    .map(|c| {
-                        params.push(Val::S(pat.clone()));
-                        format!("{c} LIKE ? ESCAPE '\\'")
-                    })
-                    .collect();
+                for c in self.text {
+                    params.push(Val::S(pat.clone()));
+                    parts.push(format!("{c} LIKE ? ESCAPE '\\'"));
+                }
+                if parts.is_empty() {
+                    return None;
+                }
                 Some(format!("({})", parts.join(" OR ")))
             }
             Ast::Tag(name) => match self.binding(name)? {
@@ -1667,6 +1699,19 @@ mod tests {
         })
     }
 
+    /// The same table with an index over the words of its rows — what a
+    /// source whose text is too wide to scan looks like.
+    static INDEXED: SqlSpec = SqlSpec {
+        index: Some(TextIndex {
+            sql: "id IN (SELECT rowid FROM item_fts WHERE item_fts MATCH ?)",
+            query: |q| {
+                let q = q.trim();
+                (!q.is_empty()).then(|| format!("\"{q}\"*"))
+            },
+        }),
+        ..SPEC
+    };
+
     static SPEC: SqlSpec = SqlSpec {
         id: "items",
         describe: "the test items",
@@ -1674,6 +1719,7 @@ mod tests {
         from: "item",
         base: "id > 0",
         text: &["name"],
+        index: None,
         tags: &[
             ("ok", TagSql::Where("ok = 1")),
             ("name", TagSql::Col("name")),
@@ -1727,6 +1773,7 @@ mod tests {
         from: "item i",
         base: "i.id > 0",
         text: &["i.name"],
+        index: None,
         tags: &[
             ("ok", TagSql::Where("i.ok = 1")),
             ("name", TagSql::Col("i.name")),
@@ -1915,6 +1962,44 @@ mod tests {
             q.sql,
             "SELECT i.ok AS g, MAX(i.at) AS last, COUNT(*) AS members \
              FROM item i WHERE i.id > 0 AND i.ok = ? GROUP BY i.ok"
+        );
+    }
+
+    /// An indexed source asks the index *first* and the columns after, in
+    /// one `OR`, with the parameters in the order the text puts the holes:
+    /// SQLite short-circuits left to right, so the wide text is answered by
+    /// the index and the narrow columns are only read for what it missed.
+    /// A query the index cannot express leaves the columns alone to answer.
+    #[test]
+    fn an_indexed_source_asks_the_index_first() {
+        let w = |s: &str| INDEXED.where_clause(TAGS, a(s).as_ref());
+        assert_eq!(
+            w("alpha"),
+            (
+                concat!(
+                    " WHERE id > 0 AND ((id IN (SELECT rowid FROM item_fts",
+                    " WHERE item_fts MATCH ?)) OR name LIKE ? ESCAPE '\\')"
+                )
+                .into(),
+                vec![Val::S("\"alpha\"*".into()), Val::S("%alpha%".into())]
+            )
+        );
+        // A tag is not free text and never reaches the index.
+        assert_eq!(
+            w("@name:Al"),
+            (
+                " WHERE id > 0 AND name LIKE ? ESCAPE '\\'".into(),
+                vec![Val::S("%Al%".into())]
+            )
+        );
+        // The index refusing the text is not the filter failing: the
+        // columns still answer, and one hole fewer is bound.
+        assert_eq!(
+            w("(@ok @or @n>5)"),
+            (
+                " WHERE id > 0 AND ((ok = 1) OR n > ?)".into(),
+                vec![Val::F(5.0)]
+            )
         );
     }
 

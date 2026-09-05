@@ -1408,6 +1408,7 @@ static CHATS_SPEC: SqlSpec = SqlSpec {
         "c.title",
         "COALESCE((SELECT GROUP_CONCAT(t.body, ' ') FROM agent_turn t WHERE t.chat = c.id), '')",
     ],
+    index: None,
     tags: &[
         (
             "waiting",

@@ -9,7 +9,9 @@ use std::rc::Rc;
 
 use kernel::filter::Op;
 use kernel::panel::{PanelId, Tag};
-use kernel::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, Values};
+use kernel::richtable::{
+    Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, TextIndex, Values,
+};
 use kernel::store::{Q, Store, Val};
 use kernel::time::fmt_date_long;
 
@@ -421,6 +423,18 @@ macro_rules! mailbox_spec {
             from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
             base: concat!("f.role = '", $role, "'"),
             text: &["m.from_name", "m.from_email", "m.subject"],
+            // The letters themselves, through the index that already holds
+            // their words. A `LIKE` over `m.body` would read every body in
+            // the folder per keystroke — a mailbox of twenty thousand
+            // letters is a couple of hundred megabytes, and it showed:
+            // a fifth of a second a count, and a count and a page run for
+            // every letter typed. This is the same words asked of the same
+            // index the launcher asks ([`fts_match`]), and it costs what an
+            // index costs.
+            index: Some(TextIndex {
+                sql: "m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)",
+                query: fts_match,
+            }),
             tags: &[
                 ("unread", TagSql::Where("m.unread = 1")),
                 ("html", TagSql::Where("m.html IS NOT NULL")),

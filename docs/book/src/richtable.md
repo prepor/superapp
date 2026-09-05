@@ -39,7 +39,14 @@ matches, while the displayed totals still cover the whole conversation.
 | `@not:tag` | `@not:unread` | Opposite of a tag |
 | `(@a @or @b)` | `(@unread @or @html)` | Either expression |
 | `@a @b` | `@unread vera` | Both expressions |
-| `text` | `budget draft` | Substring in searchable columns |
+| `text` | `budget draft` | Substring in searchable columns, and a word in an indexed one |
+
+A source may also declare an index for free text — text too wide to read a
+row at a time, such as a mail body. The index is asked first and the columns
+after, in one `OR`, so a row the index answers for is never scanned. The two
+halves read differently on purpose: a column is a substring, an index is a
+word, so `ovac` finds `vera@kovac.io` in a column and `thermo` finds
+*thermos* in a body, while the middle of a body's word finds nothing.
 
 Invalid syntax and unknown tags appear as errors below the field. The valid
 parts still filter: an invalid or unknown term is left out of the SQL rather
