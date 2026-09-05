@@ -578,6 +578,12 @@ pub struct HtmlImage {
     image: Image,
     #[live]
     draw_text: DrawText,
+    /// A reading-sized preview. The same width cap keeps adjoining banner
+    /// strips aligned; the height cap also fits portrait images.
+    #[live(360.0)]
+    max_width: f64,
+    #[live(320.0)]
+    max_height: f64,
     #[rust]
     src: String,
     #[rust]
@@ -695,14 +701,15 @@ impl Widget for HtmlImage {
 }
 
 impl HtmlImage {
-    /// The box a picture of these pixels takes: its `width` hint or its own
-    /// width, never wider than the column, and its own aspect either way.
+    /// Fit the whole picture within the reader's preview box and column.
+    /// Smaller pictures keep their size, and every scale preserves aspect.
     fn box_walk(&self, cx: &Cx2d, (nw, nh): (f64, f64)) -> Walk {
-        let mut w = self.width.filter(|w| *w >= 1.0).unwrap_or(nw);
+        let mut w = self.width.filter(|w| *w >= 1.0).unwrap_or(nw).min(nw);
         let avail = cx.turtle().inner_width();
         if avail.is_finite() && avail > 1.0 {
             w = w.min(avail);
         }
+        w = w.min(self.max_width).min(self.max_height * nw / nh);
         Walk {
             width: Size::Fixed(w),
             height: Size::Fixed(w * nh / nw),

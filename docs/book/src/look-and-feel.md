@@ -10,18 +10,22 @@ selection `#e7e7e7`, and error `#a01500`.
 
 ## Type
 
-Body text is monospace at about 14 px. Everything is drawn in bundled Geist
-Mono on every platform, so a screenshot on one machine matches another, with
-Liberation Mono and Noto as fallbacks for what Geist does not cover. Titles,
-table headers, and buttons use smaller uppercase text with extra letter
-spacing.
+Controls and technical text use bundled Geist Mono at about 14 px, with
+Liberation Mono and Noto as fallbacks. Titles, table headers, and buttons use
+smaller uppercase text with extra letter spacing.
+
+Long readings use IBM Plex Sans Text at 15 px with more space between lines.
+Shared prose styles provide semibold emphasis, italic, and bold italic;
+`SProseText` is their selectable plain-text reading. Email bodies, quoted
+letters, and the compose field use this face. Code stays in Geist Mono.
+Both families are bundled, so the choice is the same on every platform.
 
 A label in a box is centred by its line box, which is where Geist Mono puts a
 capital's middle exactly. The close button's `×` is the one glyph the chrome
 draws that is not a letter: it rides the maths axis, lower, and so is centred
 on its own ink instead.
 
-Bold text has two uses: emphasis in prose, and the one bold letter that marks a
+Emphasis uses semibold in prose, and bold for the one letter that marks a
 control's [keyboard shortcut](./interaction-grammar.md#accelerators-and-the-bar).
 Geist Mono is monospaced at every weight, so that letter is drawn in the bold
 face on the same cell as the light ones around it: the grid never shifts under

@@ -1,6 +1,6 @@
 //! The theme and the base widgets every panel is built from.
 //!
-//! The design language in one block: the mono face and its four styles, a
+//! The design language in one block: faces for controls and prose, a
 //! label, a section, a field, a button, a link, and the overlay rows. An
 //! app's own `script_mod` builds on these, so two apps look like one
 //! product without either of them saying so.
@@ -89,6 +89,36 @@ script_mod! {
         }
         font_size: 10.5
         line_spacing: 1.0
+    }
+
+    // ---- prose ------------------------------------------------------------
+
+    /** Proportional text for letters and other long readings. Bundled with
+        Makepad, with matching emphasis faces and the same fallback coverage
+        as the chrome. Sizes are points: 11.25 is 15 logical pixels. */
+    mod.widgets.SProseStyle = TextStyle{
+        font_family: FontFamily{
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-Text.ttf") asc: 0.0 desc: 0.0}
+            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
+            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+        }
+        font_size: 11.25
+        line_spacing: 1.2
+    }
+    mod.widgets.SProseBoldStyle = mod.widgets.SProseStyle{
+        font_family +: {
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-SemiBold.ttf") asc: 0.0 desc: 0.0}
+        }
+    }
+    mod.widgets.SProseItalicStyle = mod.widgets.SProseStyle{
+        font_family +: {
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-Italic.ttf") asc: 0.0 desc: 0.0}
+        }
+    }
+    mod.widgets.SProseBoldItalicStyle = mod.widgets.SProseStyle{
+        font_family +: {
+            latin := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-BoldItalic.ttf") asc: 0.0 desc: 0.0}
+        }
     }
 
     // ---- the base widgets --------------------------------------------------
@@ -206,6 +236,13 @@ script_mod! {
             color_down: #00000020
             color_empty: #00000000
         }
+    }
+
+    /** A selectable prose reading, with the same selection behavior as
+        SText. Paths, logs and other technical payloads keep SText's mono face. */
+    mod.widgets.SProseText = mod.widgets.SText {
+        is_multiline: true
+        draw_text +: { text_style: mod.widgets.SProseStyle{} }
     }
 
     /** Bordered action button. */

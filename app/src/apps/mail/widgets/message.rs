@@ -215,7 +215,9 @@ impl Widget for MessagePanel {
                 let r = row.widget(cx, path).area().rect(cx);
                 (r.size.x > 0.0 && r.size.y > 0.0).then_some(r)
             };
-            let Some(head) = rect(ids!(head)) else { continue };
+            let Some(head) = rect(ids!(head)) else {
+                continue;
+            };
             props
                 .hits
                 .add(head_label(t, is_open), head, MouseCursor::Hand, props.slot);
@@ -440,14 +442,12 @@ fn populate(
     };
     row.text_input(cx, ids!(body.text_wrap.body_txt))
         .set_text(cx, &own_text);
-    // Guarded on the way *out* as well as on the way in: rows narrowed by an
-    // older build are still out there, and one the parser cannot read takes
-    // the whole app down every frame that draws it.
-    row.html(cx, ids!(body.html_wrap.body_html))
-        .set_text(cx, &html::guard(&own_html));
+    let body_html = row.html(cx, ids!(body.html_wrap.body_html));
+    set_html(cx, body_html, &own_html);
     row.widget(cx, ids!(body.text_wrap))
         .set_visible(cx, open && !is_html);
-    row.widget(cx, ids!(body.html_wrap)).set_visible(cx, is_html);
+    row.widget(cx, ids!(body.html_wrap))
+        .set_visible(cx, is_html);
 
     let show_quote = quote.is_some() && quoted;
     let tail = quote.unwrap_or_default();
@@ -455,9 +455,11 @@ fn populate(
         .set_visible(cx, !tail.is_empty() && !quoted);
     row.text_input(cx, ids!(body.quote_wrap.quote_txt))
         .set_text(cx, if show_quote && !is_html { &tail } else { "" });
-    row.html(cx, ids!(body.quote_html.quote_body)).set_text(
+    let quote_html = row.html(cx, ids!(body.quote_html.quote_body));
+    set_html(
         cx,
-        &html::guard(if show_quote && is_html { &tail } else { "" }),
+        quote_html,
+        if show_quote && is_html { &tail } else { "" },
     );
     row.widget(cx, ids!(body.quote_wrap))
         .set_visible(cx, show_quote && !is_html);
@@ -472,7 +474,8 @@ fn populate(
     } else {
         Vec::new()
     };
-    row.widget(cx, ids!(atts)).set_visible(cx, !shown.is_empty());
+    row.widget(cx, ids!(atts))
+        .set_visible(cx, !shown.is_empty());
     for (i, name) in ATT_LINKS.iter().enumerate() {
         let link = row.widget(cx, &[live_id!(atts), *name]).as_slink();
         match shown.get(i) {
@@ -497,4 +500,37 @@ fn populate(
     let more = row.label(cx, ids!(atts.more_lbl));
     more.set_text(cx, &format!("+{rest} more"));
     more.set_visible(cx, !shown.is_empty() && rest > 0);
+}
+
+/// Apply the reader's heading scale to the parsed display document. Makepad
+/// fixes heading sizes by tag: h3 is 1.17× body text and h4 is body-sized.
+/// Use those for titles (h1–h2) and subheadings (h3–h6), respectively, so
+/// headings stay bold without either towering over prose or becoming tiny.
+/// The stored HTML and the widget's source keep their original structure.
+fn set_html(cx: &mut Cx, view: HtmlRef, text: &str) {
+    use makepad_html::HtmlNode;
+
+    let Some(mut view) = view.borrow_mut() else {
+        return;
+    };
+    // Older stored readings still need the entity repair at the point of use.
+    let text = html::guard(text);
+    if view.body.as_ref() == text.as_ref() {
+        return;
+    }
+    view.set_text(cx, &text);
+    // Only a fresh parse is remapped: revisiting unchanged content must not
+    // demote the headings again or reset selection and expanded details.
+    for node in &mut view.doc.nodes {
+        let (HtmlNode::OpenTag { lc, nc } | HtmlNode::CloseTag { lc, nc }) = node else {
+            continue;
+        };
+        let heading = match *lc {
+            live_id!(h1) | live_id!(h2) => live_id!(h3),
+            live_id!(h3) | live_id!(h4) | live_id!(h5) | live_id!(h6) => live_id!(h4),
+            _ => continue,
+        };
+        *lc = heading;
+        *nc = heading;
+    }
 }

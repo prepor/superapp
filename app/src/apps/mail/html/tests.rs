@@ -529,7 +529,7 @@ fn styled_spans_become_emphasis() {
     assert_eq!(sanitize(r#"<u style="text-decoration:none">x</u>"#), "x");
     assert_eq!(
         sanitize(r#"<span style="font-family: Consolas, monospace">x</span>"#),
-        "<code>x</code>"
+        "x"
     );
     assert_eq!(
         sanitize(r#"<span style="vertical-align:super">2</span>"#),
@@ -546,6 +546,28 @@ fn styled_spans_become_emphasis() {
     assert_eq!(
         sanitize("<b><p>a</p><p>b</p></b>"),
         "<p><b>a</b></p><p><b>b</b></p>"
+    );
+}
+
+/// Sender typography is branding, not code semantics. A Courier receipt
+/// should read as prose; real code stays fixed even if CSS asks for Arial.
+#[test]
+fn sender_typefaces_do_not_turn_prose_into_code() {
+    assert_eq!(
+        sanitize(
+            "<style>.receipt{font-family:'Courier New',monospace}</style>\
+             <div class=\"receipt\"><p>Your order is <b>on its way</b>.</p>\
+             <p>Tracking: <code style=\"font-family:Arial\">ABC-123</code></p></div>"
+        ),
+        "<p>Your order is <b>on its way</b>.</p><p>Tracking: <code>ABC-123</code></p>"
+    );
+    assert_eq!(
+        sanitize("<tt>a</tt> <kbd>b</kbd> <samp>c</samp>"),
+        "<code>a b c</code>"
+    );
+    assert_eq!(
+        sanitize("<pre style=\"font-family:serif\"><code>first\nsecond</code></pre>"),
+        "<pre>first\nsecond</pre>"
     );
 }
 
@@ -574,6 +596,75 @@ fn data_tables_keep_their_grid() {
         "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr>\
          <tr><td><b>Total</b></td><td></td></tr></table>"
     );
+}
+
+/// Release notes often have a short header over a description column.
+/// One sentence passing the layout-cell limit must not lose its row's
+/// association with the package, severity and advisory columns.
+#[test]
+fn labeled_data_tables_keep_brief_descriptions() {
+    let first = "A server may close an idle connection before the client has finished processing its pending response.";
+    let second = "A malformed response can leave a request waiting until the configured timeout; the new release closes it early.";
+    assert!(first.len() > MAX_CELL && second.len() > MAX_CELL);
+    let header = "<tr><th>Package</th><th>Severity</th><th>Advisory</th><th>Notes</th></tr>";
+    let body = format!(
+        "<tr><td><a href=\"https://example.com/client\">client</a></td><td><b>High</b></td>\
+         <td><code>ADV-001</code></td><td>{first}</td></tr>\
+         <tr><td>client</td><td>Medium</td><td>ADV-002</td><td>{second}</td></tr>"
+    );
+    assert_eq!(
+        sanitize(&format!(
+            "<table><thead>{header}</thead><tbody>{body}</tbody></table>"
+        )),
+        format!(
+            "<p><b>Package:</b> <a href=\"https://example.com/client\">client</a>\
+             <br><b>Severity: High</b><br><b>Advisory:</b> <code>ADV-001</code>\
+             <br><b>Notes:</b> {first}</p>\
+             <p><b>Package:</b> client<br><b>Severity:</b> Medium\
+             <br><b>Advisory:</b> ADV-002<br><b>Notes:</b> {second}</p>"
+        )
+    );
+
+    // Fewer columns give descriptions enough room; compact four-column
+    // tables also keep the useful side-by-side comparison.
+    for header in [
+        "<tr><th>Package</th><th>Notes</th></tr>",
+        "<tr><th>Package</th><th>Notes</th><th>Severity</th></tr>",
+    ] {
+        let third = if header.contains("Severity") {
+            "<td>High</td>"
+        } else {
+            ""
+        };
+        let body = format!("<tr><td>client</td><td>{first}</td>{third}</tr>");
+        assert_eq!(
+            sanitize(&format!("<table>{header}{body}</table>")),
+            format!("<table><thead>{header}</thead>{body}</table>")
+        );
+    }
+    let compact = "<tr><td>client</td><td>High</td><td>ADV-001</td><td>Patched</td></tr>";
+    assert_eq!(
+        sanitize(&format!("<table>{header}{compact}</table>")),
+        format!("<table><thead>{header}</thead>{compact}</table>")
+    );
+
+    // Empty labels, a spanning title and an explicit presentation role
+    // cannot promote a page-layout table into a grid with long cells.
+    for (attrs, header) in [
+        ("", "<tr><th></th><th></th><th></th><th></th></tr>"),
+        ("", "<tr><th colspan=\"4\">Newsletter</th></tr>"),
+        ("role=\"presentation\"", header),
+    ] {
+        let reading = sanitize(&format!("<table {attrs}>{header}{body}</table>"));
+        assert!(!reading.contains("<table>"));
+        assert!(!reading.contains("<b>Package:</b>"));
+    }
+    let long = "x".repeat(MAX_LABELED_CELL + 1);
+    let reading = sanitize(&format!(
+        "<table>{header}<tr><td>client</td><td>High</td><td>ADV-001</td><td>{long}</td></tr></table>"
+    ));
+    assert!(!reading.contains("<table>"));
+    assert!(!reading.contains("<b>Package:</b>"));
 }
 
 /// Everything else a table does is layout, and layout is lines: a
