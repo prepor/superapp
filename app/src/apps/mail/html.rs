@@ -28,7 +28,7 @@ use simplecss::{AttributeOperator, Declaration, DeclarationTokenizer, PseudoClas
 /// is stored, so a reading is only as good as the build that wrote it:
 /// bump this whenever the narrowing changes what it keeps or how, and the
 /// store redoes every reading it holds from raw on its next open.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Input past this is cut before parsing: a letter is not a website, and a
 /// multi-megabyte one is a mistake or an attack.
@@ -74,6 +74,9 @@ const IMG_LINES: usize = 6;
 /// longest a layout cell may be to share its line with the next one.
 const MAX_COLS: usize = 8;
 const MAX_CELL: usize = 80;
+/// A labeled data column can hold a brief description. Layout tables do
+/// not earn this allowance just by containing long text.
+const MAX_LABELED_CELL: usize = 320;
 const MAX_JOINED_CELL: usize = 48;
 
 /// Dropped whole, subtree included: source, head chrome, controls and media
@@ -380,7 +383,6 @@ struct Css {
     italic: Option<bool>,
     underline: Option<bool>,
     strike: Option<bool>,
-    mono: Option<bool>,
     sub: Option<bool>,
     sup: Option<bool>,
     pre: Option<bool>,
@@ -453,7 +455,10 @@ impl Css {
                     }
                 }
             }
-            "font-family" => self.mono = Some(mono_family(v)),
+            // The reader chooses its prose face. A sender's Courier is
+            // often branding for a whole receipt, not computer code;
+            // only semantic code tags opt into the fixed face below.
+            "font-family" => {}
             "white-space" => match v {
                 "pre" | "pre-wrap" | "pre-line" | "break-spaces" => self.pre = Some(true),
                 "normal" | "nowrap" => self.pre = Some(false),
@@ -483,7 +488,6 @@ impl Css {
         set(&mut fmt.italic, self.italic);
         set(&mut fmt.underline, self.underline);
         set(&mut fmt.strike, self.strike);
-        set(&mut fmt.mono, self.mono);
         set(&mut fmt.sub, self.sub);
         set(&mut fmt.sup, self.sup);
         set(&mut fmt.tiny, self.tiny);
@@ -531,28 +535,6 @@ fn weight(v: &str) -> Option<bool> {
         "normal" | "lighter" => Some(false),
         _ => num(v).map(|n| n >= 600.0),
     }
-}
-
-fn mono_family(v: &str) -> bool {
-    const MONO: &[&str] = &[
-        "monospace",
-        "courier",
-        "consolas",
-        "monaco",
-        "lucida console",
-        "source code",
-        "fira code",
-        "fira mono",
-        "roboto mono",
-        "sf mono",
-        "jetbrains mono",
-        "ubuntu mono",
-        "dejavu sans mono",
-        "inconsolata",
-        "andale mono",
-        "geist mono",
-    ];
-    MONO.iter().any(|m| v.contains(m))
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +954,8 @@ struct Grid {
     rows: Vec<Vec<(usize, bool, usize)>>,
     /// The first row is all `<th>`: a header.
     header: bool,
+    /// Every column has its own nonempty header, suitable as a field label.
+    labeled: bool,
 }
 
 impl Walk<'_> {
@@ -1213,9 +1197,11 @@ impl Walk<'_> {
     }
 
     /// Whether a table reads as data: two or more rows of the same two to
-    /// eight columns, every cell short inline text, no nesting, and not
-    /// declared presentation. Mail holds its page together with tables;
-    /// the ones that survive this are the ones with something to tabulate.
+    /// eight columns, every cell inline text, no nesting, and not declared
+    /// presentation. Cells stay short unless a full row of column labels
+    /// identifies the data beneath it: descriptions can wrap in that grid.
+    /// Mail holds its page together with tables; a label-free table still
+    /// has to pass the compact-cell heuristic.
     fn grid(&self, table: usize, rows: &[usize]) -> Option<Grid> {
         let doc = self.doc;
         if matches!(
@@ -1227,6 +1213,7 @@ impl Walk<'_> {
         let mut grid = Grid {
             rows: Vec::new(),
             header: false,
+            labeled: false,
         };
         let mut cols = None;
         let mut wide = 0usize;
@@ -1237,7 +1224,12 @@ impl Walk<'_> {
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(1)
                     .clamp(1, MAX_COLS);
-                if !doc.inline_only(c) || doc.text_len(c) > MAX_CELL {
+                let max_cell = if grid.labeled {
+                    MAX_LABELED_CELL
+                } else {
+                    MAX_CELL
+                };
+                if !doc.inline_only(c) || doc.text_len(c) > max_cell {
                     return None;
                 }
                 cells.push((c, doc.name(c) == "th", span));
@@ -1255,6 +1247,11 @@ impl Walk<'_> {
             }
             if grid.rows.is_empty() {
                 grid.header = cells.iter().all(|c| c.1);
+                grid.labeled = grid.header
+                    && cells.len() >= 2
+                    && cells
+                        .iter()
+                        .all(|&(c, _, span)| span == 1 && doc.text_len(c) > 0);
             }
             grid.rows.push(cells);
         }
@@ -1262,6 +1259,21 @@ impl Walk<'_> {
     }
 
     fn data_table(&mut self, grid: &Grid, ctx: &Ctx) {
+        // Makepad divides every grid into equal columns. A four-column
+        // table with sentence-length descriptions wastes most of its
+        // short columns and wraps the prose into a narrow vertical strip.
+        // Keep each record together with its labels instead; compact and
+        // two-/three-column tables still have room to read as grids.
+        if grid.labeled
+            && grid.rows[0].len() >= 4
+            && grid.rows[1..]
+                .iter()
+                .flatten()
+                .any(|&(cell, _, _)| self.doc.text_len(cell) > MAX_CELL)
+        {
+            self.labeled_rows(grid, ctx);
+            return;
+        }
         self.out.open_blocks();
         self.out.raw("<table>");
         self.out.in_grid += 1;
@@ -1282,6 +1294,31 @@ impl Walk<'_> {
         self.out.in_grid -= 1;
         self.out.raw("</table>");
         self.out.after_block = true;
+    }
+
+    fn labeled_rows(&mut self, grid: &Grid, ctx: &Ctx) {
+        let mut label_fmt = ctx.fmt.clone();
+        label_fmt.bold = true;
+        for cells in &grid.rows[1..] {
+            self.out.enter("p", "<p>".into());
+            let mut column = 0;
+            for &(cell, _, span) in cells {
+                if column > 0 {
+                    self.out.boundary();
+                }
+                // A spanning value belongs to all the labels it covers.
+                for offset in 0..span {
+                    if offset > 0 {
+                        self.collapsed(" / ", &label_fmt);
+                    }
+                    self.node(grid.rows[0][column + offset].0, ctx);
+                }
+                self.collapsed(": ", &label_fmt);
+                self.node(cell, ctx);
+                column += span;
+            }
+            self.out.leave();
+        }
     }
 }
 

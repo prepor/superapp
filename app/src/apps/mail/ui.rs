@@ -127,25 +127,13 @@ script_mod! {
         `widgets::pictures`, never from the frame that draws it. */
     mod.widgets.MailHtmlImage = set_type_default() do #(HtmlImage::register_widget(vm)) {
         width: Fit, height: Fit
+        max_width: 360
+        max_height: 320
         image: mod.widgets.Image { width: Fill, height: Fill }
         draw_text +: {
-            text_style: mod.widgets.SMonoStyle{}
+            text_style: mod.widgets.SProseStyle{}
             color: #909090
         }
-    }
-
-    /** Geist Mono's italic face at the bold weight — the one style the
-        chassis does not carry, because an HTML letter is the only thing in
-        this build that draws a bold italic. */
-    mod.widgets.MailMonoBoldItalicStyle = TextStyle{
-        font_family: FontFamily{
-            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0 weight: 700.0}
-            fallback := FontMember{res: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf") asc: 0.0 desc: 0.0}
-            symbols := FontMember{res: crate_resource("makepad_widgets:resources/NotoSans-Regular.ttf") asc: 0.0 desc: 0.0}
-            emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
-        }
-        font_size: 10.5
-        line_spacing: 1.0
     }
 
     /** An HTML letter in the app's own face and colours. What reaches this
@@ -159,23 +147,48 @@ script_mod! {
         // A letter is read, so it is selectable.
         selectable: true
 
-        font_size: 10.5
+        font_size: 11.25
         font_color: #141414
         draw_text +: { color: #141414 }
 
-        text_style_normal: mod.widgets.SMonoStyle{}
-        text_style_italic: mod.widgets.SMonoItalicStyle{}
-        text_style_bold: mod.widgets.SMonoBoldStyle{}
-        text_style_bold_italic: mod.widgets.MailMonoBoldItalicStyle{}
-        text_style_fixed: mod.widgets.SMonoStyle{}
+        text_style_normal: mod.widgets.SProseStyle{}
+        text_style_italic: mod.widgets.SProseItalicStyle{}
+        text_style_bold: mod.widgets.SProseBoldStyle{}
+        text_style_bold_italic: mod.widgets.SProseBoldItalicStyle{}
+        text_style_fixed: mod.widgets.SMonoStyle{line_spacing: 1.2}
+
+        // The reader uses a compact heading scale (see message::set_html).
+        // Margins are in ems; the other insets are logical pixels.
+        heading_margin: Inset{top: 1.0, bottom: 0.3}
+        paragraph_margin: Inset{top: 0.55, bottom: 0.55}
+
+        // Code stays mono, slightly smaller to match the prose's x-height.
+        // Horizontal insets distinguish it without inflating the whole line.
+        fixed_font_size_scale: 0.9
+        inline_code_padding: Inset{left: 2, right: 2, top: 0, bottom: 0}
+        inline_code_margin: 0
+        code_layout +: {
+            padding: Inset{left: 10, right: 10, top: 8, bottom: 8}
+        }
+        quote_layout +: {
+            padding: Inset{left: 12, right: 10, top: 8, bottom: 8}
+        }
+        list_item_layout +: {
+            padding: Inset{left: 6, right: 0, top: 5, bottom: 5}
+        }
+        // The separator shader leaves one pixel above and below its rule.
+        sep_walk +: {
+            height: 3
+            margin: Inset{top: 6, bottom: 6}
+        }
 
         // Different marks, so a nested list is easy to scan.
         ul_markers: ["•", "-"]
         ol_separator: "."
 
         a := mod.widgets.HtmlLink {
-            color: #141414
-            pressed_color: #5a5a5a
+            color: #5a5a5a
+            pressed_color: #141414
         }
         img := mod.widgets.MailHtmlImage {}
 
@@ -188,8 +201,10 @@ script_mod! {
         draw_block +: {
             line_color: #141414
             sep_color: #dcdcdc
-            quote_bg_color: #f4f4f4
-            quote_fg_color: #141414
+            quote_bg_color: #fafafa
+            quote_fg_color: #dcdcdc
+            space_1: uniform(2.0)
+            space_2: uniform(4.0)
             code_color: #f4f4f4
             table_border_color: #dcdcdc
             // A background here would cover the header text; bold already
@@ -250,7 +265,7 @@ script_mod! {
             width: Fill, height: Fit
             flow: Down
             spacing: 6
-            padding: Inset{top: 2, bottom: 6}
+            padding: Inset{left: 8, right: 8, top: 8, bottom: 12}
             status_lbl := mod.widgets.SLabel {
                 visible: false, text: "", draw_text +: { color: #5a5a5a }
             }
@@ -262,7 +277,7 @@ script_mod! {
             // out on one row and honours neither wrap nor newline.
             text_wrap := View {
                 width: Fill, height: Fit
-                body_txt := mod.widgets.SText { is_multiline: true }
+                body_txt := mod.widgets.SProseText {}
             }
             /* The other reading. Both are written on every populate — the
                hidden one emptied rather than merely hidden — so no letter
@@ -283,8 +298,7 @@ script_mod! {
             quote_wrap := View {
                 visible: false
                 width: Fill, height: Fit
-                quote_txt := mod.widgets.SText {
-                    is_multiline: true
+                quote_txt := mod.widgets.SProseText {
                     draw_text +: {
                         color: #5a5a5a
                         color_hover: #5a5a5a
@@ -411,6 +425,7 @@ script_mod! {
             width: Fill, height: Fill
             is_multiline: true
             empty_text: ""
+            draw_text +: { text_style: mod.widgets.SProseStyle{} }
             // Multiline: the return key stays a newline.
             return_key_type: ReturnKeyType.Default
         }

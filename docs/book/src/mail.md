@@ -338,17 +338,33 @@ work rather than losing it.
 A letter arrives as text, or as text and HTML. A reader draws the HTML when
 there is one; a reply quotes the text.
 
+Plain and HTML letters use the shared proportional prose face, IBM Plex Sans
+at 15 px, with semibold emphasis and space between lines and paragraphs.
+Headings stay compact: h1–h2 are semibold at 1.17× body size, and h3–h6 are
+semibold at body size, separated by spacing. Code stays monospace, links are
+grey and underlined, and quotes and dividers use light rules. The same prose
+face is used when writing a letter. Stored HTML keeps its heading levels.
+
 Outside HTML is narrowed at ingest into the limited markup the reader draws,
 and the result is stored. Scripts, frames, hidden content, unsafe link schemes,
 and unsupported styling are removed; `javascript:`, `data:`, and `cid:` hrefs
-lose their link and keep their text. Tables become a small grid. Input and
-output limits keep a large or hostile letter from blocking layout: 4 MiB in,
-100 KiB out, and the cut says so in the body rather than truncating silently.
+lose their link and keep their text. Sender font choices are discarded;
+semantic code tags determine what reads as code. Compact data tables become a
+grid. Labeled tables with four or more columns and longer descriptions read
+as one paragraph per record, each value beside its column label; two- and
+three-column tables can keep longer cells in their grid. Presentation tables
+become lines. Input and output limits keep a large or hostile letter from
+blocking layout: 4 MiB in, 100 KiB out, and the cut says so in the body rather
+than truncating silently.
 An image whose area is 25 square pixels or less is treated as a tracking pixel
 and removed with its alternative text.
 
 Because the narrowing is stored, its version is a derived schema step: raising
 it re-narrows every letter with raw MIME on the next store open.
+
+Images fit a 360 × 320 px preview box and the reading column without cropping
+or enlarging small originals. The width limit gives wide banners a consistent
+measure; the height limit keeps portrait artwork from filling the reader.
 
 Images load off the drawing thread. An inline `cid:` part and a `data:` image
 are read by a reader thread, a remote image is an ordinary HTTP request, and
