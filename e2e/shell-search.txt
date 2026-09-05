@@ -99,7 +99,7 @@ type "vera"
 wait 800
 key down
 wait 500
-type " "
+key space
 wait 400
 key shift+down
 wait 500

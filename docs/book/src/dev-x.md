@@ -200,6 +200,12 @@ paste "superapp-panel: inbox []\n\n# superapp panel context"
 quit
 ```
 
+`key` is a **press** and `type` is **text**, which is the split the platforms
+make: a key with a name of its own — the arrows, `enter`, `esc`, `tab`,
+`backspace`, `delete`, `/`, `space` — is sent as a key event, and a plain letter
+is sent as text, the way one reaches a panel when a field has the keyboard. A
+script that wants a slash or a space *in* a field spells it `type`.
+
 `paste` is `type` with the event saying it was a paste, which is the only way
 to drive a field that reads one for what it is — a panel context becoming a
 [chip](./agents.md#getting-a-panel-into-a-chat). It is also the one step whose
