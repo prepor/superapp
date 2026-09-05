@@ -192,6 +192,14 @@ impl Stage {
                 self.handle_text(cx, sh, &s);
             }
 
+            // The same door, told that this came off a clipboard: a
+            // composer that reads a paste for what it is cannot be driven
+            // by `type`, and a pasted document keeps its newlines.
+            Step::Paste(s) => {
+                eprintln!("e2e: paste {s:?}");
+                self.handle_paste(cx, sh, &s);
+            }
+
             Step::Drag { label, dx, dy } => match self.hits.by_label(&label) {
                 Some(h) => {
                     // From the left edge, so a horizontal drag sweeps the

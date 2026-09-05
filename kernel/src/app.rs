@@ -18,6 +18,7 @@ use crate::effect::{Job, Registry, World};
 use crate::panel::{PanelId, PanelKind, Tag};
 use crate::search;
 use crate::store::{Db, Store};
+use crate::tool::Tool;
 
 pub use crate::problems::{Announced, Problem, ProblemSource};
 
@@ -37,6 +38,22 @@ pub trait App: Any + Sync + Send + 'static {
     /// nothing.
     fn schema(&self) -> Option<&'static Schema> {
         None
+    }
+
+    /// The app's data in its own words: each table, what a row is, the
+    /// columns that matter, the values a column takes, and what must never
+    /// be written directly (a send is an outbox row through the app's tool,
+    /// not an `INSERT`). Read into the system prompt, so it is prose and
+    /// not a schema dump — the schema the model can ask for.
+    fn describe(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The tools this app offers an agent. Collected into one list at boot
+    /// ([`Apps::tools`]); two apps offering one name stop the process,
+    /// naming both.
+    fn tools(&self) -> Vec<Tool> {
+        Vec::new()
     }
 
     /// Demo rows for a new store. Called once, on the first open of an
@@ -110,6 +127,28 @@ pub trait App: Any + Sync + Send + 'static {
         Vec::new()
     }
 
+    /// Takes a panel as context: opens whatever this app answers a panel
+    /// with — a chat carrying the panel's chip — joined to `about`, and
+    /// answers whether it did.
+    ///
+    /// The shell offers the focused slot to the apps in list order on
+    /// `cmd+shift+a` and stops at the first taker; an app with no answer
+    /// leaves the default, so a build with nothing that takes a panel says
+    /// so instead of doing nothing.
+    fn ask(&self, _s: &mut crate::session::Session, _about: crate::layout::SlotId) -> bool {
+        false
+    }
+
+    /// The registry, finished, once for every app at the end of
+    /// [`Apps::new`]. An app that needs the *list* — the tools every app
+    /// offers, the data dictionaries — copies what it needs here.
+    ///
+    /// It may not keep the reference: a registry is built per boot and a
+    /// test builds several, so what an app holds on to is its own copy and
+    /// the last one wins. Nothing else may be done here — the store is not
+    /// open yet.
+    fn attach(&self, _apps: &Apps) {}
+
     /// For [`Apps::get_as`].
     fn as_any(&self) -> &dyn Any;
 }
@@ -136,10 +175,11 @@ impl Root {
 
 // -- the registry --------------------------------------------------------------
 
-/// Every app in this build, and the tags they own.
+/// Every app in this build, the tags they own, and the tools they offer.
 pub struct Apps {
     list: &'static [&'static dyn App],
     kinds: HashMap<Tag, &'static dyn PanelKind>,
+    tools: Vec<Tool>,
 }
 
 impl Apps {
@@ -147,7 +187,8 @@ impl Apps {
     ///
     /// # Panics
     ///
-    /// If two apps claim one tag — the process stops there, naming both.
+    /// If two apps claim one tag, or two apps offer one tool name — the
+    /// process stops there, naming both.
     #[must_use]
     pub fn new(list: &'static [&'static dyn App]) -> Apps {
         let mut kinds: HashMap<Tag, &'static dyn PanelKind> = HashMap::new();
@@ -162,7 +203,32 @@ impl Apps {
                 kinds.insert(tag, *kind);
             }
         }
-        Apps { list, kinds }
+        // The kernel's own tools — `sql.*` and `panels.*` — are chained in
+        // ahead of these, the way `problem_sources` chains its bucket
+        // problem: every build has them, whatever apps it was given.
+        let mut tools: Vec<Tool> = crate::tools::all();
+        let mut offers: HashMap<&'static str, &'static str> = HashMap::new();
+        for tool in &tools {
+            offers.insert(tool.name, "the kernel");
+        }
+        for app in list {
+            for tool in app.tools() {
+                let name = tool.name;
+                if let Some(first) = offers.get(name) {
+                    panic!("two apps offer the tool {name}: {first} and {}", app.id());
+                }
+                offers.insert(name, app.id());
+                tools.push(tool);
+            }
+        }
+        let apps = Apps { list, kinds, tools };
+        // Last, with everything in it: an app that needs the list — the
+        // agent, whose request carries every tool and every `describe` —
+        // takes its copy here.
+        for app in list {
+            app.attach(&apps);
+        }
+        apps
     }
 
     /// An app by id, or `None` when it is not in this build. This is how
@@ -200,6 +266,21 @@ impl Apps {
         let mut v: Vec<Tag> = self.kinds.keys().copied().collect();
         v.sort_by_key(|t| t.as_str());
         v
+    }
+
+    /// Every tool this build offers an agent, the kernel's own first and
+    /// then the apps', in list order. This is the list a request carries as
+    /// function definitions.
+    #[must_use]
+    pub fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+
+    /// The tool a call names, or `None` for a name no app in this build
+    /// offers — which the model reads back as *no such tool in this build*.
+    #[must_use]
+    pub fn tool(&self, name: &str) -> Option<&Tool> {
+        self.tools.iter().find(|t| t.name == name)
     }
 
     /// The launcher's roots, apps in list order.
@@ -341,6 +422,10 @@ pub struct Env {
     /// is listing. `None` is the kernel's demo tree, which is what a test
     /// and a library mount get.
     pub disk: Option<DiskFactory>,
+    /// Device sync's bucket, as the shell resolved it — `--bucket`, the
+    /// environment, the `bucket` file — for whatever else reads a Cloudflare
+    /// account off its host. `None` for a device with no bucket.
+    pub bucket: Option<String>,
     /// The wake channels of this build's background passes, so one may wake
     /// another — installed as the [`Kicker`](crate::caps::Kicker)
     /// capability. Empty in a world that runs none, where a kick does
@@ -359,6 +444,7 @@ impl Default for Env {
             secrets_backend: None,
             clock: ClockSource::default(),
             disk: None,
+            bucket: None,
             kicks: Kicks::default(),
         }
     }
@@ -426,6 +512,16 @@ pub enum Step {
     Sql(&'static str),
     /// Applied once, in order.
     Run(fn(&Connection) -> rusqlite::Result<()>),
+    /// Run at **every** open, in its place in the ladder: what a crash left
+    /// behind is put right here, before any worker is asked for. An agent
+    /// run that was streaming when the process died has no worker coming
+    /// back for it and no job in the queue, so the open is the only moment
+    /// anyone can say so.
+    ///
+    /// Recorded like any other rung the first time it runs, so the ladder's
+    /// counter still says how far a store got — a step added after it is
+    /// still a step this store has not climbed.
+    Always(fn(&Connection) -> rusqlite::Result<()>),
     /// Data rebuilt from other rows (a search index, a narrowing, derived
     /// rows): runs whenever `meta[key]` is not `version`, then sets it.
     Derived {
@@ -456,8 +552,9 @@ impl Schema {
     }
 
     /// Climbs the ladder: every step not yet run, in order, plus every
-    /// [`Step::Derived`] whose version has moved. Runs at every store open,
-    /// after the kernel's own.
+    /// [`Step::Derived`] whose version has moved and every [`Step::Always`],
+    /// which runs whatever the counter says. Runs at every store open, after
+    /// the kernel's own.
     ///
     /// # Errors
     ///
@@ -478,6 +575,9 @@ impl Schema {
                         f(conn)?;
                     }
                 }
+                // Every open, however far the ladder has already got: the
+                // sweep is the point, not the climb.
+                Step::Always(f) => f(conn)?,
                 Step::Derived {
                     key,
                     version,
@@ -923,6 +1023,7 @@ mod tests {
     use crate::effect::{Ctx, Deferred, Effect};
     use crate::panel::{Opening, Panel, PanelId, Tag};
     use serde::{Deserialize, Serialize};
+    use serde_json::Value;
 
     // -- a tiny app, and a second one that clashes with it -------------------
 
@@ -972,6 +1073,130 @@ mod tests {
     static ONE_APP: &[&dyn App] = &[&ONE];
     static BOTH: &[&dyn App] = &[&ONE, &TWO];
 
+    // -- two apps with tools, one of them offering another's name ------------
+
+    fn nothing(_s: &mut crate::session::Session, _in: &Value) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+
+    fn schema() -> Value {
+        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    struct Toolbox;
+    impl App for Toolbox {
+        fn id(&self) -> &'static str {
+            "toolbox"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn describe(&self) -> Option<&'static str> {
+            Some("a box with two tools in it")
+        }
+        fn tools(&self) -> Vec<Tool> {
+            vec![
+                Tool::new("toolbox.look", "looks", schema(), false, nothing),
+                Tool::new("toolbox.touch", "touches", schema(), true, nothing),
+            ]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static TOOLBOX: Toolbox = Toolbox;
+
+    /// Another app reaching for a name that is taken.
+    struct Borrower;
+    impl App for Borrower {
+        fn id(&self) -> &'static str {
+            "borrower"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn tools(&self) -> Vec<Tool> {
+            vec![Tool::new(
+                "toolbox.look",
+                "looks too",
+                schema(),
+                false,
+                nothing,
+            )]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static BORROWER: Borrower = Borrower;
+
+    static TOOLED: &[&dyn App] = &[&TOOLBOX, &ONE];
+    static CLASHING: &[&dyn App] = &[&TOOLBOX, &BORROWER];
+
+    #[test]
+    fn the_registry_lists_every_tool_in_app_order() {
+        let apps = Apps::new(TOOLED);
+        let names: Vec<&str> = apps.tools().iter().map(|t| t.name).collect();
+        // The kernel's own lead, whatever apps the build was given.
+        assert_eq!(names[0], "sql.query");
+        assert_eq!(&names[names.len() - 2..], &["toolbox.look", "toolbox.touch"]);
+        assert!(apps.tool("toolbox.touch").is_some_and(|t| t.writes));
+        assert!(!apps.tool("toolbox.look").expect("the tool").writes);
+        assert!(
+            apps.tool("nothing").is_none(),
+            "a name no app in this build offers"
+        );
+        // An app with nothing to offer says so by saying nothing.
+        let bare = Apps::new(ONE_APP);
+        assert_eq!(bare.tools().len(), crate::tools::all().len());
+        assert_eq!(ONE.describe(), None);
+        assert!(TOOLBOX.describe().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "two apps offer the tool toolbox.look: toolbox and borrower")]
+    fn two_apps_offering_one_tool_stop_the_boot() {
+        let _ = Apps::new(CLASHING);
+    }
+
+    /// An app that needs the finished list is handed it once, with every
+    /// other app's tools already in it.
+    struct Watcher;
+
+    /// What [`Watcher`] copied out of the registry it was attached to.
+    static ATTACHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    impl App for Watcher {
+        fn id(&self) -> &'static str {
+            "watcher"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn attach(&self, apps: &Apps) {
+            let mut seen = ATTACHED.lock().expect("what the watcher saw");
+            *seen = apps.tools().iter().map(|t| t.name.to_string()).collect();
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static WATCHER: Watcher = Watcher;
+    static WATCHING: &[&dyn App] = &[&TOOLBOX, &WATCHER];
+
+    #[test]
+    fn an_app_is_attached_to_the_finished_registry() {
+        let apps = Apps::new(WATCHING);
+        let seen = ATTACHED.lock().expect("what the watcher saw").clone();
+        let kernels: Vec<String> = crate::tools::all().iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            seen,
+            [kernels.clone(), vec!["toolbox.look".to_string(), "toolbox.touch".to_string()]].concat(),
+            "the whole list — the kernel's own first, then whoever offered one, in app order"
+        );
+        assert_eq!(apps.tools().len(), kernels.len() + 2);
+    }
+
     #[test]
     fn the_registry_answers_by_id_and_by_tag() {
         let apps = Apps::new(ONE_APP);
@@ -993,6 +1218,62 @@ mod tests {
     #[should_panic(expected = "two apps claim the tag beep: one and two")]
     fn two_apps_claiming_one_tag_stop_the_boot() {
         let _ = Apps::new(BOTH);
+    }
+
+    // -- an app that takes a panel as context --------------------------------
+
+    /// Which slot [`Taker`] was last asked about.
+    static ASKED: Mutex<Option<crate::layout::SlotId>> = Mutex::new(None);
+
+    struct Taker;
+    impl App for Taker {
+        fn id(&self) -> &'static str {
+            "taker"
+        }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] {
+            &[]
+        }
+        fn ask(&self, s: &mut crate::session::Session, about: crate::layout::SlotId) -> bool {
+            *ASKED.lock().expect("the slot last asked about") = Some(about);
+            s.notify("asked", false);
+            true
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    static TAKER: Taker = Taker;
+    static TAKING: &[&dyn App] = &[&ONE, &TAKER];
+
+    /// The hook the workspace's `cmd+shift+a` runs down the app list: an app
+    /// that answers a panel takes the slot and says so, and an app with
+    /// nothing to answer with leaves the default.
+    #[test]
+    fn an_app_can_take_a_panel_as_context() {
+        let mut s = crate::session::Session::fake(TAKING);
+        s.act(
+            crate::session::Action::new("open", "open").moving(|wm| {
+                wm.open(PanelId::bare(Tag("beep")), None, false);
+            }),
+        );
+        s.settle();
+        let slot = s.focus().expect("the new slot");
+
+        assert!(!ONE.ask(&mut s, slot), "an app with no answer leaves it");
+        assert!(ASKED.lock().expect("the slot").is_none());
+
+        assert!(TAKER.ask(&mut s, slot), "and one with an answer takes it");
+        assert_eq!(*ASKED.lock().expect("the slot"), Some(slot));
+        assert_eq!(s.notes().len(), 1, "the app acted on the session it was handed");
+
+        // What the shell does with the answers: the list in order, the first
+        // taker wins.
+        let taken = Apps::new(TAKING)
+            .list()
+            .iter()
+            .find(|a| a.ask(&mut s, slot))
+            .map(|a| a.id());
+        assert_eq!(taken, Some("taker"));
     }
 
     // -- the ladder ----------------------------------------------------------
@@ -1069,6 +1350,34 @@ mod tests {
             .unwrap();
         assert_eq!(planted, 1, "the steps ran once");
         assert_eq!(meta(&store, "rebuilds"), 1, "and so did the rebuild");
+    }
+
+    /// A rung that runs at every open runs on the climb *and* on every open
+    /// after it, in its place in the ladder — and the counter still says how
+    /// far the ladder got.
+    #[test]
+    fn an_always_step_runs_at_every_open() {
+        static SWEEPING: Schema = Schema {
+            app: "one",
+            steps: &[
+                Step::Sql("CREATE TABLE one_thing(id INTEGER PRIMARY KEY, name TEXT)"),
+                Step::Always(|c| {
+                    c.execute(
+                        "INSERT INTO meta(key, value) VALUES('sweeps', 1)
+                         ON CONFLICT(key) DO UPDATE SET value = value + 1",
+                        [],
+                    )
+                    .map(|_| ())
+                }),
+            ],
+        };
+        let store = Store::open(None, &[&SWEEPING]).expect("store");
+        assert_eq!(meta(&store, "sweeps"), 1);
+        assert_eq!(meta(&store, "schema:one"), 2, "recorded like any rung");
+
+        store.write(|c| SWEEPING.apply(c)).expect("a second open");
+        assert_eq!(meta(&store, "sweeps"), 2, "and again on the next open");
+        assert_eq!(meta(&store, "schema:one"), 2, "with the counter standing");
     }
 
     /// A `Derived` step is versioned by the walk that made it, not by the

@@ -43,6 +43,18 @@ impl Panel for Help {
         "help".into()
     }
 
+    /// The manual is not data, and says so.
+    fn about(&self) -> String {
+        "The manual, and the design language's own showcase: the legend for \
+         the three interactive signals, the workspace's keys, and the grammar \
+         of a panel — drawn with the very widgets it describes, so the links \
+         on it really open and the bar at its foot really carries this \
+         panel's verbs. It takes no arguments and reads no rows at all: there \
+         is nothing here to query. It is what a person reads to learn the \
+         shell, and the one panel a fresh store comes up on."
+            .into()
+    }
+
     /// Wide and tall enough for the legend and the keys together.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (5, 5)

@@ -392,6 +392,22 @@ impl Panel for Dir {
         basename(&self.dir).to_string()
     }
 
+    /// The directory, and the one thing that makes this app unlike the
+    /// others: there is no table under it.
+    fn about(&self) -> String {
+        format!(
+            "One directory as a list: what is in {} on this machine's disk, a \
+             row a file or a folder, with the name, the size and the date off \
+             a `stat`. Its argument is that path, in the display spelling; \
+             nothing here is in the store — the disk is the state, so there is \
+             no table to query and the listing is read again whenever anything \
+             writes. A person walks the rows, opens one as a card, marks some, \
+             and copies, moves, deletes or renames — every one of them a real \
+             move on the disk, undone by moving it back.",
+            self.dir
+        )
+    }
+
     /// A list is a column: as wide as a panel gets by default, and tall
     /// enough that a directory is read rather than scrolled.
     fn wish(&self, _cols: usize) -> (u32, u32) {

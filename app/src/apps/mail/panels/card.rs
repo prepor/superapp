@@ -203,6 +203,23 @@ impl Panel for Card {
         self.name()
     }
 
+    /// One part of a letter, and why it has no path.
+    fn about(&self) -> String {
+        format!(
+            "One part of a letter, on the same card the files app draws a path \
+             with: the name, the media type, the size, the letter it came \
+             with, and a preview when it is text or a picture. Its arguments \
+             are the letter's `message.id`, {}, and the part's place in it, \
+             {} — a part's own row in `attachment` is derived from the \
+             letter's raw MIME and local to a device, so the identity is the \
+             pair rather than that row's id. The bytes stay in `message.raw` \
+             and are never stored twice; there is no path either, so the one \
+             verb is *open*, which writes the part to a scratch directory and \
+             hands that to the operating system.",
+            self.mail, self.at
+        )
+    }
+
     /// Three rows as the floor, more when the preview needs them. The bytes
     /// are not here to measure — they come off a thread — so a text part is
     /// wished at its size and a picture at the box a card gives one.

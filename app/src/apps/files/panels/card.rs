@@ -291,6 +291,20 @@ impl Panel for Card {
         self.name()
     }
 
+    /// One file, and where its facts come from.
+    fn about(&self) -> String {
+        format!(
+            "One file as a card: {} — its name, its kind, its size, its date, \
+             its path, and a preview when it is text or a picture small enough \
+             to be worth reading. Its argument is that path; nothing is stored \
+             about it, so every fact here comes off the disk when the panel \
+             opens and again whenever a verb writes. The verbs are the file's \
+             own: open it with the operating system, hold it for a copy or a \
+             move, rename it, or put it in the trash.",
+            self.path
+        )
+    }
+
     /// Three rows as the floor, more when the preview needs them — a long
     /// text file opens tall rather than scrolled, a tall picture is seen
     /// whole — up to what a grid is likely to hold. The layout clamps it to

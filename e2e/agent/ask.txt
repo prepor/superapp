@@ -1,0 +1,118 @@
+# args: --demo-disk
+# env:
+#
+# The gate: a call that cannot be undone waits for the person's word. The
+# fake asks for `files.trash` when the message says *delete*, and that tool
+# asks — so the call does not run on arrival. It becomes a card that stands
+# there saying *waiting for you*, with *allow* and *refuse* under it.
+#
+# Twice, because both answers are worth proving. The first is a refusal: the
+# card wears *refused*, nothing on the disk moved, and the run goes on — the
+# model reads *refused by the person* as the tool's answer and says its piece.
+# The fake does not read what a call came to, so its scripted *Deleted it.*
+# follows a refusal as readily as it follows a deletion; what says whether
+# anything was deleted is the listing standing open beside the chat.
+#
+# The second is an allowance: the card becomes an ordinary done card wearing
+# the node's own sentence, the row leaves the listing, and one ⌘Z takes it
+# back — an allowed call is one undoable action like any other.
+#
+# The assertions are the clicks: a row resolves for a path that is there and
+# for no other, and the card it opens says which file it is on.
+#
+# Run with `--demo-disk`, so the tree is the fixture rather than whatever
+# this machine's ~ holds: an agent must no more delete a human's files in a
+# scripted run than a files suite may.
+
+wait 900
+
+# The directory the readme is in, open and being looked at.
+key cmd 2
+wait 500
+type "files"
+wait 500
+key enter
+wait 900
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+
+# The chat, and the ask.
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "delete the readme"
+wait 500
+key enter
+wait 900
+
+# The card is up and nothing has happened yet: the tool and what the model
+# wrote for it on the line, and under it whose move it is.
+click "files.trash"
+wait 400
+click "waiting for you"
+wait 400
+shot k1-asked
+
+# -- refused -----------------------------------------------------------------
+
+click "refuse"
+wait 900
+click "refused"
+wait 400
+
+# The refusal was the tool's answer, so the round went on rather than hanging
+# on a call that will never run.
+click "Deleted it."
+wait 400
+
+# And nothing was deleted: the row is where it was, and the card it opens is
+# on the file itself.
+click "README.txt"
+wait 700
+click "~/Downloads/README.txt"
+wait 400
+shot k1b-refused
+
+# -- allowed -----------------------------------------------------------------
+
+click "ask"
+wait 400
+type "delete the readme"
+wait 500
+key enter
+wait 900
+
+click "allow"
+wait 900
+
+# The card is an ordinary one now, wearing the sentence the tool's own node
+# wears — the words ⌘Z offers to take back.
+click "delete “README.txt”"
+wait 400
+shot k2-allowed
+
+# The listing beside it is the disk answering: its neighbour is there, and
+# the readme is not.
+click "report-q3.pdf"
+wait 700
+shot k3-gone
+
+# One undo for the preview that click opened, one for the delete — and the
+# file is back, under the card that still says what was done.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+click "README.txt"
+wait 700
+click "~/Downloads/README.txt"
+wait 400
+shot k4-undone
+quit

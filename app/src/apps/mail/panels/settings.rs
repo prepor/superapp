@@ -121,6 +121,20 @@ impl Panel for Settings {
         "settings".into()
     }
 
+    /// The accounts, and the one thing that is deliberately not here.
+    fn about(&self) -> String {
+        "Mail's accounts: one row per row of `account`, with the address, the \
+         IMAP host and what the last sync pass wrote on it, each of the three \
+         selectable so an error can be carried somewhere else, plus a *remove* \
+         per row. It takes no arguments and owns nothing — the rows are a \
+         cached query, so an account a worker has just synced changes its own \
+         line. No secret is here or in the store: an app password lives in the \
+         keychain under the address and a Google refresh token under a key of \
+         its own. What a person does here is read a failing account, remove \
+         one, or go on to the form that adds one."
+            .into()
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 4)
     }

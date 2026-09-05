@@ -74,6 +74,19 @@ impl Panel for Contact {
         self.who().0
     }
 
+    /// One correspondent, and where the card's three facts come from.
+    fn about(&self) -> String {
+        format!(
+            "One correspondent's card: the name {} last wrote under, the \
+             address itself, and how many letters in mail are theirs. Its \
+             argument is the address; a contact is not a table here, so all \
+             three are cached queries over `message` and a letter that arrives \
+             while the card is open changes the count on the next draw. Its \
+             one move is to open the inbox filtered to this address.",
+            self.email
+        )
+    }
+
     /// A card, not a list: a name, an address, a count and a link.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (3, 2)

@@ -47,6 +47,19 @@ impl Panel for Problems {
         "problems".into()
     }
 
+    /// What stands wrong, and why it is not a table.
+    fn about(&self) -> String {
+        "Everything that stands wrong right now, one row a condition: what it \
+         is, the line that says why, and whatever controls that condition \
+         carries with it. Problems are stored nowhere — every app's own \
+         sources derive them from rows on each poll, so fixing the cause makes \
+         a row disappear rather than clearing it — and this panel takes no \
+         arguments and owns nothing. What a person does here is read the line, \
+         copy it, and press what the row offers: a *retry*, or a link to \
+         wherever the fix is."
+            .into()
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 4)
     }

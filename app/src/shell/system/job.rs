@@ -61,6 +61,23 @@ impl Panel for Job {
         }
     }
 
+    /// One effect in full, and what its id means.
+    fn about(&self) -> String {
+        format!(
+            "One effect of the log in full: the sentence it described itself \
+             with, what went wrong if anything did, and then the row as \
+             `sqlite3` would show it — the job's own facts, the JSON payload \
+             it was filed as, and the answer the world gave back. Its argument \
+             is the id, {}: a positive one is a row of `effect`, a negative \
+             one a place in the in-memory ring, which has no payload, no reply \
+             and no life beyond this process — which is why such a panel saves \
+             itself as the list it came out of. Nothing here acts; everything \
+             below the subject is a selectable run, because a payload is \
+             something one copies into a report.",
+            self.job
+        )
+    }
+
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 5)
     }

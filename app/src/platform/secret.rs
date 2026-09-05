@@ -5,7 +5,7 @@
 //! else a mode-0600 file inside the app directory. Never the store: a secret
 //! is the one thing that must not replicate.
 //!
-//! A key that begins `r2/` is a device-sync bucket's secret access key and
+//! A key that begins `r2/` is a device-sync bucket's Cloudflare API token and
 //! goes under its own keychain service, so a key id can never collide with a
 //! mail account's address. The kernel spells that prefix once, in
 //! [`kernel::repl::r2::secret_key`].
@@ -22,7 +22,7 @@ use kernel::caps::Secrets;
 #[cfg(target_os = "macos")]
 const SERVICE: &str = "superapp-imap";
 
-/// The one a device-sync bucket's secret access key goes under.
+/// The one a device-sync bucket's token goes under.
 #[cfg(target_os = "macos")]
 const BUCKET_SERVICE: &str = "superapp-r2";
 

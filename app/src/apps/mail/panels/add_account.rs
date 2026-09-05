@@ -319,6 +319,19 @@ impl Panel for AddAccount {
         "add account".into()
     }
 
+    /// The two doors to one row.
+    fn about(&self) -> String {
+        "The form that adds an account, and Google's consent above it: two \
+         doors to one row of `account`. The four fields are a label, an \
+         address and the two host fields — prefilled, because a form with two \
+         empty host fields is a quiz — and *add* writes the row and files the \
+         password to the keychain, refusing a blank address or one already \
+         present. It takes no arguments and reads nothing; *sign in with \
+         google* does the same thing through an OAuth grant instead, which a \
+         scripted run refuses in one line."
+            .into()
+    }
+
     /// The form is compact: four labelled fields and the Google row above
     /// them.
     fn wish(&self, _cols: usize) -> (u32, u32) {

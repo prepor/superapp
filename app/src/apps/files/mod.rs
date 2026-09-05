@@ -16,6 +16,7 @@ use kernel::effect::World;
 use kernel::panel::PanelKind;
 use kernel::session::Session;
 use kernel::store::Store;
+use kernel::tool::Tool;
 
 pub mod completion;
 pub mod model;
@@ -23,6 +24,7 @@ pub mod ops;
 pub mod panels;
 pub mod run;
 pub mod scenes;
+pub mod tools;
 pub mod ui;
 pub mod widgets;
 
@@ -83,6 +85,10 @@ impl App for Files {
         KINDS
     }
 
+    fn tools(&self) -> Vec<Tool> {
+        tools::all()
+    }
+
     /// One root: home. Everywhere else is a walk or a typed path away.
     fn roots(&self) -> Vec<Root> {
         vec![Root::new(Dir::id(HOME), "files", "disk home directory")]
@@ -133,10 +139,34 @@ impl App for Files {
         s.redraw();
     }
 
+    /// What there is to know about files' data, which is that there is
+    /// none.
+    fn describe(&self) -> Option<&'static str> {
+        Some(FILES_DESCRIBE)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
+
+/// The data dictionary an agent is given for files. The shortest one there
+/// can be: the app stores nothing, so the whole of it is *do not go looking
+/// for a table, and here is what to use instead*.
+const FILES_DESCRIBE: &str = "\
+the files app stores nothing. There are no tables for it in the database and \
+no rows to query: the disk is the state. A listing is a directory read, a \
+file's facts are one `stat`, and a preview is the first bytes of the file — \
+so a SQL query has nothing to say about files, and everything here is done \
+through the app's own tools: list a directory, read a text file, rename, \
+move, copy, trash, make a directory, write one.
+
+Paths are written the way a person writes them, with `~` for the home \
+directory, and that is the spelling a panel carries as its argument. Every \
+one of those tools is the same code the panel's own verb runs, so a change \
+made through one and a change made through the other are the same undoable \
+action: an undo is the opposite write — a rename back, a move back, a copy \
+deleted — and never a restore from a copy nobody kept.";
 
 // -- the clipboard -------------------------------------------------------------
 

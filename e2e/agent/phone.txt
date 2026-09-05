@@ -1,0 +1,51 @@
+# args: --grid 4x3 --window 380x780
+# env:
+#
+# The chat on the cover display: a 380×780 window on a 4×3 grid, which is what
+# the outer screen of a folding phone gets. The chat asks for six by six and
+# gets the whole board, so the transcript is the screen and the composer sits
+# at its foot; when the soft keyboard shows, the shell shortens the workspace
+# by the occlusion and the panel makes room by being shorter — the composer
+# stays where it is, at the foot of whatever room is left.
+#
+# `cmd+shift+a` has no glass equivalent — a long press on a header is already
+# *pick the panel up* — so the chat's own **add panel** is the phone's way
+# into the context a chord opens on the desktop: a field over the panels that
+# are open, one pick apiece.
+
+wait 900
+shot f1-inbox
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+shot f2-chat
+
+# The verb stands the field up and hands it the keyboard; what is typed is
+# matched against the open panels' titles, and enter takes what the offer is
+# showing.
+click "add panel"
+wait 600
+type "inb"
+wait 700
+shot f3-picking
+key enter
+wait 700
+
+# The pick is the panel's own chip, in the composer, and it goes with what is
+# sent — so the answer names the panel the chip carried.
+click "chip inbox"
+wait 500
+click "ask"
+wait 400
+type "what am I looking at"
+wait 500
+key enter
+wait 900
+click "You are looking at inbox."
+wait 400
+shot f4-answered
+quit

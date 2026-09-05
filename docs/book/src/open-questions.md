@@ -59,11 +59,12 @@ belongs to.
 
 13. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
     covers the tap, the scroll, the workspace pan, the workspaces overlay, the
-    panel drag and the row's mark and sweep. Four moves still have no gesture:
+    panel drag and the row's mark and sweep. Five moves still have no gesture:
     sending a panel to another workspace, moving it between columns, toggling
-    tabs for a column, and opening a link un-joined, which on glass always
-    joins. Possible homes include a long press on a link and a menu on the
-    header.
+    tabs for a column, opening a link un-joined, which on glass always joins,
+    and offering a panel to an agent as context, since a long press on a header
+    is already *pick the panel up*. Possible homes include a long press on a
+    link and a menu on the header.
 
 14. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
     the shell's own half of it is written: touch, the grid the screen picks,
@@ -74,3 +75,36 @@ belongs to.
     private file, and, for the file browser, access outside the app directory,
     the system opener and the system trash, which mean the Storage Access
     Framework, a `FileProvider`, and `MediaStore`.
+
+16. **The gateway's account.** *(Agents)* It is read off the bucket's host, so
+    a device with no R2 bucket has no gateway at all. The store an agent reads
+    is the synced one anyway, which is the argument for it; the alternative is
+    one more const beside the gateway's name, or a field of its own, and a
+    device that wants a model without wanting to sync.
+
+17. **`sql.write` at all.** *(Agents)* A model given a writer uses it. It is
+    offered because it was asked for, because the apps' tools are preferred in
+    the prompt, and because the changeset comes back on `cmd+z`. What is not
+    settled is whether the refusals it stands on — the kernel's tables, a table
+    with no primary key, a table the call itself made, any change of shape —
+    are the right line, or whether a store this personal wants a narrower door.
+
+18. **Where a call runs.** *(Agents)* The chat panel runs a run's calls on the
+    UI thread, because a tool is the verb's own code path and a verb needs the
+    session. The cost is that a chat shown nowhere pauses its run at the next
+    call. The alternative is a kernel hook — `App::tick(&mut Session)`, run
+    every frame the store changed — which is generic and small, and would be
+    the first thing the kernel scheduled for an app.
+
+19. **The turn as wire JSON.** *(Agents)* A turn's `body` is the wire's message
+    verbatim, so the next request is built from the rows and nothing is lost in
+    a mapping. The cost is that a change in the wire is a `Step::Derived` walk
+    over every old turn. An app-shaped row per block would cost that mapping
+    now instead.
+
+20. **Asking before a call.** *(Agents)* Every tool call runs on arrival and
+    undo is the net. A gate — a card that waits, with *allow*, *refuse* and
+    *allow all for this run* — is the obvious next step, and the schema has
+    room for it: `agent_call.status` can take the words and `Tool::writes` is
+    what it would key on. What is not clear is which tools would want one,
+    since a gate on all of them is a chat nobody finishes.

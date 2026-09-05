@@ -1,9 +1,10 @@
 # Apps
 
-An app is what the shell can be extended with without being touched. Mail and
-files are apps; so is `system`, the shell's own, which supplies help, about,
-the effect log, the problems list, the search panel, the device-sync form, and
-the card a panel gets when no app in this build owns its tag.
+An app is what the shell can be extended with without being touched. Mail,
+files and [agents](./agents.md) are apps; so is `system`, the shell's own,
+which supplies help, about, the effect log, the problems list, the search
+panel, the device-sync form, and the card a panel gets when no app in this
+build owns its tag.
 
 The binary is the only place that knows which apps exist. `app/src/lib.rs`
 holds two lists side by side: `APPS`, what each app adds to the store, the
@@ -52,6 +53,10 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `workers` | the background passes the app wants running now, derived from the store |
 | `poll` | what the app owes the UI thread: work it started elsewhere that has finished and now needs a session |
 | `roots` | the panels the launcher offers whether or not they are open |
+| `describe` | the app's data in its own words: each table, what a row is, the columns that matter, and what must never be written directly. Prose, not a schema dump, because it is read into an [agent](./agents.md#what-a-panel-says-about-itself)'s system prompt |
+| `tools` | the things this app lets an agent do, by name. Collected into one list at boot; two apps offering one name stop the process, naming both. Each says whether it `writes`, and whether it `asks` — the few whose call waits for the person's word before it runs, because undo cannot take it back |
+| `ask` | takes a panel as context: opens whatever this app answers a panel with, joined to it, and says whether it did. The shell offers the focused slot to the apps in list order on `cmd+shift+a` and stops at the first taker |
+| `attach` | the finished registry, once, at the end of boot. An app that needs the *list* — every tool, every data dictionary — copies what it needs here, and may not keep the reference |
 
 `AppUi`, in `app/src/shell/app_ui.rs`, is the Makepad half: `script_mod` for
 the app's own template block, `template(tag)` for the widget the shell
@@ -74,10 +79,16 @@ no claims.
 
 `Panel` is the live instance in a slot. It owns its own state between draws:
 its table, its cursor and marks, which messages are open, what it measured, the
-text of its fields. It answers `id`, `title`, `wish`, `verbs`, `persist`, and
-`run`, is told `placed(slot)` once the layout has run, and lends itself through
-`as_any` so its own app can downcast it. The widget that draws it borrows it
-from the scope and calls its methods on input.
+text of its fields. It answers `id`, `title`, `about`, `wish`, `verbs`,
+`persist`, and `run`, is told `placed(slot)` once the layout has run, and lends
+itself through `as_any` so its own app can downcast it. The widget that draws
+it borrows it from the scope and calls its methods on input.
+
+`about` is the one paragraph the panel would say about itself to an
+[agent](./agents.md#what-a-panel-says-about-itself) — what the rows are, what
+the arguments mean, what a person does here. It leads the panel's chip, above
+the queries that drew it, so a model reads the app's own sentence before it
+reads any rows; the default is the title and the identity.
 
 `Verb` is one entry of the bar. Its `id` is stable and prefixed
 (`mail.archive`) and is what history labels, the e2e harness, and tests name it
@@ -167,13 +178,27 @@ build and compose simply offers no *attach*. State an app wants others to
 observe needs no subscription: bars are pulled on every draw, and a redraw is
 the one signal.
 
+## The kernel's own tools
+
+An app's `tools` are its own, but six belong to no app: every build has them,
+whatever apps it was given, so `Apps::tools()` chains them in ahead of the
+apps' the way the registry chains in the bucket's problem source. `sql.query`,
+`sql.write` and `sql.schema` are the store itself, read and written and
+described; `panels.list`, `panels.context` and `panels.open` are the workspace
+— what is open, what one open panel says of itself, and a way to put a panel
+beside the chat. Three rules hold over the writing one: the kernel's own tables
+are refused by name, a write is undoable or it does not happen, and it `asks` —
+a statement no app is speaking for waits for the person's word. See
+[Agents](./agents.md#the-kernels-own).
+
 ## Capabilities
 
 A capability is a trait an effect reaches the outside through. The kernel owns
 the six every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
 `Clipboard`, `Screen`, `Disk`, and the `Watcher` over it, because the harness,
 attachments, and a file browser all use them. An app defines its own and
-supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`.
+supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`, and
+the agent's is `Gateway`.
 
 `Mode` says which outside a world gets: `Real` the network and the OS, `Fake`
 the in-memory versions, `Deny` nothing but the clock, which is the default for
@@ -202,7 +227,13 @@ a draw is allowed, which is how a files panel lists its directory.
 many steps have run. `Step::Sql` and `Step::Run` are applied once, in order.
 `Step::Derived` is data rebuilt from other rows, versioned by the walk that
 made it rather than by the ladder's counter, so a better walk rebuilds every
-store on its next open however old it is.
+store on its next open however old it is. `Step::Always` runs at **every**
+open, in its place in the ladder: what a crash left behind is put right there,
+before any worker is asked for — an [agent run](./agents.md#what-a-crash-leaves)
+that was streaming when the process died has no worker coming back for it and
+no job in the queue, so the open is the only moment anybody can say so. It is
+recorded like any other rung the first time it runs, so the counter still says
+how far a store got.
 
 An app never alters another app's tables, and new apps prefix their table names
 with their id. The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`,
@@ -261,8 +292,8 @@ listed first.
 2. Code under `app/src/shell/` and `app/src/platform/` names no app.
 3. Apps reach each other only through `Apps::get` and `Apps::get_as`, and work
    when the answer is `None`.
-4. A tag, a verb id, an effect kind, and a table name never change once written
-   to a store.
+4. A tag, a verb id, a tool name, an effect kind, and a table name never change
+   once written to a store.
 5. Every deferred effect says whether it writes. Every bar has no reserved
    chord and no duplicate letter.
 6. An app's e2e suites live under `e2e/<app>/` and name only labels its own

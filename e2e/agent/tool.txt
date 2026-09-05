@@ -1,0 +1,73 @@
+# args: --demo-disk
+# env:
+#
+# A tool call, its card, and the disk it reached. The fake asks for
+# `files.rename` when the message says *rename*; the call runs on the UI
+# thread the moment it arrives, through the same code path the listing's own
+# *rename* button runs, and files one undoable node.
+#
+# So the card says that node's own sentence — *rename “README.txt” to
+# “readme-renamed.txt”*, the words ⌘Z offers to take back — rather than the
+# tool's name and the model's arguments. The assertion is the click: the line
+# resolves only if the call really put it there, and the listing standing
+# open beside the chat resolves the new name only if the file really moved.
+#
+# Run with `--demo-disk`, so the tree is the fixture rather than whatever this
+# machine's ~ holds: an agent must no more rename a human's files in a
+# scripted run than a files suite may.
+
+wait 900
+
+# The directory the readme is in, open and being looked at.
+key cmd 2
+wait 500
+type "files"
+wait 500
+key enter
+wait 900
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+shot t1-before
+
+# The chat, and the ask.
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "rename the readme"
+wait 500
+key enter
+wait 900
+
+# The card's first line is what was done, in the app's own words.
+click "rename “README.txt” to “readme-renamed.txt”"
+wait 400
+shot t2-card
+
+# The run went on: the model read what the call came to and said so.
+click "Renamed it."
+wait 400
+
+# And the listing beside it has the new name in it. A row resolves for a path
+# that is there and for no other, so this is the disk itself answering.
+click "readme-renamed.txt"
+wait 900
+shot t3-renamed
+
+# The agent's act is one undo like any other: the first ⌘Z takes back the
+# preview the click just opened, the second the rename — and the old name is
+# back in the listing, under the card that still says what was done.
+key cmd+z
+wait 700
+key cmd+z
+wait 900
+click "README.txt"
+wait 700
+shot t4-undone
+quit

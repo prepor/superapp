@@ -125,6 +125,23 @@ impl Panel for Message {
         model::thread_topic(&self.store, self.mail).unwrap_or_else(|| "message".into())
     }
 
+    /// The conversation, named, and what opening it already did.
+    fn about(&self) -> String {
+        let topic = model::thread_topic(&self.store, self.mail)
+            .unwrap_or_else(|| "a conversation".into());
+        format!(
+            "The reader: one whole conversation — “{topic}” — oldest letter \
+             first, deduplicated by `Message-ID` so a reply that sits in both \
+             Sent and the folder it was filed in appears once. Its argument is \
+             a `message.id`, {}, and the letters are every row of `message` \
+             sharing that row's `thread`; opening the panel marked the unread \
+             ones read, on the same undoable node as the panel itself. A \
+             person reads here, folds a letter or its quoted tail open and \
+             shut, and archives, deletes, replies or forwards.",
+            self.mail
+        )
+    }
+
     /// As many rows as the conversation reads as, three at the least. The
     /// letter that does not fit is the whole reason a wish takes the column
     /// width.

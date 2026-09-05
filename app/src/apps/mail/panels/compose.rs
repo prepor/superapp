@@ -214,6 +214,33 @@ impl Panel for Compose {
         }
     }
 
+    /// A draft is not a letter, and what this one started from.
+    fn about(&self) -> String {
+        let from = match self.seed {
+            Seed::Blank => "It started blank.".to_string(),
+            Seed::Reply(id) => format!(
+                "Its arguments say it is a reply to message {id}, so it came \
+                 up with the recipient and subject filled and that letter \
+                 quoted under them."
+            ),
+            Seed::Forward(id) => format!(
+                "Its arguments say it is a forward of message {id}, so it came \
+                 up with an empty recipient and that letter under a \
+                 forwarded-message header."
+            ),
+        };
+        format!(
+            "A draft, not a letter: the recipient, the subject and the body of \
+             something nobody has sent, written to `draft` as it is typed and \
+             keyed by this panel's own slot — slot ids are stable and \
+             persisted, so half-written text survives a restart. {from} \
+             *send* files one `outbox` row with a ten-second window and closes \
+             the sheet, both on one undoable node; nothing here reaches a \
+             server, and until that window runs out an undo takes the letter \
+             back."
+        )
+    }
+
     /// Three fields and room to write in the third.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 4)

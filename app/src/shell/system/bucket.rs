@@ -9,6 +9,10 @@
 //! the only way it can be. The secret field is write-only — it is seeded
 //! blank even on a configured device, because a key that can be read back
 //! off a screen is a key that leaves by a route nobody chose.
+//!
+//! What goes in that field is the Cloudflare API token's *value*: the key
+//! the bucket signs with is its hash, taken on the way to a signature
+//! ([`r2::creds`]), and the value is the one credential this device has.
 
 use std::any::Any;
 
@@ -33,8 +37,8 @@ pub struct Bucket {
     id: PanelId,
     url: String,
     key_id: String,
-    /// Write-only: typed in, filed in the platform's secret store, and
-    /// cleared. Never read back out for display.
+    /// The Cloudflare API token's value. Write-only: typed in, filed in the
+    /// platform's secret store, and cleared. Never read back out for display.
     secret: String,
 }
 
@@ -98,6 +102,21 @@ impl Panel for Bucket {
 
     fn title(&self) -> String {
         "device sync".into()
+    }
+
+    /// The form, and where what it takes actually goes.
+    fn about(&self) -> String {
+        "The device-sync form: where the bucket is and the key that opens it — \
+         an endpoint, a bucket name, an access key id, and a write-only secret \
+         field, which comes up blank even on a device that is already \
+         configured, because a key that can be read back off a screen is one \
+         that leaves by a route nobody chose. It takes no arguments, and what \
+         *connect* writes is the `bucket` file beside the store and one \
+         keychain entry — never a row, because a secret is the one thing that \
+         must not replicate. What goes in that field is the Cloudflare API \
+         token's value; the key the bucket signs with is its hash, taken on \
+         the way to a signature."
+            .into()
     }
 
     /// A form: as wide as an endpoint URL reads, and no taller than its

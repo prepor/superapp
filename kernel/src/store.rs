@@ -124,6 +124,10 @@ pub struct TraceEntry {
     pub sql: String,
     pub describe: &'static str,
     pub params: String,
+    /// The parameters as they were bound — what a re-run binds again. The
+    /// display form above is what `cmd+i` prints; this is what the panel
+    /// context re-reads the rows with.
+    pub values: Vec<Val>,
     pub rows: usize,
 }
 
@@ -221,8 +225,22 @@ type RunFn = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<Erased> + Send>;
 /// The same, for a replication-internal op on the raw connection.
 type RawFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<Erased> + Send>;
 
-/// A reply channel's payload: the closure's value plus the tables it touched.
-type WriteOut = rusqlite::Result<(Erased, HashSet<String>)>;
+/// What one captured write answers back over the reply channel.
+struct Wrote {
+    /// What the closure returned.
+    value: Erased,
+    /// The tables it touched — the invalidation the caller's [`Store`]
+    /// consumes.
+    touched: HashSet<String>,
+    /// The changeset the session recorded for it, the same bytes `repl_log`
+    /// keeps. Empty when nothing replicated moved. Handed back so a caller
+    /// that wants to undo *rows* rather than an intent of its own — an
+    /// agent's `sql.write` — can invert it.
+    cs: Vec<u8>,
+}
+
+/// A reply channel's payload.
+type WriteOut = rusqlite::Result<Wrote>;
 
 /// One unit of work for the writer thread.
 enum Job {
@@ -371,13 +389,13 @@ impl Db {
     }
 
     /// Submits a write and blocks for its value plus the tables it touched
-    /// (the invalidation the caller's [`Store`] consumes). A panic inside
-    /// `f` is caught and returned as an error — one bad closure must not
-    /// kill the only writer.
+    /// (the invalidation the caller's [`Store`] consumes) and the changeset
+    /// it recorded. A panic inside `f` is caught and returned as an error —
+    /// one bad closure must not kill the only writer.
     fn write<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<(T, HashSet<String>)> {
+    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
         if !self.writable.load(Ordering::Acquire) {
             return Err(store_err(
                 "the store is read-only: another device holds the lease",
@@ -388,9 +406,9 @@ impl Db {
         self.jobs
             .send(Job::Write { run, reply })
             .map_err(|_| gone())?;
-        let (erased, dirty) = rx.recv().map_err(|_| gone())??;
-        let v = *erased.downcast::<T>().expect("write result type");
-        Ok((v, dirty))
+        let w = rx.recv().map_err(|_| gone())??;
+        let v = *w.value.downcast::<T>().expect("write result type");
+        Ok((v, w.touched, w.cs))
     }
 
 }
@@ -587,7 +605,7 @@ fn do_write(
         tx.execute("UPDATE repl SET next_local_seq = next_local_seq + 1", [])?;
     }
     tx.commit()?;
-    Ok((value, touched))
+    Ok(Wrote { value, touched, cs })
 }
 
 /// Seconds since the epoch, for a log row's `ts` — a record timestamp, not
@@ -696,9 +714,31 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (out, dirty) = self.db.write(f)?;
+        let (out, dirty, _cs) = self.db.write(f)?;
         self.bump(&dirty);
         Ok(out)
+    }
+
+    /// The same write, answering the **changeset** it recorded beside its
+    /// value — the very bytes `repl_log` kept, empty when nothing
+    /// replicated moved.
+    ///
+    /// What it is for: an undo that has no intent of its own. An app's verb
+    /// knows how to put its rows back, so it claims an
+    /// [`Intent`](crate::history::Intent) that says so in the app's words;
+    /// a tool that ran a person's `UPDATE` knows only which rows moved, and
+    /// the session extension's inverse is the whole of what it can promise.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the closure returned, or the gate's refusal.
+    pub fn write_recorded<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<(T, Vec<u8>)> {
+        let (out, dirty, cs) = self.db.write(f)?;
+        self.bump(&dirty);
+        Ok((out, cs))
     }
 
     /// Bumps the generation of every table a commit touched, so cached
@@ -890,6 +930,7 @@ impl Store {
                         sql: sql.to_string(),
                         describe,
                         params: pkey,
+                        values: params.to_vec(),
                         rows: rows.len(),
                     });
                 }

@@ -12,6 +12,7 @@ use std::any::Any;
 
 use kernel::app::{App, Root};
 use kernel::panel::{PanelKind, Tag};
+use kernel::tool::Tool;
 use makepad_widgets::*;
 
 use crate::shell::app_ui::AppUi;
@@ -25,6 +26,7 @@ mod missing;
 mod problems;
 mod scenes;
 mod search;
+mod tools;
 
 pub use about::{About, AboutPanel};
 pub use bucket::{Bucket, BucketPanel};
@@ -563,7 +565,7 @@ script_mod! {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "SECRET" }
             secret_input := mod.widgets.SField {
-                empty_text: "secret access key — stored, never shown"
+                empty_text: "cloudflare api token — its value, stored, never shown"
                 autocapitalize: AutoCapitalize.None
                 autocorrect: AutoCorrect.Disabled
             }
@@ -572,7 +574,7 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel {
                 width: Fill
-                text: "the secret goes to this machine's keychain, never to the store: it is the one thing that must not replicate."
+                text: "the token goes to this machine's keychain, never to the store: it is the one thing that must not replicate."
                 draw_text +: { color: #909090 }
             }
         }
@@ -629,6 +631,10 @@ impl App for System {
         KINDS
     }
 
+    fn tools(&self) -> Vec<Tool> {
+        tools::all()
+    }
+
     /// Help leads, so an empty store comes up on the manual. A `job` is
     /// not a root: one is reached from the log that lists it.
     fn roots(&self) -> Vec<Root> {
@@ -675,5 +681,72 @@ impl AppUi for Ui {
     /// the two lists it keeps about itself.
     fn scenes(&self) -> Vec<kernel::scene::Scene<crate::shell::app_ui::Setup>> {
         scenes::scenes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use kernel::panel::PanelId;
+    use kernel::session::{Action, Session};
+
+    use super::*;
+
+    static APPS: &[&dyn App] = &[&SYSTEM];
+
+    /// Every kind the shell's own app owns says what it is about in its own
+    /// words — not the default, which is the title and the identity and
+    /// tells an agent nothing it could not read off the tag.
+    ///
+    /// A new kind here fails this until it has both a sample identity and a
+    /// paragraph: the two go together, since a paragraph is written about
+    /// the arguments a real one carries.
+    #[test]
+    fn every_system_panel_says_what_it_is_about() {
+        let ids = [
+            Help::id(),
+            About::id(),
+            Effects::id(),
+            Job::id(7),
+            Problems::id(),
+            Search::id(),
+            Bucket::id(),
+        ];
+        let covered: HashSet<Tag> = ids.iter().map(|id| id.tag).collect();
+        for kind in SYSTEM.kinds() {
+            assert!(
+                covered.contains(&kind.tag()),
+                "no sample panel for the tag {}",
+                kind.tag()
+            );
+        }
+
+        let mut s = Session::fake(APPS);
+        for id in ids {
+            let slot = open(&mut s, id.clone());
+            let (title, about) = {
+                let inst = s.panel(slot).expect("the panel");
+                let b = inst.borrow();
+                (b.title(), b.about())
+            };
+            assert!(!about.is_empty(), "{id} says nothing");
+            assert_ne!(about, format!("{title} — {id}"), "{id} is on the default");
+            assert!(about.len() > 120, "{id}: “{about}”");
+            assert!(
+                !about.contains("cmd+"),
+                "{id} names a chord; keys go on the control"
+            );
+        }
+    }
+
+    /// A panel opened as the launcher would.
+    fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
+        let show = id.clone();
+        s.act(Action::new("open", format!("open “{id}”")).moving(move |wm| {
+            wm.open(show, None, false);
+        }));
+        s.settle();
+        s.focus().expect("the new slot has focus")
     }
 }

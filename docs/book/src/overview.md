@@ -32,6 +32,9 @@ describes the layers and [Apps](./apps.md) is the contract between them.
   attachments, drafts, contacts, accounts, and real IMAP and SMTP.
 - [Files](./files.md): a directory as a list, a file as a card, and the disk
   operations that act on both.
+- [Agents](./agents.md): a chat over the store, with the apps as its hands —
+  a panel as context, tools that are the verbs' own code paths, and `cmd+z`
+  over everything the agent does.
 - `system`: the shell's own app. Help, about, the effect log and one job, the
   problems list, the device-sync form, and the card a panel gets when no app
   in this build owns its tag. It is listed like any other app, so the shell
@@ -44,6 +47,6 @@ every app's tables included, and the shell depends on it.
 
 The current native prototype is written in Rust with Makepad and runs on
 macOS. It includes nine scrolling workspaces with tiled panels, joins, tabs,
-animation, and keyboard and mouse controls; the three apps above; a
+animation, and keyboard and mouse controls; the four apps above; a
 single-writer device sync over a leased bucket; and a panels library that
 shows every scene of the catalogue on a zoomable canvas.

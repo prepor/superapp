@@ -1,0 +1,42 @@
+# args:
+# env:
+#
+# The paste rule. `cmd+i` copies a panel's context with the line
+# `superapp-panel: <tag> <args>` at the top, and a paste into the composer
+# whose text begins that way is a chip rather than words. Any other paste is
+# words, and a typed line that happens to read the same stays typed — the
+# composer sees a paste as a paste because the event says so.
+#
+# The two halves are asserted in one run: the first paste resolves as a chip,
+# the second as text the field took, typed on to and sent.
+
+wait 900
+
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+
+paste "superapp-panel: inbox []\n\n# superapp panel context\n\npanel: “inbox”"
+wait 700
+click "chip inbox"
+wait 400
+shot s1-pasted-chip
+
+# Anything else is text: it lands in the field, and what is typed after it
+# lands after it.
+click "ask"
+wait 400
+paste "plain text pasted"
+wait 500
+type " and typed"
+wait 500
+shot s2-pasted-text
+key enter
+wait 900
+click "plain text pasted and typed"
+wait 400
+shot s3-sent
+quit

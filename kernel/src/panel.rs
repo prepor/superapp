@@ -223,6 +223,15 @@ pub trait Panel: Any {
     /// or its own state.
     fn title(&self) -> String;
 
+    /// What this panel is about, for an agent: one paragraph in the app's
+    /// words — what the rows are, what the arguments mean, what a person
+    /// does here. It leads the panel's chip, above the queries that drew
+    /// it, so the model reads the app's own sentence before it reads any
+    /// rows. The default is the title and the identity.
+    fn about(&self) -> String {
+        format!("{} — {}", self.title(), self.id())
+    }
+
     /// The size the panel asks for, width and height in grid units, given
     /// the column's width in characters. Constant for most kinds; a letter
     /// or a file card asks for the rows its content needs. The layout
@@ -310,8 +319,11 @@ impl Verb {
         }
     }
 
-    /// A button that belongs to no panel: a problem row's *retry*. The
-    /// closure is the whole behaviour.
+    /// A button that belongs to no panel — a problem row's *retry* — or one
+    /// whose behaviour must run with nothing borrowed: [`Panel::run`] holds
+    /// its own instance for as long as it is on the stack, and a verb that
+    /// runs an agent's tool reaches every panel there is. The closure is
+    /// the whole behaviour.
     #[must_use]
     pub fn call(
         id: &'static str,
@@ -389,6 +401,25 @@ impl Panel for Missing {
         self.id.to_string()
     }
 
+    /// The one panel whose paragraph is about the build rather than about
+    /// the rows: there are none to describe.
+    fn about(&self) -> String {
+        format!(
+            "a panel this build cannot open: no app here owns the tag `{}`. \
+             The slot is kept rather than dropped, because another build has \
+             the app and the session is shared between them; its arguments \
+             ({}) mean whatever that app means by them. There is nothing to \
+             read here and nothing to do — open it on a build that has the \
+             app.",
+            self.id.tag.as_str(),
+            if self.id.args.is_empty() {
+                "none".to_string()
+            } else {
+                self.id.args.join(", ")
+            }
+        )
+    }
+
     fn as_any(&mut self) -> &mut dyn Any {
         self
     }
@@ -458,6 +489,38 @@ mod tests {
         assert_eq!(m.wish(80), crate::layout::DEFAULT_WISH);
         assert!(m.verbs().is_empty());
         assert!(m.as_any().is::<Missing>());
+    }
+
+    /// The default a panel that says nothing gets: the title and the
+    /// identity on one line, which is what an agent reads when the app has
+    /// not written its own paragraph yet.
+    #[test]
+    fn a_panel_that_says_nothing_is_still_about_something() {
+        struct Silent(PanelId);
+        impl Panel for Silent {
+            fn id(&self) -> &PanelId {
+                &self.0
+            }
+            fn title(&self) -> String {
+                "a note".into()
+            }
+            fn as_any(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+        let p = Silent(PanelId::new(T, ["42"]));
+        assert_eq!(p.about(), "a note — message(42)");
+    }
+
+    /// The panel with no app says so, in the words the card says it in: the
+    /// tag, why the slot is kept, and that there is nothing to read.
+    #[test]
+    fn the_panel_with_no_app_is_about_the_build() {
+        let m = Missing::new(PanelId::new(Tag("from_the_future"), ["7"]));
+        let about = m.about();
+        assert!(about.contains("from_the_future"), "{about}");
+        assert!(about.contains("no app here owns the tag"), "{about}");
+        assert_ne!(about, format!("{} — {}", m.title(), m.id()), "not the default");
     }
 
     #[test]

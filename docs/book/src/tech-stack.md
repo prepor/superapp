@@ -7,7 +7,7 @@ One Cargo workspace, two members:
 - **`kernel/`**: the crate named `kernel`. It has **no Makepad dependency at
   all**, which is the layering rule made structural rather than agreed to. It
   carries `rusqlite`, `serde`, `serde_json`, and the TLS and signing crates
-  device sync needs.
+  device sync and the agent's gateway need.
 - **`app/`**: the crate named `superapp`, a library with a one-line binary on
   top of it, which is the shape Android needs, since a desktop build starts at
   a `fn main` and an activity has no main at all. It depends on the kernel and
@@ -29,8 +29,8 @@ The pieces:
 - **imap, lettre, and mail-parser** provide IMAP, SMTP, and MIME support.
 - **html5ever, markup5ever_rcdom, and simplecss** narrow HTML mail.
 - **rustls** provides TLS. `ring`, `base64`, `rustls-connector`, and
-  `webpki-roots` support Gmail sign-in and signed R2 requests. The app does not
-  use a general-purpose HTTP client.
+  `webpki-roots` support Gmail sign-in, signed R2 requests, and the agent's
+  gateway. The app does not use a general-purpose HTTP client.
 - **Makepad's macOS APIs** provide the menu bar. Small gaps such as screen
   geometry, the trash, and window screenshots use `makepad-apple-sys` and
   `makepad-objc-sys`, in `app/src/platform/mac.rs`.
@@ -43,6 +43,30 @@ The pieces:
 
 There are no Cargo features. Every switch is argv, an environment variable, or
 `cfg(headless)`.
+
+## Still no HTTP client
+
+`kernel::http` is a hand-rolled HTTP/1.1 client and `kernel::sse` is the
+server-sent-events framing over its body reader. Together they are what an
+[agent](./agents.md#no-library-one-small-client)'s long streamed answer arrives
+through.
+
+They exist because the alternative is a dependency this tree cannot take:
+`ureq`, `reqwest` and their kin bring an async runtime or a second TLS stack,
+and Android must build the same crate. What is actually needed is one verb, one
+host, no redirects, one long body — the size of the two clients this tree
+already hand-rolls for Gmail sign-in and for R2. So the third one is small
+enough to read in one sitting: a request with headers and a body; a response as
+a status, its headers, and a body that undoes `Transfer-Encoding: chunked` as
+it arrives rather than at the end; timeouts on connect, on the first byte and
+between bytes. The connection is verified against the Mozilla roots and not the
+machine's, because a phone has no machine roots to verify against.
+
+The parsing is split from the socket on purpose — the head reader, the chunked
+reader and the event framing are driven by tests over an in-memory cursor — so
+the wire's edge cases are pinned without a network, including the one that
+bites: a multibyte character divided between two frames, which is why a line is
+never turned into text until its newline has arrived.
 
 ## Headless
 

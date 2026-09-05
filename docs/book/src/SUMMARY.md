@@ -19,6 +19,7 @@
 
 - [Mail](./mail.md)
 - [Files](./files.md)
+- [Agents](./agents.md)
 
 # Development
 

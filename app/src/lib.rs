@@ -22,17 +22,17 @@ pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{files, mail};
+use crate::apps::{agent, files, mail};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
 /// Every app in this build. `system` is listed last, so the launcher's
 /// roots keep their order: an app's own panels lead, help and about close.
 /// Mail leads, so a store nobody has booted comes up on the inbox.
-static APPS: &[&dyn App] = &[&mail::MAIL, &files::FILES, &system::SYSTEM];
+static APPS: &[&dyn App] = &[&mail::MAIL, &files::FILES, &agent::AGENT, &system::SYSTEM];
 
 /// Their Makepad halves, in the same order.
-static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &system::UI];
+static UIS: &[&dyn AppUi] = &[&mail::UI, &files::UI, &agent::UI, &system::UI];
 
 /// Hands the shell the app list.
 ///
@@ -65,4 +65,91 @@ pub fn run() {
     // Read argv before the window exists, so a bad script fails loudly.
     let _ = shell::boot::config();
     root::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::APPS;
+    use kernel::app::Apps;
+
+    /// The whole registry, as a request would carry it: the kernel's own
+    /// first, because every build has them, then each app's in list order.
+    /// [`Apps::new`] stops the process on a clash, so this is really asking
+    /// whether the build boots — and saying, in one place, what the list of
+    /// names is.
+    #[test]
+    fn every_tool_in_the_build_has_its_own_name_and_the_kernels_lead() {
+        let apps = Apps::new(APPS);
+        let names: Vec<&str> = apps.tools().iter().map(|t| t.name).collect();
+        assert_eq!(names[0], "sql.query");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "two tools of one name: {names:?}");
+        for name in &names {
+            assert!(
+                name.split_once('.')
+                    .is_some_and(|(app, verb)| !app.is_empty() && !verb.is_empty()),
+                "a tool wears its app's prefix: {name}"
+            );
+            assert!(apps.tool(name).is_some(), "and answers to it");
+        }
+        // The apps' own, so a tool quietly dropped from a list is noticed.
+        for name in [
+            "mail.search",
+            "mail.archive",
+            "mail.draft",
+            "mail.send",
+            "files.list",
+            "files.rename",
+            "files.write",
+            "problems.list",
+            "effects.recent",
+        ] {
+            assert!(names.contains(&name), "{name} is not offered: {names:?}");
+        }
+        // Every schema is an object that takes nothing it did not declare —
+        // the promise `Tool::check` is read against — and every tool says
+        // what it is for.
+        for t in apps.tools() {
+            assert_eq!(t.input["type"], "object", "{}", t.name);
+            assert_eq!(
+                t.input["additionalProperties"],
+                serde_json::Value::Bool(false),
+                "{}",
+                t.name
+            );
+            assert!(!t.description.is_empty(), "{}", t.name);
+        }
+    }
+
+    /// Which calls wait for the person's word, said in one place. The set
+    /// is what cannot be undone or has left the machine; a rename, an
+    /// archive and a mark-read are one chord away and must never ask, or
+    /// the gate is a dialog box on everything.
+    #[test]
+    fn only_what_cannot_be_undone_asks_before_it_runs() {
+        let apps = Apps::new(APPS);
+        let asking: Vec<&str> = apps
+            .tools()
+            .iter()
+            .filter(|t| t.asks)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            asking,
+            vec![
+                "sql.write",
+                "mail.delete",
+                "mail.send",
+                "files.trash",
+                "files.write"
+            ]
+        );
+        for name in ["mail.archive", "mail.read", "files.rename", "files.move"] {
+            let tool = apps.tool(name).expect("the tool");
+            assert!(tool.writes, "{name} writes");
+            assert!(!tool.asks, "{name} is one undo away, so it must not ask");
+        }
+    }
 }
