@@ -169,7 +169,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             // A row that scrolls out is kept for the next one that scrolls
