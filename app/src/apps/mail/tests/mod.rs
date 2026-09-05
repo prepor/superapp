@@ -179,32 +179,46 @@ fn the_inbox_lists_the_seeded_threads() {
 
 /// Free text reaches the letter itself, not only the line above it: a word
 /// that was written in a body and appears in no subject and in no address
-/// still finds the conversation it was written in.
+/// still finds the conversation it was written in. The body is read through
+/// the index, so it is read by *word*; the three small columns stay a
+/// substring, and this is where both halves are held to their word.
 #[test]
 fn the_filter_reads_the_letters() {
     let (s, _clock) = session();
     let store = s.store();
+    let topics = |f: &str| -> Vec<String> {
+        model::mailbox_filtered(store, Role::Inbox, f)
+            .iter()
+            .map(|t| t.topic.clone())
+            .collect()
+    };
 
     // "thermos" is one word of Elena's note about Saturday, and of nothing
-    // else in the world.
-    let hike = model::mailbox_filtered(store, Role::Inbox, "thermos");
-    assert_eq!(hike.len(), 1, "{:?}", hike.iter().map(|t| &t.topic));
-    assert_eq!(hike[0].topic, "Sat hike — early start?");
+    // else in the world — no subject and no address has it.
+    assert_eq!(topics("thermos"), ["Sat hike — early start?"]);
 
-    // What the sender and the subject already matched still matches, and
-    // the two reach the same row rather than two: a conversation matches
-    // when any letter of it does, on any of the columns.
-    let budget = model::mailbox_filtered(store, Role::Inbox, "budget");
-    assert_eq!(budget.len(), 1);
-    assert_eq!(budget[0].topic, "Q3 infra budget draft");
+    // The index is type-ahead, as the launcher's is: a word being typed
+    // finds the letter before the last letter of it arrives.
+    assert_eq!(topics("thermo"), ["Sat hike — early start?"]);
 
-    // A tag narrows the body search like any other: the letter about the
-    // trail is read, so this is the body's word AND the sender's.
-    assert_eq!(
-        model::mailbox_filtered(store, Role::Inbox, "thermos @from:elena").len(),
-        1
-    );
-    assert!(model::mailbox_filtered(store, Role::Inbox, "thermos @from:max").is_empty());
+    // But it knows words, not substrings. This is the trade the index buys:
+    // a body is not scanned, so the middle of one of its words is not a
+    // search term.
+    assert!(topics("hermos").is_empty());
+
+    // The small columns are still scanned, so a substring of a subject or
+    // of an address finds its row the way it always did — `ovac` is inside
+    // `vera@kovac.io` and starts no word of it.
+    assert_eq!(topics("ovac"), ["Q3 infra budget draft"]);
+
+    // A word both a subject and a body carry reaches one row, not two: a
+    // conversation matches when any letter of it does, on either side of
+    // the OR.
+    assert_eq!(topics("budget"), ["Q3 infra budget draft"]);
+
+    // A tag narrows the body search like any other.
+    assert_eq!(topics("thermos @from:elena"), ["Sat hike — early start?"]);
+    assert!(topics("thermos @from:max").is_empty());
 }
 
 /// The four mailboxes are four panels over one list, and each shows what its
@@ -1511,9 +1525,20 @@ fn a_retry_is_taken_back_with_its_failure() {
 /// The index is maintained by triggers in the database, not by this build:
 /// a letter that arrives through a plain insert is findable without anything
 /// re-indexing it.
+///
+/// The mailbox filter reads that index too, and its queries are cached on
+/// their parameters, so both are asked here *before* the write as well as
+/// after: a cached "no rows" that outlived the letter is the failure this
+/// is watching for.
 #[test]
 fn the_index_follows_a_write() {
     let (s, _clock) = session();
+    let filtered = |q: &str| -> Vec<String> {
+        model::mailbox_filtered(s.store(), Role::Inbox, q)
+            .iter()
+            .map(|t| t.topic.clone())
+            .collect()
+    };
     let hits = |q: &str| {
         let mut engine = Engine::inline(s.apps().providers());
         engine.ask(s.store(), 1, q);
@@ -1525,20 +1550,31 @@ fn the_index_follows_a_write() {
             .collect::<Vec<_>>()
     };
     assert!(hits("bathysphere").is_empty());
+    assert!(filtered("aphotic").is_empty());
     s.store()
         .write(|c| {
             c.execute(
                 "INSERT INTO message(account, folder, from_name, from_email, subject,
                                      date, unread, body, topic)
                  SELECT 1, id, 'Nobody', 'nobody@example.org', 'the bathysphere',
-                        0, 0, 'down it went', 'the bathysphere'
+                        0, 0, 'down it went, into the aphotic dark', 'the bathysphere'
                    FROM folder WHERE account = 1 AND role = 'inbox'",
                 [],
             )
-            .map(|_| ())
+            .map(|_| ())?;
+            // Its own conversation, as ingest would have given it: a
+            // mailbox row *is* a thread, and a letter anchored to nothing
+            // is in no list. `thread` is not a column the index triggers
+            // watch, so this is still an insert nothing re-indexed.
+            c.execute("UPDATE message SET thread = id WHERE thread IS NULL", [])
+                .map(|_| ())
         })
         .expect("a plain insert");
     assert_eq!(hits("bathysphere"), vec!["the bathysphere".to_string()]);
+    // "aphotic" is in the body alone — the subject and the sender have no
+    // part of it — so the filter answering with the row is the index being
+    // read, and re-read.
+    assert_eq!(filtered("aphotic"), ["the bathysphere"]);
 }
 
 /// What the launcher asks the index, out of what a person typed: every word

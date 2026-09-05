@@ -636,6 +636,7 @@ static LOG_SPEC: SqlSpec = SqlSpec {
     // address actually lives — and the ring's sentence, which is all a
     // row with no payload has.
     text: &["e.kind", "e.entity", "e.payload", "e.error", "e.what"],
+    index: None,
     tags: &[
         ("failed", TagSql::Where("e.status = 'failed'")),
         (
