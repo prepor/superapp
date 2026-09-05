@@ -23,7 +23,6 @@ use kernel::store::Store;
 
 use super::super::chip::Chip;
 use super::super::model::{self, Carried, ChatId, Run, Turn};
-use super::Agents;
 
 /// The argument a chat panel carries when there is no row behind it yet.
 const NEW: &str = "new";
@@ -334,8 +333,9 @@ impl Panel for Chat {
 
     /// *send* while there is something to send and nothing going, *stop*
     /// while something is, *retry* on a round that came to nothing,
-    /// *continue* on an answer that ran out of room — then *add panel*, and
-    /// the two that are always there: a fresh chat, and the list.
+    /// *continue* on an answer that ran out of room — then *add panel*, the
+    /// one that is always there. A fresh chat and the list of them are the
+    /// agents panel's business, not a conversation's.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
         let going = run.as_ref().is_some_and(Run::live);
@@ -359,27 +359,6 @@ impl Panel for Chat {
         // harmless where the chord is there: a field over the panels that
         // are open, one pick apiece.
         v.push(Verb::run("agent.add_panel", "add panel", Some('p')));
-        v.push(Verb::go(
-            "agent.new",
-            "new",
-            Some('n'),
-            Nav::Open {
-                from: self.slot,
-                id: Chat::new_id(),
-                fresh: true,
-            },
-        ));
-        // The one link on this bar, and it wears no letter: the composer is
-        // a text field, and a letter here would take a chord out of it.
-        v.push(Verb::go(
-            "agent.agents",
-            "agents",
-            None,
-            Nav::Replace {
-                slot: self.slot,
-                id: Agents::id(),
-            },
-        ));
         v
     }
 

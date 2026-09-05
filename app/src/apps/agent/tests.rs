@@ -1064,7 +1064,7 @@ fn deleting_chats_takes_their_rows_and_undo_puts_them_back() {
         a.go(0);
         a.toggle_mark();
     });
-    assert_eq!(verb_ids(&s, list), vec!["agent.delete"]);
+    assert_eq!(verb_ids(&s, list), vec!["agent.new", "agent.delete"]);
     verb(&mut s, list, "agent.delete");
 
     // The newest is on top, so the mark took the second one.
@@ -1175,14 +1175,14 @@ fn the_chat_panel_names_its_conversation_and_wears_its_bar() {
     );
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.add_panel", "agent.new", "agent.agents"],
+        vec!["agent.add_panel"],
         "nothing to send and nothing going; a panel is always there to add"
     );
 
     with_chat(&s, blank, |c| c.set_draft("hello"));
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.send", "agent.add_panel", "agent.new", "agent.agents"]
+        vec!["agent.send", "agent.add_panel"]
     );
 
     verb(&mut s, blank, "agent.send");
@@ -1203,6 +1203,31 @@ fn the_chat_panel_names_its_conversation_and_wears_its_bar() {
         .borrow()
         .about()
         .contains("2 turns"));
+}
+
+/// The list is where conversations begin and end: *new* is always on its
+/// bar and opens a blank chat joined to it, *delete n* only over marks.
+#[test]
+fn the_agents_list_wears_new_always_and_delete_over_marks() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    let list = open_root(&mut s, Agents::id());
+    assert_eq!(verb_ids(&s, list), vec!["agent.new"]);
+
+    verb(&mut s, list, "agent.new");
+    s.settle();
+    let blank = s.showing(&Chat::new_id());
+    assert_eq!(blank.len(), 1, "a fresh chat opened");
+    assert_eq!(
+        s.join_parent_of(blank[0]),
+        Some(list),
+        "joined to the list, where its previews go"
+    );
+
+    with_agents(&s, list, |a| {
+        a.restore_marks(&[chat]);
+    });
+    assert_eq!(verb_ids(&s, list), vec!["agent.new", "agent.delete"]);
 }
 
 #[test]
@@ -1244,12 +1269,7 @@ fn stop_ends_the_run_and_the_bar_offers_retry() {
     let slot = open_root(&mut s, Chat::id(chat));
     assert_eq!(
         verb_ids(&s, slot),
-        vec![
-            "agent.retry",
-            "agent.add_panel",
-            "agent.new",
-            "agent.agents"
-        ],
+        vec!["agent.retry", "agent.add_panel"],
         "a round that was stopped is one to ask again"
     );
 }

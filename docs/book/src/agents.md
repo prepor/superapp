@@ -453,11 +453,9 @@ going, **stop** (`cmd+k`) while something is, **retry** (`cmd+r`) on a round
 that failed or was stopped, and **continue** (`cmd+o`) on an answer the model
 ran out of room for, so a bar with none of the four is a chat waiting to be
 written in. Then **add panel** (`cmd+p`), which is always there because it is
-the phone's way into context and harmless where the chord exists. Then the two
-that are always there and are links because both go somewhere: **new**
-(`cmd+n`), a fresh chat of its own, and *agents*, which replaces the panel with
-the list. *agents* wears no letter on purpose — the composer is a text field,
-and a letter here would take a chord out of it.
+the phone's way into context and harmless where the chord exists. Nothing on
+the bar leaves the conversation: a fresh chat and the list of them belong to
+the agents list, which the launcher opens.
 
 The title is the chat's own — the first line of the first thing said in it,
 clipped at sixty characters — and `chat` before anything has been. It wishes
@@ -475,7 +473,8 @@ completes against the models chats have actually run on.
 
 The cursor previews a chat beside the list, by the shell's
 [preview](./interaction-grammar.md#preview-the-one-open-that-does-not-go) rule.
-Its bar is empty until rows are marked, and then wears one verb: **delete n**
+Its bar always wears **new** (`cmd+n`), a blank chat joined to the list where
+its previews go, and, once rows are marked, **delete n**
 (`cmd+d`), which takes the chats with their turns, runs and calls as one node.
 The cursor then stands where it stood, on whichever row is there now, as part
 of the same action.

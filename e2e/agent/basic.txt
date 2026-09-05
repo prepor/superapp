@@ -7,8 +7,8 @@
 # the assertion is a click on it — a label that does not resolve fails the
 # run.
 #
-# Then the list: the bar's *agents* link replaces the chat with the roster of
-# them, and the chat's own row previews it back.
+# Then the list: the launcher opens the roster of chats, the chat's own row
+# previews it back, and the list's *new* opens a blank one beside it.
 
 wait 900
 
@@ -55,9 +55,13 @@ shot a3b-cut-short
 
 # -- the list ----------------------------------------------------------------
 
-# A dotted link: the roster replaces the chat in place. The chat is titled by
-# the first line of the first thing said in it.
-click "agents"
+# The roster is a root of its own: the launcher opens it. The chat is titled
+# by the first line of the first thing said in it.
+key cmd 2
+wait 500
+type "agents"
+wait 500
+key enter
 wait 900
 shot a4-list
 
@@ -68,4 +72,12 @@ wait 900
 shot a5-preview
 click "Hello. I am the assistant."
 wait 500
+
+# *new* lives on the list: a blank chat, joined to it, with the caret in its
+# field — the same place the row's preview stood.
+click "new"
+wait 900
+click "ask"
+wait 400
+shot a6-new
 quit

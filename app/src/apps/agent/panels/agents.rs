@@ -145,14 +145,25 @@ impl Panel for Agents {
         self.slot = slot;
     }
 
-    /// Nothing until something is marked, and then the one thing a list of
-    /// chats can do to them.
+    /// *new* is always there — a fresh conversation opens joined to the
+    /// list, where the cursor's previews go — and then, while something is
+    /// marked, the one thing a list of chats can do to them.
     fn verbs(&self) -> Vec<Verb> {
+        let mut v = vec![Verb::go(
+            "agent.new",
+            "new",
+            Some('n'),
+            Nav::Open {
+                from: self.slot,
+                id: Chat::new_id(),
+                fresh: false,
+            },
+        )];
         let n = self.list.marks().len();
-        if n == 0 {
-            return Vec::new();
+        if n > 0 {
+            v.push(Verb::run("agent.delete", format!("delete {n}"), Some('d')));
         }
-        vec![Verb::run("agent.delete", format!("delete {n}"), Some('d'))]
+        v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
