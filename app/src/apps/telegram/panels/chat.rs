@@ -2,7 +2,7 @@
 //! line, the draft in the composer or the edit under way in it, what the
 //! composer carries, and the one line playing.
 //!
-//! Opening marks the chat read locally on the layout action's undo node.
+//! Opening with an ordinary cached line marks the chat read on the undo node.
 //! The live read receipt is separate: undo restores only the local count.
 //! The panel remembers where reading started for its unread divider.
 //!
@@ -1141,9 +1141,8 @@ fn saved_messages(store: &Store, peer: PeerId) -> PeerId {
     model::self_peer(store).unwrap_or(peer)
 }
 
-/// The factory. Opening a chat reads it: the count goes to nought on the
-/// opening action's node, and where the reading started is kept for the
-/// unread line.
+/// The factory. Opening a chat with an ordinary cached line reads it on the
+/// opening action's node. Where reading started is kept for the unread line.
 pub struct ChatKind;
 
 impl PanelKind for ChatKind {
@@ -1169,7 +1168,14 @@ impl PanelKind for ChatKind {
         } else {
             None
         };
-        if unread > 0 && at.is_none() {
+        // A newly discovered group's cache may contain only unread mentions.
+        // Claim no local read unless an ordinary line can carry it to Telegram.
+        let read_target = if unread > 0 && at.is_none() {
+            model::newest_ordinary_line(&store, peer)
+        } else {
+            None
+        };
+        if read_target.is_some() {
             cx.claim(
                 Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer)),
                 vec![Box::new(ReadClaim {
@@ -1184,10 +1190,8 @@ impl PanelKind for ChatKind {
         // line: `viewMessages` would acknowledge a named notification too,
         // which waits until it is visible in the focused transcript.
         #[cfg(feature = "tdlib")]
-        if unread > 0 && at.is_none() {
-            if let Some(last) = model::newest_ordinary_line(&store, peer) {
-                let _ = wire(&store, &requests::view_messages(peer, &[last]));
-            }
+        if let Some(last) = read_target {
+            let _ = wire(&store, &requests::view_messages(peer, &[last]));
         }
         // And fill the transcript's window from the wire: the newest page
         // first, to close whatever gap an absence left, then — the worker

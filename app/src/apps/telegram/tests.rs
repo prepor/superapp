@@ -569,6 +569,66 @@ fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
 }
 
 #[test]
+fn preview_without_an_ordinary_line_keeps_the_chat_unread() {
+    for keep_mentions in [true, false] {
+        let mut s = session();
+        // A newly discovered group may have only its unread replies cached,
+        // or no messages at all while its first history request is pending.
+        s.store().write(move |c| {
+            c.execute("DELETE FROM tg_message
+                WHERE chat = ?1 AND (unread_mention = 0 OR ?2 = 0)",
+                rusqlite::params![STELAXIS, keep_mentions])?;
+            Ok(())
+        }).unwrap();
+        let before = model::peer(s.store(), STELAXIS).unwrap();
+        let list = open_root(&mut s, Chats::id());
+        let inbox = runtime::of(s.store()).connect();
+        go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+        assert_eq!(s.focus(), Some(list));
+        assert_eq!(unread(&s, STELAXIS).0, before.unread,
+            "a preview cannot claim a read with no ordinary message to name");
+        assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+        assert_eq!(model::reply_count(s.store()), before.unread_mentions);
+        assert!(inbox.try_recv().is_err(), "unseen mentions are not acknowledged");
+
+        s.undo();
+        s.settle();
+        assert!(s.redo());
+        s.settle();
+        assert_eq!(unread(&s, STELAXIS).0, before.unread,
+            "reopening has no deferred local read claim either");
+        assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+        assert!(inbox.try_recv().is_err());
+    }
+}
+
+#[test]
+fn batch_without_an_ordinary_line_keeps_the_skipped_chat_unread_and_marked() {
+    let mut s = session();
+    s.store().write(|c| {
+        c.execute("DELETE FROM tg_message WHERE chat = ?1 AND unread_mention = 0", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    let before = model::peer(s.store(), STELAXIS).unwrap();
+    let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    let inbox = runtime::of(s.store()).connect();
+    verb(&mut s, list, "telegram.read");
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "viewMessages");
+    assert_eq!(request["chat_id"], FAMILY);
+    assert_eq!(request["message_ids"], serde_json::json!([family_last]));
+    assert!(inbox.try_recv().is_err(), "there is no read for the group holding only mentions");
+    assert_eq!(unread(&s, FAMILY).0, 0);
+    assert_eq!(unread(&s, STELAXIS).0, before.unread);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+    assert_eq!(model::reply_count(s.store()), before.unread_mentions);
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().keys()), vec![STELAXIS],
+        "the skipped group stays marked for a later retry");
+}
+
+#[test]
 fn the_people_are_the_address_book_and_a_group() {
     let mut s = session();
     let contacts = open_root(&mut s, Contacts::id());

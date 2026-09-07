@@ -221,7 +221,7 @@ impl Chats {
         }
         let store = self.store.clone();
         let archiving = verb == "telegram.archive";
-        let mut went = false;
+        let mut queued = Vec::new();
         for &peer in &peers {
             let request = match verb {
                 // Read through the newest ordinary line, preserving unread
@@ -236,10 +236,10 @@ impl Chats {
                 _ => requests::add_chat_to_list(peer, archiving),
             };
             if wire(&store, &request) {
-                went = true;
+                queued.push(peer);
             }
         }
-        if !went {
+        if queued.is_empty() {
             let word = verb.rsplit('.').next().unwrap_or(verb);
             let n = peers.len();
             let what = if n == 1 { "chat" } else { "chats" };
@@ -250,9 +250,11 @@ impl Chats {
             }
             return;
         }
-        // What was marked has been done with — and a chat just archived is
-        // not in this list to stay marked in.
-        self.list.clear_marks();
+        // A skipped chat stays unread and marked for a later retry, even
+        // when another chat in the same batch had a request to send.
+        for peer in &queued {
+            self.list.marks_mut().remove(peer);
+        }
         s.redraw();
     }
 
