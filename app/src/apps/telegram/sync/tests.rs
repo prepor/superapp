@@ -584,7 +584,7 @@ fn the_outbox_cursor_marks_sent_lines_read() {
 /// the archive's 404 ends the load. A phantom `sending` line from before
 /// the restart is cleared on the way.
 #[test]
-fn the_chat_list_is_paged_then_the_archive_and_phantoms_cleared() {
+fn the_chat_list_is_paged_and_unconfirmed_sends_stay_visible() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let w = world();
@@ -592,7 +592,11 @@ fn the_chat_list_is_paged_then_the_archive_and_phantoms_cleared() {
     acc.on_update(&w, &u.to_string());
 
     acc.on_ready(&w);
-    assert!(my_lines(&w, 2).is_empty(), "no pending send survives a restart");
+    assert_eq!(
+        my_lines(&w, 2),
+        vec![(900, "failed".to_string())],
+        "an unconfirmed send must not disappear"
+    );
     let lists = |td: &FakeTd| -> Vec<String> {
         td.sent()
             .iter()
@@ -688,7 +692,7 @@ fn a_wanted_line_is_fetched_and_lands() {
     assert_eq!(req["@type"], "getMessage");
     assert_eq!(req["chat_id"], -9_010);
     assert_eq!(req["message_id"], 4242);
-    assert_eq!(req["@extra"], "line:-9010:4242");
+    assert_eq!(req["@extra"]["context"], "line:-9010:4242");
 
     let mut answer = my_line(4242, -9_010, None);
     answer["@extra"] = json!("line:-9010:4242");
@@ -743,8 +747,14 @@ fn the_reviews_small_findings_hold() {
     assert_eq!(cap["caption"]["text"], "a caption");
     let file = crate::apps::telegram::model::Carried { path: "~/Downloads/report.pdf".into() };
     let sent = v(super::send_file(2, None, &file, ""));
-    let path = sent["input_message_content"]["document"]["path"].as_str().unwrap().to_string();
-    assert!(!path.starts_with('~') && path.ends_with("/Downloads/report.pdf"), "{path}");
+    let path = sent["input_message_content"]["document"]["document"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !path.starts_with('~') && path.ends_with("/Downloads/report.pdf"),
+        "{path}"
+    );
 }
 
 /// A first load stops at the cap: with nothing held below the pages, a
@@ -836,7 +846,7 @@ fn last_history_request(td: &FakeTd) -> Option<(i64, String)> {
     (v["@type"] == "getChatHistory").then(|| {
         (
             v["from_message_id"].as_i64().unwrap_or(-1),
-            v["@extra"].as_str().unwrap_or("").to_string(),
+            v["@extra"]["context"].as_str().unwrap_or("").to_string(),
         )
     })
 }
@@ -860,7 +870,7 @@ fn a_wanted_chat_gets_its_first_page_on_the_next_pass_and_no_more() {
     assert_eq!(req["from_message_id"], 0);
     assert_eq!(req["limit"], HISTORY_PAGE);
     assert_eq!(req["only_local"], false);
-    assert_eq!(req["@extra"], "history:-9001:fill:0");
+    assert_eq!(req["@extra"]["context"], "history:-9001:fill:0");
     assert_eq!(super::parse_history_extra("history:2:fill:0"), Some((2, Walk::Fill, 0)));
     assert_eq!(super::parse_history_extra("history:-100:tail:77"), Some((-100, Walk::Tail, 77)));
     assert_eq!(super::parse_history_extra("kick"), None);
@@ -1036,7 +1046,7 @@ fn a_wanted_file_is_asked_for_on_the_next_pass() {
     let mine = asked();
     assert_eq!(mine.len(), 1, "asked once");
     assert_eq!(mine[0]["@type"], "getRemoteFile");
-    assert_eq!(mine[0]["@extra"], "file:RID_PIC");
+    assert_eq!(mine[0]["@extra"]["context"], "file:RID_PIC");
     // And the queue is spent: a second pass does not ask again.
     acc.drain(&w);
     assert_eq!(asked().len(), 1);
@@ -1445,10 +1455,11 @@ fn the_media_sends_spell_their_requests() {
     assert_eq!(req["chat_id"], -1001);
     let c = &req["input_message_content"];
     assert_eq!(c["@type"], "inputMessagePhoto");
-    assert_eq!(c["photo"]["@type"], "inputFileLocal");
+    assert_eq!(c["photo"]["@type"], "inputPhoto");
+    assert_eq!(c["photo"]["photo"]["@type"], "inputFileLocal");
     // The files app's `~/` spelling is the disk's by the time the engine
     // reads it.
-    let path = c["photo"]["path"].as_str().unwrap();
+    let path = c["photo"]["photo"]["path"].as_str().unwrap();
     assert!(!path.starts_with('~') && path.ends_with("/a.png"), "{path}");
     assert_eq!(c["caption"]["@type"], "formattedText");
     assert_eq!(c["caption"]["text"], "here");
@@ -1465,10 +1476,10 @@ fn the_media_sends_spell_their_requests() {
         let req = v(super::send_file(-1001, None, &file(path), ""));
         let c = &req["input_message_content"];
         assert_eq!(c["@type"], kind, "{path}");
-        assert_eq!(c[names_it]["@type"], "inputFileLocal", "{path}");
+        assert_eq!(c[names_it][names_it]["@type"], "inputFileLocal", "{path}");
         // Spelled as the disk has it, whatever the files app showed.
         assert_eq!(
-            c[names_it]["path"].as_str().unwrap(),
+            c[names_it][names_it]["path"].as_str().unwrap(),
             kernel::caps::real_path(path).to_string_lossy().as_ref(),
             "{path}"
         );
@@ -1940,4 +1951,144 @@ fn workers_consume_only_their_own_stores_commands_and_download_requests() {
     drop(account_a);
     assert!(!state_a.send(&super::send_message(7, "after shutdown", None)));
     assert!(state_b.send(&super::send_message(7, "still connected", None)));
+}
+
+#[test]
+fn an_image_rejected_by_the_worker_is_visible_and_recoverable() {
+    use crate::apps::telegram::{
+        model::Carried,
+        operations::{Failures, Status},
+        panels,
+    };
+    use kernel::app::ProblemSource;
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.drain(&w);
+    assert!(panels::wire(
+        w.store(),
+        &super::send_file(
+            7,
+            Some(42),
+            &Carried {
+                path: "/nonexistent/photo.png".into()
+            },
+            ""
+        )
+    ));
+    acc.drain(&w);
+    assert!(td.sent().is_empty(), "invalid files never reach TDLib");
+    let rt = runtime::of(w.store());
+    let op = rt.operations.list().remove(0);
+    assert!(matches!(
+        op.status,
+        Status::Failed {
+            uncertain: false,
+            ..
+        }
+    ));
+    assert!(op.retryable());
+    assert!(Failures.list(w.store())[0]
+        .announce
+        .as_ref()
+        .unwrap()
+        .contains("photo.png"));
+    let retry: serde_json::Value =
+        serde_json::from_str(&rt.operations.retry(op.id).unwrap()).unwrap();
+    assert_eq!(retry["reply_to"]["message_id"], 42);
+    assert_eq!(
+        retry["input_message_content"]["photo"]["photo"]["path"],
+        "/nonexistent/photo.png"
+    );
+}
+
+#[test]
+fn chat_mutations_are_applied_only_after_successful_acknowledgement() {
+    use crate::apps::telegram::{model, panels};
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.on_update(&w, &chat_object(7, "test", json!([])));
+    acc.drain(&w);
+    assert!(panels::wire(w.store(), &super::set_chat_muted(7, true)));
+    acc.drain(&w);
+    assert!(!model::peer(w.store(), 7).unwrap().muted);
+    let req: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.on_update(
+        &w,
+        &json!({"@type": "error", "code": 403, "message": "forbidden", "@extra": req["@extra"]})
+            .to_string(),
+    );
+    assert!(!model::peer(w.store(), 7).unwrap().muted);
+    assert!(panels::wire(w.store(), &super::set_chat_muted(7, true)));
+    acc.drain(&w);
+    let req: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.on_update(
+        &w,
+        &json!({"@type": "ok", "@extra": req["@extra"]}).to_string(),
+    );
+    assert!(model::peer(w.store(), 7).unwrap().muted);
+}
+
+#[test]
+fn a_completed_download_response_is_cached_without_waiting_for_another_update() {
+    use crate::apps::telegram::{operations::Status, panels};
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.drain(&w);
+    assert!(panels::wire(w.store(), &download_file(77, 32)));
+    acc.drain(&w);
+    let req: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    let path = engine_file("response-completion");
+    let reply = json!({"@type": "file", "id": 77, "size": 20, "remote": {"unique_id": "complete-response"},
+        "local": {"is_downloading_completed": true, "path": path.to_string_lossy()}, "@extra": req["@extra"]});
+    acc.on_update(&w, &reply.to_string());
+    assert!(w
+        .with_cap::<dyn Blobs, _>(|b| b.contains("tg:complete-response"))
+        .unwrap());
+    assert_eq!(
+        runtime::of(w.store()).operations.list()[0].status,
+        Status::Done
+    );
+}
+
+#[test]
+fn list_errors_are_not_mistaken_for_the_end_of_the_list() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.on_ready(&w);
+    let req: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.on_update(&w, &json!({"@type": "error", "code": 429, "message": "Too Many Requests: retry after 30", "@extra": req["@extra"]}).to_string());
+    assert_eq!(td.sent_types(), vec!["loadChats"]);
+    assert!(!runtime::of(w.store()).list_syncing());
+    assert!(runtime::of(w.store()).operations.list()[0]
+        .line()
+        .contains("429"));
+}
+
+#[test]
+fn a_late_history_reply_cannot_release_another_chats_request() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    acc.want(&w, 7);
+    acc.drain(&w);
+    let first: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.want(&w, 8);
+    clock.advance(31.0);
+    acc.drain(&w);
+    assert!(!runtime::of(w.store()).loading(7));
+    assert!(runtime::of(w.store()).loading(8));
+    acc.on_update(
+        &w,
+        &json!({"@type": "messages", "messages": [], "@extra": first["@extra"]}).to_string(),
+    );
+    acc.want(&w, 9);
+    clock.advance(2.0);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["getChatHistory", "getChatHistory"]);
+    assert!(runtime::of(w.store()).loading(8));
 }

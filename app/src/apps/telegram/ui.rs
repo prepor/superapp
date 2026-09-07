@@ -14,12 +14,37 @@ use makepad_widgets::*;
 use crate::shell::app_ui::{AppUi, Setup};
 use crate::shell::hosted::PanelProps;
 
-use super::panels::{Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer};
-use super::widgets::{AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel, PlacePanel, ViewerPanel};
+use super::panels::{
+    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
+};
+use super::widgets::feedback::TelegramFeedback;
+use super::widgets::{
+    AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
+    PlacePanel, ViewerPanel,
+};
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
+
+    mod.widgets.TelegramFeedback = set_type_default() do #(TelegramFeedback::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fit
+        flow: Down
+        status := mod.widgets.SLabel {
+            visible: false, width: Fill, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
+        error := mod.widgets.SLabel {
+            visible: false, width: Fill, text: ""
+            draw_text +: { color: #b23b2a }
+        }
+        controls := View {
+            visible: false, width: Fill, height: Fit, spacing: 8
+            retry := mod.widgets.SBtn { text: "retry" }
+            dismiss := mod.widgets.SBtn { text: "dismiss" }
+        }
+    }
 
     // ---- the count -----------------------------------------------------------
 
@@ -177,6 +202,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
@@ -352,6 +378,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
@@ -372,6 +399,10 @@ script_mod! {
             // at the bottom).
             auto_tail: true
             row := mod.widgets.TelegramMsgRow {}
+        }
+        drop_hint := mod.widgets.SLabel {
+            visible: false, width: Fill, text: "drop files to attach · enter to send"
+            draw_text +: { color: #5a5a5a }
         }
         reply_row := View {
             visible: false
@@ -468,6 +499,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
@@ -528,6 +560,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
@@ -562,6 +595,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 4
 
@@ -657,6 +691,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 8
 
@@ -744,6 +779,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
@@ -797,6 +833,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 6
 
@@ -816,6 +853,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 6
 
@@ -860,6 +898,7 @@ script_mod! {
         ..mod.widgets.View
         width: Fill, height: Fill
         flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 8
 

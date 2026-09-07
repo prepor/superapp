@@ -86,6 +86,12 @@ impl Panel for Place {
             s.notify("unblock this user before sending a message", false);
             return;
         }
+        if super::live(&self.store) && matches!(verb, "telegram.send_place" | "telegram.send_live") {
+            let error = "Location sharing is not available yet; the map shows a demo location.";
+            super::super::runtime::of(&self.store).operations.report(&self.store, "sharing location", error);
+            s.notify(error, true);
+            return;
+        }
         let (lat, lon) = self.here();
         match verb {
             // The one-off share, over the wire where the build is signed in:

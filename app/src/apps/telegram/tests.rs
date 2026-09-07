@@ -1558,7 +1558,7 @@ fn signin_maps_each_state_to_its_field_and_verb() {
         assert_eq!(p.line(), "signed in as +4915150525562");
         // The note counts what the store holds — the demo world's rows here.
         let note = p.note().expect("a note once signed in");
-        assert!(note.starts_with("syncing · "), "{note}");
+        assert!(!note.starts_with("syncing"), "{note}");
         assert!(note.ends_with(" lines") && note.contains(" chats · "), "{note}");
         assert!(!note.contains("· 0 lines"), "the demo world has lines: {note}");
     });
@@ -2040,4 +2040,52 @@ fn player_verbs_follow_their_own_clock_without_a_widget_draw() {
     assert_eq!(label(&a, a_line), "play");
     assert_eq!(label(&a, a_viewer), "play");
     assert_eq!(label(&b, b_line), "pause");
+}
+
+#[test]
+fn dropping_files_stages_them_once_and_rejects_directories() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources/icon_32.png")
+        .to_string_lossy()
+        .into_owned();
+    let paths = vec![
+        file.clone(),
+        file.clone(),
+        std::env::temp_dir().to_string_lossy().into_owned(),
+    ];
+    let panel = s.panel(slot).unwrap().clone();
+    let mut panel = panel.borrow_mut();
+    let chat = panel.as_any().downcast_mut::<Chat>().unwrap();
+    chat.drop_files(&mut s, &paths);
+    assert_eq!(chat.carrying(), &[model::Carried { path: file }]);
+    assert!(s
+        .notes()
+        .iter()
+        .any(|n| n.err && n.msg.contains("not a regular file")));
+    assert!(s.notes().iter().any(|n| n.msg.contains("attached 1 file")));
+}
+
+#[test]
+fn a_disconnected_worker_does_not_clear_the_composer_or_fake_a_send() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let rt = runtime::of(s.store());
+    drop(rt.connect());
+    with_chat(&s, slot, |c| {
+        c.set_draft("keep this caption");
+        c.carry(&["/tmp/keep-this.png".into()]);
+    });
+    send(&mut s, slot);
+    with_chat(&s, slot, |c| {
+        assert_eq!(c.draft(), "keep this caption");
+        assert_eq!(c.carrying().len(), 1);
+    });
+    assert!(s.notes().last().unwrap().err);
+    assert!(rt
+        .operations
+        .list()
+        .iter()
+        .all(|o| o.status != super::operations::Status::Pending));
 }

@@ -126,7 +126,12 @@ impl SignIn {
         let c = self.store.conn();
         let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
         Some(format!(
-            "syncing · {} chats · {} lines",
+            "{}{} chats · {} lines",
+            if super::super::runtime::of(&self.store).list_syncing() {
+                "syncing · "
+            } else {
+                ""
+            },
             count("SELECT COUNT(*) FROM tg_chat"),
             count("SELECT COUNT(*) FROM tg_message")
         ))
@@ -135,6 +140,16 @@ impl SignIn {
     /// The bar's verb for the current field, if any — the word it sends.
     #[must_use]
     pub fn action(&self) -> Option<(&'static str, &'static str)> {
+        if super::super::runtime::of(&self.store)
+            .operations
+            .list()
+            .iter()
+            .any(|o| {
+                o.label == "signing in" && o.status == super::super::operations::Status::Pending
+            })
+        {
+            return None;
+        }
         match self.field_kind()? {
             Field::Phone => Some((VERB, "send phone")),
             Field::Code => Some((VERB, "send code")),
@@ -166,6 +181,9 @@ impl SignIn {
     /// TDLib's answer rides an update the worker projects into `tg_session`,
     /// and the next draw reflects it.
     fn send(&mut self, s: &mut Session) {
+        if self.action().is_none() {
+            return;
+        }
         let Some(kind) = self.field_kind() else {
             return;
         };

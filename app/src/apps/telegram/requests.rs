@@ -201,11 +201,12 @@ pub fn send_file(
 ) -> String {
     // The kind's `@type`, and the field it names its file by: each input
     // content spells its own, `photo` for a photo and so on down.
-    let (kind, names_it) = match file.kind() {
-        "photo" => ("inputMessagePhoto", "photo"),
-        "video" => ("inputMessageVideo", "video"),
-        "audio" => ("inputMessageAudio", "audio"),
-        _ => ("inputMessageDocument", "document"),
+    let (kind, media, names_it) = match file.kind() {
+        "photo" => ("inputMessagePhoto", "inputPhoto", "photo"),
+        "animation" => ("inputMessageAnimation", "inputAnimation", "animation"),
+        "video" => ("inputMessageVideo", "inputVideo", "video"),
+        "audio" => ("inputMessageAudio", "inputAudio", "audio"),
+        _ => ("inputMessageDocument", "inputDocument", "document"),
     };
     let mut content = json!({
         "@type": kind,
@@ -213,7 +214,11 @@ pub fn send_file(
     });
     // The files app spells a path the way it shows it — `~/Downloads/x` —
     // and the engine reads a path as the disk has it (review, 2026-09-07).
-    content[names_it] = json!({
+    // Current TDLib takes an inputPhoto/inputVideo/etc, containing the
+    // InputFile. Passing InputFile directly is accepted by the JSON parser
+    // but loses the file and fails with "InputFile is not specified".
+    content[names_it] = json!({ "@type": media });
+    content[names_it][names_it] = json!({
         "@type": "inputFileLocal",
         "path": kernel::caps::real_path(&file.path).to_string_lossy(),
     });
