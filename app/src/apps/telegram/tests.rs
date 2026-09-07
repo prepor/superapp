@@ -26,6 +26,8 @@ use super::{runtime, schema, requests, sync, Telegram, TELEGRAM};
 
 static APPS: &[&dyn App] = &[&TELEGRAM];
 
+mod topics_tests;
+
 fn session() -> Session {
     Session::fake(APPS)
 }
@@ -140,7 +142,7 @@ fn the_app_registers_its_tags_and_roots() {
         tags,
         vec![
             "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
-            "place", "signin", "telegram-chat"
+            "place", "signin", "telegram-chat", "telegram-topics"
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
@@ -567,7 +569,7 @@ fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let last = add_trailing_mentions(&s);
     let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
     let list = open_root(&mut s, Chats::id());
-    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY].map(|peer| format!("{peer}:0"))));
     let inbox = runtime::of(s.store()).connect();
     verb(&mut s, list, "telegram.read");
     let requests: Vec<serde_json::Value> = inbox.try_iter()
@@ -606,7 +608,7 @@ fn ordinary_reads_with_a_stale_target_preserve_the_server_read_state() {
             let list = open_root(&mut s, Chats::id());
             let inbox = runtime::of(s.store()).connect();
             if batch {
-                with_chats(&s, list, |c| c.list_mut().marks_mut().add(STELAXIS));
+                with_chats(&s, list, |c| c.list_mut().marks_mut().add(format!("{STELAXIS}:0")));
                 verb(&mut s, list, "telegram.read");
             } else {
                 go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
@@ -715,7 +717,7 @@ fn batch_without_an_ordinary_line_keeps_the_skipped_chat_unread_and_marked() {
     let before = model::peer(s.store(), STELAXIS).unwrap();
     let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
     let list = open_root(&mut s, Chats::id());
-    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY].map(|peer| format!("{peer}:0"))));
     let inbox = runtime::of(s.store()).connect();
     verb(&mut s, list, "telegram.read");
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
@@ -730,7 +732,7 @@ fn batch_without_an_ordinary_line_keeps_the_skipped_chat_unread_and_marked() {
     assert_eq!(unread(&s, STELAXIS).0, before.unread);
     assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
     assert_eq!(model::reply_count(s.store()), before.unread_mentions);
-    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().keys()), vec![STELAXIS],
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().keys()), vec![format!("{STELAXIS}:0")],
         "the skipped group stays marked for a later retry");
 }
 

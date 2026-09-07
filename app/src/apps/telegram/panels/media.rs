@@ -93,7 +93,7 @@ impl Viewer {
     /// the one after, where there are any.
     #[must_use]
     pub fn neighbours(&self) -> (Option<MsgId>, Option<MsgId>) {
-        let ids = model::media_ids(self.world.store(), self.chat);
+        let ids = model::media_ids(self.world.store(), self.chat, self.msg);
         let Some(i) = ids.iter().position(|id| *id == self.msg) else {
             return (None, None);
         };

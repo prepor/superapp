@@ -32,6 +32,7 @@ pub mod text;
 #[cfg(feature = "tdlib")]
 pub mod tdjson;
 pub mod trace;
+pub mod topics;
 /// The engine seam the loop drives: the real transport, and a fake for tests.
 pub mod transport;
 pub mod ui;
@@ -85,6 +86,7 @@ static VIEWER_KIND: panels::media::ViewerKind = panels::media::ViewerKind;
 static PLACE_KIND: panels::place::PlaceKind = panels::place::PlaceKind;
 static ATTACH_KIND: panels::attach::AttachKind = panels::attach::AttachKind;
 static SIGNIN_KIND: panels::signin::SignInKind = panels::signin::SignInKind;
+static TOPICS_KIND: panels::topics::TopicsKind = panels::topics::TopicsKind;
 static KINDS: &[&dyn PanelKind] = &[
     &CHATS_KIND,
     &CHAT_KIND,
@@ -97,6 +99,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &PLACE_KIND,
     &ATTACH_KIND,
     &SIGNIN_KIND,
+    &TOPICS_KIND,
 ];
 
 impl App for Telegram {
@@ -112,11 +115,22 @@ impl App for Telegram {
         let rt = runtime::of(s.store());
         rt.operations.expire(s.store(), std::time::Instant::now());
         if rt.operations.take_changed() {
-            for op in rt.operations.list() {
+            let operations = rt.operations.list();
+            for op in &operations {
                 if matches!(op.status, operations::Status::Failed { .. }) {
                     if let Some(context) = op.context() {
                         if context.starts_with("load_chats:") {
                             rt.set_list_syncing(false);
+                        }
+                        if let Some(chat) = context.strip_prefix("topics:")
+                            .and_then(|s| s.split(':').next()?.parse().ok())
+                        {
+                            let pending = operations.iter().any(|op| op.chat == Some(chat)
+                                && op.status == operations::Status::Pending
+                                && op.context().is_some_and(|c| c.starts_with("topics:")));
+                            if rt.topics_status(chat) == Ok(true) && !rt.topic_list_queued(chat) && !pending {
+                                rt.topics_loaded(chat, Err("could not load topics · refresh to try again".into()));
+                            }
                         }
                     }
                 }

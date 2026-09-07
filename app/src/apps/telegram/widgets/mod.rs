@@ -19,6 +19,7 @@ pub mod peer;
 pub mod people;
 pub mod place;
 mod text;
+pub mod topics;
 
 pub use attach::AttachPanel;
 pub use chat::ChatPanel;
@@ -29,6 +30,7 @@ pub use messages::MessagesPanel;
 pub use peer::PeerPanel;
 pub use people::PeoplePanel;
 pub use place::PlacePanel;
+pub use topics::TopicsPanel;
 
 use kernel::session::Session;
 use makepad_widgets::Scope;

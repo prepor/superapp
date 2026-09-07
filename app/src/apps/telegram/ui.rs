@@ -22,6 +22,7 @@ use super::widgets::{
     AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
     PlacePanel, ViewerPanel,
 };
+use super::{panels::Topics, widgets::TopicsPanel};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -232,6 +233,42 @@ script_mod! {
         suggest: mod.widgets.TblSuggest {}
     }
 
+    mod.widgets.TelegramTopicBody = View {
+        width: Fill, height: Fit
+        spacing: 10
+        check_lbl := mod.widgets.SLabel { padding: 0, width: Fit, text: "[ ]" }
+        View {
+            width: Fill, height: Fit, flow: Down
+            name_lbl := mod.widgets.SLabel {
+                padding: 0, width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+            }
+            detail_lbl := mod.widgets.SLabel {
+                padding: 0, width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+                draw_text +: { color: #5a5a5a }
+            }
+        }
+    }
+    mod.widgets.TelegramTopicRow = mod.widgets.TblRow {
+        line          := mod.widgets.TblLine        { body := mod.widgets.TelegramTopicBody {} }
+        line_sel      := mod.widgets.TblLineSel     { body := mod.widgets.TelegramTopicBody {} }
+        line_mark     := mod.widgets.TblLineMark    { body := mod.widgets.TelegramTopicBody {} }
+        line_mark_sel := mod.widgets.TblLineMarkSel { body := mod.widgets.TelegramTopicBody {} }
+        mod.widgets.TblHairline {}
+    }
+    mod.widgets.TelegramTopicsPanel = set_type_default() do #(TopicsPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 8
+        filter_input := mod.widgets.TblFilter { empty_text: "filter topics" }
+        status_lbl := mod.widgets.SLabel { width: Fill, draw_text +: { color: #5a5a5a } }
+        mod.widgets.TblHeadRule {}
+        empty_lbl := mod.widgets.TblEmpty {}
+        list := mod.widgets.SList {
+            width: Fill, height: Fill, flow: Down, reuse_items: true
+            row := mod.widgets.TelegramTopicRow {}
+        }
+    }
     // ---- the transcript ----------------------------------------------------------
 
     /** One message: a header line — the writer, and at the right what the
@@ -953,6 +990,7 @@ impl AppUi for Ui {
             Viewer::TAG => Some(live_id!(telegram_media_tpl)),
             Place::TAG => Some(live_id!(telegram_place_tpl)),
             SignIn::TAG => Some(live_id!(telegram_signin_tpl)),
+            Topics::TAG => Some(live_id!(telegram_topics_tpl)),
             _ => None,
         }
     }

@@ -1,0 +1,57 @@
+# args: --demo-disk
+# env:
+# Select topics as independent conversations and change the selection again.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "topics"
+wait 700
+click "Вастрик.Берлин"
+wait 700
+click "0 of 4 topics shown as chats"
+click "Meetups"
+wait 400
+click "Cycling"
+wait 400
+click "2 of 4 topics shown as chats"
+shot topics-selected
+click "chats"
+wait 700
+click "Meetups · Вастрик.Берлин"
+wait 700
+click "Vera Kovac: Coffee at the canal on Saturday?"
+wait 400
+click "write a message"
+type "coffee draft"
+wait 400
+shot topic-chat
+click "topics"
+wait 700
+click "filter topics"
+type "meet"
+wait 400
+click "hide matches"
+wait 400
+click "1 of 4 topics shown as chats"
+click "show matches"
+wait 400
+click "2 of 4 topics shown as chats"
+click "filter topics"
+key cmd+a
+key backspace
+wait 400
+click "hide all"
+wait 400
+click "0 of 4 topics shown as chats"
+click "General"
+wait 400
+click "1 of 4 topics shown as chats"
+key space
+wait 400
+click "0 of 4 topics shown as chats"
+shot topics-hidden
+quit

@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use super::model::{Media, MsgId, PeerId};
-use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer};
+use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
 
 // -- a message ----------------------------------------------------------------------
 
@@ -27,6 +27,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
     Some(IncomingMessage {
         id,
         chat,
+        topic: message_topic(m),
         sender: sender_id(&m["sender_id"], chat),
         date,
         text,
@@ -55,6 +56,39 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
         // currently maps to fallback text. Dedicated service-message decoding
         // is not implemented yet.
         service: false,
+    })
+}
+
+/// Forum topic ids in the installed TDLib API are carried by MessageTopic.
+/// Ordinary chats, channel comments and direct-message topics stay distinct.
+pub fn message_topic(m: &Value) -> i64 {
+    if m["topic_id"]["@type"].as_str() == Some("messageTopicForum") {
+        m["topic_id"]["forum_topic_id"].as_i64().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// A full forumTopic, an updateForumTopic, or a bare forumTopicInfo.
+pub fn topic(chat: PeerId, v: &Value) -> Option<IncomingTopic> {
+    let info = v.get("info").unwrap_or(v);
+    let id = info["forum_topic_id"].as_i64()?;
+    if id <= 0 { return None; }
+    let settings = &v["notification_settings"];
+    Some(IncomingTopic {
+        chat,
+        id,
+        name: info["name"].as_str().map(str::to_string),
+        closed: info["is_closed"].as_bool(),
+        hidden: info["is_hidden"].as_bool(),
+        unread: v["unread_count"].as_i64(),
+        mention: v["unread_mention_count"].as_i64().map(|n| n.max(0)),
+        muted: settings["mute_for"].as_i64().map(|n| n > 0),
+        mute_default: settings["use_default_mute_for"].as_bool(),
+        last_read: v["last_read_inbox_message_id"].as_i64(),
+        read_outbox: v["last_read_outbox_message_id"].as_i64(),
+        has_draft: v.get("draft_message").is_some(),
+        draft: nonempty(v["draft_message"]["input_message_text"]["text"]["text"].as_str()),
     })
 }
 

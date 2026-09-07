@@ -13,10 +13,9 @@ use rusqlite::Connection;
 /// status row the real client writes, then the repair of `V1`'s one
 /// in-place edit, the reply freed from the window, the clip a moving
 /// picture plays, whether a chat is mine at all, and the message given a row
-/// key of its own, message link metadata, and the person's block state. A
-/// fresh store runs every rung, a store already at a rung only the later
-/// ones — which is why a rung, once run anywhere, must not change: see
-/// [`V4`](v4_media_columns).
+/// key of its own, message link metadata, the person's block state, and
+/// topics. Published SQL keeps its version; column checks also repair
+/// development builds that used the same version for a different feature.
 pub static SCHEMA: Schema = Schema {
     app: "telegram",
     steps: &[
@@ -28,10 +27,11 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V6),
         Step::Run(v7_listing),
         Step::Sql(V8),
-        Step::Sql(V9),
-        Step::Sql(V10),
-        Step::Sql(V11),
-        Step::Sql(V12),
+        Step::Always(v9_link_entities),
+        Step::Always(v10_known_entities),
+        Step::Always(v11_block_state),
+        Step::Always(v12_mentions),
+        Step::Always(v13_topic_schema),
     ],
 };
 
@@ -57,6 +57,129 @@ ALTER TABLE tg_message ADD COLUMN unread_mention INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE tg_message ADD COLUMN mention_read INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX tg_message_unread_mention ON tg_message(chat, id) WHERE unread_mention = 1;
 ";
+
+// Early topic builds used rungs 9 and 10 before the link migrations landed
+// on main. Keep main's SQL and numbering, checking each column in place so
+// V10 can never run before its entities column exists. Complete databases
+// incur no schema writes, and existing metadata and block state stay intact.
+fn v9_link_entities(c: &Connection) -> rusqlite::Result<()> {
+    if !columns(c, "tg_message")?.contains("entities") {
+        c.execute_batch(V9)?;
+    }
+    Ok(())
+}
+
+fn v10_known_entities(c: &Connection) -> rusqlite::Result<()> {
+    if !columns(c, "tg_message")?.contains("entities_known") {
+        c.execute_batch(V10)?;
+    }
+    Ok(())
+}
+
+fn v11_block_state(c: &Connection) -> rusqlite::Result<()> {
+    if !columns(c, "tg_peer")?.contains("blocked") {
+        c.execute_batch(V11)?;
+    }
+    Ok(())
+}
+
+// Earlier topic builds also occupied V12. Keep main's mention migration at
+// V12 and repair its shape even when that shared counter has already advanced.
+fn v12_mentions(c: &Connection) -> rusqlite::Result<()> {
+    let message = columns(c, "tg_message")?;
+    if !message.contains("unread_mention") && !message.contains("mention_read") {
+        return c.execute_batch(V12);
+    }
+    for column in ["unread_mention", "mention_read"] {
+        if !message.contains(column) {
+            c.execute_batch(&format!("ALTER TABLE tg_message ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"))?;
+        }
+    }
+    let indexed: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master
+        WHERE type = 'index' AND name = 'tg_message_unread_mention')", [], |r| r.get(0))?;
+    if !indexed {
+        c.execute_batch("CREATE INDEX tg_message_unread_mention
+            ON tg_message(chat, id) WHERE unread_mention = 1")?;
+    }
+    Ok(())
+}
+
+const TOPIC_FLAGS: &[(&str, &str)] = &[
+    ("selected", "INTEGER NOT NULL DEFAULT 0"),
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("archived", "INTEGER NOT NULL DEFAULT 0"),
+    ("closed", "INTEGER NOT NULL DEFAULT 0"),
+    ("hidden", "INTEGER NOT NULL DEFAULT 0"),
+    ("unread", "INTEGER NOT NULL DEFAULT 0"),
+    ("mention", "INTEGER NOT NULL DEFAULT 0"),
+    ("muted", "INTEGER NOT NULL DEFAULT 0"),
+    ("mute_default", "INTEGER NOT NULL DEFAULT 1"),
+    ("last_read", "INTEGER"),
+    ("read_outbox", "INTEGER"),
+    ("draft", "TEXT"),
+];
+
+fn columns(c: &Connection, table: &str) -> rusqlite::Result<std::collections::HashSet<String>> {
+    c.prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get(1))?
+        .collect()
+}
+
+/// Early topic and message-link builds both used rung 9. Opening a store
+/// from the other build skipped topic creation and hid every listed chat.
+/// Check the shape at every open, since another build can advance the shared
+/// counter again. A complete topic schema needs no writes; repairs add only
+/// missing columns and objects, preserving messages and topic preferences.
+fn v13_topic_schema(c: &Connection) -> rusqlite::Result<()> {
+    let peer = columns(c, "tg_peer")?;
+    let message = columns(c, "tg_message")?;
+    let topic = columns(c, "tg_topic")?;
+    let objects: i64 = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE
+         (type = 'view' AND name = 'tg_dialog') OR
+         (type = 'index' AND name = 'tg_message_topic')",
+        [], |r| r.get(0),
+    )?;
+    if peer.contains("is_forum") && message.contains("topic") && objects == 2
+        && TOPIC_FLAGS.iter().all(|(name, _)| topic.contains(*name))
+    {
+        return Ok(());
+    }
+
+    let tx = c.unchecked_transaction()?;
+    tx.execute_batch("DROP VIEW IF EXISTS tg_dialog")?;
+    if !peer.contains("is_forum") {
+        tx.execute_batch("ALTER TABLE tg_peer ADD COLUMN is_forum INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !message.contains("topic") {
+        tx.execute_batch("ALTER TABLE tg_message ADD COLUMN topic INTEGER NOT NULL DEFAULT 0")?;
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS tg_topic(
+        chat INTEGER NOT NULL REFERENCES tg_peer(id),
+        id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(chat, id)
+    )")?;
+    for (name, ty) in TOPIC_FLAGS {
+        if !topic.contains(*name) {
+            tx.execute_batch(&format!("ALTER TABLE tg_topic ADD COLUMN {name} {ty}"))?;
+        }
+    }
+    tx.execute_batch("
+        CREATE INDEX IF NOT EXISTS tg_message_topic ON tg_message(chat, topic, date DESC, id DESC);
+        CREATE VIEW tg_dialog AS
+          SELECT c.peer, 0 AS topic, CAST(c.peer AS TEXT) || ':0' AS row_key,
+                 p.name AS title, p.is_forum, c.pinned, c.muted, c.archived, c.in_main,
+                 c.unread, c.mention, c.draft, c.typing
+          FROM tg_chat c JOIN tg_peer p ON p.id = c.peer
+          UNION ALL
+          SELECT t.chat, t.id, CAST(t.chat AS TEXT) || ':' || t.id,
+                 t.name || ' · ' || p.name, 0, t.pinned,
+                 CASE WHEN t.mute_default = 1 THEN c.muted ELSE t.muted END, t.archived,
+                 (c.in_main = 1 OR c.archived = 1), t.unread, t.mention, t.draft, NULL
+          FROM tg_topic t JOIN tg_peer p ON p.id = t.chat JOIN tg_chat c ON c.peer = t.chat
+          WHERE t.selected = 1 AND p.is_forum = 1;
+    ")?;
+    tx.commit()
+}
 
 const V1: &str = "
 CREATE TABLE tg_peer(
@@ -554,6 +677,8 @@ pub fn set_session(
 mod tests {
     use rusqlite::Connection;
 
+    mod topics;
+
     #[test]
     fn v9_keeps_cached_messages_and_their_search_index() {
         let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..8] };
@@ -638,7 +763,7 @@ mod tests {
         for step in &super::SCHEMA.steps[..11] {
             match step {
                 kernel::app::Step::Sql(sql) => c.execute_batch(sql).unwrap(),
-                kernel::app::Step::Run(run) => run(&c).unwrap(),
+                kernel::app::Step::Run(run) | kernel::app::Step::Always(run) => run(&c).unwrap(),
                 _ => unreachable!("the first eleven Telegram migrations are SQL or Run"),
             }
         }

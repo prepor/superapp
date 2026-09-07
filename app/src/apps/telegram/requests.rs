@@ -21,6 +21,7 @@ use super::model::{self, MsgId, PeerId};
 pub(super) fn set_tdlib_parameters(api_id: i32, api_hash: &str, dir: &Path) -> String {
     json!({
         "@type": "setTdlibParameters",
+        "@extra": "tdlib_parameters",
         "database_directory": dir.to_string_lossy().into_owned(),
         "use_message_database": false,
         "use_chat_info_database": false,
@@ -504,9 +505,8 @@ pub(super) fn delete_chat_history(chat_id: PeerId, remove_from_list: bool) -> St
 ///
 /// An empty text sends `draft_message: null`, which is how the type language
 /// spells *there is no draft*: clearing one and never having had one are the
-/// same request. `message_thread_id` is nought — a thread's own draft is a
-/// later phase — and the draft answers no message and carries no date of its
-/// own, the server dating it as it arrives.
+/// same request. [`in_topic`] supplies a forum destination when this draft
+/// belongs to a topic. The server dates the draft as it arrives.
 #[must_use]
 pub fn set_chat_draft(chat_id: PeerId, text: Option<&str>) -> String {
     let draft = match text.map(str::trim).filter(|t| !t.is_empty()) {
@@ -525,6 +525,63 @@ pub fn set_chat_draft(chat_id: PeerId, text: Option<&str>) -> String {
         "draft_message": draft,
     })
     .to_string()
+}
+
+/// Route a composer command to a forum topic. Message ids still belong to
+/// the parent chat; the topic is a separate destination in TDLib's API.
+pub fn in_topic(request: String, topic: i64) -> String {
+    if topic == 0 { return request; }
+    let mut req: Value = serde_json::from_str(&request).expect("a request builder's JSON");
+    req["topic_id"] = json!({"@type": "messageTopicForum", "forum_topic_id": topic});
+    req.as_object_mut().unwrap().remove("message_thread_id");
+    if req["@type"] == "viewMessages" {
+        req.as_object_mut().unwrap().remove("topic_id");
+        req["source"] = json!({"@type": "messageSourceForumTopicHistory"});
+    }
+    req.to_string()
+}
+
+pub fn get_forum_topics(chat: PeerId, date: i64, message: MsgId, topic: i64) -> String {
+    json!({"@type": "getForumTopics", "chat_id": chat, "query": "",
+        "offset_date": date, "offset_message_id": message, "offset_forum_topic_id": topic,
+        "limit": 100, "@extra": format!("topics:{chat}:{date}:{message}:{topic}")}).to_string()
+}
+
+pub fn get_forum_topic(chat: PeerId, topic: i64) -> String {
+    json!({"@type": "getForumTopic", "chat_id": chat, "forum_topic_id": topic,
+        "@extra": format!("topic:{chat}:{topic}")}).to_string()
+}
+
+pub fn set_topic_muted(chat: PeerId, topic: i64, muted: bool) -> String {
+    let mut request: Value = serde_json::from_str(&set_chat_muted(chat, muted)).unwrap();
+    request["@type"] = json!("setForumTopicNotificationSettings");
+    request["forum_topic_id"] = json!(topic);
+    request.to_string()
+}
+
+pub fn get_history_in(chat: PeerId, topic: i64, from: MsgId, walk: Walk) -> String {
+    if topic == 0 { return get_chat_history(chat, from, walk); }
+    json!({"@type": "getForumTopicHistory", "chat_id": chat, "forum_topic_id": topic,
+        "from_message_id": from, "offset": 0, "limit": HISTORY_PAGE,
+        "@extra": history_extra_in(chat, topic, from, walk)}).to_string()
+}
+
+pub(super) fn history_extra_in(chat: PeerId, topic: i64, from: MsgId, walk: Walk) -> String {
+    if topic == 0 {
+        format!("history:{chat}:{}:{from}", walk.word())
+    } else {
+        format!("topic_history:{chat}:{topic}:{}:{from}", walk.word())
+    }
+}
+
+pub(super) fn parse_history_in(extra: &str) -> Option<(PeerId, i64, Walk, MsgId)> {
+    if let Some((chat, walk, from)) = parse_history_extra(extra) {
+        return Some((chat, 0, walk, from));
+    }
+    let mut parts = extra.split(':');
+    if parts.next()? != "topic_history" { return None; }
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?,
+        Walk::parse(parts.next()?)?, parts.next()?.parse().ok()?))
 }
 
 /// Ask TDLib to fetch a file by its session-local id. Not synchronous — the
@@ -617,7 +674,7 @@ pub fn get_chat_history(chat: PeerId, from: MsgId, walk: Walk) -> String {
         "offset": 0,
         "limit": HISTORY_PAGE,
         "only_local": false,
-        "@extra": format!("history:{chat}:{}:{from}", walk.word()),
+        "@extra": history_extra_in(chat, 0, from, walk),
     })
     .to_string()
 }

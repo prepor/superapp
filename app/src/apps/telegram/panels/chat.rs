@@ -71,6 +71,7 @@ impl Row {
 pub struct Chat {
     id: PanelId,
     peer: PeerId,
+    topic: i64,
     store: Rc<Store>,
     slot: SlotId,
     cursor: Option<MsgId>,
@@ -124,6 +125,21 @@ impl Chat {
         model::chat_id(peer, Some(msg))
     }
 
+    pub fn topic(peer: PeerId, topic: i64) -> PanelId {
+        if topic == 0 { return Self::id(peer); }
+        PanelId::new(Self::TAG, [peer.to_string(), "topic".into(), topic.to_string()])
+    }
+
+    pub fn topic_at(peer: PeerId, topic: i64, msg: MsgId) -> PanelId {
+        if topic == 0 { return Self::at(peer, msg); }
+        PanelId::new(Self::TAG, [peer.to_string(), "topic".into(), topic.to_string(), msg.to_string()])
+    }
+
+    pub fn topic_of(id: &PanelId) -> i64 {
+        if id.tag != Self::TAG || id.arg(1) != Some("topic") { return 0; }
+        id.arg(2).and_then(|s| s.parse().ok()).filter(|id| *id > 0).unwrap_or(0)
+    }
+
     /// The peer a `chat` panel names; `None` for any other tag.
     #[must_use]
     pub fn of(id: &PanelId) -> Option<PeerId> {
@@ -136,7 +152,7 @@ impl Chat {
     #[must_use]
     pub fn msg_of(id: &PanelId) -> Option<MsgId> {
         (id.tag == Self::TAG)
-            .then(|| id.arg(1)?.parse().ok())
+            .then(|| id.arg(if Self::topic_of(id) == 0 { 1 } else { 3 })?.parse().ok())
             .flatten()
     }
 
@@ -147,6 +163,13 @@ impl Chat {
 
     fn blocked(&self) -> bool {
         model::peer(&self.store, self.peer).is_some_and(|c| c.blocked)
+    }
+
+    #[cfg(test)]
+    pub fn topic_id(&self) -> i64 { self.topic }
+
+    fn request(&self, request: String) -> String {
+        requests::in_topic(request, self.topic)
     }
 
     pub fn play_on_open(&self, id: MsgId) {
@@ -161,7 +184,7 @@ impl Chat {
     /// history walk a chat starts as it opens, until its last page lands.
     #[must_use]
     pub fn loading(&self) -> bool {
-        runtime::of(&self.store).loading(self.peer)
+        runtime::of(&self.store).loading_in(self.peer, self.topic)
     }
 
     /// Who the chat is with, and its flags. `None` for a peer the store does
@@ -175,7 +198,7 @@ impl Chat {
     /// on showing the stale string.
     #[must_use]
     pub fn card(&mut self) -> Option<PeerCard> {
-        let card = model::peer(&self.store, self.peer);
+        let card = super::super::topics::card(&self.store, self.peer, self.topic);
         if let Some(c) = &card {
             self.take_draft(c.draft.clone().unwrap_or_default());
         }
@@ -211,7 +234,7 @@ impl Chat {
     /// The lines, oldest first.
     #[must_use]
     pub fn history(&self) -> Rc<Vec<Msg>> {
-        model::history(&self.store, self.peer)
+        model::history_in(&self.store, self.peer, self.topic)
     }
 
     /// The widget supplies only messages visible in the focused transcript.
@@ -223,7 +246,7 @@ impl Chat {
         if ids.is_empty() {
             return;
         }
-        if wire(&self.store, &requests::view_messages(self.peer, &ids)) {
+        if wire(&self.store, &requests::in_topic(requests::view_messages(self.peer, &ids), self.topic)) {
             for id in ids {
                 self.viewed_mentions.insert(id, now);
             }
@@ -515,8 +538,8 @@ impl Chat {
             return;
         }
         self.draft = text.to_string();
-        let (peer, d) = (self.peer, self.draft.clone());
-        if let Err(e) = self.store.write(move |c| model::set_draft_tx(c, peer, &d)) {
+        let (peer, topic, d) = (self.peer, self.topic, self.draft.clone());
+        if let Err(e) = self.store.write(move |c| super::super::topics::draft_tx(c, peer, topic, &d)) {
             runtime::of(&self.store)
                 .operations
                 .report(&self.store, "saving draft", &e.to_string());
@@ -668,7 +691,7 @@ impl Chat {
         let text = self.draft.trim().to_string();
         let wired = if self.carrying.is_empty() {
             !text.is_empty()
-                && wire(&self.store, &requests::send_message(self.peer, &text, self.reply_to))
+                && wire(&self.store, &self.request(requests::send_message(self.peer, &text, self.reply_to)))
         } else {
             self.send_files(&text)
         };
@@ -707,7 +730,7 @@ impl Chat {
         if self.carrying.is_empty() {
             sent_first = wire(
                 &self.store,
-                &requests::send_message(self.peer, &text, self.reply_to),
+                &self.request(requests::send_message(self.peer, &text, self.reply_to)),
             );
         } else {
             let files = std::mem::take(&mut self.carrying);
@@ -719,7 +742,7 @@ impl Chat {
                     &file,
                     if i == 0 { &text } else { "" },
                 );
-                if !wire(&self.store, &request) {
+                if !wire(&self.store, &self.request(request)) {
                     self.carrying.push(file);
                     self.carrying.extend(files.map(|(_, file)| file));
                     break;
@@ -756,7 +779,7 @@ impl Chat {
             let first = i == 0;
             let caption = if first { text } else { "" };
             let reply = if first { self.reply_to } else { None };
-            if wire(&self.store, &requests::send_file(self.peer, reply, file, caption)) {
+            if wire(&self.store, &self.request(requests::send_file(self.peer, reply, file, caption))) {
                 went = true;
             }
         }
@@ -777,7 +800,7 @@ impl Chat {
         let text = self.draft.trim();
         if wire(
             &self.store,
-            &requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text)),
+            &self.request(requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text))),
         ) {
             self.sent_draft.clone_from(&self.draft);
         }
@@ -898,7 +921,7 @@ impl Panel for Chat {
     /// [`card`](Chat::card): a title is asked for from `&self`, and the card
     /// is the draw's reader, which reconciles.
     fn title(&self) -> String {
-        model::peer(&self.store, self.peer).map_or_else(|| "chat".to_string(), |c| c.name)
+        super::super::topics::card(&self.store, self.peer, self.topic).map_or_else(|| "chat".to_string(), |c| c.name)
     }
 
     /// Five wide, the whole height: a conversation is the one panel that
@@ -941,6 +964,11 @@ impl Panel for Chat {
                 },
             ));
         }
+        if model::peer(&self.store, self.peer).is_some_and(|c| c.is_forum) {
+            v.push(Verb::go("telegram.topics", "topics", None, Nav::Open {
+                from: self.slot, id: super::Topics::id(self.peer), fresh: false,
+            }));
+        }
         if n == 0 {
             if let Some(m) = under {
                 if !blocked {
@@ -971,7 +999,7 @@ impl Panel for Chat {
                 Some('h'),
                 Nav::Open {
                     from: self.slot,
-                    id: Attach::id(self.peer),
+                    id: Attach::in_topic(self.peer, self.topic),
                     fresh: false,
                 },
             ));
@@ -1094,6 +1122,7 @@ impl Drop for Chat {
 /// The read a chat claims when it opens, and how it is given back.
 pub struct ReadClaim {
     pub peer: PeerId,
+    pub topic: i64,
     pub unread: i64,
     pub last_read: Option<MsgId>,
     pub through: MsgId,
@@ -1105,9 +1134,13 @@ impl Intent for ReadClaim {
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let (peer, unread, last_read) = (self.peer, self.unread, self.last_read);
+        let (peer, topic, unread, last_read) = (self.peer, self.topic, self.unread, self.last_read);
         w.store()
             .write(move |c| {
+                if topic != 0 {
+                    return c.execute("UPDATE tg_topic SET unread = ?3, last_read = ?4
+                        WHERE chat = ?1 AND id = ?2", rusqlite::params![peer, topic, unread, last_read]).map(|_| ());
+                }
                 c.execute(
                     "UPDATE tg_chat SET unread = ?2, last_read = ?3 WHERE peer = ?1",
                     rusqlite::params![peer, unread, last_read],
@@ -1118,9 +1151,9 @@ impl Intent for ReadClaim {
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let (peer, through) = (self.peer, self.through);
+        let (peer, topic, through) = (self.peer, self.topic, self.through);
         w.store()
-            .write(move |c| model::mark_read_tx(c, peer, through))
+            .write(move |c| super::super::topics::read_tx(c, peer, topic, through))
             .map_err(|e| e.to_string())
     }
 }
@@ -1154,15 +1187,17 @@ impl PanelKind for ChatKind {
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let store = cx.session().store().clone();
         let peer = saved_messages(&store, Chat::of(id).unwrap_or_default());
+        let topic = Chat::topic_of(id);
         let at = Chat::msg_of(id);
-        let card = model::peer(&store, peer);
+        let topic = if topic == 0 { at.map_or(0, |msg| model::message_topic(&store, peer, msg)) } else { topic };
+        let card = super::super::topics::card(&store, peer, topic);
         let (unread, last_read, draft) = card.map_or(
             (0, None, String::new()),
             |c| (c.unread, c.last_read, c.draft.unwrap_or_default()),
         );
         // Capture the unread divider before advancing the read position.
         let first_unread = if unread > 0 {
-            model::history(&store, peer)
+            model::history_in(&store, peer, topic)
                 .iter()
                 .find(|m| m.id > last_read.unwrap_or(0) && !m.out && !m.service)
                 .map(|m| m.id)
@@ -1174,16 +1209,17 @@ impl PanelKind for ChatKind {
         // A restored panel must not send a new receipt beyond a redo's
         // original boundary; the recorded claim reapplies that exact read.
         let read_target = if unread > 0 && at.is_none() && cx.how().claims() {
-            model::newest_ordinary_line(&store, peer)
+            model::newest_ordinary_line_in(&store, peer, topic)
                 .filter(|through| *through > last_read.unwrap_or(0))
         } else {
             None
         };
         if let Some(through) = read_target {
             cx.claim(
-                Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer, through)),
+                Box::new(move |tx: &rusqlite::Transaction| super::super::topics::read_tx(tx, peer, topic, through)),
                 vec![Box::new(ReadClaim {
                     peer,
+                    topic,
                     unread,
                     last_read,
                     through,
@@ -1196,7 +1232,7 @@ impl PanelKind for ChatKind {
         // which waits until it is visible in the focused transcript.
         #[cfg(feature = "tdlib")]
         if let Some(last) = read_target {
-            let _ = wire(&store, &requests::view_messages(peer, &[last]));
+            let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));
         }
         // And fill the transcript's window from the wire: the newest page
         // first, to close whatever gap an absence left, then — the worker
@@ -1206,13 +1242,18 @@ impl PanelKind for ChatKind {
         // real chat's history on the engine's queue for a scene.
         #[cfg(feature = "tdlib")]
         if super::super::Telegram::engine_store(store.dir()) {
-            runtime::of(&store).want_history(peer);
+            if topic == 0 {
+                runtime::of(&store).want_history(peer);
+            } else {
+                runtime::of(&store).want_topic_history(peer, topic);
+            }
         }
         // Opened at a line — from a messages list — the cursor starts on
         // it; from a row of the chat list, nowhere.
         Box::new(Chat {
             id: id.clone(),
             peer,
+            topic,
             store,
             slot: 0,
             cursor: at,

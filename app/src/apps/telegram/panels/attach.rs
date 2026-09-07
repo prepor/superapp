@@ -61,6 +61,11 @@ impl Attach {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
+    pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
+        if topic == 0 { return Self::id(chat); }
+        PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])
+    }
+
     /// The chat an `attach` panel is for; `None` for any other tag.
     #[must_use]
     pub fn of(id: &PanelId) -> Option<PeerId> {
@@ -72,7 +77,8 @@ impl Attach {
     /// The chat's title.
     #[must_use]
     pub fn chat_title(&self) -> String {
-        model::peer(&self.store, self.chat).map_or_else(|| "chat".to_string(), |c| c.name)
+        let topic = self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        super::super::topics::card(&self.store, self.chat, topic).map_or_else(|| "chat".to_string(), |c| c.name)
     }
 
     /// What the composer will send with the text, in the order it will go.
@@ -260,7 +266,7 @@ impl Panel for Attach {
             Some('p'),
             Nav::Open {
                 from: self.slot,
-                id: Place::id(self.chat),
+                id: Place::in_topic(self.chat, self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
                 fresh: false,
             },
         ));

@@ -32,9 +32,11 @@ struct State {
     next_action: u64,
     forward: Option<Forward>,
     play_next: Option<(PeerId, MsgId)>,
-    loading: Vec<PeerId>,
+    loading: Vec<(PeerId, i64)>,
+    topic_lists: std::collections::HashMap<PeerId, Result<bool, String>>,
     mentions_loading: Vec<PeerId>,
     mentions_failed: Vec<PeerId>,
+    connection_error: Option<String>,
     list_syncing: bool,
     connection_status: Option<String>,
     wanted: Wanted,
@@ -91,6 +93,8 @@ impl Drop for Inbox {
 pub struct Wanted {
     pub chats: Vec<PeerId>,
     pub mentions: Vec<PeerId>,
+    pub topic_chats: Vec<(PeerId, i64)>,
+    pub topic_lists: Vec<PeerId>,
     pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
@@ -123,6 +127,9 @@ impl Runtime {
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
         let state = self.state();
+        if state.connection_error.is_some() {
+            return false;
+        }
         let Some(sender) = state.sender.as_ref() else {
             return false;
         };
@@ -147,6 +154,20 @@ impl Runtime {
             "connectionStateUpdating" => Some("updating Telegram…".into()),
             _ => Some("connecting to Telegram…".into()),
         };
+    }
+
+    /// A connection failure belongs to this process, even when another app
+    /// window shares its database and is successfully signed in.
+    pub fn connection_error(&self) -> Option<String> {
+        self.state().connection_error.clone()
+    }
+
+    pub fn set_connection_error(&self, error: Option<String>) {
+        let mut state = self.state();
+        if error.is_some() {
+            state.list_syncing = false;
+        }
+        state.connection_error = error;
     }
 
     /// Serialize profile actions for each person until their reply arrives.
@@ -212,16 +233,26 @@ impl Runtime {
         true
     }
 
+    #[cfg(test)]
     pub fn loading(&self, chat: PeerId) -> bool {
-        self.state().loading.contains(&chat)
+        self.loading_in(chat, 0)
     }
 
+    pub fn loading_in(&self, chat: PeerId, topic: i64) -> bool {
+        self.state().loading.contains(&(chat, topic))
+    }
+
+    #[cfg(test)]
     pub fn set_loading(&self, chat: PeerId, on: bool) {
+        self.set_loading_in(chat, 0, on);
+    }
+
+    pub fn set_loading_in(&self, chat: PeerId, topic: i64, on: bool) {
         let mut state = self.state();
         if on {
-            push_unique(&mut state.loading, chat);
+            push_unique(&mut state.loading, (chat, topic));
         } else {
-            state.loading.retain(|c| *c != chat);
+            state.loading.retain(|c| *c != (chat, topic));
         }
     }
 
@@ -236,8 +267,42 @@ impl Runtime {
     #[cfg(any(feature = "tdlib", test))]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
-        push_unique(&mut state.loading, chat);
+        push_unique(&mut state.loading, (chat, 0));
         push_unique(&mut state.wanted.chats, chat);
+    }
+
+    #[cfg(any(feature = "tdlib", test))]
+    pub fn want_topic_history(&self, chat: PeerId, topic: i64) {
+        let mut state = self.state();
+        push_unique(&mut state.loading, (chat, topic));
+        push_unique(&mut state.wanted.topic_chats, (chat, topic));
+    }
+
+    pub fn refresh_topics(&self, chat: PeerId) {
+        let mut state = self.state();
+        if state.sender.is_none() || state.connection_error.is_some()
+            || state.topic_lists.get(&chat) == Some(&Ok(true))
+        {
+            return;
+        }
+        push_unique(&mut state.wanted.topic_lists, chat);
+        state.topic_lists.insert(chat, Ok(true));
+    }
+
+    pub fn topics_loaded(&self, chat: PeerId, status: Result<bool, String>) {
+        self.state().topic_lists.insert(chat, status);
+    }
+
+    pub fn topic_list_queued(&self, chat: PeerId) -> bool {
+        self.state().wanted.topic_lists.contains(&chat)
+    }
+
+    pub fn topics_status(&self, chat: PeerId) -> Result<bool, String> {
+        let state = self.state();
+        if let Some(error) = &state.connection_error {
+            return Err(error.clone());
+        }
+        state.topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
     }
 
     pub fn want_line(&self, chat: PeerId, id: MsgId) {

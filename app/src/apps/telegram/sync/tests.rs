@@ -10,6 +10,8 @@ use kernel::store::Store;
 use serde_json::json;
 use std::rc::Rc;
 
+mod topics_tests;
+
 /// A world over a fresh telegram store — the schema only, no demo seed —
 /// with a fake api_hash planted where the parameters step reads it, so no
 /// real keychain is ever touched.
@@ -41,7 +43,11 @@ fn tdlib_dir() -> std::path::PathBuf {
 /// and a scratch tdlib directory (nothing is written to it but the files
 /// a download test plants — no client runs).
 fn account(td: FakeTd, phone: Option<&str>) -> Account<FakeTd> {
-    Account::new(td, 17844, tdlib_dir(), phone.map(str::to_string))
+    let account = Account::new(td, 17844, tdlib_dir(), phone.map(str::to_string));
+    // Content fixtures begin connected. Startup tests construct a fresh
+    // account explicitly or drive its authorization updates.
+    account.auth_ready.set(true);
+    account
 }
 
 /// A finished download on disk where the engine keeps them, named for
@@ -84,6 +90,59 @@ fn wait_tdlib_parameters_sends_the_parameters() {
     assert_eq!(sent["use_message_database"], false);
     assert_eq!(sent["use_file_database"], false);
     assert_eq!(state(&w), "connecting");
+}
+
+#[test]
+fn a_locked_telegram_session_reports_the_connection_failure_until_auth_resumes() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.drain(&w);
+    acc.on_update(&w, &auth("authorizationStateWaitTdlibParameters"));
+    let parameters: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    let extra = parameters["@extra"].clone();
+    assert!(extra["operation"].is_u64(), "parameters are correlated");
+    acc.on_update(&w, &json!({"@type": "error", "code": 400,
+        "message": "Can't lock file \"td.binlog\", because it is already in use; check for another program instance running",
+        "@extra": extra,
+    }).to_string());
+
+    let runtime = runtime::of(w.store());
+    let error = runtime.connection_error().expect("a visible failure");
+    assert!(error.contains("another app window"));
+    assert!(error.contains("restart"));
+    assert_eq!(runtime.topics_status(42), Err(error));
+    assert!(!runtime.list_syncing());
+    assert!(!runtime.send(&super::get_forum_topics(42, 0, 0, 0)));
+    runtime.want_history(42);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters"]);
+    assert_eq!(
+        state(&w), "connecting",
+        "a failure is local to this process"
+    );
+    assert!(runtime::of(world().store()).connection_error().is_none());
+
+    acc.on_update(&w, &auth("authorizationStateReady"));
+    acc.drain(&w);
+    assert!(runtime.connection_error().is_none());
+    assert!(runtime.list_syncing());
+    assert_eq!(
+        td.sent_types(),
+        vec!["setTdlibParameters", "loadChats"]
+    );
+    for list in ["main", "archive"] {
+        acc.on_update(&w, &json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")}).to_string());
+    }
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters", "loadChats", "loadChats", "getChatHistory"]);
+    acc.on_update(
+        &w,
+        &json!({"@type": "error", "code": 404,
+            "message": "Chat not found", "@extra": "unrelated"}).to_string(),
+    );
+    assert!(runtime.connection_error().is_none());
 }
 
 /// A configured phone is sent the moment TDLib asks for one.

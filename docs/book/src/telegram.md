@@ -66,12 +66,54 @@ notifications are acknowledged when their messages are visible in the focused
 conversation. A live count clears on Telegram's acknowledgment, including
 when another device reads the message. **Refresh** retries an incomplete load.
 
+## Topics as chats
+
+Use **topics** on the chats panel, choose a forum group (for example,
+Вастрик.Берлин), then check the topics you want to see. The picker supports
+text filtering, individual toggles by click or space, and showing or hiding
+all matching topics. Changes take effect immediately and survive a restart.
+Each toggle or bulk change can be undone and redone during the current session,
+restoring the previous mix of shown and hidden topics.
+The group stays available in the picker even when no topics are selected.
+
+Selected topics appear beside ordinary chats, labeled **topic · group**.
+Opening one shows its own transcript and composer. History, drafts, unread
+counts, replies, attachments and forward destinations retain both the parent
+chat id and the topic id. General is a topic too. **topics** on a topic's
+conversation or the group's card opens the picker again.
+
+Topic selection, pinning and archiving are preferences for this app's panel;
+they do not change the official Telegram client's topic layout. Muting and
+reading a topic do go to Telegram. Refresh reloads the group's topic catalog,
+including pages beyond the first hundred topics, without replacing the
+selection. A failed refresh keeps the cached catalog and offers a retry.
+Topic updates are applied directly; they never trigger another request for
+the same update. Metadata requests are deduplicated while pending, and topic
+refresh and history wait for the current client's sign-in and chat-list load.
+Forum capability follows group or bot metadata; ordinary-chat messages with
+stray topic ids stay in their normal chat, and refreshed metadata repairs
+earlier cached assignments.
+
+The topic protocol uses the installed TDLib API's `messageTopicForum`,
+`getForumTopics`, and `getForumTopicHistory` types. The V13 startup check adds
+and repairs topic metadata, message membership and the chat-list view that
+combines ordinary chats with selected topics. The existing link, block and
+unread-mention migrations also check their columns, including topic builds
+that already used V12, so upgrades preserve messages, link metadata, drafts
+and selections.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.
 The build looks under `/opt/homebrew/opt/tdlib/lib` by default; set `TDLIB_DIR`
 to another installation prefix containing `lib/libtdjson.dylib` on macOS.
 The same path is added to the executable's runtime library search path.
+
+Only one running app can use a TDLib session directory. Development workspaces
+share the default directory, so close the other app before restarting the
+one you want to connect. Initialization failures appear in sign-in and empty
+chat/topic lists; cached chats can still be present while the connection is
+unavailable. These errors stay in the current process's runtime.
 
 Tests, demos and targets without TDLib can drop the feature explicitly:
 
@@ -132,7 +174,7 @@ history pacing. Loading flags stay with the store that requested the work.
 | `schema`, `seed` | Append-only migration ladder and offline fixtures |
 | `model`, `search` | Panel queries, value types, formatting and search provider |
 | `runtime`, `trace` | Store-scoped coordination and local diagnostic output |
-| `panels`, `verbs` | Interaction state, live commands and undoable fixture actions |
+| `panels`, `verbs` | Interaction state, live commands and undoable local actions |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
 
 A row receives its clock explicitly. Transcript rows also receive a
@@ -153,10 +195,14 @@ is not a multi-account dispatcher.
 
 Live commands have store-scoped request ids and pending, completed and failed
 outcomes. Sends wait for final delivery updates, and transfers display byte
-progress when TDLib supplies it. Every Telegram panel shares the status strip;
-failures also appear in Problems and announce a toast. Errors go to stderr and
-`tg-debug.log`, with the request type/id and chat, without command payloads or
-login credentials. Normal `loadChats` 404 replies mean the list is complete.
+progress when TDLib supplies it. Every Telegram panel shares the status strip
+for command progress and connection state. Background history, topic and media
+requests leave this strip unchanged; a chat's header shows loading for its whole
+history walk. Background failures still appear in the strip with recovery
+controls, and all failures also appear in Problems and announce a toast. Errors
+go to stderr and `tg-debug.log`, with the request type/id and chat, without
+command payloads or login credentials. Normal `loadChats` 404 replies mean the
+list is complete.
 
 Failed commands retain their input in memory for an explicit retry, including
 file paths, captions and replies. An accepted but failed send retries TDLib's
@@ -180,7 +226,8 @@ retry payloads; unconfirmed projected messages remain visible as failed and ask
 for a delivery check. Login secrets are never retained for retry. Recording
 and location sharing report that they are unavailable in live accounts; attach
 an existing recording instead. The location panel still shows its demo map.
-`verbs` implements undo only for local fixture edits and deletes.
+`verbs` implements undo for topic visibility preferences in all accounts, and
+for local fixture edits and deletes.
 
 `tg_session` currently persists authorization status in the replicated store;
 it is not excluded from replication. The actual TDLib session files and login

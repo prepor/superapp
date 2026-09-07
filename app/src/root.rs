@@ -59,6 +59,7 @@ script_mod! {
                         telegram_place_tpl := mod.widgets.TelegramPlacePanel{}
                         telegram_attach_tpl := mod.widgets.TelegramAttachPanel{}
                         telegram_signin_tpl := mod.widgets.TelegramSigninPanel{}
+                        telegram_topics_tpl := mod.widgets.TelegramTopicsPanel{}
                         // Files' two tags: a directory is a list, a file is
                         // a card.
                         files_dir_tpl := mod.widgets.FilesDirPanel{}
@@ -124,6 +125,7 @@ script_mod! {
                             telegram_place_tpl := mod.widgets.TelegramPlacePanel{}
                             telegram_attach_tpl := mod.widgets.TelegramAttachPanel{}
                             telegram_signin_tpl := mod.widgets.TelegramSigninPanel{}
+                            telegram_topics_tpl := mod.widgets.TelegramTopicsPanel{}
                             files_dir_tpl := mod.widgets.FilesDirPanel{}
                             files_card_tpl := mod.widgets.FilesCardPanel{}
                             agent_chat_tpl := mod.widgets.AgentChatPanel{}

@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use super::model::{self, Media, MsgId, PeerId};
 use super::project::{
-    apply_read_outbox, history_window, project_chats, project_members, project_messages,
-    project_peers, trim_chat, IncomingMessage, HISTORY_KEEP,
+    apply_read_outbox, history_window_in, project_chats, project_members, project_messages,
+    project_peers, project_topic, set_forum, trim_topic, IncomingMessage, HISTORY_KEEP,
 };
 use super::requests::*;
 use super::runtime;
@@ -53,6 +53,9 @@ const TYPING_FOR: f64 = 6.0;
 pub struct Account<T: Td> {
     td: T,
     commands: std::cell::RefCell<Option<runtime::Inbox>>,
+    /// Readiness belongs to this TDLib client, not the last process's
+    /// persisted authorization row.
+    auth_ready: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -87,6 +90,7 @@ pub struct Account<T: Td> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Page {
     chat: PeerId,
+    topic: i64,
     from: MsgId,
     walk: Walk,
 }
@@ -146,7 +150,10 @@ impl<T: Td> Account<T> {
                     .and_then(|ids| ids.iter().filter_map(Value::as_i64).max()) else {
                     return;
                 };
-                w.store().write(move |c| model::mark_read_tx(c, chat, through))
+                let topic = if request["source"]["@type"] == "messageSourceForumTopicHistory" {
+                    model::message_topic(w.store(), chat, through)
+                } else { 0 };
+                w.store().write(move |c| super::topics::read_tx(c, chat, topic, through))
             }
             Some("setChatNotificationSettings") => {
                 let muted = request["notification_settings"]["mute_for"]
@@ -154,6 +161,14 @@ impl<T: Td> Account<T> {
                     .unwrap_or(0)
                     > 0;
                 w.store().write(move |c| model::set_muted_tx(c, chat, muted))
+            }
+            Some("setForumTopicNotificationSettings") => {
+                let Some(topic) = request["forum_topic_id"].as_i64() else { return; };
+                let muted = request["notification_settings"]["mute_for"].as_i64().unwrap_or(0) > 0;
+                w.store().write(move |c| {
+                    c.execute("UPDATE tg_topic SET muted = ?3, mute_default = 0 WHERE chat = ?1 AND id = ?2",
+                        rusqlite::params![chat, topic, muted]).map(|_| ())
+                })
             }
             Some("toggleChatIsPinned") => {
                 let pinned = request["is_pinned"] == true;
@@ -184,6 +199,7 @@ impl<T: Td> Account<T> {
         Account {
             td,
             commands: std::cell::RefCell::new(None),
+            auth_ready: std::cell::Cell::new(false),
             api_id,
             tdlib_dir,
             phone,
@@ -199,10 +215,15 @@ impl<T: Td> Account<T> {
     /// Queues the first page of a chat's fill, at the front: the chat just
     /// opened is the one the account holder is looking at.
     pub fn want(&self, w: &World, chat: PeerId) {
-        runtime::of(w.store()).set_loading(chat, true);
+        self.want_in(w, chat, 0);
+    }
+
+    fn want_in(&self, w: &World, chat: PeerId, topic: i64) {
+        runtime::of(w.store()).set_loading_in(chat, topic, true);
         let mut pages = self.pages.borrow_mut();
         let page = Page {
             chat,
+            topic,
             from: 0,
             walk: Walk::Fill,
         };
@@ -216,8 +237,8 @@ impl<T: Td> Account<T> {
     /// honoured. The chats the panels wanted since the last pass go to the
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
-        if super::Telegram::engine_store(w.store().dir())
-            && schema::session(w.store().conn()).state != "ready"
+        let rt = runtime::of(w.store());
+        if !self.auth_ready.get() || rt.connection_error().is_some() || rt.list_syncing()
         {
             return;
         }
@@ -238,6 +259,21 @@ impl<T: Td> Account<T> {
                 self.want_mentions(w, chat);
             }
         }
+        for (chat, topic) in wanted.topic_chats {
+            if !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
+                rt.set_loading_in(chat, topic, false);
+                continue;
+            }
+            self.want_in(w, chat, topic);
+            self.request_topic(w, chat, topic);
+        }
+        for chat in wanted.topic_lists {
+            if model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
+                self.send(w, &get_forum_topics(chat, 0, 0, 0));
+            } else {
+                rt.topics_loaded(chat, Err("this chat no longer has forum topics".into()));
+            }
+        }
         let now = w.now();
         if let Some((page, sent)) = self.in_flight.get() {
             if now - sent < PAGE_PATIENCE {
@@ -247,7 +283,7 @@ impl<T: Td> Account<T> {
             self.finish_page(w, page, true);
             runtime::of(w.store()).operations.fail_context(
                 w.store(),
-                &format!("history:{}:{}:{}", page.chat, page.walk.word(), page.from),
+                &history_extra_in(page.chat, page.topic, page.from, page.walk),
                 "Telegram did not return the history page. Try again.",
             );
         }
@@ -259,7 +295,7 @@ impl<T: Td> Account<T> {
         };
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
-        self.send(w, &get_chat_history(page.chat, page.from, page.walk));
+        self.send(w, &get_history_in(page.chat, page.topic, page.from, page.walk));
     }
 
     /// Files a write's outcome. A refused write goes to the trace and, once
@@ -403,6 +439,8 @@ impl<T: Td> Account<T> {
     /// One authorization state: fire what TDLib waits for, or record what the
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
+        self.auth_ready.set(false);
+        runtime::of(w.store()).set_connection_error(None);
         let now = w.now();
         // The state row, written on the store's writer thread. Only the owned
         // arguments cross; `w` is not captured, so the closure is `Send`.
@@ -518,6 +556,7 @@ impl<T: Td> Account<T> {
     /// Keep unconfirmed messages from a previous run visible. The projection
     /// cannot establish whether Telegram delivered them while we were away.
     pub fn on_ready(&self, w: &World) {
+        self.auth_ready.set(true);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -570,6 +609,15 @@ impl<T: Td> Account<T> {
             return;
         }
         match (v["@extra"].as_str(), failed) {
+            (Some("tdlib_parameters"), true) => {
+                let message = v["message"].as_str().unwrap_or("unknown error");
+                let error = if message.contains("Can't lock file") {
+                    "Telegram is open in another app window\nclose it and restart this app".into()
+                } else {
+                    format!("could not connect to Telegram: {message}")
+                };
+                runtime::of(w.store()).set_connection_error(Some(error));
+            }
             (Some("load_chats:main"), false) => self.send(w, &load_chats(ChatList::Main)),
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
                 self.send(w, &load_chats(ChatList::Archive));
@@ -579,11 +627,11 @@ impl<T: Td> Account<T> {
             // how long to hold off: the page goes back to the front and the
             // whole queue waits that long. Anything else — a chat gone
             // private, not found — ends that chat's walk.
-            (Some(extra), true) if extra.starts_with("history:") => {
-                let Some((chat, walk, from)) = parse_history_extra(extra) else {
+            (Some(extra), true) if parse_history_in(extra).is_some() => {
+                let Some((chat, topic, walk, from)) = parse_history_in(extra) else {
                     return;
                 };
-                let page = Page { chat, walk, from };
+                let page = Page { chat, topic, walk, from };
                 if self
                     .in_flight
                     .get()
@@ -600,9 +648,14 @@ impl<T: Td> Account<T> {
                 match wait {
                     Some(secs) => {
                         self.not_before.set(w.now() + secs + 1.0);
-                        self.pages.borrow_mut().push_front(Page { chat, from, walk });
+                        self.pages.borrow_mut().push_front(Page { chat, topic, from, walk });
                     }
                     None => self.finish_page(w, page, true),
+                }
+            }
+            (Some(extra), true) if extra.starts_with("topics:") => {
+                if let Some(chat) = extra.split(':').nth(1).and_then(|s| s.parse().ok()) {
+                    runtime::of(w.store()).topics_loaded(chat, Err("could not load topics · refresh to try again".into()));
                 }
             }
             _ => {}
@@ -738,15 +791,83 @@ impl<T: Td> Account<T> {
             }
             // The groups behind the chats: how many are in one, how many are
             // here now, what it says about itself.
-            Some("updateSupergroup") => self.on_counts(w, updates::supergroup(update)),
+            Some("updateSupergroup") => {
+                self.on_counts(w, updates::supergroup(update));
+                if let Some(id) = update["supergroup"]["id"].as_i64() {
+                    let chat = -1_000_000_000_000 - id;
+                    if let Some(forum) = update["supergroup"]["is_forum"].as_bool() {
+                        self.filed(w, "forum", w.store().write(move |c| set_forum(c, chat, forum)));
+                    }
+                }
+            }
             Some("updateSupergroupFullInfo") => self.on_counts(w, updates::supergroup_full(update)),
             Some("updateBasicGroup") => self.on_counts(w, updates::basic_group(update)),
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
             Some("messages" | "foundChatMessages") => self.on_history(w, update),
+            Some("forumTopics") => self.on_topics(w, update),
+            Some("forumTopic") => {
+                if let Some(chat) = update["info"]["chat_id"].as_i64()
+                    .or_else(|| update["@extra"].as_str()?.split(':').nth(1)?.parse().ok()) {
+                    self.on_topic(w, chat, update);
+                }
+            }
+            Some("updateForumTopicInfo") => {
+                if let Some(chat) = update["info"]["chat_id"].as_i64() {
+                    self.on_topic(w, chat, &update["info"]);
+                }
+            }
+            Some("updateForumTopic") => {
+                if let Some(chat) = update["chat_id"].as_i64() {
+                    // getForumTopic itself emits this update. Applying it
+                    // must not request the same topic again.
+                    self.on_topic(w, chat, update);
+                }
+            }
             _ => {}
         }
+    }
+
+    fn request_topic(&self, w: &World, chat: PeerId, topic: i64) {
+        if self.auth_ready.get()
+            && model::peer(w.store(), chat).is_some_and(|p| p.is_forum)
+            && !runtime::of(w.store()).operations.pending_context(&format!("topic:{chat}:{topic}"))
+        {
+            self.send(w, &get_forum_topic(chat, topic));
+        }
+    }
+
+    fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
+        let Some(topic) = updates::topic(chat, value) else { return; };
+        let message = updates::message(&value["last_message"])
+            .filter(|m| m.chat == chat && m.topic == topic.id);
+        self.filed(w, "topic", w.store().write(move |c| {
+            ensure_peer(c, chat)?;
+            model::ensure_chat_tx(c, chat)?;
+            project_topic(c, &topic)?;
+            if let Some(m) = message {
+                if let Some(sender) = m.sender { ensure_peer(c, sender)?; }
+                project_messages(c, &[m])?;
+                apply_read_outbox(c, chat)?;
+            }
+            Ok(())
+        }));
+    }
+
+    fn on_topics(&self, w: &World, value: &Value) {
+        let Some(extra) = value["@extra"].as_str().filter(|s| s.starts_with("topics:")) else { return; };
+        let Some(chat) = extra.split(':').nth(1).and_then(|s| s.parse().ok()) else { return; };
+        let Some(topics) = value["topics"].as_array() else { return; };
+        for topic in topics { self.on_topic(w, chat, topic); }
+        let date = value["next_offset_date"].as_i64().unwrap_or(0);
+        let message = value["next_offset_message_id"].as_i64().unwrap_or(0);
+        let topic = value["next_offset_forum_topic_id"].as_i64().unwrap_or(0);
+        let next = get_forum_topics(chat, date, message, topic);
+        let moved = extra != format!("topics:{chat}:{date}:{message}:{topic}");
+        let more = !topics.is_empty() && (date != 0 || message != 0 || topic != 0) && moved;
+        runtime::of(w.store()).topics_loaded(chat, Ok(more));
+        if more { self.send(w, &next); }
     }
 
     /// A new line: map it, make sure its chat and its sender stand as peers so
@@ -757,7 +878,7 @@ impl<T: Td> Account<T> {
         let Some(msg) = updates::message(message) else {
             return;
         };
-        let (chat, sender) = (msg.chat, msg.sender);
+        let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
         self.filed(
             w,
             "on_new_message",
@@ -769,10 +890,13 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &[msg])?;
                 apply_read_outbox(c, chat)?;
-                trim_chat(c, chat)?;
+                trim_topic(c, chat, topic)?;
                 Ok(())
             }),
         );
+        if topic != 0 {
+            self.request_topic(w, chat, topic);
+        }
         // Ask for the media, if any: TDLib downloads it, `updateFile`
         // completes, and [`on_file`](Account::on_file) ingests the bytes into
         // the blob cache under the same tg: key the row names — the next
@@ -933,6 +1057,9 @@ impl<T: Td> Account<T> {
             self.on_new_message(w, &chat["last_message"]);
         }
         self.want_mentions(w, peer);
+        for topic in super::topics::list(w.store(), peer).iter().filter(|t| t.selected) {
+            self.request_topic(w, peer, topic.id);
+        }
     }
 
     /// The far side read up to a line: every sent line up to it is read —
@@ -1238,10 +1365,18 @@ impl<T: Td> Account<T> {
         let Some(p) = updates::peer(user) else {
             return;
         };
+        let forum = user["type"]["@type"].as_str().map(|kind| {
+            kind == "userTypeBot" && user["type"]["has_topics"].as_bool().unwrap_or(false)
+        });
         self.filed(
             w,
             "on_user",
-            w.store().write(move |c| project_peers(c, &[p])),
+            w.store().write(move |c| {
+                let peer = p.id;
+                project_peers(c, &[p])?;
+                if let Some(forum) = forum { set_forum(c, peer, forum)?; }
+                Ok(())
+            }),
         );
     }
 
@@ -1347,10 +1482,10 @@ impl<T: Td> Account<T> {
     /// from, ends the walk. Media is fetched for the first page only — what
     /// the transcript shows as it opens — never for the thousands beneath.
     fn on_history(&self, w: &World, v: &Value) {
-        let Some((chat, walk, from)) = v["@extra"].as_str().and_then(parse_history_extra) else {
+        let Some((chat, topic, walk, from)) = v["@extra"].as_str().and_then(parse_history_in) else {
             return;
         };
-        let page = Page { chat, walk, from };
+        let page = Page { chat, topic, walk, from };
         let stale = self.in_flight.get().is_some_and(|(current, _)| current != page);
         if !self.accept_page(page) {
             return;
@@ -1360,10 +1495,11 @@ impl<T: Td> Account<T> {
             return;
         }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
-        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message).collect();
+        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
+            .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {
-                runtime::of(w.store()).set_loading(chat, false);
+                runtime::of(w.store()).set_loading_in(chat, topic, false);
             }
             return;
         };
@@ -1372,8 +1508,8 @@ impl<T: Td> Account<T> {
             .store()
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND id BETWEEN ?2 AND ?3",
-                rusqlite::params![chat, oldest, newest],
+                "SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND id BETWEEN ?2 AND ?3 AND (?4 = 0 OR topic = ?4)",
+                rusqlite::params![chat, oldest, newest, topic],
                 |r| r.get(0),
             )
             .unwrap_or(0);
@@ -1381,7 +1517,7 @@ impl<T: Td> Account<T> {
         // then the page fills a gap above known history, which is worth
         // closing whatever the window holds; else this is the first load,
         // which the cap bounds like a tail.
-        let gap = history_window(w.store().conn(), chat)
+        let gap = history_window_in(w.store().conn(), chat, topic)
             .ok()
             .and_then(|(held, _)| held)
             .is_some_and(|held| held < oldest);
@@ -1407,11 +1543,11 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &batch)?;
                 apply_read_outbox(c, chat)?;
-                trim_chat(c, chat)?;
+                trim_topic(c, chat, topic)?;
                 Ok(())
             }),
         );
-        let (held_oldest, count) = history_window(w.store().conn(), chat).unwrap_or((None, 0));
+        let (held_oldest, count) = history_window_in(w.store().conn(), chat, topic).unwrap_or((None, 0));
         if stale {
             return;
         }
@@ -1430,9 +1566,9 @@ impl<T: Td> Account<T> {
             Walk::Tail => None,
             Walk::Mentions(_) => unreachable!("handled above"),
         };
-        runtime::of(w.store()).set_loading(chat, next.is_some());
+        runtime::of(w.store()).set_loading_in(chat, topic, next.is_some());
         if let Some((from, walk)) = next {
-            self.pages.borrow_mut().push_back(Page { chat, from, walk });
+            self.pages.borrow_mut().push_back(Page { chat, topic, from, walk });
         }
     }
 

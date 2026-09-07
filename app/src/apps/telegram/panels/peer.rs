@@ -163,7 +163,11 @@ impl Panel for Peer {
                 Some('c'),
                 Nav::Open {
                     from: self.slot,
-                    id: Chat::id(self.peer),
+                    id: if card.as_ref().is_some_and(|c| c.is_forum) {
+                        super::Topics::id(self.peer)
+                    } else {
+                        Chat::id(self.peer)
+                    },
                     fresh: false,
                 },
             ),
@@ -178,6 +182,11 @@ impl Panel for Peer {
                 },
             ),
         ];
+        if card.as_ref().is_some_and(|c| c.is_forum) {
+            v.push(Verb::go("telegram.topics", "topics", None, Nav::Open {
+                from: self.slot, id: super::Topics::id(self.peer), fresh: false,
+            }));
+        }
         if group {
             v.push(Verb::go(
                 "telegram.members",
