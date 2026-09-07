@@ -3,7 +3,6 @@
 use super::super::panels::Topics;
 use crate::shell::{
     hosted::{Ask, PanelProps},
-    keys::Letters,
     widgets::table,
 };
 use kernel::{nav::Nav, session::Session};
@@ -49,9 +48,6 @@ impl Widget for TopicsPanel {
             }
         }
         let field_focused = field.key_focus(cx);
-        if field_focused {
-            props.chord.field(Letters::ALL);
-        }
         let mut toggle = None;
         if let Some(ask) = props.grab.ask() {
             if let Ask::Mark(at) = ask {
@@ -63,9 +59,6 @@ impl Widget for TopicsPanel {
             }
         } else {
             if let Event::KeyDown(k) = event {
-                if focused && field_focused && k.modifiers.logo {
-                    props.chord.take();
-                }
                 if focused && !k.modifiers.logo && !k.modifiers.control && !k.modifiers.alt {
                     match k.key_code {
                         KeyCode::Slash if !field_focused => {
@@ -163,9 +156,6 @@ impl Widget for TopicsPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let field = self.view.text_input(cx, ids!(filter_input));
-        if field.key_focus(cx) {
-            props.chord.field(Letters::ALL);
-        }
         with_topics(&props, |p| p.set_filter(field.text()));
         let Some((topics, cursor, status, empty)) =
             with_topics(&props, |p| (p.rows(), p.cursor(), p.status(), p.empty()))
@@ -216,22 +206,15 @@ impl Widget for TopicsPanel {
         self.rows.clear();
         let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
         for (index, row) in drawn {
-            let mut rect = row.area().rect(cx);
-            if clip.size.y > 0.0 {
-                let top = rect.pos.y.max(clip.pos.y);
-                let bottom = (rect.pos.y + rect.size.y).min(clip.pos.y + clip.size.y);
-                rect.pos.y = top;
-                rect.size.y = bottom - top;
-            }
-            if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
-                continue;
-            }
-            props.hits.add_row(
+            let Some(rect) = props.hits.add_row_clipped(
                 topics[index].name.clone(),
-                rect,
+                row.area().rect(cx),
+                clip,
                 MouseCursor::Hand,
                 props.slot,
-            );
+            ) else {
+                continue;
+            };
             self.rows.push((topics[index].id, rect));
         }
         for path in [ids!(status_lbl), ids!(empty_lbl)] {

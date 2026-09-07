@@ -6,11 +6,12 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
 use kernel::store::Store;
 
-use super::model::{MsgId, PeerId};
+use super::model::{DownloadProgress, MsgId, PeerId};
 use super::requests::PeerAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,8 @@ struct State {
     mentions_failed: Vec<PeerId>,
     connection_error: Option<String>,
     list_syncing: bool,
+    connection_note: Option<String>,
+    downloads: HashMap<String, DownloadProgress>,
     connection_status: Option<String>,
     wanted: Wanted,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
@@ -95,7 +98,6 @@ pub struct Wanted {
     pub mentions: Vec<PeerId>,
     pub topic_chats: Vec<(PeerId, i64)>,
     pub topic_lists: Vec<PeerId>,
-    pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
 
@@ -264,6 +266,31 @@ impl Runtime {
         self.state().list_syncing = on;
     }
 
+    /// This client's connection state, independent of another process's
+    /// writes to the shared session row. None once this client is ready.
+    pub fn connection_note(&self) -> Option<String> {
+        self.state().connection_note.clone()
+    }
+
+    pub fn set_connection_note(&self, note: Option<&str>) {
+        self.state().connection_note = note.map(str::to_string);
+    }
+
+    /// Progress follows the same `tg:` key as the media cache, so a clip and
+    /// its poster never share counts. Finished or stopped downloads are removed.
+    pub fn set_download(&self, reference: &str, progress: Option<DownloadProgress>) {
+        let mut state = self.state();
+        if let Some(progress) = progress {
+            state.downloads.insert(reference.to_string(), progress);
+        } else {
+            state.downloads.remove(reference);
+        }
+    }
+
+    pub fn download(&self, reference: &str) -> Option<DownloadProgress> {
+        self.state().downloads.get(reference).copied()
+    }
+
     #[cfg(any(feature = "tdlib", test))]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
@@ -303,10 +330,6 @@ impl Runtime {
             return Err(error.clone());
         }
         state.topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
-    }
-
-    pub fn want_line(&self, chat: PeerId, id: MsgId) {
-        push_unique(&mut self.state().wanted.lines, (chat, id));
     }
 
     pub fn want_mentions(&self, chat: PeerId) {
@@ -377,9 +400,15 @@ mod tests {
         state.carry_forward(7, vec![42]);
         state.play_on_open(7, 42);
         state.set_list_syncing(true);
+        state.set_connection_note(Some("connecting to Telegram…"));
+        let progress = DownloadProgress {
+            downloaded: 1024,
+            total: Some(4096),
+            estimated: false,
+        };
+        state.set_download("tg:photo", Some(progress));
         for _ in 0..2 {
             state.want_history(7);
-            state.want_line(7, 42);
             state.want_file("remote-photo");
         }
 
@@ -396,9 +425,10 @@ mod tests {
             );
             assert!(state.loading(7));
             assert!(state.list_syncing());
+            assert_eq!(state.connection_note().as_deref(), Some("connecting to Telegram…"));
+            assert_eq!(state.download("tg:photo"), Some(progress));
             let wanted = state.take_wanted();
             assert_eq!(wanted.chats, vec![7]);
-            assert_eq!(wanted.lines, vec![(7, 42)]);
             assert_eq!(wanted.files, vec!["remote-photo"]);
             state.set_loading(7, false);
             state.set_list_syncing(false);
@@ -414,6 +444,9 @@ mod tests {
         assert!(other.take_forward().is_none());
         assert!(!other.take_play_on_open(7, 42));
         assert!(!other.loading(7));
+        assert_eq!(other.connection_note(), None);
+        assert_eq!(other.download("tg:photo"), None);
+        assert_eq!(state.download("tg:photo"), Some(progress));
         assert!(other.take_wanted().files.is_empty());
         assert!(state.take_play_on_open(7, 42));
         assert!(!state.take_play_on_open(7, 42));

@@ -768,8 +768,8 @@ script_mod! {
                 width: 480, height: Fit
                 player := mod.widgets.MediaPlayer {}
             }
-            // What the panel is waiting on, in a word: the clip nobody had
-            // downloaded is on its way. Empty and hidden the rest of the time.
+            // Downloaded / total bytes for the clip or picture on its way.
+            // Empty and hidden once the file is here.
             note_lbl := mod.widgets.SLabel {
                 visible: false
                 width: Fit, text: ""

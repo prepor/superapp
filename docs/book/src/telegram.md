@@ -172,6 +172,29 @@ History and missing-file requests use a separate deduplicated pending set in
 the same runtime. The worker drains it on each pass and maintains its own
 history pacing. Loading flags stay with the store that requested the work.
 
+The media viewer shows downloaded and total bytes while a clip or photo is
+arriving. File replies and updates refresh these counts in the store runtime,
+keyed by the media's cache reference. Estimated totals are prefixed with `~`;
+an unknown total is shown as unknown. Finished and stopped downloads clear
+their progress, and the note disappears once the media is available locally.
+
+Downloads and history requested during startup stay queued until this client
+is authorized. If initialization fails, the viewer and sign-in panel show
+the connection problem, including a session held by another app instance.
+Initialization retries every five seconds after a failure; queued media
+starts automatically once Telegram is ready.
+
+An uncached viewer first restores its source message in the current TDLib
+session, waiting with history requests for that chat to load during startup.
+A saved remote file id
+alone cannot repair an expired file reference. The viewer then downloads the
+fresh file at priority 32 with a completion response, while `updateFile` keeps
+the byte counts current. Source errors, download failures and timeouts appear
+in the viewer; the shared feedback controls offer an explicit retry.
+
+Playing videos fit inside the viewer at their original aspect ratio, including
+when the window is resized, with empty space around the frame where needed.
+
 ## Modules
 
 | Module | Responsibility |

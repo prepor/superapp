@@ -30,6 +30,8 @@ pub struct ViewerPanel {
     #[rust]
     last_word: String,
     #[rust]
+    last_note: Option<String>,
+    #[rust]
     play: Option<Rect>,
     #[rust]
     seek_bar: Option<SeekBar>,
@@ -158,7 +160,7 @@ impl Widget for ViewerPanel {
                 v.ask_for_picture(&m);
                 let st = v.player_state(&m, now);
                 let clip = v.plays_clip(&m).then(|| v.clip_file(&m)).flatten();
-                let note = v.clip_note(&m);
+                let note = v.download_note(&m);
                 let awaiting = v.awaiting_picture(&m);
                 Some((m, st, clip, v.running(), note, v.playing(now), awaiting))
             })
@@ -166,6 +168,13 @@ impl Widget for ViewerPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let v = &self.view;
+        if note != self.last_note {
+            super::super::trace::note(
+                store_dir.as_deref(),
+                &format!("media: line {} {}", m.id, note.as_deref().unwrap_or("download ready")),
+            );
+            self.last_note = note.clone();
+        }
         // What is on the picture box, by the line and the file it shows —
         // recorded only once the bytes decoded, so a photo that arrives
         // after the panel opened is decoded then, and a line whose media
@@ -237,7 +246,7 @@ impl Widget for ViewerPanel {
         word_lbl.set_text(cx, &m.media.as_ref().map(|md| md.line(now)).unwrap_or_default());
         word_lbl.set_visible(cx, !shown && !rolling && sticker.is_none());
         let note_lbl = v.label(cx, ids!(body.note_lbl));
-        note_lbl.set_text(cx, note.unwrap_or(""));
+        note_lbl.set_text(cx, note.as_deref().unwrap_or(""));
         note_lbl.set_visible(cx, note.is_some());
         let player_w = v.widget(cx, ids!(body.player_box.player));
         media::fill_player(cx, &player_w, player.as_ref());

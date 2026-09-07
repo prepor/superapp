@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::model::{Media, MsgId, PeerId};
+use super::model::{DownloadProgress, Media, MsgId, PeerId};
 use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
 
 // -- a message ----------------------------------------------------------------------
@@ -368,8 +368,20 @@ fn location_media(content: &Value, date: f64) -> Media {
 
 /// The blob-cache key a file resolves through: `tg:<remote unique id>`. `None`
 /// when the file has no remote yet — a purely local one not on the server.
-fn file_ref(file: &Value) -> Option<String> {
+pub fn file_ref(file: &Value) -> Option<String> {
     nonempty(file["remote"]["unique_id"].as_str()).map(|uid| format!("tg:{uid}"))
+}
+
+/// Downloaded bytes are the total received, not the contiguous prefix used
+/// for streaming. Prefer the exact size; zero means TDLib does not know it.
+pub fn download_progress(file: &Value) -> DownloadProgress {
+    let size = file["size"].as_u64().filter(|&n| n > 0);
+    let expected = file["expected_size"].as_u64().filter(|&n| n > 0);
+    DownloadProgress {
+        downloaded: file["local"]["downloaded_size"].as_u64().unwrap_or(0),
+        total: size.or(expected),
+        estimated: size.is_none() && expected.is_some(),
+    }
 }
 
 /// The id a file is taken back by across sessions: `remoteFile.id`, which a
@@ -403,6 +415,22 @@ fn download_target(content: &Value) -> Option<&Value> {
         "messageVideoNote" => &content["video_note"]["thumbnail"]["file"],
         _ => return None,
     })
+}
+
+/// The viewer's full clip or picture, including videos without thumbnails.
+pub fn viewer_file(content: &Value, clip: bool) -> Option<&Value> {
+    let file = if clip {
+        match content["@type"].as_str()? {
+            "messageVideo" => &content["video"]["video"],
+            "messageAnimation" => &content["animation"]["animation"],
+            "messageVideoNote" => &content["video_note"]["video"],
+            _ => return None,
+        }
+    } else {
+        download_target(content)?
+    };
+    file_id(file).filter(|id| *id > 0)?;
+    Some(file)
 }
 
 /// The session-local id the worker fires `downloadFile` on, for the file

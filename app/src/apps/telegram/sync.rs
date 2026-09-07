@@ -53,9 +53,17 @@ const TYPING_FOR: f64 = 6.0;
 pub struct Account<T: Td> {
     td: T,
     commands: std::cell::RefCell<Option<runtime::Inbox>>,
-    /// Readiness belongs to this TDLib client, not the last process's
-    /// persisted authorization row.
+    /// Media and history stay queued until this client is authorized. The
+    /// persisted session row may describe a different running app instance.
     auth_ready: std::cell::Cell<bool>,
+    waiting_for_parameters: std::cell::Cell<bool>,
+    /// A failed initialization needs another request: TDLib does not emit
+    /// WaitTdlibParameters again when a competing instance releases its lock.
+    retry_parameters: std::cell::Cell<Option<f64>>,
+    /// A restored viewer can open before loadChats has restored its chat.
+    media_requests: std::cell::RefCell<Vec<String>>,
+    known_chats: std::cell::RefCell<std::collections::HashSet<PeerId>>,
+    loading_chats: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -109,6 +117,8 @@ const PAGE_PATIENCE: f64 = 30.0;
 /// opens; the rest are the viewer's to ask for.
 const FETCH_ON_OPEN: usize = 40;
 
+const PARAMETERS_RETRY: f64 = 5.0;
+
 impl<T: Td> Account<T> {
     /// The single outbound boundary for commands and background requests.
     fn send(&self, w: &World, request: &str) {
@@ -119,6 +129,17 @@ impl<T: Td> Account<T> {
                 .report(w.store(), "sending request", "Invalid request JSON");
             return;
         };
+        if v["@type"] == "getMessage"
+            && v["@extra"]["context"].as_str().and_then(parse_media_extra).is_some()
+            && (!self.auth_ready.get() || (self.loading_chats.get()
+                && !v["chat_id"].as_i64().is_some_and(|chat| self.known_chats.borrow().contains(&chat))))
+        {
+            let mut pending = self.media_requests.borrow_mut();
+            if !pending.contains(&request) {
+                pending.push(request);
+            }
+            return;
+        }
         if let Err(error) = super::operations::validate_files(&v) {
             if let Some(id) = v["@extra"]["operation"].as_u64() {
                 rt.operations.fail(w.store(), id, &error, false);
@@ -200,6 +221,11 @@ impl<T: Td> Account<T> {
             td,
             commands: std::cell::RefCell::new(None),
             auth_ready: std::cell::Cell::new(false),
+            waiting_for_parameters: std::cell::Cell::new(false),
+            retry_parameters: std::cell::Cell::new(None),
+            media_requests: std::cell::RefCell::new(Vec::new()),
+            known_chats: std::cell::RefCell::new(std::collections::HashSet::new()),
+            loading_chats: std::cell::Cell::new(false),
             api_id,
             tdlib_dir,
             phone,
@@ -238,18 +264,26 @@ impl<T: Td> Account<T> {
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
         let rt = runtime::of(w.store());
-        if !self.auth_ready.get() || rt.connection_error().is_some() || rt.list_syncing()
-        {
+        if !self.auth_ready.get() || rt.connection_error().is_some() {
             return;
         }
-        // Files a drawing found missing go first, and single lines asked for
-        // with them: few, cheap, and somebody is looking at each.
+        let pending = std::mem::take(&mut *self.media_requests.borrow_mut());
+        for request in pending {
+            let id = serde_json::from_str::<Value>(&request).ok()
+                .and_then(|v| v["@extra"]["operation"].as_u64());
+            if id.is_some_and(|id| runtime::of(w.store()).operations.pending(id)) {
+                self.send(w, &request);
+            }
+        }
+        // A viewer can fetch its media once that chat is known. Background
+        // history and topic work wait until the chat lists finish loading.
+        if rt.list_syncing() {
+            return;
+        }
+        // Files a drawing found missing go before background history pages.
         let wanted = runtime::of(w.store()).take_wanted();
         for rid in wanted.files {
             self.send(w, &request_file(&rid));
-        }
-        for (chat, id) in wanted.lines {
-            self.send(w, &get_message(chat, id));
         }
         for chat in wanted.chats {
             self.want(w, chat);
@@ -290,8 +324,12 @@ impl<T: Td> Account<T> {
         if now < self.not_before.get() {
             return;
         }
-        let Some(page) = self.pages.borrow_mut().pop_front() else {
-            return;
+        let page = {
+            let mut pages = self.pages.borrow_mut();
+            let Some(index) = pages.iter().position(|page| {
+                !self.loading_chats.get() || self.known_chats.borrow().contains(&page.chat)
+            }) else { return };
+            pages.remove(index).unwrap()
         };
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
@@ -325,8 +363,24 @@ impl<T: Td> Account<T> {
         // The receiver belongs to this account. Its lifetime is the send
         // permission: a stopped worker cannot leave a live sender behind.
         let mut commands = self.commands.borrow_mut();
-        let inbox = commands.get_or_insert_with(|| runtime::of(w.store()).connect());
+        let inbox = commands.get_or_insert_with(|| {
+            let state = runtime::of(w.store());
+            if !self.auth_ready.get() && state.connection_note().is_none() {
+                state.set_connection_note(Some("connecting to Telegram…"));
+            }
+            state.connect()
+        });
         for request in inbox.try_iter() {
+            if !self.auth_ready.get() {
+                if let Ok(v) = serde_json::from_str::<Value>(&request) {
+                    if v["@type"] == "getRemoteFile" {
+                        if let Some(rid) = v["remote_file_id"].as_str() {
+                            runtime::of(w.store()).want_file(rid);
+                            continue;
+                        }
+                    }
+                }
+            }
             self.send(w, &request);
         }
         drop(commands);
@@ -338,6 +392,10 @@ impl<T: Td> Account<T> {
         while let Some(raw) = self.td.receive(0.0) {
             self.on_update(w, &raw);
             n += 1;
+        }
+        if self.retry_parameters.get().is_some_and(|at| w.now() >= at) {
+            self.retry_parameters.set(None);
+            self.parameters(w);
         }
         self.pump(w);
         n
@@ -357,6 +415,16 @@ impl<T: Td> Account<T> {
             return;
         };
         let rt = runtime::of(w.store());
+        let context = v["@extra"]["context"].as_str().or_else(|| v["@extra"].as_str());
+        if v["@type"] == "message" {
+            if let Some((_, _, clip)) = context.and_then(parse_media_extra) {
+                if updates::viewer_file(&v["content"], clip).is_none() {
+                    self.on_new_message(w, &v);
+                    v = serde_json::json!({"@type": "error", "code": 404,
+                        "message": "This message no longer has downloadable media", "@extra": v["@extra"]});
+                }
+            }
+        }
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
@@ -377,10 +445,9 @@ impl<T: Td> Account<T> {
                 ));
                 self.on_auth(w, &v["authorization_state"]);
             }
-            // An error object is not an update; the flow ignores it, but a
-            // trace must show it — a bad phone, a flood wait, a rejected
-            // parameter all arrive this way. A 404 to the chat-list load is
-            // the one error that means something: the list is complete.
+            // Errors carry the request's correlation tag, so initialization,
+            // downloads, history and sends can recover in their own flow.
+            // A 404 to the chat-list load means the list is complete.
             Some("error") => {
                 let end = v["code"] == 404
                     && v["@extra"]
@@ -401,14 +468,15 @@ impl<T: Td> Account<T> {
             }
             Some("file") => {
                 self.log("<< file");
-                self.on_file_answer(w, &v);
                 self.on_file(w, &v);
+                self.on_file_answer(w, &v);
             }
-            // A single line fetched afresh ([`runtime::Runtime::want_line`]) answers as the
-            // message itself, which lands the way a new line does.
+            // A refreshed source message lands like a new line before its
+            // viewer starts downloading the file registered by that message.
             Some("message") => {
                 self.log("<< message");
                 self.on_new_message(w, &v);
+                self.on_media_answer(w, &v);
             }
             Some("messages") if tracked && v["@extra"].is_null() => {
                 if let Some(messages) = v["messages"].as_array() {
@@ -436,12 +504,40 @@ impl<T: Td> Account<T> {
     #[cfg(not(feature = "tdlib"))]
     fn log(&self, _line: &str) {}
 
+    fn parameters(&self, w: &World) {
+        let api_hash = w
+            .with_cap::<dyn Secrets, _>(|s| s.get("tg/api_hash"))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.log(&format!(
+            ">> setTdlibParameters api_id={} api_hash_len={} dir={}",
+            self.api_id,
+            api_hash.len(),
+            self.tdlib_dir.display()
+        ));
+        self.send(w, &set_tdlib_parameters(self.api_id, &api_hash, &self.tdlib_dir));
+    }
+
     /// One authorization state: fire what TDLib waits for, or record what the
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
         self.auth_ready.set(false);
         runtime::of(w.store()).set_connection_error(None);
         let now = w.now();
+        self.retry_parameters.set(None);
+        self.waiting_for_parameters.set(
+            st["@type"].as_str() == Some("authorizationStateWaitTdlibParameters"),
+        );
+        if st["@type"].as_str() != Some("authorizationStateReady") {
+            let note = match st["@type"].as_str() {
+                Some("authorizationStateWaitTdlibParameters") => "connecting to Telegram…",
+                Some("authorizationStateClosing" | "authorizationStateClosed") => "Telegram is disconnected",
+                Some("authorizationStateLoggingOut") => "signing out of Telegram…",
+                _ => "sign in to Telegram to download media",
+            };
+            runtime::of(w.store()).set_connection_note(Some(note));
+        }
         // The state row, written on the store's writer thread. Only the owned
         // arguments cross; `w` is not captured, so the closure is `Send`.
         let write = |phone: Option<String>, state: &'static str, detail: Option<String>| {
@@ -458,21 +554,7 @@ impl<T: Td> Account<T> {
             // anything else. The api_hash is the secret half, read from the
             // account holder's keychain and never from a file.
             Some("authorizationStateWaitTdlibParameters") => {
-                let api_hash = w
-                    .with_cap::<dyn Secrets, _>(|s| s.get("tg/api_hash"))
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                self.log(&format!(
-                    ">> setTdlibParameters api_id={} api_hash_len={} dir={}",
-                    self.api_id,
-                    api_hash.len(),
-                    self.tdlib_dir.display()
-                ));
-                self.send(
-                    w,
-                    &set_tdlib_parameters(self.api_id, &api_hash, &self.tdlib_dir),
-                );
+                self.parameters(w);
                 write(None, "connecting", None);
             }
             // The phone. If the file configured one, send it and move on; if
@@ -557,6 +639,10 @@ impl<T: Td> Account<T> {
     /// cannot establish whether Telegram delivered them while we were away.
     pub fn on_ready(&self, w: &World) {
         self.auth_ready.set(true);
+        self.loading_chats.set(true);
+        self.waiting_for_parameters.set(false);
+        self.retry_parameters.set(None);
+        runtime::of(w.store()).set_connection_note(None);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -609,7 +695,7 @@ impl<T: Td> Account<T> {
             return;
         }
         match (v["@extra"].as_str(), failed) {
-            (Some("tdlib_parameters"), true) => {
+            (Some("tdlib_parameters"), true) if self.waiting_for_parameters.get() => {
                 let message = v["message"].as_str().unwrap_or("unknown error");
                 let error = if message.contains("Can't lock file") {
                     "Telegram is open in another app window\nclose it and restart this app".into()
@@ -617,12 +703,35 @@ impl<T: Td> Account<T> {
                     format!("could not connect to Telegram: {message}")
                 };
                 runtime::of(w.store()).set_connection_error(Some(error));
+                let locked = v["message"].as_str().is_some_and(|m| m.contains("Can't lock file"));
+                runtime::of(w.store()).set_connection_note(Some(if locked {
+                    "Telegram is open in another app instance · close it to continue"
+                } else {
+                    "could not connect to Telegram · retrying…"
+                }));
+                self.retry_parameters.set(Some(w.now() + PARAMETERS_RETRY));
+            }
+            (Some("tdlib_parameters"), false) => {
+                self.retry_parameters.set(None);
+            }
+            (Some(extra), true)
+                if extra.starts_with("file:") || extra.starts_with("clip:") =>
+            {
+                // Preserve an older in-flight request rejected during startup.
+                if v["message"].as_str().is_some_and(|m| m.starts_with("Initialization parameters are needed")) {
+                    if let Some((_, rid)) = extra.split_once(':') {
+                        runtime::of(w.store()).want_file(rid);
+                    }
+                }
             }
             (Some("load_chats:main"), false) => self.send(w, &load_chats(ChatList::Main)),
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
                 self.send(w, &load_chats(ChatList::Archive));
             }
-            (Some("load_chats:archive"), true) => runtime::of(w.store()).set_list_syncing(false),
+            (Some("load_chats:archive"), true) => {
+                self.loading_chats.set(false);
+                runtime::of(w.store()).set_list_syncing(false);
+            }
             // A history page refused. Telegram's *too many requests* says
             // how long to hold off: the page goes back to the front and the
             // whole queue waits that long. Anything else — a chat gone
@@ -730,9 +839,27 @@ impl<T: Td> Account<T> {
             v["local"]["is_downloading_completed"],
             v["local"]["path"].as_str().unwrap_or("")
         ));
-        if let Some(id) = v["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
-            self.log(&format!(">> downloadFile {id} priority=32"));
-            self.send(w, &download_file(id, 32));
+        let context = format!("download:{}", v["id"]);
+        self.start_media(w, v, &context);
+    }
+
+    fn on_media_answer(&self, w: &World, message: &Value) {
+        let Some(context) = message["@extra"].as_str() else { return };
+        let Some((_, _, clip)) = parse_media_extra(context) else { return };
+        let Some(file) = updates::viewer_file(&message["content"], clip) else { return };
+        self.start_media(w, file, context);
+    }
+
+    fn start_media(&self, w: &World, file: &Value, context: &str) {
+        self.on_file(w, file);
+        if let Some(key) = updates::file_ref(file) {
+            if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key)).unwrap_or(false) {
+                return;
+            }
+            runtime::of(w.store()).set_download(&key, Some(updates::download_progress(file)));
+        }
+        if let Some(id) = file["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
+            self.send(w, &download_media(id, context));
         }
     }
 
@@ -901,7 +1028,8 @@ impl<T: Td> Account<T> {
         // completes, and [`on_file`](Account::on_file) ingests the bytes into
         // the blob cache under the same tg: key the row names — the next
         // redraw draws the photo.
-        if message["sending_state"].is_null() {
+        let clip = message["@extra"].as_str().and_then(parse_media_extra).map(|(_, _, clip)| clip);
+        if message["sending_state"].is_null() && clip != Some(false) {
             self.fetch(w, &message["content"]);
         }
     }
@@ -1019,6 +1147,9 @@ impl<T: Td> Account<T> {
     /// private chat), then the chat row. `INSERT OR IGNORE` on the stub never
     /// overwrites a real peer already filed.
     fn on_new_chat(&self, w: &World, chat: &Value) {
+        if let Some(id) = chat["id"].as_i64() {
+            self.known_chats.borrow_mut().insert(id);
+        }
         let Some(ch) = updates::chat(chat) else {
             return;
         };
@@ -1572,7 +1703,9 @@ impl<T: Td> Account<T> {
         }
     }
 
-    /// A file's state changed. On a finished download the bytes are ingested
+    /// A file's state changed. Active downloads publish their byte counts in
+    /// the store runtime; finished or stopped downloads clear those counts.
+    /// On a finished download the bytes are ingested
     /// into the [blob cache](Blobs) under the same `tg:<unique id>` key the
     /// message rows already point at, so a view resolves straight to the cached
     /// file — no row need change, the reference having named the key all along.
@@ -1600,21 +1733,23 @@ impl<T: Td> Account<T> {
     /// the engine's to forget.
     fn on_file(&self, w: &World, file: &Value) {
         runtime::of(w.store()).operations.file_progress(file);
+        let Some(key) = updates::file_ref(file) else {
+            return;
+        };
         let local = &file["local"];
-        if local["is_downloading_completed"].as_bool() != Some(true) {
+        let complete = local["is_downloading_completed"].as_bool() == Some(true);
+        let active = local["is_downloading_active"].as_bool() == Some(true);
+        runtime::of(w.store()).set_download(
+            &key,
+            (active && !complete).then(|| updates::download_progress(file)),
+        );
+        if !complete {
             return;
         }
         let Some(path) = local["path"].as_str().filter(|p| !p.is_empty()) else {
             return;
         };
-        let Some(uid) = file["remote"]["unique_id"]
-            .as_str()
-            .filter(|u| !u.is_empty())
-        else {
-            return;
-        };
         let src = PathBuf::from(path);
-        let key = format!("tg:{uid}");
         let rt = runtime::of(w.store());
         if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key))
             .unwrap_or(false)
