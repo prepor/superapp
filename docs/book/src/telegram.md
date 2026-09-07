@@ -87,9 +87,11 @@ including pages beyond the first hundred topics, without replacing the
 selection. A failed refresh keeps the cached catalog and offers a retry.
 
 The topic protocol uses the installed TDLib API's `messageTopicForum`,
-`getForumTopics`, and `getForumTopicHistory` types. The append-only V9 migration
-adds topic metadata and message membership, and the chat list reads a view
-combining ordinary chats with selected topics.
+`getForumTopics`, and `getForumTopicHistory` types. The V13 startup check adds
+and repairs topic metadata, message membership and the chat-list view that
+combines ordinary chats with selected topics. The existing link and block
+migrations also check their columns, so databases from earlier development
+builds upgrade without losing messages, link metadata, drafts or selections.
 
 ## Builds
 
