@@ -10,7 +10,8 @@ use std::rc::Rc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
-    Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, SecretsFactory, Watcher,
+    BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen,
+    SecretsFactory, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -354,6 +355,18 @@ impl Boot {
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
         let disk = disk_for(self.mode, scripted, c.demo_disk, &clock);
+        // The blob cache sits beside the store on a real, unscripted boot —
+        // device-local and un-synced, so its budget is not the store's to
+        // replicate. A script (or a build with no store on disk) gets a fresh
+        // temp dir, so a suite neither reads nor fills the machine's cache.
+        let blobs_dir = if self.mode == Mode::Real && !scripted {
+            db_dir
+                .clone()
+                .map(|d| d.join("blobs"))
+                .unwrap_or_else(scratch_blobs_dir)
+        } else {
+            scratch_blobs_dir()
+        };
         let env = Env {
             db_dir: db_dir.clone(),
             scripted,
@@ -365,6 +378,7 @@ impl Boot {
             // Filled in by the mount that runs the passes: only a threaded
             // one has channels to wake anybody through.
             kicks: Kicks::default(),
+            blobs: BlobCache::at(blobs_dir, BLOB_BUDGET_DEFAULT),
         };
         // A library mount: its own store, in memory, with the demo rows and
         // the outside its scene asked for. Nothing it does can reach the
@@ -513,6 +527,14 @@ fn resolve_db() -> Option<PathBuf> {
     let dir = PathBuf::from(home).join("Library/Application Support/superapp");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("superapp.db"))
+}
+
+/// A throwaway blob-cache directory under the temp root, for a scripted run
+/// or a build with no store on disk: named by the pid so parallel suites
+/// share nothing, and never the machine's real cache. The cache makes it on
+/// first use, so a run that caches nothing leaves nothing.
+fn scratch_blobs_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("superapp-blobs-{}", std::process::id()))
 }
 
 /// The shell's own [`Clipboard`]: the platform's, not the kernel's fake.

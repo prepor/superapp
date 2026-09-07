@@ -124,6 +124,11 @@ mod boundary {
     /// The store's other guarantee: `Connection::open` lives in one module,
     /// so no code can quietly open a second writable handle and route
     /// around the one writer.
+    ///
+    /// The blob cache is the one deliberate exception, named here so it stays
+    /// deliberate: its index is a *separate*, device-local database in the
+    /// cache directory — not the store, never replicated — so its handle
+    /// routes around nothing the rule protects.
     #[test]
     fn connection_open_is_confined_to_the_store() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -132,8 +137,10 @@ mod boundary {
         let mut offenders = Vec::new();
         for path in files {
             let name = path.file_name().and_then(|n| n.to_str());
-            if name == Some("store.rs") || name == Some("lib.rs") {
-                continue; // the one place the writer lives, and this test
+            if name == Some("store.rs") || name == Some("lib.rs") || name == Some("blobs.rs") {
+                // The store's one writer, this test, and the blob cache's own
+                // device-local index — the exception documented above.
+                continue;
             }
             let src = std::fs::read_to_string(&path).expect("read source");
             for (n, line) in src.lines().enumerate() {

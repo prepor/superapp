@@ -10,9 +10,11 @@ A window's own run reaches real servers. Every scripted run, every test, and
 every panels-library mount gets a fake set of servers instead, which registers
 itself under all three capability traits and under its own type, so a test can
 plant a letter or take the servers offline. The demo account a fresh store is
-seeded with carries the fake servers' hosts only in those runs; in a real one
-it has the same letters and no hosts, so no sync worker runs for a mailbox
-that is not out there.
+seeded with carries the fake servers' hosts only where a sync can reach them,
+in a scripted run and in a test; in a real run it has the same letters and no
+hosts, so no sync worker runs for a mailbox that is not out there, and in a
+library mount — a world with the clock and nothing else — it has none either,
+so no pass fails on every panel of the canvas.
 
 ## Tags and roots
 

@@ -19,6 +19,13 @@ path = "src/lib.rs"
 name = "superapp"
 path = "src/main.rs"
 
+# The real Telegram engine is an optional native link, off by default: a plain
+# `cargo build` needs no TDLib and the app runs the demo world. `--features
+# tdlib` binds `libtdjson` (the link plumbing is in `build.rs`) for a run that
+# reaches an account.
+[features]
+tdlib = []
+
 [dependencies]
 superapp-kernel = { path = "../kernel" }
 

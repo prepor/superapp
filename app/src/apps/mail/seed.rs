@@ -662,14 +662,16 @@ pub fn rfc822(m: &SeedMail) -> String {
 /// account is a mirror of a server rather than a pile of rows nothing can
 /// push.
 ///
-/// The hosts it is a mirror *of* are written only where they exist: a world
-/// with the fake servers in it ([`Mode::Fake`], [`Mode::Deny`]) gets
-/// `imap.demo` and `smtp.demo`, so a suite and a test can sync the demo
-/// account against them. A real run's demo account has no hosts, because
-/// there is no `imap.demo` out there — and an account with a host is an
-/// account with a [worker](super::sync::workers), which would stand as a
-/// failing sync in a person's own store every minute. The letters are the
-/// same either way.
+/// The hosts it is a mirror *of* are written only where a sync can reach
+/// them: a [`Mode::Fake`] world, which has the fake servers and the shared
+/// secrets, gets `imap.demo` and `smtp.demo`, so a suite and a test can
+/// sync the demo account against them. A real run's demo account has no
+/// hosts, because there is no `imap.demo` out there, and a [`Mode::Deny`]
+/// world's has none either, because such a world has the clock and nothing
+/// else — an account with a host is an account with a
+/// [worker](super::sync::workers), which would stand as a failing sync in
+/// a person's own store every minute, and as a failing sync announced on
+/// every panel of the library. The letters are the same either way.
 ///
 /// # Errors
 ///
@@ -681,7 +683,7 @@ pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
     if n > 0 {
         return Ok(());
     }
-    let hosts = (mode != Mode::Real).then_some((IMAP_HOST, SMTP_HOST));
+    let hosts = (mode == Mode::Fake).then_some((IMAP_HOST, SMTP_HOST));
     store.write(move |c| {
         c.execute(
             "INSERT INTO account(id, label, email, imap_host, smtp_host)

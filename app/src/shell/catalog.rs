@@ -23,6 +23,8 @@ use kernel::store::Store;
 use makepad_widgets::*;
 
 use super::dsl::{OverlayProps, OverlayRowData, OverlayRowWidgetRefExt, SLinkWidgetRefExt};
+use super::widgets::map::{self, FakeTiles};
+use super::widgets::media::{self, PlayerState};
 
 /// Sets a component's state through its own API, once, when it mounts.
 pub type Populate = Rc<dyn Fn(&mut Cx, &WidgetRef)>;
@@ -179,6 +181,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
     let mut all = vec![
         link(),
         overlay_row(),
+        media_kit(),
         launcher(),
         workspace_scene(),
         phone_scene(),
@@ -212,6 +215,56 @@ fn link() -> Scene<Setup> {
         .node("accelerator", l("reply", false, Some('r')))
         .about("cmd+r")
         .edge("solid", "dotted", "the same link, dotted")
+}
+
+/// The media kit: what any panel embeds to show a sound, a recording under
+/// way, or a place. Fixtures, not a world: the state a player is handed is
+/// the panel's, and here it is written down.
+fn media_kit() -> Scene<Setup> {
+    let player = |playing: bool, position: f64| {
+        widget(live_id!(media_player_tpl), move |cx, w| {
+            let st = PlayerState {
+                playing,
+                position,
+                length: 42.0,
+            };
+            media::fill_player(cx, w, Some(&st));
+        })
+    };
+    let meter = |level: f32| {
+        widget(live_id!(media_meter_tpl), move |cx, w| {
+            media::fill_meter(cx, w, level);
+        })
+    };
+    let place = |lat: f64, lon: f64| {
+        widget(live_id!(media_map_tpl), move |cx, w| {
+            let snap = map::snapshot(&mut FakeTiles, lat, lon, map::ZOOM, 320, 160);
+            media::fill_map(cx, w, Some(&snap));
+        })
+    };
+    Scene::new("media kit", (360.0, 40.0))
+        .note("The shell's media kit: a player over any recording, the meter of one under way, and a place on the map — one set for a chat's voice note, a letter's audio part and a file on a card.")
+        .note("A player's state is the panel's, ticked against the clock; the kit only draws it. The map is drawn from tiles — a fake street grid here, OpenStreetMap's once the kernel fetches them.")
+        .node("player, at rest", player(false, 0.0))
+        .about("play, the progress as a hairline, the time")
+        .node("player, playing", player(true, 17.0))
+        .about("pause while it runs, the hairline filled to where it stands")
+        .node("player, paused", player(false, 17.0))
+        .about("stopped where it was: play takes it on from there")
+        .node("meter, quiet", meter(0.25))
+        .sized((360.0, 16.0))
+        .about("the level of a recording, as bars")
+        .node("meter, loud", meter(0.85))
+        .sized((360.0, 16.0))
+        .node("map", place(47.0472, 8.3164))
+        .sized((320.0, 164.0))
+        .about("a place: the map around it, the pin at its centre")
+        .node("map, elsewhere", place(55.7512, 37.6184))
+        .sized((320.0, 164.0))
+        .about("another place is another map")
+        .edge("player, at rest", "player, playing", "play")
+        .edge("player, playing", "player, paused", "pause")
+        .edge("meter, quiet", "meter, loud", "speak up")
 }
 
 /// One row of a modal sheet, in each of its states.
@@ -370,7 +423,7 @@ mod tests {
     #[test]
     fn every_scene_is_a_dag_with_a_name_per_state() {
         let all = scenes();
-        assert!(all.len() >= 5, "the shell's own scenes at least");
+        assert!(all.len() >= 6, "the shell's own scenes at least");
         for s in &all {
             s.check().unwrap_or_else(|e| panic!("{e}"));
             assert!(!s.nodes.is_empty(), "{}: no nodes", s.name);

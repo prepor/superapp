@@ -9,11 +9,14 @@
 //! is handed its data.
 //!
 //! Their templates are in [`dsl`], registered by the shell's own
-//! `script_mod`. An app composes them: the chassis, the filter, the row
+//! `script_mod`. The media kit — a picture, a player, a recording meter, a
+//! map — is [`media`], with the map's maths and its fake tiles in [`map`]. An app composes them: the chassis, the filter, the row
 //! twins and the completion box are the shell's; the row's content and what
 //! a row opens are the app's.
 
 pub mod card;
 pub mod dsl;
+pub mod map;
+pub mod media;
 pub mod suggest;
 pub mod table;

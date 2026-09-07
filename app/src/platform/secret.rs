@@ -10,6 +10,12 @@
 //! mail account's address. The kernel spells that prefix once, in
 //! [`kernel::repl::r2::secret_key`].
 //!
+//! A key that begins `tg/` is a Telegram credential — an account's api_hash —
+//! under a third service of its own, filed under the name after the slash. Its
+//! non-secret half (the api_id and the account phone) is not a secret and not
+//! here: it lives in a plain `telegram` file beside the store, read by the
+//! telegram app's `config`.
+//!
 //! Only [`Mode::Real`](kernel::app::Mode) gets this. A scripted run keeps
 //! the kernel's in-memory one: a suite must no more write to a human's
 //! keychain than delete their files.
@@ -28,6 +34,13 @@ const BUCKET_SERVICE: &str = "superapp-r2";
 
 /// The prefix the kernel files a bucket secret under.
 const BUCKET_PREFIX: &str = "r2/";
+
+/// The one a Telegram credential — an account's api_hash — goes under.
+#[cfg(target_os = "macos")]
+const TG_SERVICE: &str = "superapp-telegram";
+
+/// The prefix a Telegram credential is filed under.
+const TG_PREFIX: &str = "tg/";
 
 /// The platform's secret store.
 pub struct Keychain {
@@ -76,18 +89,21 @@ impl Secrets for Keychain {
     }
 }
 
-/// The service a key belongs to, and the account inside it. Two services,
-/// because the two kinds of secret are two kinds of thing and a person
+/// The service a key belongs to, and the account inside it. Three services,
+/// because the three kinds of secret are three kinds of thing and a person
 /// looking in Keychain Access should see which is which.
 fn split(key: &str) -> (&'static str, &str) {
     #[cfg(target_os = "macos")]
-    match key.strip_prefix(BUCKET_PREFIX) {
-        Some(key_id) => (BUCKET_SERVICE, key_id),
-        None => (SERVICE, key),
+    match key.strip_prefix(TG_PREFIX) {
+        Some(name) => (TG_SERVICE, name),
+        None => match key.strip_prefix(BUCKET_PREFIX) {
+            Some(key_id) => (BUCKET_SERVICE, key_id),
+            None => (SERVICE, key),
+        },
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = BUCKET_PREFIX;
+        let _ = (BUCKET_PREFIX, TG_PREFIX);
         ("", key)
     }
 }
@@ -177,15 +193,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The two kinds of secret go under two services, so a bucket key and a
-    /// mail password of the same name are two entries.
+    /// The three kinds of secret go under three services, so a Telegram
+    /// api_hash, a bucket key, and a mail password of the same name are three
+    /// distinct entries.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_bucket_key_and_a_password_are_two_entries() {
+    fn each_kind_of_secret_gets_its_own_service() {
+        // A bare address is still a mail password, unprefixed.
         assert_eq!(split("a@b.c"), (SERVICE, "a@b.c"));
+        // `r2/` still routes to the bucket service, unchanged.
         assert_eq!(
             split(&kernel::repl::r2::secret_key("AKIDEXAMPLE")),
             (BUCKET_SERVICE, "AKIDEXAMPLE")
         );
+        // `tg/api_hash` — the key the real client reads — routes to Telegram's
+        // own service, filed under the name after the slash.
+        assert_eq!(split("tg/api_hash"), (TG_SERVICE, "api_hash"));
     }
 }

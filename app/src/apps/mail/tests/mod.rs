@@ -1512,6 +1512,24 @@ fn a_real_seed_leaves_the_demo_account_without_hosts() {
         .map(|w| w.name())
         .collect();
     assert_eq!(names, vec!["sender".to_string()], "no pass for a hostless account");
+
+    // A world with the clock and nothing else — a library mount — gets no
+    // hosts either: a pass there could only fail, and announce it on every
+    // panel of the canvas.
+    let store = Store::open(None, &apps.schemas()).expect("in-memory store");
+    apps.seed(&store, Mode::Deny).expect("the demo rows");
+    let hosts: (Option<String>, Option<String>) = store
+        .conn()
+        .query_row("SELECT imap_host, smtp_host FROM account", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("the demo account is there all the same");
+    assert_eq!(hosts, (None, None));
+    let names: Vec<String> = super::sync::workers(&store)
+        .iter()
+        .map(|w| w.name())
+        .collect();
+    assert_eq!(names, vec!["sender".to_string()]);
 }
 
 /// A compose's identity round-trips through its arguments, which is the one
