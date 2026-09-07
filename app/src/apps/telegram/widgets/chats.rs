@@ -14,13 +14,13 @@ use crate::shell::hosted::PanelProps;
 use crate::shell::widgets::table::{self, RowSpec, TableView};
 
 use super::super::model::{self, ChatRow};
-use super::super::panels::{Chat, Chats};
+use super::super::panels::Chats;
 
 /// What the table needs to know about a chat list's rows.
 pub struct ChatsRows;
 
 impl RowSpec for ChatsRows {
-    type Src = &'static SqlSource<ChatRow, i64>;
+    type Src = &'static SqlSource<ChatRow, String>;
     type Panel = Chats;
 
     fn list(panel: &mut Chats) -> &mut ListState<Self::Src> {
@@ -36,7 +36,7 @@ impl RowSpec for ChatsRows {
     /// twin, not a weight, because a label's style is not a runtime value.
     fn populate(cx: &mut Cx, row: &WidgetRef, r: &ChatRow, selected: bool, marked: bool, now: f64) {
         let line = table::line(cx, row, selected, marked);
-        let unread = r.unread > 0 || r.unread_mentions > 0;
+        let unread = !r.is_forum && (r.unread > 0 || r.unread_mentions > 0);
         for (path, on) in [(ids!(body.title_lbl), !unread), (ids!(body.title_b), unread)] {
             let lbl = line.label(cx, path);
             lbl.set_text(cx, if on { &r.title } else { "" });
@@ -53,7 +53,7 @@ impl RowSpec for ChatsRows {
         line.label(cx, ids!(body.when_lbl))
             .set_text(cx, &model::when(r.last, now));
         line.label(cx, ids!(body.preview_lbl))
-            .set_text(cx, &r.preview(now));
+            .set_text(cx, &if r.is_forum { "select topics to show as chats".into() } else { r.preview(now) });
         line.label(cx, ids!(body.pinned_lbl))
             .set_visible(cx, r.pinned > 0);
         // Personal replies and mentions stay visible beside the ordinary
@@ -76,12 +76,14 @@ impl RowSpec for ChatsRows {
     }
 
     fn target(r: &ChatRow) -> PanelId {
-        Chat::id(r.peer)
+        Chats::target(r)
     }
 
     fn empty_line(panel: &Chats, filter: &str) -> String {
         if !filter.trim().is_empty() {
             "no chat under this filter".to_string()
+        } else if panel.managing_topics() {
+            "no groups with topics yet".to_string()
         } else if panel.archived() {
             "nothing archived".to_string()
         } else {
@@ -92,6 +94,7 @@ impl RowSpec for ChatsRows {
     /// A finger: leftward archives, rightward reads — the two verbs the
     /// bar wears over the marks, asked of the same panel.
     fn swipe_verbs(panel: &Chats) -> [Option<&'static str>; 2] {
+        if panel.managing_topics() { return [None, None]; }
         [
             Some(if panel.archived() {
                 "telegram.unarchive"

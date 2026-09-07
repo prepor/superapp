@@ -20,17 +20,17 @@ use kernel::store::Store;
 
 use super::super::model::{self, ChatRow, PeerId, PAGE};
 use super::super::{draft_toast, requests, runtime};
-#[cfg(test)]
 use super::Chat;
-use super::{told, wire, Contacts, Messages};
+use super::{flip, told, wire, Contacts, Messages};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
     id: PanelId,
     archive: bool,
+    forums: bool,
     store: Rc<Store>,
     slot: SlotId,
-    list: ListState<&'static SqlSource<ChatRow, i64>>,
+    list: ListState<&'static SqlSource<ChatRow, String>>,
 }
 
 impl Chats {
@@ -48,6 +48,12 @@ impl Chats {
         PanelId::new(Self::TAG, ["archive"])
     }
 
+    pub fn forums() -> PanelId {
+        PanelId::new(Self::TAG, ["topics"])
+    }
+
+    pub fn managing_topics(&self) -> bool { self.forums }
+
     /// Whether a `chats` panel is the archive.
     #[must_use]
     pub fn is_archive(id: &PanelId) -> bool {
@@ -59,7 +65,7 @@ impl Chats {
         self.archive
     }
 
-    pub fn list_mut(&mut self) -> &mut ListState<&'static SqlSource<ChatRow, i64>> {
+    pub fn list_mut(&mut self) -> &mut ListState<&'static SqlSource<ChatRow, String>> {
         &mut self.list
     }
 
@@ -75,7 +81,7 @@ impl Chats {
     pub fn go(&mut self, i: usize) -> Option<Nav> {
         let store = self.store.clone();
         let row = self.list.set_cursor(&store, i)?;
-        Some(self.preview(row.peer))
+        Some(Nav::Preview { from: self.slot, id: Self::target(&row) })
     }
 
     /// Space: the mark on the cursor's row, toggled.
@@ -85,12 +91,9 @@ impl Chats {
         self.list.toggle_mark(&store)
     }
 
-    #[cfg(test)]
-    fn preview(&self, peer: model::PeerId) -> Nav {
-        Nav::Preview {
-            from: self.slot,
-            id: Chat::id(peer),
-        }
+    pub fn target(row: &ChatRow) -> PanelId {
+        if row.is_forum { super::Topics::id(row.peer) }
+        else { Chat::topic(row.peer, row.topic) }
     }
 }
 
@@ -103,7 +106,7 @@ impl Panel for Chats {
     /// down page by page, *syncing…* beside it, so a list that is short is
     /// seen to be short for now.
     fn title(&self) -> String {
-        let word = if self.archive { "archive" } else { "chats" };
+        let word = if self.forums { "topic groups" } else if self.archive { "archive" } else { "chats" };
         if runtime::of(&self.store).list_syncing() {
             format!("{word} · syncing…")
         } else {
@@ -131,6 +134,11 @@ impl Panel for Chats {
     /// a waiting forward as well as for a marked set, being the way out of
     /// either.
     fn verbs(&self) -> Vec<Verb> {
+        if self.forums {
+            return vec![Verb::go("telegram.chats", "chats", Some('c'), Nav::Open {
+                from: self.slot, id: Self::id(), fresh: false,
+            })];
+        }
         let mut v = vec![Verb::go(
             "telegram.new",
             "new message",
@@ -148,6 +156,9 @@ impl Panel for Chats {
             Some('s'),
             Nav::Open { from: self.slot, id: Messages::replies(None), fresh: false },
         ));
+        v.push(Verb::go("telegram.topics", "topics", None, Nav::Open {
+            from: self.slot, id: Self::forums(), fresh: false,
+        }));
         let forwarding = runtime::of(&self.store).pending_forward().is_some();
         if forwarding {
             v.push(Verb::run("telegram.forward_here", "forward here", Some('f')));
@@ -215,28 +226,36 @@ impl Chats {
     /// where the build is not signed in — and then nothing is written and the
     /// marks stay, there being nothing done to have finished with.
     fn batch(&mut self, s: &mut Session, verb: &str) {
-        let peers: Vec<PeerId> = self.list.marks().keys();
+        let peers: Vec<(PeerId, i64)> = self.list.marks().keys().iter()
+            .filter_map(|key| super::super::topics::parse_key(key)).collect();
         if peers.is_empty() {
             return;
         }
         let store = self.store.clone();
         let archiving = verb == "telegram.archive";
         let mut queued = Vec::new();
-        for &peer in &peers {
+        let mut local = Vec::new();
+        for &(peer, topic) in &peers {
+            if topic != 0 && matches!(verb, "telegram.pin" | "telegram.archive" | "telegram.unarchive") {
+                local.push((peer, topic));
+                queued.push((peer, topic));
+                continue;
+            }
             let request = match verb {
-                // Read through the newest ordinary line, preserving unread
-                // replies and mentions for the focused transcript. Without
-                // an ordinary line, there is no read to send yet.
-                "telegram.read" => match model::newest_ordinary_line(&store, peer) {
+                // Without an ordinary line, no receipt can advance this
+                // conversation without acknowledging an unread mention.
+                "telegram.read" => match model::newest_ordinary_line_in(&store, peer, topic) {
                     Some(last) => requests::view_messages(peer, &[last]),
                     None => continue,
                 },
+                "telegram.mute" if topic != 0 => requests::set_topic_muted(peer, topic, true),
                 "telegram.mute" => requests::set_chat_muted(peer, true),
                 "telegram.pin" => requests::toggle_chat_pinned(peer, true),
                 _ => requests::add_chat_to_list(peer, archiving),
             };
+            let request = if verb == "telegram.read" { requests::in_topic(request, topic) } else { request };
             if wire(&store, &request) {
-                queued.push(peer);
+                queued.push((peer, topic));
             }
         }
         if queued.is_empty() {
@@ -250,10 +269,22 @@ impl Chats {
             }
             return;
         }
-        // A skipped chat stays unread and marked for a later retry, even
-        // when another chat in the same batch had a request to send.
-        for peer in &queued {
-            self.list.marks_mut().remove(peer);
+        // Topic pinning and archiving are local preferences. Reads and
+        // other server flags settle only when Telegram acknowledges them.
+        let topic_column = if verb == "telegram.pin" { "pinned" } else { "archived" };
+        let value = i64::from(verb != "telegram.unarchive");
+        if !local.is_empty() {
+            flip(&store, move |c| {
+                for (peer, topic) in local {
+                    c.execute(&format!("UPDATE tg_topic SET {topic_column} = ?3 WHERE chat = ?1 AND id = ?2"),
+                        rusqlite::params![peer, topic, value])?;
+                }
+                Ok(())
+            });
+        }
+        // A skipped conversation stays unread and marked for a later retry.
+        for (peer, topic) in queued {
+            self.list.marks_mut().remove(&format!("{peer}:{topic}"));
         }
         s.redraw();
     }
@@ -271,7 +302,7 @@ impl Chats {
         let Some(f) = runtime::of(&self.store).pending_forward() else {
             return;
         };
-        let Some(&peer) = self.list.cursor_key() else {
+        let Some((peer, topic)) = self.list.cursor_key().and_then(|k| super::super::topics::parse_key(k)) else {
             s.notify("put the cursor on a chat to forward to", true);
             return;
         };
@@ -280,12 +311,12 @@ impl Chats {
             return;
         }
         let name =
-            model::peer(&self.store, peer).map_or_else(|| "the chat".to_string(), |c| c.name);
+            super::super::topics::card(&self.store, peer, topic).map_or_else(|| "the chat".to_string(), |c| c.name);
         let n = f.ids.len();
         let what = if n == 1 { "line" } else { "lines" };
         let went = told(
             s,
-            &requests::forward_messages(peer, f.from, &f.ids),
+            &requests::in_topic(requests::forward_messages(peer, f.from, &f.ids), topic),
             &format!("forward {n} {what} to {name}"),
         );
         if went || !super::live(&self.store) {
@@ -308,12 +339,14 @@ impl PanelKind for ChatsKind {
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let archive = Chats::is_archive(id);
+        let forums = id.arg(0) == Some("topics");
         Box::new(Chats {
             id: id.clone(),
             archive,
+            forums,
             store: cx.session().store().clone(),
             slot: 0,
-            list: ListState::new(model::chats(archive), PAGE),
+            list: ListState::new(if forums { &model::FORUMS } else { model::chats(archive) }, PAGE),
         })
     }
 }

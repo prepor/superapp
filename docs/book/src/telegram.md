@@ -66,6 +66,31 @@ notifications are acknowledged when their messages are visible in the focused
 conversation. A live count clears on Telegram's acknowledgment, including
 when another device reads the message. **Refresh** retries an incomplete load.
 
+## Topics as chats
+
+Use **topics** on the chats panel, choose a forum group (for example,
+Вастрик.Берлин), then check the topics you want to see. The picker supports
+text filtering, individual toggles by click or space, and showing or hiding
+all matching topics. Changes take effect immediately and survive a restart.
+The group stays available in the picker even when no topics are selected.
+
+Selected topics appear beside ordinary chats, labeled **topic · group**.
+Opening one shows its own transcript and composer. History, drafts, unread
+counts, replies, attachments and forward destinations retain both the parent
+chat id and the topic id. General is a topic too. **topics** on a topic's
+conversation or the group's card opens the picker again.
+
+Topic selection, pinning and archiving are preferences for this app's panel;
+they do not change the official Telegram client's topic layout. Muting and
+reading a topic do go to Telegram. Refresh reloads the group's topic catalog,
+including pages beyond the first hundred topics, without replacing the
+selection. A failed refresh keeps the cached catalog and offers a retry.
+
+The topic protocol uses the installed TDLib API's `messageTopicForum`,
+`getForumTopics`, and `getForumTopicHistory` types. The append-only V9 migration
+adds topic metadata and message membership, and the chat list reads a view
+combining ordinary chats with selected topics.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

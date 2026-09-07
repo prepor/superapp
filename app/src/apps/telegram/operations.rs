@@ -87,6 +87,9 @@ impl Operation {
             "loadChats"
                 | "getChatHistory"
                 | "searchChatMessages"
+                | "getForumTopicHistory"
+                | "getForumTopic"
+                | "getForumTopics"
                 | "getMessage"
                 | "getRemoteFile"
                 | "downloadFile"
@@ -138,7 +141,7 @@ impl Tracker {
         if v["@extra"]["operation"].as_u64().is_some() {
             return request.to_string();
         }
-        if let Some(context) = v["@extra"].as_str().filter(|s| s.starts_with("history:")) {
+        if let Some(context) = v["@extra"].as_str().filter(|s| super::requests::parse_history_in(s).is_some()) {
             if let Some(op) = self
                 .list()
                 .into_iter()
@@ -562,7 +565,9 @@ fn label(v: &Value) -> String {
         | "checkAuthenticationCode"
         | "checkAuthenticationPassword" => "signing in".into(),
         "loadChats" => "loading chats".into(),
-        "getChatHistory" => "loading messages".into(),
+        "getChatHistory" | "getForumTopicHistory" => "loading messages".into(),
+        "getForumTopic" | "getForumTopics" => "loading topics".into(),
+        "setForumTopicNotificationSettings" => "updating topic notifications".into(),
         "getMessage" => "loading message".into(),
         "getRemoteFile" | "downloadFile" => "downloading media".into(),
         "deleteFile" => "updating media cache".into(),

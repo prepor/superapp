@@ -10,6 +10,8 @@ use kernel::store::Store;
 use serde_json::json;
 use std::rc::Rc;
 
+mod topics_tests;
+
 /// A world over a fresh telegram store — the schema only, no demo seed —
 /// with a fake api_hash planted where the parameters step reads it, so no
 /// real keychain is ever touched.

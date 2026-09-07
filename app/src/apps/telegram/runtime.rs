@@ -32,7 +32,8 @@ struct State {
     next_action: u64,
     forward: Option<Forward>,
     play_next: Option<(PeerId, MsgId)>,
-    loading: Vec<PeerId>,
+    loading: Vec<(PeerId, i64)>,
+    topic_lists: std::collections::HashMap<PeerId, Result<bool, String>>,
     mentions_loading: Vec<PeerId>,
     mentions_failed: Vec<PeerId>,
     list_syncing: bool,
@@ -91,6 +92,7 @@ impl Drop for Inbox {
 pub struct Wanted {
     pub chats: Vec<PeerId>,
     pub mentions: Vec<PeerId>,
+    pub topic_chats: Vec<(PeerId, i64)>,
     pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
@@ -212,16 +214,26 @@ impl Runtime {
         true
     }
 
+    #[cfg(test)]
     pub fn loading(&self, chat: PeerId) -> bool {
-        self.state().loading.contains(&chat)
+        self.loading_in(chat, 0)
     }
 
+    pub fn loading_in(&self, chat: PeerId, topic: i64) -> bool {
+        self.state().loading.contains(&(chat, topic))
+    }
+
+    #[cfg(test)]
     pub fn set_loading(&self, chat: PeerId, on: bool) {
+        self.set_loading_in(chat, 0, on);
+    }
+
+    pub fn set_loading_in(&self, chat: PeerId, topic: i64, on: bool) {
         let mut state = self.state();
         if on {
-            push_unique(&mut state.loading, chat);
+            push_unique(&mut state.loading, (chat, topic));
         } else {
-            state.loading.retain(|c| *c != chat);
+            state.loading.retain(|c| *c != (chat, topic));
         }
     }
 
@@ -236,8 +248,32 @@ impl Runtime {
     #[cfg(any(feature = "tdlib", test))]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
-        push_unique(&mut state.loading, chat);
+        push_unique(&mut state.loading, (chat, 0));
         push_unique(&mut state.wanted.chats, chat);
+    }
+
+    #[cfg(any(feature = "tdlib", test))]
+    pub fn want_topic_history(&self, chat: PeerId, topic: i64) {
+        let mut state = self.state();
+        push_unique(&mut state.loading, (chat, topic));
+        push_unique(&mut state.wanted.topic_chats, (chat, topic));
+    }
+
+    pub fn refresh_topics(&self, chat: PeerId) {
+        if self.topics_status(chat) == Ok(true) {
+            return;
+        }
+        if self.send(&super::requests::get_forum_topics(chat, 0, 0, 0)) {
+            self.topics_loaded(chat, Ok(true));
+        }
+    }
+
+    pub fn topics_loaded(&self, chat: PeerId, status: Result<bool, String>) {
+        self.state().topic_lists.insert(chat, status);
+    }
+
+    pub fn topics_status(&self, chat: PeerId) -> Result<bool, String> {
+        self.state().topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
     }
 
     pub fn want_line(&self, chat: PeerId, id: MsgId) {

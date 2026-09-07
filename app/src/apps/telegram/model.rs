@@ -63,6 +63,8 @@ impl PeerKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatRow {
     pub peer: PeerId,
+    pub topic: i64,
+    pub is_forum: bool,
     pub kind: PeerKind,
     pub title: String,
     /// 0 for an unpinned chat, else its place among the pinned ones.
@@ -86,6 +88,10 @@ pub struct ChatRow {
 }
 
 impl ChatRow {
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.peer, self.topic)
+    }
+
     /// The second line: what the chat last said, in a word or two. A draft
     /// or somebody typing takes the line over.
     #[must_use]
@@ -500,6 +506,7 @@ pub struct MsgHit {
     pub seq: i64,
     pub id: MsgId,
     pub chat: PeerId,
+    pub topic: i64,
     pub chat_title: String,
     pub sender_name: String,
     pub date: f64,
@@ -588,6 +595,7 @@ pub struct PeerCard {
     /// no chat at all reads `false`, which is the same thing — nothing here
     /// to leave, and something here to join.
     pub in_main: bool,
+    pub is_forum: bool,
 }
 
 impl PeerCard {
@@ -805,24 +813,24 @@ macro_rules! chats_spec {
         SqlSpec {
             id: $id,
             describe: "the chats under the panel's filter, pinned first, then latest first",
-            select: "c.peer AS peer, p.kind, p.name, c.pinned, c.muted, c.unread, c.mention,
+            select: "c.peer AS peer, p.kind, c.title, c.pinned, c.muted, c.unread, c.mention,
                      c.draft, c.typing,
                      COALESCE(m.date, 0) AS last, COALESCE(m.text, ''),
                      COALESCE(m.out, 0), m.state, COALESCE(s.name, ''), COALESCE(m.service, 0),
                      m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                      m.media_secs, m.media_lat, m.media_lon, m.media_until,
                      m.media_clip, m.media_clip_rid,
-                     (c.pinned = 0) AS unpinned",
+                     (c.pinned = 0) AS unpinned, c.topic, c.is_forum",
             // The last line is named by the row it is, not by its message id:
             // that number belongs to the chat it is in, and another chat's
             // line may wear it (V8).
-            from: "tg_chat c JOIN tg_peer p ON p.id = c.peer
+            from: "tg_dialog c JOIN tg_peer p ON p.id = c.peer
                    LEFT JOIN tg_message m ON m.seq = (SELECT t.seq FROM tg_message t
-                                                      WHERE t.chat = c.peer
+                                                      WHERE t.chat = c.peer AND t.topic = c.topic
                                                       ORDER BY t.date DESC, t.id DESC LIMIT 1)
                    LEFT JOIN tg_peer s ON s.id = m.sender",
             base: $base,
-            text: &["p.name", "m.text"],
+            text: &["c.title", "m.text"],
             index: None,
             tags: &[
                 ("unread", TagSql::Where("c.unread > 0 OR c.mention > 0")),
@@ -846,10 +854,11 @@ macro_rules! chats_spec {
                 ("c.pinned", Dir::Asc),
                 ("COALESCE(m.date, 0)", Dir::Desc),
                 ("c.peer", Dir::Desc),
+                ("c.topic", Dir::Desc),
             ],
             group: None,
-            key: "c.peer",
-            deps: &[],
+            key: "c.row_key",
+            deps: &["tg_chat", "tg_peer", "tg_topic", "tg_message"],
         }
     };
 }
@@ -858,12 +867,15 @@ macro_rules! chats_spec {
 // positions say, and a chat it merely came to know — a channel a line was
 // forwarded from, a group a reply was quoted out of — has none. The archive
 // is its own place.
-static CHATS_SPEC: SqlSpec = chats_spec!("chats", "c.archived = 0 AND c.in_main = 1");
-static ARCHIVE_SPEC: SqlSpec = chats_spec!("archive", "c.archived = 1");
+static CHATS_SPEC: SqlSpec = chats_spec!("chats", "c.archived = 0 AND c.in_main = 1 AND c.is_forum = 0");
+static ARCHIVE_SPEC: SqlSpec = chats_spec!("archive", "c.archived = 1 AND c.is_forum = 0");
+static FORUMS_SPEC: SqlSpec = chats_spec!("telegram forums", "c.is_forum = 1 AND (c.in_main = 1 OR c.archived = 1)");
 
 fn chat_row(r: &rusqlite::Row) -> rusqlite::Result<ChatRow> {
     Ok(ChatRow {
         peer: r.get(0)?,
+        topic: r.get(28)?,
+        is_forum: r.get::<_, i64>(29)? != 0,
         kind: PeerKind::of(&r.get::<_, String>(1)?),
         title: r.get(2)?,
         pinned: r.get(3)?,
@@ -900,13 +912,14 @@ macro_rules! chats_source {
             spec: $spec,
             tags: CHATS_TAGS,
             map: chat_row,
-            key: |c| c.peer,
+            key: ChatRow::key,
             rank: |c| {
                 vec![
                     Val::I(i64::from(c.pinned == 0)),
                     Val::I(c.pinned),
                     Val::F(c.last),
                     Val::I(c.peer),
+                    Val::I(c.topic),
                 ]
             },
             suggest: suggest_chats,
@@ -914,13 +927,14 @@ macro_rules! chats_source {
     };
 }
 
-static CHATS: SqlSource<ChatRow, i64> = chats_source!(&CHATS_SPEC);
-static ARCHIVE: SqlSource<ChatRow, i64> = chats_source!(&ARCHIVE_SPEC);
+static CHATS: SqlSource<ChatRow, String> = chats_source!(&CHATS_SPEC);
+static ARCHIVE: SqlSource<ChatRow, String> = chats_source!(&ARCHIVE_SPEC);
+pub static FORUMS: SqlSource<ChatRow, String> = chats_source!(&FORUMS_SPEC);
 
 /// The datasource a chat list pages through: the active chats, or the
 /// archived ones.
 #[must_use]
-pub fn chats(archive: bool) -> &'static SqlSource<ChatRow, i64> {
+pub fn chats(archive: bool) -> &'static SqlSource<ChatRow, String> {
     if archive {
         &ARCHIVE
     } else {
@@ -974,7 +988,7 @@ static MESSAGES_SPEC: SqlSpec = SqlSpec {
              m.text, m.out,
              m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
              m.media_secs, m.media_lat, m.media_lon, m.media_until,
-             m.media_clip, m.media_clip_rid",
+             m.media_clip, m.media_clip_rid, m.topic",
     from: "tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
     base: "m.service = 0",
     text: &["m.text"],
@@ -1002,6 +1016,7 @@ pub(crate) fn msg_hit_row(r: &rusqlite::Row) -> rusqlite::Result<MsgHit> {
         text: r.get(6)?,
         out: r.get::<_, i64>(7)? != 0,
         media: media_from_row(r, 8)?,
+        topic: r.get(20)?,
     })
 }
 
@@ -1172,7 +1187,7 @@ static Q_PEER: Q = Q {
                  p.online, p.admin, p.is_contact, p.is_self,
                  COALESCE(c.muted, 0), COALESCE(c.pinned, 0), COALESCE(c.archived, 0),
                  COALESCE(c.unread, 0), c.last_read, c.draft, c.typing, COALESCE(c.mention, 0),
-                 COALESCE(c.in_main, 0), p.blocked
+                 COALESCE(c.in_main, 0), p.blocked, p.is_forum
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           WHERE p.id = ?1",
     describe: "one peer, with the flags of the chat I have with it",
@@ -1202,6 +1217,7 @@ fn peer_card_row(r: &rusqlite::Row) -> rusqlite::Result<PeerCard> {
         unread_mentions: r.get(19)?,
         in_main: r.get::<_, i64>(20)? != 0,
         blocked: r.get::<_, i64>(21)? != 0,
+        is_forum: r.get::<_, i64>(22)? != 0,
     })
 }
 
@@ -1231,7 +1247,7 @@ static Q_HISTORY: Q = Q {
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = m.chat AND r.id = m.reply_to
           LEFT JOIN tg_peer rs ON rs.id = r.sender
-          WHERE m.chat = ?1
+          WHERE m.chat = ?1 AND (?2 = 0 OR m.topic = ?2)
           ORDER BY m.date, m.id",
     describe: "one chat's lines, oldest first, each with what it answers",
 };
@@ -1278,7 +1294,11 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
 /// One chat's lines, oldest first.
 #[must_use]
 pub fn history(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<Msg>> {
-    store.rows(&Q_HISTORY, &[Val::I(chat)], msg_row)
+    history_in(store, chat, 0)
+}
+
+pub fn history_in(store: &Store, chat: PeerId, topic: i64) -> std::rc::Rc<Vec<Msg>> {
+    store.rows(&Q_HISTORY, &[Val::I(chat), Val::I(topic)], msg_row)
 }
 
 static Q_FOLDERS: Q = Q {
@@ -1657,14 +1677,25 @@ static Q_MEDIA_IDS: Q = Q {
     id: "tg media ids",
     sql: "SELECT id FROM tg_message
           WHERE chat = ?1 AND media IS NOT NULL AND service = 0
+            AND topic = COALESCE((SELECT topic FROM tg_message WHERE chat = ?1 AND id = ?2), 0)
           ORDER BY date, id",
     describe: "the lines of a chat that carry media, oldest first, for the viewer's walk",
 };
 
 /// The lines of a chat that carry media, oldest first.
 #[must_use]
-pub fn media_ids(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<MsgId>> {
-    store.rows(&Q_MEDIA_IDS, &[Val::I(chat)], |r| r.get(0))
+pub fn media_ids(store: &Store, chat: PeerId, around: MsgId) -> std::rc::Rc<Vec<MsgId>> {
+    store.rows(&Q_MEDIA_IDS, &[Val::I(chat), Val::I(around)], |r| r.get(0))
+}
+
+static Q_MESSAGE_TOPIC: Q = Q {
+    id: "telegram message topic",
+    sql: "SELECT topic FROM tg_message WHERE chat = ?1 AND id = ?2",
+    describe: "the conversation a message belongs to",
+};
+
+pub fn message_topic(store: &Store, chat: PeerId, id: MsgId) -> i64 {
+    store.rows(&Q_MESSAGE_TOPIC, &[Val::I(chat), Val::I(id)], |r| r.get(0)).first().copied().unwrap_or(0)
 }
 
 /// One line, by id.
@@ -1697,7 +1728,7 @@ pub fn chat_id(peer: PeerId, at: Option<MsgId>) -> PanelId {
 
 static Q_NEWEST_ORDINARY_LINE: Q = Q {
     id: "tg newest ordinary line",
-    sql: "SELECT MAX(id) FROM tg_message WHERE chat = ?1 AND unread_mention = 0",
+    sql: "SELECT MAX(id) FROM tg_message WHERE chat = ?1 AND topic = ?2 AND unread_mention = 0",
     describe: "the newest line a chat can read without acknowledging an unread mention",
 };
 
@@ -1705,8 +1736,12 @@ static Q_NEWEST_ORDINARY_LINE: Q = Q {
 /// acknowledging an unread reply or mention, or `None` when none is cached.
 #[must_use]
 pub fn newest_ordinary_line(store: &Store, chat: PeerId) -> Option<MsgId> {
+    newest_ordinary_line_in(store, chat, 0)
+}
+
+pub fn newest_ordinary_line_in(store: &Store, chat: PeerId, topic: i64) -> Option<MsgId> {
     store
-        .rows(&Q_NEWEST_ORDINARY_LINE, &[Val::I(chat)], |r| {
+        .rows(&Q_NEWEST_ORDINARY_LINE, &[Val::I(chat), Val::I(topic)], |r| {
             r.get::<_, Option<MsgId>>(0)
         })
         .first()
@@ -1910,6 +1945,8 @@ mod tests {
     fn row() -> ChatRow {
         ChatRow {
             peer: 2,
+            topic: 0,
+            is_forum: false,
             kind: PeerKind::Person,
             title: "Vera Kovac".into(),
             pinned: 0,

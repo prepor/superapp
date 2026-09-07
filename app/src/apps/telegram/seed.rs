@@ -30,6 +30,7 @@ pub const FAMILY: PeerId = 12;
 pub const RUST_WEEKLY: PeerId = 13;
 pub const DEV: PeerId = 14;
 pub const OLD_FLAT: PeerId = 15;
+pub const BERLIN: PeerId = 16;
 
 /// One peer of the demo world.
 struct SeedPeer {
@@ -781,6 +782,26 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                 rusqlite::params![chat.peer, last_read, unread],
             )?;
         }
+        seed_topics(c)?;
         Ok(())
     })
+}
+
+fn seed_topics(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    c.execute("INSERT INTO tg_peer(id, kind, name, is_forum, members)
+        VALUES(?1, 'group', 'Вастрик.Берлин', 1, 1200)", [BERLIN])?;
+    c.execute("INSERT INTO tg_chat(peer) VALUES(?1)", [BERLIN])?;
+    for (id, name, text) in [
+        (1, "General", "Welcome to the Berlin group"),
+        (2, "Meetups", "Coffee at the canal on Saturday?"),
+        (3, "Housing", "A room is available in Neukölln"),
+        (4, "Cycling", "Sunday ride through Grunewald"),
+    ] {
+        c.execute("INSERT INTO tg_topic(chat, id, name, unread) VALUES(?1, ?2, ?3, 1)",
+            rusqlite::params![BERLIN, id, name])?;
+        c.execute("INSERT INTO tg_message(chat, id, topic, sender, date, text)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![BERLIN, id * 1000, id, VERA, ts(2026, 9, 1, 11, 55), text])?;
+    }
+    Ok(())
 }

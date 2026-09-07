@@ -24,6 +24,7 @@ pub mod peer;
 pub mod people;
 pub mod place;
 pub mod signin;
+pub mod topics;
 
 pub use attach::Attach;
 pub use chat::{Chat, Row};
@@ -35,6 +36,7 @@ pub use peer::Peer;
 pub use people::{Contacts, Members, People};
 pub use place::Place;
 pub use signin::SignIn;
+pub use topics::Topics;
 
 /// Queue a request for this store's worker. False means no worker is
 /// connected; true means queued, not acknowledged by Telegram.

@@ -26,6 +26,8 @@ use super::{runtime, schema, requests, sync, Telegram, TELEGRAM};
 
 static APPS: &[&dyn App] = &[&TELEGRAM];
 
+mod topics_tests;
+
 fn session() -> Session {
     Session::fake(APPS)
 }
@@ -140,7 +142,7 @@ fn the_app_registers_its_tags_and_roots() {
         tags,
         vec![
             "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
-            "place", "signin", "telegram-chat"
+            "place", "signin", "telegram-chat", "telegram-topics"
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();

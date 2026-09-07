@@ -32,6 +32,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V10),
         Step::Sql(V11),
         Step::Sql(V12),
+        Step::Sql(V13),
     ],
 };
 
@@ -56,6 +57,44 @@ const V12: &str = "
 ALTER TABLE tg_message ADD COLUMN unread_mention INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE tg_message ADD COLUMN mention_read INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX tg_message_unread_mention ON tg_message(chat, id) WHERE unread_mention = 1;
+";
+
+// Topic visibility and list placement are this app's preferences. Server
+// projections update topic metadata without overwriting these columns.
+const V13: &str = "
+ALTER TABLE tg_peer ADD COLUMN is_forum INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tg_message ADD COLUMN topic INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX tg_message_topic ON tg_message(chat, topic, date DESC, id DESC);
+CREATE TABLE tg_topic(
+  chat INTEGER NOT NULL REFERENCES tg_peer(id),
+  id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  selected INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
+  closed INTEGER NOT NULL DEFAULT 0,
+  hidden INTEGER NOT NULL DEFAULT 0,
+  unread INTEGER NOT NULL DEFAULT 0,
+  mention INTEGER NOT NULL DEFAULT 0,
+  muted INTEGER NOT NULL DEFAULT 0,
+  mute_default INTEGER NOT NULL DEFAULT 1,
+  last_read INTEGER,
+  read_outbox INTEGER,
+  draft TEXT,
+  PRIMARY KEY(chat, id)
+);
+CREATE VIEW tg_dialog AS
+  SELECT c.peer, 0 AS topic, CAST(c.peer AS TEXT) || ':0' AS row_key,
+         p.name AS title, p.is_forum, c.pinned, c.muted, c.archived, c.in_main,
+         c.unread, c.mention, c.draft, c.typing
+  FROM tg_chat c JOIN tg_peer p ON p.id = c.peer
+  UNION ALL
+  SELECT t.chat, t.id, CAST(t.chat AS TEXT) || ':' || t.id,
+         t.name || ' · ' || p.name, 0, t.pinned,
+         CASE WHEN t.mute_default = 1 THEN c.muted ELSE t.muted END, t.archived,
+         (c.in_main = 1 OR c.archived = 1), t.unread, t.mention, t.draft, NULL
+  FROM tg_topic t JOIN tg_peer p ON p.id = t.chat JOIN tg_chat c ON c.peer = t.chat
+  WHERE t.selected = 1 AND p.is_forum = 1;
 ";
 
 const V1: &str = "

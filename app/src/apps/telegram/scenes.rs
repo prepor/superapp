@@ -28,6 +28,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
     vec![
         chat_row(),
         chats(),
+        topics(),
         message_row(),
         media(),
         chat(),
@@ -38,6 +39,15 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         people(),
         peer(),
     ]
+}
+
+fn topics() -> Scene<Setup> {
+    use super::{panels::Topics, seed::BERLIN};
+    Scene::new("telegram topics", (480.0, 650.0))
+        .note("Selected topics appear as independent conversations in the chat list.")
+        .node("choose", panel(|_| Topics::id(BERLIN), ""))
+        .node("selected", panel(|_| Topics::id(BERLIN), "click \"Meetups\"\nclick \"Cycling\"\nwait 500"))
+        .node("filter", panel(|_| Topics::id(BERLIN), "click \"filter topics\"\ntype \"meet\"\nwait 500"))
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +62,8 @@ fn today(h: u32, min: u32) -> f64 {
 fn chat_fixture(title: &str, kind: PeerKind, text: &str) -> ChatRow {
     ChatRow {
         peer: 2,
+        topic: 0,
+        is_forum: false,
         kind,
         title: title.to_string(),
         pinned: 0,

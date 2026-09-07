@@ -34,6 +34,15 @@ impl Place {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
+    pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
+        if topic == 0 { return Self::id(chat); }
+        PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])
+    }
+
+    fn topic(&self) -> i64 {
+        self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
     /// The chat a `place` panel is for; `None` for any other tag.
     #[must_use]
     pub fn of(id: &PanelId) -> Option<PeerId> {
@@ -51,7 +60,7 @@ impl Place {
     /// The chat's title.
     #[must_use]
     pub fn chat_title(&self) -> String {
-        model::peer(&self.store, self.chat).map_or_else(|| "chat".to_string(), |c| c.name)
+        super::super::topics::card(&self.store, self.chat, self.topic()).map_or_else(|| "chat".to_string(), |c| c.name)
     }
 }
 
@@ -102,7 +111,7 @@ impl Panel for Place {
             "telegram.send_place" => {
                 told(
                     s,
-                    &requests::send_location(self.chat, None, lat, lon),
+                    &requests::in_topic(requests::send_location(self.chat, None, lat, lon), self.topic()),
                     &format!("place {lat:.4}, {lon:.4}"),
                 );
             }

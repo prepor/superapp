@@ -47,7 +47,7 @@ impl RowSpec for MessagesRows {
 
     /// The chat, opened at that line.
     fn target(r: &MsgHit) -> PanelId {
-        Chat::at(r.chat, r.id)
+        Chat::topic_at(r.chat, r.topic, r.id)
     }
 
     fn seed_filter(panel: &Messages) -> String {

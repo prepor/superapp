@@ -41,6 +41,7 @@ impl<T: Td> Account<T> {
             );
             self.pages.borrow_mut().push_front(Page {
                 chat,
+                topic: 0,
                 from: 0,
                 walk: Walk::Mentions(generation),
             });
@@ -92,7 +93,7 @@ impl<T: Td> Account<T> {
                 runtime::of(w.store()).set_mentions_status(page.chat, false, failed);
             }
         } else {
-            runtime::of(w.store()).set_loading(page.chat, false);
+            runtime::of(w.store()).set_loading_in(page.chat, page.topic, false);
         }
     }
 

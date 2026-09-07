@@ -67,6 +67,44 @@ pub struct IncomingMember {
     pub admin: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct IncomingTopic {
+    pub chat: PeerId,
+    pub id: i64,
+    pub name: Option<String>,
+    pub closed: Option<bool>,
+    pub hidden: Option<bool>,
+    pub unread: Option<i64>,
+    pub mention: Option<bool>,
+    pub muted: Option<bool>,
+    pub mute_default: Option<bool>,
+    pub last_read: Option<MsgId>,
+    pub read_outbox: Option<MsgId>,
+    pub has_draft: bool,
+    pub draft: Option<String>,
+}
+
+/// Metadata can arrive before the list response. Only fields supplied by the
+/// update change; selection, pinning and archiving belong to this app.
+pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> {
+    c.execute("UPDATE tg_peer SET is_forum = 1 WHERE id = ?1", [t.chat])?;
+    c.execute("INSERT INTO tg_topic(chat, id, name) VALUES(?1, ?2, ?3)
+               ON CONFLICT(chat, id) DO NOTHING",
+        rusqlite::params![t.chat, t.id, t.name.clone().unwrap_or_else(|| format!("topic {}", t.id))])?;
+    c.execute("UPDATE tg_topic SET name = COALESCE(?3, name), closed = COALESCE(?4, closed),
+        hidden = COALESCE(?5, hidden), unread = COALESCE(?6, unread), mention = COALESCE(?7, mention),
+        muted = COALESCE(?8, muted), last_read = COALESCE(?9, last_read),
+        read_outbox = COALESCE(?10, read_outbox), draft = CASE WHEN ?11 THEN ?12 ELSE draft END,
+        mute_default = COALESCE(?13, mute_default)
+        WHERE chat = ?1 AND id = ?2",
+        rusqlite::params![t.chat, t.id, t.name, t.closed, t.hidden, t.unread,
+            t.mention, t.muted, t.last_read, t.read_outbox, t.has_draft, t.draft, t.mute_default])?;
+    c.execute("UPDATE tg_message SET state = 'read' WHERE chat = ?1 AND topic = ?2
+        AND out = 1 AND state = 'sent' AND id <= COALESCE(?3, 0)",
+        rusqlite::params![t.chat, t.id, t.read_outbox])?;
+    Ok(())
+}
+
 /// One message as an update carries it. The fields are TDLib's `message`,
 /// flattened: its id and chat, who sent it and when, the text, my-or-theirs
 /// and its send state, what it answers and what it was forwarded from, its
@@ -76,6 +114,7 @@ pub struct IncomingMember {
 pub struct IncomingMessage {
     pub id: MsgId,
     pub chat: PeerId,
+    pub topic: i64,
     /// `None` for a service line and a channel's own post.
     pub sender: Option<PeerId>,
     pub date: f64,
@@ -220,11 +259,11 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service, entities, entities_known, unread_mention)
+  views, comments, reactions, service, entities, entities_known, topic, unread_mention)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1, ?28)
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1, ?28, ?29)
 ON CONFLICT(chat, id) DO UPDATE SET
-  sender = excluded.sender, date = excluded.date,
+  sender = excluded.sender, date = excluded.date, topic = excluded.topic,
   text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
   edited = excluded.edited, reply_to = excluded.reply_to,
@@ -281,6 +320,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.reactions,
             m.service,
             serde_json::to_string(&m.entities).expect("text entities serialize"),
+            m.topic,
             m.unread_mention,
         ])?;
     }
@@ -348,7 +388,10 @@ pub fn apply_read_outbox(c: &Connection, chat: PeerId) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE tg_message SET state = 'read'
          WHERE chat = ?1 AND out = 1 AND state = 'sent'
-           AND id <= COALESCE((SELECT read_outbox FROM tg_chat WHERE peer = ?1), 0)",
+           AND id <= COALESCE(CASE WHEN topic = 0
+               THEN (SELECT read_outbox FROM tg_chat WHERE peer = ?1)
+               ELSE (SELECT read_outbox FROM tg_topic t WHERE t.chat = ?1 AND t.id = tg_message.topic)
+               END, 0)",
         [chat],
     )
     .map(|_| ())
@@ -361,10 +404,10 @@ pub fn apply_read_outbox(c: &Connection, chat: PeerId) -> rusqlite::Result<()> {
 /// # Errors
 ///
 /// If the store refuses the read.
-pub fn history_window(c: &Connection, chat: PeerId) -> rusqlite::Result<(Option<MsgId>, i64)> {
+pub fn history_window_in(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::Result<(Option<MsgId>, i64)> {
     c.query_row(
-        "SELECT MIN(id), COUNT(*) FROM tg_message WHERE chat = ?1",
-        [chat],
+        "SELECT MIN(id), COUNT(*) FROM tg_message WHERE chat = ?1 AND (?2 = 0 OR topic = ?2)",
+        [chat, topic],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
 }
@@ -377,14 +420,14 @@ pub fn history_window(c: &Connection, chat: PeerId) -> rusqlite::Result<(Option<
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn trim_chat(c: &Connection, chat: PeerId) -> rusqlite::Result<usize> {
+pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::Result<usize> {
     let gone = c.execute(
         "DELETE FROM tg_message
-         WHERE chat = ?1 AND unread_mention = 0 AND seq NOT IN (
-           SELECT seq FROM tg_message WHERE chat = ?1
+         WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0 AND seq NOT IN (
+           SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
            ORDER BY date DESC, id DESC LIMIT ?2
          )",
-        rusqlite::params![chat, HISTORY_KEEP as i64],
+        rusqlite::params![chat, HISTORY_KEEP as i64, topic],
     )?;
     Ok(gone)
 }
@@ -401,7 +444,7 @@ const SEARCH_LOCAL_SQL: &str = "
 SELECT m.seq, m.id, m.chat, p.name, COALESCE(s.name, ''), m.date, m.text, m.out,
        m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
        m.media_secs, m.media_lat, m.media_lon, m.media_until,
-       m.media_clip, m.media_clip_rid
+       m.media_clip, m.media_clip_rid, m.topic
 FROM tg_message_fts
 JOIN tg_message m ON m.seq = tg_message_fts.rowid
 JOIN tg_peer p ON p.id = m.chat
@@ -476,6 +519,7 @@ mod tests {
     /// no sender peer is needed).
     fn msg(id: MsgId, chat: PeerId, at: f64, text: &str) -> IncomingMessage {
         IncomingMessage {
+            topic: 0,
             id,
             chat,
             sender: None,
@@ -958,7 +1002,7 @@ mod tests {
             .map(|i| msg(7_000 + i, 6_000, base + i as f64 * 60.0, &text_for(i)))
             .collect();
         s.write(move |c| project_messages(c, &batch)).unwrap();
-        let dropped = s.write(|c| trim_chat(c, 6_000)).unwrap();
+        let dropped = s.write(|c| trim_topic(c, 6_000, 0)).unwrap();
         assert_eq!(dropped, 50);
         let kept: i64 = s
             .conn()

@@ -9,7 +9,7 @@ use kernel::search::{Abandoned, Hit, Provider};
 use kernel::store::{Q, Store};
 
 use super::model::{self, first_name, one_line, PeerId, PeerKind};
-use super::panels::{Chat, Peer};
+use super::panels::{Chat, Peer, Topics};
 
 /// How many messages one question is worth showing.
 const LIMIT: i64 = 100;
@@ -17,7 +17,7 @@ const LIMIT: i64 = 100;
 static Q_NAMES: Q = Q {
     id: "tg search names",
     sql: "SELECT p.id, p.kind, p.name, COALESCE(p.username, ''), COALESCE(p.status, ''),
-                 p.is_self, p.is_contact, c.peer IS NOT NULL, p.blocked
+                 p.is_self, p.is_contact, c.peer IS NOT NULL, p.blocked, p.is_forum
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           ORDER BY p.name",
     describe: "every peer's name, kind and presence, for the search panel",
@@ -33,6 +33,7 @@ struct Named {
     is_contact: bool,
     has_chat: bool,
     blocked: bool,
+    is_forum: bool,
 }
 
 fn named_row(r: &rusqlite::Row) -> rusqlite::Result<Named> {
@@ -46,13 +47,15 @@ fn named_row(r: &rusqlite::Row) -> rusqlite::Result<Named> {
         is_contact: r.get::<_, i64>(6)? != 0,
         has_chat: r.get::<_, i64>(7)? != 0,
         blocked: r.get::<_, i64>(8)? != 0,
+        is_forum: r.get(9)?,
     })
 }
 
 /// The messages a pattern reaches, latest first, service lines left out.
 const MESSAGES_SQL: &str = "
-    SELECT m.id, m.chat, p.name, COALESCE(s.name, ''), m.out, m.text
+    SELECT m.id, m.chat, COALESCE(t.name || ' · ', '') || p.name, COALESCE(s.name, ''), m.out, m.text, m.topic
     FROM tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender
+    LEFT JOIN tg_topic t ON t.chat = m.chat AND t.id = m.topic
     WHERE m.service = 0 AND m.text LIKE ?1 ESCAPE '\\'
     ORDER BY m.date DESC, m.id DESC
     LIMIT ?2";
@@ -72,6 +75,9 @@ impl Provider for TelegramSearch {
         }
         store.poll_external();
         let mut hits = matching_names(store, &terms);
+        let rows = store.rows(&Q_TOPICS, &[], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)));
+        hits.extend(rows.iter().filter(|(_, _, name, group)| kernel::search::matches(&terms, &[name, group]))
+            .map(|(chat, topic, name, group)| Hit::found(name, group, Chat::topic(*chat, *topic))));
         if abandoned.yes() {
             return hits;
         }
@@ -103,7 +109,9 @@ fn matching_names(store: &Store, terms: &[String]) -> Vec<Hit> {
                     PeerKind::Channel => "channel".to_string(),
                 }
             };
-            let target = if n.blocked && !n.has_chat { Peer::id(n.id) } else { Chat::id(n.id) };
+            let target = if n.is_forum { Topics::id(n.id) }
+                else if n.blocked && !n.has_chat { Peer::id(n.id) }
+                else { Chat::id(n.id) };
             Hit::found(&n.name, detail, target)
         })
         .collect()
@@ -135,6 +143,7 @@ fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
             r.get::<_, String>(3)?,
             r.get::<_, i64>(4)? != 0,
             r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
         ))
     });
     let rows = match rows {
@@ -145,14 +154,22 @@ fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
         }
     };
     rows.filter_map(Result::ok)
-        .map(|(id, chat, title, sender, out, text)| {
+        .map(|(id, chat, title, sender, out, text, topic)| {
             let who = if out { "me" } else { first_name(&sender) };
             let detail = if who.is_empty() || who == title {
                 title.clone()
             } else {
                 format!("{who} in {title}")
             };
-            Hit::found(one_line(&text), detail, Chat::at(chat, id))
+            Hit::found(one_line(&text), detail, Chat::topic_at(chat, topic, id))
         })
         .collect()
 }
+
+static Q_TOPICS: Q = Q {
+    id: "telegram search topics",
+    sql: "SELECT t.chat, t.id, t.name, p.name FROM tg_topic t
+        JOIN tg_peer p ON p.id = t.chat JOIN tg_chat c ON c.peer = t.chat
+        WHERE t.selected = 1 AND p.is_forum = 1 AND (c.in_main = 1 OR c.archived = 1)",
+    describe: "selected topics by name and group",
+};

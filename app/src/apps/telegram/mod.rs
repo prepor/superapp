@@ -32,6 +32,7 @@ pub mod text;
 #[cfg(feature = "tdlib")]
 pub mod tdjson;
 pub mod trace;
+pub mod topics;
 /// The engine seam the loop drives: the real transport, and a fake for tests.
 pub mod transport;
 pub mod ui;
@@ -85,6 +86,7 @@ static VIEWER_KIND: panels::media::ViewerKind = panels::media::ViewerKind;
 static PLACE_KIND: panels::place::PlaceKind = panels::place::PlaceKind;
 static ATTACH_KIND: panels::attach::AttachKind = panels::attach::AttachKind;
 static SIGNIN_KIND: panels::signin::SignInKind = panels::signin::SignInKind;
+static TOPICS_KIND: panels::topics::TopicsKind = panels::topics::TopicsKind;
 static KINDS: &[&dyn PanelKind] = &[
     &CHATS_KIND,
     &CHAT_KIND,
@@ -97,6 +99,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &PLACE_KIND,
     &ATTACH_KIND,
     &SIGNIN_KIND,
+    &TOPICS_KIND,
 ];
 
 impl App for Telegram {
