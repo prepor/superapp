@@ -255,8 +255,9 @@ fn last_mention_request(td: &FakeTd) -> serde_json::Value {
 
 fn mention_page(chat: i64, ids: &[i64], request: &serde_json::Value, next: Option<i64>) -> String {
     let mut page: serde_json::Value = serde_json::from_str(
-        &history_page(chat, ids, request["@extra"].as_str().unwrap())
+        &history_page(chat, ids, "")
     ).unwrap();
+    page["@extra"] = request["@extra"].clone();
     for message in page["messages"].as_array_mut().unwrap() {
         message["contains_unread_mention"] = json!(true);
         // The original isn't in the local history; Telegram still knows
@@ -368,7 +369,7 @@ fn unread_search_errors_and_timeouts_leave_the_count_and_allow_refresh() {
     acc.drain(&w);
     assert_eq!(td.sent().len(), sent + 1);
     acc.on_update(&w, &json!({"@type": "error", "code": 500, "message": "unavailable",
-        "@extra": first["@extra"]}).to_string());
+        "@extra": last_mention_request(&td)["@extra"]}).to_string());
     assert_eq!(runtime::of(w.store()).mentions_status(None), (false, true));
     assert_eq!(super::model::reply_count(w.store()), 2);
     runtime::of(w.store()).want_mentions(-9001);

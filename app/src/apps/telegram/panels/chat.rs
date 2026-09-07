@@ -1096,6 +1096,7 @@ pub struct ReadClaim {
     pub peer: PeerId,
     pub unread: i64,
     pub last_read: Option<MsgId>,
+    pub through: MsgId,
 }
 
 impl Intent for ReadClaim {
@@ -1117,9 +1118,9 @@ impl Intent for ReadClaim {
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let peer = self.peer;
+        let (peer, through) = (self.peer, self.through);
         w.store()
-            .write(move |c| model::mark_read_tx(c, peer))
+            .write(move |c| model::mark_read_tx(c, peer, through))
             .map_err(|e| e.to_string())
     }
 }
@@ -1159,7 +1160,7 @@ impl PanelKind for ChatKind {
             (0, None, String::new()),
             |c| (c.unread, c.last_read, c.draft.unwrap_or_default()),
         );
-        // Read before the claim below, which is what makes them all read.
+        // Capture the unread divider before advancing the read position.
         let first_unread = if unread > 0 {
             model::history(&store, peer)
                 .iter()
@@ -1170,18 +1171,22 @@ impl PanelKind for ChatKind {
         };
         // A newly discovered group's cache may contain only unread mentions.
         // Claim no local read unless an ordinary line can carry it to Telegram.
-        let read_target = if unread > 0 && at.is_none() {
+        // A restored panel must not send a new receipt beyond a redo's
+        // original boundary; the recorded claim reapplies that exact read.
+        let read_target = if unread > 0 && at.is_none() && cx.how().claims() {
             model::newest_ordinary_line(&store, peer)
+                .filter(|through| *through > last_read.unwrap_or(0))
         } else {
             None
         };
-        if read_target.is_some() {
+        if let Some(through) = read_target {
             cx.claim(
-                Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer)),
+                Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer, through)),
                 vec![Box::new(ReadClaim {
                     peer,
                     unread,
                     last_read,
+                    through,
                 }) as Box<dyn Intent>],
             );
         }

@@ -1355,18 +1355,26 @@ pub fn set_draft_tx(c: &rusqlite::Connection, peer: PeerId, draft: &str) -> rusq
     Ok(())
 }
 
-/// Marks the ordinary inbox read through its newest line. Replies and
-/// mentions have their own acknowledgment when the message is viewed.
+/// Advances the ordinary inbox to the exact line named in its read receipt.
+/// Only cached incoming messages crossed by that boundary are subtracted
+/// from the count; uncached unread messages wait for the server's count.
+/// The remaining cached messages are a lower bound, including new arrivals.
+/// Replies and mentions keep their separate acknowledgment when viewed.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn mark_read_tx(c: &rusqlite::Connection, peer: PeerId) -> rusqlite::Result<()> {
+pub fn mark_read_tx(c: &rusqlite::Connection, peer: PeerId, through: MsgId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE tg_chat SET unread = 0,
-                last_read = (SELECT MAX(id) FROM tg_message WHERE chat = ?1)
-         WHERE peer = ?1",
-        rusqlite::params![peer],
+        "UPDATE tg_chat SET unread = MAX(
+            (SELECT COUNT(*) FROM tg_message
+             WHERE chat = ?1 AND id > ?2 AND out = 0 AND service = 0),
+            unread - (SELECT COUNT(*) FROM tg_message
+                      WHERE chat = ?1 AND id > COALESCE(tg_chat.last_read, 0)
+                        AND id <= ?2 AND out = 0 AND service = 0)),
+            last_read = ?2
+         WHERE peer = ?1 AND ?2 > COALESCE(last_read, 0)",
+        rusqlite::params![peer, through],
     )?;
     Ok(())
 }

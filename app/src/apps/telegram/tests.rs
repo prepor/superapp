@@ -524,7 +524,6 @@ fn add_trailing_mentions(s: &Session) -> i64 {
     last
 }
 
-#[cfg(feature = "tdlib")]
 #[test]
 fn preview_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let mut s = session();
@@ -533,16 +532,33 @@ fn preview_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let inbox = runtime::of(s.store()).connect();
     go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
     assert_eq!(s.focus(), Some(list), "the transcript has not been focused");
-    assert_eq!(unread(&s, STELAXIS).0, 0);
+    assert_eq!(unread(&s, STELAXIS).0, 2);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
     assert_eq!(model::reply_count(s.store()), 4);
-    let request: serde_json::Value = serde_json::from_str(
-        &inbox.try_recv().expect("the preview sends a read for the preceding ordinary message")
-    ).unwrap();
-    assert_eq!(request["@type"], "viewMessages");
-    assert_eq!(request["chat_id"], STELAXIS);
-    assert_eq!(request["message_ids"], serde_json::json!([last]));
-    assert_eq!(request["force_read"], true);
+    #[cfg(feature = "tdlib")]
+    {
+        let request: serde_json::Value = serde_json::from_str(
+            &inbox.try_recv().expect("the preview sends a read for the preceding ordinary message")
+        ).unwrap();
+        assert_eq!(request["@type"], "viewMessages");
+        assert_eq!(request["chat_id"], STELAXIS);
+        assert_eq!(request["message_ids"], serde_json::json!([last]));
+        assert_eq!(request["force_read"], true);
+    }
     assert!(inbox.try_recv().is_err(), "unseen mentions have no acknowledgment");
+
+    account().on_update(s.world(), &serde_json::json!({
+        "@type": "updateNewChat",
+        "chat": {
+            "id": STELAXIS, "title": "stelaxis",
+            "type": {"@type": "chatTypeSupergroup", "is_channel": false},
+            "positions": [{"list": {"@type": "chatListMain"}, "order": "100"}],
+            "unread_count": 2, "last_read_inbox_message_id": last,
+            "unread_mention_count": 4
+        }
+    }).to_string());
+    assert_eq!(unread(&s, STELAXIS).0, 2, "the server confirms the same remaining count");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
 }
 
 #[test]
@@ -557,15 +573,102 @@ fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let requests: Vec<serde_json::Value> = inbox.try_iter()
         .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
     assert_eq!(requests.len(), 2, "one read for each marked group");
-    for (peer, last) in [(STELAXIS, last), (FAMILY, family_last)] {
+    assert_eq!(unread(&s, STELAXIS).0, 8, "a queued read waits for confirmation");
+    for (peer, last, remaining) in [(STELAXIS, last, 2), (FAMILY, family_last, 0)] {
         let request = requests.iter().find(|r| r["chat_id"] == peer).unwrap();
         assert_eq!(request["@type"], "viewMessages");
         assert_eq!(request["message_ids"], serde_json::json!([last]));
         assert_eq!(request["force_read"], true);
-        assert_eq!(unread(&s, peer).0, 0);
+        account().on_update(s.world(), &serde_json::json!({
+            "@type": "ok", "@extra": request["@extra"]
+        }).to_string());
+        assert_eq!(unread(&s, peer).0, remaining);
+        assert_eq!(model::peer(s.store(), peer).unwrap().last_read, Some(last));
     }
     assert_eq!(model::reply_count(s.store()), 4, "read n preserves every mention");
     assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().len()), 0);
+}
+
+#[test]
+fn ordinary_reads_with_a_stale_target_preserve_the_server_read_state() {
+    for batch in [false, true] {
+        for read_ahead in [0, 1] {
+            let mut s = session();
+            let last = add_trailing_mentions(&s);
+            let read_before = last + read_ahead;
+            s.store().write(move |c| {
+                // Some of these unread messages aren't cached yet. Neither
+                // an equal nor an older target can change the server count.
+                c.execute("UPDATE tg_chat SET last_read = ?2, unread = 5 WHERE peer = ?1",
+                    [STELAXIS, read_before])?;
+                Ok(())
+            }).unwrap();
+            let list = open_root(&mut s, Chats::id());
+            let inbox = runtime::of(s.store()).connect();
+            if batch {
+                with_chats(&s, list, |c| c.list_mut().marks_mut().add(STELAXIS));
+                verb(&mut s, list, "telegram.read");
+            } else {
+                go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+            }
+            assert_eq!(unread(&s, STELAXIS).0, 5);
+            assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(read_before));
+            for raw in inbox.try_iter() {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(request["message_ids"], serde_json::json!([last]));
+                account().on_update(s.world(), &serde_json::json!({
+                    "@type": "ok", "@extra": request["@extra"]
+                }).to_string());
+            }
+            assert_eq!(unread(&s, STELAXIS).0, 5);
+            assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(read_before));
+        }
+    }
+}
+
+#[test]
+fn ordinary_reads_preserve_unread_messages_missing_from_the_cache() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    s.store().write(move |c| {
+        c.execute("DELETE FROM tg_message WHERE chat = ?1 AND id = ?2", [STELAXIS, last + 2])?;
+        Ok(())
+    }).unwrap();
+    let list = open_root(&mut s, Chats::id());
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(unread(&s, STELAXIS).0, 2, "one cached and one uncached message remain unread");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+}
+
+#[test]
+fn redoing_an_ordinary_read_keeps_the_original_receipt_boundary() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let before = model::peer(s.store(), STELAXIS).unwrap();
+    let list = open_root(&mut s, Chats::id());
+    let inbox = runtime::of(s.store()).connect();
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(unread(&s, STELAXIS).0, 2);
+    let _ = inbox.try_iter().count();
+    assert!(s.undo());
+    assert_eq!(unread(&s, STELAXIS).0, before.unread);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+    let arrived_at = model::history(s.store(), STELAXIS).last().unwrap().date + 1.0;
+    s.store().write(move |c| {
+        for (offset, out, service) in [(3, false, false), (4, true, false), (5, false, true)] {
+            c.execute("INSERT INTO tg_message(id, chat, date, text, out, service)
+                VALUES(?1, ?2, ?3, 'arrived while undone', ?4, ?5)",
+                rusqlite::params![last + offset, STELAXIS, arrived_at, out, service])?;
+        }
+        c.execute("UPDATE tg_chat SET unread = unread + 1 WHERE peer = ?1", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    assert!(s.redo());
+    assert_eq!(unread(&s, STELAXIS).0, 3, "the two mentions and the new incoming line stay unread");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+    let reader = s.joined_child(list).unwrap();
+    assert_eq!(with_chat(&s, reader, |c| c.first_unread()), Some(last + 1));
+    assert!(inbox.try_recv().is_err(), "restoring the panel sends no new read receipt");
 }
 
 #[test]
@@ -620,6 +723,9 @@ fn batch_without_an_ordinary_line_keeps_the_skipped_chat_unread_and_marked() {
     assert_eq!(request["chat_id"], FAMILY);
     assert_eq!(request["message_ids"], serde_json::json!([family_last]));
     assert!(inbox.try_recv().is_err(), "there is no read for the group holding only mentions");
+    account().on_update(s.world(), &serde_json::json!({
+        "@type": "ok", "@extra": request["@extra"]
+    }).to_string());
     assert_eq!(unread(&s, FAMILY).0, 0);
     assert_eq!(unread(&s, STELAXIS).0, before.unread);
     assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);

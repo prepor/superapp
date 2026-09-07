@@ -141,6 +141,13 @@ impl<T: Td> Account<T> {
             return;
         };
         let result = match request["@type"].as_str() {
+            Some("viewMessages") if request["force_read"] == true => {
+                let Some(through) = request["message_ids"].as_array()
+                    .and_then(|ids| ids.iter().filter_map(Value::as_i64).max()) else {
+                    return;
+                };
+                w.store().write(move |c| model::mark_read_tx(c, chat, through))
+            }
             Some("setChatNotificationSettings") => {
                 let muted = request["notification_settings"]["mute_for"]
                     .as_i64()

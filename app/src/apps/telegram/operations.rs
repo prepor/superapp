@@ -86,6 +86,7 @@ impl Operation {
             self.kind.as_str(),
             "loadChats"
                 | "getChatHistory"
+                | "searchChatMessages"
                 | "getMessage"
                 | "getRemoteFile"
                 | "downloadFile"
@@ -555,6 +556,7 @@ fn label(v: &Value) -> String {
         "deleteChatHistory" => "deleting history".into(),
         "setChatDraftMessage" => "saving draft".into(),
         "viewMessages" => "marking read".into(),
+        "searchChatMessages" => "loading replies and mentions".into(),
         "setTdlibParameters" => "connecting to Telegram".into(),
         "setAuthenticationPhoneNumber"
         | "checkAuthenticationCode"
