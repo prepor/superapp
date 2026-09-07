@@ -95,8 +95,13 @@ fn v12_mentions(c: &Connection) -> rusqlite::Result<()> {
             c.execute_batch(&format!("ALTER TABLE tg_message ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"))?;
         }
     }
-    c.execute_batch("CREATE INDEX IF NOT EXISTS tg_message_unread_mention
-        ON tg_message(chat, id) WHERE unread_mention = 1")
+    let indexed: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master
+        WHERE type = 'index' AND name = 'tg_message_unread_mention')", [], |r| r.get(0))?;
+    if !indexed {
+        c.execute_batch("CREATE INDEX tg_message_unread_mention
+            ON tg_message(chat, id) WHERE unread_mention = 1")?;
+    }
+    Ok(())
 }
 
 const TOPIC_FLAGS: &[(&str, &str)] = &[

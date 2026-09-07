@@ -38,6 +38,45 @@ fn line(id: i64, topic: i64) -> serde_json::Value {
 }
 
 #[test]
+fn topic_read_receipts_keep_mentions_and_other_topics_independent() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    forum(&acc, &w);
+    for (id, count) in [(2, 2), (3, 1)] {
+        let mut metadata = topic(id, "topic");
+        metadata["unread_mention_count"] = json!(count);
+        acc.on_topic(&w, GROUP, &metadata);
+    }
+    for (id, topic, mention) in [(10, 2, false), (20, 2, true), (30, 2, true), (40, 3, true)] {
+        let mut message = line(id, topic);
+        message["contains_unread_mention"] = json!(mention);
+        acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": message}).to_string());
+    }
+    let group = model::peer(w.store(), GROUP).unwrap();
+    assert_eq!(topics::card(w.store(), GROUP, 2).unwrap().unread_mentions, 2);
+    acc.send(&w, &requests::in_topic(requests::view_messages(GROUP, &[10]), 2));
+    let receipt: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().unread, 3);
+    acc.on_update(&w, &json!({"@type": "ok", "@extra": receipt["@extra"]}).to_string());
+    let read = topics::get(w.store(), GROUP, 2).unwrap();
+    assert_eq!((read.unread, read.unread_mentions, read.last_read), (2, 2, Some(10)));
+    assert_eq!(topics::get(w.store(), GROUP, 3).unwrap().unread, 3);
+    assert_eq!(model::peer(w.store(), GROUP).unwrap().unread, group.unread);
+
+    let viewed = json!({"@type": "updateMessageMentionRead", "chat_id": GROUP,
+        "message_id": 20, "unread_mention_count": 2});
+    for _ in 0..2 {
+        acc.on_update(&w, &viewed.to_string());
+        assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().unread_mentions, 1);
+        assert_eq!(topics::get(w.store(), GROUP, 3).unwrap().unread_mentions, 1);
+    }
+    acc.on_update(&w, &json!({"@type": "updateChatUnreadMentionCount", "chat_id": GROUP,
+        "unread_mention_count": 0}).to_string());
+    assert!(topics::list(w.store(), GROUP).iter().all(|t| t.unread_mentions == 0));
+}
+
+#[test]
 fn topic_responses_do_not_feed_a_request_loop() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);

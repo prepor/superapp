@@ -82,7 +82,7 @@ pub fn topic(chat: PeerId, v: &Value) -> Option<IncomingTopic> {
         closed: info["is_closed"].as_bool(),
         hidden: info["is_hidden"].as_bool(),
         unread: v["unread_count"].as_i64(),
-        mention: v["unread_mention_count"].as_i64().map(|n| n > 0),
+        mention: v["unread_mention_count"].as_i64().map(|n| n.max(0)),
         muted: settings["mute_for"].as_i64().map(|n| n > 0),
         mute_default: settings["use_default_mute_for"].as_bool(),
         last_read: v["last_read_inbox_message_id"].as_i64(),

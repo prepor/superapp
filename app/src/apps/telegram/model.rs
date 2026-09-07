@@ -1735,6 +1735,7 @@ static Q_NEWEST_ORDINARY_LINE: Q = Q {
 /// The newest line that can advance a chat's read position without
 /// acknowledging an unread reply or mention, or `None` when none is cached.
 #[must_use]
+#[cfg(test)]
 pub fn newest_ordinary_line(store: &Store, chat: PeerId) -> Option<MsgId> {
     newest_ordinary_line_in(store, chat, 0)
 }

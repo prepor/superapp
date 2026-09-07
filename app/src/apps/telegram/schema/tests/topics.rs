@@ -89,6 +89,11 @@ fn early_topic_builds_upgrade_with_link_metadata_and_block_state() {
 
         schema::SCHEMA.apply(&c).unwrap();
         assert_eq!(schema::SCHEMA.progress(&c).unwrap(), 13);
+        let mentions: (bool, bool) = c.query_row(
+            "SELECT unread_mention, mention_read FROM tg_message WHERE chat = 42 AND id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(mentions, (false, false), "topic builds at V12 need main's mention columns too");
         let saved: (bool, String, i64, String, bool, bool) = c
             .query_row(
                 "SELECT t.selected, t.draft, m.topic, m.entities, m.entities_known, p.blocked

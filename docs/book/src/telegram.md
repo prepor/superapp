@@ -97,9 +97,10 @@ earlier cached assignments.
 The topic protocol uses the installed TDLib API's `messageTopicForum`,
 `getForumTopics`, and `getForumTopicHistory` types. The V13 startup check adds
 and repairs topic metadata, message membership and the chat-list view that
-combines ordinary chats with selected topics. The existing link and block
-migrations also check their columns, so databases from earlier development
-builds upgrade without losing messages, link metadata, drafts or selections.
+combines ordinary chats with selected topics. The existing link, block and
+unread-mention migrations also check their columns, including topic builds
+that already used V12, so upgrades preserve messages, link metadata, drafts
+and selections.
 
 ## Builds
 

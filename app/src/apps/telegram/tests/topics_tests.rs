@@ -378,6 +378,40 @@ fn topic_history_read_claim_and_drafts_never_cross_topics() {
 }
 
 #[test]
+fn topic_read_undo_and_redo_preserve_mentions_and_the_receipt_boundary() {
+    let mut s = session();
+    s.store().write(|c| {
+        for id in [2001, 2002] {
+            c.execute("INSERT INTO tg_message(chat, id, topic, date, text, unread_mention)
+                VALUES(?1, ?2, 2, ?2, 'reply to me', 1)", [BERLIN, id])?;
+        }
+        c.execute("UPDATE tg_topic SET unread = 3, mention = 2, last_read = 1999
+            WHERE chat = ?1 AND id = 2", [BERLIN])?;
+        Ok(())
+    }).unwrap();
+    let list = open_root(&mut s, Chats::id());
+    go(&mut s, Nav::Preview { from: list, id: Chat::topic(BERLIN, 2) });
+    let read = topics::get(s.store(), BERLIN, 2).unwrap();
+    assert_eq!((read.unread, read.unread_mentions, read.last_read), (2, 2, Some(2000)));
+    assert_eq!(topics::get(s.store(), BERLIN, 4).unwrap().unread, 1);
+
+    assert!(s.undo());
+    let before = topics::get(s.store(), BERLIN, 2).unwrap();
+    assert_eq!((before.unread, before.last_read), (3, Some(1999)));
+    s.store().write(|c| {
+        super::super::project::read_mentions(c, BERLIN, &[2001, 2001])?;
+        c.execute("INSERT INTO tg_message(chat, id, topic, date, text)
+            VALUES(?1, 2003, 2, 2003, 'new arrival')", [BERLIN])?;
+        c.execute("UPDATE tg_topic SET unread = unread + 1 WHERE chat = ?1 AND id = 2", [BERLIN])?;
+        Ok(())
+    }).unwrap();
+    assert!(s.redo());
+    let again = topics::get(s.store(), BERLIN, 2).unwrap();
+    assert_eq!((again.unread, again.unread_mentions, again.last_read), (3, 1, Some(2000)));
+    assert_eq!(topics::get(s.store(), BERLIN, 4).unwrap().unread, 1);
+}
+
+#[test]
 fn composer_files_drafts_and_forwards_target_the_selected_topic() {
     let mut s = session();
     let inbox = runtime::of(s.store()).connect();
@@ -531,7 +565,7 @@ fn a_read_batch_keeps_unloaded_conversations_unread_and_marked() {
 
     verb(&mut s, list, "telegram.read");
 
-    assert_eq!(unread(&s, ANNA), (3, 1));
+    assert_eq!(unread(&s, ANNA), (3, true));
     assert_eq!(unread(&s, STELAXIS), before);
     let meetup = topics::get(s.store(), BERLIN, 2).unwrap();
     assert_eq!(meetup.unread, 5);

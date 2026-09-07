@@ -75,7 +75,7 @@ pub struct IncomingTopic {
     pub closed: Option<bool>,
     pub hidden: Option<bool>,
     pub unread: Option<i64>,
-    pub mention: Option<bool>,
+    pub mention: Option<i64>,
     pub muted: Option<bool>,
     pub mute_default: Option<bool>,
     pub last_read: Option<MsgId>,
@@ -346,6 +346,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
 pub fn set_mentions(c: &Connection, chat: PeerId, count: i64) -> rusqlite::Result<()> {
     c.execute("UPDATE tg_chat SET mention = ?2 WHERE peer = ?1", (chat, count.max(0)))?;
     if count <= 0 {
+        c.execute("UPDATE tg_topic SET mention = 0 WHERE chat = ?1", [chat])?;
         c.execute(
             "UPDATE tg_message SET unread_mention = 0, mention_read = 1
              WHERE chat = ?1 AND unread_mention = 1",
@@ -358,6 +359,11 @@ pub fn set_mentions(c: &Connection, chat: PeerId, count: i64) -> rusqlite::Resul
 /// Clear only the named mentions. Remember the read so a history response
 /// already in flight cannot resurrect the same notification.
 pub fn read_mentions(c: &Connection, chat: PeerId, ids: &[MsgId]) -> rusqlite::Result<()> {
+    for id in ids.iter().copied().collect::<std::collections::BTreeSet<_>>() {
+        c.execute("UPDATE tg_topic SET mention = MAX(0, mention - 1)
+            WHERE chat = ?1 AND id = (SELECT topic FROM tg_message
+                WHERE chat = ?1 AND id = ?2 AND unread_mention = 1)", (chat, id))?;
+    }
     let read = dismiss_mentions(c, chat, ids)?;
     c.execute(
         "UPDATE tg_chat SET mention = MAX(0, mention - ?2) WHERE peer = ?1",
@@ -1055,13 +1061,13 @@ mod tests {
         reply.unread_mention = true;
         s.write(move |c| {
             project_messages(c, &[reply])?;
-            assert_eq!(trim_chat(c, 6_000)?, 0);
+            assert_eq!(trim_topic(c, 6_000, 0)?, 0);
             Ok(())
         }).unwrap();
         assert_eq!(search_local(s.conn(), Some(6_000), "alpha").len(), 1);
         s.write(|c| {
             read_mentions(c, 6_000, &[7_000])?;
-            assert_eq!(trim_chat(c, 6_000)?, 1);
+            assert_eq!(trim_topic(c, 6_000, 0)?, 1);
             Ok(())
         }).unwrap();
         assert!(search_local(s.conn(), Some(6_000), "alpha").is_empty());
