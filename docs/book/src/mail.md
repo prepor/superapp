@@ -1,7 +1,7 @@
 # Mail
 
-The mail app is four mailboxes over one list, conversations, drafts, contacts,
-and accounts, with real IMAP and SMTP behind them. It registers ten panel
+The mail app is five mailboxes over one list, conversations, drafts, contacts,
+and accounts, with real IMAP and SMTP behind them. It registers eleven panel
 kinds, its own schema ladder, a demo seed, four deferred effects, three
 capabilities of its own, a search source, two problem sources, and one worker
 per account plus the sender.
@@ -18,7 +18,7 @@ that is not out there.
 
 | Tag | Argument | What it shows |
 |---|---|---|
-| `inbox`, `archive`, `sent`, `spam` | none, or a sender to filter by | one mailbox |
+| `inbox`, `archive`, `sent`, `spam`, `trash` | none, or a sender to filter by | one mailbox |
 | `message` | a mail id | one conversation |
 | `compose` | none, or `reply`/`forward`/`reopen` and a mail id | one draft |
 | `contact` | an address | one correspondent |
@@ -27,23 +27,39 @@ that is not out there.
 | `add_account` | none | the add-account form |
 
 The roots the launcher offers, in this order: **inbox**, **archive**, **sent**,
-**spam**, **new mail**, **settings**. Mail is listed first among the apps, so a
-store nobody has booted comes up on the inbox.
+**spam**, **trash**, **new mail**, **settings**. Mail is listed first among the
+apps, so a store nobody has booted comes up on the inbox.
 
-## Four mailboxes, one list
+## Five mailboxes, one list
 
-Inbox, archive, sent, and spam are four tags over one panel kind, one row
-shape, and one query written out four times so the folder role is a SQL
+Inbox, archive, sent, spam and trash are five tags over one panel kind, one row
+shape, and one query written out five times so the folder role is a SQL
 literal. They share rows, filtering, marks, cursor movement, and message
 previews.
 
 What differs is one verb: the verb that *keeps* a conversation. Only the inbox
-offers **archive**, because everywhere else the mail is already out of it, and
+offers **archive**, because everywhere else the mail is already out of it;
 only spam offers **not spam**, which puts a conversation back in the inbox —
-the same move in the other direction. The archive and Sent offer neither.
-**delete** is the move every mailbox has, and it means moving to the account's
-trash folder. Trash is a role a folder plays, not a mailbox panel; nothing
-lists it.
+the same move in the other direction; and only the trash offers **put back**,
+which is that move again, to wherever the delete took the letter from. The
+archive and Sent offer none of the three.
+
+**delete** is the move every mailbox has but the trash, and it means moving to
+the account's trash folder. The trash wears no delete at all: that is where
+delete goes.
+
+Deleting writes down where each letter was, in a `trashed` row per letter, and
+*put back* reads it. A letter that arrived in the trash from the server —
+deleted on another device, mirrored here — has no such row, and goes to the
+inbox. The undo tree knows where a letter came from too, and better, but only
+until the process ends: history is in memory, keeps its last two hundred
+nodes, and never had a node for a delete that happened elsewhere. `cmd+z` is
+the walk back through what you just did; *put back* is a verb over one
+conversation, weeks later.
+
+A row's participants and its count leave the trash out — what a conversation
+is, is what is left of it — except in the trash itself, where they count the
+deleted letters alone, since a row there is what was thrown away.
 
 The filter tags are `@unread`, `@html`, `@from:`, `@subject:`, `@date`, and
 `@account:`. Free text matches the sender's name, the sender's address and the
@@ -65,8 +81,9 @@ link opens: the panel is filtered from its first draw, and the field shows
 `@from:vera@kovac.io` so the next edit is the person's.
 
 The bar is `sync` (`cmd+s`), and while rows are marked, `archive n` (`cmd+a`,
-inbox only), `not spam n` (`cmd+n`, spam only), `delete n` (`cmd+d`), `mark
-all` (`cmd+m`), and `clear`. *mark all* wears `m` rather than `l` because the
+inbox only), `not spam n` (`cmd+n`, spam only), `put back n` (`cmd+p`, trash
+only), `delete n` (`cmd+d`, everywhere but the trash), `mark all` (`cmd+m`),
+and `clear`. *mark all* wears `m` rather than `l` because the
 shell keeps `cmd+l`; *clear* wears no letter because `esc` is the table's.
 
 ## Threads: the row is the conversation, the panel is the whole of it
@@ -96,6 +113,10 @@ has been read.
 
 A message panel shows the whole conversation oldest first, deduplicated by
 `Message-ID` so a reply that exists both in Sent and in the list appears once.
+The deleted letters are left out of it — a conversation is what is left of it
+— unless the letter the panel was opened on is itself in the trash, and then
+it is drawn whole: the deleted letters beside the ones still filed, which is
+the conversation you asked to see.
 The TO line of its first letter is at the top: the account's own address for a
 conversation that came in, and the person it went to for one this mailbox
 started — a letter's recipients are read off its own `To` header and kept on
@@ -119,7 +140,9 @@ into one node, so one undo closes the whole walk.
 The reader's bar is `archive` (`cmd+a`), `delete` (`cmd+d`), `reply` (`cmd+r`),
 and `forward` (`cmd+f`), plus `not spam` (`cmd+n`) over a letter read out of
 the spam folder and nowhere else: archiving and deleting are moves any letter
-has, while a letter is junk or it is not. The filing verbs are buttons; reply
+has, while a letter is junk or it is not. Over a letter read out of the trash,
+`put back` (`cmd+p`) takes the place `delete` has everywhere else, because
+deleting a deleted letter is the one filing with nothing to do. The filing verbs are buttons; reply
 and forward are links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
 and open a draft joined to the reader. Filing closes the reader's own slot and
 nothing else: another panel reading the same conversation stays where it is and
@@ -194,9 +217,9 @@ Mail's search source — what the [search panel](./interaction-grammar.md#search
 puts a question to — answers with the people who wrote first and then the
 letters a query's words reach, best match first, out of an FTS5 index. Spam is
 left out of the sender side, so nothing a search or a compose field offers came
-out of the junk, and the trash is left out of the letters: a deleted mail is
-out of its own conversation, so a reader opened on one would have nothing to
-show. A source may only offer what can be read.
+out of the junk, and the trash is left out of the letters: what you deleted is
+what you decided you were not looking for. The trash has its own list, and it
+filters like any other mailbox, which is where to go looking through it.
 
 ## Accounts
 
@@ -279,8 +302,8 @@ not reading it, and a plain fetch would mark every unread letter it walked
 `NOOP` rather than signed in again, because providers count logins.
 
 Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
-and trash. Only the first four have mailbox panels. Folders without one of
-these roles are not mirrored.
+and trash. Each of the five has a mailbox panel. Folders without one of these
+roles are not mirrored.
 
 `message` rows store the desired state. `server_msg` rows store the last state
 seen on the server. A difference between them becomes a queued job: the folder

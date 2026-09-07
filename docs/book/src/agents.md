@@ -433,7 +433,7 @@ action.
 
 | App | Reads | Writes |
 |---|---|---|
-| mail | `mail.search`, `mail.thread` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
+| mail | `mail.search`, `mail.thread` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.put_back`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
 | files | `files.list`, `files.read` | `files.rename`, `files.move`, `files.copy`, `files.trash`, `files.mkdir`, `files.write` |
 | system | `problems.list`, `effects.recent` | — |
 

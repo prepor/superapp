@@ -34,6 +34,7 @@ fn one_of_each(s: &Session) -> Vec<PanelId> {
         Role::Archive.id(),
         Role::Sent.id(),
         Role::Spam.id(),
+        Role::Trash.id(),
         Role::Inbox.filtered("vera@kovac.io"),
         Message::id(budget),
         Compose::id(Seed::Blank),

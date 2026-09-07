@@ -108,7 +108,9 @@ impl From<Static> for SeedMail {
 
 /// The demo world's letters, in the order they are filed: the hand-written
 /// inbox first, then the generated tail that makes it overflow, then the
-/// conversation, the junk, and the CI runs.
+/// conversation, the junk, the CI runs, and what was thrown away.
+///
+/// The deleted ones go last so that every id before them stays where it was.
 #[must_use]
 pub fn mails() -> Vec<SeedMail> {
     let mut v = base_mails();
@@ -116,6 +118,7 @@ pub fn mails() -> Vec<SeedMail> {
     v.extend(thread_mails());
     v.extend(spam_mails());
     v.extend(ci_mails());
+    v.extend(trash_mails());
     v
 }
 
@@ -400,6 +403,49 @@ fn spam_mails() -> Vec<SeedMail> {
             html: None,
             status: None,
             folder: "spam",
+            mid: "",
+            refs: &[],
+            forwarded: false,
+        },
+    ]
+    .into_iter()
+    .map(SeedMail::from)
+    .collect()
+}
+
+/// What the demo world has thrown away, so the trash has rows and *put
+/// back* has something to put back.
+///
+/// These arrive already in the trash and carry no `trashed` row — nobody
+/// pressed delete on this device, the server simply had them there. That is
+/// the case a put back falls back to the inbox for, and the demo is where it
+/// can be seen.
+fn trash_mails() -> Vec<SeedMail> {
+    [
+        Static {
+            from_name: "Lena Fischer",
+            from_email: "lena@fischer.studio",
+            subject: "Studio move — new address from October",
+            date: ts(2026, 8, 27, 16, 5),
+            unread: false,
+            body: "We are finally out of the basement.\n\nFrom the first of October we are at Ritterstraße 12, second courtyard. Same doorbell, better light.\n\nDrop by whenever you are in the neighbourhood.",
+            html: None,
+            status: None,
+            folder: "trash",
+            mid: "",
+            refs: &[],
+            forwarded: false,
+        },
+        Static {
+            from_name: "Bahn Tickets",
+            from_email: "no-reply@tickets.bahn.example",
+            subject: "Your ticket for ICE 574, 24.08 — Berlin Hbf → Hamburg Hbf",
+            date: ts(2026, 8, 23, 8, 12),
+            unread: false,
+            body: "Coach 12, seat 84, window.\n\nDeparture 09:34 from Berlin Hbf, arrival 11:22 Hamburg Hbf. Show this mail or the app at the barrier.",
+            html: None,
+            status: None,
+            folder: "trash",
             mid: "",
             refs: &[],
             forwarded: false,

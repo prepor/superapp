@@ -2,7 +2,7 @@
 //! fake server.
 //!
 //! What it adds to the shell is two halves and nothing else: the kernel's
-//! [`App`] — ten panel kinds, a schema ladder, a demo seed, four deferred
+//! [`App`] — eleven panel kinds, a schema ladder, a demo seed, four deferred
 //! effects, three capabilities of its own, a search source, a problem source,
 //! a worker per account plus the sender, and its roots for the launcher — and
 //! the shell's [`AppUi`](crate::shell::app_ui::AppUi), which is [`ui`] and the
@@ -59,6 +59,7 @@ static INBOX_KIND: panels::MailboxKind = panels::MailboxKind(Role::Inbox);
 static ARCHIVE_KIND: panels::MailboxKind = panels::MailboxKind(Role::Archive);
 static SENT_KIND: panels::MailboxKind = panels::MailboxKind(Role::Sent);
 static SPAM_KIND: panels::MailboxKind = panels::MailboxKind(Role::Spam);
+static TRASH_KIND: panels::MailboxKind = panels::MailboxKind(Role::Trash);
 static MESSAGE_KIND: panels::MessageKind = panels::MessageKind;
 static COMPOSE_KIND: panels::ComposeKind = panels::ComposeKind;
 static CONTACT_KIND: panels::ContactKind = panels::ContactKind;
@@ -71,6 +72,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &ARCHIVE_KIND,
     &SENT_KIND,
     &SPAM_KIND,
+    &TRASH_KIND,
     &MESSAGE_KIND,
     &COMPOSE_KIND,
     &CONTACT_KIND,
@@ -126,7 +128,7 @@ impl App for Mail {
         tools::all()
     }
 
-    /// The four mailboxes lead, then a blank sheet, then the accounts: the
+    /// The five mailboxes lead, then a blank sheet, then the accounts: the
     /// launcher's order for mail, whatever else is in the build.
     fn roots(&self) -> Vec<Root> {
         vec![
@@ -134,6 +136,7 @@ impl App for Mail {
             Root::new(Role::Archive.id(), "archive", "mail filed kept"),
             Root::new(Role::Sent.id(), "sent", "mail outgoing wrote"),
             Root::new(Role::Spam.id(), "spam", "mail junk"),
+            Root::new(Role::Trash.id(), "trash", "mail deleted bin"),
             Root::new(Compose::id(Seed::Blank), "new mail", "compose write send"),
             Root::new(Settings::id(), "settings", "accounts mail imap smtp"),
         ]
@@ -171,8 +174,9 @@ app password lives in the keychain and a refresh token under its own key.
 `folder` — one row per folder on a server: `account`, `name`, and `role`, \
 which is how the app files by meaning rather than by name: 'inbox', \
 'archive', 'sent', 'spam', 'trash', or NULL for a folder that is none of \
-them and is not mirrored. Only the first four have panels; the trash is a \
-role, not a list. `uidvalidity` and `uidnext` are the sync pass's own.
+them and is not mirrored. Each of the five has a mailbox panel; a letter in \
+the trash also has a `trashed` row saying which folder it was deleted from, \
+which is where mail.put_back sends it. `uidvalidity` and `uidnext` are the sync pass's own.
 
 `message` — one row per letter, and the state the person wants it in: \
 `folder` (where it should be), `unread`, `forwarded`, with `from_name`, \

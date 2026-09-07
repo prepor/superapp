@@ -15,10 +15,10 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::{Action, Session};
 use kernel::store::Store;
 
-use super::super::effects::{Filed, MarkRead};
+use super::super::effects::MarkRead;
 use super::super::model::{self, MailId, Role, Seed, ThreadMail};
 use super::super::{parts, reading};
-use super::mailbox::{nothing_said, word_of, Mailbox};
+use super::mailbox::{movable, move_tx, moved, Mailbox, To};
 
 /// Roughly how many lines of letter one grid row holds. An estimate, like the
 /// chrome allowance below: the wish only has to land on the right grid row,
@@ -166,9 +166,11 @@ impl Panel for Message {
     ///
     /// *not spam* is the one button that comes and goes: a letter is junk or
     /// it is not, and only one read out of the spam folder can be said not to
-    /// be. *archive* and *delete* are moves any letter has, so they are on
-    /// the bar wherever it was read and refuse in words when there is nowhere
-    /// to go.
+    /// be. *archive* is a move any letter has, so it is on the bar wherever
+    /// it was read and refuses in words when there is nowhere to go. *delete*
+    /// is that too, until the letter is already in the trash — there the same
+    /// place on the bar wears *put back*, because deleting a deleted letter
+    /// is the one filing with nothing to do.
     ///
     /// *forward* is a link like *reply*: opening a sheet claims nothing. The
     /// `$Forwarded` keyword is set when the letter has actually **left** —
@@ -177,10 +179,14 @@ impl Panel for Message {
     fn verbs(&self) -> Vec<Verb> {
         let (slot, mail) = (self.slot, self.mail);
         let mut v = vec![Verb::run("mail.archive", "archive", Some('a'))];
-        if model::role_of(&self.store, mail) == Some(Role::Spam) {
-            v.push(Verb::run("mail.not_spam", "not spam", Some('n')));
+        match model::role_of(&self.store, mail) {
+            Some(Role::Spam) => {
+                v.push(Verb::run("mail.not_spam", "not spam", Some('n')));
+                v.push(Verb::run("mail.delete", "delete", Some('d')));
+            }
+            Some(Role::Trash) => v.push(Verb::run("mail.put_back", "put back", Some('p'))),
+            _ => v.push(Verb::run("mail.delete", "delete", Some('d'))),
         }
-        v.push(Verb::run("mail.delete", "delete", Some('d')));
         v.push(Verb::go(
             "mail.reply",
             "reply",
@@ -206,9 +212,10 @@ impl Panel for Message {
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
-            "mail.archive" => self.file_thread(s, "archive"),
-            "mail.not_spam" => self.file_thread(s, "inbox"),
-            "mail.delete" => self.file_thread(s, "trash"),
+            "mail.archive" => self.file_thread(s, To::Role("archive")),
+            "mail.not_spam" => self.file_thread(s, To::Role("inbox")),
+            "mail.delete" => self.file_thread(s, To::Role("trash")),
+            "mail.put_back" => self.file_thread(s, To::Back),
             _ => {}
         }
     }
@@ -289,7 +296,7 @@ impl Message {
     /// layout half — the instance runs to the end of this method all the
     /// same, and is dropped at the settle — and the cursor walk that follows
     /// folds into the same node: filing is one gesture, so it is one undo.
-    fn file_thread(&mut self, s: &mut Session, role: &'static str) {
+    fn file_thread(&mut self, s: &mut Session, to: To) {
         let (store, slot, mail) = (self.store.clone(), self.slot, self.mail);
         // Asked before acting, of the mail the panel was opened on: without
         // the folder the move is a no-op, and so is filing a mail into the
@@ -297,25 +304,25 @@ impl Message {
         // wears the *archive* button, because the button is about the mail.
         // An action that changes nothing records no node, so the answer has
         // to be a word rather than silence.
-        if !model::can_file(&store, mail, role) {
-            s.notify(format!("this account has no {role} folder"), true);
-            return;
-        }
-        if model::already_filed(&store, mail, role) {
-            s.notify(format!("already in the {role}"), true);
-            return;
+        if let To::Role(role) = to {
+            if !model::can_file(&store, mail, role) {
+                s.notify(format!("this account has no {role} folder"), true);
+                return;
+            }
+            if model::already_filed(&store, mail, role) {
+                s.notify(format!("already in the {role}"), true);
+                return;
+            }
         }
         let moving: Vec<(MailId, i64)> = model::thread_siblings(&store, mail)
             .into_iter()
-            .filter(|id| {
-                model::can_file(&store, *id, role) && !model::already_filed(&store, *id, role)
-            })
+            .filter(|id| movable(&store, *id, to))
             .map(|id| (id, model::folder_of(&store, id)))
             .collect();
         // The mail itself moves, so this is the rest of the conversation
         // having nowhere to go — which is not a refusal of the verb.
         if moving.is_empty() {
-            s.notify(nothing_said(role), false);
+            s.notify(to.nothing_said(), false);
             return;
         }
 
@@ -323,20 +330,14 @@ impl Message {
 
         let intents: Vec<Box<dyn Intent>> = moving
             .iter()
-            .map(|(mail, from)| {
-                Box::new(Filed {
-                    mail: *mail,
-                    from_folder: *from,
-                    role,
-                }) as Box<dyn Intent>
-            })
+            .map(|(mail, from)| moved(&store, *mail, *from, to))
             .collect();
         let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
         let title = self.title();
         let done = s.act(
-            Action::writing("file", format!("{} “{title}”", word_of(role)), move |tx| {
+            Action::writing("file", format!("{} “{title}”", to.word()), move |tx| {
                 for id in &ids {
-                    model::file_tx(tx, *id, role)?;
+                    move_tx(tx, *id, to)?;
                 }
                 Ok(())
             })

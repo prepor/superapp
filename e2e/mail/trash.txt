@@ -1,0 +1,106 @@
+# args:
+# env:
+#
+# The trash: where delete files a conversation, and the verb that takes it
+# back out again.
+#
+# Assertions are the clicks. A row that resolves in the trash is proof the
+# delete landed there; the same row resolving in the inbox afterwards is
+# proof the put back went where the delete came from. Exactly one mail list
+# is open at a time — two of them would make "click the budget conversation"
+# mean either.
+
+wait 900
+
+# -- delete, from the reader's own bar -----------------------------------------
+
+# Boot is the inbox. A press on a row previews the conversation joined to
+# it, and the reader's `delete` files the whole of it and closes itself.
+click "Q3 infra"
+wait 800
+shot d1-preview
+click "delete"
+wait 900
+shot d2-deleted
+
+# Nothing but the inbox is left, and the conversation is not in it: close it,
+# and the rest of this run is about the trash.
+key cmd+w
+wait 600
+
+# -- the trash is a mailbox, and its bar puts a conversation back --------------
+
+# The launcher offers it as a root of its own, after the spam.
+key cmd 2
+wait 400
+type "trash"
+wait 500
+shot d3-launcher-trash
+key enter
+wait 800
+shot d4-trash
+
+# The deleted conversation is listed here, newest first, and clicking it
+# previews it — a reader over a deleted letter draws the conversation whole
+# rather than the nothing it drew before this list existed.
+click "Q3 infra"
+wait 800
+shot d5-trash-previews
+
+# Space marks the row under the cursor, and the bar grows the trash's own
+# verb with its count. `delete 1` is what a mailbox wears here and the trash
+# does not: this is where delete goes.
+key space
+wait 500
+shot d6-marked
+click "put back 1"
+wait 900
+shot d7-put-back
+
+# -- and it went back where the delete took it from ---------------------------
+
+key cmd+w
+wait 600
+key cmd 2
+wait 400
+type "inbox"
+wait 500
+key enter
+wait 800
+
+# The row resolves in the inbox again, which is the whole claim of the verb:
+# it went back to the folder the delete moved it out of.
+click "Q3 infra"
+wait 800
+shot d8-back-in-the-inbox
+key cmd+w
+wait 600
+
+# -- the reader over a letter this device never deleted -----------------------
+
+# The demo world's own trash arrived deleted: no row says where those
+# letters were, so a put back sends them to the inbox, and the reader wears
+# the verb in the place `delete` has everywhere else.
+key cmd 2
+wait 400
+type "trash"
+wait 500
+key enter
+wait 800
+click "Studio move"
+wait 800
+shot d9-studio-move
+click "put back"
+wait 900
+key cmd+w
+wait 600
+key cmd 2
+wait 400
+type "inbox"
+wait 500
+key enter
+wait 800
+click "Studio move"
+wait 800
+shot d10-studio-move-in-the-inbox
+quit

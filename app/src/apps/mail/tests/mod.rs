@@ -221,10 +221,10 @@ fn the_filter_reads_the_letters() {
     assert!(topics("thermos @from:max").is_empty());
 }
 
-/// The four mailboxes are four panels over one list, and each shows what its
+/// The five mailboxes are five panels over one list, and each shows what its
 /// own folder holds.
 #[test]
-fn the_four_mailboxes_show_their_own_folders() {
+fn the_five_mailboxes_show_their_own_folders() {
     let (mut s, _clock) = session();
     let counts: Vec<(&str, usize)> = model::ROLES
         .into_iter()
@@ -236,7 +236,13 @@ fn the_four_mailboxes_show_their_own_folders() {
         .collect();
     assert_eq!(
         counts,
-        vec![("inbox", 69), ("archive", 1), ("sent", 1), ("spam", 3)]
+        vec![
+            ("inbox", 69),
+            ("archive", 1),
+            ("sent", 1),
+            ("spam", 3),
+            ("trash", 2)
+        ]
     );
 
     // Sent holds my own note to Max — the conversation read from the other
@@ -749,6 +755,220 @@ fn the_reader_wears_not_spam_over_a_letter_in_the_junk() {
     );
 }
 
+// -- the trash -------------------------------------------------------------------
+
+/// The demo account's folder of that role — there is one account, so there
+/// is one answer.
+fn folder_id(store: &Store, role: &str) -> i64 {
+    store
+        .conn()
+        .query_row("SELECT id FROM folder WHERE role = ?1", [role], |r| {
+            r.get(0)
+        })
+        .expect("the demo account has every role")
+}
+
+/// The trash is the fifth mailbox: what *delete* files is listed there, its
+/// bar wears *put back* where the others wear *delete* and wears no delete
+/// at all, and one press sends the conversation back where it was deleted
+/// from — with the row that remembered it going too, and coming back on
+/// undo.
+#[test]
+fn the_trash_lists_what_was_deleted_and_puts_it_back() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let mail = with_mailbox(&s, inbox, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    verb(&mut s, inbox, "mail.delete");
+    assert_eq!(role_of(s.store(), mail), "trash");
+    assert_eq!(
+        model::trashed_from(s.store(), mail),
+        Some(folder_id(s.store(), "inbox")),
+        "the delete wrote down where the letter left"
+    );
+
+    let trash = open_root(&mut s, Role::Trash.id());
+    assert_eq!(
+        with_mailbox(&s, trash, |m| m.len()),
+        3,
+        "the two the demo world threw away, and the one just deleted"
+    );
+    with_mailbox(&s, trash, |m| {
+        assert_eq!(m.rows(0, 1)[0].target, mail, "newest first, like any list");
+        m.go(0);
+        m.toggle_mark();
+    });
+    let labels: Vec<String> = s
+        .panel(trash)
+        .unwrap()
+        .borrow()
+        .verbs()
+        .iter()
+        .map(|v| v.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["sync", "put back 1", "mark all", "clear"],
+        "no delete here: this is where delete goes"
+    );
+
+    let before = kinds(&s).len();
+    verb(&mut s, trash, "mail.put_back");
+    assert_eq!(role_of(s.store(), mail), "inbox", "back where it came from");
+    assert_eq!(model::trashed_from(s.store(), mail), None);
+    assert_eq!(
+        with_mailbox(&s, trash, |m| m.len()),
+        2,
+        "the list is shorter"
+    );
+    assert_eq!(kinds(&s).len(), before + 1, "{:?}", kinds(&s));
+
+    // One press takes the whole gesture back: the letter returns to the
+    // trash still remembering where it was deleted from, and the mark
+    // returns to its row.
+    assert!(s.undo());
+    assert_eq!(role_of(s.store(), mail), "trash");
+    assert_eq!(
+        model::trashed_from(s.store(), mail),
+        Some(folder_id(s.store(), "inbox")),
+        "put back a second time, it would go to the same place"
+    );
+    assert_eq!(with_mailbox(&s, trash, |m| m.list().marks().len()), 1);
+}
+
+/// *put back* is not *not spam*: it reads the folder the delete came from
+/// rather than filing everything into the inbox. A letter this device never
+/// deleted — one the server simply had in its trash — has no such row, and
+/// the inbox is the honest answer for it.
+#[test]
+fn a_put_back_goes_where_the_delete_took_it_from() {
+    let (mut s, _clock) = session();
+    let archive = open_root(&mut s, Role::Archive.id());
+    let letters = with_mailbox(&s, archive, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    let letters = model::thread_siblings(s.store(), letters);
+    assert_eq!(letters.len(), 5, "the archived CI runs");
+    verb(&mut s, archive, "mail.delete");
+    assert!(letters.iter().all(|id| role_of(s.store(), *id) == "trash"));
+
+    let trash = open_root(&mut s, Role::Trash.id());
+    with_mailbox(&s, trash, |m| {
+        m.go(0);
+        m.toggle_mark();
+    });
+    verb(&mut s, trash, "mail.put_back");
+    assert!(
+        letters
+            .iter()
+            .all(|id| role_of(s.store(), *id) == "archive"),
+        "every letter went back to the archive, not to the inbox"
+    );
+
+    // What is left is the demo world's own trash, which arrived deleted and
+    // carries no row saying where from.
+    with_mailbox(&s, trash, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.go(1);
+        m.toggle_mark();
+    });
+    verb(&mut s, trash, "mail.put_back");
+    assert_eq!(with_mailbox(&s, trash, |m| m.len()), 0);
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    assert_eq!(
+        with_mailbox(&s, inbox, |m| m.len()),
+        71,
+        "the two that were never deleted here land in the inbox"
+    );
+}
+
+/// A memory may not hold a mirror open. When the server drops a letter this
+/// device had deleted — an expunge from another client — the local row goes
+/// inside the sync pass's own commit, and the row that remembered where it
+/// came from goes with it rather than failing the pass.
+#[test]
+fn a_letter_the_server_drops_takes_its_trashed_row_with_it() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let mail = with_mailbox(&s, inbox, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    verb(&mut s, inbox, "mail.delete");
+    assert!(model::trashed_from(s.store(), mail).is_some());
+
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.folders
+            .get_mut("Trash")
+            .expect("the demo server's trash")
+            .2
+            .clear();
+    });
+    sync::sync_account(s.world(), seed::ACCOUNT).expect("the pass survives the deletion");
+    assert_eq!(role_of(s.store(), mail), "", "the letter went with it");
+    let left: i64 = s
+        .store()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM trashed", [], |r| r.get(0))
+        .expect("the trashed rows");
+    assert_eq!(left, 0, "and so did what remembered where it had been");
+}
+
+/// A conversation read out of the trash is drawn whole — the deleted letters
+/// beside the ones still filed — and the reader wears *put back* in the
+/// place *delete* has everywhere else.
+#[test]
+fn the_reader_over_a_deleted_letter_wears_put_back() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    // The conversation with my own note in Sent: deleting it out of the
+    // inbox leaves that copy where it is, which is what a reader over the
+    // deleted half has to show beside them.
+    let mail = with_mailbox(&s, inbox, |m| {
+        m.list_mut().set_filter("panel model");
+        assert_eq!(m.len(), 1);
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    verb(&mut s, inbox, "mail.delete");
+
+    let trash = open_root(&mut s, Role::Trash.id());
+    let nav = with_mailbox(&s, trash, |m| m.go(0)).expect("the trash's first row");
+    go(&mut s, nav);
+    let reader = s.joined_child(trash).expect("a reader");
+    assert_eq!(
+        verb_ids(&s, reader),
+        vec![
+            "mail.archive",
+            "mail.put_back",
+            "mail.reply",
+            "mail.forward"
+        ]
+    );
+    let msgs = model::thread(s.store(), mail);
+    assert!(
+        msgs.iter()
+            .any(|t| t.mail.head.id == mail && t.role == "trash"),
+        "the letter the panel was opened on is in the conversation it draws"
+    );
+    assert!(
+        msgs.iter().any(|t| t.role != "trash"),
+        "and so is what was not deleted"
+    );
+
+    verb(&mut s, reader, "mail.put_back");
+    assert_eq!(role_of(s.store(), mail), "inbox");
+    assert!(s.panel(reader).is_none(), "the reader closed with it");
+}
+
 // -- the send flow ---------------------------------------------------------------
 
 /// A reply written, sent after its window, handed to the submission server,
@@ -1231,14 +1451,17 @@ fn the_app_registers_its_tags_workers_and_roots() {
             "message",
             "sent",
             "settings",
-            "spam"
+            "spam",
+            "trash"
         ]
     );
 
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
     assert_eq!(
         roots,
-        vec!["inbox", "archive", "sent", "spam", "new mail", "settings"]
+        vec![
+            "inbox", "archive", "sent", "spam", "trash", "new mail", "settings"
+        ]
     );
 
     // The passes follow the store: one account is configured, so its sync

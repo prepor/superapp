@@ -31,14 +31,15 @@ script_mod! {
                         // custom-drawn widget are never auto-drawn — they
                         // are collected as templates and instantiated per
                         // slot, PortalList-style.
-                        // Mail's nine tags. All four mailboxes draw with one
-                        // widget, hung four times: a template is
-                        // instantiated per slot, and the four lists are four
+                        // Mail's tags. All five mailboxes draw with one
+                        // widget, hung five times: a template is
+                        // instantiated per slot, and the five lists are five
                         // panels.
                         mail_inbox_tpl := mod.widgets.MailMailboxPanel{}
                         mail_archive_tpl := mod.widgets.MailMailboxPanel{}
                         mail_sent_tpl := mod.widgets.MailMailboxPanel{}
                         mail_spam_tpl := mod.widgets.MailMailboxPanel{}
+                        mail_trash_tpl := mod.widgets.MailMailboxPanel{}
                         mail_message_tpl := mod.widgets.MailMessagePanel{}
                         mail_compose_tpl := mod.widgets.MailComposePanel{}
                         mail_contact_tpl := mod.widgets.MailContactPanel{}
@@ -84,6 +85,7 @@ script_mod! {
                             mail_archive_tpl := mod.widgets.MailMailboxPanel{}
                             mail_sent_tpl := mod.widgets.MailMailboxPanel{}
                             mail_spam_tpl := mod.widgets.MailMailboxPanel{}
+                            mail_trash_tpl := mod.widgets.MailMailboxPanel{}
                             mail_message_tpl := mod.widgets.MailMessagePanel{}
                             mail_compose_tpl := mod.widgets.MailComposePanel{}
                             mail_contact_tpl := mod.widgets.MailContactPanel{}

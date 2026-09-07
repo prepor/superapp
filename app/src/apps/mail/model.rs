@@ -119,26 +119,34 @@ pub struct Draft {
 
 // -- the mailbox roles ---------------------------------------------------------
 
-/// Which mailbox a list panel is over. Four, and they are the four folders a
-/// mail can be filed into and read back out of; `trash` is a role a folder
-/// plays and not a panel, because nothing lists it.
+/// Which mailbox a list panel is over. Five, and they are the five folders a
+/// mail can be filed into and read back out of — the trash included, because
+/// a delete you cannot see is a delete you cannot take back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Inbox,
     Archive,
     Sent,
     Spam,
+    Trash,
 }
 
 /// Every role a mail list can show, in the order the launcher offers them:
 /// the inbox first, then where mail goes when it leaves it.
-pub const ROLES: [Role; 4] = [Role::Inbox, Role::Archive, Role::Sent, Role::Spam];
+pub const ROLES: [Role; 5] = [
+    Role::Inbox,
+    Role::Archive,
+    Role::Sent,
+    Role::Spam,
+    Role::Trash,
+];
 
 impl Role {
     pub const INBOX: Tag = Tag("inbox");
     pub const ARCHIVE: Tag = Tag("archive");
     pub const SENT: Tag = Tag("sent");
     pub const SPAM: Tag = Tag("spam");
+    pub const TRASH: Tag = Tag("trash");
 
     #[must_use]
     pub fn tag(self) -> Tag {
@@ -147,6 +155,7 @@ impl Role {
             Role::Archive => Role::ARCHIVE,
             Role::Sent => Role::SENT,
             Role::Spam => Role::SPAM,
+            Role::Trash => Role::TRASH,
         }
     }
 
@@ -159,9 +168,10 @@ impl Role {
     }
 
     /// The role a `folder.role` string names, or `None` for one no list shows
-    /// (`trash`, and anything a later build learns to file). Not `FromStr`:
-    /// this reads the store's own column, not a person's typing, and there is
-    /// no error to report — only "no panel for that".
+    /// — a folder role a later build learns to file, and `NULL`, which is
+    /// every folder this app does not mirror. Not `FromStr`: this reads the
+    /// store's own column, not a person's typing, and there is no error to
+    /// report — only "no panel for that".
     #[must_use]
     pub fn named(s: &str) -> Option<Role> {
         ROLES.into_iter().find(|r| r.as_str() == s)
@@ -242,6 +252,22 @@ static Q_THREAD: Q = Q {
     describe: "the conversation a mail belongs to, oldest first, trash left out",
 };
 
+/// The same conversation with the trash in it — what a letter *read out of
+/// the trash* is part of. A deleted letter is not gone, it is filed
+/// somewhere a list now shows, so a reader opened on one draws the whole
+/// conversation: the deleted letters beside the ones still filed.
+static Q_THREAD_ALL: Q = Q {
+    id: "thread with trash",
+    sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
+                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded,
+                 COALESCE(f.role, ''), COALESCE(m.message_id, '')
+          FROM message m JOIN account a ON a.id = m.account
+                         JOIN folder f ON f.id = m.folder
+          WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
+          ORDER BY m.date, m.id",
+    describe: "the conversation a mail belongs to, oldest first, the trash included",
+};
+
 static Q_THREAD_TOPIC: Q = Q {
     id: "thread topic",
     sql: "SELECT COALESCE(t.topic, t.subject) FROM message t
@@ -258,6 +284,18 @@ static Q_THREAD_MEMBERS: Q = Q {
             AND f.role IS NOT 'trash'
           ORDER BY m.date, m.id",
     describe: "every mail of a conversation with its read flag and folder role",
+};
+
+/// The same, with the trash in it — asked when the mail in hand is itself
+/// deleted, which is the only time its siblings in the trash are what a verb
+/// or a read mark is about.
+static Q_THREAD_MEMBERS_ALL: Q = Q {
+    id: "thread members with trash",
+    sql: "SELECT m.id, m.unread, COALESCE(f.role, '')
+          FROM message m JOIN folder f ON f.id = m.folder
+          WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
+          ORDER BY m.date, m.id",
+    describe: "every mail of a conversation, the trash included, with its read flag and role",
 };
 
 /// Distinct senders on one side of the spam line — `?1` picks which.
@@ -397,10 +435,15 @@ pub fn spam_senders(store: &Store) -> Rc<Vec<Sender>> {
 ///
 /// The role is a literal rather than a bound parameter: a [`SqlSpec`] is
 /// static text, which is what lets the same builder, the same rank and the
-/// same page cache serve four lists without a string being formatted per
-/// keystroke. `concat!` writes the four out at compile time.
+/// same page cache serve five lists without a string being formatted per
+/// keystroke. `concat!` writes the five out at compile time.
+///
+/// `$of` is which side of the trash a row's count is over. Four lists leave
+/// the trash out, so how long a conversation is is what is left of it; the
+/// trash counts the deleted letters alone, because a row there is what was
+/// thrown away and would otherwise say *0*.
 macro_rules! mailbox_spec {
-    ($role:literal, $who:literal, $text:expr) => {
+    ($role:literal, $who:expr, $text:expr, $of:literal) => {
         SqlSpec {
             id: concat!($role, " table"),
             describe: concat!(
@@ -426,7 +469,9 @@ macro_rules! mailbox_spec {
                    WHERE t.thread = m.thread ORDER BY t.date, t.id LIMIT 1) AS topic,
                  (SELECT COUNT(DISTINCT COALESCE(NULLIF(t.message_id, ''), 'id:' || t.id))
                    FROM message t JOIN folder tf ON tf.id = t.folder
-                   WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS n"
+                   WHERE t.thread = m.thread AND tf.role ",
+                $of,
+                " 'trash') AS n"
             ),
             from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
             base: concat!("f.role = '", $role, "'"),
@@ -461,27 +506,38 @@ macro_rules! mailbox_spec {
 
 /// A mailbox of letters that **arrived**: a row names everyone who wrote in
 /// the conversation, newest speaker first, `me` for the account's own
-/// address. The whole conversation, trash aside — a reply of mine is part of
-/// who is in it.
+/// address.
+///
+/// `$of` is which side of the trash that name list counts, and it is the
+/// same word the row's own count uses: everywhere but the trash it is the
+/// whole conversation, trash aside — a reply of mine is part of who is in it
+/// — and in the trash it is the deleted letters alone, which is what a row
+/// there stands for.
 macro_rules! arrived_spec {
-    ($role:literal) => {
+    ($role:literal, $of:literal) => {
         mailbox_spec!(
             $role,
-            "(SELECT GROUP_CONCAT(
-                  CASE WHEN t.from_email = ta.email THEN 'me'
-                       WHEN t.from_name = '' THEN t.from_email
-                       ELSE t.from_name END, char(31) ORDER BY t.date DESC)
-                FROM message t JOIN folder tf ON tf.id = t.folder
-                               JOIN account ta ON ta.id = t.account
-               WHERE t.thread = m.thread AND tf.role IS NOT 'trash')",
-            &["m.from_name", "m.from_email", "m.subject"]
+            concat!(
+                "(SELECT GROUP_CONCAT(
+                      CASE WHEN t.from_email = ta.email THEN 'me'
+                           WHEN t.from_name = '' THEN t.from_email
+                           ELSE t.from_name END, char(31) ORDER BY t.date DESC)
+                    FROM message t JOIN folder tf ON tf.id = t.folder
+                                   JOIN account ta ON ta.id = t.account
+                   WHERE t.thread = m.thread AND tf.role ",
+                $of,
+                " 'trash')"
+            ),
+            &["m.from_name", "m.from_email", "m.subject"],
+            $of
         )
     };
 }
 
-static INBOX_SPEC: SqlSpec = arrived_spec!("inbox");
-static ARCHIVE_SPEC: SqlSpec = arrived_spec!("archive");
-static SPAM_SPEC: SqlSpec = arrived_spec!("spam");
+static INBOX_SPEC: SqlSpec = arrived_spec!("inbox", "IS NOT");
+static ARCHIVE_SPEC: SqlSpec = arrived_spec!("archive", "IS NOT");
+static SPAM_SPEC: SqlSpec = arrived_spec!("spam", "IS NOT");
+static TRASH_SPEC: SqlSpec = arrived_spec!("trash", "IS");
 
 /// Sent is the mailbox of letters that **left**, and a row names who they
 /// went to: their sender is always me, so the TO line is the only thing on
@@ -500,7 +556,8 @@ static SENT_SPEC: SqlSpec = mailbox_spec!(
        WHERE t.thread = m.thread AND tf.role = 'sent' AND t.to_addr != '')",
     // …and free text over the same line, because a list is searched by what
     // it shows: the sender of everything here is the account itself.
-    &["m.to_addr", "m.subject"]
+    &["m.to_addr", "m.subject"],
+    "IS NOT"
 );
 
 /// The spec one role's list runs on.
@@ -510,6 +567,7 @@ fn spec_of(role: Role) -> &'static SqlSpec {
         Role::Archive => &ARCHIVE_SPEC,
         Role::Sent => &SENT_SPEC,
         Role::Spam => &SPAM_SPEC,
+        Role::Trash => &TRASH_SPEC,
     }
 }
 
@@ -605,7 +663,7 @@ fn suggest_spam(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
     suggest_mailbox(store, true, tag, typed)
 }
 
-/// One role's datasource: what that mailbox panel's rich table runs on. Four
+/// One role's datasource: what that mailbox panel's rich table runs on. Five
 /// values of one shape — everything but the spec is shared, because a row of
 /// the sent folder is decoded, keyed and ranked exactly like a row of the
 /// inbox.
@@ -626,6 +684,7 @@ static INBOX: SqlSource<ThreadHead, i64> = mailbox_source!(&INBOX_SPEC, suggest_
 static ARCHIVE: SqlSource<ThreadHead, i64> = mailbox_source!(&ARCHIVE_SPEC, suggest_correspondents);
 static SENT: SqlSource<ThreadHead, i64> = mailbox_source!(&SENT_SPEC, suggest_correspondents);
 static SPAM: SqlSource<ThreadHead, i64> = mailbox_source!(&SPAM_SPEC, suggest_spam);
+static TRASH: SqlSource<ThreadHead, i64> = mailbox_source!(&TRASH_SPEC, suggest_correspondents);
 
 /// The datasource a mailbox panel of this role pages through.
 #[must_use]
@@ -635,6 +694,7 @@ pub fn threads(role: Role) -> &'static SqlSource<ThreadHead, i64> {
         Role::Archive => &ARCHIVE,
         Role::Sent => &SENT,
         Role::Spam => &SPAM,
+        Role::Trash => &TRASH,
     }
 }
 
@@ -758,7 +818,12 @@ pub fn thread_tx(
 /// message here: the copy outside Sent wins.
 #[must_use]
 pub fn thread(store: &Store, id: MailId) -> Vec<ThreadMail> {
-    let rows = store.rows(&Q_THREAD, &[Val::I(id)], thread_row);
+    let q = if is_trashed(store, id) {
+        &Q_THREAD_ALL
+    } else {
+        &Q_THREAD
+    };
+    let rows = store.rows(q, &[Val::I(id)], thread_row);
     let mut out: Vec<ThreadMail> = Vec::with_capacity(rows.len());
     for m in rows.iter() {
         if !m.message_id.is_empty() {
@@ -787,7 +852,7 @@ pub fn thread_topic(store: &Store, id: MailId) -> Option<String> {
 #[must_use]
 pub fn thread_unread(store: &Store, id: MailId) -> Vec<MailId> {
     store
-        .rows(&Q_THREAD_MEMBERS, &[Val::I(id)], |r| {
+        .rows(members_q(store, id), &[Val::I(id)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?))
         })
         .iter()
@@ -824,11 +889,28 @@ pub fn role_word_of(store: &Store, id: MailId) -> Option<String> {
         .flatten()
 }
 
-/// The same, as a mailbox: `None` for a mail no list shows (a trashed one,
-/// reached from a reader).
+/// The same, as a mailbox: `None` for a mail no list shows — one in a folder
+/// this build files nothing into.
 #[must_use]
 pub fn role_of(store: &Store, id: MailId) -> Option<Role> {
     role_word_of(store, id).as_deref().and_then(Role::named)
+}
+
+/// Whether this mail is in the trash. What it decides is how its
+/// conversation reads: everywhere else the trash is left out, and a letter
+/// already in it is read with its deleted siblings.
+#[must_use]
+pub fn is_trashed(store: &Store, id: MailId) -> bool {
+    role_word_of(store, id).as_deref() == Some(Role::TRASH.as_str())
+}
+
+/// Which members query a conversation is asked with — see [`is_trashed`].
+fn members_q(store: &Store, id: MailId) -> &'static Q {
+    if is_trashed(store, id) {
+        &Q_THREAD_MEMBERS_ALL
+    } else {
+        &Q_THREAD_MEMBERS
+    }
 }
 
 /// Which of a conversation's mails share this one's folder role — what
@@ -839,15 +921,15 @@ pub fn role_of(store: &Store, id: MailId) -> Option<Role> {
 /// deleting from the archive takes the archived ones. That mailbox is not
 /// passed in — it is what the mail under the cursor is already filed as,
 /// which is the same answer and cannot disagree with the list. A mail in no
-/// listed role (a trashed one, reached from a reader) is alone: the set is
-/// just itself.
+/// listed role — one in a folder this build files nothing into — is alone:
+/// the set is just itself.
 #[must_use]
 pub fn thread_siblings(store: &Store, id: MailId) -> Vec<MailId> {
     let Some(role) = role_of(store, id) else {
         return vec![id];
     };
     store
-        .rows(&Q_THREAD_MEMBERS, &[Val::I(id)], |r| {
+        .rows(members_q(store, id), &[Val::I(id)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?))
         })
         .iter()
@@ -914,6 +996,13 @@ pub fn mark_read_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<()
 ///
 /// If the store refuses the write.
 pub fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Result<bool> {
+    // Where it stood, read before the move: a delete is the one filing whose
+    // origin has to outlive the session that made it.
+    let was: Option<i64> = c
+        .query_row("SELECT folder FROM message WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok();
     let n = c.execute(
         "UPDATE message SET folder =
            (SELECT f.id FROM folder f
@@ -925,7 +1014,125 @@ pub fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Re
                               WHERE f.account = message.account AND f.role = ?2)",
         rusqlite::params![id, role],
     )?;
+    if n > 0 {
+        match (role == Role::TRASH.as_str(), was) {
+            (true, Some(was)) => {
+                c.execute(
+                    "INSERT OR REPLACE INTO trashed(message, folder) VALUES(?1, ?2)",
+                    rusqlite::params![id, was],
+                )?;
+            }
+            // Out of the trash by any other road — archived from a reader,
+            // undone, moved by a tool. The letter is filed again, so where
+            // it was deleted from is no longer a fact about it.
+            _ => {
+                c.execute("DELETE FROM trashed WHERE message = ?1", [id])?;
+            }
+        }
+    }
     Ok(n > 0)
+}
+
+/// Where a deleted letter was filed before it was deleted, if that is
+/// written down. `None` for one that arrived in the trash from the server —
+/// deleted on another device, mirrored here — which never passed through a
+/// filing of ours.
+#[must_use]
+pub fn trashed_from(store: &Store, id: MailId) -> Option<i64> {
+    store
+        .conn()
+        .query_row("SELECT folder FROM trashed WHERE message = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok()
+}
+
+/// The folder a *put back* sends a letter to: where it was deleted from,
+/// else the account's inbox. Both halves are joined against `folder`, so a
+/// row pointing at a folder a resync dropped falls through to the inbox
+/// rather than moving the letter nowhere.
+const Q_PUT_BACK_TARGET: &str = "SELECT COALESCE(
+     (SELECT t.folder FROM trashed t JOIN folder f ON f.id = t.folder
+       WHERE t.message = ?1),
+     (SELECT f.id FROM folder f JOIN message m ON m.account = f.account
+       WHERE m.id = ?1 AND f.role = 'inbox'))";
+
+/// Where a *put back* would send this letter — [`Q_PUT_BACK_TARGET`].
+/// `None` when there is nowhere: the account has no inbox row either, which
+/// is a mailbox this app never mirrored.
+#[must_use]
+pub fn put_back_target(store: &Store, id: MailId) -> Option<i64> {
+    target_of(store.conn(), id)
+}
+
+fn target_of(c: &rusqlite::Connection, id: MailId) -> Option<i64> {
+    c.query_row(Q_PUT_BACK_TARGET, [id], |r| r.get::<_, Option<i64>>(0))
+        .ok()
+        .flatten()
+}
+
+/// Puts a letter back where it was deleted from, and the row that remembered
+/// it goes with the move. Answers whether anything moved.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn put_back_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<bool> {
+    let Some(to) = target_of(c, id) else {
+        return Ok(false);
+    };
+    let n = c.execute(
+        "UPDATE message SET folder = ?2 WHERE id = ?1 AND folder IS NOT ?2",
+        rusqlite::params![id, to],
+    )?;
+    c.execute("DELETE FROM trashed WHERE message = ?1", [id])?;
+    Ok(n > 0)
+}
+
+/// Puts a letter back in the trash and writes down where it came from — what
+/// undoing a *put back* does, and nothing else: the row it restores is the
+/// one the put back consumed.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn retrash_tx(
+    c: &rusqlite::Connection,
+    id: MailId,
+    trash: i64,
+    from: i64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE message SET folder = ?2 WHERE id = ?1",
+        rusqlite::params![id, trash],
+    )?;
+    c.execute(
+        "INSERT OR REPLACE INTO trashed(message, folder) VALUES(?1, ?2)",
+        rusqlite::params![id, from],
+    )?;
+    Ok(())
+}
+
+/// What a letter's `trashed` row should be once a move has been reversed:
+/// the one it had before the move, or none at all. The folder half of undo,
+/// which writes `message.folder` back directly rather than filing it.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn set_trashed_tx(
+    c: &rusqlite::Connection,
+    id: MailId,
+    was: Option<i64>,
+) -> rusqlite::Result<()> {
+    match was {
+        Some(folder) => c.execute(
+            "INSERT OR REPLACE INTO trashed(message, folder) VALUES(?1, ?2)",
+            rusqlite::params![id, folder],
+        ),
+        None => c.execute("DELETE FROM trashed WHERE message = ?1", [id]),
+    }?;
+    Ok(())
 }
 
 /// Whether this mail's account has the folder a triage would move it to. The
