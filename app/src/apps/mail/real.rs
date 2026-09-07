@@ -357,7 +357,7 @@ pub fn role_for(name: &str, attrs: &[String]) -> (Option<String>, bool) {
 
 /// A sorted uid list as an IMAP sequence set, runs collapsed: `1:200` where
 /// the batch is consecutive, `4,9:11` where the server's deletions left
-/// holes. A backfill batch is one command either way, and a folder whose
+/// holes. A UID set fits one command either way, and a folder whose
 /// past is intact costs eleven characters rather than a kilobyte of commas.
 fn seq_set(uids: &[u32]) -> String {
     let mut out = String::new();
@@ -385,7 +385,7 @@ fn seq_set(uids: &[u32]) -> String {
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod session {
     use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet, Watched};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::time::Duration;
 
     use imap::extensions::idle::WaitOutcome;
@@ -579,18 +579,28 @@ mod session {
         /// Fetch the envelope and MIME structure, then only reading sections.
         /// PEEK keeps both mirroring and attachment downloads from setting Seen.
         pub fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
+            use super::super::content::FetchPlan;
             self.ensure(name)?;
             let fetches = self
                 .session
                 .uid_fetch(set, "(UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])")
                 .map_err(s)?;
-            let mut out = Vec::new();
+            let mut groups: BTreeMap<Vec<String>, Vec<(RemoteMail, FetchPlan)>> = BTreeMap::new();
             for f in fetches.iter() {
                 let Some(uid) = f.uid else { continue };
-                let plan = super::super::content::FetchPlan::new(
-                    f.header().ok_or("server omitted message headers")?,
-                    f.bodystructure().ok_or("server omitted MIME structure")?,
-                )?;
+                let (Some(header), Some(structure)) = (f.header(), f.bodystructure()) else {
+                    eprintln!(
+                        "mail: skipped uid {uid} in {name}: missing headers or MIME structure"
+                    );
+                    continue;
+                };
+                let plan = match FetchPlan::new(header, structure) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        eprintln!("mail: skipped uid {uid} in {name}: {e}");
+                        continue;
+                    }
+                };
                 let unread = !f
                     .flags()
                     .iter()
@@ -599,31 +609,75 @@ mod session {
                     matches!(fl, imap::types::Flag::Custom(k)
                             if k.eq_ignore_ascii_case(FORWARDED))
                 });
-                let mut bodies = HashMap::new();
-                if !plan.readings.is_empty() {
+                groups.entry(plan.readings.clone()).or_default().push((
+                    RemoteMail {
+                        uid,
+                        unread,
+                        forwarded,
+                        raw: Vec::new(),
+                    },
+                    plan,
+                ));
+            }
+            let mut out = Vec::new();
+            for (readings, group) in groups {
+                let mut bodies: HashMap<u32, HashMap<String, Vec<u8>>> = HashMap::new();
+                if !readings.is_empty() {
+                    let paths = match readings
+                        .iter()
+                        .map(|p| section_path(p))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(paths) => paths,
+                        Err(e) => {
+                            eprintln!("mail: skipped MIME sections in {name}: {e}");
+                            continue;
+                        }
+                    };
+                    // Messages with the same reading sections share one
+                    // command, even when their attachment layouts differ.
+                    let mut uids: Vec<_> = group.iter().map(|(m, _)| m.uid).collect();
+                    uids.sort_unstable();
+                    uids.dedup();
+                    let requested: HashSet<_> = uids.iter().copied().collect();
                     let query = format!(
                         "(UID {})",
-                        plan.readings
+                        readings
                             .iter()
                             .map(|p| format!("BODY.PEEK[{p}]"))
                             .collect::<Vec<_>>()
                             .join(" ")
                     );
-                    let replies = self.session.uid_fetch(uid.to_string(), query).map_err(s)?;
-                    for reply in replies.iter().filter(|r| r.uid == Some(uid)) {
-                        for section in &plan.readings {
-                            if let Some(bytes) = reply.section(&section_path(section)?) {
-                                bodies.insert(section.clone(), bytes.to_vec());
+                    // Transport/command failures still fail the fetch; bad
+                    // content and omitted sections affect only their UID.
+                    let replies = self
+                        .session
+                        .uid_fetch(super::seq_set(&uids), query)
+                        .map_err(s)?;
+                    for reply in replies.iter() {
+                        let Some(uid) = reply.uid.filter(|uid| requested.contains(uid)) else {
+                            continue;
+                        };
+                        for (section, path) in readings.iter().zip(&paths) {
+                            if let Some(bytes) = reply.section(path) {
+                                bodies
+                                    .entry(uid)
+                                    .or_default()
+                                    .insert(section.clone(), bytes.to_vec());
                             }
                         }
                     }
                 }
-                out.push(RemoteMail {
-                    uid,
-                    unread,
-                    forwarded,
-                    raw: plan.finish(&bodies)?,
-                });
+                let empty = HashMap::new();
+                for (mut mail, plan) in group {
+                    match plan.finish(bodies.get(&mail.uid).unwrap_or(&empty)) {
+                        Ok(raw) => {
+                            mail.raw = raw;
+                            out.push(mail);
+                        }
+                        Err(e) => eprintln!("mail: skipped uid {} in {name}: {e}", mail.uid),
+                    }
+                }
             }
             out.sort_by_key(|m| m.uid);
             Ok(out)
@@ -726,28 +780,29 @@ mod session {
         use std::io::{BufRead, BufReader, Write};
         use std::net::{TcpListener, TcpStream};
 
-        /// Drive the real IMAP adapter against a scripted server, including
-        /// literal section responses. Any eager attachment fetch fails the
-        /// command assertion before the server provides those bytes.
-        #[test]
-        fn sync_fetches_readings_and_a_download_fetches_only_its_section() {
+        const TEXT: &str = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)";
+        const MIXED: &str = "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"file.bin\") NIL NIL \"BASE64\" 8) \"MIXED\" (\"BOUNDARY\" \"x\"))";
+        const SELECTED: &str =
+            "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] current\r\n* OK [UIDNEXT 204] next\r\n";
+
+        fn metadata(uid: u32, structure: &str) -> String {
+            let header = format!("From: me@example.org\r\nSubject: message {uid}\r\n\r\n");
+            format!("* {uid} FETCH (UID {uid} FLAGS () BODYSTRUCTURE {structure} BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len())
+        }
+
+        fn scripted(steps: Vec<(&'static str, String)>) -> (Imap, std::thread::JoinHandle<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (socket, _) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut io = BufReader::new(socket);
                 io.get_mut().write_all(b"* OK test server\r\n").unwrap();
-                let header = "From: me@example.org\r\nSubject: remote\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n";
-                let structure = "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"file.bin\") NIL NIL \"BASE64\" 8) \"MIXED\" (\"BOUNDARY\" \"x\"))";
-                let steps = [
-                    ("LOGIN \"test\" \"password\"", String::new()),
-                    ("SELECT \"INBOX\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] current\r\n* OK [UIDNEXT 43] next\r\n".into()),
-                    ("UID FETCH 42 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", format!("* 1 FETCH (UID 42 FLAGS () BODYSTRUCTURE {structure} BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len())),
-                    ("UID FETCH 42 (UID BODY.PEEK[1])", "* 1 FETCH (UID 42 BODY[1] {5}\r\nhello)\r\n".into()),
-                    ("UID FETCH 42 (UID BODY.PEEK[2])", "* 1 FETCH (UID 42 BODY[2] {8}\r\naGVsbG8=)\r\n".into()),
-                ];
-                for (expected, reply) in steps {
+                for (expected, reply) in
+                    std::iter::once(("LOGIN \"test\" \"password\"", String::new())).chain(steps)
+                {
                     let mut line = String::new();
                     io.read_line(&mut line).unwrap();
                     let (tag, command) = line.trim_end().split_once(' ').expect("command with tag");
@@ -756,11 +811,44 @@ mod session {
                 }
             });
             let socket = TcpStream::connect(address).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut client = imap::Client::new(Box::new(socket) as Box<dyn imap::ImapConnection>);
             client.read_greeting().unwrap();
-            let session = client.login("test", "password").map_err(|(e, _)| e).unwrap();
-            let mut adapter = Imap { session, selected: None, idle: None };
+            let session = client
+                .login("test", "password")
+                .map_err(|(e, _)| e)
+                .unwrap();
+            (
+                Imap {
+                    session,
+                    selected: None,
+                    idle: None,
+                },
+                server,
+            )
+        }
+
+        /// Any eager attachment fetch fails the command assertion before
+        /// the server provides those bytes.
+        #[test]
+        fn sync_fetches_readings_and_a_download_fetches_only_its_section() {
+            let (mut adapter, server) = scripted(vec![
+                ("SELECT \"INBOX\"", SELECTED.into()),
+                (
+                    "UID FETCH 42 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])",
+                    metadata(42, MIXED),
+                ),
+                (
+                    "UID FETCH 42 (UID BODY.PEEK[1])",
+                    "* 1 FETCH (UID 42 BODY[1] {5}\r\nhello)\r\n".into(),
+                ),
+                (
+                    "UID FETCH 42 (UID BODY.PEEK[2])",
+                    "* 1 FETCH (UID 42 BODY[2] {8}\r\naGVsbG8=)\r\n".into(),
+                ),
+            ]);
             let mails = adapter.fetch_set("INBOX", "42").unwrap();
             assert_eq!(mails.len(), 1);
             assert!(mails[0].unread);
@@ -769,6 +857,100 @@ mod session {
             assert_eq!(parsed.attachments[0].name, "file.bin");
             assert_eq!(adapter.section(42, "2").unwrap(), b"aGVsbG8=");
             assert!(adapter.section(42, "2] BODY[]").is_err());
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn readings_are_batched_by_section_list_and_matched_by_uid() {
+            // Two hundred common layouts cost one reading fetch. A second
+            // layout costs one more, and a standalone file costs neither.
+            let mut headers = (1..=200)
+                .rev()
+                .map(|uid| metadata(uid, MIXED))
+                .collect::<String>();
+            let alternative = "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 11 1) \"ALTERNATIVE\")";
+            headers += &metadata(201, alternative);
+            headers += &metadata(202, alternative);
+            headers += &metadata(
+                203,
+                "(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" 12000)",
+            );
+            let bodies = (1..=200)
+                .map(|uid| format!("* {uid} FETCH (UID {uid} BODY[1] {{5}}\r\n{uid:05})\r\n"))
+                .collect();
+            let alternatives = (201..=202).rev().map(|uid| format!("* {uid} FETCH (UID {uid} BODY[2] {{11}}\r\n<b>html</b> BODY[1] {{5}}\r\nplain)\r\n")).collect();
+            let (mut adapter, server) = scripted(vec![
+                ("SELECT \"INBOX\"", SELECTED.into()),
+                (
+                    "UID FETCH 1:203 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])",
+                    headers,
+                ),
+                ("UID FETCH 1:200 (UID BODY.PEEK[1])", bodies),
+                (
+                    "UID FETCH 201:202 (UID BODY.PEEK[1] BODY.PEEK[2])",
+                    alternatives,
+                ),
+            ]);
+            let mails = adapter.fetch_set("INBOX", "1:203").unwrap();
+            assert_eq!(mails.len(), 203);
+            for m in &mails[..200] {
+                let parsed = super::super::super::sync::parse_mail(&m.raw);
+                assert_eq!(parsed.body, format!("{:05}", m.uid));
+                assert_eq!(parsed.attachments.len(), 1);
+            }
+            for m in &mails[200..202] {
+                let parsed = super::super::super::sync::parse_mail(&m.raw);
+                assert_eq!(parsed.body, "plain");
+                assert!(parsed.html.is_some());
+            }
+            assert_eq!(
+                super::super::super::sync::parse_mail(&mails[202].raw).attachments[0].mime,
+                "application/pdf"
+            );
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn unusable_responses_do_not_discard_good_mail_or_stop_later_folders() {
+            let mut headers = format!("* 1 FETCH (UID 1 BODYSTRUCTURE {TEXT})\r\n");
+            headers += &metadata(2, TEXT).replace(&format!("BODYSTRUCTURE {TEXT} "), "");
+            headers += &metadata(3, TEXT);
+            headers += &metadata(4, TEXT);
+            let (mut adapter, server) = scripted(vec![
+                ("SELECT \"INBOX\"", SELECTED.into()),
+                ("UID FETCH 1:4 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", headers),
+                // UID 3 disappeared; an unsolicited response for UID 99
+                // must neither supply its body nor be ingested itself.
+                ("UID FETCH 3:4 (UID BODY.PEEK[1])", "* 99 FETCH (UID 99 BODY[1] {5}\r\nwrong)\r\n* 4 FETCH (UID 4 BODY[1] {5}\r\nhello)\r\n".into()),
+                ("SELECT \"Archive\"", SELECTED.into()),
+                ("UID FETCH 1 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", metadata(1, TEXT)),
+                ("UID FETCH 1 (UID BODY.PEEK[1])", "* 1 FETCH (UID 1 BODY[1] {5}\r\nlater)\r\n".into()),
+            ]);
+            let mails = adapter.fetch_set("INBOX", "1:4").unwrap();
+            assert_eq!(mails.iter().map(|m| m.uid).collect::<Vec<_>>(), [4]);
+            assert_eq!(
+                super::super::super::sync::parse_mail(&mails[0].raw).body,
+                "hello"
+            );
+            let later = adapter.fetch_set("Archive", "1").unwrap();
+            assert_eq!(
+                super::super::super::sync::parse_mail(&later[0].raw).body,
+                "later"
+            );
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn a_disconnected_reading_fetch_still_reports_a_transport_error() {
+            let (mut adapter, server) = scripted(vec![
+                ("SELECT \"INBOX\"", SELECTED.into()),
+                (
+                    "UID FETCH 1 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])",
+                    metadata(1, TEXT),
+                ),
+                // Close before the reading fetch can finish.
+            ]);
+            assert!(adapter.fetch_set("INBOX", "1").is_err());
             server.join().unwrap();
         }
     }
@@ -852,7 +1034,7 @@ mod tests {
         );
     }
 
-    /// A backfill batch is one command: consecutive uids collapse to a
+    /// A batch's UID set fits one command: consecutive uids collapse to a
     /// range, and the holes a server's deletions left are named beside it.
     #[test]
     fn a_uid_batch_is_one_sequence_set() {

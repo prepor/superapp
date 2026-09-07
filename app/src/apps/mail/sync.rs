@@ -423,13 +423,13 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
 
         // Reach back, over the session this pass already holds. The `ALL`
         // search above is the folder entire, so what this store is missing
-        // is a set difference rather than a guess: one fetch and one commit
-        // a batch, which is what keeps a whole mailbox out of memory while
-        // still mirroring it in one sitting. A folder already whole asks
-        // for nothing and costs no round trip at all.
+        // is a set difference rather than a guess: one metadata fetch,
+        // grouped reading fetches, and one commit per batch. A folder
+        // already mirrored asks for nothing and costs no fetch at all.
         let until = w.now() + REACH_BUDGET.as_secs_f64();
+        let mut untried = server;
         loop {
-            let batch = missing(w.store(), fid, &server);
+            let batch = missing(w.store(), fid, &untried);
             if batch.is_empty() {
                 break;
             }
@@ -437,15 +437,19 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                 more = true;
                 break;
             }
+            // A missing or unusable message must not trap older mail
+            // behind this batch. Try each UID once this pass, then allow
+            // skipped UIDs to be retried on a later pass.
+            for uid in &batch {
+                untried.remove(uid);
+            }
             let got = w.run(&Backfill {
                 account,
                 folder: rf.name.clone(),
                 uids: batch,
             })?;
-            // Listed by the search and then not handed over: nothing this
-            // pass can do about it, and asking again in a loop is a spin.
             if got.is_empty() {
-                break;
+                continue;
             }
             w.store()
                 .write(move |tx| {
@@ -463,7 +467,7 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
 /// The uids the server still has and this store does not, newest first,
 /// capped at one batch — what the backfill asks for next. Read back out of
 /// the store after each commit, so a folder that was just reset counts as
-/// holding nothing and a batch already landed is never asked for twice.
+/// holding nothing. `server` excludes UIDs already attempted this pass.
 fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
     let mut have: HashSet<u32> = HashSet::new();
     if let Ok(mut stmt) = store

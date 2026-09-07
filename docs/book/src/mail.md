@@ -186,11 +186,14 @@ versioned content snapshot: the MIME reading with file bodies removed, plus
 each file's description, decoding headers, and IMAP section number. Older
 stored letters are converted on open. The `attachment` rows remain derived
 from that snapshot, with stable part indices for existing cards.
+Unreadable legacy content is preserved for recovery and marked as scanned,
+so it cannot stop the rest of the conversion or repeat on every sender pass.
 
 Previews, inline images, and `open` download the requested section over IMAP
-on a worker. Files use the same bounded, least-recently-used local cache as
-Telegram, so a cached file works offline and an evicted file downloads again
-when needed. Cache identity includes the account, server folder, UIDVALIDITY,
+on a worker; cards show `loading preview…` while awaiting content. Files use
+the same bounded, least-recently-used local cache as Telegram, so a cached
+file works offline and an evicted file downloads again when needed.
+Cache identity includes the account, server folder, UIDVALIDITY,
 UID, and section; a stale UID generation is refused. The cache's SQLite index
 holds filenames and sizes only; file bytes stay on disk. File sizes shown from
 the server's MIME structure are estimates.
@@ -301,7 +304,7 @@ It pushes local changes every turn and pulls when the watch below says so, on
 receives new mail, and reconciles flags and deletions. A folder is mirrored
 **whole**: after the new mail lands, the pass compares the server's uid list
 against what the store holds and reaches back for the missing ones 200 at a
-time, newest first — one fetch and one commit a batch, over the session it
+time, newest first — grouped fetches and one commit a batch, over the session it
 already holds. Nothing is dropped for being old; the batches only keep a whole
 mailbox out of memory. A pass reaches back for at most twenty seconds, so this
 account's own jobs are not left waiting behind a first sync, and comes back
@@ -309,8 +312,11 @@ five seconds later for the rest. A UIDVALIDITY reset re-ingests that folder
 from scratch, the same way.
 
 Sync fetches headers and `BODYSTRUCTURE`, followed by `BODY.PEEK[section]`
-for reading text only. File sections are fetched on demand with `PEEK` too,
-which leaves the server's `\Seen` flag alone. A session is kept between passes
+for reading text only. UIDs needing the same reading sections share one
+command. Unusable messages are skipped for the current pass and retried
+later, so older mail and other folders can keep syncing. File sections are
+fetched on demand with `PEEK` too, which leaves the server's `\Seen` flag
+alone. A session is kept between passes
 and checked with a `NOOP` rather than signed in again, because providers count
 logins.
 

@@ -677,8 +677,8 @@ impl Imap for FakeServers {
             let out: Vec<RemoteMail> =
                 f.2.iter()
                     .filter(|m| m.uid >= from)
-                    .map(compact_mail)
-                    .collect::<Result<_, _>>()?;
+                    .filter_map(|m| compact_mail(m).ok())
+                    .collect();
             s.fetched += out.len();
             Ok(out)
         })
@@ -695,8 +695,8 @@ impl Imap for FakeServers {
             let out: Vec<RemoteMail> =
                 f.2.iter()
                     .filter(|m| uids.contains(&m.uid))
-                    .map(compact_mail)
-                    .collect::<Result<_, _>>()?;
+                    .filter_map(|m| compact_mail(m).ok())
+                    .collect();
             s.fetched += out.len();
             s.backfills.push((folder.to_string(), uids.to_vec()));
             Ok(out)

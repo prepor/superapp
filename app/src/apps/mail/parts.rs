@@ -145,26 +145,32 @@ struct Location {
     uid: u32,
 }
 
+static Q_LOCATION: Q = Q {
+    id: "mail image source",
+    sql: "SELECT a.id, a.email, COALESCE(a.imap_host, ''), f.name, f.uidvalidity, s.uid
+          FROM message m JOIN account a ON a.id = m.account
+          JOIN server_msg s ON s.message = m.id JOIN folder f ON f.id = s.folder
+          WHERE m.id = ?1",
+    describe: "the server identity of a letter's images and attachments",
+};
+
+fn location_row(r: &rusqlite::Row) -> rusqlite::Result<Location> {
+    Ok(Location {
+        account: r.get(0)?,
+        email: r.get(1)?,
+        host: r.get(2)?,
+        folder: r.get(3)?,
+        validity: r.get(4)?,
+        uid: r.get(5)?,
+    })
+}
+
 fn location(store: &Store, mail: MailId) -> Result<Location, String> {
+    // Downloads need a fresh read before and after network I/O, including
+    // commits the worker's store has not polled yet. Draws use rows below.
     store
         .conn()
-        .query_row(
-            "SELECT a.id, a.email, COALESCE(a.imap_host, ''), f.name, f.uidvalidity, s.uid
-         FROM message m JOIN account a ON a.id = m.account
-         JOIN server_msg s ON s.message = m.id JOIN folder f ON f.id = s.folder
-         WHERE m.id = ?1",
-            [mail],
-            |r| {
-                Ok(Location {
-                    account: r.get(0)?,
-                    email: r.get(1)?,
-                    host: r.get(2)?,
-                    folder: r.get(3)?,
-                    validity: r.get(4)?,
-                    uid: r.get(5)?,
-                })
-            },
-        )
+        .query_row(Q_LOCATION.sql, [mail], location_row)
         .map_err(|_| {
             "message location is unavailable; sync before downloading this attachment".into()
         })
@@ -196,7 +202,10 @@ impl Location {
 /// A process-local image namespace that changes when the server identity
 /// changes, and also distinguishes independent stores with the same row ids.
 pub fn image_scope(store: &Store, mail: MailId) -> String {
-    let identity = location(store, mail).map(|l| l.key("")).unwrap_or_default();
+    // Hash only when the query cache is filled. Both the join and its
+    // derived identity stay cached until a source table changes.
+    let identities = store.rows(&Q_LOCATION, &[Val::I(mail)], |r| Ok(location_row(r)?.key("")));
+    let identity = identities.first().map_or("", String::as_str);
     format!(
         "m{mail}-{:p}-{identity}",
         std::sync::Arc::as_ptr(&store.db())
@@ -420,8 +429,17 @@ pub fn scan(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         // something to walk is rewritten.
         match raw {
             Some(raw) => {
-                let compact = super::content::compact(&raw)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                let compact = match super::content::compact(&raw) {
+                    Ok(compact) => compact,
+                    Err(e) => {
+                        // Preserve unreadable legacy data for recovery,
+                        // but finish its derivation so every later message
+                        // can convert and later sender passes do not spin.
+                        eprintln!("mail: cannot convert message {id}: {e}");
+                        attach_tx(conn, id, &[])?;
+                        continue;
+                    }
+                };
                 attach_tx(conn, id, &super::sync::parse_mail(&compact).attachments)?;
                 if raw != compact {
                     conn.execute(
