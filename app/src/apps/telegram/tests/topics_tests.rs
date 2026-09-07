@@ -29,6 +29,47 @@ fn selected_topics(s: &Session, chat: i64) -> Vec<i64> {
 }
 
 #[test]
+fn search_keeps_the_unblock_path_for_a_deleted_bot_forum() {
+    let mut s = session();
+    let search_name = |s: &Session, name: &str| {
+        let mut engine = Engine::inline(s.apps().providers());
+        engine.ask(s.store(), 1, name);
+        engine
+            .collect()
+            .into_iter()
+            .flat_map(|a| a.hits)
+            .find(|h| h.label == name)
+            .expect("the peer's name is searchable")
+    };
+    assert_eq!(
+        search_name(&s, "Вастрик.Берлин").go,
+        Go::Open(Topics::id(BERLIN))
+    );
+    // A bot with topics is a person peer with forum capability, so it can
+    // be blocked and its chat deleted through the existing profile actions.
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE tg_peer SET is_forum = 1 WHERE id = ?1", [VERA])?;
+            model::set_blocked_tx(c, VERA, true)
+        })
+        .unwrap();
+    assert_eq!(search_name(&s, "Vera Kovac").go, Go::Open(Topics::id(VERA)));
+    s.store().write(|c| model::leave_chat_tx(c, VERA)).unwrap();
+    let hit = search_name(&s, "Vera Kovac");
+    assert_eq!(hit.detail, "blocked");
+    assert_eq!(hit.go, Go::Open(Peer::id(VERA)));
+    let Go::Open(target) = hit.go else {
+        panic!("a panel target")
+    };
+    let profile = open_root(&mut s, target);
+    assert!(verb_ids(&s, profile).contains(&"telegram.unblock"));
+    assert_eq!(
+        search_name(&s, "Вастрик.Берлин").go,
+        Go::Open(Topics::id(BERLIN))
+    );
+}
+
+#[test]
 fn bulk_topic_visibility_round_trips_a_mixed_selection() {
     for (verb_id, shown) in [
         ("telegram.show_topics", vec![1, 2, 3, 4]),

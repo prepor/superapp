@@ -109,8 +109,8 @@ fn matching_names(store: &Store, terms: &[String]) -> Vec<Hit> {
                     PeerKind::Channel => "channel".to_string(),
                 }
             };
-            let target = if n.is_forum { Topics::id(n.id) }
-                else if n.blocked && !n.has_chat { Peer::id(n.id) }
+            let target = if n.blocked && !n.has_chat { Peer::id(n.id) }
+                else if n.is_forum { Topics::id(n.id) }
                 else { Chat::id(n.id) };
             Hit::found(&n.name, detail, target)
         })
