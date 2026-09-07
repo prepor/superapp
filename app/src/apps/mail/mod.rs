@@ -205,10 +205,10 @@ Threading is three lookups over this table and no subject guessing.
 `server_msg` — the server's last word about a letter: `folder`, `uid`, \
 `seen`, `forwarded`, one row per message. It is a record, not an intent.
 
-`attachment` and `attachment_scan` — derived from `message.raw`: a part's \
+`attachment` — saved with the message: a part's \
 `name`, `mime`, `size`, `cid`, and the `part` index its bytes are read back \
 by. Bytes download on demand via IMAP into the device-local file cache \
-shared with Telegram. `attachment_scan` records which walk made the rows.
+shared with Telegram.
 
 `draft` and `draft_attachment` — a compose panel's unsent text and the \
 paths it will carry, both keyed by that panel's slot (`panel`), which is why \
@@ -229,7 +229,8 @@ What must never be written directly:
   writing `server_msg` by hand tells the app a change has already been \
   pushed when it has not;
 — marking a letter read is `message.unread`, not `server_msg.seen`;
-— `attachment`, `attachment_scan` and `message_fts` are derived from \
-  `message` and are rebuilt from it; a row written into them is lost at the \
-  next walk, and so is a `to_addr` written by hand over a letter that keeps \
-  its `raw`.";
+— `attachment` describes the remote parts of `message.raw` and is written \
+  by ingest together with the message;
+— `message_fts` is maintained from `message` by triggers; a `to_addr` \
+  written by hand over a letter that keeps its `raw` is lost at the next \
+  recipient rebuild.";

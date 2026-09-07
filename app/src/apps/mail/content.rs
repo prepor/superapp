@@ -1,8 +1,8 @@
 //! The stored reading of a message, with remote references to its files.
 //!
-//! `message.raw` used to contain the entire RFC822 message. It now holds a
-//! versioned snapshot: the MIME reading without attachment bodies, and the
-//! descriptions and IMAP section numbers needed to retrieve those bodies.
+//! `message.raw` holds a content snapshot: the MIME reading without
+//! attachment bodies, and the descriptions and IMAP section numbers needed
+//! to retrieve those bodies.
 //! Keeping the original reading lets HTML and recipient derivations run
 //! again without downloading files or putting them in the replicated store.
 
@@ -31,8 +31,7 @@ pub struct Content {
 }
 
 impl Content {
-    /// Reads the stored format. Legacy RFC822 is converted before the store
-    /// opens, not while a reading or attachment is being displayed.
+    /// Reads a content snapshot from the store.
     pub fn read(raw: &[u8]) -> Result<Self, String> {
         let json = raw
             .strip_prefix(PREFIX)
@@ -76,16 +75,6 @@ impl Content {
         reading.extend_from_slice(&raw[start..]);
         Ok(Self { reading, parts })
     }
-}
-
-/// Compact at every ingest boundary, including fakes and legacy snapshots.
-pub fn compact(raw: &[u8]) -> Result<Vec<u8>, String> {
-    if raw.starts_with(PREFIX) {
-        Content::read(raw)
-    } else {
-        Content::from_raw(raw)
-    }
-    .map(|c| c.encode())
 }
 
 /// MIME tree positions are IMAP section numbers, not parser part indices.
@@ -403,8 +392,8 @@ mod tests {
             assert!(!reading.contains(file), "{reading}");
         }
         let stored = c.encode();
-        assert_eq!(compact(&stored).unwrap(), stored);
-        let parsed = super::super::sync::parse_mail(&stored);
+        assert_eq!(Content::read(&stored).unwrap().encode(), stored);
+        let parsed = super::super::sync::parse_mail(&stored).unwrap();
         assert_eq!(parsed.body, "hello");
         assert_eq!(parsed.to, "me@example.org");
         assert_eq!(parsed.attachments.len(), 2, "the picture is inline");
@@ -455,7 +444,7 @@ mod tests {
         assert_eq!(c.parts[0].section, "1.2");
         assert_eq!(c.parts[1].section, "2");
         assert_eq!(c.parts[1].part.name, "note.txt");
-        let parsed = super::super::sync::parse_mail(&stored);
+        let parsed = super::super::sync::parse_mail(&stored).unwrap();
         assert_eq!(parsed.body, "hello");
         assert_eq!(parsed.attachments.len(), 1);
         assert!(
@@ -477,7 +466,7 @@ mod tests {
         let stored = p
             .finish(&HashMap::from([("1".into(), b"caf\xe9".to_vec())]))
             .unwrap();
-        assert_eq!(super::super::sync::parse_mail(&stored).body, "café");
+        assert_eq!(super::super::sync::parse_mail(&stored).unwrap().body, "café");
     }
 
     #[test]

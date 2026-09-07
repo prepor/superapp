@@ -183,12 +183,9 @@ filename, and asks the operating system to open it.
 
 Attachment bytes stay out of SQLite and device sync. `message.raw` holds a
 versioned content snapshot: the MIME reading with file bodies removed, plus
-each file's description, decoding headers, and IMAP section number. Existing
-letters and their attachment rows are migrated in place before the store opens
-to the UI. New mail and its attachment metadata are committed and replicated
-together, so the list is available with the message, without a background scan.
-Part indices stay stable for existing cards. Unreadable legacy content is
-preserved for recovery and marked as scanned so the migration can finish.
+each file's description, decoding headers, and IMAP section number. Messages
+and their attachment metadata are committed and replicated together, so the
+list is available with the message. Part indices stay stable for existing cards.
 
 Previews, inline images, and `open` download the requested section over IMAP
 on a worker; cards show `loading preview…` while awaiting content. Files use

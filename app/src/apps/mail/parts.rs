@@ -4,11 +4,8 @@
 //! File bodies live on the server and in the kernel's bounded blob cache,
 //! shared with Telegram. Neither downloads nor cache paths are replicated.
 //!
-//! Existing messages are converted in place when the store opens, before
-//! the UI or workers start. Ingest writes new messages and their attachment
-//! rows in the same transaction; replication carries that whole commit.
-//! `attachment_scan` records the derivation version per message so an
-//! interrupted migration can resume without converting finished rows again.
+//! Ingest writes messages and their attachment rows in the same transaction;
+//! replication carries that whole commit. Lists read those rows directly.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -17,10 +14,6 @@ use kernel::caps::{fmt_size, FileKind};
 use kernel::store::{Store, Val, Q};
 
 use super::model::{self, MailId};
-
-/// Which walk over `raw` the stored rows came out of. Bump it and every
-/// store re-derives every letter's parts on its next open.
-pub const ATTACH_VERSION: i64 = 3;
 
 /// One part's description, derived from the stored content snapshot.
 /// [`part`] retrieves its bytes from the cache or the server.
@@ -312,15 +305,9 @@ impl Reader {
     }
 }
 
-/// Records what a letter carries, and marks the mail walked at this build's
-/// version. One transaction with the ingest that stored the letter, so no
-/// draw ever sees a mail without its parts.
-///
-/// An **upsert on `(message, part)`**, not a delete and a re-insert: a part
-/// is what an `attachment` panel persists, and a re-derive — the walk's
-/// version changed, or a peer's snapshot landed — must not hand that place to
-/// a different part of a different letter. Parts the letter no longer has go
-/// afterwards, which is the only thing a re-derive may take away.
+/// Records what a letter carries in the transaction that stores the letter,
+/// so its attachment list is available on the first read. Part indices are
+/// the stable identities used by attachment panels.
 ///
 /// # Errors
 ///
@@ -360,92 +347,6 @@ pub fn attach_tx(
         )
     };
     c.execute(&sql, [message])?;
-    mark_scanned_tx(c, message)
-}
-
-/// Notes that this mail's `raw` has been walked at the current version —
-/// including the answer "there was nothing to walk", which is why it is its
-/// own function.
-///
-/// # Errors
-///
-/// If the store refuses the write.
-pub fn mark_scanned_tx(c: &rusqlite::Connection, message: MailId) -> rusqlite::Result<()> {
-    c.execute(
-        "INSERT INTO attachment_scan(message, version) VALUES(?1, ?2)
-         ON CONFLICT(message) DO UPDATE SET version = excluded.version",
-        rusqlite::params![message, ATTACH_VERSION],
-    )?;
-    Ok(())
-}
-
-/// Converts existing mail and rebuilds its attachment rows at store open.
-///
-/// The schema's [`Step::Derived`](kernel::app::Step) runs this synchronously
-/// when the version moves. Per-message versions let an interrupted migration
-/// resume; ingest and replication already commit complete attachment rows.
-///
-/// # Errors
-///
-/// If the store refuses a read or a write.
-pub fn scan(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    // Rows whose letter is gone go first, and not only for tidiness: SQLite
-    // hands a fresh `message` the lowest free rowid, so a stale
-    // `attachment_scan` row would tell the walk below that a letter it has
-    // never seen was already walked — and stale `attachment` rows would be
-    // listed under it.
-    for t in ["attachment", "attachment_scan"] {
-        conn.execute(
-            &format!(
-                "DELETE FROM {t} WHERE NOT EXISTS
-                   (SELECT 1 FROM message m WHERE m.id = {t}.message)"
-            ),
-            [],
-        )?;
-    }
-    let rows: Vec<MailId> = conn
-        .prepare(
-            "SELECT m.id FROM message m
-             LEFT JOIN attachment_scan s ON s.message = m.id
-             WHERE s.version IS NULL OR s.version != ?1",
-        )?
-        .query_map([ATTACH_VERSION], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for id in rows {
-        // Convert one legacy message at a time: an existing mailbox can
-        // contain gigabytes of attachments before this conversion.
-        let raw: Option<Vec<u8>> =
-            conn.query_row("SELECT raw FROM message WHERE id = ?1", [id], |r| r.get(0))?;
-        // No raw is not the same as no parts: a seeded letter writes its own
-        // rows and this must not take them away, so only a mail there *is*
-        // something to walk is rewritten.
-        match raw {
-            Some(raw) => {
-                let compact = match super::content::compact(&raw) {
-                    Ok(compact) => compact,
-                    Err(e) => {
-                        // Preserve unreadable legacy data for recovery,
-                        // but finish its derivation so every later message
-                        // can convert and a resumed migration can advance.
-                        eprintln!("mail: cannot convert message {id}: {e}");
-                        attach_tx(conn, id, &[])?;
-                        continue;
-                    }
-                };
-                let attachments = super::sync::parse_mail(&compact).attachments;
-                if raw != compact {
-                    conn.execute(
-                        "UPDATE message SET raw = ?2 WHERE id = ?1",
-                        rusqlite::params![id, compact],
-                    )?;
-                }
-                // Mark the message complete only after its stored content
-                // and attachment rows have both been converted.
-                attach_tx(conn, id, &attachments)?;
-            }
-            None => mark_scanned_tx(conn, id)?,
-        }
-    }
     Ok(())
 }
 

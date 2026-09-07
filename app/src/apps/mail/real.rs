@@ -852,7 +852,7 @@ mod session {
             let mails = adapter.fetch_set("INBOX", "42").unwrap();
             assert_eq!(mails.len(), 1);
             assert!(mails[0].unread);
-            let parsed = super::super::super::sync::parse_mail(&mails[0].raw);
+            let parsed = super::super::super::sync::parse_mail(&mails[0].raw).unwrap();
             assert_eq!(parsed.body, "hello");
             assert_eq!(parsed.attachments[0].name, "file.bin");
             assert_eq!(adapter.section(42, "2").unwrap(), b"aGVsbG8=");
@@ -894,17 +894,17 @@ mod session {
             let mails = adapter.fetch_set("INBOX", "1:203").unwrap();
             assert_eq!(mails.len(), 203);
             for m in &mails[..200] {
-                let parsed = super::super::super::sync::parse_mail(&m.raw);
+                let parsed = super::super::super::sync::parse_mail(&m.raw).unwrap();
                 assert_eq!(parsed.body, format!("{:05}", m.uid));
                 assert_eq!(parsed.attachments.len(), 1);
             }
             for m in &mails[200..202] {
-                let parsed = super::super::super::sync::parse_mail(&m.raw);
+                let parsed = super::super::super::sync::parse_mail(&m.raw).unwrap();
                 assert_eq!(parsed.body, "plain");
                 assert!(parsed.html.is_some());
             }
             assert_eq!(
-                super::super::super::sync::parse_mail(&mails[202].raw).attachments[0].mime,
+                super::super::super::sync::parse_mail(&mails[202].raw).unwrap().attachments[0].mime,
                 "application/pdf"
             );
             server.join().unwrap();
@@ -929,12 +929,12 @@ mod session {
             let mails = adapter.fetch_set("INBOX", "1:4").unwrap();
             assert_eq!(mails.iter().map(|m| m.uid).collect::<Vec<_>>(), [4]);
             assert_eq!(
-                super::super::super::sync::parse_mail(&mails[0].raw).body,
+                super::super::super::sync::parse_mail(&mails[0].raw).unwrap().body,
                 "hello"
             );
             let later = adapter.fetch_set("Archive", "1").unwrap();
             assert_eq!(
-                super::super::super::sync::parse_mail(&later[0].raw).body,
+                super::super::super::sync::parse_mail(&later[0].raw).unwrap().body,
                 "later"
             );
             server.join().unwrap();

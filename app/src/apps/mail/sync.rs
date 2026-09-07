@@ -602,9 +602,8 @@ fn ingest_message(
     if exists {
         return Ok(());
     }
-    let raw = super::content::compact(&m.raw)
+    let p = parse_mail(&m.raw)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-    let p = parse_mail(&raw);
     if !p.message_id.is_empty() {
         // A uid-less twin in this account is the same mail, post-move.
         let orphan: Option<i64> = tx
@@ -642,7 +641,7 @@ fn ingest_message(
             p.topic,
             m.forwarded,
             p.html,
-            raw,
+            m.raw,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -693,23 +692,21 @@ pub struct ParsedMail {
     pub attachments: Vec<Part>,
 }
 
-/// MIME → panel text, through `mail-parser`. Paragraph structure survives as
-/// the `\n\n` convention the message panel already renders.
+/// Stored content → panel text, through `mail-parser`. Paragraph structure
+/// survives as the `\n\n` convention the message panel already renders.
 ///
 /// A multipart/alternative mail yields both halves: the plain text as `body`,
 /// the HTML as `html`. Both are kept because they answer different questions;
 /// quoting a reply wants the text.
-#[must_use]
-pub fn parse_mail(raw: &[u8]) -> ParsedMail {
-    let content = super::content::Content::read(raw).ok();
-    let raw = content.as_ref().map_or(raw, |c| c.reading.as_slice());
-    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
-        return ParsedMail {
-            subject: "(unparseable message)".into(),
-            topic: "(unparseable message)".into(),
-            ..ParsedMail::default()
-        };
-    };
+///
+/// # Errors
+///
+/// If the snapshot or its MIME reading cannot be parsed.
+pub fn parse_mail(raw: &[u8]) -> Result<ParsedMail, String> {
+    let content = super::content::Content::read(raw)?;
+    let msg = mail_parser::MessageParser::default()
+        .parse(&content.reading)
+        .ok_or("cannot parse message reading")?;
     let (from_name, from_email) = msg
         .from()
         .and_then(|a| a.first())
@@ -748,22 +745,18 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             references.push(id);
         }
     }
-    let attachments = content.as_ref().map_or_else(
-        || parts_of(&msg, html.as_deref()),
-        |c| {
-            c.parts
-                .iter()
-                .map(|p| p.part.clone())
-                .filter(|p| {
-                    p.cid.is_empty()
-                        || !html
-                            .as_deref()
-                            .is_some_and(|h| h.contains(&format!("cid:{}", p.cid)))
-                })
-                .collect()
-        },
-    );
-    ParsedMail {
+    let attachments = content
+        .parts
+        .into_iter()
+        .map(|p| p.part)
+        .filter(|p| {
+            p.cid.is_empty()
+                || !html
+                    .as_deref()
+                    .is_some_and(|h| h.contains(&format!("cid:{}", p.cid)))
+        })
+        .collect();
+    Ok(ParsedMail {
         from_name,
         from_email,
         to: to_line(&msg),
@@ -778,7 +771,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
         message_id: norm_id(msg.message_id().unwrap_or_default()),
         references,
         attachments,
-    }
+    })
 }
 
 /// Who a letter was addressed to: the addresses of its `To` line, in header
@@ -800,14 +793,16 @@ fn to_line(msg: &mail_parser::Message<'_>) -> String {
 /// The same line off a letter's bytes, without walking its body — what the
 /// backfill over a mailbox already stored reads
 /// ([`schema`](super::schema)).
-#[must_use]
-pub fn to_of(raw: &[u8]) -> String {
-    let content = super::content::Content::read(raw).ok();
-    let raw = content.as_ref().map_or(raw, |c| c.reading.as_slice());
+///
+/// # Errors
+///
+/// If the snapshot or its MIME headers cannot be parsed.
+pub fn to_of(raw: &[u8]) -> Result<String, String> {
+    let content = super::content::Content::read(raw)?;
     mail_parser::MessageParser::default()
-        .parse_headers(raw)
+        .parse_headers(&content.reading)
         .map(|m| to_line(&m))
-        .unwrap_or_default()
+        .ok_or_else(|| "cannot parse message headers".into())
 }
 
 /// One part's description. Its index is stable across conversion to a

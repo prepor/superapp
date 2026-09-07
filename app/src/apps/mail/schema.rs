@@ -9,21 +9,20 @@
 //! undo entity (`outbox:N`) that exists before the row does.
 //!
 //! SQLite decodes records left to right, so everything a list reads sits
-//! before `raw`. It now holds a content snapshot without file bodies; older
-//! stores held full RFC822 messages, converted by the attachment derivation.
+//! before `raw`, which holds a content snapshot without file bodies.
 
 use kernel::app::{Schema, Step};
 
 /// Mail's ladder. Step one is the store shape this build was written
 /// against; step two is what a draft carries, which arrived with the compose
 /// panel's *attach*; step four is what a *letter* carries, and the draft rows
-/// as the send actually needs them; step seven is `to_addr` for a store built
+/// as the send actually needs them; step six is `to_addr` for a store built
 /// before [`V1`] had it; the last is where a deleted letter came from, which
 /// is what the trash gives back.
 ///
-/// The four derived steps are versioned by the walk that makes each rather
-/// than by the ladder's counter: an index, a narrowing, a set of derived rows
-/// and a header read back out of the letters are all reproducible from
+/// The three derived steps are versioned by the walk that makes each rather
+/// than by the ladder's counter: an index, a narrowing and a header read
+/// back out of the letters are all reproducible from
 /// `message` at any moment, so the honest question is not "how old is this
 /// database" but "is this the shape this build wants".
 pub static SCHEMA: Schema = Schema {
@@ -41,11 +40,6 @@ pub static SCHEMA: Schema = Schema {
             key: "mail:html",
             version: HTML_VERSION,
             rebuild: rebuild_html,
-        },
-        Step::Derived {
-            key: "mail:attachments",
-            version: super::parts::ATTACH_VERSION,
-            rebuild: super::parts::scan,
         },
         Step::Run(add_to_addr),
         Step::Derived {
@@ -189,15 +183,11 @@ CREATE TABLE draft_file(
 
 /// What a letter carries, and what a draft will.
 ///
-/// `attachment` is **derived**, like the HTML reading: one row per part of a
-/// mail's `raw`, holding the description a list and a card need — name, media
+/// `attachment` is written with the message: one row per part, holding the
+/// description a list and a card need — name, media
 /// type, size, the Content-ID an inline part wears — and `part`, the index
 /// the stored content snapshot maps to an IMAP section. Attachment bodies are
 /// downloaded on demand into the local file cache, never into SQLite.
-///
-/// `attachment_scan` records the derivation version per mail, so a migration
-/// interrupted while converting an existing mailbox resumes where it left
-/// off. New mail and its attachment rows are committed and replicated together.
 ///
 /// `draft_attachment` is the other direction and is not derived at all: a
 /// compose panel's own list of files to carry out, keyed by its slot like the
@@ -216,11 +206,6 @@ CREATE TABLE attachment(
 );
 CREATE INDEX idx_attachment_message ON attachment(message, id);
 CREATE UNIQUE INDEX idx_attachment_part ON attachment(message, part);
-
-CREATE TABLE attachment_scan(
-  message INTEGER PRIMARY KEY,
-  version INTEGER NOT NULL
-);
 
 CREATE TABLE draft_attachment(
   id     INTEGER PRIMARY KEY,
@@ -286,11 +271,11 @@ CREATE INDEX idx_message_thread      ON message(thread);
 CREATE INDEX idx_message_mid         ON message(account, message_id);
 ";
 
-/// Where the ladder stands with everything before [`V4`] climbed: the six
+/// Where the ladder stands with everything before [`V4`] climbed: the five
 /// steps a store made by the build before this one had run. What a test
 /// winds a store back to, to send it up the rewrite again.
 #[cfg(test)]
-pub const BEFORE_TO_ADDR: i64 = 6;
+pub const BEFORE_TO_ADDR: i64 = 5;
 
 /// Runs [`V4`] where it is owed. A fresh store climbs every step, this one
 /// included, and it already has the column from [`V1`] — so what is asked is
@@ -416,9 +401,13 @@ fn rebuild_html(c: &rusqlite::Connection) -> rusqlite::Result<()> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, raw) in rows {
+        let parsed = super::sync::parse_mail(&raw)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                1, rusqlite::types::Type::Blob, e.into(),
+            ))?;
         c.execute(
             "UPDATE message SET html = ?2 WHERE id = ?1",
-            rusqlite::params![id, super::sync::parse_mail(&raw).html],
+            rusqlite::params![id, parsed.html],
         )?;
     }
     Ok(())
@@ -441,9 +430,13 @@ fn rebuild_recipients(c: &rusqlite::Connection) -> rusqlite::Result<()> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, raw) in rows {
+        let to = super::sync::to_of(&raw)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                1, rusqlite::types::Type::Blob, e.into(),
+            ))?;
         c.execute(
             "UPDATE message SET to_addr = ?2 WHERE id = ?1",
-            rusqlite::params![id, super::sync::to_of(&raw)],
+            rusqlite::params![id, to],
         )?;
     }
     Ok(())

@@ -849,7 +849,7 @@ impl Imap for FakeServers {
 
 fn compact_mail(m: &RemoteMail) -> Result<RemoteMail, String> {
     Ok(RemoteMail {
-        raw: super::content::compact(&m.raw)?,
+        raw: super::content::Content::from_raw(&m.raw)?.encode(),
         ..m.clone()
     })
 }
