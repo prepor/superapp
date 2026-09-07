@@ -22,7 +22,7 @@ use super::super::model::{self, ChatRow, PeerId, PAGE};
 use super::super::{draft_toast, requests, runtime};
 #[cfg(test)]
 use super::Chat;
-use super::{told, wire, Contacts};
+use super::{told, wire, Contacts, Messages};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
@@ -141,6 +141,13 @@ impl Panel for Chats {
                 fresh: false,
             },
         )];
+        let replies = model::reply_count(&self.store);
+        v.push(Verb::go(
+            "telegram.replies",
+            format!("replies & mentions {replies}"),
+            Some('s'),
+            Nav::Open { from: self.slot, id: Messages::replies(None), fresh: false },
+        ));
         let forwarding = runtime::of(&self.store).pending_forward().is_some();
         if forwarding {
             v.push(Verb::run("telegram.forward_here", "forward here", Some('f')));
@@ -214,14 +221,13 @@ impl Chats {
         }
         let store = self.store.clone();
         let archiving = verb == "telegram.archive";
-        let mut went = false;
+        let mut queued = Vec::new();
         for &peer in &peers {
             let request = match verb {
-                // A read names the newest line the store holds for the chat,
-                // and everything under it is read with it. A chat holding no
-                // line yet has nothing to name — its count clears here and
-                // the wire hears of it when one arrives.
-                "telegram.read" => match model::newest_line(&store, peer) {
+                // Read through the newest ordinary line, preserving unread
+                // replies and mentions for the focused transcript. Without
+                // an ordinary line, there is no read to send yet.
+                "telegram.read" => match model::newest_ordinary_line(&store, peer) {
                     Some(last) => requests::view_messages(peer, &[last]),
                     None => continue,
                 },
@@ -230,10 +236,10 @@ impl Chats {
                 _ => requests::add_chat_to_list(peer, archiving),
             };
             if wire(&store, &request) {
-                went = true;
+                queued.push(peer);
             }
         }
-        if !went {
+        if queued.is_empty() {
             let word = verb.rsplit('.').next().unwrap_or(verb);
             let n = peers.len();
             let what = if n == 1 { "chat" } else { "chats" };
@@ -244,9 +250,11 @@ impl Chats {
             }
             return;
         }
-        // What was marked has been done with — and a chat just archived is
-        // not in this list to stay marked in.
-        self.list.clear_marks();
+        // A skipped chat stays unread and marked for a later retry, even
+        // when another chat in the same batch had a request to send.
+        for peer in &queued {
+            self.list.marks_mut().remove(peer);
+        }
         s.redraw();
     }
 

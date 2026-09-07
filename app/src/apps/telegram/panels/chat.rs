@@ -2,7 +2,7 @@
 //! line, the draft in the composer or the edit under way in it, what the
 //! composer carries, and the one line playing.
 //!
-//! Opening marks the chat read locally on the layout action's undo node.
+//! Opening with an ordinary cached line marks the chat read on the undo node.
 //! The live read receipt is separate: undo restores only the local count.
 //! The panel remembers where reading started for its unread divider.
 //!
@@ -98,6 +98,9 @@ pub struct Chat {
     /// The first message not read when the panel opened, where there was
     /// one: the unread line stays above it for the panel's life.
     first_unread: Option<MsgId>,
+    /// Retry unacknowledged views after a short delay; a queued command is
+    /// not enough to dismiss a server notification.
+    viewed_mentions: std::collections::BTreeMap<MsgId, f64>,
     /// What the composer will send with the text, in the order it will go.
     /// Edited from the attach panel, through the join.
     carrying: Vec<Carried>,
@@ -211,6 +214,27 @@ impl Chat {
     #[must_use]
     pub fn history(&self) -> Rc<Vec<Msg>> {
         model::history(&self.store, self.peer)
+    }
+
+    /// The widget supplies only messages visible in the focused transcript.
+    pub fn view_mentions(&mut self, visible: &[MsgId], now: f64) {
+        let ids: Vec<MsgId> = self.history().iter()
+            .filter(|m| m.unread_mention && visible.contains(&m.id))
+            .filter(|m| self.viewed_mentions.get(&m.id).is_none_or(|at| now - at >= 5.0))
+            .map(|m| m.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        if wire(&self.store, &requests::view_messages(self.peer, &ids)) {
+            for id in ids {
+                self.viewed_mentions.insert(id, now);
+            }
+        } else if !super::super::Telegram::engine_store(self.store.dir())
+            && super::super::schema::session(self.store.conn()).state == "closed"
+        {
+            let peer = self.peer;
+            super::flip(&self.store, move |c| super::super::project::read_mentions(c, peer, &ids));
+        }
     }
 
     /// Where the reading started, if anything was unread.
@@ -934,6 +958,20 @@ impl Panel for Chat {
         if !self.reply_back.is_empty() {
             v.push(Verb::run("telegram.back", "back", Some('b')));
         }
+        if let Some(card) = model::peer(&self.store, self.peer)
+            .filter(|c| c.kind == model::PeerKind::Group && c.unread_mentions > 0)
+        {
+            v.push(Verb::go(
+                "telegram.replies",
+                format!("replies & mentions {}", card.unread_mentions),
+                Some('s'),
+                Nav::Open {
+                    from: self.slot,
+                    id: super::Messages::replies(Some(self.peer)),
+                    fresh: false,
+                },
+            ));
+        }
         if n == 0 {
             if let Some(m) = under {
                 if !blocked {
@@ -1091,8 +1129,8 @@ impl Drop for Chat {
 pub struct ReadClaim {
     pub peer: PeerId,
     pub unread: i64,
-    pub mention: bool,
     pub last_read: Option<MsgId>,
+    pub through: MsgId,
 }
 
 impl Intent for ReadClaim {
@@ -1101,13 +1139,12 @@ impl Intent for ReadClaim {
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let (peer, unread, mention, last_read) =
-            (self.peer, self.unread, self.mention, self.last_read);
+        let (peer, unread, last_read) = (self.peer, self.unread, self.last_read);
         w.store()
             .write(move |c| {
                 c.execute(
-                    "UPDATE tg_chat SET unread = ?2, mention = ?3, last_read = ?4 WHERE peer = ?1",
-                    rusqlite::params![peer, unread, mention, last_read],
+                    "UPDATE tg_chat SET unread = ?2, last_read = ?3 WHERE peer = ?1",
+                    rusqlite::params![peer, unread, last_read],
                 )
                 .map(|_| ())
             })
@@ -1115,9 +1152,9 @@ impl Intent for ReadClaim {
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let peer = self.peer;
+        let (peer, through) = (self.peer, self.through);
         w.store()
-            .write(move |c| model::mark_read_tx(c, peer))
+            .write(move |c| model::mark_read_tx(c, peer, through))
             .map_err(|e| e.to_string())
     }
 }
@@ -1139,9 +1176,8 @@ fn saved_messages(store: &Store, peer: PeerId) -> PeerId {
     model::self_peer(store).unwrap_or(peer)
 }
 
-/// The factory. Opening a chat reads it: the count goes to nought on the
-/// opening action's node, and where the reading started is kept for the
-/// unread line.
+/// The factory. Opening a chat with an ordinary cached line reads it on the
+/// opening action's node. Where reading started is kept for the unread line.
 pub struct ChatKind;
 
 impl PanelKind for ChatKind {
@@ -1154,11 +1190,11 @@ impl PanelKind for ChatKind {
         let peer = saved_messages(&store, Chat::of(id).unwrap_or_default());
         let at = Chat::msg_of(id);
         let card = model::peer(&store, peer);
-        let (unread, mention, last_read, draft) = card.map_or(
-            (0, false, None, String::new()),
-            |c| (c.unread, c.mention, c.last_read, c.draft.unwrap_or_default()),
+        let (unread, last_read, draft) = card.map_or(
+            (0, None, String::new()),
+            |c| (c.unread, c.last_read, c.draft.unwrap_or_default()),
         );
-        // Read before the claim below, which is what makes them all read.
+        // Capture the unread divider before advancing the read position.
         let first_unread = if unread > 0 {
             model::history(&store, peer)
                 .iter()
@@ -1167,27 +1203,34 @@ impl PanelKind for ChatKind {
         } else {
             None
         };
-        if unread > 0 {
+        // A newly discovered group's cache may contain only unread mentions.
+        // Claim no local read unless an ordinary line can carry it to Telegram.
+        // A restored panel must not send a new receipt beyond a redo's
+        // original boundary; the recorded claim reapplies that exact read.
+        let read_target = if unread > 0 && at.is_none() && cx.how().claims() {
+            model::newest_ordinary_line(&store, peer)
+                .filter(|through| *through > last_read.unwrap_or(0))
+        } else {
+            None
+        };
+        if let Some(through) = read_target {
             cx.claim(
-                Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer)),
+                Box::new(move |tx: &rusqlite::Transaction| model::mark_read_tx(tx, peer, through)),
                 vec![Box::new(ReadClaim {
                     peer,
                     unread,
-                    mention,
                     last_read,
+                    through,
                 }) as Box<dyn Intent>],
             );
         }
-        // Where the build is signed in, carry that read through to Telegram
-        // too, so the count clears at the server as it just did locally. The
-        // newest line stands for the whole chat; `viewMessages` force-reads up
-        // to it. Fully gated, so the demo build and the read-claim undo are
-        // untouched, and a no-op when signed out.
+        // Carry the ordinary read through to Telegram even when the newest
+        // lines are unread replies or mentions. Name the preceding ordinary
+        // line: `viewMessages` would acknowledge a named notification too,
+        // which waits until it is visible in the focused transcript.
         #[cfg(feature = "tdlib")]
-        if unread > 0 {
-            if let Some(last) = model::history(&store, peer).iter().last().map(|m| m.id) {
-                let _ = wire(&store, &requests::view_messages(peer, &[last]));
-            }
+        if let Some(last) = read_target {
+            let _ = wire(&store, &requests::view_messages(peer, &[last]));
         }
         // And fill the transcript's window from the wire: the newest page
         // first, to close whatever gap an absence left, then — the worker
@@ -1207,7 +1250,7 @@ impl PanelKind for ChatKind {
             store,
             slot: 0,
             cursor: at,
-            follow_wish: None,
+            follow_wish: at,
             reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,
@@ -1216,6 +1259,7 @@ impl PanelKind for ChatKind {
             draft,
             editing: None,
             first_unread,
+            viewed_mentions: std::collections::BTreeMap::new(),
             carrying: Vec::new(),
             wants_field: false,
             player: None,

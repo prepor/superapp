@@ -62,6 +62,21 @@ replies cannot complete a later attempt.
 Block state also follows chat snapshots and user full info, including changes
 made on another device; the stories-only block list does not block messages.
 
+## Unread replies
+
+The chat list shows an `@` count beside the ordinary unread count. **Replies &
+mentions** on its bar opens unread messages addressed to you in groups,
+including muted and archived groups. The launcher has the same entry; a
+group's bar opens the view with that group as its initial filter. Selecting a
+message opens the conversation at that message.
+
+Telegram counts replies to your messages and direct mentions together. The
+view uses its unread-mention search, fetching older items even outside the
+ordinary history window. Opening or previewing a group preserves this count;
+notifications are acknowledged when their messages are visible in the focused
+conversation. A live count clears on Telegram's acknowledgment, including
+when another device reads the message. **Refresh** retries an incomplete load.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

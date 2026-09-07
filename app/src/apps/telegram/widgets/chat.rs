@@ -74,6 +74,21 @@ const FILE_TAG: Tag = Tag("file");
 struct RowHit {
     id: MsgId,
     rect: Rect,
+    /// Mention acknowledgement measures how much of the full message was seen.
+    unclipped: Rect,
+}
+
+impl RowHit {
+    fn viewed_in(&self, viewport: Rect) -> bool {
+        let full = self.unclipped;
+        let height = (full.pos.y + full.size.y).min(viewport.pos.y + viewport.size.y)
+            - full.pos.y.max(viewport.pos.y);
+        // A long reply can be taller than the viewport; showing a
+        // substantial part of it must still let the reader dismiss it.
+        viewport.size.y > 0.0 && height + 1.0 >= full.size.y.min(viewport.size.y * 0.5)
+            && full.pos.x >= viewport.pos.x - 1.0
+            && full.pos.x + full.size.x <= viewport.pos.x + viewport.size.x + 1.0
+    }
 }
 
 /// A control inside a row, by the rectangle of the last draw.
@@ -222,6 +237,12 @@ impl Widget for ChatPanel {
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
+        if has_focus && self.mounted {
+            let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
+            let visible: Vec<MsgId> = self.rows.iter().filter(|r| r.viewed_in(viewport))
+                .map(|r| r.id).collect();
+            with_chat(&props, |c| c.view_mentions(&visible, super::now(scope)));
+        }
         // A reply or an edit asked for the caret — the bar's verb over the
         // cursor, or the line's card through the join — since both are
         // written.
@@ -694,23 +715,23 @@ impl Widget for ChatPanel {
         let clip = self.view.widget(cx, LIST).area().rect(cx);
         for (idx, row) in drawn {
             let Some(r) = rows.get(idx) else { continue };
-            let rect = row.area().rect(cx);
-            if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            let full = row.area().rect(cx);
+            if full.size.x <= 0.0 || full.size.y <= 0.0 {
                 continue;
             }
             match r {
                 Row::Message { msg, .. } => {
                     let Some(rect) = props.hits.add_row_clipped(
-                        row_label(r, now), rect, clip, MouseCursor::Hand, props.slot,
+                        row_label(r, now), full, clip, MouseCursor::Hand, props.slot,
                     ) else { continue };
-                    self.rows.push(RowHit { id: msg.id, rect });
+                    self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
                     self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), &render);
                 }
                 Row::Service(_) | Row::Day(_) | Row::Unread => {
                     props.hits.add_clipped(
-                        row_label(r, now), rect, clip, MouseCursor::Default, props.slot,
+                        row_label(r, now), full, clip, MouseCursor::Default, props.slot,
                     );
                 }
             }
@@ -1226,4 +1247,25 @@ fn wire_clip(m: &Msg) -> bool {
         matches!(md.kind.as_str(), "video" | "circle" | "animation")
             && md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipped_hits_only_acknowledge_mentions_after_enough_of_the_message_is_shown() {
+        let rect = |y, h| Rect { pos: dvec2(0.0, y), size: dvec2(300.0, h) };
+        let viewport = rect(100.0, 200.0);
+        for (full, viewed) in [
+            (rect(130.0, 40.0), true),
+            (rect(280.0, 60.0), false),
+            (rect(0.0, 120.0), false),
+            (rect(180.0, 400.0), true),
+            (rect(280.0, 400.0), false),
+        ] {
+            let row = RowHit { id: 1, rect: visible(full, viewport).unwrap(), unclipped: full };
+            assert_eq!(row.viewed_in(viewport), viewed, "full: {full:?}, hit: {:?}", row.rect);
+        }
+    }
 }

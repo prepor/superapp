@@ -43,6 +43,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
             .as_i64()
             .or_else(|| m["reply_to"]["message_id"].as_i64())
             .filter(|&r| r != 0),
+        unread_mention: !out && m["contains_unread_mention"].as_bool().unwrap_or(false),
         fwd_from: forward_from(&m["forward_info"]),
         media,
         views: info["view_count"].as_i64().filter(|&n| n > 0),
@@ -499,7 +500,7 @@ pub fn chat(chat: &Value) -> Option<IncomingChat> {
             > 0,
         archived,
         unread: chat["unread_count"].as_i64().unwrap_or(0),
-        mention: chat["unread_mention_count"].as_i64().unwrap_or(0) > 0,
+        unread_mentions: chat["unread_mention_count"].as_i64().unwrap_or(0).max(0),
         draft: nonempty(chat["draft_message"]["input_message_text"]["text"]["text"].as_str()),
         typing: None,
         last_read: chat["last_read_inbox_message_id"]
@@ -597,13 +598,11 @@ pub fn chat_title(u: &Value) -> Option<(PeerId, String)> {
     Some((u["chat_id"].as_i64()?, nonempty(u["title"].as_str())?))
 }
 
-/// `updateChatUnreadMentionCount`: whether one of the unread lines names me,
-/// which is the badge the list draws beside the count. The store keeps the
-/// fact, not the number — one mention and a dozen read the same.
+/// TDLib counts direct mentions and replies to my messages together.
 #[must_use]
-pub fn chat_mentions(u: &Value) -> Option<(PeerId, bool)> {
+pub fn chat_mentions(u: &Value) -> Option<(PeerId, i64)> {
     let chat = u["chat_id"].as_i64()?;
-    Some((chat, u["unread_mention_count"].as_i64().unwrap_or(0) > 0))
+    Some((chat, u["unread_mention_count"].as_i64()?.max(0)))
 }
 
 /// `updateChatDraftMessage`: what is typed and unsent, from whichever device
@@ -1261,7 +1260,7 @@ mod tests {
         let ch = chat(&raw).expect("a chat");
         assert_eq!(ch.peer, -1001);
         assert_eq!(ch.unread, 3);
-        assert!(ch.mention);
+        assert_eq!(ch.unread_mentions, 1);
         assert_eq!(ch.pinned, 1);
         assert!(!ch.muted);
         assert_eq!(ch.last_read, Some(900));
@@ -1445,11 +1444,11 @@ mod tests {
 
         assert_eq!(
             chat_mentions(&json!({"@type": "updateChatUnreadMentionCount", "chat_id": 2, "unread_mention_count": 3})),
-            Some((2, true))
+            Some((2, 3))
         );
         assert_eq!(
             chat_mentions(&json!({"@type": "updateChatUnreadMentionCount", "chat_id": 2, "unread_mention_count": 0})),
-            Some((2, false))
+            Some((2, 0))
         );
         assert!(chat_mentions(&json!({"@type": "updateChatUnreadMentionCount"})).is_none());
 

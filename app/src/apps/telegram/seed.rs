@@ -237,7 +237,6 @@ struct SeedChat {
     /// The index into `lines` of the last message I read; `None` reads
     /// everything.
     last_read: Option<usize>,
-    mention: bool,
     lines: Vec<Line>,
 }
 
@@ -253,6 +252,7 @@ struct Line {
     edited: bool,
     /// The index into the chat's lines of what it answers.
     reply_to: Option<usize>,
+    unread_mention: bool,
     fwd_from: Option<&'static str>,
     media: Option<&'static str>,
     media_label: Option<&'static str>,
@@ -328,7 +328,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 from(VERA, t(8, 27, 10, 0), "lunch thursday?"),
                 me(t(8, 27, 10, 5), "yes, 13:00 at the usual"),
@@ -362,7 +361,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: Some(5),
-            mention: true,
             lines: vec![
                 service(t(8, 25, 10, 0), "Ivan Petrov joined the group"),
                 from(MAX, t(8, 25, 10, 30), "welcome Ivan — the design doc is pinned"),
@@ -392,10 +390,14 @@ fn chats() -> Vec<SeedChat> {
                     media_label: Some("report-q3.pdf · 2.1 MB"),
                     ..from(MAX, t(8, 31, 9, 3), "the numbers")
                 },
-                from(ANNA, t(9, 1, 11, 20), "@prepor can you look at the fold layout today?"),
+                Line {
+                    unread_mention: true,
+                    ..from(ANNA, t(9, 1, 11, 20), "@prepor can you look at the fold layout today?")
+                },
                 from(ANNA, t(9, 1, 11, 21), "the cover display clips the header"),
                 Line {
-                    reply_to: Some(9),
+                    reply_to: Some(6),
+                    unread_mention: true,
                     ..from(VERA, t(9, 1, 11, 25), "I saw it — the inset is 28 dp, it wants 34")
                 },
                 Line {
@@ -422,7 +424,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: Some(1),
-            mention: false,
             lines: vec![
                 from(ELENA, t(8, 30, 18, 20), "Sat hike — early start?"),
                 me(t(8, 30, 18, 40), "7:30 at the trailhead?"),
@@ -438,7 +439,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: Some("Irina"),
             last_read: Some(2),
-            mention: false,
             lines: vec![
                 Line {
                     media: Some("photo"),
@@ -469,7 +469,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: Some(0),
-            mention: false,
             lines: vec![
                 Line {
                     reactions: Some("🦀 120"),
@@ -506,7 +505,6 @@ fn chats() -> Vec<SeedChat> {
             draft: Some("I'll bring the thermos and"),
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 from(VERA, t(8, 29, 20, 0), "who's in for saturday? 7:30 at the trailhead"),
                 from(MAX, t(8, 29, 20, 5), "in"),
@@ -531,7 +529,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 Line {
                     out: true,
@@ -558,7 +555,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 from(MAX, t(8, 29, 21, 0), "Q3 infra budget draft — do the numbers check out?"),
                 Line {
@@ -575,7 +571,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 me(t(8, 12, 10, 0), "book: that airport book — chapter 4, on queues"),
                 Line {
@@ -617,7 +612,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 from(ANNA, t(8, 12, 15, 0), "hi! Vera gave me your contact — about the fold review"),
                 me(t(8, 12, 15, 20), "sure, send the doc over"),
@@ -631,7 +625,6 @@ fn chats() -> Vec<SeedChat> {
             draft: None,
             typing: None,
             last_read: None,
-            mention: false,
             lines: vec![
                 from(SERGEY, t(8, 12, 9, 0), "the keys are with the neighbour"),
                 service(t(8, 12, 9, 30), "Anna Schmidt left the group"),
@@ -715,16 +708,15 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
         }
         for chat in &chats() {
             c.execute(
-                "INSERT INTO tg_chat(peer, pinned, muted, archived, draft, typing, mention)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tg_chat(peer, pinned, muted, archived, draft, typing)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     chat.peer,
                     chat.pinned,
                     chat.muted,
                     chat.archived,
                     chat.draft,
-                    chat.typing,
-                    chat.mention
+                    chat.typing
                 ],
             )?;
             let mut ids: Vec<i64> = Vec::with_capacity(chat.lines.len());
@@ -736,9 +728,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                                             reply_to, fwd_from, media, media_label, views,
                                             comments, reactions, service, media_ref,
                                             media_w, media_h, media_secs, media_lat,
-                                            media_lon, media_until, entities, entities_known)
+                                            media_lon, media_until, entities, entities_known, unread_mention)
                      VALUES(?23, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?24, ?25)",
+                            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?24, ?25, ?26)",
                     rusqlite::params![
                         chat.peer,
                         l.sender,
@@ -764,7 +756,8 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                         l.media_until,
                         next_msg,
                         serde_json::to_string(l.entities.as_deref().unwrap_or_default()).expect("text entities serialize"),
-                        l.entities.is_some()
+                        l.entities.is_some(),
+                        l.unread_mention
                     ],
                 )?;
                 ids.push(next_msg);
@@ -782,7 +775,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                 .filter(|(l, id)| **id > last_read && !l.out && !l.service)
                 .count() as i64;
             c.execute(
-                "UPDATE tg_chat SET last_read = ?2, unread = ?3 WHERE peer = ?1",
+                "UPDATE tg_chat SET last_read = ?2, unread = ?3,
+                    mention = (SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND unread_mention = 1)
+                 WHERE peer = ?1",
                 rusqlite::params![chat.peer, last_read, unread],
             )?;
         }

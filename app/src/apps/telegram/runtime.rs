@@ -33,6 +33,8 @@ struct State {
     forward: Option<Forward>,
     play_next: Option<(PeerId, MsgId)>,
     loading: Vec<PeerId>,
+    mentions_loading: Vec<PeerId>,
+    mentions_failed: Vec<PeerId>,
     list_syncing: bool,
     connection_status: Option<String>,
     wanted: Wanted,
@@ -88,6 +90,7 @@ impl Drop for Inbox {
 #[derive(Default)]
 pub struct Wanted {
     pub chats: Vec<PeerId>,
+    pub mentions: Vec<PeerId>,
     pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
@@ -239,6 +242,34 @@ impl Runtime {
 
     pub fn want_line(&self, chat: PeerId, id: MsgId) {
         push_unique(&mut self.state().wanted.lines, (chat, id));
+    }
+
+    pub fn want_mentions(&self, chat: PeerId) {
+        let mut state = self.state();
+        // Offline scenes must not acquire a loading state with no worker.
+        if state.sender.is_some() {
+            push_unique(&mut state.wanted.mentions, chat);
+            push_unique(&mut state.mentions_loading, chat);
+            state.mentions_failed.retain(|c| *c != chat);
+        }
+    }
+
+    pub fn mentions_status(&self, chat: Option<PeerId>) -> (bool, bool) {
+        let state = self.state();
+        let matches = |peers: &[PeerId]| peers.iter().any(|p| chat.is_none_or(|c| c == *p));
+        (matches(&state.mentions_loading), matches(&state.mentions_failed))
+    }
+
+    pub fn set_mentions_status(&self, chat: PeerId, loading: bool, failed: bool) {
+        let mut state = self.state();
+        state.mentions_loading.retain(|c| *c != chat);
+        state.mentions_failed.retain(|c| *c != chat);
+        if loading {
+            push_unique(&mut state.mentions_loading, chat);
+        }
+        if failed {
+            push_unique(&mut state.mentions_failed, chat);
+        }
     }
 
     pub fn want_file(&self, remote_id: &str) {

@@ -144,7 +144,7 @@ fn the_app_registers_its_tags_and_roots() {
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
-    assert_eq!(roots, vec!["chats", "contacts", "saved messages", "sign in"]);
+    assert_eq!(roots, vec!["chats", "replies & mentions", "contacts", "saved messages", "sign in"]);
     // No worker without the engine: the demo world runs no background sync,
     // and the sign-in panel reads the 'closed' session row it leaves.
     assert!(s.workers().names().is_empty(), "nothing runs in the background yet");
@@ -177,7 +177,7 @@ fn the_list_puts_pinned_chats_first_and_the_archive_aside() {
     assert_eq!(titles(&s, archive), vec!["Old flat"]);
     let row = with_chats(&s, list, |c| c.rows(1, 2).remove(0));
     assert_eq!(row.kind, PeerKind::Group);
-    assert!(row.muted && row.mention && row.pinned == 2);
+    assert!(row.muted && row.unread_mentions == 2 && row.pinned == 2);
     assert_eq!(row.unread, 8);
     assert_eq!(row.preview(s.now()), "Ivan: meeting moved to 15:00");
 }
@@ -221,7 +221,7 @@ fn a_preview_marks_the_chat_read_and_undo_gives_it_back() {
     let nav = with_chats(&s, list, |c| c.go(1)).expect("a row");
     go(&mut s, nav);
     let reader = s.joined_child(list).expect("the chat, joined");
-    assert_eq!(unread(&s, STELAXIS), (0, false));
+    assert_eq!(unread(&s, STELAXIS), (0, true));
     // Where the reading started is kept on the instance for the unread
     // line, and the cursor starts nowhere.
     let (first, cursor) = with_chat(&s, reader, |c| (c.first_unread(), c.cursor()));
@@ -642,6 +642,310 @@ fn messages_are_found_everywhere_and_narrowed_to_a_chat() {
     let n = lines(&s, in_chat, &seed).len();
     assert_eq!(n, 13, "the group's lines, service ones left out");
     assert!(verb_ids(&s, all).is_empty(), "a messages list wears no bar");
+}
+
+#[test]
+fn unread_replies_open_at_the_message_and_only_visible_items_are_read() {
+    let mut s = session();
+    let chats = open_root(&mut s, Chats::id());
+    assert_eq!(model::reply_count(s.store()), 2);
+    verb(&mut s, chats, "telegram.replies");
+    let inbox = s.joined_child(chats).unwrap();
+    let rows = {
+        let panel = s.panel(inbox).unwrap();
+        let mut panel = panel.borrow_mut();
+        let messages = panel.as_any().downcast_mut::<Messages>().unwrap();
+        assert!(messages.is_replies());
+        messages.rows(0, 50)
+    };
+    assert_eq!(rows.len(), 2, "a reply to me and a direct mention");
+    let reply = &rows[0];
+    assert_eq!(reply.text, "I saw it — the inset is 28 dp, it wants 34");
+    assert_eq!(model::line(s.store(), STELAXIS, reply.id).unwrap().reply_name, "me");
+    go(&mut s, Nav::Open { from: inbox, id: Chat::at(reply.chat, reply.id), fresh: false });
+    let reader = s.joined_child(inbox).unwrap();
+    with_chat(&s, reader, |c| {
+        assert_eq!(c.cursor(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), Some(reply.id), "the transcript scrolls to the reply");
+        c.view_mentions(&[], s.now());
+    });
+    assert_eq!(model::reply_count(s.store()), 2, "opening alone reads no notification");
+    assert_eq!(unread(&s, STELAXIS).0, 8, "a targeted opening does not read the whole chat");
+    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now()));
+    assert_eq!(model::reply_count(s.store()), 1);
+    assert!(!model::line(s.store(), reply.chat, reply.id).unwrap().unread_mention);
+    assert!(model::line(s.store(), rows[1].chat, rows[1].id).unwrap().unread_mention);
+    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now() + 10.0));
+    assert_eq!(model::reply_count(s.store()), 1, "repeat views cannot decrement twice");
+}
+
+#[test]
+fn unread_replies_include_archived_groups_and_exclude_other_conversations() {
+    let mut s = session();
+    s.store().write(|c| {
+        for peer in [OLD_FLAT, ANNA, RUST_WEEKLY] {
+            c.execute("UPDATE tg_chat SET mention = 1 WHERE peer = ?1", [peer])?;
+            c.execute(
+                "INSERT INTO tg_message(id, chat, date, text, unread_mention) VALUES(999999, ?1, 1, 'look here', 1)",
+                [peer],
+            )?;
+        }
+        Ok(())
+    }).unwrap();
+    assert_eq!(model::reply_count(s.store()), 3, "muted stelaxis and the archived group");
+    let inbox = open_root(&mut s, Messages::replies(None));
+    let panel = s.panel(inbox).unwrap();
+    let mut panel = panel.borrow_mut();
+    let messages = panel.as_any().downcast_mut::<Messages>().unwrap();
+    let rows = messages.rows(0, 50);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|m| m.chat == OLD_FLAT));
+    assert!(rows.iter().all(|m| m.chat == OLD_FLAT || m.chat == STELAXIS));
+}
+
+#[test]
+fn live_reply_views_wait_for_acknowledgment_and_can_retry() {
+    let mut s = session();
+    let unread_ids: Vec<_> = model::history(s.store(), STELAXIS).iter()
+        .filter(|m| m.unread_mention).map(|m| m.id).collect();
+    let reader = open_root(&mut s, Chat::at(STELAXIS, unread_ids[0]));
+    let inbox = runtime::of(s.store()).connect();
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now()));
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "viewMessages");
+    assert_eq!(request["message_ids"], serde_json::json!([unread_ids[0]]));
+    assert_eq!(model::reply_count(s.store()), 2, "enqueue is not acknowledgment");
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 1.0));
+    assert!(inbox.try_recv().is_err(), "views are deduplicated while pending");
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 6.0));
+    assert!(inbox.try_recv().is_ok(), "an unacknowledged view can retry");
+}
+
+/// Leave an ordinary line before two unread mentions at the end of the group.
+fn add_trailing_mentions(s: &Session) -> i64 {
+    let history = model::history(s.store(), STELAXIS);
+    let ordinary = &history[history.len() - 3];
+    assert!(!ordinary.unread_mention);
+    let last = ordinary.id;
+    s.store().write(move |c| {
+        c.execute("UPDATE tg_message SET unread_mention = 1
+            WHERE chat = ?1 AND id > ?2", [STELAXIS, last])?;
+        c.execute("UPDATE tg_chat SET mention =
+            (SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND unread_mention = 1)
+            WHERE peer = ?1", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    last
+}
+
+#[test]
+fn preview_reads_ordinary_messages_with_unread_mentions_at_the_end() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let list = open_root(&mut s, Chats::id());
+    let inbox = runtime::of(s.store()).connect();
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(s.focus(), Some(list), "the transcript has not been focused");
+    assert_eq!(unread(&s, STELAXIS).0, 2);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+    assert_eq!(model::reply_count(s.store()), 4);
+    #[cfg(feature = "tdlib")]
+    {
+        let request: serde_json::Value = serde_json::from_str(
+            &inbox.try_recv().expect("the preview sends a read for the preceding ordinary message")
+        ).unwrap();
+        assert_eq!(request["@type"], "viewMessages");
+        assert_eq!(request["chat_id"], STELAXIS);
+        assert_eq!(request["message_ids"], serde_json::json!([last]));
+        assert_eq!(request["force_read"], true);
+    }
+    assert!(inbox.try_recv().is_err(), "unseen mentions have no acknowledgment");
+
+    account().on_update(s.world(), &serde_json::json!({
+        "@type": "updateNewChat",
+        "chat": {
+            "id": STELAXIS, "title": "stelaxis",
+            "type": {"@type": "chatTypeSupergroup", "is_channel": false},
+            "positions": [{"list": {"@type": "chatListMain"}, "order": "100"}],
+            "unread_count": 2, "last_read_inbox_message_id": last,
+            "unread_mention_count": 4
+        }
+    }).to_string());
+    assert_eq!(unread(&s, STELAXIS).0, 2, "the server confirms the same remaining count");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+}
+
+#[test]
+fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    let inbox = runtime::of(s.store()).connect();
+    verb(&mut s, list, "telegram.read");
+    let requests: Vec<serde_json::Value> = inbox.try_iter()
+        .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    assert_eq!(requests.len(), 2, "one read for each marked group");
+    assert_eq!(unread(&s, STELAXIS).0, 8, "a queued read waits for confirmation");
+    for (peer, last, remaining) in [(STELAXIS, last, 2), (FAMILY, family_last, 0)] {
+        let request = requests.iter().find(|r| r["chat_id"] == peer).unwrap();
+        assert_eq!(request["@type"], "viewMessages");
+        assert_eq!(request["message_ids"], serde_json::json!([last]));
+        assert_eq!(request["force_read"], true);
+        account().on_update(s.world(), &serde_json::json!({
+            "@type": "ok", "@extra": request["@extra"]
+        }).to_string());
+        assert_eq!(unread(&s, peer).0, remaining);
+        assert_eq!(model::peer(s.store(), peer).unwrap().last_read, Some(last));
+    }
+    assert_eq!(model::reply_count(s.store()), 4, "read n preserves every mention");
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().len()), 0);
+}
+
+#[test]
+fn ordinary_reads_with_a_stale_target_preserve_the_server_read_state() {
+    for batch in [false, true] {
+        for read_ahead in [0, 1] {
+            let mut s = session();
+            let last = add_trailing_mentions(&s);
+            let read_before = last + read_ahead;
+            s.store().write(move |c| {
+                // Some of these unread messages aren't cached yet. Neither
+                // an equal nor an older target can change the server count.
+                c.execute("UPDATE tg_chat SET last_read = ?2, unread = 5 WHERE peer = ?1",
+                    [STELAXIS, read_before])?;
+                Ok(())
+            }).unwrap();
+            let list = open_root(&mut s, Chats::id());
+            let inbox = runtime::of(s.store()).connect();
+            if batch {
+                with_chats(&s, list, |c| c.list_mut().marks_mut().add(STELAXIS));
+                verb(&mut s, list, "telegram.read");
+            } else {
+                go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+            }
+            assert_eq!(unread(&s, STELAXIS).0, 5);
+            assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(read_before));
+            for raw in inbox.try_iter() {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(request["message_ids"], serde_json::json!([last]));
+                account().on_update(s.world(), &serde_json::json!({
+                    "@type": "ok", "@extra": request["@extra"]
+                }).to_string());
+            }
+            assert_eq!(unread(&s, STELAXIS).0, 5);
+            assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(read_before));
+        }
+    }
+}
+
+#[test]
+fn ordinary_reads_preserve_unread_messages_missing_from_the_cache() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    s.store().write(move |c| {
+        c.execute("DELETE FROM tg_message WHERE chat = ?1 AND id = ?2", [STELAXIS, last + 2])?;
+        Ok(())
+    }).unwrap();
+    let list = open_root(&mut s, Chats::id());
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(unread(&s, STELAXIS).0, 2, "one cached and one uncached message remain unread");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+}
+
+#[test]
+fn redoing_an_ordinary_read_keeps_the_original_receipt_boundary() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let before = model::peer(s.store(), STELAXIS).unwrap();
+    let list = open_root(&mut s, Chats::id());
+    let inbox = runtime::of(s.store()).connect();
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(unread(&s, STELAXIS).0, 2);
+    let _ = inbox.try_iter().count();
+    assert!(s.undo());
+    assert_eq!(unread(&s, STELAXIS).0, before.unread);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+    let arrived_at = model::history(s.store(), STELAXIS).last().unwrap().date + 1.0;
+    s.store().write(move |c| {
+        for (offset, out, service) in [(3, false, false), (4, true, false), (5, false, true)] {
+            c.execute("INSERT INTO tg_message(id, chat, date, text, out, service)
+                VALUES(?1, ?2, ?3, 'arrived while undone', ?4, ?5)",
+                rusqlite::params![last + offset, STELAXIS, arrived_at, out, service])?;
+        }
+        c.execute("UPDATE tg_chat SET unread = unread + 1 WHERE peer = ?1", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    assert!(s.redo());
+    assert_eq!(unread(&s, STELAXIS).0, 3, "the two mentions and the new incoming line stay unread");
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(last));
+    let reader = s.joined_child(list).unwrap();
+    assert_eq!(with_chat(&s, reader, |c| c.first_unread()), Some(last + 1));
+    assert!(inbox.try_recv().is_err(), "restoring the panel sends no new read receipt");
+}
+
+#[test]
+fn preview_without_an_ordinary_line_keeps_the_chat_unread() {
+    for keep_mentions in [true, false] {
+        let mut s = session();
+        // A newly discovered group may have only its unread replies cached,
+        // or no messages at all while its first history request is pending.
+        s.store().write(move |c| {
+            c.execute("DELETE FROM tg_message
+                WHERE chat = ?1 AND (unread_mention = 0 OR ?2 = 0)",
+                rusqlite::params![STELAXIS, keep_mentions])?;
+            Ok(())
+        }).unwrap();
+        let before = model::peer(s.store(), STELAXIS).unwrap();
+        let list = open_root(&mut s, Chats::id());
+        let inbox = runtime::of(s.store()).connect();
+        go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+        assert_eq!(s.focus(), Some(list));
+        assert_eq!(unread(&s, STELAXIS).0, before.unread,
+            "a preview cannot claim a read with no ordinary message to name");
+        assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+        assert_eq!(model::reply_count(s.store()), before.unread_mentions);
+        assert!(inbox.try_recv().is_err(), "unseen mentions are not acknowledged");
+
+        s.undo();
+        s.settle();
+        assert!(s.redo());
+        s.settle();
+        assert_eq!(unread(&s, STELAXIS).0, before.unread,
+            "reopening has no deferred local read claim either");
+        assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+        assert!(inbox.try_recv().is_err());
+    }
+}
+
+#[test]
+fn batch_without_an_ordinary_line_keeps_the_skipped_chat_unread_and_marked() {
+    let mut s = session();
+    s.store().write(|c| {
+        c.execute("DELETE FROM tg_message WHERE chat = ?1 AND unread_mention = 0", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    let before = model::peer(s.store(), STELAXIS).unwrap();
+    let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    let inbox = runtime::of(s.store()).connect();
+    verb(&mut s, list, "telegram.read");
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "viewMessages");
+    assert_eq!(request["chat_id"], FAMILY);
+    assert_eq!(request["message_ids"], serde_json::json!([family_last]));
+    assert!(inbox.try_recv().is_err(), "there is no read for the group holding only mentions");
+    account().on_update(s.world(), &serde_json::json!({
+        "@type": "ok", "@extra": request["@extra"]
+    }).to_string());
+    assert_eq!(unread(&s, FAMILY).0, 0);
+    assert_eq!(unread(&s, STELAXIS).0, before.unread);
+    assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, before.last_read);
+    assert_eq!(model::reply_count(s.store()), before.unread_mentions);
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().keys()), vec![STELAXIS],
+        "the skipped group stays marked for a later retry");
 }
 
 #[test]

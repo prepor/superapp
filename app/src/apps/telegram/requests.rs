@@ -298,9 +298,9 @@ pub fn delete_messages(chat_id: PeerId, message_ids: &[MsgId], revoke: bool) -> 
     .to_string()
 }
 
-/// Marks lines seen. `force_read` reads them at the server — the chat's unread
-/// count clears, not merely that the lines were shown — so a chat read locally
-/// is read on Telegram too. The newest line stands for the whole chat.
+/// Marks the named lines seen, including their reply or mention notifications.
+/// `force_read` also advances the ordinary inbox's read position; callers
+/// reading a chat without viewing mentions name its newest ordinary line.
 #[must_use]
 pub fn view_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
     json!({
@@ -561,21 +561,24 @@ pub fn delete_file(file_id: i32) -> String {
 /// The most lines one `getChatHistory` asks for — TDLib's own ceiling.
 pub const HISTORY_PAGE: i64 = 100;
 
-/// The two walks a history backfill makes, named in the request's `@extra`
-/// so the page that answers knows which it belongs to.
+/// History and unread-search walks, named in the request's `@extra` so the
+/// page that answers knows which it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Walk {
     /// Down from the newest line, while pages bring lines the store lacks.
     Fill,
     /// Down from the oldest line held, until the window is full.
     Tail,
+    /// Unread replies and mentions, with a generation to reject stale pages.
+    Mentions(u64),
 }
 
 impl Walk {
-    pub(super) fn word(self) -> &'static str {
+    pub(super) fn word(self) -> String {
         match self {
-            Walk::Fill => "fill",
-            Walk::Tail => "tail",
+            Walk::Fill => "fill".to_string(),
+            Walk::Tail => "tail".to_string(),
+            Walk::Mentions(generation) => format!("mentions-{generation}"),
         }
     }
 
@@ -583,7 +586,7 @@ impl Walk {
         match word {
             "fill" => Some(Walk::Fill),
             "tail" => Some(Walk::Tail),
-            _ => None,
+            _ => word.strip_prefix("mentions-")?.parse().ok().map(Walk::Mentions),
         }
     }
 }
@@ -594,6 +597,19 @@ impl Walk {
 /// whose page it reads and whether the page moved at all.
 #[must_use]
 pub fn get_chat_history(chat: PeerId, from: MsgId, walk: Walk) -> String {
+    if matches!(walk, Walk::Mentions(_)) {
+        return json!({
+            "@type": "searchChatMessages",
+            "chat_id": chat,
+            "query": "",
+            "sender_id": null,
+            "from_message_id": from,
+            "offset": 0,
+            "limit": HISTORY_PAGE,
+            "filter": {"@type": "searchMessagesFilterUnreadMention"},
+            "@extra": format!("history:{chat}:{}:{from}", walk.word()),
+        }).to_string();
+    }
     json!({
         "@type": "getChatHistory",
         "chat_id": chat,
