@@ -743,9 +743,17 @@ pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
                 let raw = rfc822(m);
                 c.execute(
                     "UPDATE message SET raw = ?2 WHERE id = ?1",
-                    rusqlite::params![id, raw.as_bytes()],
+                    rusqlite::params![
+                        id,
+                        super::content::compact(raw.as_bytes())
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+                    ],
                 )?;
-                super::parts::attach_tx(c, id, &super::sync::parse_mail(raw.as_bytes()).attachments)?;
+                super::parts::attach_tx(
+                    c,
+                    id,
+                    &super::sync::parse_mail(raw.as_bytes()).attachments,
+                )?;
             }
             // The uid the fake server handed the same letter: one per
             // folder, in this order, from one.

@@ -8,10 +8,9 @@
 //! outbox row shares that id, which means one pending send per compose and an
 //! undo entity (`outbox:N`) that exists before the row does.
 //!
-//! One rule about column order is load-bearing: `raw` is a blob of a hundred
-//! kilobytes and SQLite decodes a record left to right, so everything a list
-//! reads sits *before* it. A query that asked for `thread` past the letter
-//! would walk the overflow chain of every mail it touched.
+//! SQLite decodes records left to right, so everything a list reads sits
+//! before `raw`. It now holds a content snapshot without file bodies; older
+//! stores held full RFC822 messages, converted by the attachment derivation.
 
 use kernel::app::{Schema, Step};
 
@@ -193,9 +192,8 @@ CREATE TABLE draft_file(
 /// `attachment` is **derived**, like the HTML reading: one row per part of a
 /// mail's `raw`, holding the description a list and a card need — name, media
 /// type, size, the Content-ID an inline part wears — and `part`, the index
-/// [`part_bytes`](super::sync::part_bytes) reads the bytes back by. The bytes
-/// themselves stay in `raw`; a second copy of every attachment in the mailbox
-/// is exactly the cost this design refuses.
+/// the stored content snapshot maps to an IMAP section. Attachment bodies are
+/// downloaded on demand into the local file cache, never into SQLite.
 ///
 /// `attachment_scan` is where the walk's version is written down, one row per
 /// mail. A **table** rather than one `meta` key, because the question is per

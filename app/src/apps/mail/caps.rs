@@ -52,6 +52,8 @@ pub struct RemoteMail {
     pub unread: bool,
     /// The `$Forwarded` keyword — set by this app or by another client.
     pub forwarded: bool,
+    /// The content snapshot returned by a mailbox fetch. The fake server
+    /// itself holds RFC822 here and compacts it at the fetch boundary.
     pub raw: Vec<u8>,
 }
 
@@ -266,6 +268,17 @@ pub trait Imap {
         uids: &[u32],
     ) -> Result<Vec<RemoteMail>, String>;
 
+    /// Fetch just one MIME section without marking the message read.
+    /// Check UIDVALIDITY first: an old UID must never return another mail.
+    fn part(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uidvalidity: u32,
+        uid: u32,
+        section: &str,
+    ) -> Result<Vec<u8>, String>;
+
     /// The uids in the folder: every one, those without `\Seen`, or those
     /// wearing `$Forwarded`.
     ///
@@ -386,6 +399,8 @@ pub struct FakeServer {
     /// How many letters this account has handed to a fetch — what a test
     /// counts to see that a folder already mirrored costs no round trip.
     pub fetched: usize,
+    /// Attachment section requests, separate from mailbox mirroring.
+    pub part_fetches: Vec<(String, u32, String)>,
     /// The backfill batches it was asked for, in order: `(folder, uids)`.
     /// A test reads them to see a folder arrive newest-first, a batch at a
     /// time.
@@ -501,7 +516,7 @@ impl FakeServers {
 
     /// The same servers as another world sees them: the same mail, sessions
     /// of its own. What [`install`] hands each world it builds.
-    fn for_world(&self) -> FakeServers {
+    pub(super) fn for_world(&self) -> FakeServers {
         FakeServers {
             servers: self.servers.clone(),
             world: WORLDS.fetch_add(1, Ordering::Relaxed),
@@ -659,7 +674,11 @@ impl Imap for FakeServers {
     fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
         self.live(account, |s| {
             let f = s.get(folder)?;
-            let out: Vec<RemoteMail> = f.2.iter().filter(|m| m.uid >= from).cloned().collect();
+            let out: Vec<RemoteMail> =
+                f.2.iter()
+                    .filter(|m| m.uid >= from)
+                    .map(compact_mail)
+                    .collect::<Result<_, _>>()?;
             s.fetched += out.len();
             Ok(out)
         })
@@ -676,8 +695,8 @@ impl Imap for FakeServers {
             let out: Vec<RemoteMail> =
                 f.2.iter()
                     .filter(|m| uids.contains(&m.uid))
-                    .cloned()
-                    .collect();
+                    .map(compact_mail)
+                    .collect::<Result<_, _>>()?;
             s.fetched += out.len();
             s.backfills.push((folder.to_string(), uids.to_vec()));
             Ok(out)
@@ -696,6 +715,30 @@ impl Imap for FakeServers {
                 })
                 .map(|m| m.uid)
                 .collect())
+        })
+    }
+
+    fn part(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uidvalidity: u32,
+        uid: u32,
+        section: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.live(account, |s| {
+            let f = s.get(folder)?;
+            if f.0 != uidvalidity {
+                return Err("mailbox changed; sync before downloading this attachment".into());
+            }
+            let m =
+                f.2.iter()
+                    .find(|m| m.uid == uid)
+                    .ok_or("message is no longer on the server")?;
+            let bytes = super::content::section_bytes(&m.raw, section)
+                .ok_or("attachment is no longer on the server")?;
+            s.part_fetches.push((folder.into(), uid, section.into()));
+            Ok(bytes)
         })
     }
 
@@ -804,6 +847,13 @@ impl Imap for FakeServers {
     }
 }
 
+fn compact_mail(m: &RemoteMail) -> Result<RemoteMail, String> {
+    Ok(RemoteMail {
+        raw: super::content::compact(&m.raw)?,
+        ..m.clone()
+    })
+}
+
 impl Smtp for FakeServers {
     fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
         let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
@@ -894,6 +944,11 @@ impl OAuth for FakeServers {
 pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     if real_run(mode, env) {
         super::real::install(env, caps);
+        caps.insert::<super::parts::Reader>(Box::new(super::parts::Reader {
+            env: env.clone(),
+            mode,
+            fake: None,
+        }));
         return;
     }
     // A world of its own: its sessions are its own, as the real backend's
@@ -903,6 +958,11 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Imap>(Box::new(servers.clone()));
     caps.insert::<dyn Smtp>(Box::new(servers.clone()));
     caps.insert::<dyn OAuth>(Box::new(servers.clone()));
+    caps.insert::<super::parts::Reader>(Box::new(super::parts::Reader {
+        env: env.clone(),
+        mode,
+        fake: Some(servers.clone()),
+    }));
     caps.insert::<FakeServers>(Box::new(servers));
 }
 

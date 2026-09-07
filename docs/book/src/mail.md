@@ -181,12 +181,19 @@ has no disk path, so its one verb is `open` (`cmd+o`), which writes the part to
 a per-part directory under the system temporary directory, keeping the sender's
 filename, and asks the operating system to open it.
 
-The bytes are never stored twice. A letter's raw MIME already holds every part;
-an `attachment` row is the description a list and a card need, plus the part
-index the bytes are read back by. Those rows are derived and versioned by the
-walk that made them, and the version is recorded per letter, so a letter that
-arrives through device sync gets its parts scanned by the sender worker. The
-bytes themselves are read on a worker, not while drawing.
+Attachment bytes stay out of SQLite and device sync. `message.raw` holds a
+versioned content snapshot: the MIME reading with file bodies removed, plus
+each file's description, decoding headers, and IMAP section number. Older
+stored letters are converted on open. The `attachment` rows remain derived
+from that snapshot, with stable part indices for existing cards.
+
+Previews, inline images, and `open` download the requested section over IMAP
+on a worker. Files use the same bounded, least-recently-used local cache as
+Telegram, so a cached file works offline and an evicted file downloads again
+when needed. Cache identity includes the account, server folder, UIDVALIDITY,
+UID, and section; a stale UID generation is refused. The cache's SQLite index
+holds filenames and sizes only; file bytes stay on disk. File sizes shown from
+the server's MIME structure are estimates.
 
 ## Carrying a file
 
@@ -301,10 +308,11 @@ account's own jobs are not left waiting behind a first sync, and comes back
 five seconds later for the rest. A UIDVALIDITY reset re-ingests that folder
 from scratch, the same way.
 
-Letters are fetched with `BODY.PEEK[]`, not `RFC822`: mirroring a folder is
-not reading it, and a plain fetch would mark every unread letter it walked
-`\Seen` on the server. A session is kept between passes and checked with a
-`NOOP` rather than signed in again, because providers count logins.
+Sync fetches headers and `BODYSTRUCTURE`, followed by `BODY.PEEK[section]`
+for reading text only. File sections are fetched on demand with `PEEK` too,
+which leaves the server's `\Seen` flag alone. A session is kept between passes
+and checked with a `NOOP` rather than signed in again, because providers count
+logins.
 
 Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
 and trash. Each of the five has a mailbox panel. Folders without one of these

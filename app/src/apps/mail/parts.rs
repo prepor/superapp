@@ -1,12 +1,8 @@
-//! What a letter carries: the `attachment` rows derived from its `raw`, the
-//! bytes read back out of it, and where a part lands when it is opened.
+//! Attachment descriptions, on-demand IMAP downloads, and the local file cache.
 //!
-//! The bytes are **not** stored twice. A letter's `raw` already holds every
-//! part; a row here is the description a list and a card need — name, media
-//! type, size, the Content-ID an inline part wears — plus `part`, the index
-//! [`part_bytes`](super::sync::part_bytes) reads the bytes back by. A second
-//! copy of every attachment in the mailbox is exactly the cost this design
-//! refuses.
+//! SQLite holds the reading and each file's MIME description and section.
+//! File bodies live on the server and in the kernel's bounded blob cache,
+//! shared with Telegram. Neither downloads nor cache paths are replicated.
 //!
 //! The rows are derived, so they are versioned by the walk that made them
 //! ([`ATTACH_VERSION`]) rather than by the schema counter, and
@@ -24,16 +20,14 @@ use super::model::{self, MailId};
 
 /// Which walk over `raw` the stored rows came out of. Bump it and every
 /// store re-derives every letter's parts on its next open.
-pub const ATTACH_VERSION: i64 = 1;
+pub const ATTACH_VERSION: i64 = 2;
 
-/// One part of a letter, as the panels see it: the row
-/// [`sync`](super::sync) derived from the mail's `raw`. The bytes are not
-/// here — [`part`] reads them back out of the letter when a card asks.
+/// One part's description, derived from the stored content snapshot.
+/// [`part`] retrieves its bytes from the cache or the server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attachment {
     pub message: MailId,
-    /// Which part of the letter it is (see
-    /// [`part_bytes`](super::sync::part_bytes)).
+    /// Its original MIME parser index, retained across content conversion.
     pub at: u32,
     pub name: String,
     pub mime: String,
@@ -128,13 +122,185 @@ pub fn thread_carriers(store: &Store, id: MailId) -> std::collections::BTreeSet<
         .collect()
 }
 
-/// One part's bytes, out of the letter that carries them. Reads the whole
-/// `raw` and walks its MIME, so it belongs on a thread and never in a draw;
-/// [`pictures`](super::widgets::pictures) asks for it the way it asks for a
-/// letter's own images.
-#[must_use]
-pub fn part(store: &Store, a: &Attachment) -> Option<Vec<u8>> {
-    super::sync::part_bytes(&model::raw(store, a.message)?, a.at)
+/// One part's decoded bytes. Cache and network I/O belong on a worker;
+/// neither a preview nor an open performs this on the live UI thread.
+pub fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u8>, String> {
+    let raw = model::raw(world.store(), a.message).ok_or("message is no longer stored")?;
+    let content = super::content::Content::read(&raw)?;
+    let remote = content
+        .parts
+        .iter()
+        .find(|p| p.part.at == a.at)
+        .ok_or("attachment is no longer in the message")?;
+    download(world, a.message, remote)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Location {
+    account: i64,
+    email: String,
+    host: String,
+    folder: String,
+    validity: u32,
+    uid: u32,
+}
+
+fn location(store: &Store, mail: MailId) -> Result<Location, String> {
+    store
+        .conn()
+        .query_row(
+            "SELECT a.id, a.email, COALESCE(a.imap_host, ''), f.name, f.uidvalidity, s.uid
+         FROM message m JOIN account a ON a.id = m.account
+         JOIN server_msg s ON s.message = m.id JOIN folder f ON f.id = s.folder
+         WHERE m.id = ?1",
+            [mail],
+            |r| {
+                Ok(Location {
+                    account: r.get(0)?,
+                    email: r.get(1)?,
+                    host: r.get(2)?,
+                    folder: r.get(3)?,
+                    validity: r.get(4)?,
+                    uid: r.get(5)?,
+                })
+            },
+        )
+        .map_err(|_| {
+            "message location is unavailable; sync before downloading this attachment".into()
+        })
+}
+
+impl Location {
+    fn key(&self, section: &str) -> String {
+        // Length-delimited fields avoid collisions between accounts, folder
+        // names and parts. UIDVALIDITY protects against server UID reuse.
+        let identity = serde_json::to_vec(&(
+            &self.host,
+            &self.email,
+            &self.folder,
+            self.validity,
+            self.uid,
+            section,
+        ))
+        .unwrap();
+        let digest = ring::digest::digest(&ring::digest::SHA256, &identity);
+        use std::fmt::Write as _;
+        let mut key = "mail:".to_string();
+        for byte in digest.as_ref() {
+            let _ = write!(key, "{byte:02x}");
+        }
+        key
+    }
+}
+
+/// A process-local image namespace that changes when the server identity
+/// changes, and also distinguishes independent stores with the same row ids.
+pub fn image_scope(store: &Store, mail: MailId) -> String {
+    let identity = location(store, mail).map(|l| l.key("")).unwrap_or_default();
+    format!(
+        "m{mail}-{:p}-{identity}",
+        std::sync::Arc::as_ptr(&store.db())
+    )
+}
+
+pub fn download(
+    world: &kernel::effect::World,
+    mail: MailId,
+    remote: &super::content::RemotePart,
+) -> Result<Vec<u8>, String> {
+    use kernel::caps::Blobs;
+    let loc = location(world.store(), mail)?;
+    let key = loc.key(&remote.section);
+    if let Some(path) = world
+        .with_cap::<dyn Blobs, _>(|b| b.get(&key))
+        .ok()
+        .flatten()
+    {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Ok(bytes);
+        }
+        let _ = world.with_cap::<dyn Blobs, _>(|b| b.remove(&key));
+    }
+    // The bundled demo is available even in a library mount with no network
+    // capabilities. Its fixtures are compiled assets, never database blobs.
+    if loc.email == super::seed::ADDRESS && loc.host.is_empty() {
+        if let Some(m) = model::mail(world.store(), mail) {
+            if let Some((_, bytes)) = super::seed::parts_of(&m.head.subject)
+                .iter()
+                .find(|(name, _)| *name == remote.part.name)
+            {
+                return Ok(bytes.to_vec());
+            }
+        }
+    }
+    super::sync::connect(world, loc.account)?;
+    let encoded = world.run(&FetchPart {
+        loc: &loc,
+        section: &remote.section,
+    })?;
+    let bytes = super::content::decode(&remote.headers, &encoded)?;
+    if location(world.store(), mail)? != loc {
+        return Err("message moved while downloading; try again".into());
+    }
+    world.with_cap::<dyn Blobs, _>(|b| b.put(&key, &bytes))??;
+    Ok(bytes)
+}
+
+struct FetchPart<'a> {
+    loc: &'a Location,
+    section: &'a str,
+}
+
+impl kernel::effect::Effect for FetchPart<'_> {
+    const KIND: &'static str = "mail-part";
+    type Reply = Vec<u8>;
+    fn describe(&self) -> String {
+        format!(
+            "download part {} of uid {} in {}",
+            self.section, self.loc.uid, self.loc.folder
+        )
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn perform(&self, cx: &mut kernel::effect::Ctx<'_>) -> Result<Vec<u8>, String> {
+        cx.cap::<dyn super::caps::Imap>()?.part(
+            self.loc.account,
+            &self.loc.folder,
+            self.loc.validity,
+            self.loc.uid,
+            self.section,
+        )
+    }
+}
+
+/// Rebuild the requesting world's capabilities on the picture reader thread.
+/// Fakes share the exact same server, so tests can take a download offline.
+#[derive(Clone)]
+pub struct Reader {
+    pub env: kernel::app::Env,
+    pub mode: kernel::app::Mode,
+    pub fake: Option<super::caps::FakeServers>,
+}
+
+impl Reader {
+    pub fn world(
+        &self,
+        db: std::sync::Arc<kernel::store::Db>,
+    ) -> Result<kernel::effect::World, String> {
+        static APPS: &[&dyn kernel::app::App] = &[&super::MAIL];
+        let store = Store::with_db(db).map_err(|e| e.to_string())?;
+        let w = kernel::app::world_for(APPS, store, self.mode, &self.env);
+        if let Some(fake) = &self.fake {
+            let fake = fake.for_world();
+            w.caps(|caps| {
+                caps.insert::<dyn super::caps::Imap>(Box::new(fake.clone()));
+                caps.insert::<dyn super::caps::OAuth>(Box::new(fake.clone()));
+                caps.insert::<super::caps::FakeServers>(Box::new(fake));
+            });
+        }
+        Ok(w)
+    }
 }
 
 /// Records what a letter carries, and marks the mail walked at this build's
@@ -236,20 +402,34 @@ pub fn scan(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
-    let rows: Vec<(MailId, Option<Vec<u8>>)> = conn
+    let rows: Vec<MailId> = conn
         .prepare(
-            "SELECT m.id, m.raw FROM message m
+            "SELECT m.id FROM message m
              LEFT JOIN attachment_scan s ON s.message = m.id
              WHERE s.version IS NULL OR s.version != ?1",
         )?
-        .query_map([ATTACH_VERSION], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([ATTACH_VERSION], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, raw) in rows {
+    for id in rows {
+        // Convert one legacy message at a time: an existing mailbox can
+        // contain gigabytes of attachments before this conversion.
+        let raw: Option<Vec<u8>> =
+            conn.query_row("SELECT raw FROM message WHERE id = ?1", [id], |r| r.get(0))?;
         // No raw is not the same as no parts: a seeded letter writes its own
         // rows and this must not take them away, so only a mail there *is*
         // something to walk is rewritten.
         match raw {
-            Some(raw) => attach_tx(conn, id, &super::sync::parse_mail(&raw).attachments)?,
+            Some(raw) => {
+                let compact = super::content::compact(&raw)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                attach_tx(conn, id, &super::sync::parse_mail(&compact).attachments)?;
+                if raw != compact {
+                    conn.execute(
+                        "UPDATE message SET raw = ?2 WHERE id = ?1",
+                        rusqlite::params![id, compact],
+                    )?;
+                }
+            }
             None => mark_scanned_tx(conn, id)?,
         }
     }

@@ -249,9 +249,8 @@ fn a_discard_and_its_undo_carry_the_files_with_the_text() {
         .is_empty());
 }
 
-/// A letter's parts are derived from its `raw`, and the bytes come back out
-/// of it: the seed's two carriers are the walk's proof, since their `raw` is
-/// a real `multipart/mixed` and nothing wrote the rows by hand.
+/// The seed stores file descriptions in its content snapshot; bytes come
+/// from the fake IMAP server through the same cache path as a real download.
 #[test]
 fn a_letter_lists_its_parts_and_yields_their_bytes() {
     let (s, _clock) = session();
@@ -271,8 +270,8 @@ fn a_letter_lists_its_parts_and_yields_their_bytes() {
         kernel::panel::PanelId::new(panels::Card::TAG, ["1".to_string(), a.at.to_string()])
     );
 
-    // The bytes are not stored twice: they come back out of the letter.
-    let bytes = parts::part(store, a).expect("the part is in the letter");
+    // The content snapshot contains descriptors; IMAP supplies the bytes.
+    let bytes = parts::part(s.world(), a).expect("the part downloads from IMAP");
     assert!(
         String::from_utf8_lossy(&bytes).starts_with("line,aug,sep,delta"),
         "{:?}",

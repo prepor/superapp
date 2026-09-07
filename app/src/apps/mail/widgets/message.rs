@@ -15,7 +15,6 @@
 //! of a portal list are rebuilt every draw, and a synthesized press has to
 //! land the way a finger does.
 
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use kernel::nav::Nav;
@@ -65,10 +64,6 @@ pub struct MessagePanel {
     view: View,
     #[rust]
     rows: Vec<RowHit>,
-    /// Mails whose own images (`cid:` parts) have been asked for: the raw is
-    /// read and its MIME walked once per panel.
-    #[rust]
-    pictured: HashSet<MailId>,
 }
 
 impl Widget for MessagePanel {
@@ -160,14 +155,11 @@ impl Widget for MessagePanel {
             .label(cx, ids!(to_lbl))
             .set_text(cx, msgs.first().map_or("", |t| t.mail.to.as_str()));
 
-        // A letter's own images — the `cid:` parts of its raw — are asked for
-        // as its rows open: the read and the MIME walk happen off the frame,
-        // and the parts are filed under the names the narrowing wrote, which
-        // the image items then look themselves up by.
+        // Opening a reading requests its inline files from the cache or
+        // IMAP. Pictures deduplicates these asks and retries failed downloads.
         for (i, t) in msgs.iter().enumerate() {
             let mid = t.mail.head.id;
             if !open[i]
-                || self.pictured.contains(&mid)
                 || !t
                     .mail
                     .html
@@ -176,8 +168,9 @@ impl Widget for MessagePanel {
             {
                 continue;
             }
-            self.pictured.insert(mid);
-            pictures::want_cid_parts(cx, &store, mid);
+            if let Some(s) = scope.data.get_mut::<Session>() {
+                pictures::want_cid_parts(cx, s.world(), mid);
+            }
         }
 
         let n = msgs.len();
@@ -196,7 +189,15 @@ impl Widget for MessagePanel {
             while let Some(idx) = list.next_visible_item(cx) {
                 let Some(t) = msgs.get(idx) else { continue };
                 let row = list.item(cx, idx, live_id!(msg));
-                populate(cx, &row, t, open[idx], quoted[idx], &atts[idx], props.slot);
+                populate(
+                    cx,
+                    &row,
+                    t,
+                    open[idx],
+                    quoted[idx],
+                    &atts[idx],
+                    (props.slot, &parts::image_scope(&store, t.mail.head.id)),
+                );
                 row.draw_all(cx, scope);
                 drawn.push((idx, row));
             }
@@ -386,8 +387,9 @@ fn populate(
     open: bool,
     quoted: bool,
     atts: &[Attachment],
-    slot: kernel::layout::SlotId,
+    context: (kernel::layout::SlotId, &str),
 ) {
+    let (slot, cid_scope) = context;
     let m = &t.mail;
     let (line, err) = preview(m);
     row.label(cx, ids!(head.name_lbl)).set_text(cx, &writer(m));
@@ -435,7 +437,7 @@ fn populate(
     let (own_text, own_html, quote): (String, String, Option<String>) = if !open {
         (String::new(), String::new(), None)
     } else if let Some(h) = &m.html {
-        let h = html::scope_cids(h, &format!("m{}", m.head.id));
+        let h = html::scope_cids(h, cid_scope);
         let (own, q) = reading::split_quote_html(&h);
         (String::new(), own, q)
     } else {

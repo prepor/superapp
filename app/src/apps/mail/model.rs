@@ -390,10 +390,9 @@ pub fn mail(store: &Store, id: MailId) -> Option<MailFull> {
     store.rows(&Q_MAIL, &[Val::I(id)], full_row).first().cloned()
 }
 
-/// The mail as it arrived, for what its reading refers to but does not hold.
-/// `None` for a letter the seed wrote by hand. Read straight off the
-/// connection rather than through the query cache — a letter with parts is
-/// megabytes, and a panel wants it once.
+/// The stored content snapshot: MIME reading and remote file descriptors.
+/// `None` for a letter the seed wrote by hand. Read off the connection;
+/// drawings use the derived columns and leave content decoding to workers.
 #[must_use]
 pub fn raw(store: &Store, id: MailId) -> Option<Vec<u8>> {
     store

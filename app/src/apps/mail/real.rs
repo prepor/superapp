@@ -18,12 +18,12 @@ use std::time::Duration;
 use kernel::app::{Capabilities, Env};
 use kernel::caps::{ClockSource, MemSecrets, Secrets, SecretsFactory};
 
+#[cfg(test)]
+use super::caps::Part;
 use super::caps::{
     Auth, Creds, FolderMeta, Imap, MailFlag, OAuth, Outgoing, RemoteFolder, RemoteMail, Smtp,
     UidSet, Watched,
 };
-#[cfg(test)]
-use super::caps::Part;
 use super::oauth;
 
 /// How early a cached access token is treated as spent, so a long sync
@@ -95,6 +95,21 @@ impl Imap for RealServers {
             return Ok(Vec::new());
         }
         self.session(account)?.fetch_set(folder, &seq_set(uids))
+    }
+
+    fn part(
+        &mut self,
+        account: i64,
+        folder: &str,
+        uidvalidity: u32,
+        uid: u32,
+        section: &str,
+    ) -> Result<Vec<u8>, String> {
+        let session = self.session(account)?;
+        if session.select(folder)?.uidvalidity != uidvalidity {
+            return Err("mailbox changed; sync before downloading this attachment".into());
+        }
+        session.section(uid, section)
     }
 
     fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
@@ -370,7 +385,7 @@ fn seq_set(uids: &[u32]) -> String {
 /// suppresses redundant SELECTs — that optimisation stays private.
 mod session {
     use super::{Auth, FolderMeta, MailFlag, RemoteFolder, RemoteMail, UidSet, Watched};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     use imap::extensions::idle::WaitOutcome;
@@ -388,6 +403,18 @@ mod session {
 
     fn s<E: std::fmt::Display>(e: E) -> String {
         format!("{e}")
+    }
+
+    fn section_path(section: &str) -> Result<imap_proto::types::SectionPath, String> {
+        let ids: Vec<u32> = section
+            .split('.')
+            .map(|p| p.parse::<u32>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| "invalid MIME section")?;
+        if ids.is_empty() || ids.contains(&0) {
+            return Err("invalid MIME section".into());
+        }
+        Ok(imap_proto::types::SectionPath::Part(ids, None))
     }
 
     /// The IMAP keyword for "passed on" (registered in RFC 5788's list):
@@ -549,43 +576,71 @@ mod session {
             self.fetch_set(name, &format!("{from}:*"))
         }
 
-        /// One `UID FETCH` over any sequence set — `12:*` for new mail,
-        /// `1:200` and its like for the backfill.
-        ///
-        /// `BODY.PEEK[]` rather than `RFC822`, which is the same bytes
-        /// without the `\Seen` a plain fetch sets: mirroring a folder is
-        /// not reading it, and a backfill that walked a mailbox's whole
-        /// past would otherwise mark every unread letter in it read — on
-        /// the server, for every client the person owns.
+        /// Fetch the envelope and MIME structure, then only reading sections.
+        /// PEEK keeps both mirroring and attachment downloads from setting Seen.
         pub fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
             self.ensure(name)?;
             let fetches = self
                 .session
-                .uid_fetch(set, "(UID FLAGS BODY.PEEK[])")
+                .uid_fetch(set, "(UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])")
                 .map_err(s)?;
-            let mut out: Vec<RemoteMail> = fetches
-                .iter()
-                .filter_map(|f| {
-                    let uid = f.uid?;
-                    let raw = f.body().or_else(|| f.text())?;
-                    let unread = !f
-                        .flags()
-                        .iter()
-                        .any(|fl| matches!(fl, imap::types::Flag::Seen));
-                    let forwarded = f.flags().iter().any(|fl| {
-                        matches!(fl, imap::types::Flag::Custom(k)
+            let mut out = Vec::new();
+            for f in fetches.iter() {
+                let Some(uid) = f.uid else { continue };
+                let plan = super::super::content::FetchPlan::new(
+                    f.header().ok_or("server omitted message headers")?,
+                    f.bodystructure().ok_or("server omitted MIME structure")?,
+                )?;
+                let unread = !f
+                    .flags()
+                    .iter()
+                    .any(|fl| matches!(fl, imap::types::Flag::Seen));
+                let forwarded = f.flags().iter().any(|fl| {
+                    matches!(fl, imap::types::Flag::Custom(k)
                             if k.eq_ignore_ascii_case(FORWARDED))
-                    });
-                    Some(RemoteMail {
-                        uid,
-                        unread,
-                        forwarded,
-                        raw: raw.to_vec(),
-                    })
-                })
-                .collect();
+                });
+                let mut bodies = HashMap::new();
+                if !plan.readings.is_empty() {
+                    let query = format!(
+                        "(UID {})",
+                        plan.readings
+                            .iter()
+                            .map(|p| format!("BODY.PEEK[{p}]"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    let replies = self.session.uid_fetch(uid.to_string(), query).map_err(s)?;
+                    for reply in replies.iter().filter(|r| r.uid == Some(uid)) {
+                        for section in &plan.readings {
+                            if let Some(bytes) = reply.section(&section_path(section)?) {
+                                bodies.insert(section.clone(), bytes.to_vec());
+                            }
+                        }
+                    }
+                }
+                out.push(RemoteMail {
+                    uid,
+                    unread,
+                    forwarded,
+                    raw: plan.finish(&bodies)?,
+                });
+            }
             out.sort_by_key(|m| m.uid);
             Ok(out)
+        }
+
+        pub fn section(&mut self, uid: u32, section: &str) -> Result<Vec<u8>, String> {
+            let path = section_path(section)?;
+            let replies = self
+                .session
+                .uid_fetch(uid.to_string(), format!("(UID BODY.PEEK[{section}])"))
+                .map_err(s)?;
+            replies
+                .iter()
+                .filter(|f| f.uid == Some(uid))
+                .find_map(|f| f.section(&path))
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "attachment is no longer on the server".into())
         }
 
         pub fn uids(&mut self, name: &str, which: UidSet) -> Result<HashSet<u32>, String> {
@@ -628,12 +683,7 @@ mod session {
             Ok(yes)
         }
 
-        pub fn move_uid(
-            &mut self,
-            from: &str,
-            to: &str,
-            uid: u32,
-        ) -> Result<Option<u32>, String> {
+        pub fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String> {
             self.ensure(from)?;
             self.session.uid_mv(uid.to_string(), to).map_err(s)?;
             // The crate acks the MOVE but does not surface COPYUID; the new
@@ -667,6 +717,59 @@ mod session {
                 .finish()
                 .map_err(s)?;
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        /// Drive the real IMAP adapter against a scripted server, including
+        /// literal section responses. Any eager attachment fetch fails the
+        /// command assertion before the server provides those bytes.
+        #[test]
+        fn sync_fetches_readings_and_a_download_fetches_only_its_section() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut io = BufReader::new(socket);
+                io.get_mut().write_all(b"* OK test server\r\n").unwrap();
+                let header = "From: me@example.org\r\nSubject: remote\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n";
+                let structure = "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"file.bin\") NIL NIL \"BASE64\" 8) \"MIXED\" (\"BOUNDARY\" \"x\"))";
+                let steps = [
+                    ("LOGIN \"test\" \"password\"", String::new()),
+                    ("SELECT \"INBOX\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] current\r\n* OK [UIDNEXT 43] next\r\n".into()),
+                    ("UID FETCH 42 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", format!("* 1 FETCH (UID 42 FLAGS () BODYSTRUCTURE {structure} BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len())),
+                    ("UID FETCH 42 (UID BODY.PEEK[1])", "* 1 FETCH (UID 42 BODY[1] {5}\r\nhello)\r\n".into()),
+                    ("UID FETCH 42 (UID BODY.PEEK[2])", "* 1 FETCH (UID 42 BODY[2] {8}\r\naGVsbG8=)\r\n".into()),
+                ];
+                for (expected, reply) in steps {
+                    let mut line = String::new();
+                    io.read_line(&mut line).unwrap();
+                    let (tag, command) = line.trim_end().split_once(' ').expect("command with tag");
+                    assert_eq!(command, expected);
+                    write!(io.get_mut(), "{reply}{tag} OK completed\r\n").unwrap();
+                }
+            });
+            let socket = TcpStream::connect(address).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut client = imap::Client::new(Box::new(socket) as Box<dyn imap::ImapConnection>);
+            client.read_greeting().unwrap();
+            let session = client.login("test", "password").map_err(|(e, _)| e).unwrap();
+            let mut adapter = Imap { session, selected: None, idle: None };
+            let mails = adapter.fetch_set("INBOX", "42").unwrap();
+            assert_eq!(mails.len(), 1);
+            assert!(mails[0].unread);
+            let parsed = super::super::super::sync::parse_mail(&mails[0].raw);
+            assert_eq!(parsed.body, "hello");
+            assert_eq!(parsed.attachments[0].name, "file.bin");
+            assert_eq!(adapter.section(42, "2").unwrap(), b"aGVsbG8=");
+            assert!(adapter.section(42, "2] BODY[]").is_err());
+            server.join().unwrap();
         }
     }
 }

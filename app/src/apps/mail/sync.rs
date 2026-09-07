@@ -18,13 +18,13 @@ use kernel::time::fmt_date;
 use rusqlite::Transaction;
 
 use super::accounts;
-use super::parts;
 use super::caps::{Creds, OAuth, RemoteMail, UidSet, Watched};
 use super::effects::{
     account_entity, Backfill, Connect, Disconnect, Fetch, Folders, Forwarded, Meta, Move, Seen,
     Submit, Uids, Watch,
 };
 use super::model::{self, topic_of};
+use super::parts;
 
 /// How many older messages one pass reaches back for. Nothing is dropped: a
 /// folder is mirrored entire, newest first, a batch a turn — the batching is
@@ -303,7 +303,9 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
     for rf in w.run(&Folders { account })? {
-        let Some(role) = rf.role.clone() else { continue };
+        let Some(role) = rf.role.clone() else {
+            continue;
+        };
 
         // The folder row and what we last knew about it — a short write, no
         // network in sight. Owned copies cross to the writer thread; the
@@ -596,7 +598,9 @@ fn ingest_message(
     if exists {
         return Ok(());
     }
-    let p = parse_mail(&m.raw);
+    let raw = super::content::compact(&m.raw)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    let p = parse_mail(&raw);
     if !p.message_id.is_empty() {
         // A uid-less twin in this account is the same mail, post-move.
         let orphan: Option<i64> = tx
@@ -634,7 +638,7 @@ fn ingest_message(
             p.topic,
             m.forwarded,
             p.html,
-            m.raw,
+            raw,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -680,8 +684,8 @@ pub struct ParsedMail {
     /// The subject with its reply and forward prefixes stripped.
     pub topic: String,
     /// The parts the letter carries beside its readings — what the message
-    /// panel lists and a card opens. The bytes stay in `raw`; only the
-    /// description is stored (see [`parts`](super::parts)).
+    /// panel lists and a card opens. Only the description is stored;
+    /// bytes download separately (see [`parts`](super::parts)).
     pub attachments: Vec<Part>,
 }
 
@@ -693,6 +697,8 @@ pub struct ParsedMail {
 /// quoting a reply wants the text.
 #[must_use]
 pub fn parse_mail(raw: &[u8]) -> ParsedMail {
+    let content = super::content::Content::read(raw).ok();
+    let raw = content.as_ref().map_or(raw, |c| c.reading.as_slice());
     let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
         return ParsedMail {
             subject: "(unparseable message)".into(),
@@ -738,7 +744,21 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             references.push(id);
         }
     }
-    let attachments = parts_of(&msg, html.as_deref());
+    let attachments = content.as_ref().map_or_else(
+        || parts_of(&msg, html.as_deref()),
+        |c| {
+            c.parts
+                .iter()
+                .map(|p| p.part.clone())
+                .filter(|p| {
+                    p.cid.is_empty()
+                        || !html
+                            .as_deref()
+                            .is_some_and(|h| h.contains(&format!("cid:{}", p.cid)))
+                })
+                .collect()
+        },
+    );
     ParsedMail {
         from_name,
         from_email,
@@ -778,20 +798,19 @@ fn to_line(msg: &mail_parser::Message<'_>) -> String {
 /// ([`schema`](super::schema)).
 #[must_use]
 pub fn to_of(raw: &[u8]) -> String {
+    let content = super::content::Content::read(raw).ok();
+    let raw = content.as_ref().map_or(raw, |c| c.reading.as_slice());
     mail_parser::MessageParser::default()
         .parse_headers(raw)
         .map(|m| to_line(&m))
         .unwrap_or_default()
 }
 
-/// One part of a letter, as a row describes it. The bytes are not here:
-/// they live in the `raw` the store already keeps, and [`part_bytes`] reads
-/// them back by `at` — which is what keeps a mailbox one copy of itself
-/// rather than two.
-#[derive(Debug, Clone, PartialEq)]
+/// One part's description. Its index is stable across conversion to a
+/// content snapshot; the snapshot maps that index to its IMAP section.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Part {
-    /// Which part of the parsed message it is — the index [`part_bytes`]
-    /// reads back by.
+    /// Which part of the original parsed message it is.
     pub at: u32,
     /// What to call it: the `filename`, else the `name`, else a made-up one
     /// — a part with no name is still a part.
@@ -808,7 +827,7 @@ pub struct Part {
 /// `html` is the letter's reading: a part it already draws inline is not
 /// also an attachment, or a pasted screenshot would be listed under the
 /// picture of itself.
-fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
+pub(super) fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
     use mail_parser::MimeHeaders;
     let mut out = Vec::new();
     for at in msg.attachments.iter().copied() {
@@ -817,7 +836,7 @@ fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
         };
         let cid = norm_id(p.content_id().unwrap_or_default());
         // Drawn in the letter already: the `multipart/related` a composer
-        // writes around a pasted screenshot (see [`inline_images`]).
+        // writes around a pasted screenshot.
         if !cid.is_empty() && html.is_some_and(|h| h.contains(&format!("cid:{cid}"))) {
             continue;
         }
@@ -848,35 +867,10 @@ fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
 /// the raw no longer parses or no longer has that part — a row from a build
 /// whose walk numbered them differently, or a mail refetched.
 #[must_use]
+#[cfg(test)]
 pub fn part_bytes(raw: &[u8], at: u32) -> Option<Vec<u8>> {
     let msg = mail_parser::MessageParser::default().parse(raw)?;
     Some(msg.parts.get(at as usize)?.contents().to_vec())
-}
-
-/// The images a letter carries inside itself — its parts with a Content-ID
-/// and an image type, the `multipart/related` a composer writes around a
-/// pasted screenshot — as `(cid, bytes)`, brackets off: the names its HTML
-/// refers to them by (`src="cid:…"`).
-#[must_use]
-pub fn inline_images(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
-    use mail_parser::MimeHeaders;
-    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
-        return Vec::new();
-    };
-    msg.parts
-        .iter()
-        .filter_map(|p| {
-            let cid = p
-                .content_id()?
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>');
-            let image = p
-                .content_type()
-                .is_some_and(|t| t.ctype().eq_ignore_ascii_case("image"));
-            (image && !cid.is_empty()).then(|| (cid.to_string(), p.contents().to_vec()))
-        })
-        .collect()
 }
 
 /// One id out of an id header, as threading compares it: trimmed, and without
