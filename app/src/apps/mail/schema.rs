@@ -18,13 +18,14 @@ use kernel::app::{Schema, Step};
 /// Mail's ladder. Step one is the store shape this build was written
 /// against; step two is what a draft carries, which arrived with the compose
 /// panel's *attach*; step four is what a *letter* carries, and the draft rows
-/// as the send actually needs them.
+/// as the send actually needs them; step seven is `to_addr` for a store built
+/// before [`V1`] had it.
 ///
-/// The three derived steps are versioned by the walk that makes each rather
-/// than by the ladder's counter: an index, a narrowing and a set of derived
-/// rows are all reproducible from `message` at any moment, so the honest
-/// question is not "how old is this database" but "is this the shape this
-/// build wants".
+/// The four derived steps are versioned by the walk that makes each rather
+/// than by the ladder's counter: an index, a narrowing, a set of derived rows
+/// and a header read back out of the letters are all reproducible from
+/// `message` at any moment, so the honest question is not "how old is this
+/// database" but "is this the shape this build wants".
 pub static SCHEMA: Schema = Schema {
     app: "mail",
     steps: &[
@@ -45,6 +46,12 @@ pub static SCHEMA: Schema = Schema {
             key: "mail:attachments",
             version: super::parts::ATTACH_VERSION,
             rebuild: super::parts::scan,
+        },
+        Step::Run(add_to_addr),
+        Step::Derived {
+            key: "mail:recipients",
+            version: TO_VERSION,
+            rebuild: rebuild_recipients,
         },
     ],
 };
@@ -90,6 +97,12 @@ CREATE TABLE message(
   folder     INTEGER NOT NULL REFERENCES folder(id),
   from_name  TEXT NOT NULL DEFAULT '',
   from_email TEXT NOT NULL DEFAULT '',
+  -- The other end of the letter: its `To` line, as addresses, comma-joined
+  -- in header order. Beside the sender because it answers the same question
+  -- from the other side, and well before `html` — a letter in Sent is the
+  -- only one whose recipient the account cannot answer for, and the reader
+  -- asks for it by name. Empty where the letter named nobody.
+  to_addr    TEXT NOT NULL DEFAULT '',
   subject    TEXT NOT NULL DEFAULT '',
   date       REAL NOT NULL,
   unread     INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +237,79 @@ CREATE INDEX idx_draft_attachment_panel ON draft_attachment(panel, id);
 DROP TABLE draft_file;
 ";
 
+/// `to_addr`, for a store built before [`V1`] had it: the whole table
+/// rewritten in place — SQLite's twelve-step ALTER, less the steps a table
+/// nothing points at does not need.
+///
+/// `ADD COLUMN` would have been one line, and the column would have landed
+/// *past* `raw`: every read of a letter's TO line would then walk the
+/// overflow chain of a hundred-kilobyte blob to reach four bytes behind it,
+/// which is the one rule the top of this file calls load-bearing. A copy
+/// through a table of the right shape costs one rewrite, once, and leaves
+/// every store — new or old — the same `message`.
+///
+/// Nothing declares a foreign key *to* `message`, so the drop needs no
+/// deferral; what it does take with it are the table's own indexes and the
+/// FTS triggers, both put back after — the ids are copied as they stand, so
+/// the index over them is still the index of these letters.
+const V4: &str = "
+CREATE TABLE message_new(
+  id         INTEGER PRIMARY KEY,
+  account    INTEGER NOT NULL REFERENCES account(id),
+  folder     INTEGER NOT NULL REFERENCES folder(id),
+  from_name  TEXT NOT NULL DEFAULT '',
+  from_email TEXT NOT NULL DEFAULT '',
+  to_addr    TEXT NOT NULL DEFAULT '',
+  subject    TEXT NOT NULL DEFAULT '',
+  date       REAL NOT NULL,
+  unread     INTEGER NOT NULL DEFAULT 0,
+  body       TEXT NOT NULL DEFAULT '',
+  status     TEXT,
+  status_err INTEGER NOT NULL DEFAULT 0,
+  message_id TEXT,
+  thread     INTEGER,
+  topic      TEXT,
+  forwarded  INTEGER NOT NULL DEFAULT 0,
+  html       TEXT,
+  raw        BLOB
+);
+INSERT INTO message_new(id, account, folder, from_name, from_email, subject,
+                        date, unread, body, status, status_err, message_id,
+                        thread, topic, forwarded, html, raw)
+     SELECT id, account, folder, from_name, from_email, subject,
+            date, unread, body, status, status_err, message_id,
+            thread, topic, forwarded, html, raw FROM message;
+DROP TABLE message;
+ALTER TABLE message_new RENAME TO message;
+CREATE INDEX idx_message_folder_date ON message(folder, date DESC);
+CREATE INDEX idx_message_thread      ON message(thread);
+CREATE INDEX idx_message_mid         ON message(account, message_id);
+";
+
+/// Where the ladder stands with everything before [`V4`] climbed: the six
+/// steps a store made by the build before this one had run. What a test
+/// winds a store back to, to send it up the rewrite again.
+#[cfg(test)]
+pub const BEFORE_TO_ADDR: i64 = 6;
+
+/// Runs [`V4`] where it is owed. A fresh store climbs every step, this one
+/// included, and it already has the column from [`V1`] — so what is asked is
+/// the table rather than the counter, and a store of the right shape is left
+/// alone.
+fn add_to_addr(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('message') WHERE name = 'to_addr'")?
+        .exists([])?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(V4)?;
+    // The triggers went with the table they were on. The index itself is
+    // still good — the letters kept their ids — but it is rebuilt with them
+    // rather than trusted, which costs one walk on one store, once.
+    rebuild_fts(c)
+}
+
 /// Which walk over `message` the index came out of. Bump it and every store
 /// re-indexes on its next open.
 const FTS_VERSION: i64 = 1;
@@ -302,6 +388,31 @@ fn rebuild_html(c: &rusqlite::Connection) -> rusqlite::Result<()> {
         c.execute(
             "UPDATE message SET html = ?2 WHERE id = ?1",
             rusqlite::params![id, super::sync::parse_mail(&raw).html],
+        )?;
+    }
+    Ok(())
+}
+
+/// Which walk over the stored letters the TO lines came out of.
+const TO_VERSION: i64 = 1;
+
+/// Reads every stored letter's `To` line back out of the `raw` it keeps.
+///
+/// Derived, like the HTML reading: the header is in the letter, and the
+/// column is a cache of it — which is what makes a mailbox synced before
+/// this existed answer for its Sent folder on the next open rather than on
+/// the next sync. Only the headers are parsed; the body is a hundred
+/// kilobytes nobody here is asking about. A mail without `raw` — a seeded
+/// letter written by hand — keeps the line the seed wrote.
+fn rebuild_recipients(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, Vec<u8>)> = c
+        .prepare("SELECT id, raw FROM message WHERE raw IS NOT NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, raw) in rows {
+        c.execute(
+            "UPDATE message SET to_addr = ?2 WHERE id = ?1",
+            rusqlite::params![id, super::sync::to_of(&raw)],
         )?;
     }
     Ok(())

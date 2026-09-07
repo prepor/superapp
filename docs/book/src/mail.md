@@ -47,8 +47,9 @@ lists it.
 
 The filter tags are `@unread`, `@html`, `@from:`, `@subject:`, `@date`, and
 `@account:`. Free text matches the sender's name, the sender's address and the
-subject as a substring, and the letter's own text through the same FTS5 index
-the launcher searches, so a word you remember from a body finds the
+subject as a substring — in Sent, the recipients and the subject, so a list is
+searched by what it shows — and the letter's own text through the same FTS5
+index the launcher searches, so a word you remember from a body finds the
 conversation it was written in; a conversation matches when any of its letters
 does. The body goes through the index rather than a scan because a filter runs
 on every keystroke and a mailbox of twenty thousand letters is a couple of
@@ -73,7 +74,10 @@ shell keeps `cmd+l`; *clear* wears no letter because `esc` is the table's.
 Each mailbox row is a conversation with at least one message in that folder. It
 shows the participants newest speaker first with the account's own address as
 *me*, the message count, the subject of the oldest message with `Re:` and its
-translations stripped, and the date of the latest message in that folder. It is
+translations stripped, and the date of the latest message in that folder. Sent
+is the exception, and for the reason the rest is the rule: its letters all have
+the same sender, so a row there names who they *went* to — the addresses of the
+conversation's own sent letters, newest first. It is
 bold while any message is unread. The same conversation can appear in more than
 one mailbox, and the count covers the whole conversation either way.
 
@@ -92,9 +96,13 @@ has been read.
 
 A message panel shows the whole conversation oldest first, deduplicated by
 `Message-ID` so a reply that exists both in Sent and in the list appears once.
-The account's address is at the top. Each message is one row that folds open in
-place: closed, it shows the sender, the first content line or error, and the
-date. It opens unfolded from its first unread message down — the read run above
+The TO line of its first letter is at the top: the account's own address for a
+conversation that came in, and the person it went to for one this mailbox
+started — a letter's recipients are read off its own `To` header and kept on
+its row, because the account answers the first case and nothing but the
+letter answers the second. Each message is one row that folds open in place:
+closed, it shows the sender, the first content line or error, and the date.
+It opens unfolded from its first unread message down — the read run above
 that message is what folds, so catching up on a conversation is one read from
 where you left it, and a message under an unread one stays open whether or not
 another client already flagged it. A conversation with nothing unread opens on
@@ -121,7 +129,11 @@ action — one undo puts the mail back, reopens the reader on it, and takes the
 walk's own read mark back with it.
 
 A reply fills the recipient and subject, quotes the source message, and sends
-`In-Reply-To` and `References` headers. A forward starts with an empty
+`In-Reply-To` and `References` headers. The recipient is the letter's sender —
+or, over a letter this account itself sent, the people that letter went to,
+because answering one's own letter means writing to them again and not to
+oneself. The field is a comma-separated list either way, and a send addresses
+every name in it. A forward starts with an empty
 recipient, adds a forwarded-message header block, and keeps the reference chain
 without naming a reply parent. Sent mail then joins the same conversation. A
 forwarded source shows a muted mark once the letter has actually left, and only
