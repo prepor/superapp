@@ -2,7 +2,7 @@
 //!
 //! Entity offsets count UTF-16 code units, including in captions. Only links
 //! become markup; everything the sender wrote is escaped. Code entities stay
-//! literal, and plain URLs in older cached messages are recognized locally.
+//! literal. Only messages without entity metadata use local URL detection.
 
 use std::ops::Range;
 
@@ -99,9 +99,14 @@ pub fn destination(raw: &str) -> Option<String> {
     }
 }
 
-/// Render supported entities and auto-detected links without changing the
-/// original text used by search, copying a message, or the composer.
-pub fn html(text: &str, entities: &[Entity]) -> String {
+/// Received entities are authoritative, even when empty. Only `None` (older
+/// cached text or a local fixture edit) permits conservative link detection.
+pub fn html(text: &str, entities: Option<&[Entity]>) -> String {
+    let mut out = String::new();
+    let Some(entities) = entities else {
+        plain(&mut out, text);
+        return out;
+    };
     let mut spans: Vec<_> = entities
         .iter()
         .filter_map(|entity| {
@@ -121,23 +126,23 @@ pub fn html(text: &str, entities: &[Entity]) -> String {
         .collect();
     spans.sort_by_key(|(range, _)| (range.start, range.end));
 
-    let mut out = String::new();
     let mut cursor = 0;
     for (range, url) in spans {
         if range.start < cursor {
             continue;
         }
-        plain(&mut out, &text[cursor..range.start]);
+        escape(&mut out, &text[cursor..range.start]);
         span(&mut out, &text[range.clone()], url.as_deref());
         cursor = range.end;
     }
-    plain(&mut out, &text[cursor..]);
+    escape(&mut out, &text[cursor..]);
     out
 }
 
 fn plain(out: &mut String, text: &str) {
-    let mut finder = LinkFinder::new();
-    finder.url_must_have_scheme(false);
+    // Require a URL scheme: arbitrary dotted text such as main.rs, Dr.Smith
+    // and it.Then must not acquire a destination. Email detection stays on.
+    let finder = LinkFinder::new();
     let mut cursor = 0;
     for link in finder.links(text) {
         escape(out, &text[cursor..link.start()]);
@@ -208,48 +213,95 @@ mod tests {
     #[test]
     fn unicode_offsets_and_multiline_labels_keep_all_the_text() {
         let text = "👋 Привет\nworld <&>";
-        let out = html(text, &[link(3, 12, "https://example.org/?a=1&b=2")]);
+        let out = html(text, Some(&[link(3, 12, "https://example.org/?a=1&b=2")]));
         assert_eq!(out, "👋&#32;<a href=\"https://example.org/?a=1&amp;b=2\">Привет</a><br/><a href=\"https://example.org/?a=1&amp;b=2\">world</a>&#32;&lt;&amp;&gt;");
     }
 
     #[test]
-    fn plain_urls_email_and_telegram_links_leave_punctuation_outside() {
+    fn fallback_requires_a_scheme_and_leaves_punctuation_outside() {
         let out = html(
             "See (https://example.org/a_(b)), www.example.org.\nt.me/example and me@example.org",
-            &[],
+            None,
         );
-        assert_eq!(out, "See&#32;(<a href=\"https://example.org/a_(b)\">https://example.org/a_(b)</a>),&#32;<a href=\"https://www.example.org\">www.example.org</a>.<br/><a href=\"https://t.me/example\">t.me/example</a>&#32;and&#32;<a href=\"mailto:me@example.org\">me@example.org</a>");
+        assert_eq!(out, "See&#32;(<a href=\"https://example.org/a_(b)\">https://example.org/a_(b)</a>),&#32;www.example.org.<br/>t.me/example&#32;and&#32;<a href=\"mailto:me@example.org\">me@example.org</a>");
+        for text in ["main.rs", "notes.md", "report.pdf", "Dr.Smith", "it.Then"] {
+            assert_eq!(html(text, None), text);
+        }
+    }
+
+    #[test]
+    fn received_entities_are_authoritative_including_an_empty_list() {
+        let text =
+            "docs main.rs notes.md report.pdf Dr.Smith it.Then https://example.org me@example.org";
+        let mut escaped = String::new();
+        escape(&mut escaped, text);
+        assert_eq!(html(text, Some(&[])), escaped);
         assert_eq!(
-            destination("example.org:8080/notes"),
-            Some("https://example.org:8080/notes".into())
+            html(
+                text,
+                Some(&[Entity {
+                    offset: 0,
+                    length: 4,
+                    kind: EntityKind::Other
+                }])
+            ),
+            escaped
+        );
+
+        let out = html(text, Some(&[link(0, 4, "https://docs.example.org")]));
+        assert_eq!(out.matches("<a ").count(), 1);
+        assert_eq!(
+            out,
+            format!(
+                "<a href=\"https://docs.example.org\">docs</a>{}",
+                &escaped[4..]
+            )
         );
     }
 
     #[test]
-    fn explicit_links_win_over_auto_detection_and_other_styles() {
-        let text = "example.org";
-        let out = html(
-            text,
-            &[
-                Entity {
+    fn server_marked_domains_email_and_labeled_links_still_open() {
+        for text in [
+            "example.org",
+            "www.example.org",
+            "t.me/telegram",
+            "example.org:8080/notes",
+            "main.rs",
+        ] {
+            let out = html(
+                text,
+                Some(&[Entity {
                     offset: 0,
-                    length: 11,
-                    kind: EntityKind::Other,
-                },
-                link(0, 11, "https://example.net"),
-            ],
-        );
-        assert_eq!(out, "<a href=\"https://example.net\">example.org</a>");
+                    length: text.len() as u32,
+                    kind: EntityKind::Url,
+                }]),
+            );
+            assert_eq!(out, format!("<a href=\"https://{text}\">{text}</a>"));
+        }
         assert_eq!(
             html(
-                text,
-                &[Entity {
+                "me@example.org",
+                Some(&[Entity {
                     offset: 0,
-                    length: 11,
-                    kind: EntityKind::Url
-                }]
+                    length: 14,
+                    kind: EntityKind::EmailAddress
+                }])
             ),
-            "<a href=\"https://example.org\">example.org</a>"
+            "<a href=\"mailto:me@example.org\">me@example.org</a>"
+        );
+        assert_eq!(
+            html(
+                "example.org",
+                Some(&[
+                    Entity {
+                        offset: 0,
+                        length: 11,
+                        kind: EntityKind::Other
+                    },
+                    link(0, 11, "https://example.net"),
+                ])
+            ),
+            "<a href=\"https://example.net\">example.org</a>"
         );
     }
 
@@ -258,14 +310,14 @@ mod tests {
         for kind in [EntityKind::Code, EntityKind::Pre, EntityKind::PreCode] {
             assert_eq!(
                 html(
-                    "example.org",
-                    &[Entity {
+                    "https://example.org",
+                    Some(&[Entity {
                         offset: 0,
-                        length: 11,
+                        length: 19,
                         kind
-                    }]
+                    }])
                 ),
-                "example.org"
+                "https://example.org"
             );
         }
         for url in [
@@ -277,30 +329,32 @@ mod tests {
             "https://",
         ] {
             assert_eq!(destination(url), None, "{url}");
-            assert_eq!(html("example.org", &[link(0, 11, url)]), "example.org");
+            assert_eq!(
+                html("example.org", Some(&[link(0, 11, url)])),
+                "example.org"
+            );
         }
         assert_eq!(
             destination("tg://resolve?domain=telegram"),
             Some("tg://resolve?domain=telegram".into())
         );
         assert_eq!(
-            html("<a href=\"bad\">  hi\tthere\n</a>", &[]),
+            html("<a href=\"bad\">  hi\tthere\n</a>", None),
             "&lt;a&#32;href=&quot;bad&quot;&gt;&#32;&#32;hi&#9;there<br/>&lt;/a&gt;"
         );
     }
 
     #[test]
     fn malformed_and_overlapping_entities_cannot_drop_text_or_panic() {
-        let good = link(3, 2, "https://example.org");
         let out = html(
             "👋 go!",
-            &[
+            Some(&[
                 link(1, 1, "https://invalid.org"), // inside a surrogate pair
                 link(2, u32::MAX, "https://invalid.org"),
                 link(80, 2, "https://invalid.org"),
-                good,
+                link(3, 2, "https://example.org"),
                 link(3, 3, "https://overlap.org"),
-            ],
+            ]),
         );
         assert_eq!(out, "👋&#32;<a href=\"https://example.org\">go</a>!");
         let decoded = entities(&json!([

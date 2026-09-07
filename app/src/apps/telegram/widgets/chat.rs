@@ -1081,7 +1081,7 @@ pub fn populate(
                 cx,
                 &body,
                 if has_text { &m.text } else { "" },
-                &m.entities,
+                m.entities.as_deref(),
             );
 
             // The media, through the kit: a picture — a photo, or a video's

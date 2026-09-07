@@ -12,9 +12,12 @@ Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 Message text and media captions show selectable, underlined links in the
 transcript and line cards. Web URLs, labeled links, email addresses and Telegram
 links open their destination on a tap; dragging selects text. Incoming entities
-are retained with the message and replaced on content edits. Older cached text
-also recognizes URLs locally; labeled destinations lost by an earlier build
-become available when the message is fetched again. Code spans stay literal.
+are retained with the message and replaced on content edits; their spans are
+authoritative even when the server reports no links. Only text without metadata
+uses local detection, which requires a URL scheme or an email address so filenames
+and ordinary dotted words stay plain. Older cached labeled links and URLs without
+a scheme become available when their entities are fetched again. Code spans stay
+literal.
 
 ## Builds
 

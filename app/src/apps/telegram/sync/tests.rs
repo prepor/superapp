@@ -309,7 +309,7 @@ fn links_survive_projection_and_follow_content_edits_in_their_own_chat() {
     let reading = |chat| {
         let history = model::history(w.store(), chat);
         let message = &history[0];
-        text::html(&message.text, &message.entities)
+        text::html(&message.text, message.entities.as_deref())
     };
     assert!(reading(-1008).contains("href=\"https://example.org/first\""));
 
@@ -325,9 +325,17 @@ fn links_survive_projection_and_follow_content_edits_in_their_own_chat() {
     acc.on_update(&w, &edit.to_string());
     assert!(reading(-1008).contains("href=\"https://example.org/first\""));
     edit["new_content"]["caption"]["entities"] = json!([]);
+    edit["new_content"]["caption"]["text"] = json!("main.rs notes.md report.pdf Dr.Smith it.Then https://example.org me@example.org");
     acc.on_update(&w, &edit.to_string());
     assert!(!reading(-1008).contains("<a "));
+    assert_eq!(model::history(w.store(), -1008)[0].entities, Some(vec![]));
     assert!(reading(-1009).contains("href=\"https://example.org/first\""));
+
+    // A fresh message with an empty entity array also forbids local guessing.
+    update["message"]["content"]["text"] = edit["new_content"]["caption"].clone();
+    acc.on_update(&w, &update.to_string());
+    assert!(!reading(-1008).contains("<a "));
+    assert_eq!(model::history(w.store(), -1008)[0].entities, Some(vec![]));
 }
 
 /// An `updateNewMessage` carrying a photo whose file has the given remote

@@ -219,12 +219,12 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service, entities)
+  views, comments, reactions, service, entities, entities_known)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date,
-  text = excluded.text, entities = excluded.entities,
+  text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
   edited = excluded.edited, reply_to = excluded.reply_to,
   fwd_from = excluded.fwd_from, media = excluded.media,

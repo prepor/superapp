@@ -184,7 +184,7 @@ impl Widget for LinePanel {
             cx,
             &body,
             if has_text { &m.text } else { "" },
-            &m.entities,
+            m.entities.as_deref(),
         );
 
         let reactions = m.reactions.clone().unwrap_or_default();

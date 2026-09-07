@@ -921,20 +921,36 @@ fn editing_and_deleting_a_link_restore_its_destination_on_undo() {
     let entities = vec![Entity { offset: 0, length: 4,
         kind: EntityKind::TextUrl { url: "https://example.org".into() } }];
     let original = entities.clone();
-    s.store().write(move |c| model::edit_tx(c, VERA, id, "read this", false, &original)).unwrap();
+    s.store().write(move |c| model::edit_tx(c, VERA, id, "read this", false, Some(&original))).unwrap();
     super::verbs::edit_line(&mut s, VERA, id, "read this", false, "new text");
     s.settle();
     let current = |s: &Session| model::history(s.store(), VERA).iter().find(|m| m.id == id).unwrap().clone();
-    assert!(current(&s).entities.is_empty());
+    assert!(current(&s).entities.is_none());
     s.undo();
     s.settle();
-    assert_eq!(current(&s).entities, entities);
+    assert_eq!(current(&s).entities, Some(entities.clone()));
     assert_eq!(current(&s).text, "read this");
     super::verbs::delete_lines(&mut s, VERA, vec![id]);
     s.settle();
     s.undo();
     s.settle();
-    assert_eq!(current(&s).entities, entities);
+    assert_eq!(current(&s).entities, Some(entities));
+}
+
+#[test]
+fn undo_restores_a_received_empty_entity_list_without_enabling_detection() {
+    let mut s = session();
+    let id = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().id;
+    let text = "main.rs https://example.org";
+    s.store().write(move |c| model::edit_tx(c, VERA, id, text, false, Some(&[]))).unwrap();
+    super::verbs::edit_line(&mut s, VERA, id, text, false, "new text");
+    s.settle();
+    s.undo();
+    s.settle();
+    let history = model::history(s.store(), VERA);
+    let restored = history.iter().find(|m| m.id == id).unwrap();
+    assert_eq!(restored.entities, Some(vec![]));
+    assert!(!super::text::html(&restored.text, restored.entities.as_deref()).contains("<a "));
 }
 
 /// The viewer walks the chat's media in place; a line's card replies on

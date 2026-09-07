@@ -6,7 +6,7 @@ use crate::shell::hosted::PanelProps;
 
 use super::super::text::{self, Entity};
 
-pub(super) fn set(cx: &mut Cx, widget: &WidgetRef, body: &str, entities: &[Entity]) {
+pub(super) fn set(cx: &mut Cx, widget: &WidgetRef, body: &str, entities: Option<&[Entity]>) {
     widget.as_html().set_text(cx, &text::html(body, entities));
 }
 

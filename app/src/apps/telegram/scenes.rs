@@ -82,7 +82,7 @@ fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
         sender_name: name.to_string(),
         date: at,
         text: text.to_string(),
-        entities: Vec::new(),
+        entities: None,
         out: false,
         state: None,
         edited: false,
@@ -334,10 +334,13 @@ fn message_row() -> Scene<Setup> {
         .note("Nothing is aligned by who wrote it — a transcript in one face reads by names, as a log does.")
         .node("theirs", row(line(vera("the forecast changed, rain after 2pm")), false, false))
         .node("links", row(line(Msg {
-            entities: vec![super::text::Entity {
+            entities: Some(vec![super::text::Entity {
                 offset: 3, length: 13,
                 kind: super::text::EntityKind::TextUrl { url: "https://example.org/project".into() },
-            }],
+            }, super::text::Entity {
+                offset: 19, length: 33,
+                kind: super::text::EntityKind::Url,
+            }]),
             ..vera("👋 project notes — https://example.org/notes?a=1&b=2")
         }), false, false))
         .sized((560.0, 100.0))

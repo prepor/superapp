@@ -26,7 +26,7 @@ pub fn edit_line(
     let write = after.clone();
     let _ = s.act(
         Action::writing("edit", format!("edit “{}”", short(&before)), move |tx| {
-            model::edit_tx(tx, chat, msg, &write, true, &[])
+            model::edit_tx(tx, chat, msg, &write, true, None)
         })
         .about(format!("chat:{chat}"))
         .claiming(vec![Box::new(Edited {
@@ -81,7 +81,7 @@ struct Edited {
     chat: PeerId,
     msg: MsgId,
     before: String,
-    before_entities: Vec<super::text::Entity>,
+    before_entities: Option<Vec<super::text::Entity>>,
     was_edited: bool,
     after: String,
 }
@@ -95,14 +95,14 @@ impl Intent for Edited {
         let (chat, msg, text, was) = (self.chat, self.msg, self.before.clone(), self.was_edited);
         let entities = self.before_entities.clone();
         w.store()
-            .write(move |c| model::edit_tx(c, chat, msg, &text, was, &entities))
+            .write(move |c| model::edit_tx(c, chat, msg, &text, was, entities.as_deref()))
             .map_err(|e| e.to_string())
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
         let (chat, msg, text) = (self.chat, self.msg, self.after.clone());
         w.store()
-            .write(move |c| model::edit_tx(c, chat, msg, &text, true, &[]))
+            .write(move |c| model::edit_tx(c, chat, msg, &text, true, None))
             .map_err(|e| e.to_string())
     }
 }

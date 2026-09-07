@@ -1316,7 +1316,7 @@ fn set_content(
            text = ?3, media = ?4, media_label = ?5, media_ref = ?6, media_rid = ?7,
            media_w = ?8, media_h = ?9, media_secs = ?10,
            media_lat = ?11, media_lon = ?12, media_until = ?13,
-           media_clip = ?14, media_clip_rid = ?15, entities = ?16
+           media_clip = ?14, media_clip_rid = ?15, entities = ?16, entities_known = 1
          WHERE chat = ?1 AND id = ?2",
         rusqlite::params![
             chat,
