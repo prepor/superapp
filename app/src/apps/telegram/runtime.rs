@@ -39,9 +39,9 @@ struct State {
     mentions_failed: Vec<PeerId>,
     connection_error: Option<String>,
     list_syncing: bool,
-    connection_status: Option<String>,
     connection_note: Option<String>,
     downloads: HashMap<String, DownloadProgress>,
+    connection_status: Option<String>,
     wanted: Wanted,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
@@ -98,7 +98,6 @@ pub struct Wanted {
     pub mentions: Vec<PeerId>,
     pub topic_chats: Vec<(PeerId, i64)>,
     pub topic_lists: Vec<PeerId>,
-    pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
 
@@ -333,10 +332,6 @@ impl Runtime {
         state.topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
     }
 
-    pub fn want_line(&self, chat: PeerId, id: MsgId) {
-        push_unique(&mut self.state().wanted.lines, (chat, id));
-    }
-
     pub fn want_mentions(&self, chat: PeerId) {
         let mut state = self.state();
         // Offline scenes must not acquire a loading state with no worker.
@@ -414,7 +409,6 @@ mod tests {
         state.set_download("tg:photo", Some(progress));
         for _ in 0..2 {
             state.want_history(7);
-            state.want_line(7, 42);
             state.want_file("remote-photo");
         }
 
@@ -435,7 +429,6 @@ mod tests {
             assert_eq!(state.download("tg:photo"), Some(progress));
             let wanted = state.take_wanted();
             assert_eq!(wanted.chats, vec![7]);
-            assert_eq!(wanted.lines, vec![(7, 42)]);
             assert_eq!(wanted.files, vec!["remote-photo"]);
             state.set_loading(7, false);
             state.set_list_syncing(false);

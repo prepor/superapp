@@ -417,6 +417,22 @@ fn download_target(content: &Value) -> Option<&Value> {
     })
 }
 
+/// The viewer's full clip or picture, including videos without thumbnails.
+pub fn viewer_file(content: &Value, clip: bool) -> Option<&Value> {
+    let file = if clip {
+        match content["@type"].as_str()? {
+            "messageVideo" => &content["video"]["video"],
+            "messageAnimation" => &content["animation"]["animation"],
+            "messageVideoNote" => &content["video_note"]["video"],
+            _ => return None,
+        }
+    } else {
+        download_target(content)?
+    };
+    file_id(file).filter(|id| *id > 0)?;
+    Some(file)
+}
+
 /// The session-local id the worker fires `downloadFile` on, for the file
 /// [`download_target`] picks. The finished file lands in the blob cache under
 /// the same `tg:` key the row already names, and the next redraw resolves it.

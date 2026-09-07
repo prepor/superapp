@@ -60,6 +60,10 @@ pub struct Account<T: Td> {
     /// A failed initialization needs another request: TDLib does not emit
     /// WaitTdlibParameters again when a competing instance releases its lock.
     retry_parameters: std::cell::Cell<Option<f64>>,
+    /// A restored viewer can open before loadChats has restored its chat.
+    media_requests: std::cell::RefCell<Vec<String>>,
+    known_chats: std::cell::RefCell<std::collections::HashSet<PeerId>>,
+    loading_chats: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -125,6 +129,17 @@ impl<T: Td> Account<T> {
                 .report(w.store(), "sending request", "Invalid request JSON");
             return;
         };
+        if v["@type"] == "getMessage"
+            && v["@extra"]["context"].as_str().and_then(parse_media_extra).is_some()
+            && (!self.auth_ready.get() || (self.loading_chats.get()
+                && !v["chat_id"].as_i64().is_some_and(|chat| self.known_chats.borrow().contains(&chat))))
+        {
+            let mut pending = self.media_requests.borrow_mut();
+            if !pending.contains(&request) {
+                pending.push(request);
+            }
+            return;
+        }
         if let Err(error) = super::operations::validate_files(&v) {
             if let Some(id) = v["@extra"]["operation"].as_u64() {
                 rt.operations.fail(w.store(), id, &error, false);
@@ -208,6 +223,9 @@ impl<T: Td> Account<T> {
             auth_ready: std::cell::Cell::new(false),
             waiting_for_parameters: std::cell::Cell::new(false),
             retry_parameters: std::cell::Cell::new(None),
+            media_requests: std::cell::RefCell::new(Vec::new()),
+            known_chats: std::cell::RefCell::new(std::collections::HashSet::new()),
+            loading_chats: std::cell::Cell::new(false),
             api_id,
             tdlib_dir,
             phone,
@@ -246,18 +264,26 @@ impl<T: Td> Account<T> {
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
         let rt = runtime::of(w.store());
-        if !self.auth_ready.get() || rt.connection_error().is_some() || rt.list_syncing()
-        {
+        if !self.auth_ready.get() || rt.connection_error().is_some() {
             return;
         }
-        // Files a drawing found missing go first, and single lines asked for
-        // with them: few, cheap, and somebody is looking at each.
+        let pending = std::mem::take(&mut *self.media_requests.borrow_mut());
+        for request in pending {
+            let id = serde_json::from_str::<Value>(&request).ok()
+                .and_then(|v| v["@extra"]["operation"].as_u64());
+            if id.is_some_and(|id| runtime::of(w.store()).operations.pending(id)) {
+                self.send(w, &request);
+            }
+        }
+        // A viewer can fetch its media once that chat is known. Background
+        // history and topic work wait until the chat lists finish loading.
+        if rt.list_syncing() {
+            return;
+        }
+        // Files a drawing found missing go before background history pages.
         let wanted = runtime::of(w.store()).take_wanted();
         for rid in wanted.files {
             self.send(w, &request_file(&rid));
-        }
-        for (chat, id) in wanted.lines {
-            self.send(w, &get_message(chat, id));
         }
         for chat in wanted.chats {
             self.want(w, chat);
@@ -298,8 +324,12 @@ impl<T: Td> Account<T> {
         if now < self.not_before.get() {
             return;
         }
-        let Some(page) = self.pages.borrow_mut().pop_front() else {
-            return;
+        let page = {
+            let mut pages = self.pages.borrow_mut();
+            let Some(index) = pages.iter().position(|page| {
+                !self.loading_chats.get() || self.known_chats.borrow().contains(&page.chat)
+            }) else { return };
+            pages.remove(index).unwrap()
         };
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
@@ -385,6 +415,16 @@ impl<T: Td> Account<T> {
             return;
         };
         let rt = runtime::of(w.store());
+        let context = v["@extra"]["context"].as_str().or_else(|| v["@extra"].as_str());
+        if v["@type"] == "message" {
+            if let Some((_, _, clip)) = context.and_then(parse_media_extra) {
+                if updates::viewer_file(&v["content"], clip).is_none() {
+                    self.on_new_message(w, &v);
+                    v = serde_json::json!({"@type": "error", "code": 404,
+                        "message": "This message no longer has downloadable media", "@extra": v["@extra"]});
+                }
+            }
+        }
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
@@ -431,11 +471,12 @@ impl<T: Td> Account<T> {
                 self.on_file(w, &v);
                 self.on_file_answer(w, &v);
             }
-            // A single line fetched afresh ([`runtime::Runtime::want_line`]) answers as the
-            // message itself, which lands the way a new line does.
+            // A refreshed source message lands like a new line before its
+            // viewer starts downloading the file registered by that message.
             Some("message") => {
                 self.log("<< message");
                 self.on_new_message(w, &v);
+                self.on_media_answer(w, &v);
             }
             Some("messages") if tracked && v["@extra"].is_null() => {
                 if let Some(messages) = v["messages"].as_array() {
@@ -598,6 +639,7 @@ impl<T: Td> Account<T> {
     /// cannot establish whether Telegram delivered them while we were away.
     pub fn on_ready(&self, w: &World) {
         self.auth_ready.set(true);
+        self.loading_chats.set(true);
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
         runtime::of(w.store()).set_connection_note(None);
@@ -686,7 +728,10 @@ impl<T: Td> Account<T> {
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
                 self.send(w, &load_chats(ChatList::Archive));
             }
-            (Some("load_chats:archive"), true) => runtime::of(w.store()).set_list_syncing(false),
+            (Some("load_chats:archive"), true) => {
+                self.loading_chats.set(false);
+                runtime::of(w.store()).set_list_syncing(false);
+            }
             // A history page refused. Telegram's *too many requests* says
             // how long to hold off: the page goes back to the front and the
             // whole queue waits that long. Anything else — a chat gone
@@ -794,17 +839,27 @@ impl<T: Td> Account<T> {
             v["local"]["is_downloading_completed"],
             v["local"]["path"].as_str().unwrap_or("")
         ));
-        if let Some(id) = v["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
-            if let Some(key) = updates::file_ref(v) {
-                if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key)).unwrap_or(false) {
-                    return;
-                }
-                // Show the size as soon as getRemoteFile answers, even
-                // before downloadFile starts receiving bytes.
-                runtime::of(w.store()).set_download(&key, Some(updates::download_progress(v)));
+        let context = format!("download:{}", v["id"]);
+        self.start_media(w, v, &context);
+    }
+
+    fn on_media_answer(&self, w: &World, message: &Value) {
+        let Some(context) = message["@extra"].as_str() else { return };
+        let Some((_, _, clip)) = parse_media_extra(context) else { return };
+        let Some(file) = updates::viewer_file(&message["content"], clip) else { return };
+        self.start_media(w, file, context);
+    }
+
+    fn start_media(&self, w: &World, file: &Value, context: &str) {
+        self.on_file(w, file);
+        if let Some(key) = updates::file_ref(file) {
+            if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key)).unwrap_or(false) {
+                return;
             }
-            self.log(&format!(">> downloadFile {id} priority=32"));
-            self.send(w, &download_file(id, 32));
+            runtime::of(w.store()).set_download(&key, Some(updates::download_progress(file)));
+        }
+        if let Some(id) = file["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
+            self.send(w, &download_media(id, context));
         }
     }
 
@@ -973,7 +1028,8 @@ impl<T: Td> Account<T> {
         // completes, and [`on_file`](Account::on_file) ingests the bytes into
         // the blob cache under the same tg: key the row names — the next
         // redraw draws the photo.
-        if message["sending_state"].is_null() {
+        let clip = message["@extra"].as_str().and_then(parse_media_extra).map(|(_, _, clip)| clip);
+        if message["sending_state"].is_null() && clip != Some(false) {
             self.fetch(w, &message["content"]);
         }
     }
@@ -1091,6 +1147,9 @@ impl<T: Td> Account<T> {
     /// private chat), then the chat row. `INSERT OR IGNORE` on the stub never
     /// overwrites a real peer already filed.
     fn on_new_chat(&self, w: &World, chat: &Value) {
+        if let Some(id) = chat["id"].as_i64() {
+            self.known_chats.borrow_mut().insert(id);
+        }
         let Some(ch) = updates::chat(chat) else {
             return;
         };

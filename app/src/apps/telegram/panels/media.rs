@@ -52,8 +52,6 @@ pub struct Viewer {
     /// the draw hands back what it stands at, which is how a clip that has
     /// run to its end puts the button back to *play*.
     running: bool,
-    /// The line was sent for afresh, for the clip id it lacked — once.
-    refreshing: bool,
     /// Whether the clip has been asked for. Once per open: the answer lands
     /// in the blob cache under the row's own key, and every draw looks there
     /// again until it does.
@@ -150,8 +148,8 @@ impl Viewer {
 
     /// Whether the clip is this panel's to play: the line is a moving
     /// picture of the wire's — never the demo's — and either its file is
-    /// already here, or it has been asked for, or the line itself is being
-    /// fetched afresh for the id to ask by. A demo line and a build with no
+    /// already here, or its source message and clip have been asked for.
+    /// A demo line and a build with no
     /// engine keep the poster and the fake timeline the panels library
     /// draws; a real video never runs the fake timeline, which would only
     /// count seconds over a still (Andrey, 2026-09-07: "the seconds update
@@ -159,7 +157,7 @@ impl Viewer {
     #[must_use]
     pub fn plays_clip(&self, m: &Msg) -> bool {
         moving_picture_of_the_wire(m)
-            && (self.asked || self.refreshing || self.clip_file(m).is_some())
+            && (self.asked || self.clip_file(m).is_some())
     }
 
     /// Downloaded and total bytes for the clip or picture this viewer is
@@ -182,6 +180,10 @@ impl Viewer {
         if let Some(note) = state.connection_note() {
             return Some(note);
         }
+        let context = requests::media_context(m.chat, m.id, self.plays_clip(m));
+        if let Some(note) = state.operations.media_note(&context) {
+            return Some(note);
+        }
         Some(
             reference
                 .and_then(|key| state.download(key))
@@ -189,69 +191,29 @@ impl Viewer {
         )
     }
 
-    /// Asks the engine for the clip, once.
-    ///
-    /// A clip is never fetched on arrival — the transcript draws its poster
-    /// and no more (Andrey, 2026-09-06) — so the file behind a video line is
-    /// asked for here, when somebody opens the viewer on it or presses play.
-    /// The request is a `getRemoteFile` on the row's durable remote id; the
-    /// worker turns the answer into a download at the front of the queue, and
-    /// the finished file lands in the blob cache under the row's own `clip`
-    /// key, where [`clip_file`](Self::clip_file) is already looking. Nothing
-    /// happens where the file is here, where the row names no clip, or where
-    /// this build has no engine to ask.
-    ///
-    /// A line from before the remote id was kept on the row has none to ask
-    /// by; that line is fetched afresh from the engine ([`runtime::Runtime::want_line`])
-    /// and re-projected, and the next draw finds the id and asks.
+    /// Fetch the source message in this session before asking for its clip.
+    /// Remote file ids survive restarts, but their expiring file references
+    /// need a source TDLib can refresh. The cache still answers immediately.
     pub fn ask_for_clip(&mut self, m: &Msg) {
-        if self.asked || self.clip_file(m).is_some() {
+        if self.asked || !moving_picture_of_the_wire(m) || self.clip_file(m).is_some() {
             return;
         }
-        let Some(rid) = m.media.as_ref().and_then(|md| md.clip_rid.as_deref()) else {
-            if moving_picture_of_the_wire(m) && !self.refreshing {
-                self.refreshing = true;
-                runtime::of(self.world.store()).want_line(m.chat, m.id);
-            }
-            return;
-        };
-        self.asked = wire(self.world.store(), &requests::request_file(rid));
+        self.asked = wire(self.world.store(), &requests::request_media(m.chat, m.id, true));
     }
 
-    /// Asks the engine for the picture, once.
-    ///
-    /// A photo is fetched as its line arrives — but only for the newest forty
-    /// lines of a chat as it opens, and the blob cache evicts what it must,
-    /// so a picture opened on may well have no bytes on this device at all.
-    /// The row keeps the file's durable remote id for exactly this
-    /// ([`Media::rid`](model::Media::rid)): the worker turns it into a
-    /// download on its next pass ([`runtime::Runtime::want_file`]), which lands under the
-    /// row's own key, where the draw is already looking. Nothing happens
-    /// where the bytes are here, or where the row names no id — a demo line,
-    /// or one projected before the column existed.
+    /// Restore a missing photo through its source message too. A clip request
+    /// already fetches its poster, so it needs no second message request.
     pub fn ask_for_picture(&mut self, m: &Msg) {
-        if self.wanted_pic {
+        if self.wanted_pic || self.asked {
             return;
         }
         let Some(md) = m.media.as_ref() else { return };
-        // Only a kind that draws as a picture is waited for: a file's or a
-        // sound's bytes would never decode into the box, and a viewer
-        // waiting on them would draw forever (review, 2026-09-07).
-        if !md.has_picture() || md.picture_bytes(self.world.store().dir()).is_some() {
+        if !md.has_picture() || md.picture_bytes(self.world.store().dir()).is_some()
+            || !md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
+        {
             return;
         }
-        let Some(rid) = md.rid.as_deref() else {
-            // A row from before the id was kept: fetched afresh, once, and
-            // asked for on the draw that finds the id.
-            let real = md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"));
-            if real && !self.refreshing {
-                self.refreshing = true;
-                runtime::of(self.world.store()).want_line(m.chat, m.id);
-            }
-            return;
-        };
-        self.wanted_pic = true;
-        runtime::of(self.world.store()).want_file(rid);
+        self.wanted_pic = wire(self.world.store(), &requests::request_media(m.chat, m.id, false));
     }
 
     /// Whether a picture was asked for and has not landed — what keeps the
@@ -464,7 +426,6 @@ impl PanelKind for ViewerKind {
             player: None,
             // Opened from a line's own play button, it plays as it opens.
             running: runtime::of(cx.session().store()).take_play_on_open(chat, msg),
-            refreshing: false,
             asked: false,
             wanted_pic: false,
         })

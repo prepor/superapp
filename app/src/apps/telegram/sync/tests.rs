@@ -952,16 +952,17 @@ fn a_wanted_line_is_fetched_and_lands() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let w = world();
-    runtime::of(w.store()).want_line(-9_010, 4242);
+    acc.drain(&w);
+    assert!(runtime::of(w.store()).send(&super::request_media(-9_010, 4242, true)));
     acc.drain(&w);
     let req: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     assert_eq!(req["@type"], "getMessage");
     assert_eq!(req["chat_id"], -9_010);
     assert_eq!(req["message_id"], 4242);
-    assert_eq!(req["@extra"]["context"], "line:-9010:4242");
+    assert_eq!(req["@extra"]["context"], "media:-9010:4242:true");
 
     let mut answer = my_line(4242, -9_010, None);
-    answer["@extra"] = json!("line:-9010:4242");
+    answer["@extra"] = req["@extra"].clone();
     answer["content"] = json!({"@type": "messageVideo", "caption": {"text": "clip"},
         "video": {"duration": 3, "width": 640, "height": 360,
                   "video": {"id": 9, "remote": {"id": "RID_V", "unique_id": "VU"}},
@@ -970,6 +971,68 @@ fn a_wanted_line_is_fetched_and_lands() {
     let rid: String = w.store().conn().query_row(
         "SELECT media_clip_rid FROM tg_message WHERE id = 4242", [], |r| r.get(0)).unwrap();
     assert_eq!(rid, "RID_V");
+    let download: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(download["file_id"], 9, "download the refreshed clip, not its poster");
+    assert_eq!(download["synchronous"], true);
+    assert_eq!(download["@extra"]["context"], req["@extra"]["context"]);
+}
+
+#[test]
+fn media_source_errors_and_timeouts_are_visible_without_automatic_retries() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    let rt = runtime::of(w.store());
+    let context = super::media_context(7, 42, true);
+    for (code, message) in [(404, "Message not found"), (429, "Too Many Requests: retry after 60")] {
+        acc.send(&w, &super::request_media(7, 42, true));
+        let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+        acc.on_update(&w, &json!({"@type": "error", "code": code, "message": message,
+            "@extra": request["@extra"]}).to_string());
+        assert!(rt.operations.media_note(&context).unwrap().contains(message));
+        let count = td.sent().len();
+        for _ in 0..10 { acc.drain(&w); }
+        assert_eq!(td.sent().len(), count, "respect failures and Telegram's rate limit");
+    }
+    acc.send(&w, &super::request_media(7, 42, true));
+    assert_eq!(rt.operations.media_note(&context).as_deref(), Some("loading media details…"));
+    rt.operations.expire(w.store(), std::time::Instant::now() + std::time::Duration::from_secs(121));
+    assert!(rt.operations.media_note(&context).unwrap().contains("did not respond"));
+}
+
+#[test]
+fn a_message_without_the_requested_media_finishes_with_an_error() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.send(&w, &super::request_media(7, 42, true));
+    let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    let mut answer = my_line(42, 7, None);
+    answer["@extra"] = request["@extra"].clone();
+    acc.on_update(&w, &answer.to_string());
+    let note = runtime::of(w.store()).operations.media_note(&super::media_context(7, 42, true)).unwrap();
+    assert!(note.contains("no longer has downloadable media"));
+    assert_eq!(td.sent_types(), vec!["getMessage"]);
+}
+
+#[test]
+fn a_media_request_that_times_out_waiting_for_its_chat_requires_a_retry() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.drain(&w);
+    acc.on_ready(&w);
+    acc.send(&w, &super::request_media(7, 42, true));
+    assert_eq!(td.sent_types(), vec!["loadChats"]);
+    let rt = runtime::of(w.store());
+    let op = rt.operations.list().last().unwrap().id;
+    rt.operations.expire(w.store(), std::time::Instant::now() + std::time::Duration::from_secs(121));
+    acc.loading_chats.set(false);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["loadChats"], "an expired queued request stays stopped");
+    crate::apps::telegram::operations::retry(w.store(), op);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["loadChats", "getMessage"]);
 }
 
 /// The review's small findings, each pinned: an archive position lands
@@ -2260,7 +2323,7 @@ fn workers_consume_only_their_own_stores_commands_and_download_requests() {
     assert!(state_a.send(&super::send_message(7, "for A", None)));
     assert!(state_b.send(&super::send_message(7, "for B", None)));
     state_a.want_file("A-photo");
-    state_a.want_line(7, 42);
+    assert!(state_a.send(&super::request_media(7, 42, true)));
     state_a.want_history(7);
     account_b.drain(&b);
     assert_eq!(td_b.sent_types(), vec!["sendMessage"]);
@@ -2269,7 +2332,7 @@ fn workers_consume_only_their_own_stores_commands_and_download_requests() {
     assert!(!state_b.loading(7));
 
     account_a.drain(&a);
-    assert_eq!(td_a.sent_types(), vec!["sendMessage", "getRemoteFile", "getMessage", "getChatHistory"]);
+    assert_eq!(td_a.sent_types(), vec!["sendMessage", "getMessage", "getRemoteFile", "getChatHistory"]);
     assert!(td_a.sent()[0].contains("for A"));
     drop(account_a);
     assert!(!state_a.send(&super::send_message(7, "after shutdown", None)));

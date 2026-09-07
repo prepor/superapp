@@ -1622,7 +1622,6 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     assert_eq!(note(&s, viewer).as_deref(), Some("connecting to Telegram…"));
     assert_eq!(note(&s, picture).as_deref(), Some("connecting to Telegram…"));
     runtime::of(s.store()).want_history(STELAXIS);
-    runtime::of(s.store()).want_line(STELAXIS, video);
     acc.drain(s.world());
     assert!(td.sent().is_empty(), "downloads and history must wait for authorization");
 
@@ -1654,20 +1653,45 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     acc.drain(s.world());
     assert_eq!(td.sent_types(), vec![
         "setTdlibParameters", "setTdlibParameters", "loadChats",
-        "getRemoteFile", "getRemoteFile", "getMessage", "getChatHistory",
     ]);
-    assert_eq!(note(&s, viewer).as_deref(), Some("downloading…"));
-    assert_eq!(note(&s, picture).as_deref(), Some("downloading…"));
+    assert_eq!(note(&s, viewer).as_deref(), Some("loading media details…"));
+    assert_eq!(note(&s, picture).as_deref(), Some("loading media details…"));
+    // Authorization precedes chat restoration. Neither viewer may lose its
+    // request to a premature "Chat not found" response.
+    acc.on_update(s.world(), &json!({"@type": "updateNewChat", "chat": {
+        "id": STELAXIS, "title": "fixture", "type": {"@type": "chatTypeSupergroup"}
+    }}).to_string());
+    acc.drain(s.world());
+    assert!(!td.sent_types().iter().any(|t| t == "getChatHistory"), "history waits for the chat lists");
+    let source_extra = |id| td.sent().iter()
+        .map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap())
+        .find(|r| r["@type"] == "getMessage" && r["message_id"] == id).unwrap()["@extra"].clone();
+    let video_extra = source_extra(video);
+    let photo_extra = source_extra(photo);
+    assert!(!td.sent_types().iter().any(|t| t == "getRemoteFile" || t == "downloadFile"));
+    for list in ["main", "archive"] {
+        acc.on_update(s.world(), &json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")}).to_string());
+    }
+    acc.drain(s.world());
+    assert!(td.sent_types().iter().any(|t| t == "getChatHistory"), "history starts after the chat lists load");
 
     let mb = 1024 * 1024;
     let mut file = json!({
-        "@type": "file", "id": 77, "@extra": "file:RID_CLIP",
+        "@type": "file", "id": 77,
         "size": 48 * mb, "expected_size": 60 * mb,
         "local": {"is_downloading_active": false, "is_downloading_completed": false, "downloaded_size": 0},
-        "remote": {"unique_id": "clip"}
+        "remote": {"unique_id": "clip", "id": "REFRESHED_CLIP"}
     });
-    acc.on_update(s.world(), &file.to_string());
+    acc.on_update(s.world(), &json!({"@type": "message", "id": video, "chat_id": STELAXIS,
+        "@extra": video_extra, "content": {"@type": "messageVideo", "video": {
+            "width": 640, "height": 360, "duration": 30, "video": file
+        }}}).to_string());
     assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 0 B / 48 MB"));
+    let download: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(download["@type"], "downloadFile");
+    assert_eq!(download["synchronous"], true, "later failures must reach the viewer");
+    assert_eq!(download["file_id"], 77);
 
     file.as_object_mut().unwrap().remove("@extra");
     file["local"]["is_downloading_active"] = json!(true);
@@ -1682,6 +1706,10 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
         "local": {"is_downloading_active": true, "downloaded_size": mb},
         "remote": {"unique_id": "poster"}
     });
+    acc.on_update(s.world(), &json!({"@type": "message", "id": photo, "chat_id": STELAXIS,
+        "@extra": photo_extra, "content": {"@type": "messagePhoto", "photo": {"sizes": [{
+            "width": 640, "height": 480, "photo": poster
+        }]}}}).to_string());
     let update = |file: &serde_json::Value| json!({"@type": "updateFile", "file": file}).to_string();
     acc.on_update(s.world(), &update(&poster));
     assert_eq!(note(&s, picture).as_deref(), Some("downloading · 1.0 MB / 2.0 MB"));
@@ -1702,6 +1730,25 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     acc.on_update(s.world(), &update(&file));
     assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB · total unknown"));
     file["expected_size"] = json!(48 * mb);
+    acc.on_update(s.world(), &update(&file));
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / ~48 MB"));
+
+    // The real failure sequence: bytes stop, then the completion response
+    // fails. Late file snapshots must not replace the error with a spinner.
+    file["local"]["is_downloading_active"] = json!(false);
+    acc.on_update(s.world(), &update(&file));
+    acc.on_update(s.world(), &json!({"@type": "error", "code": 400,
+        "message": "File download has failed or was canceled", "@extra": download["@extra"]
+    }).to_string());
+    assert!(note(&s, viewer).unwrap().contains("failed or was canceled"));
+    acc.on_update(s.world(), &update(&file));
+    assert!(note(&s, viewer).unwrap().contains("failed or was canceled"));
+    let sent = td.sent().len();
+    acc.drain(s.world());
+    assert_eq!(td.sent().len(), sent, "failed downloads do not retry in a loop");
+    super::operations::retry(s.store(), download["@extra"]["operation"].as_u64().unwrap());
+    acc.drain(s.world());
+    file["local"]["is_downloading_active"] = json!(true);
     acc.on_update(s.world(), &update(&file));
     assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / ~48 MB"));
 

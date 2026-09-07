@@ -203,6 +203,22 @@ impl Tracker {
             .collect()
     }
 
+    /// The latest attempt owns the viewer's status; a late failure from an
+    /// older attempt must not hide new progress. Byte counts live in Runtime.
+    pub fn media_note(&self, context: &str) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        let op = state.operations.values().rev().find(|o| o.context() == Some(context))?;
+        match &op.status {
+            Status::Failed { .. } => Some(op.line()),
+            Status::Pending if op.kind == "getMessage" => Some("loading media details…".into()),
+            _ => None,
+        }
+    }
+
+    pub fn pending(&self, id: u64) -> bool {
+        self.state.lock().unwrap().operations.get(&id).is_some_and(|o| o.status == Status::Pending)
+    }
+
     pub fn dismiss(&self, id: u64) {
         self.dirty.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();

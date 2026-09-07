@@ -680,8 +680,8 @@ pub fn get_chat_history(chat: PeerId, from: MsgId, walk: Walk) -> String {
 }
 
 /// Ask TDLib for one line by its ids — the answer is the `message` itself,
-/// re-projected whole. What a viewer sends for a video line that predates the
-/// clip's remote id being kept on the row.
+/// re-projected whole. The viewer adds its media correlation with
+/// [`request_media`] so the refreshed file can be downloaded next.
 #[must_use]
 pub fn get_message(chat: PeerId, id: MsgId) -> String {
     json!({
@@ -691,6 +691,33 @@ pub fn get_message(chat: PeerId, id: MsgId) -> String {
         "@extra": format!("line:{chat}:{id}"),
     })
     .to_string()
+}
+
+/// Restore the message's file source in this TDLib session before downloading.
+/// A persistent remote file id alone cannot repair an expired file reference.
+pub fn request_media(chat: PeerId, id: MsgId, clip: bool) -> String {
+    let mut request: Value = serde_json::from_str(&get_message(chat, id)).unwrap();
+    request["@extra"] = json!(media_context(chat, id, clip));
+    request.to_string()
+}
+
+pub fn media_context(chat: PeerId, id: MsgId, clip: bool) -> String {
+    format!("media:{chat}:{id}:{clip}")
+}
+
+pub(super) fn parse_media_extra(extra: &str) -> Option<(PeerId, MsgId, bool)> {
+    let mut parts = extra.strip_prefix("media:")?.split(':');
+    let result = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    parts.next().is_none().then_some(result)
+}
+
+/// Still sent through the asynchronous JSON transport. Waiting for completion
+/// makes TDLib return download failures as well as updateFile byte counts.
+pub fn download_media(file_id: i32, context: &str) -> String {
+    let mut request: Value = serde_json::from_str(&download_file(file_id, 32)).unwrap();
+    request["synchronous"] = json!(true);
+    request["@extra"] = json!(context);
+    request.to_string()
 }
 
 /// The seconds a *Too Many Requests: retry after N* asks for, or `None`

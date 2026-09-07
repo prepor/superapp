@@ -184,6 +184,14 @@ the connection problem, including a session held by another app instance.
 Initialization retries every five seconds after a failure; queued media
 starts automatically once Telegram is ready.
 
+An uncached viewer first restores its source message in the current TDLib
+session, waiting with history requests for that chat to load during startup.
+A saved remote file id
+alone cannot repair an expired file reference. The viewer then downloads the
+fresh file at priority 32 with a completion response, while `updateFile` keeps
+the byte counts current. Source errors, download failures and timeouts appear
+in the viewer; the shared feedback controls offer an explicit retry.
+
 Playing videos fit inside the viewer at their original aspect ratio, including
 when the window is resized, with empty space around the frame where needed.
 
