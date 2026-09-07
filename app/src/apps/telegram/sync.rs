@@ -233,8 +233,9 @@ impl<T: Td> Account<T> {
     /// honoured. The chats the panels wanted since the last pass go to the
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
-        if super::Telegram::engine_store(w.store().dir())
-            && schema::session(w.store().conn()).state != "ready"
+        if runtime::of(w.store()).connection_error().is_some()
+            || (super::Telegram::engine_store(w.store().dir())
+                && schema::session(w.store().conn()).state != "ready")
         {
             return;
         }
@@ -424,6 +425,7 @@ impl<T: Td> Account<T> {
     /// One authorization state: fire what TDLib waits for, or record what the
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
+        runtime::of(w.store()).set_connection_error(None);
         let now = w.now();
         // The state row, written on the store's writer thread. Only the owned
         // arguments cross; `w` is not captured, so the closure is `Send`.
@@ -591,6 +593,15 @@ impl<T: Td> Account<T> {
             return;
         }
         match (v["@extra"].as_str(), failed) {
+            (Some("tdlib_parameters"), true) => {
+                let message = v["message"].as_str().unwrap_or("unknown error");
+                let error = if message.contains("Can't lock file") {
+                    "Telegram is open in another app window\nclose it and restart this app".into()
+                } else {
+                    format!("could not connect to Telegram: {message}")
+                };
+                runtime::of(w.store()).set_connection_error(Some(error));
+            }
             (Some("load_chats:main"), false) => self.send(w, &load_chats(ChatList::Main)),
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
                 self.send(w, &load_chats(ChatList::Archive));

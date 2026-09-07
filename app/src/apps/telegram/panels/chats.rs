@@ -54,6 +54,27 @@ impl Chats {
 
     pub fn managing_topics(&self) -> bool { self.forums }
 
+    pub fn empty_line(&self, filter: &str) -> String {
+        let runtime = runtime::of(&self.store);
+        if let Some(error) = runtime.connection_error() {
+            error
+        } else if !filter.trim().is_empty() {
+            "no chat under this filter".into()
+        } else if runtime.list_syncing() {
+            if self.forums {
+                "loading groups with topics…".into()
+            } else {
+                "loading chats…".into()
+            }
+        } else if self.forums {
+            "no groups with topics yet".into()
+        } else if self.archive {
+            "nothing archived".into()
+        } else {
+            "no chats yet".into()
+        }
+    }
+
     /// Whether a `chats` panel is the archive.
     #[must_use]
     pub fn is_archive(id: &PanelId) -> bool {

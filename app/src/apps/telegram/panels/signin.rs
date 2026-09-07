@@ -62,7 +62,12 @@ impl SignIn {
     /// no sign-in has begun.
     #[must_use]
     pub fn session(&self) -> TgSession {
-        schema::session(self.store.conn())
+        let mut session = schema::session(self.store.conn());
+        if let Some(error) = super::super::runtime::of(&self.store).connection_error() {
+            session.state = "error".into();
+            session.detail = Some(error);
+        }
+        session
     }
 
     /// The auth state, in a word.
@@ -87,6 +92,7 @@ impl SignIn {
     pub fn line(&self) -> String {
         let s = self.session();
         match s.state.as_str() {
+            "error" => s.detail.unwrap_or_else(|| "could not connect to Telegram".into()),
             "connecting" => "connecting to Telegram…".to_string(),
             "wait_phone" => "enter your phone number".to_string(),
             "wait_code" => "enter the code Telegram sent".to_string(),

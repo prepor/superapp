@@ -100,6 +100,12 @@ The build looks under `/opt/homebrew/opt/tdlib/lib` by default; set `TDLIB_DIR`
 to another installation prefix containing `lib/libtdjson.dylib` on macOS.
 The same path is added to the executable's runtime library search path.
 
+Only one running app can use a TDLib session directory. Development workspaces
+share the default directory, so close the other app before restarting the
+one you want to connect. Initialization failures appear in sign-in and empty
+chat/topic lists; cached chats can still be present while the connection is
+unavailable. These errors stay in the current process's runtime.
+
 Tests, demos and targets without TDLib can drop the feature explicitly:
 
 ```sh

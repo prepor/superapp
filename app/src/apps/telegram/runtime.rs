@@ -36,6 +36,7 @@ struct State {
     topic_lists: std::collections::HashMap<PeerId, Result<bool, String>>,
     mentions_loading: Vec<PeerId>,
     mentions_failed: Vec<PeerId>,
+    connection_error: Option<String>,
     list_syncing: bool,
     connection_status: Option<String>,
     wanted: Wanted,
@@ -125,6 +126,9 @@ impl Runtime {
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
         let state = self.state();
+        if state.connection_error.is_some() {
+            return false;
+        }
         let Some(sender) = state.sender.as_ref() else {
             return false;
         };
@@ -149,6 +153,20 @@ impl Runtime {
             "connectionStateUpdating" => Some("updating Telegram…".into()),
             _ => Some("connecting to Telegram…".into()),
         };
+    }
+
+    /// A connection failure belongs to this process, even when another app
+    /// window shares its database and is successfully signed in.
+    pub fn connection_error(&self) -> Option<String> {
+        self.state().connection_error.clone()
+    }
+
+    pub fn set_connection_error(&self, error: Option<String>) {
+        let mut state = self.state();
+        if error.is_some() {
+            state.list_syncing = false;
+        }
+        state.connection_error = error;
     }
 
     /// Serialize profile actions for each person until their reply arrives.
@@ -273,7 +291,11 @@ impl Runtime {
     }
 
     pub fn topics_status(&self, chat: PeerId) -> Result<bool, String> {
-        self.state().topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
+        let state = self.state();
+        if let Some(error) = &state.connection_error {
+            return Err(error.clone());
+        }
+        state.topic_lists.get(&chat).cloned().unwrap_or(Ok(false))
     }
 
     pub fn want_line(&self, chat: PeerId, id: MsgId) {

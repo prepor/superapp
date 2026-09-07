@@ -80,15 +80,7 @@ impl RowSpec for ChatsRows {
     }
 
     fn empty_line(panel: &Chats, filter: &str) -> String {
-        if !filter.trim().is_empty() {
-            "no chat under this filter".to_string()
-        } else if panel.managing_topics() {
-            "no groups with topics yet".to_string()
-        } else if panel.archived() {
-            "nothing archived".to_string()
-        } else {
-            "no chats yet".to_string()
-        }
+        panel.empty_line(filter)
     }
 
     /// A finger: leftward archives, rightward reads — the two verbs the

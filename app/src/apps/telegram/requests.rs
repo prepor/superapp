@@ -21,6 +21,7 @@ use super::model::{self, MsgId, PeerId};
 pub(super) fn set_tdlib_parameters(api_id: i32, api_hash: &str, dir: &Path) -> String {
     json!({
         "@type": "setTdlibParameters",
+        "@extra": "tdlib_parameters",
         "database_directory": dir.to_string_lossy().into_owned(),
         "use_message_database": false,
         "use_chat_info_database": false,

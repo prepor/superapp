@@ -88,6 +88,53 @@ fn wait_tdlib_parameters_sends_the_parameters() {
     assert_eq!(state(&w), "connecting");
 }
 
+#[test]
+fn a_locked_telegram_session_reports_the_connection_failure_until_auth_resumes() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    acc.drain(&w);
+    acc.on_update(&w, &auth("authorizationStateWaitTdlibParameters"));
+    let parameters: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    let extra = parameters["@extra"].clone();
+    assert!(extra["operation"].is_u64(), "parameters are correlated");
+    acc.on_update(&w, &json!({"@type": "error", "code": 400,
+        "message": "Can't lock file \"td.binlog\", because it is already in use; check for another program instance running",
+        "@extra": extra,
+    }).to_string());
+
+    let runtime = runtime::of(w.store());
+    let error = runtime.connection_error().expect("a visible failure");
+    assert!(error.contains("another app window"));
+    assert!(error.contains("restart"));
+    assert_eq!(runtime.topics_status(42), Err(error));
+    assert!(!runtime.list_syncing());
+    assert!(!runtime.send(&super::get_forum_topics(42, 0, 0, 0)));
+    runtime.want_history(42);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters"]);
+    assert_eq!(
+        state(&w), "connecting",
+        "a failure is local to this process"
+    );
+    assert!(runtime::of(world().store()).connection_error().is_none());
+
+    acc.on_update(&w, &auth("authorizationStateReady"));
+    acc.drain(&w);
+    assert!(runtime.connection_error().is_none());
+    assert!(runtime.list_syncing());
+    assert_eq!(
+        td.sent_types(),
+        vec!["setTdlibParameters", "loadChats", "getChatHistory"]
+    );
+    acc.on_update(
+        &w,
+        &json!({"@type": "error", "code": 404,
+            "message": "Chat not found", "@extra": "unrelated"}).to_string(),
+    );
+    assert!(runtime.connection_error().is_none());
+}
+
 /// A configured phone is sent the moment TDLib asks for one.
 #[test]
 fn wait_phone_number_sends_the_configured_phone() {

@@ -55,6 +55,44 @@ fn selection_replaces_the_forum_with_independent_chat_rows() {
 }
 
 #[test]
+fn empty_topic_groups_show_the_local_connection_failure_over_shared_session_state() {
+    let mut s = session();
+    s.store()
+        .write(|c| c.execute("UPDATE tg_peer SET is_forum = 0", []).map(|_| ()))
+        .unwrap();
+    let groups = open_root(&mut s, Chats::forums());
+    assert!(with_chats(&s, groups, |p| p.rows(0, 50)).is_empty());
+    let runtime = runtime::of(s.store());
+    runtime.set_list_syncing(true);
+    assert_eq!(
+        with_chats(&s, groups, |p| p.empty_line("")),
+        "loading groups with topics…"
+    );
+
+    let error = "Telegram is open in another app window\nclose it and restart this app";
+    runtime.set_connection_error(Some(error.into()));
+    // Another process can update the shared account row, but its connection
+    // cannot make this process's failed initialization successful.
+    set_session(&s, "ready", None, None);
+    let signin = open_root(&mut s, SignIn::id());
+    assert_eq!(with_chats(&s, groups, |p| p.empty_line("")), error);
+    with_signin(&s, signin, |p| {
+        assert_eq!(p.line(), error);
+        assert!(p.note().is_none());
+        assert!(p.field_kind().is_none());
+    });
+    let picker = open_root(&mut s, Topics::id(BERLIN));
+    assert_eq!(with_topics(&s, picker, |p| p.status()), error);
+
+    runtime.set_connection_error(None);
+    assert_eq!(
+        with_chats(&s, groups, |p| p.empty_line("")),
+        "no groups with topics yet"
+    );
+    assert!(with_signin(&s, signin, |p| p.note()).is_some());
+}
+
+#[test]
 fn topic_history_read_claim_and_drafts_never_cross_topics() {
     let mut s = session();
     let list = open_root(&mut s, Chats::id());
