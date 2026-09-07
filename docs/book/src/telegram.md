@@ -9,6 +9,12 @@ even when the native client is linked.
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
 
+Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
+answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
+Following several originals keeps each return point, so repeated `back`
+retraces them in order. This history belongs to the open panel; replies that
+have been deleted or are no longer loaded are skipped.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

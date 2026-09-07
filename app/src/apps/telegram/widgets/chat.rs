@@ -362,8 +362,8 @@ impl Widget for ChatPanel {
         self.view.handle_event(cx, event, scope);
         self.mount(cx, &props, scope);
 
-        // A verb moved the cursor — a reply's original — and asked for it
-        // on screen.
+        // A verb moved the cursor — to a reply's original or back to the
+        // reply — and asked for it on screen.
         if self.mounted {
             if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
                 self.follow(cx, &props, id, super::now(scope));

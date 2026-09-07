@@ -74,9 +74,11 @@ pub struct Chat {
     store: Rc<Store>,
     slot: SlotId,
     cursor: Option<MsgId>,
-    /// A line the transcript is asked to bring on screen — the original a
-    /// reply jumps to — taken once by the widget, the way a caret wish is.
+    /// A line the transcript is asked to bring on screen — a reply's
+    /// original or the way back — taken once by the widget.
     follow_wish: Option<MsgId>,
+    /// Replies left by successful jumps to their originals, newest last.
+    reply_back: Vec<MsgId>,
     marks: BTreeSet<MsgId>,
     reply_to: Option<MsgId>,
     /// The composer's text. Written to the chat's row behind it, so the list
@@ -396,6 +398,7 @@ impl Chat {
         for id in ids {
             self.marks.remove(id);
         }
+        self.reply_back.retain(|id| !ids.contains(id));
         if self.editing.as_ref().is_some_and(|e| ids.contains(&e.msg)) {
             self.editing = None;
         }
@@ -420,17 +423,21 @@ impl Chat {
     /// Puts the cursor on the line the cursor's line answers — a reply's
     /// original — and asks the transcript to bring it on screen. An original
     /// the window does not hold (older than the ten thousand kept, or not
-    /// yet backfilled) is said so rather than silently not jumped to.
+    /// yet backfilled) is said so rather than silently not jumped to. Only
+    /// a successful jump remembers the reply for the way back.
     pub fn jump_to_original(&mut self, s: &mut Session) {
         let hist = self.history();
-        let Some(target) = self
+        let Some(reply) = self
             .cursor
             .and_then(|c| hist.iter().find(|m| m.id == c))
-            .and_then(|m| m.reply_to)
         else {
             return;
         };
+        let Some(target) = reply.reply_to.filter(|id| *id != reply.id) else {
+            return;
+        };
         if hist.iter().any(|m| m.id == target) {
+            self.reply_back.push(reply.id);
             self.cursor = Some(target);
             self.follow_wish = Some(target);
         } else {
@@ -439,6 +446,24 @@ impl Chat {
         s.redraw();
     }
 
+    /// Returns through the replies whose originals were followed, one at
+    /// a time. Server deletions or retention may have removed a saved line
+    /// without telling this panel, so skip those on the way back.
+    fn jump_back(&mut self, s: &mut Session) {
+        if self.reply_back.is_empty() {
+            return;
+        }
+        let hist = self.history();
+        while let Some(target) = self.reply_back.pop() {
+            if hist.iter().any(|m| m.id == target) {
+                self.cursor = Some(target);
+                self.follow_wish = Some(target);
+                s.redraw();
+                return;
+            }
+        }
+        s.notify("the reply is no longer loaded", false);
+    }
 
     /// What the line above the composer says while replying: *reply to
     /// Vera: the line*, shortened to one line.
@@ -769,13 +794,17 @@ impl Panel for Chat {
     /// the cursor's line as a card, which wears the verbs on one line;
     /// `about`, the peer's card, which wears the verbs about the chat and
     /// its search. With marks: `forward n`, `delete n` while every marked
-    /// line is mine, and `clear`.
+    /// line is mine, and `clear`. A jump to an original offers `back` until
+    /// the saved replies have been retraced, even while rows are marked.
     fn verbs(&self) -> Vec<Verb> {
         let n = self.marks.len();
         let k = self.carrying.len();
         let hist = self.history();
         let under = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c && !m.service));
         let mut v = Vec::new();
+        if !self.reply_back.is_empty() {
+            v.push(Verb::run("telegram.back", "back", Some('b')));
+        }
         if n == 0 {
             if let Some(m) = under {
                 v.push(Verb::run("telegram.reply", "reply", Some('r')));
@@ -853,6 +882,7 @@ impl Panel for Chat {
                 }
             }
             "telegram.original" => self.jump_to_original(s),
+            "telegram.back" => self.jump_back(s),
             // The marks, or the cursor's own line.
             "telegram.delete" => {
                 let ids: Vec<MsgId> = if self.marks.is_empty() {
@@ -1035,6 +1065,7 @@ impl PanelKind for ChatKind {
             slot: 0,
             cursor: at,
             follow_wish: None,
+            reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,
             sent_draft: draft.clone(),

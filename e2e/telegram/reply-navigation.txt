@@ -1,0 +1,72 @@
+# args:
+# env:
+#
+# Original and back use the transcript's cursor and bring its line into view.
+# Exercise the bar, a quote press, and the keyboard shortcut from the composer.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+wait 600
+key enter
+wait 600
+key esc
+wait 300
+key end
+wait 300
+key up 3
+wait 400
+
+# Only the reply under the cursor offers original. Replying at the other
+# end proves that the jump selected the message the quote names.
+click "original"
+wait 400
+click "reply"
+wait 400
+click "reply to Vera Kovac: see you at 7:30 then?"
+wait 300
+key esc
+wait 300
+key esc
+wait 300
+
+# Reading elsewhere does not lose the return point. Back must scroll as
+# well as select: the reply's row resolves only when it is drawn again.
+key home
+wait 400
+click "back"
+wait 400
+click "me: yes — the trailhead car park"
+wait 300
+click "original"
+wait 400
+click "back"
+wait 400
+
+# A quote press keeps the same way back. Enter puts the caret in the
+# composer; cmd+b still returns to the reply and keeps the draft intact.
+click "the line it answers"
+wait 400
+key home
+wait 400
+key enter
+wait 300
+type "still writing"
+wait 300
+key cmd+b
+wait 400
+shot reply-returned
+click "original"
+wait 400
+click "back"
+wait 400
+click "reply"
+wait 400
+click "reply to me: yes — the trailhead car park"
+wait 300
+quit
