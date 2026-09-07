@@ -125,6 +125,47 @@ mod tests {
         assert_eq!(v["@type"], "textEntities");
     }
 
+    /// Probe the linked library's JSON schema without opening an account.
+    /// Its parser must reach the nested InputFile path in our actual builder:
+    /// replacing that string with an array must produce a parse error. The
+    /// old, flat media request ignores that path on modern TDLib and fails
+    /// this test. No send is executed by the synchronous API.
+    #[test]
+    fn media_builders_match_the_native_json_decoder() {
+        use crate::apps::telegram::{model::Carried, requests};
+        use serde_json::{json, Value};
+        fn invalidate_paths(v: &mut Value) {
+            if v["@type"] == "inputFileLocal" {
+                v["path"] = json!([]);
+            } else if let Some(object) = v.as_object_mut() {
+                for child in object.values_mut() {
+                    invalidate_paths(child);
+                }
+            }
+        }
+        for path in [
+            "/tmp/probe.png",
+            "/tmp/probe.jpg",
+            "/tmp/probe.mp4",
+            "/tmp/probe.gif",
+            "/tmp/probe.mp3",
+            "/tmp/probe.pdf",
+        ] {
+            let request = requests::send_file(0, None, &Carried { path: path.into() }, "");
+            let mut request: Value = serde_json::from_str(&request).unwrap();
+            invalidate_paths(&mut request);
+            let reply: Value =
+                serde_json::from_str(&execute(&request.to_string()).unwrap()).unwrap();
+            assert!(
+                reply["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Expected String"),
+                "{path}: {reply}"
+            );
+        }
+    }
+
     /// A freshly minted client id is a small positive int — the library made
     /// it, no network touched.
     #[test]

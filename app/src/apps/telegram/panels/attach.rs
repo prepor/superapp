@@ -269,6 +269,17 @@ impl Panel for Attach {
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         let now = s.now();
+        if super::live(&self.store) && matches!(verb, "telegram.voice" | "telegram.video") {
+            let error =
+                "Recording is not available yet. Attach a recorded audio or video file instead.";
+            super::super::runtime::of(&self.store).operations.report(
+                &self.store,
+                "recording",
+                error,
+            );
+            s.notify(error, true);
+            return;
+        }
         match verb {
             // What the files app holds goes to the chat's list, by path:
             // the send reads it as the message leaves, as a letter does.

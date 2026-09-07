@@ -378,12 +378,27 @@ impl Panel for Viewer {
                 let file = self.msg().and_then(|m| self.file_to_open(&m));
                 match file {
                     Some(path) if cfg!(target_os = "macos") => {
-                        let opened = std::process::Command::new("open").arg(&path).spawn().is_ok();
-                        s.notify(
-                            if opened { "opened with the system" } else { "could not open it" }
-                                .to_string(),
-                            !opened,
+                        let _ = super::super::operations::run_local(
+                            self.world.store(),
+                            Some(self.chat),
+                            "opening media",
+                            move || {
+                                let output = std::process::Command::new("open")
+                                    .arg(&path)
+                                    .output()
+                                    .map_err(|e| e.to_string())?;
+                                if output.status.success() {
+                                    Ok(())
+                                } else {
+                                    Err(format!(
+                                        "{}: {}",
+                                        output.status,
+                                        String::from_utf8_lossy(&output.stderr).trim()
+                                    ))
+                                }
+                            },
                         );
+                        s.redraw();
                     }
                     Some(_) => s.notify(draft_toast("open with the system"), false),
                     None => s.notify("nothing here to open yet".to_string(), false),

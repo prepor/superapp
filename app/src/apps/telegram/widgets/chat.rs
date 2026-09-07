@@ -146,6 +146,8 @@ pub struct ChatPanel {
     /// by how much this line moved and moves the list with it.
     #[rust]
     anchor: Option<(MsgId, usize)>,
+    #[rust]
+    dragging_files: bool,
 }
 
 impl Widget for ChatPanel {
@@ -153,6 +155,44 @@ impl Widget for ChatPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+
+        if matches!(event, Event::Drag(_) | Event::Drop(_) | Event::DragEnd) {
+            match event.drag_hits(cx, self.view.area()) {
+                DragHit::Drag(e) => {
+                    self.dragging_files = e.state != DragState::Out
+                        && e.items
+                            .iter()
+                            .any(|item| matches!(item, DragItem::FilePath { .. }))
+                        && can_post(&props)
+                        && !with_chat(&props, |c| c.editing().is_some()).unwrap_or(true);
+                    if e.state != DragState::Out {
+                        *e.response.lock().unwrap() = if self.dragging_files {
+                            DragResponse::Copy
+                        } else {
+                            DragResponse::None
+                        };
+                    }
+                }
+                DragHit::Drop(e) => {
+                    self.dragging_files = false;
+                    let paths: Vec<String> = e
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            DragItem::FilePath { path, .. } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(s) = scope.data.get_mut::<Session>() {
+                        with_chat(&props, |c| c.drop_files(s, &paths));
+                        s.nav(Nav::Focus(props.slot));
+                        self.refocus = can_post(&props);
+                    }
+                }
+                _ => self.dragging_files = false,
+            }
+            self.view.redraw(cx);
+        }
 
         let field = self.view.text_input(cx, INPUT);
         // The panel taking focus puts the caret in the composer, the way
@@ -499,6 +539,9 @@ impl Widget for ChatPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = render.now;
+        self.view
+            .label(cx, ids!(drop_hint))
+            .set_visible(cx, self.dragging_files);
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
         let Some((card, rows, cursor, marks, above, text, carrying, players, moving)) = ({

@@ -22,6 +22,7 @@ pub struct Forward {
 #[derive(Default)]
 pub struct Runtime {
     state: Mutex<State>,
+    pub operations: super::operations::Tracker,
 }
 
 #[derive(Default)]
@@ -33,6 +34,7 @@ struct State {
     play_next: Option<(PeerId, MsgId)>,
     loading: Vec<PeerId>,
     list_syncing: bool,
+    connection_status: Option<String>,
     wanted: Wanted,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
@@ -117,10 +119,31 @@ impl Runtime {
 
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
-        self.state()
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.send(request.to_string()).is_ok())
+        let state = self.state();
+        let Some(sender) = state.sender.as_ref() else {
+            return false;
+        };
+        sender.send(self.operations.track(request)).is_ok()
+    }
+
+    pub fn has_worker(&self) -> bool {
+        // An inbox that has disconnected still belongs to a live account;
+        // its panels must not fall back to simulated fixture actions.
+        self.state().connection != 0
+    }
+
+    pub fn connection(&self) -> Option<String> {
+        self.state().connection_status.clone()
+    }
+
+    pub fn set_connection(&self, state: &str) {
+        self.state().connection_status = match state {
+            "connectionStateReady" => None,
+            "connectionStateWaitingForNetwork" => Some("waiting for network…".into()),
+            "connectionStateConnectingToProxy" => Some("connecting to proxy…".into()),
+            "connectionStateUpdating" => Some("updating Telegram…".into()),
+            _ => Some("connecting to Telegram…".into()),
+        };
     }
 
     /// Serialize profile actions for each person until their reply arrives.

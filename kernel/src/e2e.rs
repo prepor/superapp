@@ -34,6 +34,7 @@
 //! holdmove "inbox" 400 0 — long-press the element and drag it: a panel is
 //!                       pressed on its header and picked up, and a move of
 //!                       0 0 is the long press alone (a row marks)
+//! dropfiles ["field", "path"] — drag local files onto the labelled element
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
 //!
@@ -117,6 +118,8 @@ pub enum Step {
     },
     /// Release a gesture left alive by `holdmove … hold` or `swipe … hold`.
     Drop,
+    /// Deliver desktop file drag/drop events at a labelled element.
+    DropFiles { label: String, paths: Vec<String> },
     /// End the run.
     Quit,
 }
@@ -133,6 +136,7 @@ impl Step {
                 | Step::Mouse { .. }
                 | Step::MultiClick { .. }
                 | Step::Drag { .. }
+                | Step::DropFiles { .. }
                 | Step::Swipe { .. }
                 | Step::HoldMove { .. }
         )
@@ -219,6 +223,17 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
         // `\n` is a newline here and nowhere else: a paste is the one step
         // whose argument is a document rather than a word.
         "paste" => Step::Paste(unescape(&quoted()?)),
+        "dropfiles" => {
+            let values: Vec<String> = serde_json::from_str(rest)
+                .map_err(|_| err("expected a JSON array: [\"label\", \"path\", ...]"))?;
+            let mut values = values.into_iter();
+            let label = values.next().ok_or_else(|| err("expected a drop target"))?;
+            let paths: Vec<_> = values.collect();
+            if paths.is_empty() {
+                return Err(err("expected at least one file path"));
+            }
+            Step::DropFiles { label, paths }
+        }
         "drag" | "swipe" | "holdmove" => {
             let label = quoted()?;
             let after = &rest[rest.rfind('"').unwrap() + 1..];

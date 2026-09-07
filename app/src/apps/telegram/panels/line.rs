@@ -230,7 +230,11 @@ impl Panel for Line {
             "telegram.delete" => {
                 let (chat, msg) = (self.chat, self.msg);
                 self.tell_chat(s, |c| c.lines_gone(&[msg]));
-                if !wire(self.world.store(), &requests::delete_messages(chat, &[msg], true)) {
+                if !wire(
+                    self.world.store(),
+                    &requests::delete_messages(chat, &[msg], true),
+                ) && !super::live(self.world.store())
+                {
                     verbs::delete_lines(s, chat, vec![msg]);
                 }
                 s.redraw();
