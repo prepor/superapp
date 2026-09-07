@@ -74,6 +74,30 @@ script_mod! {
         clip := mod.widgets.Video {
             width: Fill, height: Fill
             show_controls: false
+            draw_bg +: {
+                // Video's default shader stretches a Fill walk. Fit against
+                // the current draw rectangle so playback and window resizing
+                // keep the source proportions, just like the poster.
+                get_color_scale_pan: fn() {
+                    let source = max(self.source_size, vec2(1.0, 1.0))
+                    let target = max(self.rect_size, vec2(1.0, 1.0))
+                    let fit = min(target.x / source.x, target.y / source.y)
+                    let size = source * fit
+                    let coord = (self.pos * target - (target - size) * 0.5) / size
+                    if coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0 {
+                        return vec4(0.0, 0.0, 0.0, 0.0)
+                    }
+                    if self.show_thumbnail > 0.5 {
+                        return self.thumbnail_texture.sample_as_bgra(coord).xyzw
+                    } else if self.yuv_enabled > 0.5 {
+                        return self.sample_yuv(coord)
+                    } else if self.video_rgba_2d > 0.5 {
+                        return self.video_texture_2d.sample(coord)
+                    } else {
+                        return self.sample_oes(coord)
+                    }
+                }
+            }
         }
     }
 

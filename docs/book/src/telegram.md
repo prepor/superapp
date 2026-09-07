@@ -184,6 +184,9 @@ the connection problem, including a session held by another app instance.
 Initialization retries every five seconds after a failure; queued media
 starts automatically once Telegram is ready.
 
+Playing videos fit inside the viewer at their original aspect ratio, including
+when the window is resized, with empty space around the frame where needed.
+
 ## Modules
 
 | Module | Responsibility |
