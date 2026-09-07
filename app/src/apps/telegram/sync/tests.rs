@@ -234,6 +234,179 @@ fn num(w: &World, sql: &str) -> i64 {
     w.store().conn().query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+fn mention_group(acc: &Account<FakeTd>, w: &World, chat: i64, count: i64) {
+    acc.on_update(w, &json!({
+        "@type": "updateNewChat",
+        "chat": {
+            "id": chat, "title": "Unread group",
+            "type": {"@type": "chatTypeSupergroup", "is_channel": false},
+            "positions": [{"list": {"@type": "chatListMain"}, "order": "100"}],
+            "unread_count": 0, "last_read_inbox_message_id": 10000,
+            "unread_mention_count": count,
+            "notification_settings": {"mute_for": 3600}
+        }
+    }).to_string());
+}
+
+fn last_mention_request(td: &FakeTd) -> serde_json::Value {
+    td.sent().iter().rev().filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .find(|v| v["@type"] == "searchChatMessages").expect("an unread search request")
+}
+
+fn mention_page(chat: i64, ids: &[i64], request: &serde_json::Value, next: Option<i64>) -> String {
+    let mut page: serde_json::Value = serde_json::from_str(
+        &history_page(chat, ids, request["@extra"].as_str().unwrap())
+    ).unwrap();
+    for message in page["messages"].as_array_mut().unwrap() {
+        message["contains_unread_mention"] = json!(true);
+        // The original isn't in the local history; Telegram still knows
+        // that this message answers me.
+        message["reply_to"] = json!({"@type": "messageReplyToMessage", "chat_id": chat, "message_id": 42});
+    }
+    if let Some(next) = next {
+        page["@type"] = json!("foundChatMessages");
+        page["next_from_message_id"] = json!(next);
+    }
+    page.to_string()
+}
+
+#[test]
+fn unread_mentions_are_loaded_without_history_and_paginate_short_pages() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 3);
+    acc.drain(&w);
+    let first = last_mention_request(&td);
+    assert_eq!(first["filter"]["@type"], "searchMessagesFilterUnreadMention");
+    assert_eq!(first["from_message_id"], 0);
+    assert_eq!(first["query"], "");
+    assert!(runtime::of(w.store()).mentions_status(None).0);
+
+    acc.on_update(&w, &mention_page(-9001, &[100], &first, Some(90)));
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_message WHERE unread_mention = 1"), 1);
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9001"), 0);
+    assert_eq!(super::model::reply_count(w.store()), 3, "count isn't bounded by downloaded history");
+    clock.advance(PAGE_GAP + 0.1);
+    acc.drain(&w);
+    let second = last_mention_request(&td);
+    assert_eq!(second["from_message_id"], 90, "a short page must follow the server continuation");
+    acc.on_update(&w, &mention_page(-9001, &[80, 70], &second, Some(0)));
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_message WHERE unread_mention = 1"), 3);
+    assert_eq!(runtime::of(w.store()).mentions_status(None), (false, false));
+}
+
+#[test]
+fn legacy_mention_pages_progress_without_repeating_the_boundary() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 2);
+    acc.drain(&w);
+    let first = last_mention_request(&td);
+    acc.on_update(&w, &mention_page(-9001, &[100], &first, None));
+    clock.advance(PAGE_GAP + 0.1);
+    acc.drain(&w);
+    let second = last_mention_request(&td);
+    assert_eq!(second["from_message_id"], 99);
+    acc.on_update(&w, &mention_page(-9001, &[], &second, None));
+    assert!(!runtime::of(w.store()).mentions_status(None).0);
+}
+
+#[test]
+fn mention_reads_from_another_device_clear_only_that_chat_and_reject_stale_pages() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 2);
+    acc.drain(&w);
+    let first = last_mention_request(&td);
+    acc.on_update(&w, &mention_page(-9001, &[100, 90], &first, Some(80)));
+    clock.advance(PAGE_GAP + 0.1);
+    acc.drain(&w);
+    let stale = last_mention_request(&td);
+    mention_group(&acc, &w, -9002, 1);
+    let mut same_id: serde_json::Value = serde_json::from_str(&mention_page(-9002, &[100], &first, None)).unwrap();
+    same_id = same_id["messages"][0].clone();
+    acc.on_update(&w, &same_id.to_string());
+    acc.on_update(&w, &json!({"@type": "updateMessageMentionRead", "chat_id": -9001,
+        "message_id": 100, "unread_mention_count": 1}).to_string());
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE chat = -9001 AND id = 100"), 0);
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE chat = -9002 AND id = 100"), 1);
+    assert_eq!(num(&w, "SELECT mention FROM tg_chat WHERE peer = -9001"), 1);
+    acc.on_update(&w, &mention_page(-9001, &[100, 90, 70], &stale, Some(0)));
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_message WHERE chat = -9001"), 2, "stale scan discarded");
+    let delayed: serde_json::Value = serde_json::from_str(&mention_page(-9001, &[100], &first, None)).unwrap();
+    acc.on_update(&w, &delayed["messages"][0].to_string());
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE chat = -9001 AND id = 100"), 0,
+        "a delayed ordinary message response cannot undo the read either");
+    acc.on_update(&w, &json!({"@type": "updateChatUnreadMentionCount", "chat_id": -9001,
+        "unread_mention_count": 0}).to_string());
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_message WHERE chat = -9001 AND unread_mention = 1"), 0);
+    assert_eq!(super::model::reply_count(w.store()), 1, "the other group is still unread");
+}
+
+#[test]
+fn unread_search_errors_and_timeouts_leave_the_count_and_allow_refresh() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 2);
+    acc.drain(&w);
+    let first = last_mention_request(&td);
+    acc.on_update(&w, &json!({"@type": "error", "code": 429, "message": "Too Many Requests: retry after 5",
+        "@extra": first["@extra"]}).to_string());
+    let sent = td.sent().len();
+    clock.advance(5.0);
+    acc.drain(&w);
+    assert_eq!(td.sent().len(), sent, "the flood wait is honored");
+    clock.advance(1.1);
+    acc.drain(&w);
+    assert_eq!(td.sent().len(), sent + 1);
+    acc.on_update(&w, &json!({"@type": "error", "code": 500, "message": "unavailable",
+        "@extra": first["@extra"]}).to_string());
+    assert_eq!(runtime::of(w.store()).mentions_status(None), (false, true));
+    assert_eq!(super::model::reply_count(w.store()), 2);
+    runtime::of(w.store()).want_mentions(-9001);
+    clock.advance(PAGE_GAP + 0.1);
+    acc.drain(&w);
+    assert_ne!(last_mention_request(&td)["@extra"], first["@extra"]);
+    clock.advance(super::PAGE_PATIENCE + 0.1);
+    acc.drain(&w);
+    assert_eq!(runtime::of(w.store()).mentions_status(None), (false, true));
+    assert_eq!(super::model::reply_count(w.store()), 2);
+}
+
+#[test]
+fn a_completed_rescan_reconciles_old_notifications_and_preserves_new_arrivals() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 2);
+    acc.drain(&w);
+    let first = last_mention_request(&td);
+    acc.on_update(&w, &mention_page(-9001, &[100, 90], &first, Some(0)));
+    // The server only announces a smaller count: the completed search
+    // must identify which locally cached notification disappeared.
+    acc.on_update(&w, &json!({"@type": "updateChatUnreadMentionCount", "chat_id": -9001,
+        "unread_mention_count": 1}).to_string());
+    clock.advance(PAGE_GAP + 0.1);
+    acc.drain(&w);
+    let second = last_mention_request(&td);
+    let incoming: serde_json::Value = serde_json::from_str(&mention_page(-9001, &[110], &first, None)).unwrap();
+    acc.on_update(&w, &incoming["messages"][0].to_string());
+    acc.on_update(&w, &mention_page(-9001, &[90], &second, Some(0)));
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE id = 100"), 0);
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE id = 90"), 1);
+    assert_eq!(num(&w, "SELECT unread_mention FROM tg_message WHERE id = 110"), 1,
+        "a message received during the scan is not part of its snapshot");
+}
+
 /// An `updateUser` for a person, as TDLib frames one.
 fn user_update(id: i64, first: &str, last: &str, username: &str) -> String {
     json!({
@@ -1665,7 +1838,7 @@ fn a_chats_later_updates_land_the_title_the_mention_and_the_counts() {
                 "unread_mention_count": 2})
         .to_string(),
     );
-    assert_eq!(num(&w, "SELECT mention FROM tg_chat WHERE peer = -1006"), 1);
+    assert_eq!(num(&w, "SELECT mention FROM tg_chat WHERE peer = -1006"), 2);
     acc.on_update(
         &w,
         &json!({"@type": "updateChatUnreadMentionCount", "chat_id": -1006,

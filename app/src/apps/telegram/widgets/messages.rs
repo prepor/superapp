@@ -54,7 +54,19 @@ impl RowSpec for MessagesRows {
         panel.seed_filter()
     }
 
-    fn empty_line(_panel: &Messages, filter: &str) -> String {
+    fn empty_line(panel: &Messages, filter: &str) -> String {
+        if panel.is_replies() {
+            let (loading, failed) = panel.reply_status();
+            return if loading {
+                "loading unread replies and mentions…"
+            } else if failed {
+                "could not load replies and mentions · refresh to retry"
+            } else if panel.pending_count() == 0 {
+                "no unread replies or mentions"
+            } else {
+                "no loaded replies or mentions under this filter · refresh to retry"
+            }.to_string();
+        }
         if filter.trim().is_empty() {
             "no messages".to_string()
         } else {

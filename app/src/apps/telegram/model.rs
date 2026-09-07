@@ -69,7 +69,7 @@ pub struct ChatRow {
     pub pinned: i64,
     pub muted: bool,
     pub unread: i64,
-    pub mention: bool,
+    pub unread_mentions: i64,
     pub draft: Option<String>,
     /// Who is typing, in a word.
     pub typing: Option<String>,
@@ -468,6 +468,7 @@ pub struct Msg {
     pub state: Option<String>,
     pub edited: bool,
     pub reply_to: Option<MsgId>,
+    pub unread_mention: bool,
     /// Who wrote what it answers, and what they wrote.
     pub reply_name: String,
     pub reply_text: String,
@@ -578,7 +579,7 @@ pub struct PeerCard {
     pub pinned: i64,
     pub archived: bool,
     pub unread: i64,
-    pub mention: bool,
+    pub unread_mentions: i64,
     pub last_read: Option<MsgId>,
     pub draft: Option<String>,
     pub typing: Option<String>,
@@ -750,6 +751,13 @@ const DATE_OPS: &[Op] = &[Op::Eq, Op::Gt, Op::Gte, Op::Lt, Op::Lte];
 /// The chat list's tags.
 static CHATS_TAGS: &[TagDef] = &[
     TagDef {
+        name: "replies",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "unread replies and mentions in groups",
+        values: Values::None,
+    },
+    TagDef {
         name: "unread",
         kind: TagType::Bool,
         ops: &[],
@@ -817,7 +825,8 @@ macro_rules! chats_spec {
             text: &["p.name", "m.text"],
             index: None,
             tags: &[
-                ("unread", TagSql::Where("c.unread > 0")),
+                ("unread", TagSql::Where("c.unread > 0 OR c.mention > 0")),
+                ("replies", TagSql::Where("p.kind = 'group' AND c.mention > 0")),
                 ("muted", TagSql::Where("c.muted = 1")),
                 ("pinned", TagSql::Where("c.pinned > 0")),
                 ("kind", TagSql::Col("p.kind")),
@@ -860,7 +869,7 @@ fn chat_row(r: &rusqlite::Row) -> rusqlite::Result<ChatRow> {
         pinned: r.get(3)?,
         muted: r.get::<_, i64>(4)? != 0,
         unread: r.get(5)?,
-        mention: r.get::<_, i64>(6)? != 0,
+        unread_mentions: r.get(6)?,
         draft: r.get(7)?,
         typing: r.get(8)?,
         last: r.get(9)?,
@@ -1024,6 +1033,36 @@ pub static MESSAGES: SqlSource<MsgHit, i64> = SqlSource {
     suggest: suggest_messages,
 };
 
+static REPLIES_SPEC: SqlSpec = SqlSpec {
+    id: "telegram replies",
+    describe: "unread replies and mentions in joined groups, including the archive",
+    from: "tg_message m JOIN tg_peer p ON p.id = m.chat
+           JOIN tg_chat c ON c.peer = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
+    base: "m.service = 0 AND m.out = 0 AND m.unread_mention = 1
+           AND p.kind = 'group' AND (c.in_main = 1 OR c.archived = 1)",
+    ..MESSAGES_SPEC
+};
+
+pub static REPLIES: SqlSource<MsgHit, i64> = SqlSource {
+    spec: &REPLIES_SPEC,
+    ..MESSAGES
+};
+
+static Q_REPLY_CHATS: Q = Q {
+    id: "tg reply chats",
+    sql: "SELECT c.peer, c.mention FROM tg_chat c JOIN tg_peer p ON p.id = c.peer
+          WHERE p.kind = 'group' AND (c.in_main = 1 OR c.archived = 1) AND c.mention > 0",
+    describe: "groups with unread replies or mentions, whether muted or archived",
+};
+
+pub fn reply_chats(store: &Store) -> std::rc::Rc<Vec<(PeerId, i64)>> {
+    store.rows(&Q_REPLY_CHATS, &[], |r| Ok((r.get(0)?, r.get(1)?)))
+}
+
+pub fn reply_count(store: &Store) -> i64 {
+    reply_chats(store).iter().map(|(_, n)| n).sum()
+}
+
 // -- the people -------------------------------------------------------------------------
 
 static CONTACTS_TAGS: &[TagDef] = &[TagDef {
@@ -1160,7 +1199,7 @@ fn peer_card_row(r: &rusqlite::Row) -> rusqlite::Result<PeerCard> {
         last_read: r.get(16)?,
         draft: r.get(17)?,
         typing: r.get(18)?,
-        mention: r.get::<_, i64>(19)? != 0,
+        unread_mentions: r.get(19)?,
         in_main: r.get::<_, i64>(20)? != 0,
         blocked: r.get::<_, i64>(21)? != 0,
     })
@@ -1187,7 +1226,7 @@ static Q_HISTORY: Q = Q {
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known
+                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention
           FROM tg_message m
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = m.chat AND r.id = m.reply_to
@@ -1224,6 +1263,7 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         state: r.get(7)?,
         edited: r.get::<_, i64>(8)? != 0,
         reply_to: r.get(9)?,
+        unread_mention: r.get(33)?,
         reply_name,
         reply_text,
         fwd_from: r.get(12)?,
@@ -1315,15 +1355,15 @@ pub fn set_draft_tx(c: &rusqlite::Connection, peer: PeerId, draft: &str) -> rusq
     Ok(())
 }
 
-/// Marks a chat read: the count to nought, the mention gone, the last read
-/// line the newest one.
+/// Marks the ordinary inbox read through its newest line. Replies and
+/// mentions have their own acknowledgment when the message is viewed.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
 pub fn mark_read_tx(c: &rusqlite::Connection, peer: PeerId) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE tg_chat SET unread = 0, mention = 0,
+        "UPDATE tg_chat SET unread = 0,
                 last_read = (SELECT MAX(id) FROM tg_message WHERE chat = ?1)
          WHERE peer = ?1",
         rusqlite::params![peer],
@@ -1867,7 +1907,7 @@ mod tests {
             pinned: 0,
             muted: false,
             unread: 0,
-            mention: false,
+            unread_mentions: 0,
             draft: None,
             typing: None,
             last: ts(2026, 9, 1, 11, 52),

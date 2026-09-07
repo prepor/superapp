@@ -33,6 +33,8 @@ use super::transport::RealTd;
 use super::transport::Td;
 use super::updates;
 
+mod mentions;
+
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
 /// so every Telegram client expires an action on its own clock; about six
@@ -74,6 +76,8 @@ pub struct Account<T: Td> {
     pages: std::cell::RefCell<std::collections::VecDeque<Page>>,
     /// When the page on the wire went, or `None` when none is.
     in_flight: std::cell::Cell<Option<(Page, f64)>>,
+    mention_generation: std::cell::Cell<u64>,
+    mention_scans: std::cell::RefCell<std::collections::HashMap<PeerId, mentions::Scan>>,
     /// The earliest the next page may go: the pace, or the wait Telegram
     /// asked for.
     not_before: std::cell::Cell<f64>,
@@ -179,6 +183,8 @@ impl<T: Td> Account<T> {
             typing: std::cell::RefCell::new(std::collections::HashMap::new()),
             pages: std::cell::RefCell::new(std::collections::VecDeque::new()),
             in_flight: std::cell::Cell::new(None),
+            mention_generation: std::cell::Cell::new(0),
+            mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
         }
     }
@@ -220,13 +226,18 @@ impl<T: Td> Account<T> {
         for chat in wanted.chats {
             self.want(w, chat);
         }
+        for chat in wanted.mentions {
+            if !self.mention_scans.borrow().contains_key(&chat) {
+                self.want_mentions(w, chat);
+            }
+        }
         let now = w.now();
         if let Some((page, sent)) = self.in_flight.get() {
             if now - sent < PAGE_PATIENCE {
                 return;
             }
             self.in_flight.set(None);
-            runtime::of(w.store()).set_loading(page.chat, false);
+            self.finish_page(w, page, true);
             runtime::of(w.store()).operations.fail_context(
                 w.store(),
                 &format!("history:{}:{}:{}", page.chat, page.walk.word(), page.from),
@@ -573,7 +584,9 @@ impl<T: Td> Account<T> {
                 {
                     return;
                 }
-                self.in_flight.set(None);
+                if !self.accept_page(page) {
+                    return;
+                }
                 let wait = (v["code"].as_i64() == Some(429))
                     .then(|| retry_after(v["message"].as_str().unwrap_or("")))
                     .flatten();
@@ -582,7 +595,7 @@ impl<T: Td> Account<T> {
                         self.not_before.set(w.now() + secs + 1.0);
                         self.pages.borrow_mut().push_front(Page { chat, from, walk });
                     }
-                    None => runtime::of(w.store()).set_loading(chat, false),
+                    None => self.finish_page(w, page, true),
                 }
             }
             _ => {}
@@ -686,6 +699,7 @@ impl<T: Td> Account<T> {
             // mention badge, a draft from another device, somebody typing.
             Some("updateChatTitle") => self.on_chat_title(w, update),
             Some("updateChatUnreadMentionCount") => self.on_chat_mentions(w, update),
+            Some("updateMessageMentionRead") => self.on_mention_read(w, update),
             Some("updateChatDraftMessage") => self.on_chat_draft(w, update),
             Some("updateChatAction") => self.on_chat_action(w, update),
             Some("updateMessageInteractionInfo") => self.on_interaction(w, update),
@@ -723,7 +737,7 @@ impl<T: Td> Account<T> {
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
-            Some("messages") => self.on_history(w, update),
+            Some("messages" | "foundChatMessages") => self.on_history(w, update),
             _ => {}
         }
     }
@@ -878,6 +892,7 @@ impl<T: Td> Account<T> {
             return;
         };
         let peer = ch.peer;
+        let mentions = ch.unread_mentions;
         let derived = updates::chat_peer(chat);
         let blocked = updates::blocked(chat);
         let read_outbox = chat["last_read_outbox_message_id"]
@@ -893,6 +908,7 @@ impl<T: Td> Account<T> {
                 ensure_peer(c, peer)?;
                 model::set_blocked_tx(c, peer, blocked)?;
                 project_chats(c, &[ch])?;
+                super::project::set_mentions(c, peer, mentions)?;
                 if read_outbox.is_some() {
                     c.execute(
                         "UPDATE tg_chat SET read_outbox = ?2 WHERE peer = ?1",
@@ -909,6 +925,7 @@ impl<T: Td> Account<T> {
         if chat["last_message"].is_object() {
             self.on_new_message(w, &chat["last_message"]);
         }
+        self.want_mentions(w, peer);
     }
 
     /// The far side read up to a line: every sent line up to it is read —
@@ -1095,17 +1112,10 @@ impl<T: Td> Account<T> {
         let Some((chat, mention)) = updates::chat_mentions(u) else {
             return;
         };
-        self.filed(
-            w,
-            "on_chat_mentions",
-            w.store().write(move |c| {
-                c.execute(
-                    "UPDATE tg_chat SET mention = ?2 WHERE peer = ?1",
-                    rusqlite::params![chat, mention],
-                )
-                .map(|_| ())
-            }),
-        );
+        self.filed(w, "on_chat_mentions", w.store().write(move |c| {
+            super::project::set_mentions(c, chat, mention)
+        }));
+        self.want_mentions(w, chat);
     }
 
     /// A draft, from whichever device typed it — the phone's half-written
@@ -1333,12 +1343,14 @@ impl<T: Td> Account<T> {
         let Some((chat, walk, from)) = v["@extra"].as_str().and_then(parse_history_extra) else {
             return;
         };
-        let stale = self
-            .in_flight
-            .get()
-            .is_some_and(|(page, _)| page != Page { chat, walk, from });
-        if !stale {
-            self.in_flight.set(None);
+        let page = Page { chat, walk, from };
+        let stale = self.in_flight.get().is_some_and(|(current, _)| current != page);
+        if !self.accept_page(page) {
+            return;
+        }
+        if matches!(walk, Walk::Mentions(_)) {
+            self.on_mentions(w, v, page);
+            return;
         }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
         let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message).collect();
@@ -1409,6 +1421,7 @@ impl<T: Td> Account<T> {
             Walk::Fill => held_oldest.filter(|_| room).map(|o| (o, Walk::Tail)),
             Walk::Tail if progressed && room => Some((oldest, Walk::Tail)),
             Walk::Tail => None,
+            Walk::Mentions(_) => unreachable!("handled above"),
         };
         runtime::of(w.store()).set_loading(chat, next.is_some());
         if let Some((from, walk)) = next {

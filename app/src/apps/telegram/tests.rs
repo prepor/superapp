@@ -144,7 +144,7 @@ fn the_app_registers_its_tags_and_roots() {
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
-    assert_eq!(roots, vec!["chats", "contacts", "saved messages", "sign in"]);
+    assert_eq!(roots, vec!["chats", "replies & mentions", "contacts", "saved messages", "sign in"]);
     // No worker without the engine: the demo world runs no background sync,
     // and the sign-in panel reads the 'closed' session row it leaves.
     assert!(s.workers().names().is_empty(), "nothing runs in the background yet");
@@ -177,7 +177,7 @@ fn the_list_puts_pinned_chats_first_and_the_archive_aside() {
     assert_eq!(titles(&s, archive), vec!["Old flat"]);
     let row = with_chats(&s, list, |c| c.rows(1, 2).remove(0));
     assert_eq!(row.kind, PeerKind::Group);
-    assert!(row.muted && row.mention && row.pinned == 2);
+    assert!(row.muted && row.unread_mentions == 2 && row.pinned == 2);
     assert_eq!(row.unread, 8);
     assert_eq!(row.preview(s.now()), "Ivan: meeting moved to 15:00");
 }
@@ -221,7 +221,7 @@ fn a_preview_marks_the_chat_read_and_undo_gives_it_back() {
     let nav = with_chats(&s, list, |c| c.go(1)).expect("a row");
     go(&mut s, nav);
     let reader = s.joined_child(list).expect("the chat, joined");
-    assert_eq!(unread(&s, STELAXIS), (0, false));
+    assert_eq!(unread(&s, STELAXIS), (0, true));
     // Where the reading started is kept on the instance for the unread
     // line, and the cursor starts nowhere.
     let (first, cursor) = with_chat(&s, reader, |c| (c.first_unread(), c.cursor()));
@@ -428,6 +428,98 @@ fn messages_are_found_everywhere_and_narrowed_to_a_chat() {
     let n = lines(&s, in_chat, &seed).len();
     assert_eq!(n, 13, "the group's lines, service ones left out");
     assert!(verb_ids(&s, all).is_empty(), "a messages list wears no bar");
+}
+
+#[test]
+fn unread_replies_open_at_the_message_and_only_visible_items_are_read() {
+    let mut s = session();
+    let chats = open_root(&mut s, Chats::id());
+    assert_eq!(model::reply_count(s.store()), 2);
+    verb(&mut s, chats, "telegram.replies");
+    let inbox = s.joined_child(chats).unwrap();
+    let rows = {
+        let panel = s.panel(inbox).unwrap();
+        let mut panel = panel.borrow_mut();
+        let messages = panel.as_any().downcast_mut::<Messages>().unwrap();
+        assert!(messages.is_replies());
+        messages.rows(0, 50)
+    };
+    assert_eq!(rows.len(), 2, "a reply to me and a direct mention");
+    let reply = &rows[0];
+    assert_eq!(reply.text, "I saw it — the inset is 28 dp, it wants 34");
+    assert_eq!(model::line(s.store(), STELAXIS, reply.id).unwrap().reply_name, "me");
+    go(&mut s, Nav::Open { from: inbox, id: Chat::at(reply.chat, reply.id), fresh: false });
+    let reader = s.joined_child(inbox).unwrap();
+    with_chat(&s, reader, |c| {
+        assert_eq!(c.cursor(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), Some(reply.id), "the transcript scrolls to the reply");
+        c.view_mentions(&[], s.now());
+    });
+    assert_eq!(model::reply_count(s.store()), 2, "opening alone reads no notification");
+    assert_eq!(unread(&s, STELAXIS).0, 8, "a targeted opening does not read the whole chat");
+    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now()));
+    assert_eq!(model::reply_count(s.store()), 1);
+    assert!(!model::line(s.store(), reply.chat, reply.id).unwrap().unread_mention);
+    assert!(model::line(s.store(), rows[1].chat, rows[1].id).unwrap().unread_mention);
+    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now() + 10.0));
+    assert_eq!(model::reply_count(s.store()), 1, "repeat views cannot decrement twice");
+}
+
+#[test]
+fn unread_replies_include_archived_groups_and_exclude_other_conversations() {
+    let mut s = session();
+    s.store().write(|c| {
+        for peer in [OLD_FLAT, ANNA, RUST_WEEKLY] {
+            c.execute("UPDATE tg_chat SET mention = 1 WHERE peer = ?1", [peer])?;
+            c.execute(
+                "INSERT INTO tg_message(id, chat, date, text, unread_mention) VALUES(999999, ?1, 1, 'look here', 1)",
+                [peer],
+            )?;
+        }
+        Ok(())
+    }).unwrap();
+    assert_eq!(model::reply_count(s.store()), 3, "muted stelaxis and the archived group");
+    let inbox = open_root(&mut s, Messages::replies(None));
+    let panel = s.panel(inbox).unwrap();
+    let mut panel = panel.borrow_mut();
+    let messages = panel.as_any().downcast_mut::<Messages>().unwrap();
+    let rows = messages.rows(0, 50);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|m| m.chat == OLD_FLAT));
+    assert!(rows.iter().all(|m| m.chat == OLD_FLAT || m.chat == STELAXIS));
+}
+
+#[test]
+fn live_reply_views_wait_for_acknowledgment_and_can_retry() {
+    let mut s = session();
+    let unread_ids: Vec<_> = model::history(s.store(), STELAXIS).iter()
+        .filter(|m| m.unread_mention).map(|m| m.id).collect();
+    let reader = open_root(&mut s, Chat::at(STELAXIS, unread_ids[0]));
+    let inbox = runtime::of(s.store()).connect();
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now()));
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "viewMessages");
+    assert_eq!(request["message_ids"], serde_json::json!([unread_ids[0]]));
+    assert_eq!(model::reply_count(s.store()), 2, "enqueue is not acknowledgment");
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 1.0));
+    assert!(inbox.try_recv().is_err(), "views are deduplicated while pending");
+    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 6.0));
+    assert!(inbox.try_recv().is_ok(), "an unacknowledged view can retry");
+}
+
+#[test]
+fn opening_a_group_does_not_acknowledge_an_unseen_reply_at_its_end() {
+    let mut s = session();
+    s.store().write(|c| {
+        c.execute("UPDATE tg_message SET unread_mention = 1
+            WHERE chat = ?1 AND id = (SELECT MAX(id) FROM tg_message WHERE chat = ?1)", [STELAXIS])?;
+        c.execute("UPDATE tg_chat SET mention = 3 WHERE peer = ?1", [STELAXIS])?;
+        Ok(())
+    }).unwrap();
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(STELAXIS));
+    assert_eq!(model::reply_count(s.store()), 3);
+    assert!(inbox.try_recv().is_err(), "viewMessages would prematurely acknowledge the final reply");
 }
 
 #[test]

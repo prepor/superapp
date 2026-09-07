@@ -22,7 +22,7 @@ use super::super::model::{self, ChatRow, PeerId, PAGE};
 use super::super::{draft_toast, requests, runtime};
 #[cfg(test)]
 use super::Chat;
-use super::{told, wire, Contacts};
+use super::{told, wire, Contacts, Messages};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
@@ -141,6 +141,13 @@ impl Panel for Chats {
                 fresh: false,
             },
         )];
+        let replies = model::reply_count(&self.store);
+        v.push(Verb::go(
+            "telegram.replies",
+            format!("replies & mentions {replies}"),
+            Some('s'),
+            Nav::Open { from: self.slot, id: Messages::replies(None), fresh: false },
+        ));
         let forwarding = runtime::of(&self.store).pending_forward().is_some();
         if forwarding {
             v.push(Verb::run("telegram.forward_here", "forward here", Some('f')));
