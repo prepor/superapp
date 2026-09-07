@@ -6,11 +6,12 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
 use kernel::store::Store;
 
-use super::model::{MsgId, PeerId};
+use super::model::{DownloadProgress, MsgId, PeerId};
 use super::requests::PeerAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,7 @@ struct State {
     connection_error: Option<String>,
     list_syncing: bool,
     connection_status: Option<String>,
+    downloads: HashMap<String, DownloadProgress>,
     wanted: Wanted,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
@@ -264,6 +266,21 @@ impl Runtime {
         self.state().list_syncing = on;
     }
 
+    /// Progress follows the same `tg:` key as the media cache, so a clip and
+    /// its poster never share counts. Finished or stopped downloads are removed.
+    pub fn set_download(&self, reference: &str, progress: Option<DownloadProgress>) {
+        let mut state = self.state();
+        if let Some(progress) = progress {
+            state.downloads.insert(reference.to_string(), progress);
+        } else {
+            state.downloads.remove(reference);
+        }
+    }
+
+    pub fn download(&self, reference: &str) -> Option<DownloadProgress> {
+        self.state().downloads.get(reference).copied()
+    }
+
     #[cfg(any(feature = "tdlib", test))]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
@@ -377,6 +394,12 @@ mod tests {
         state.carry_forward(7, vec![42]);
         state.play_on_open(7, 42);
         state.set_list_syncing(true);
+        let progress = DownloadProgress {
+            downloaded: 1024,
+            total: Some(4096),
+            estimated: false,
+        };
+        state.set_download("tg:photo", Some(progress));
         for _ in 0..2 {
             state.want_history(7);
             state.want_line(7, 42);
@@ -396,6 +419,7 @@ mod tests {
             );
             assert!(state.loading(7));
             assert!(state.list_syncing());
+            assert_eq!(state.download("tg:photo"), Some(progress));
             let wanted = state.take_wanted();
             assert_eq!(wanted.chats, vec![7]);
             assert_eq!(wanted.lines, vec![(7, 42)]);
@@ -414,6 +438,8 @@ mod tests {
         assert!(other.take_forward().is_none());
         assert!(!other.take_play_on_open(7, 42));
         assert!(!other.loading(7));
+        assert_eq!(other.download("tg:photo"), None);
+        assert_eq!(state.download("tg:photo"), Some(progress));
         assert!(other.take_wanted().files.is_empty());
         assert!(state.take_play_on_open(7, 42));
         assert!(!state.take_play_on_open(7, 42));

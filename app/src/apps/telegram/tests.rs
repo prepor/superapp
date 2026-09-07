@@ -1548,7 +1548,7 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
         // panel's to play and there is no file to point a player at.
         v.ask_for_clip(&line);
         assert!(!v.plays_clip(&line), "nothing to play it with");
-        assert_eq!(v.clip_note(&line), None, "and nothing to wait for");
+        assert_eq!(v.download_note(&line), None, "and nothing to wait for");
         assert!(v.clip_file(&line).is_none(), "the store is in memory");
     }
     // So `play` runs the timeline against the clock, as it always has.
@@ -1558,6 +1558,136 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
     let st = v.player_state(&line, now + 4.0).expect("the fake timeline");
     assert!(st.playing, "so the button reads pause");
     assert!((st.position - 4.0).abs() < 1e-6, "four seconds in");
+}
+
+/// The viewer reads live byte counts for its own file, including before the
+/// first bytes arrive and when Telegram only knows an approximate size.
+#[test]
+fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
+    use kernel::app::{Apps, Env, Mode, Workers};
+    use kernel::caps::{BlobCache, BLOB_BUDGET_DEFAULT};
+    use kernel::effect::World;
+    use kernel::store::Store;
+    use serde_json::json;
+    use std::rc::Rc;
+
+    let dir = std::env::temp_dir()
+        .join(format!("superapp-tg-viewer-progress-{}", std::process::id()));
+    let engine = dir.join("tdlib");
+    std::fs::create_dir_all(&engine).unwrap();
+    let apps = Apps::new(APPS);
+    let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap());
+    apps.seed(&store, Mode::Fake).unwrap();
+    let env = Env {
+        blobs: BlobCache::at(dir.join("blobs"), BLOB_BUDGET_DEFAULT),
+        ..Env::default()
+    };
+    let world = Rc::new(World::new(store, apps.capabilities(Mode::Fake, &env), apps.registry()));
+    let workers = Workers::inline(APPS, world.clone());
+    let mut s = Session::new(apps, world, workers, Mode::Fake);
+    let acc = sync::Account::new(FakeTd::new(), 17844, engine.clone(), None);
+    acc.drain(s.world());
+
+    let history = model::history(s.store(), STELAXIS);
+    let video = history.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "video")).unwrap().id;
+    let photo = history.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "photo")).unwrap().id;
+    s.store().write(move |c| {
+        c.execute(
+            "UPDATE tg_message SET media_ref = 'tg:poster', media_rid = 'RID_POSTER', \
+             media_clip = 'tg:clip', media_clip_rid = 'RID_CLIP' WHERE chat = ?1 AND id = ?2",
+            [STELAXIS, video],
+        )?;
+        c.execute(
+            "UPDATE tg_message SET media_ref = 'tg:poster', media_rid = 'RID_POSTER' \
+             WHERE chat = ?1 AND id = ?2",
+            [STELAXIS, photo],
+        )
+    }).unwrap();
+    let viewer = open_root(&mut s, Viewer::id(STELAXIS, video));
+    let picture = open_root(&mut s, Viewer::id(STELAXIS, photo));
+    let note = |s: &Session, slot| {
+        let inst = s.panel(slot).unwrap();
+        let mut borrow = inst.borrow_mut();
+        let v = borrow.as_any().downcast_mut::<Viewer>().unwrap();
+        let m = v.msg().unwrap();
+        v.ask_for_clip(&m);
+        v.ask_for_picture(&m);
+        v.download_note(&m)
+    };
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading…"));
+    assert_eq!(note(&s, picture).as_deref(), Some("downloading…"));
+
+    let mb = 1024 * 1024;
+    let mut file = json!({
+        "@type": "file", "id": 77, "@extra": "file:RID_CLIP",
+        "size": 48 * mb, "expected_size": 60 * mb,
+        "local": {"is_downloading_active": false, "is_downloading_completed": false, "downloaded_size": 0},
+        "remote": {"unique_id": "clip"}
+    });
+    acc.on_update(s.world(), &file.to_string());
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 0 B / 48 MB"));
+
+    file.as_object_mut().unwrap().remove("@extra");
+    file["local"]["is_downloading_active"] = json!(true);
+    file["local"]["downloaded_size"] = json!(12 * mb);
+    file["local"]["downloaded_prefix_size"] = json!(mb);
+    // An asynchronous downloadFile reply also carries a current snapshot.
+    acc.on_update(s.world(), &file.to_string());
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / 48 MB"));
+
+    let mut poster = json!({
+        "@type": "file", "id": 78, "size": 2 * mb,
+        "local": {"is_downloading_active": true, "downloaded_size": mb},
+        "remote": {"unique_id": "poster"}
+    });
+    let update = |file: &serde_json::Value| json!({"@type": "updateFile", "file": file}).to_string();
+    acc.on_update(s.world(), &update(&poster));
+    assert_eq!(note(&s, picture).as_deref(), Some("downloading · 1.0 MB / 2.0 MB"));
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / 48 MB"));
+
+    // Some Telegram videos carry no thumbnail. Their clip still owns the
+    // progress display and must become playable when its bytes arrive.
+    s.store().write(move |c| {
+        c.execute(
+            "UPDATE tg_message SET media_ref = NULL, media_rid = NULL WHERE chat = ?1 AND id = ?2",
+            [STELAXIS, video],
+        )
+    }).unwrap();
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / 48 MB"));
+
+    file["size"] = json!(0);
+    file["expected_size"] = json!(0);
+    acc.on_update(s.world(), &update(&file));
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB · total unknown"));
+    file["expected_size"] = json!(48 * mb);
+    acc.on_update(s.world(), &update(&file));
+    assert_eq!(note(&s, viewer).as_deref(), Some("downloading · 12 MB / ~48 MB"));
+
+    let clip_path = engine.join("clip.mp4");
+    std::fs::write(&clip_path, b"mp4 bytes").unwrap();
+    file["size"] = json!(48 * mb);
+    file["local"] = json!({
+        "path": clip_path, "is_downloading_active": false,
+        "is_downloading_completed": true, "downloaded_size": 48 * mb
+    });
+    acc.on_update(s.world(), &update(&file));
+    assert_eq!(note(&s, viewer), None, "the clip is ready, even while its poster downloads");
+    assert_eq!(runtime::of(s.store()).download("tg:clip"), None);
+
+    let photo_path = engine.join("photo.png");
+    std::fs::write(&photo_path, super::seed::demo_bytes("demo:palette").unwrap()).unwrap();
+    poster["local"] = json!({"path": photo_path, "is_downloading_completed": true});
+    acc.on_update(s.world(), &update(&poster));
+    assert_eq!(note(&s, picture), None);
+    assert_eq!(runtime::of(s.store()).download("tg:poster"), None);
+
+    // TDLib then forgets its local copy. That update must not revive progress.
+    poster["local"] = json!({"is_downloading_active": false, "downloaded_size": 0});
+    acc.on_update(s.world(), &update(&poster));
+    assert_eq!(runtime::of(s.store()).download("tg:poster"), None);
+    drop(s);
+    drop(env);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The links off a card go where they say.

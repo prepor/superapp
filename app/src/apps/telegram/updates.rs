@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::model::{Media, MsgId, PeerId};
+use super::model::{DownloadProgress, Media, MsgId, PeerId};
 use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
 
 // -- a message ----------------------------------------------------------------------
@@ -368,8 +368,20 @@ fn location_media(content: &Value, date: f64) -> Media {
 
 /// The blob-cache key a file resolves through: `tg:<remote unique id>`. `None`
 /// when the file has no remote yet — a purely local one not on the server.
-fn file_ref(file: &Value) -> Option<String> {
+pub fn file_ref(file: &Value) -> Option<String> {
     nonempty(file["remote"]["unique_id"].as_str()).map(|uid| format!("tg:{uid}"))
+}
+
+/// Downloaded bytes are the total received, not the contiguous prefix used
+/// for streaming. Prefer the exact size; zero means TDLib does not know it.
+pub fn download_progress(file: &Value) -> DownloadProgress {
+    let size = file["size"].as_u64().filter(|&n| n > 0);
+    let expected = file["expected_size"].as_u64().filter(|&n| n > 0);
+    DownloadProgress {
+        downloaded: file["local"]["downloaded_size"].as_u64().unwrap_or(0),
+        total: size.or(expected),
+        estimated: size.is_none() && expected.is_some(),
+    }
 }
 
 /// The id a file is taken back by across sessions: `remoteFile.id`, which a

@@ -164,6 +164,32 @@ pub fn media_or_text(media: Option<&Media>, text: &str, now: f64) -> String {
 
 // -- media --------------------------------------------------------------------------
 
+/// The latest byte counts for one download. An unknown total stays unknown;
+/// TDLib's expected size is only an estimate until it reports the real size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub estimated: bool,
+}
+
+impl DownloadProgress {
+    #[must_use]
+    pub fn note(self) -> String {
+        use kernel::caps::fmt_size;
+
+        let downloaded = fmt_size(self.downloaded);
+        match self.total {
+            Some(total) => format!(
+                "downloading · {downloaded} / {}{}",
+                if self.estimated { "~" } else { "" },
+                fmt_size(total)
+            ),
+            None => format!("downloading · {downloaded} · total unknown"),
+        }
+    }
+}
+
 /// What a message carries besides its text: one of nine kinds, and what is
 /// known about it.
 #[derive(Debug, Clone, PartialEq, Default)]

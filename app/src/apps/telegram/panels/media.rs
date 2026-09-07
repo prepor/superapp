@@ -14,8 +14,8 @@
 //! poster is never fetched on arrival — a chat full of video would
 //! otherwise pull every one of them — so
 //! opening the viewer on a video is what asks for it, and the panel says
-//! *downloading…* until the file lands in the blob cache under the key the
-//! row already names. Then the platform's own player draws and plays it, and
+//! *downloading · 12 MB / 48 MB* until the file lands in the blob cache under
+//! the key the row already names. Then the platform's own player draws and plays it, and
 //! the one *play* button drives that instead of the timeline. A voice note
 //! and a track still run the fake timeline against the clock; playing a
 //! sound is not implemented.
@@ -162,12 +162,27 @@ impl Viewer {
             && (self.asked || self.refreshing || self.clip_file(m).is_some())
     }
 
-    /// What the viewer says while there is nothing to play yet. `None` once
-    /// the file is here — the player says the rest from there — and for every
-    /// line that is not a clip's.
+    /// Downloaded and total bytes for the clip or picture this viewer is
+    /// waiting on. A clip takes precedence over its poster; once the clip
+    /// is here, the player says the rest.
     #[must_use]
-    pub fn clip_note(&self, m: &Msg) -> Option<&'static str> {
-        (self.plays_clip(m) && self.clip_file(m).is_none()).then_some("downloading…")
+    pub fn download_note(&self, m: &Msg) -> Option<String> {
+        let md = m.media.as_ref()?;
+        let reference = if self.plays_clip(m) {
+            if self.clip_file(m).is_some() {
+                return None;
+            }
+            md.clip.as_deref()
+        } else if self.awaiting_picture(m) {
+            md.reference.as_deref()
+        } else {
+            return None;
+        };
+        Some(
+            reference
+                .and_then(|key| runtime::of(self.world.store()).download(key))
+                .map_or_else(|| "downloading…".to_string(), |progress| progress.note()),
+        )
     }
 
     /// Asks the engine for the clip, once.
@@ -414,12 +429,15 @@ impl Panel for Viewer {
 }
 
 /// Whether a line is a moving picture that came over the wire — a video, a
-/// circle or an animation whose poster is a `tg:` reference — as against
+/// circle or an animation whose clip or poster is a `tg:` reference — as against
 /// the demo world's, which are bundled stills with a fake timeline.
 fn moving_picture_of_the_wire(m: &Msg) -> bool {
     m.media.as_ref().is_some_and(|md| {
         matches!(md.kind.as_str(), "video" | "circle" | "animation")
-            && md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
+            && [md.clip.as_deref(), md.reference.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|r| r.starts_with("tg:"))
     })
 }
 

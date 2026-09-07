@@ -172,6 +172,12 @@ History and missing-file requests use a separate deduplicated pending set in
 the same runtime. The worker drains it on each pass and maintains its own
 history pacing. Loading flags stay with the store that requested the work.
 
+The media viewer shows downloaded and total bytes while a clip or photo is
+arriving. File replies and updates refresh these counts in the store runtime,
+keyed by the media's cache reference. Estimated totals are prefixed with `~`;
+an unknown total is shown as unknown. Finished and stopped downloads clear
+their progress, and the note disappears once the media is available locally.
+
 ## Modules
 
 | Module | Responsibility |

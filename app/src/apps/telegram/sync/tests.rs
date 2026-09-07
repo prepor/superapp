@@ -1256,6 +1256,26 @@ fn a_file_request_is_answered_with_a_download() {
     assert_eq!(td.sent().len(), 2);
 }
 
+/// getRemoteFile can already hold the finished file. Its reply is ingested
+/// directly, without starting another download or leaving progress behind.
+#[test]
+fn a_file_request_that_is_already_complete_is_cached() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    let src = engine_file("completed-answer");
+    let update: serde_json::Value =
+        serde_json::from_str(&file_update(&src.to_string_lossy(), "already_here")).unwrap();
+    let mut answer = update["file"].clone();
+    answer["@extra"] = json!("file:RID_HERE");
+
+    acc.on_update(&w, &answer.to_string());
+    assert!(w.with_cap::<dyn Blobs, _>(|b| b.contains("tg:already_here")).unwrap());
+    assert!(!src.exists());
+    assert_eq!(td.sent_types(), vec!["deleteFile"]);
+    assert_eq!(runtime::of(w.store()).download("tg:already_here"), None);
+}
+
 /// A picture a drawing found missing is asked for on the worker's next
 /// pass, by the durable remote id the row keeps — and once, however many
 /// draws ask for it.

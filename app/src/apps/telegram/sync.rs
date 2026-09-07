@@ -401,8 +401,8 @@ impl<T: Td> Account<T> {
             }
             Some("file") => {
                 self.log("<< file");
-                self.on_file_answer(w, &v);
                 self.on_file(w, &v);
+                self.on_file_answer(w, &v);
             }
             // A single line fetched afresh ([`runtime::Runtime::want_line`]) answers as the
             // message itself, which lands the way a new line does.
@@ -731,6 +731,14 @@ impl<T: Td> Account<T> {
             v["local"]["path"].as_str().unwrap_or("")
         ));
         if let Some(id) = v["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
+            if let Some(key) = updates::file_ref(v) {
+                if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key)).unwrap_or(false) {
+                    return;
+                }
+                // Show the size as soon as getRemoteFile answers, even
+                // before downloadFile starts receiving bytes.
+                runtime::of(w.store()).set_download(&key, Some(updates::download_progress(v)));
+            }
             self.log(&format!(">> downloadFile {id} priority=32"));
             self.send(w, &download_file(id, 32));
         }
@@ -1572,7 +1580,9 @@ impl<T: Td> Account<T> {
         }
     }
 
-    /// A file's state changed. On a finished download the bytes are ingested
+    /// A file's state changed. Active downloads publish their byte counts in
+    /// the store runtime; finished or stopped downloads clear those counts.
+    /// On a finished download the bytes are ingested
     /// into the [blob cache](Blobs) under the same `tg:<unique id>` key the
     /// message rows already point at, so a view resolves straight to the cached
     /// file — no row need change, the reference having named the key all along.
@@ -1600,21 +1610,23 @@ impl<T: Td> Account<T> {
     /// the engine's to forget.
     fn on_file(&self, w: &World, file: &Value) {
         runtime::of(w.store()).operations.file_progress(file);
+        let Some(key) = updates::file_ref(file) else {
+            return;
+        };
         let local = &file["local"];
-        if local["is_downloading_completed"].as_bool() != Some(true) {
+        let complete = local["is_downloading_completed"].as_bool() == Some(true);
+        let active = local["is_downloading_active"].as_bool() == Some(true);
+        runtime::of(w.store()).set_download(
+            &key,
+            (active && !complete).then(|| updates::download_progress(file)),
+        );
+        if !complete {
             return;
         }
         let Some(path) = local["path"].as_str().filter(|p| !p.is_empty()) else {
             return;
         };
-        let Some(uid) = file["remote"]["unique_id"]
-            .as_str()
-            .filter(|u| !u.is_empty())
-        else {
-            return;
-        };
         let src = PathBuf::from(path);
-        let key = format!("tg:{uid}");
         let rt = runtime::of(w.store());
         if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key))
             .unwrap_or(false)

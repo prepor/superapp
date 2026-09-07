@@ -158,7 +158,7 @@ impl Widget for ViewerPanel {
                 v.ask_for_picture(&m);
                 let st = v.player_state(&m, now);
                 let clip = v.plays_clip(&m).then(|| v.clip_file(&m)).flatten();
-                let note = v.clip_note(&m);
+                let note = v.download_note(&m);
                 let awaiting = v.awaiting_picture(&m);
                 Some((m, st, clip, v.running(), note, v.playing(now), awaiting))
             })
@@ -237,7 +237,7 @@ impl Widget for ViewerPanel {
         word_lbl.set_text(cx, &m.media.as_ref().map(|md| md.line(now)).unwrap_or_default());
         word_lbl.set_visible(cx, !shown && !rolling && sticker.is_none());
         let note_lbl = v.label(cx, ids!(body.note_lbl));
-        note_lbl.set_text(cx, note.unwrap_or(""));
+        note_lbl.set_text(cx, note.as_deref().unwrap_or(""));
         note_lbl.set_visible(cx, note.is_some());
         let player_w = v.widget(cx, ids!(body.player_box.player));
         media::fill_player(cx, &player_w, player.as_ref());
