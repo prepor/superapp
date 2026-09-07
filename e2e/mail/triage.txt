@@ -67,11 +67,13 @@ shot t7-marked
 
 # Two conversations filed in one action: the marks come off with them, so
 # the count goes off the bar. It closes nothing — the cursor stands where it
-# stood, which is now the row that took its place, and previews it.
+# stood, which is now the row that took the filed block's place, and previews
+# it. The rows the batch took from above the cursor are rows it no longer
+# counts: landing a row further down would be the walk-past this rule fixed.
 click "archive 2"
 wait 900
 shot t8-batch
-click "Elena Petrova · aug 30 18:20"
+click "Max Ivanov · aug 31 07:30"
 wait 500
 
 # One step back, for the reason the reader's *archive* needs one: the walk
