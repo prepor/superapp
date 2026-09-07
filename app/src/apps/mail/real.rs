@@ -180,7 +180,7 @@ impl Smtp for RealServers {
 /// If there is no recipient, if an address does not parse, or if lettre
 /// refuses the body.
 pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
-    use lettre::message::header;
+    use lettre::message::{header, Mailboxes};
     use lettre::Message;
     let s = |e: &dyn std::fmt::Display| format!("{e}");
     let bracket = |id: &str| {
@@ -189,24 +189,23 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
             id.trim().trim_start_matches('<').trim_end_matches('>')
         )
     };
-    let mut b = Message::builder()
-        .from(from.parse().map_err(|e| s(&e))?)
-        .subject(m.subject.clone());
     // The TO field holds a *list* — its completion is comma-separated, and a
     // reply to one's own letter is prefilled with every address that letter
-    // went to. Each is added as a mailbox of its own, which is one `To`
-    // header with all of them and an envelope that names all of them.
-    let to: Vec<&str> =
-        m.to.split(',')
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-            .collect();
-    if to.is_empty() {
+    // went to. It is read as a header is read rather than cut on commas: a
+    // display name may carry one of its own (`"Doe, Jane" <jane@x>` is one
+    // recipient, not two), and only the parser knows which comma separates.
+    // All of them land in one `To`, which is also the envelope.
+    if m.to.trim().is_empty() {
         return Err("no recipient".into());
     }
-    for addr in to {
-        b = b.to(addr.parse().map_err(|e| s(&e))?);
+    let to: Mailboxes = m.to.parse().map_err(|e| s(&e))?;
+    if to.iter().next().is_none() {
+        return Err("no recipient".into());
     }
+    let mut b = Message::builder()
+        .from(from.parse().map_err(|e| s(&e))?)
+        .mailbox(header::To::from(to))
+        .subject(m.subject.clone());
     if let Some(mid) = &m.in_reply_to {
         b = b.header(header::InReplyTo::from(bracket(mid)));
     }
@@ -795,6 +794,29 @@ mod tests {
         let raw = String::from_utf8_lossy(&msg.formatted()).into_owned();
         assert!(raw.contains("To: vera@kovac.io, max@ivanov.dev"), "{raw}");
         assert!(rfc822("me@prepor.dev", &Outgoing::default()).is_err());
+
+        // The comma inside a display name is not a separator. The list is
+        // read as a header is read, so this is one recipient — cutting the
+        // field on commas would have made it two, and neither would parse.
+        let named = Outgoing {
+            to: "\"Doe, Jane\" <jane@doe.com>".into(),
+            subject: "one of you".into(),
+            body: "hello".into(),
+            ..Outgoing::default()
+        };
+        let msg = rfc822("me@prepor.dev", &named).expect("a message");
+        assert_eq!(msg.envelope().to().len(), 1, "one recipient, not two");
+        // Read back through the app's own reader — the name is encoded on
+        // the wire, as a name with a comma in it must be, and comes back
+        // whole.
+        let out = msg.formatted();
+        let back = mail_parser::MessageParser::default()
+            .parse_headers(&out)
+            .expect("the letter reads back");
+        let to: Vec<_> = back.to().expect("a To line").iter().collect();
+        assert_eq!(to.len(), 1, "one recipient, not two");
+        assert_eq!(to[0].name(), Some("Doe, Jane"));
+        assert_eq!(to[0].address(), Some("jane@doe.com"));
     }
 
     /// A letter that carries something goes out as a `multipart/mixed`: the
