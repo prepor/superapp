@@ -147,9 +147,36 @@ There is one live account per process. Admission still uses the real boot
 store's directory because TDLib's modern receive queue is process-wide. This
 is not a multi-account dispatcher.
 
-Live commands are in-memory requests followed by server updates. Their error
-handling, persistence and undo semantics are not yet the kernel's deferred
-effect model. `verbs` implements undo only for local fixture edits and deletes.
+Live commands have store-scoped request ids and pending, completed and failed
+outcomes. Sends wait for final delivery updates, and transfers display byte
+progress when TDLib supplies it. Every Telegram panel shares the status strip;
+failures also appear in Problems and announce a toast. Errors go to stderr and
+`tg-debug.log`, with the request type/id and chat, without command payloads or
+login credentials. Normal `loadChats` 404 replies mean the list is complete.
+
+Failed commands retain their input in memory for an explicit retry, including
+file paths, captions and replies. An accepted but failed send retries TDLib's
+message id. Missing delivery confirmation is marked uncertain and asks the user
+to check the chat; it does not automatically resend. Edits, pinning, muting,
+archiving and deletion settle through acknowledgements and updates. A disconnected
+worker keeps the composer intact. Downloads finish after their bytes reach the
+cache; missing files, cache errors and request timeouts are visible failures.
+
+Drag files from the desktop onto a writable chat to stage attachments. The chat
+shows a drop hint, the carried files, and a confirmation; Enter sends them.
+Directories and missing paths show an error. PNG/JPEG are photos, GIF is an
+animation, supported video/audio extensions use their media types, and other
+formats (including HEIC/WebP) are sent as documents. Upload sources are preserved.
+The media requests use the [TDLib schema](https://github.com/tdlib/td/blob/master/td/generate/scheme/td_api.tl)'s `inputPhoto`, `inputAnimation`, `inputVideo`,
+`inputAudio` and `inputDocument` wrappers; the native tests probe the linked JSON
+decoder so an incompatible TDLib schema fails validation.
+
+Commands are still in memory, rather than a durable outbox. Restarting loses
+retry payloads; unconfirmed projected messages remain visible as failed and ask
+for a delivery check. Login secrets are never retained for retry. Recording
+and location sharing report that they are unavailable in live accounts; attach
+an existing recording instead. The location panel still shows its demo map.
+`verbs` implements undo only for local fixture edits and deletes.
 
 `tg_session` currently persists authorization status in the replicated store;
 it is not excluded from replication. The actual TDLib session files and login

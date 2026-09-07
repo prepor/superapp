@@ -220,6 +220,54 @@ impl Stage {
                 self.handle_paste(cx, sh, &s);
             }
 
+            Step::DropFiles { label, paths } => match self.hits.by_label(&label) {
+                Some(hit) => {
+                    use std::sync::{Arc, Mutex};
+                    let abs = hit.rect.pos + hit.rect.size / 2.0;
+                    let items = Arc::new(
+                        paths
+                            .into_iter()
+                            .map(|path| DragItem::FilePath {
+                                path,
+                                internal_id: None,
+                            })
+                            .collect(),
+                    );
+                    let response = Arc::new(Mutex::new(DragResponse::None));
+                    self.handle_with(
+                        cx,
+                        sh,
+                        &Event::Drag(DragEvent {
+                            modifiers: KeyModifiers::default(),
+                            handled: Arc::new(Mutex::new(false)),
+                            abs,
+                            items: Arc::clone(&items),
+                            response: Arc::clone(&response),
+                        }),
+                    );
+                    if *response.lock().unwrap() != DragResponse::Copy {
+                        eprintln!(
+                            "{}e2e: FAIL dropfiles: {label:?} did not accept the files",
+                            r.tag
+                        );
+                        r.failures += 1;
+                    } else {
+                        self.handle_with(
+                            cx,
+                            sh,
+                            &Event::Drop(DropEvent {
+                                modifiers: KeyModifiers::default(),
+                                handled: Arc::new(Mutex::new(false)),
+                                abs,
+                                items,
+                            }),
+                        );
+                    }
+                    self.handle_with(cx, sh, &Event::DragEnd);
+                }
+                None => self.no_such(r, "dropfiles", &label),
+            },
+
             Step::Drag { label, dx, dy } => match self.hits.by_label(&label) {
                 Some(h) => {
                     // From the left edge, so a horizontal drag sweeps the

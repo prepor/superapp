@@ -387,7 +387,11 @@ impl Chat {
         // the wire — the demo, or signed out — the local action deletes them
         // and undo puts them back. One or the other, never both, so a line is
         // not deleted twice.
-        if !wire(&self.store, &requests::delete_messages(self.peer, &ids, true)) {
+        if !wire(
+            &self.store,
+            &requests::delete_messages(self.peer, &ids, true),
+        ) && !super::live(&self.store)
+        {
             verbs::delete_lines(s, self.peer, ids);
         }
         s.redraw();
@@ -514,7 +518,9 @@ impl Chat {
         self.draft = text.to_string();
         let (peer, d) = (self.peer, self.draft.clone());
         if let Err(e) = self.store.write(move |c| model::set_draft_tx(c, peer, &d)) {
-            eprintln!("telegram: the draft was not written: {e}");
+            runtime::of(&self.store)
+                .operations
+                .report(&self.store, "saving draft", &e.to_string());
         }
     }
 
@@ -538,6 +544,55 @@ impl Chat {
             }
         }
         added
+    }
+
+    /// A desktop drop stages readable, regular files for review in the composer.
+    pub fn drop_files(&mut self, s: &mut Session, paths: &[String]) {
+        if self.editing.is_some() || self.card().is_some_and(|c| !c.can_post()) {
+            s.notify(
+                "files can only be attached to a new message in a chat you can write to",
+                true,
+            );
+            return;
+        }
+        let mut valid = Vec::new();
+        for path in paths {
+            let disk = kernel::caps::real_path(path);
+            match std::fs::metadata(&disk) {
+                Ok(m) if m.is_file() => valid.push(
+                    std::fs::canonicalize(&disk)
+                        .unwrap_or(disk)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                result => {
+                    let error = match result {
+                        Ok(_) => format!("{path} is not a regular file"),
+                        Err(e) => format!("Cannot attach {path}: {e}"),
+                    };
+                    runtime::of(&self.store).operations.report(
+                        &self.store,
+                        "attaching file",
+                        &error,
+                    );
+                    s.notify(error, true);
+                }
+            }
+        }
+        let added = self.carry(&valid);
+        if added > 0 {
+            self.wants_field = true;
+            s.notify(
+                format!(
+                    "attached {added} file{} · enter to send",
+                    if added == 1 { "" } else { "s" }
+                ),
+                false,
+            );
+        } else if !valid.is_empty() {
+            s.notify("already carrying these files", false);
+        }
+        s.redraw();
     }
 
     /// Puts one down, by its place in the order.
@@ -589,13 +644,21 @@ impl Chat {
                     requests::edit_message_text(self.peer, e.msg, &text)
                 };
                 if !wire(&self.store, &request) {
-                    verbs::edit_line(s, self.peer, e.msg, &e.original, e.was_edited, &text);
+                    if super::live(&self.store) {
+                        self.editing = Some(e);
+                    } else {
+                        verbs::edit_line(s, self.peer, e.msg, &e.original, e.was_edited, &text);
+                    }
                 }
             }
             s.redraw();
             return;
         }
         if self.draft.trim().is_empty() && self.carrying.is_empty() {
+            return;
+        }
+        if super::live(&self.store) {
+            self.send_live(s);
             return;
         }
         // Over the wire where the build is signed in; the sent line rides its
@@ -634,6 +697,50 @@ impl Chat {
         self.seen_draft.clear();
         self.carrying.clear();
         self.reply_to = None;
+        s.redraw();
+    }
+
+    /// Only queued files leave the composer. Each queued request owns its
+    /// caption, reply and source path until Telegram confirms delivery.
+    fn send_live(&mut self, s: &mut Session) {
+        let text = self.draft.trim().to_string();
+        let mut sent_first = false;
+        if self.carrying.is_empty() {
+            sent_first = wire(
+                &self.store,
+                &requests::send_message(self.peer, &text, self.reply_to),
+            );
+        } else {
+            let files = std::mem::take(&mut self.carrying);
+            let mut files = files.into_iter().enumerate();
+            while let Some((i, file)) = files.next() {
+                let request = requests::send_file(
+                    self.peer,
+                    if i == 0 { self.reply_to } else { None },
+                    &file,
+                    if i == 0 { &text } else { "" },
+                );
+                if !wire(&self.store, &request) {
+                    self.carrying.push(file);
+                    self.carrying.extend(files.map(|(_, file)| file));
+                    break;
+                }
+                if i == 0 {
+                    sent_first = true;
+                }
+            }
+        }
+        if sent_first {
+            self.set_draft("");
+            self.sent_draft.clear();
+            self.seen_draft.clear();
+            self.reply_to = None;
+        } else {
+            s.notify(
+                "send failed: Telegram is not connected; your draft and files are kept",
+                true,
+            );
+        }
         s.redraw();
     }
 

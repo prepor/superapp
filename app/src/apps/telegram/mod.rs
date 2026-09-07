@@ -16,6 +16,7 @@ use kernel::store::Store;
 
 pub mod config;
 pub mod model;
+pub mod operations;
 pub mod panels;
 pub mod project;
 pub mod requests;
@@ -64,7 +65,6 @@ pub static TELEGRAM: Telegram = Telegram {
 impl Telegram {
     /// The boot store admitted to the single native receive loop. This is
     /// registration policy only; panels send through their own runtime.
-    #[cfg_attr(not(feature = "tdlib"), allow(dead_code))]
     #[must_use]
     pub fn engine_store(dir: Option<&Path>) -> bool {
         match (TELEGRAM.engine_store.get(), dir) {
@@ -104,6 +104,31 @@ impl App for Telegram {
         "telegram"
     }
 
+    fn problems(&self) -> &'static [&'static dyn kernel::app::ProblemSource] {
+        &[&operations::Failures]
+    }
+
+    fn poll(&self, s: &mut kernel::session::Session) {
+        let rt = runtime::of(s.store());
+        rt.operations.expire(s.store(), std::time::Instant::now());
+        if rt.operations.take_changed() {
+            for op in rt.operations.list() {
+                if matches!(op.status, operations::Status::Failed { .. }) {
+                    if let Some(context) = op.context() {
+                        if context.starts_with("load_chats:") {
+                            rt.set_list_syncing(false);
+                        }
+                    }
+                }
+            }
+            s.redraw();
+        }
+        for (text, error) in rt.take_notices() {
+            s.notify(text, error);
+            s.redraw();
+        }
+    }
+
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         KINDS
     }
@@ -138,13 +163,6 @@ impl App for Telegram {
 
     fn search_providers(&self) -> Vec<Box<dyn Provider>> {
         vec![Box::new(search::TelegramSearch)]
-    }
-
-    fn poll(&self, s: &mut kernel::session::Session) {
-        for (text, error) in runtime::of(s.store()).take_notices() {
-            s.notify(text, error);
-            s.redraw();
-        }
     }
 
     /// The list, the people, the chat with oneself, and the door an account

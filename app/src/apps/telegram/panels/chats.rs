@@ -22,7 +22,7 @@ use super::super::model::{self, ChatRow, PeerId, PAGE};
 use super::super::{draft_toast, requests, runtime};
 #[cfg(test)]
 use super::Chat;
-use super::{flip, told, wire, Contacts};
+use super::{told, wire, Contacts};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
@@ -198,16 +198,9 @@ impl Panel for Chats {
 
 // -- the batch verbs ---------------------------------------------------------
 
-/// The local half of one batch verb, over one chat: a plain function, so the
-/// verb is chosen here and carried into the store's writer thread, which takes
-/// only what owns itself.
-type Flip = fn(&rusqlite::Connection, PeerId) -> rusqlite::Result<()>;
-
 impl Chats {
-    /// A batch verb over the marks: one request per chat, and — where they
-    /// went — the same flip on every marked row in one write, so the list
-    /// redraws read, muted, pinned or filed rather than waiting on the
-    /// engine's answer for each of them in turn.
+    /// A batch verb over the marks: one request per chat. Acknowledgements
+    /// and updates settle each local row, so a failed command keeps its data.
     ///
     /// A set is too many states to toggle one by one, so the bar's word is
     /// what happens: *mute 3* mutes three, and it is the archive's own bar
@@ -244,22 +237,13 @@ impl Chats {
             let word = verb.rsplit('.').next().unwrap_or(verb);
             let n = peers.len();
             let what = if n == 1 { "chat" } else { "chats" };
-            s.notify(draft_toast(&format!("{word} {n} {what}")), false);
+            if super::live(&store) {
+                s.notify(format!("{word} failed: Telegram is not connected"), true);
+            } else {
+                s.notify(draft_toast(&format!("{word} {n} {what}")), false);
+            }
             return;
         }
-        let one: Flip = match verb {
-            "telegram.read" => model::mark_read_tx,
-            "telegram.mute" => |c, peer| model::set_muted_tx(c, peer, true),
-            "telegram.pin" => |c, peer| model::set_pinned_tx(c, peer, true),
-            "telegram.archive" => |c, peer| model::set_archived_tx(c, peer, true),
-            _ => |c, peer| model::set_archived_tx(c, peer, false),
-        };
-        flip(&store, move |c| {
-            for peer in peers {
-                one(c, peer)?;
-            }
-            Ok(())
-        });
         // What was marked has been done with — and a chat just archived is
         // not in this list to stay marked in.
         self.list.clear_marks();
@@ -296,9 +280,11 @@ impl Chats {
             &requests::forward_messages(peer, f.from, &f.ids),
             &format!("forward {n} {what} to {name}"),
         );
-        runtime::of(&self.store).take_forward();
+        if went || !super::live(&self.store) {
+            runtime::of(&self.store).take_forward();
+        }
         if went {
-            s.notify(format!("forwarded {n} {what} to {name}"), false);
+            s.notify(format!("forwarding {n} {what} to {name}…"), false);
         }
         s.redraw();
     }

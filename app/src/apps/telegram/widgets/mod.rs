@@ -11,6 +11,7 @@
 pub mod attach;
 pub mod chat;
 pub mod chats;
+pub mod feedback;
 pub mod line;
 pub mod media;
 pub mod messages;

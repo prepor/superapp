@@ -1466,7 +1466,8 @@ impl Carried {
             .map(|(_, e)| e.to_ascii_lowercase())
             .unwrap_or_default();
         match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "gif" | "heic" | "webp" => "photo",
+            "png" | "jpg" | "jpeg" => "photo",
+            "gif" => "animation",
             "mp4" | "mov" | "m4v" | "webm" => "video",
             "mp3" | "m4a" | "ogg" | "opus" | "wav" | "flac" => "audio",
             _ => "file",

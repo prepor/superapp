@@ -67,6 +67,22 @@ impl Widget for ViewerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if let Event::VideoDecodingError(error) = event {
+            // Only this player's matching error changes its state. The
+            // native error overlay is hidden with the failed clip, so report
+            // it on the panel and stop the playback wish until another play.
+            if before != "unprepared" && media::video_word(cx, &clip_box) == "unprepared" {
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    super::super::runtime::of(s.store()).operations.report(
+                        s.store(), "playing video", &error.error,
+                    );
+                    if let Some(viewer) = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>() {
+                        viewer.set_running(false);
+                    }
+                    s.redraw();
+                }
+            }
+        }
         let position = match event {
             Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
                 self.scrubbing = None;

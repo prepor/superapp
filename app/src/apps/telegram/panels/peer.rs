@@ -274,33 +274,33 @@ impl Panel for Peer {
             "telegram.mute" => {
                 let on = !card.muted;
                 let word = if on { "mute" } else { "unmute" };
-                if told(s, &requests::set_chat_muted(peer, on), word) {
-                    flip(&self.store, move |c| model::set_muted_tx(c, peer, on));
-                }
+                told(s, &requests::set_chat_muted(peer, on), word);
             }
             "telegram.pin" => {
                 let on = card.pinned == 0;
                 let word = if on { "pin" } else { "unpin" };
-                if told(s, &requests::toggle_chat_pinned(peer, on), word) {
-                    flip(&self.store, move |c| model::set_pinned_tx(c, peer, on));
-                }
+                told(s, &requests::toggle_chat_pinned(peer, on), word);
             }
             "telegram.archive" | "telegram.unarchive" => {
                 let on = verb == "telegram.archive";
                 let word = if on { "archive" } else { "unarchive" };
-                if told(s, &requests::add_chat_to_list(peer, on), word) {
-                    flip(&self.store, move |c| model::set_archived_tx(c, peer, on));
-                }
+                told(s, &requests::add_chat_to_list(peer, on), word);
             }
             "telegram.join" => {
                 told(s, &requests::join_chat(peer), "join");
             }
             "telegram.clear_history" => {
                 told(s, &requests::clear_history(peer), "clear history");
-                flip(&self.store, move |c| model::clear_history_tx(c, peer));
+                if !super::live(&self.store) {
+                    flip(&self.store, move |c| model::clear_history_tx(c, peer));
+                }
             }
             "telegram.leave" => {
                 told(s, &requests::leave_chat(peer), "leave");
+                if super::live(&self.store) {
+                    s.redraw();
+                    return;
+                }
                 flip(&self.store, move |c| model::leave_chat_tx(c, peer));
                 s.nav(Nav::Close {
                     slot: self.slot,

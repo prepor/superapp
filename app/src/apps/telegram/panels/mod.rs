@@ -40,16 +40,50 @@ pub use signin::SignIn;
 /// connected; true means queued, not acknowledged by Telegram.
 #[must_use]
 pub fn wire(store: &Store, request: &str) -> bool {
-    super::runtime::of(store).send(request)
+    let rt = super::runtime::of(store);
+    if !live(store) {
+        return false;
+    }
+    let tracked = rt.operations.track(request);
+    let sent = rt.send(&tracked);
+    if !sent {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tracked) {
+            if let Some(id) = v["@extra"]["operation"].as_u64() {
+                rt.operations.fail(
+                    store,
+                    id,
+                    "Telegram is not connected. Your request was not sent.",
+                    false,
+                );
+                // The composer still owns these; its Enter is the retry.
+                if v["@type"] == "sendMessage"
+                    || v["@type"] == "editMessageText"
+                    || v["@type"] == "editMessageCaption"
+                {
+                    rt.operations.forget_payload(id);
+                }
+            }
+        }
+    }
+    sent
 }
 
-/// Queue a live verb, or show the offline toast. A true result permits an
-/// optimistic local change; the server can still reject the command.
+pub fn live(store: &Store) -> bool {
+    super::runtime::of(store).has_worker() || super::Telegram::engine_store(store.dir())
+}
+
+/// Queue a live verb, or explain why it did not go. Local changes wait for
+/// the worker's acknowledgement; fixture actions use the offline toast.
 pub fn told(s: &mut Session, request: &str, what: &str) -> bool {
     if wire(s.store(), request) {
+        s.redraw();
         return true;
     }
-    s.notify(super::draft_toast(what), false);
+    if live(s.store()) {
+        s.notify(format!("{what} failed: Telegram is not connected"), true);
+    } else {
+        s.notify(super::draft_toast(what), false);
+    }
     false
 }
 
@@ -63,6 +97,8 @@ pub fn flip(
     what: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()> + Send + 'static,
 ) {
     if let Err(e) = store.write(what) {
-        eprintln!("telegram: the flip was not written: {e}");
+        super::runtime::of(store)
+            .operations
+            .report(store, "saving change", &e.to_string());
     }
 }

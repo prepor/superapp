@@ -61,9 +61,6 @@ pub struct Account<T: Td> {
     /// The configured phone. If absent, authorization waits for a command
     /// from the sign-in panel.
     phone: Option<String>,
-    /// Every distinct write failure said on stderr so far — each is said
-    /// once, however many lines it refuses.
-    seen: std::cell::RefCell<std::collections::HashSet<String>>,
     /// When each chat's *typing…* falls silent, in unix seconds. Telegram's
     /// server does not reliably send `chatActionCancel` — a client that
     /// waited for one would leave a person typing forever — so every client
@@ -76,7 +73,7 @@ pub struct Account<T: Td> {
     /// take turns. One page is on the wire at a time, a second apart.
     pages: std::cell::RefCell<std::collections::VecDeque<Page>>,
     /// When the page on the wire went, or `None` when none is.
-    in_flight: std::cell::Cell<Option<f64>>,
+    in_flight: std::cell::Cell<Option<(Page, f64)>>,
     /// The earliest the next page may go: the pace, or the wait Telegram
     /// asked for.
     not_before: std::cell::Cell<f64>,
@@ -105,6 +102,72 @@ const PAGE_PATIENCE: f64 = 30.0;
 const FETCH_ON_OPEN: usize = 40;
 
 impl<T: Td> Account<T> {
+    /// The single outbound boundary for commands and background requests.
+    fn send(&self, w: &World, request: &str) {
+        let rt = runtime::of(w.store());
+        let request = rt.operations.track(request);
+        let Ok(v) = serde_json::from_str::<Value>(&request) else {
+            rt.operations
+                .report(w.store(), "sending request", "Invalid request JSON");
+            return;
+        };
+        if let Err(error) = super::operations::validate_files(&v) {
+            if let Some(id) = v["@extra"]["operation"].as_u64() {
+                rt.operations.fail(w.store(), id, &error, false);
+            }
+            return;
+        }
+        self.log(&format!(
+            ">> {} request={} chat={}",
+            v["@type"], v["@extra"]["operation"], v["chat_id"]
+        ));
+        self.td.send(&request);
+    }
+
+    fn acknowledged(&self, w: &World, request: &Value) {
+        // Profile actions have their own attempt guard in on_reply. In
+        // particular, a stale delete-chat reply must not clear any rows here.
+        if request["@extra"]["context"]
+            .as_str()
+            .is_some_and(|context| context.starts_with("peer_action:"))
+        {
+            return;
+        }
+        let Some(chat) = request["chat_id"].as_i64() else {
+            return;
+        };
+        let result = match request["@type"].as_str() {
+            Some("setChatNotificationSettings") => {
+                let muted = request["notification_settings"]["mute_for"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    > 0;
+                w.store().write(move |c| model::set_muted_tx(c, chat, muted))
+            }
+            Some("toggleChatIsPinned") => {
+                let pinned = request["is_pinned"] == true;
+                w.store().write(move |c| model::set_pinned_tx(c, chat, pinned))
+            }
+            Some("addChatToList") => {
+                let archived = request["chat_list"]["@type"] == "chatListArchive";
+                w.store().write(move |c| model::set_archived_tx(c, chat, archived))
+            }
+            Some("leaveChat") => w.store().write(move |c| model::leave_chat_tx(c, chat)),
+            Some("deleteChatHistory") => {
+                let remove = request["remove_from_chat_list"] == true;
+                w.store().write(move |c| {
+                    model::clear_history_tx(c, chat)?;
+                    if remove {
+                        model::leave_chat_tx(c, chat)?;
+                    }
+                    Ok(())
+                })
+            }
+            _ => return,
+        };
+        self.filed(w, "applying confirmed change", result);
+    }
+
     #[must_use]
     pub fn new(td: T, api_id: i32, tdlib_dir: PathBuf, phone: Option<String>) -> Account<T> {
         Account {
@@ -113,7 +176,6 @@ impl<T: Td> Account<T> {
             api_id,
             tdlib_dir,
             phone,
-            seen: std::cell::RefCell::new(std::collections::HashSet::new()),
             typing: std::cell::RefCell::new(std::collections::HashMap::new()),
             pages: std::cell::RefCell::new(std::collections::VecDeque::new()),
             in_flight: std::cell::Cell::new(None),
@@ -141,24 +203,35 @@ impl<T: Td> Account<T> {
     /// honoured. The chats the panels wanted since the last pass go to the
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
+        if super::Telegram::engine_store(w.store().dir())
+            && schema::session(w.store().conn()).state != "ready"
+        {
+            return;
+        }
         // Files a drawing found missing go first, and single lines asked for
         // with them: few, cheap, and somebody is looking at each.
         let wanted = runtime::of(w.store()).take_wanted();
         for rid in wanted.files {
-            self.td.send(&request_file(&rid));
+            self.send(w, &request_file(&rid));
         }
         for (chat, id) in wanted.lines {
-            self.td.send(&get_message(chat, id));
+            self.send(w, &get_message(chat, id));
         }
         for chat in wanted.chats {
             self.want(w, chat);
         }
         let now = w.now();
-        if let Some(sent) = self.in_flight.get() {
+        if let Some((page, sent)) = self.in_flight.get() {
             if now - sent < PAGE_PATIENCE {
                 return;
             }
             self.in_flight.set(None);
+            runtime::of(w.store()).set_loading(page.chat, false);
+            runtime::of(w.store()).operations.fail_context(
+                w.store(),
+                &format!("history:{}:{}:{}", page.chat, page.walk.word(), page.from),
+                "Telegram did not return the history page. Try again.",
+            );
         }
         if now < self.not_before.get() {
             return;
@@ -166,9 +239,9 @@ impl<T: Td> Account<T> {
         let Some(page) = self.pages.borrow_mut().pop_front() else {
             return;
         };
-        self.in_flight.set(Some(now));
+        self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
-        self.td.send(&get_chat_history(page.chat, page.from, page.walk));
+        self.send(w, &get_chat_history(page.chat, page.from, page.walk));
     }
 
     /// Files a write's outcome. A refused write goes to the trace and, once
@@ -178,13 +251,11 @@ impl<T: Td> Account<T> {
     /// failing on a first-shape store while the sign-in panel said the chats
     /// were syncing (2026-09-07) — so nothing the worker writes is dropped
     /// unheard again.
-    fn filed<R, E: std::fmt::Display>(&self, what: &str, r: Result<R, E>) {
+    fn filed<R, E: std::fmt::Display>(&self, w: &World, what: &str, r: Result<R, E>) {
         if let Err(e) = r {
-            let line = format!("{what}: {e}");
-            self.log(&format!("!! {line}"));
-            if self.seen.borrow_mut().insert(line.clone()) {
-                eprintln!("telegram: a write failed — {line}");
-            }
+            runtime::of(w.store())
+                .operations
+                .report(w.store(), what, &e.to_string());
         }
     }
 
@@ -202,9 +273,12 @@ impl<T: Td> Account<T> {
         let mut commands = self.commands.borrow_mut();
         let inbox = commands.get_or_insert_with(|| runtime::of(w.store()).connect());
         for request in inbox.try_iter() {
-            self.td.send(&request);
+            self.send(w, &request);
         }
         drop(commands);
+        runtime::of(w.store())
+            .operations
+            .expire(w.store(), std::time::Instant::now());
         self.expire_typing(w);
         let mut n = 0;
         while let Some(raw) = self.td.receive(0.0) {
@@ -220,11 +294,28 @@ impl<T: Td> Account<T> {
     /// which projects content. An unparseable line is dropped, not fatal — the
     /// wire's framing is TDLib's to keep, not ours.
     pub fn on_update(&self, w: &World, raw: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(raw) else {
-            self.log(&format!("<< UNPARSEABLE {raw}"));
+        let Ok(mut v) = serde_json::from_str::<Value>(raw) else {
+            runtime::of(w.store()).operations.report(
+                w.store(),
+                "reading Telegram response",
+                "Invalid JSON from TDLib",
+            );
             return;
         };
+        let rt = runtime::of(w.store());
+        let tracked = v["@extra"]["operation"].is_u64();
+        if let Some(request) = rt.operations.reply(w.store(), &v) {
+            self.acknowledged(w, &request);
+        }
+        if tracked {
+            v["@extra"] = v["@extra"]["context"].clone();
+        }
         match v["@type"].as_str() {
+            Some("updateConnectionState") => {
+                rt.set_connection(v["state"]["@type"].as_str().unwrap_or(""));
+                // The session poll needs a redraw even without a projection write.
+                rt.operations.changed();
+            }
             Some("updateAuthorizationState") => {
                 self.log(&format!(
                     "<< auth {}",
@@ -237,7 +328,17 @@ impl<T: Td> Account<T> {
             // parameter all arrive this way. A 404 to the chat-list load is
             // the one error that means something: the list is complete.
             Some("error") => {
-                self.log(&format!("<< ERROR {v}"));
+                let end = v["code"] == 404
+                    && v["@extra"]
+                        .as_str()
+                        .is_some_and(|x| x.starts_with("load_chats:"));
+                if !tracked && !end {
+                    rt.operations.report(
+                        w.store(),
+                        "Telegram request",
+                        &super::operations::error_text(&v),
+                    );
+                }
                 self.on_reply(w, &v, true);
             }
             Some("ok") => {
@@ -246,13 +347,21 @@ impl<T: Td> Account<T> {
             }
             Some("file") => {
                 self.log("<< file");
-                self.on_file_answer(&v);
+                self.on_file_answer(w, &v);
+                self.on_file(w, &v);
             }
             // A single line fetched afresh ([`runtime::Runtime::want_line`]) answers as the
             // message itself, which lands the way a new line does.
             Some("message") => {
                 self.log("<< message");
                 self.on_new_message(w, &v);
+            }
+            Some("messages") if tracked && v["@extra"].is_null() => {
+                if let Some(messages) = v["messages"].as_array() {
+                    for message in messages {
+                        self.on_new_message(w, message);
+                    }
+                }
             }
             other => {
                 self.log(&format!("<< {}", other.unwrap_or("?")));
@@ -280,9 +389,13 @@ impl<T: Td> Account<T> {
         // The state row, written on the store's writer thread. Only the owned
         // arguments cross; `w` is not captured, so the closure is `Send`.
         let write = |phone: Option<String>, state: &'static str, detail: Option<String>| {
-            self.filed("on_auth", w.store().write(move |c| {
-                schema::set_session(c, phone.as_deref(), state, detail.as_deref(), now)
-            }));
+            self.filed(
+                w,
+                "on_auth",
+                w.store().write(move |c| {
+                    schema::set_session(c, phone.as_deref(), state, detail.as_deref(), now)
+                }),
+            );
         };
         match st["@type"].as_str() {
             // Handshake: TDLib wants the application's own parameters before
@@ -300,19 +413,18 @@ impl<T: Td> Account<T> {
                     api_hash.len(),
                     self.tdlib_dir.display()
                 ));
-                self.td.send(&set_tdlib_parameters(
-                    self.api_id,
-                    &api_hash,
-                    &self.tdlib_dir,
-                ));
+                self.send(
+                    w,
+                    &set_tdlib_parameters(self.api_id, &api_hash, &self.tdlib_dir),
+                );
                 write(None, "connecting", None);
             }
             // The phone. If the file configured one, send it and move on; if
             // not, wait for the UI to supply it through `set_phone`.
             Some("authorizationStateWaitPhoneNumber") => {
                 if let Some(phone) = self.phone.clone() {
-                    self.log(&format!(">> setAuthenticationPhoneNumber {phone}"));
-                    self.td.send(&set_authentication_phone(&phone));
+                    self.log(">> setAuthenticationPhoneNumber");
+                    self.send(w, &set_authentication_phone(&phone));
                     write(Some(phone), "wait_phone", None);
                 } else {
                     self.log(">> (no phone configured, waiting for the UI)");
@@ -385,25 +497,22 @@ impl<T: Td> Account<T> {
     /// the archive's 404 ends the load ([`on_reply`](Account::on_reply)).
     /// The transcripts fill as panels request history through the runtime.
     ///
-    /// A line still `sending` from before is a phantom: with no message
-    /// database on the engine's side, no pending send survives a restart,
-    /// so the echo that stayed behind is cleared here rather than drawn
-    /// forever as *sending…*.
+    /// Keep unconfirmed messages from a previous run visible. The projection
+    /// cannot establish whether Telegram delivered them while we were away.
     pub fn on_ready(&self, w: &World) {
-        self.filed(
-            "on_ready",
-            w.store().write(|c| {
-                c.execute("DELETE FROM tg_message WHERE state = 'sending'", [])
-                    .map(|_| ())
-            }),
-        );
+        match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
+            Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
+                "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
+            Ok(_) => {},
+            Err(error) => runtime::of(w.store()).operations.report(w.store(), "recovering sends", &error.to_string()),
+        }
         runtime::of(w.store()).set_list_syncing(true);
-        self.td.send(&load_chats(ChatList::Main));
+        self.send(w, &load_chats(ChatList::Main));
     }
 
     /// A plain reply — `ok` or an error — to one of this account's own
     /// requests, told apart by the `@extra` it wore: the chat-list load, a
-    /// history page, and a send.
+    /// history page. Send outcomes are handled by the operation tracker.
     ///
     /// The list load: `ok` says a page landed and there may be another, an
     /// error (TDLib's 404) that the list is complete — after the main list
@@ -433,10 +542,19 @@ impl<T: Td> Account<T> {
             }
             return;
         }
+        if failed
+            && v["code"] != 404
+            && v["@extra"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("load_chats:"))
+        {
+            runtime::of(w.store()).set_list_syncing(false);
+            return;
+        }
         match (v["@extra"].as_str(), failed) {
-            (Some("load_chats:main"), false) => self.td.send(&load_chats(ChatList::Main)),
+            (Some("load_chats:main"), false) => self.send(w, &load_chats(ChatList::Main)),
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
-                self.td.send(&load_chats(ChatList::Archive));
+                self.send(w, &load_chats(ChatList::Archive));
             }
             (Some("load_chats:archive"), true) => runtime::of(w.store()).set_list_syncing(false),
             // A history page refused. Telegram's *too many requests* says
@@ -444,10 +562,18 @@ impl<T: Td> Account<T> {
             // whole queue waits that long. Anything else — a chat gone
             // private, not found — ends that chat's walk.
             (Some(extra), true) if extra.starts_with("history:") => {
-                self.in_flight.set(None);
                 let Some((chat, walk, from)) = parse_history_extra(extra) else {
                     return;
                 };
+                let page = Page { chat, walk, from };
+                if self
+                    .in_flight
+                    .get()
+                    .is_some_and(|(current, _)| current != page)
+                {
+                    return;
+                }
+                self.in_flight.set(None);
                 let wait = (v["code"].as_i64() == Some(429))
                     .then(|| retry_after(v["message"].as_str().unwrap_or("")))
                     .flatten();
@@ -458,44 +584,6 @@ impl<T: Td> Account<T> {
                     }
                     None => runtime::of(w.store()).set_loading(chat, false),
                 }
-            }
-            // A send refused — a line past the length limit, an attachment
-            // that is not there, a chat one may not write in. The composer
-            // was emptied the moment the request was queued, so the words are
-            // nowhere but in the `@extra`: they go back on the chat as its
-            // draft, and the open transcript takes them into the field on its
-            // next draw ([`Chat::card`](crate::apps::telegram::Chat)). Onto a
-            // composer somebody has typed in since they do not go — that
-            // draft is newer than this one.
-            //
-            // The line answered and the files carried are not given back:
-            // neither is on the row, and a send is the one place the panel
-            // lets go of them. What was written is the half that cannot be
-            // typed again from what is on the screen.
-            (Some(extra), true) if extra.starts_with("send:") => {
-                let Some((chat, text)) = parse_send_extra(extra) else {
-                    return;
-                };
-                self.log(&format!(
-                    "!! send to {chat} refused: {} {}",
-                    v["code"],
-                    v["message"].as_str().unwrap_or("")
-                ));
-                if text.is_empty() {
-                    return;
-                }
-                let text = text.to_string();
-                self.filed(
-                    "on_reply/send",
-                    w.store().write(move |c| {
-                        c.execute(
-                            "UPDATE tg_chat SET draft = ?2
-                             WHERE peer = ?1 AND COALESCE(draft, '') = ''",
-                            rusqlite::params![chat, text],
-                        )
-                        .map(|_| ())
-                    }),
-                );
             }
             _ => {}
         }
@@ -523,6 +611,7 @@ impl<T: Td> Account<T> {
         };
         self.log(&format!("<< my_id {id}"));
         self.filed(
+            w,
             "on_option",
             w.store().write(move |c| {
                 ensure_peer(c, id)?;
@@ -548,7 +637,7 @@ impl<T: Td> Account<T> {
     ///
     /// Accept the older viewer's `clip:` correlation prefix as well as the
     /// current `file:` prefix.
-    fn on_file_answer(&self, v: &Value) {
+    fn on_file_answer(&self, w: &World, v: &Value) {
         if !v["@extra"]
             .as_str()
             .is_some_and(|x| x.starts_with("file:") || x.starts_with("clip:"))
@@ -570,7 +659,7 @@ impl<T: Td> Account<T> {
         ));
         if let Some(id) = v["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
             self.log(&format!(">> downloadFile {id} priority=32"));
-            self.td.send(&download_file(id, 32));
+            self.send(w, &download_file(id, 32));
         }
     }
 
@@ -648,22 +737,28 @@ impl<T: Td> Account<T> {
             return;
         };
         let (chat, sender) = (msg.chat, msg.sender);
-        self.filed("on_new_message", w.store().write(move |c| {
-            ensure_peer(c, chat)?;
-            model::ensure_chat_tx(c, chat)?;
-            if let Some(s) = sender {
-                ensure_peer(c, s)?;
-            }
-            project_messages(c, &[msg])?;
-            apply_read_outbox(c, chat)?;
-            trim_chat(c, chat)?;
-            Ok(())
-        }));
+        self.filed(
+            w,
+            "on_new_message",
+            w.store().write(move |c| {
+                ensure_peer(c, chat)?;
+                model::ensure_chat_tx(c, chat)?;
+                if let Some(s) = sender {
+                    ensure_peer(c, s)?;
+                }
+                project_messages(c, &[msg])?;
+                apply_read_outbox(c, chat)?;
+                trim_chat(c, chat)?;
+                Ok(())
+            }),
+        );
         // Ask for the media, if any: TDLib downloads it, `updateFile`
         // completes, and [`on_file`](Account::on_file) ingests the bytes into
         // the blob cache under the same tg: key the row names — the next
         // redraw draws the photo.
-        self.fetch(w, &message["content"]);
+        if message["sending_state"].is_null() {
+            self.fetch(w, &message["content"]);
+        }
     }
 
     /// Asks TDLib for the media a line's content carries — unless the blob
@@ -682,7 +777,7 @@ impl<T: Td> Account<T> {
                 .unwrap_or(false)
         });
         if !cached {
-            self.td.send(&download_file(file_id, 1));
+            self.send(w, &download_file(file_id, 1));
         }
     }
 
@@ -695,9 +790,12 @@ impl<T: Td> Account<T> {
         };
         let (text, media) = updates::content(&u["new_content"], 0.0);
         let entities = updates::content_entities(&u["new_content"]);
-        self.filed("on_message_content", w
-            .store()
-            .write(move |c| set_content(c, chat, id, &text, media.as_ref(), &entities)));
+        self.filed(
+            w,
+            "on_message_content",
+            w.store()
+                .write(move |c| set_content(c, chat, id, &text, media.as_ref(), &entities)),
+        );
         // A swapped-in photo or file is fetched the same way a new line's is.
         self.fetch(w, &u["new_content"]);
     }
@@ -709,13 +807,17 @@ impl<T: Td> Account<T> {
             return;
         };
         let edited = u["edit_date"].as_i64().unwrap_or(0) > 0;
-        self.filed("on_message_edited", w.store().write(move |c| {
-            c.execute(
-                "UPDATE tg_message SET edited = ?3 WHERE chat = ?1 AND id = ?2",
-                rusqlite::params![chat, id, edited],
-            )
-            .map(|_| ())
-        }));
+        self.filed(
+            w,
+            "on_message_edited",
+            w.store().write(move |c| {
+                c.execute(
+                    "UPDATE tg_message SET edited = ?3 WHERE chat = ?1 AND id = ?2",
+                    rusqlite::params![chat, id, edited],
+                )
+                .map(|_| ())
+            }),
+        );
     }
 
     /// What a line has gathered since it was posted: the views a channel
@@ -729,6 +831,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_interaction",
             w.store().write(move |c| {
                 c.execute(
@@ -758,9 +861,12 @@ impl<T: Td> Account<T> {
         if ids.is_empty() {
             return;
         }
-        self.filed("on_delete_messages", w
-            .store()
-            .write(move |c| model::delete_lines_tx(c, chat, &ids).map(|_| ())));
+        self.filed(
+            w,
+            "on_delete_messages",
+            w.store()
+                .write(move |c| model::delete_lines_tx(c, chat, &ids).map(|_| ())),
+        );
     }
 
     /// A chat arrives: its peer where the chat is the only source of one (a
@@ -774,23 +880,29 @@ impl<T: Td> Account<T> {
         let peer = ch.peer;
         let derived = updates::chat_peer(chat);
         let blocked = updates::blocked(chat);
-        let read_outbox = chat["last_read_outbox_message_id"].as_i64().filter(|&m| m != 0);
-        self.filed("on_new_chat", w.store().write(move |c| {
-            if let Some(p) = derived {
-                project_peers(c, &[p])?;
-            }
-            ensure_peer(c, peer)?;
-            model::set_blocked_tx(c, peer, blocked)?;
-            project_chats(c, &[ch])?;
-            if read_outbox.is_some() {
-                c.execute(
-                    "UPDATE tg_chat SET read_outbox = ?2 WHERE peer = ?1",
-                    rusqlite::params![peer, read_outbox],
-                )?;
-                apply_read_outbox(c, peer)?;
-            }
-            Ok(())
-        }));
+        let read_outbox = chat["last_read_outbox_message_id"]
+            .as_i64()
+            .filter(|&m| m != 0);
+        self.filed(
+            w,
+            "on_new_chat",
+            w.store().write(move |c| {
+                if let Some(p) = derived {
+                    project_peers(c, &[p])?;
+                }
+                ensure_peer(c, peer)?;
+                model::set_blocked_tx(c, peer, blocked)?;
+                project_chats(c, &[ch])?;
+                if read_outbox.is_some() {
+                    c.execute(
+                        "UPDATE tg_chat SET read_outbox = ?2 WHERE peer = ?1",
+                        rusqlite::params![peer, read_outbox],
+                    )?;
+                    apply_read_outbox(c, peer)?;
+                }
+                Ok(())
+            }),
+        );
         // The chat object carries its last line; a chat loaded from the list
         // gets its one line from here, the way a new line rides
         // `updateChatLastMessage`.
@@ -810,6 +922,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_chat_read_outbox",
             w.store().write(move |c| {
                 c.execute(
@@ -828,12 +941,14 @@ impl<T: Td> Account<T> {
     /// marked failed. Without this the echo stayed a second copy forever,
     /// still *sending…*, beside the line that had in fact gone.
     fn on_sent(&self, w: &World, u: &Value) {
+        runtime::of(w.store()).operations.sent(w.store(), u);
         let Some(msg) = updates::message(&u["message"]) else {
             return;
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
         let (chat, sender) = (msg.chat, msg.sender);
         self.filed(
+            w,
             "on_sent",
             w.store().write(move |c| {
                 if old != 0 && old != msg.id {
@@ -874,6 +989,7 @@ impl<T: Td> Account<T> {
         let pinned = i64::from(listed && pos["is_pinned"].as_bool() == Some(true));
         let archive = sql.contains("archived");
         self.filed(
+            w,
             "on_chat_position",
             w.store().write(move |c| {
                 // Each statement binds exactly its own parameters: the
@@ -903,6 +1019,7 @@ impl<T: Td> Account<T> {
         };
         let sql = format!("UPDATE tg_chat SET {col} = ?2 WHERE peer = ?1");
         self.filed(
+            w,
             "on_chat_listing",
             w.store().write(move |c| {
                 c.execute(&sql, rusqlite::params![chat, i64::from(on)])
@@ -919,7 +1036,7 @@ impl<T: Td> Account<T> {
         };
         let unread = u["unread_count"].as_i64().unwrap_or(0);
         let last_read = u["last_read_inbox_message_id"].as_i64().filter(|&m| m != 0);
-        self.filed("on_chat_read_inbox", w.store().write(move |c| {
+        self.filed(w, "on_chat_read_inbox", w.store().write(move |c| {
             c.execute(
                 "UPDATE tg_chat SET unread = ?2, last_read = COALESCE(?3, last_read) WHERE peer = ?1",
                 rusqlite::params![chat, unread, last_read],
@@ -936,13 +1053,17 @@ impl<T: Td> Account<T> {
             return;
         };
         let muted = u["notification_settings"]["mute_for"].as_i64().unwrap_or(0) > 0;
-        self.filed("on_chat_notifications", w.store().write(move |c| {
-            c.execute(
-                "UPDATE tg_chat SET muted = ?2 WHERE peer = ?1",
-                rusqlite::params![chat, muted],
-            )
-            .map(|_| ())
-        }));
+        self.filed(
+            w,
+            "on_chat_notifications",
+            w.store().write(move |c| {
+                c.execute(
+                    "UPDATE tg_chat SET muted = ?2 WHERE peer = ?1",
+                    rusqlite::params![chat, muted],
+                )
+                .map(|_| ())
+            }),
+        );
     }
 
     /// A chat renamed. The title is the peer's, a chat and its peer sharing
@@ -955,6 +1076,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_chat_title",
             w.store().write(move |c| {
                 ensure_peer(c, chat)?;
@@ -974,6 +1096,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_chat_mentions",
             w.store().write(move |c| {
                 c.execute(
@@ -994,6 +1117,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_chat_draft",
             w.store().write(move |c| {
                 c.execute(
@@ -1026,6 +1150,7 @@ impl<T: Td> Account<T> {
         };
         let chat = a.chat;
         self.filed(
+            w,
             "on_chat_action",
             w.store().write(move |c| {
                 c.execute(
@@ -1084,6 +1209,7 @@ impl<T: Td> Account<T> {
             list.join(", ")
         );
         self.filed(
+            w,
             "expire_typing",
             w.store().write(move |c| c.execute(&sql, []).map(|_| ())),
         );
@@ -1095,11 +1221,15 @@ impl<T: Td> Account<T> {
         let Some(p) = updates::peer(user) else {
             return;
         };
-        self.filed("on_user", w.store().write(move |c| project_peers(c, &[p])));
+        self.filed(
+            w,
+            "on_user",
+            w.store().write(move |c| project_peers(c, &[p])),
+        );
     }
 
     fn on_blocked(&self, w: &World, peer: PeerId, blocked: bool) {
-        self.filed("on_blocked", w.store().write(move |c| {
+        self.filed(w, "on_blocked", w.store().write(move |c| {
             ensure_peer(c, peer)?;
             model::set_blocked_tx(c, peer, blocked)
         }));
@@ -1115,6 +1245,7 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed(
+            w,
             "on_user_status",
             w.store().write(move |c| {
                 ensure_peer(c, id)?;
@@ -1142,10 +1273,13 @@ impl<T: Td> Account<T> {
         let Some(c) = counts else {
             return;
         };
-        self.filed("on_counts", w.store().write(move |conn| {
-            ensure_peer(conn, c.id)?;
-            conn.execute(
-                "UPDATE tg_peer SET members = COALESCE(?2, members),
+        self.filed(
+            w,
+            "on_counts",
+            w.store().write(move |conn| {
+                ensure_peer(conn, c.id)?;
+                conn.execute(
+                    "UPDATE tg_peer SET members = COALESCE(?2, members),
                                     online = COALESCE(?3, online),
                                     about = COALESCE(?4, about),
                                     admin = COALESCE(?5, admin)
@@ -1169,12 +1303,16 @@ impl<T: Td> Account<T> {
         if members.is_empty() {
             return;
         }
-        self.filed("on_basic_group_full", w.store().write(move |c| {
-            for m in &members {
-                ensure_peer(c, m.peer)?;
-            }
-            project_members(c, &members)
-        }));
+        self.filed(
+            w,
+            "on_basic_group_full",
+            w.store().write(move |c| {
+                for m in &members {
+                    ensure_peer(c, m.peer)?;
+                }
+                project_members(c, &members)
+            }),
+        );
     }
 
     /// A page of a chat's history, answering a `getChatHistory` this account
@@ -1195,11 +1333,19 @@ impl<T: Td> Account<T> {
         let Some((chat, walk, from)) = v["@extra"].as_str().and_then(parse_history_extra) else {
             return;
         };
-        self.in_flight.set(None);
+        let stale = self
+            .in_flight
+            .get()
+            .is_some_and(|(page, _)| page != Page { chat, walk, from });
+        if !stale {
+            self.in_flight.set(None);
+        }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
         let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
-            runtime::of(w.store()).set_loading(chat, false);
+            if !stale {
+                runtime::of(w.store()).set_loading(chat, false);
+            }
             return;
         };
         let newest = batch.iter().map(|m| m.id).max().unwrap_or(oldest);
@@ -1232,6 +1378,7 @@ impl<T: Td> Account<T> {
         let senders: Vec<PeerId> = batch.iter().filter_map(|m| m.sender).collect();
         let brought = batch.len() as i64;
         self.filed(
+            w,
             "history",
             w.store().write(move |c| {
                 ensure_peer(c, chat)?;
@@ -1246,6 +1393,9 @@ impl<T: Td> Account<T> {
             }),
         );
         let (held_oldest, count) = history_window(w.store().conn(), chat).unwrap_or((None, 0));
+        if stale {
+            return;
+        }
         let progressed = from == 0 || oldest < from;
         // A fill goes on until a page is known whole, whatever the window
         // holds: an absence's gap sits above the lines kept, and the trim
@@ -1293,6 +1443,7 @@ impl<T: Td> Account<T> {
     /// its owner keeps it, and no `deleteFile` is sent: there is nothing of
     /// the engine's to forget.
     fn on_file(&self, w: &World, file: &Value) {
+        runtime::of(w.store()).operations.file_progress(file);
         let local = &file["local"];
         if local["is_downloading_completed"].as_bool() != Some(true) {
             return;
@@ -1307,38 +1458,48 @@ impl<T: Td> Account<T> {
             return;
         };
         let src = PathBuf::from(path);
-        if !src.exists() {
-            return;
-        }
         let key = format!("tg:{uid}");
-        if !src.starts_with(&self.tdlib_dir) {
-            // An upload is announced more than once, and the bytes under a
-            // remote unique id are those bytes forever: a key the cache holds
-            // is not read off the disk again.
-            if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key))
-                .unwrap_or(false)
-            {
-                return;
-            }
-            match std::fs::read(&src) {
-                Ok(bytes) => match w.with_cap::<dyn Blobs, _>(|b| b.put(&key, &bytes)) {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) | Err(e) => {
-                        eprintln!("telegram: caching a file of my own failed: {e}");
-                    }
-                },
-                Err(e) => eprintln!("telegram: reading a file of my own failed: {e}"),
-            }
+        let rt = runtime::of(w.store());
+        if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key))
+            .unwrap_or(false)
+        {
+            rt.operations.file_finished(w.store(), file, None);
             return;
         }
-        match w.with_cap::<dyn Blobs, _>(|b| b.ingest(&key, &src)) {
-            Ok(Ok(_)) => {
-                if let Some(id) = file["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
-                    self.td.send(&delete_file(id));
+        if !src.exists() {
+            let error = "Downloaded file is missing from disk";
+            rt.operations.file_finished(w.store(), file, Some(error));
+            rt.operations.report(w.store(), "caching media", error);
+            return;
+        }
+        // Upload sources belong to the user. Never move or delete them, even
+        // when the file update arrives while the upload is still in progress.
+        let result = if !src.starts_with(&self.tdlib_dir) {
+            std::fs::read(&src)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    w.with_cap::<dyn Blobs, _>(|b| b.put(&key, &bytes))
+                        .and_then(|r| r)
+                        .map(|_| ())
+                })
+        } else {
+            w.with_cap::<dyn Blobs, _>(|b| b.ingest(&key, &src))
+                .and_then(|r| r)
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                rt.operations.file_finished(w.store(), file, None);
+                if src.starts_with(&self.tdlib_dir) {
+                    if let Some(id) = file["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
+                        self.send(w, &delete_file(id));
+                    }
                 }
             }
-            Ok(Err(e)) => eprintln!("telegram: caching a download failed: {e}"),
-            Err(e) => eprintln!("telegram: {e}"),
+            Err(error) => {
+                rt.operations.file_finished(w.store(), file, Some(&error));
+                rt.operations.report(w.store(), "caching media", &error);
+            }
         }
     }
 }
