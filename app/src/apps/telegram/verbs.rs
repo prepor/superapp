@@ -1,8 +1,9 @@
-//! Undoable local edits and deletes for offline fixtures.
+//! Undoable topic preferences, plus edits and deletes for offline fixtures.
 //!
-//! Live panels queue requests instead and let TDLib updates settle the store.
-//! These intents reverse only the local fixture changes, not server actions.
+//! Live message changes queue requests and let TDLib updates settle the store.
+//! Topic visibility is this app's preference in both live and offline accounts.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use kernel::effect::World;
@@ -10,6 +11,59 @@ use kernel::history::Intent;
 use kernel::session::{Action, Session};
 
 use super::model::{self, LineCopy, MsgId, PeerId};
+use super::topics;
+
+/// Each gesture owns only the visibility flags it changes, so undo restores
+/// a mixed selection without changing topic metadata or later discoveries.
+pub fn select_topics(s: &mut Session, chat: PeerId, ids: Vec<i64>, selected: bool) {
+    let wanted: HashSet<_> = ids.into_iter().collect();
+    // Every retained row had !selected; unchanged rows must not be reversed.
+    let ids: Vec<_> = topics::list(s.store(), chat)
+        .iter()
+        .filter(|t| wanted.contains(&t.id) && t.selected != selected)
+        .map(|t| t.id)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let n = ids.len();
+    let word = if selected { "show" } else { "hide" };
+    let write = ids.clone();
+    let _ = s.act(
+        Action::writing(
+            "topic selection",
+            format!("{word} {n} topic{}", if n == 1 { "" } else { "s" }),
+            move |tx| topics::select_tx(tx, chat, &write, selected),
+        )
+        .claiming(vec![Box::new(TopicSelection { chat, ids, selected })]),
+    );
+}
+
+struct TopicSelection {
+    chat: PeerId,
+    ids: Vec<i64>,
+    selected: bool,
+}
+
+impl Intent for TopicSelection {
+    fn describe(&self) -> String {
+        format!("chat:{} topic selection", self.chat)
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let (chat, ids, selected) = (self.chat, self.ids.clone(), !self.selected);
+        w.store()
+            .write(move |c| topics::select_tx(c, chat, &ids, selected))
+            .map_err(|e| e.to_string())
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let (chat, ids, selected) = (self.chat, self.ids.clone(), self.selected);
+        w.store()
+            .write(move |c| topics::select_tx(c, chat, &ids, selected))
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// Writes a new text over one of my lines, as one undoable action.
 pub fn edit_line(

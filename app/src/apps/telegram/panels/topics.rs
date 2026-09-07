@@ -11,6 +11,7 @@ use super::super::{
     model::{self, PeerId},
     runtime,
     topics::{self, Topic},
+    verbs,
 };
 use super::{Chat, Chats};
 
@@ -75,13 +76,7 @@ impl Topics {
     }
 
     fn select(&self, ids: Vec<i64>, selected: bool, s: &mut Session) {
-        let chat = self.chat;
-        if let Err(e) = self
-            .store
-            .write(move |c| topics::select_tx(c, chat, &ids, selected))
-        {
-            s.notify(format!("could not save topic selection: {e}"), true);
-        }
+        verbs::select_topics(s, self.chat, ids, selected);
         s.redraw();
     }
 

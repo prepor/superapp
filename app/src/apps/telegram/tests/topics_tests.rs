@@ -18,6 +18,156 @@ fn toggle(s: &mut Session, slot: SlotId, id: i64) {
     s.settle();
 }
 
+fn selected_topics(s: &Session, chat: i64) -> Vec<i64> {
+    let mut ids: Vec<_> = topics::list(s.store(), chat)
+        .iter()
+        .filter(|t| t.selected)
+        .map(|t| t.id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn bulk_topic_visibility_round_trips_a_mixed_selection() {
+    for (verb_id, shown) in [
+        ("telegram.show_topics", vec![1, 2, 3, 4]),
+        ("telegram.hide_topics", vec![]),
+    ] {
+        let mut s = session();
+        s.store()
+            .write(|c| topics::select_tx(c, BERLIN, &[2, 4], true))
+            .unwrap();
+        let chats = open_root(&mut s, Chats::id());
+        let picker = open_root(&mut s, Topics::id(BERLIN));
+        let inbox = runtime::of(s.store()).connect();
+        let before = s.history().head();
+
+        verb(&mut s, picker, verb_id);
+        assert_eq!(selected_topics(&s, BERLIN), shown);
+        assert_eq!(
+            with_chats(&s, chats, |p| p.rows(0, 50))
+                .iter()
+                .filter(|r| r.peer == BERLIN)
+                .count(),
+            shown.len()
+        );
+        let action = s.history().head();
+        assert_ne!(action, before);
+        verb(&mut s, picker, verb_id);
+        assert_eq!(
+            s.history().head(),
+            action,
+            "an unchanged selection is not an action"
+        );
+
+        s.store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE tg_topic SET draft = 'new draft', unread = 7, pinned = 1,
+                     muted = 1, mute_default = 0 WHERE chat = ?1 AND id = 2",
+                    [BERLIN],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let after = topics::list(s.store(), BERLIN);
+        let mut restored = after.as_ref().clone();
+        for topic in &mut restored {
+            topic.selected = [2, 4].contains(&topic.id);
+        }
+        assert!(s.undo());
+        assert_eq!(
+            s.history().head(),
+            before,
+            "one undo restores the whole selection"
+        );
+        assert_eq!(topics::list(s.store(), BERLIN).as_ref(), &restored);
+        assert_eq!(
+            with_chats(&s, chats, |p| p.rows(0, 50))
+                .iter()
+                .filter(|r| r.peer == BERLIN)
+                .count(),
+            2
+        );
+        assert!(s.redo());
+        assert_eq!(topics::list(s.store(), BERLIN), after);
+        assert!(
+            inbox.try_iter().next().is_none(),
+            "selection stays local even when connected"
+        );
+    }
+}
+
+#[test]
+fn filtered_topic_selection_undo_keeps_the_original_matches() {
+    for (verb_id, mut shown) in [
+        ("telegram.show_topics", vec![2, 3, 4]),
+        ("telegram.hide_topics", vec![4]),
+    ] {
+        let mut s = session();
+        s.store()
+            .write(|c| {
+                topics::select_tx(c, BERLIN, &[2, 4], true)?;
+                c.execute(
+                    "UPDATE tg_topic SET name = 'Match ' || id WHERE chat = ?1 AND id IN (2, 3)",
+                    [BERLIN],
+                )?;
+                c.execute(
+                    "INSERT INTO tg_topic(chat, id, name) VALUES(?1, 3, 'Another group')",
+                    [HIKE],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let picker = open_root(&mut s, Topics::id(BERLIN));
+        with_topics(&s, picker, |p| p.set_filter("match".into()));
+        verb(&mut s, picker, verb_id);
+        assert_eq!(selected_topics(&s, BERLIN), shown);
+
+        with_topics(&s, picker, |p| p.set_filter("cycling".into()));
+        s.store()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO tg_topic(chat, id, name, selected) VALUES(?1, 5, 'Match 5', 1)",
+                    [BERLIN],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(s.undo());
+        assert_eq!(selected_topics(&s, BERLIN), vec![2, 4, 5]);
+        assert!(selected_topics(&s, HIKE).is_empty());
+        assert!(s.redo());
+        shown.push(5);
+        assert_eq!(selected_topics(&s, BERLIN), shown);
+        assert!(selected_topics(&s, HIKE).is_empty());
+    }
+}
+
+#[test]
+fn topic_toggles_undo_individually_and_empty_matches_leave_history_alone() {
+    let mut s = session();
+    let picker = open_root(&mut s, Topics::id(BERLIN));
+    let before = s.history().head();
+    with_topics(&s, picker, |p| p.set_filter("no matches".into()));
+    verb(&mut s, picker, "telegram.show_topics");
+    verb(&mut s, picker, "telegram.hide_topics");
+    assert_eq!(s.history().head(), before);
+
+    with_topics(&s, picker, |p| p.set_filter(String::new()));
+    toggle(&mut s, picker, 2);
+    toggle(&mut s, picker, 4);
+    assert!(s.undo());
+    assert_eq!(selected_topics(&s, BERLIN), vec![2]);
+    assert!(s.undo());
+    assert!(selected_topics(&s, BERLIN).is_empty());
+    assert!(s.redo());
+    assert_eq!(selected_topics(&s, BERLIN), vec![2]);
+    assert!(s.redo());
+    assert_eq!(selected_topics(&s, BERLIN), vec![2, 4]);
+}
+
 #[test]
 fn selection_replaces_the_forum_with_independent_chat_rows() {
     let mut s = session();

@@ -72,6 +72,8 @@ Use **topics** on the chats panel, choose a forum group (for example,
 Вастрик.Берлин), then check the topics you want to see. The picker supports
 text filtering, individual toggles by click or space, and showing or hiding
 all matching topics. Changes take effect immediately and survive a restart.
+Each toggle or bulk change can be undone and redone during the current session,
+restoring the previous mix of shown and hidden topics.
 The group stays available in the picker even when no topics are selected.
 
 Selected topics appear beside ordinary chats, labeled **topic · group**.
@@ -165,7 +167,7 @@ history pacing. Loading flags stay with the store that requested the work.
 | `schema`, `seed` | Append-only migration ladder and offline fixtures |
 | `model`, `search` | Panel queries, value types, formatting and search provider |
 | `runtime`, `trace` | Store-scoped coordination and local diagnostic output |
-| `panels`, `verbs` | Interaction state, live commands and undoable fixture actions |
+| `panels`, `verbs` | Interaction state, live commands and undoable local actions |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
 
 A row receives its clock explicitly. Transcript rows also receive a
@@ -213,7 +215,8 @@ retry payloads; unconfirmed projected messages remain visible as failed and ask
 for a delivery check. Login secrets are never retained for retry. Recording
 and location sharing report that they are unavailable in live accounts; attach
 an existing recording instead. The location panel still shows its demo map.
-`verbs` implements undo only for local fixture edits and deletes.
+`verbs` implements undo for topic visibility preferences in all accounts, and
+for local fixture edits and deletes.
 
 `tg_session` currently persists authorization status in the replicated store;
 it is not excluded from replication. The actual TDLib session files and login
