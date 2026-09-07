@@ -456,7 +456,9 @@ impl Chat {
             return;
         };
         if hist.iter().any(|m| m.id == target) {
-            self.reply_back.push(reply.id);
+            if self.reply_back.last() != Some(&reply.id) {
+                self.reply_back.push(reply.id);
+            }
             self.cursor = Some(target);
             self.follow_wish = Some(target);
         } else {

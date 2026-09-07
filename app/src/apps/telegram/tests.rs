@@ -384,6 +384,33 @@ fn a_reply_original_has_a_way_back_after_walking_and_marking() {
 }
 
 #[test]
+fn revisiting_a_reply_does_not_duplicate_the_return_point() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap();
+    let original = reply.reply_to.unwrap();
+
+    for _ in 0..2 {
+        // Clicking the reply again instead of using Back keeps its return point.
+        with_chat(&s, chat, |c| c.set_cursor(reply.id));
+        verb(&mut s, chat, "telegram.original");
+        with_chat(&s, chat, |c| {
+            assert_eq!(c.cursor(), Some(original));
+            assert_eq!(c.take_follow_wish(), Some(original));
+        });
+        assert!(verb_ids(&s, chat).contains(&"telegram.back"));
+    }
+
+    verb(&mut s, chat, "telegram.back");
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.cursor(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), Some(reply.id));
+    });
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+}
+
+#[test]
 fn reply_originals_are_retraced_in_order_and_skip_missing_return_points() {
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(VERA));
