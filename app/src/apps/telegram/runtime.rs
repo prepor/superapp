@@ -6,13 +6,20 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
 use kernel::store::Store;
 
 use super::model::{DownloadProgress, MsgId, PeerId};
 use super::requests::PeerAction;
+
+/// Chosen when the world is created, independently of worker availability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Live,
+    Demo,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
@@ -56,6 +63,7 @@ struct State {
     wanted: Wanted,
     next_reaction: u64,
     reactions: HashMap<u64, Weak<Mutex<Option<ReactionResult>>>>,
+    demo_reactions: HashSet<(PeerId, MsgId, String)>,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
 }
@@ -63,6 +71,11 @@ struct State {
 impl State {
     fn disconnect(&mut self) {
         self.sender = None;
+        for (_, reply) in self.reactions.drain() {
+            if let Some(reply) = reply.upgrade() {
+                *reply.lock().expect("reaction reply") = Some(ReactionResult::Error("Telegram is disconnected".into()));
+            }
+        }
         if !self.peer_actions.is_empty() {
             self.peer_actions.clear();
             self.notices.push(("Telegram disconnected before confirming pending user actions".to_string(), true));
@@ -239,6 +252,14 @@ impl Runtime {
         if let Some(reply) = self.state().reactions.remove(&id).and_then(|r| r.upgrade()) {
             *reply.lock().expect("reaction reply") = Some(result);
         }
+    }
+
+    pub fn demo_reacted(&self, chat: PeerId, msg: MsgId, emoji: &str) -> bool {
+        self.state().demo_reactions.contains(&(chat, msg, emoji.to_string()))
+    }
+
+    pub fn remember_demo_reaction(&self, chat: PeerId, msg: MsgId, emoji: &str) {
+        self.state().demo_reactions.insert((chat, msg, emoji.to_string()));
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {

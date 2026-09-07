@@ -142,9 +142,9 @@ results remain queryable after their status line disappears.
 
 Select a message and press **Cmd+J**, or choose **react (j)** in the chat's
 bar or its line card. The shortcut also works while the composer has focus.
-The bar shows the ordinary emoji Telegram allows for that
-message, six at a time; **more** and **back** move through them. Choose an
-emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
+The bar shows the ordinary emoji Telegram allows for that message in evenly
+spaced, borderless choices, six at a time; **more** and **back** move through
+them. Choose an emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
 cursor also closes it. Service messages and pending or failed sends do not
 offer reactions, and marking messages keeps the batch actions on the bar.
 
@@ -155,7 +155,9 @@ shows **could not load reactions** or **reaction failed**, plus **retry**, and
 automatically reports the reason in a notification; click the status to see it
 again. Startup failures also appear in the sign-in panel. If another app
 instance has locked Telegram's database, close it and restart this instance.
-Offline demos offer a small fixture list and show a toast when an emoji is chosen.
+Offline demos offer a small fixture list and update the message's displayed counts
+locally when an emoji is chosen. A live account with no connected worker reports
+a connection error; it never falls back to demo reactions.
 Custom emoji and paid reactions are not offered.
 
 ## Builds

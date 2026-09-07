@@ -21,6 +21,7 @@ click "back"
 wait 300
 click "👍"
 wait 400
+shot reactions-added
 # Choosing a fixture emoji closes the picker; the normal actions return.
 key cmd+j
 wait 300

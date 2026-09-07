@@ -212,7 +212,7 @@ impl Panel for Line {
         match verb {
             "telegram.react" => {
                 if let Some(m) = self.msg() {
-                    self.reactions.open(self.world.store(), &m);
+                    self.reactions.open(s, &m);
                     s.redraw();
                 }
             }

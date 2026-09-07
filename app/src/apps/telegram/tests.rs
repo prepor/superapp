@@ -2813,19 +2813,74 @@ fn reaction_pickers_ignore_late_answers_and_keep_panels_and_stores_separate() {
 }
 
 #[test]
+fn a_live_reaction_picker_never_falls_back_to_demo_when_the_worker_is_missing() {
+    let mut s = session();
+    s.world().caps(|caps| caps.insert(Box::new(runtime::Delivery::Live)));
+    set_session(&s, "ready", None, None);
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let chat = open_root(&mut s, Chat::at(VERA, m.id));
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    for slot in [chat, card] {
+        verb(&mut s, slot, "telegram.react");
+        assert!(!verb_ids(&s, slot).contains(&"telegram.reaction_0"));
+        assert!(poll_reactions(&mut s, slot));
+        assert!(s.notes().last().unwrap().msg.contains("not connected"));
+    }
+
+    // A worker that starts later makes retry useful, without reopening the panel.
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, chat, "telegram.reactions_retry");
+    acc.drain(s.world());
+    let query = last_reaction_request(&td, "getMessageAvailableReactions");
+    offer_reactions(&acc, &s, &query, &["👍"]);
+    assert!(verb_ids(&s, chat).contains(&"telegram.reaction_0"));
+    verb(&mut s, card, "telegram.reactions_retry");
+    verb(&mut s, chat, "telegram.reaction_0");
+    acc.drain(s.world());
+    drop(acc);
+    for slot in [chat, card] {
+        assert!(poll_reactions(&mut s, slot), "both loading and adding stop on disconnect");
+        assert!(s.notes().last().unwrap().msg.contains("disconnected"));
+        verb(&mut s, slot, "telegram.reactions_cancel");
+    }
+
+    // Closing the picker must not forget that this is a live account.
+    verb(&mut s, chat, "telegram.react");
+    assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_0"));
+    assert_eq!(model::line(s.store(), m.chat, m.id).unwrap(), m);
+}
+
+#[test]
 fn demo_reactions_page_and_cancel_without_touching_the_composer_or_service_messages() {
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(STELAXIS));
     let hist = model::history(s.store(), STELAXIS);
     let m = hist.iter().find(|m| !m.service).unwrap();
+    let id = m.id;
+    s.store().write(move |c| {
+        c.execute("UPDATE tg_message SET reactions = '👍 3 · ❤️ 1' WHERE chat = ?1 AND id = ?2",
+            [STELAXIS, id]).map(|_| ())
+    }).unwrap();
     with_chat(&s, chat, |c| { c.set_cursor(m.id); c.set_draft("a draft"); c.reply(m.id); });
     verb(&mut s, chat, "telegram.react");
     verb(&mut s, chat, "telegram.reactions_more");
     assert!(!verb_ids(&s, chat).contains(&"telegram.reactions_more"));
     verb(&mut s, chat, "telegram.reactions_back");
     verb(&mut s, chat, "telegram.reaction_0");
-    assert!(s.notes().last().unwrap().msg.contains("react 👍"));
-    assert_eq!(model::line(s.store(), m.chat, m.id).as_ref(), Some(m));
+    let mut expected = m.clone();
+    expected.reactions = Some("👍 4 · ❤️ 1".into());
+    assert_eq!(model::line(s.store(), m.chat, m.id).as_ref(), Some(&expected));
+    assert!(!s.notes().iter().any(|n| n.msg.contains("draft: nothing leaves")));
+    let card = open_root(&mut s, Line::id(STELAXIS, m.id));
+    verb(&mut s, card, "telegram.react");
+    verb(&mut s, card, "telegram.reaction_0");
+    assert_eq!(model::line(s.store(), m.chat, m.id).as_ref(), Some(&expected), "one reaction per emoji, across panels");
+    verb(&mut s, card, "telegram.react");
+    verb(&mut s, card, "telegram.reaction_2");
+    expected.reactions = Some("👍 4 · ❤️ 1 · 🔥 1".into());
+    assert_eq!(model::line(s.store(), m.chat, m.id).as_ref(), Some(&expected));
     with_chat(&s, chat, |c| {
         assert_eq!(c.field_text(), "a draft");
         assert_eq!(c.reply_to(), Some(m.id));

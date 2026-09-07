@@ -169,8 +169,10 @@ impl App for Telegram {
 
     /// Admit the real, unscripted boot store. Library mounts and tests do not
     /// open native clients; TDLib's process-wide receive queue has one owner.
-    fn outside(&self, mode: Mode, env: &Env, _caps: &mut Capabilities) {
-        if mode == Mode::Real && !env.scripted {
+    fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
+        let live = mode == Mode::Real && !env.scripted;
+        caps.insert(Box::new(if live { runtime::Delivery::Live } else { runtime::Delivery::Demo }));
+        if live {
             // An empty parent is no directory, which is what the store makes
             // of one too — so both sides of the comparison mean the same
             // thing by *in memory*.

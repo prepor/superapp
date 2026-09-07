@@ -6,8 +6,8 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, Msg, MsgId, PeerId};
+use super::super::requests;
 use super::super::runtime::{self, ReactionReply, ReactionResult};
-use super::super::{draft_toast, requests};
 use super::wire;
 
 const CHOICES: [&str; 6] = [
@@ -59,10 +59,15 @@ pub(super) fn can_react(m: &Msg) -> bool {
 }
 
 impl Reactions {
-    pub fn open(&mut self, store: &Store, m: &Msg) {
+    pub fn open(&mut self, s: &Session, m: &Msg) {
         if !can_react(m) {
             return;
         }
+        let store = s.store();
+        let demo = s
+            .world()
+            .with_cap::<runtime::Delivery, _>(|mode| *mode == runtime::Delivery::Demo)
+            .unwrap_or(false);
         let runtime = runtime::of(store);
         let (id, reply) = runtime.await_reaction();
         let was_live = self.0.as_ref().is_some_and(|p| p.live);
@@ -73,8 +78,10 @@ impl Reactions {
         if !live {
             let result = if let Some(error) = runtime.connection_error() {
                 ReactionResult::Error(error)
-            } else if was_live {
-                ReactionResult::Error("Telegram is disconnected".into())
+            } else if was_live || !demo {
+                ReactionResult::Error(
+                    "Telegram is not connected. Open sign in, then try again.".into(),
+                )
             } else {
                 ReactionResult::Choices(
                     ["👍", "❤️", "🔥", "😂", "😮", "🙏", "🎉", "👏"]
@@ -91,7 +98,7 @@ impl Reactions {
             page: 0,
             reply,
             adding: false,
-            live: live || was_live,
+            live: live || was_live || !demo,
             seen_reply: false,
         });
     }
@@ -124,49 +131,58 @@ impl Reactions {
         let p = self.0.as_ref().filter(|p| p.active())?;
         let mut verbs = Vec::new();
         match p.result() {
-            None => verbs.push(Verb::run(
-                "telegram.reaction_status",
-                if p.adding {
-                    "adding reaction…"
-                } else {
-                    "loading reactions…"
-                },
-                None,
-            )),
+            None => verbs.push(
+                Verb::run(
+                    "telegram.reaction_status",
+                    if p.adding {
+                        "adding reaction…"
+                    } else {
+                        "loading reactions…"
+                    },
+                    None,
+                )
+                .plain(),
+            ),
             Some(ReactionResult::Choices(emojis)) if !emojis.is_empty() => {
                 for (id, emoji) in CHOICES
                     .iter()
                     .zip(emojis.iter().skip(p.page * CHOICES.len()))
                 {
-                    verbs.push(Verb::run(id, emoji, None));
+                    verbs.push(Verb::glyph(id, emoji));
                 }
                 if p.page > 0 {
-                    verbs.push(Verb::run("telegram.reactions_back", "back", Some('b')));
+                    verbs.push(Verb::run("telegram.reactions_back", "back", Some('b')).plain());
                 }
                 if (p.page + 1) * CHOICES.len() < emojis.len() {
-                    verbs.push(Verb::run("telegram.reactions_more", "more", Some('m')));
+                    verbs.push(Verb::run("telegram.reactions_more", "more", Some('m')).plain());
                 }
             }
-            Some(ReactionResult::Choices(_)) => verbs.push(Verb::run(
-                "telegram.reaction_status",
-                "no emoji reactions available",
-                None,
-            )),
-            Some(ReactionResult::Error(_)) => {
-                verbs.push(Verb::run(
+            Some(ReactionResult::Choices(_)) => verbs.push(
+                Verb::run(
                     "telegram.reaction_status",
-                    if p.adding {
-                        "reaction failed"
-                    } else {
-                        "could not load reactions"
-                    },
+                    "no emoji reactions available",
                     None,
-                ));
-                verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')));
+                )
+                .plain(),
+            ),
+            Some(ReactionResult::Error(_)) => {
+                verbs.push(
+                    Verb::run(
+                        "telegram.reaction_status",
+                        if p.adding {
+                            "reaction failed"
+                        } else {
+                            "could not load reactions"
+                        },
+                        None,
+                    )
+                    .plain(),
+                );
+                verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')).plain());
             }
             Some(ReactionResult::Added) => return None,
         }
-        verbs.push(Verb::run("telegram.reactions_cancel", "cancel", Some('c')));
+        verbs.push(Verb::run("telegram.reactions_cancel", "cancel", Some('c')).plain());
         Some(verbs)
     }
 
@@ -198,7 +214,7 @@ impl Reactions {
             }
             "telegram.reactions_retry" => {
                 if let Some(m) = model::line(store, p.chat, p.msg) {
-                    self.open(store, &m);
+                    self.open(s, &m);
                 } else {
                     self.cancel();
                     s.notify("that message is no longer available", true);
@@ -219,7 +235,17 @@ impl Reactions {
                         self.cancel();
                         s.notify("that message is no longer available", true);
                     } else if !p.live {
-                        s.notify(draft_toast(&format!("react {emoji}")), false);
+                        let runtime = runtime::of(store);
+                        if !runtime.demo_reacted(p.chat, p.msg, emoji) {
+                            let (chat, msg, chosen) = (p.chat, p.msg, emoji.clone());
+                            if let Err(error) =
+                                store.write(move |c| demo_reaction(c, chat, msg, &chosen))
+                            {
+                                s.notify(format!("could not add reaction: {error}"), true);
+                                return true;
+                            }
+                            runtime.remember_demo_reaction(p.chat, p.msg, emoji);
+                        }
                         self.cancel();
                     } else {
                         let runtime = runtime::of(store);
@@ -244,4 +270,43 @@ impl Reactions {
         s.redraw();
         true
     }
+}
+
+/// A fixture updates the same count line the real projection renders.
+/// Only explicitly offline worlds reach this; a missing worker never does.
+fn demo_reaction(
+    c: &rusqlite::Connection,
+    chat: PeerId,
+    msg: MsgId,
+    emoji: &str,
+) -> rusqlite::Result<()> {
+    let before: Option<String> = c.query_row(
+        "SELECT reactions FROM tg_message WHERE chat = ?1 AND id = ?2",
+        [chat, msg],
+        |r| r.get(0),
+    )?;
+    let mut parts: Vec<String> = before
+        .as_deref()
+        .into_iter()
+        .flat_map(|s| s.split(" · "))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(part) = parts
+        .iter_mut()
+        .find(|p| p.rsplit_once(' ').is_some_and(|(e, _)| e == emoji))
+    {
+        let count = part
+            .rsplit_once(' ')
+            .and_then(|(_, n)| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        *part = format!("{emoji} {}", count.saturating_add(1));
+    } else {
+        parts.push(format!("{emoji} 1"));
+    }
+    c.execute(
+        "UPDATE tg_message SET reactions = ?3 WHERE chat = ?1 AND id = ?2",
+        rusqlite::params![chat, msg, parts.join(" · ")],
+    )?;
+    Ok(())
 }

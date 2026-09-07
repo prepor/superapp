@@ -1176,7 +1176,7 @@ impl Panel for Chat {
             "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.react" if self.marks.is_empty() => {
                 if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, self.peer, id)) {
-                    self.reactions.open(&self.store, &m);
+                    self.reactions.open(s, &m);
                     s.redraw();
                 }
             }
