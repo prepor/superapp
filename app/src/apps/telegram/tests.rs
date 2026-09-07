@@ -1573,6 +1573,7 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
 
     let dir = std::env::temp_dir()
         .join(format!("superapp-tg-viewer-progress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     let engine = dir.join("tdlib");
     std::fs::create_dir_all(&engine).unwrap();
     let apps = Apps::new(APPS);
