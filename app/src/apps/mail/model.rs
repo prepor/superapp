@@ -43,7 +43,12 @@ pub struct MailFull {
     pub html: Option<String>,
     /// An optional status line; `true` marks it as an error.
     pub status: Option<(String, bool)>,
-    /// The receiving account's address (the TO line).
+    /// The TO line: who the letter was addressed to, as addresses. A letter
+    /// that arrived is addressed to the account it arrived at, and one in
+    /// Sent to the person it went to — the second is the whole reason this
+    /// is read off the letter rather than off the account. A letter whose
+    /// bytes named nobody falls back to the account, which is what a letter
+    /// that arrived says anyway.
     pub to: String,
     /// Passed on — the `$Forwarded` keyword, as this app or another client
     /// set it. The row draws a muted mark by the date.
@@ -216,16 +221,18 @@ impl Role {
 static Q_MAIL: Q = Q {
     id: "mail",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded
+                 m.body, m.status, m.status_err,
+                 COALESCE(NULLIF(m.to_addr, ''), a.email), m.html, m.forwarded
           FROM message m JOIN account a ON a.id = m.account
           WHERE m.id = ?1",
-    describe: "one mail, both readings included, with its account's address",
+    describe: "one mail, both readings included, with the line it was addressed to",
 };
 
 static Q_THREAD: Q = Q {
     id: "thread",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded,
+                 m.body, m.status, m.status_err,
+                 COALESCE(NULLIF(m.to_addr, ''), a.email), m.html, m.forwarded,
                  COALESCE(f.role, ''), COALESCE(m.message_id, '')
           FROM message m JOIN account a ON a.id = m.account
                          JOIN folder f ON f.id = m.folder
@@ -383,12 +390,17 @@ pub fn spam_senders(store: &Store) -> Rc<Vec<Sender>> {
 /// is aggregates over them, or over the whole conversation (participants,
 /// count, topic — trash left out), read by subquery.
 ///
+/// `$who` and `$text` are what differ by mailbox: three lists are of letters
+/// that came, so a row names who wrote them and free text matches the sender;
+/// Sent is the list of letters that left, so both are about the other end —
+/// a list searches what it shows.
+///
 /// The role is a literal rather than a bound parameter: a [`SqlSpec`] is
 /// static text, which is what lets the same builder, the same rank and the
 /// same page cache serve four lists without a string being formatted per
 /// keystroke. `concat!` writes the four out at compile time.
 macro_rules! mailbox_spec {
-    ($role:literal) => {
+    ($role:literal, $who:literal, $text:expr) => {
         SqlSpec {
             id: concat!($role, " table"),
             describe: concat!(
@@ -407,13 +419,9 @@ macro_rules! mailbox_spec {
                    ORDER BY t.unread DESC,
                             CASE WHEN t.unread THEN t.date ELSE -t.date END, t.id
                    LIMIT 1) AS target,
-                 (SELECT GROUP_CONCAT(
-                     CASE WHEN t.from_email = ta.email THEN 'me'
-                          WHEN t.from_name = '' THEN t.from_email
-                          ELSE t.from_name END, char(31) ORDER BY t.date DESC)
-                   FROM message t JOIN folder tf ON tf.id = t.folder
-                                  JOIN account ta ON ta.id = t.account
-                   WHERE t.thread = m.thread AND tf.role IS NOT 'trash') AS who,
+                 ",
+                $who,
+                " AS who,
                  (SELECT COALESCE(t.topic, t.subject) FROM message t
                    WHERE t.thread = m.thread ORDER BY t.date, t.id LIMIT 1) AS topic,
                  (SELECT COUNT(DISTINCT COALESCE(NULLIF(t.message_id, ''), 'id:' || t.id))
@@ -422,7 +430,7 @@ macro_rules! mailbox_spec {
             ),
             from: "message m JOIN folder f ON m.folder = f.id JOIN account a ON a.id = m.account",
             base: concat!("f.role = '", $role, "'"),
-            text: &["m.from_name", "m.from_email", "m.subject"],
+            text: $text,
             // The letters themselves, through the index that already holds
             // their words. A `LIKE` over `m.body` would read every body in
             // the folder per keystroke — a mailbox of twenty thousand
@@ -451,10 +459,49 @@ macro_rules! mailbox_spec {
     };
 }
 
-static INBOX_SPEC: SqlSpec = mailbox_spec!("inbox");
-static ARCHIVE_SPEC: SqlSpec = mailbox_spec!("archive");
-static SENT_SPEC: SqlSpec = mailbox_spec!("sent");
-static SPAM_SPEC: SqlSpec = mailbox_spec!("spam");
+/// A mailbox of letters that **arrived**: a row names everyone who wrote in
+/// the conversation, newest speaker first, `me` for the account's own
+/// address. The whole conversation, trash aside — a reply of mine is part of
+/// who is in it.
+macro_rules! arrived_spec {
+    ($role:literal) => {
+        mailbox_spec!(
+            $role,
+            "(SELECT GROUP_CONCAT(
+                  CASE WHEN t.from_email = ta.email THEN 'me'
+                       WHEN t.from_name = '' THEN t.from_email
+                       ELSE t.from_name END, char(31) ORDER BY t.date DESC)
+                FROM message t JOIN folder tf ON tf.id = t.folder
+                               JOIN account ta ON ta.id = t.account
+               WHERE t.thread = m.thread AND tf.role IS NOT 'trash')",
+            &["m.from_name", "m.from_email", "m.subject"]
+        )
+    };
+}
+
+static INBOX_SPEC: SqlSpec = arrived_spec!("inbox");
+static ARCHIVE_SPEC: SqlSpec = arrived_spec!("archive");
+static SPAM_SPEC: SqlSpec = arrived_spec!("spam");
+
+/// Sent is the mailbox of letters that **left**, and a row names who they
+/// went to: their sender is always me, so the TO line is the only thing on
+/// them worth a name. The conversation's own sent letters, newest first —
+/// what the person wrote, not what came back.
+///
+/// A `To` line is itself a list, so its commas become the separator the
+/// concatenation already uses and each address arrives as a name of its own:
+/// two letters to one person are one name on the row, as two letters *from*
+/// one are.
+static SENT_SPEC: SqlSpec = mailbox_spec!(
+    "sent",
+    "(SELECT GROUP_CONCAT(REPLACE(t.to_addr, ', ', char(31)), char(31)
+                          ORDER BY t.date DESC)
+        FROM message t JOIN folder tf ON tf.id = t.folder
+       WHERE t.thread = m.thread AND tf.role = 'sent' AND t.to_addr != '')",
+    // …and free text over the same line, because a list is searched by what
+    // it shows: the sender of everything here is the account itself.
+    &["m.to_addr", "m.subject"]
+);
 
 /// The spec one role's list runs on.
 fn spec_of(role: Role) -> &'static SqlSpec {
@@ -977,6 +1024,21 @@ impl Seed {
     }
 }
 
+/// Who a reply is addressed to: whoever wrote the letter — unless that is an
+/// account of this store's own, in which case answering means writing to the
+/// people it went to rather than to oneself. A reply out of Sent is a second
+/// letter to the same person, which is what every client makes of one.
+///
+/// The whole TO line, as the letter wrote it: a letter to three people is
+/// answered to three people, and the field takes the list it takes.
+#[must_use]
+fn reply_to(store: &Store, m: &MailFull) -> String {
+    if super::accounts::account_for(store, &m.head.from_email).is_some() {
+        return m.to.clone();
+    }
+    m.head.from_email.clone()
+}
+
 /// The draft a fresh compose starts from, by its seed: a reply answers its
 /// mail, a forward passes it on. Text the panel persisted wins over this —
 /// the panel asks only when there is none.
@@ -985,7 +1047,7 @@ pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
     match seed {
         Seed::Blank => Draft::default(),
         Seed::Reply(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
-            to: m.head.from_email.clone(),
+            to: reply_to(store, &m),
             subject: format!("Re: {}", topic_of(&m.head.subject)),
             body: quoted(&m),
         }),

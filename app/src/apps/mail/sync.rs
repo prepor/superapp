@@ -617,14 +617,15 @@ fn ingest_message(
         }
     }
     tx.execute(
-        "INSERT INTO message(account, folder, from_name, from_email, subject, date,
-                             unread, body, message_id, topic, forwarded, html, raw)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        "INSERT INTO message(account, folder, from_name, from_email, to_addr, subject,
+                             date, unread, body, message_id, topic, forwarded, html, raw)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         rusqlite::params![
             account,
             folder,
             p.from_name,
             p.from_email,
+            p.to,
             p.subject,
             p.date,
             m.unread,
@@ -657,6 +658,11 @@ fn ingest_message(
 pub struct ParsedMail {
     pub from_name: String,
     pub from_email: String,
+    /// Who the letter was addressed to — its `To` line, as addresses (see
+    /// [`to_line`]). The one thing about a letter that the account it sits
+    /// under cannot answer: everything in a mailbox came *to* this address,
+    /// and everything in Sent went somewhere else.
+    pub to: String,
     pub subject: String,
     pub date: f64,
     pub body: String,
@@ -736,6 +742,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
     ParsedMail {
         from_name,
         from_email,
+        to: to_line(&msg),
         topic: topic_of(&subject),
         subject,
         date: msg.date().map_or(0.0, |d| d.to_timestamp() as f64),
@@ -748,6 +755,33 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
         references,
         attachments,
     }
+}
+
+/// Who a letter was addressed to: the addresses of its `To` line, in header
+/// order, comma-separated. The names are dropped, because this line is read
+/// as addresses everywhere it lands — a compose's TO field, a forward's
+/// header block, an agent asking who a letter went to.
+fn to_line(msg: &mail_parser::Message<'_>) -> String {
+    msg.to()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.address())
+                .filter(|x| !x.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// The same line off a letter's bytes, without walking its body — what the
+/// backfill over a mailbox already stored reads
+/// ([`schema`](super::schema)).
+#[must_use]
+pub fn to_of(raw: &[u8]) -> String {
+    mail_parser::MessageParser::default()
+        .parse_headers(raw)
+        .map(|m| to_line(&m))
+        .unwrap_or_default()
 }
 
 /// One part of a letter, as a row describes it. The bytes are not here:

@@ -176,11 +176,13 @@ role, not a list. `uidvalidity` and `uidnext` are the sync pass's own.
 
 `message` — one row per letter, and the state the person wants it in: \
 `folder` (where it should be), `unread`, `forwarded`, with `from_name`, \
-`from_email`, `subject`, `date`, `body`, `html`, `message_id`, `topic` (the \
-subject with its reply prefixes stripped) and `thread` — the smallest id in \
-its conversation, decided at ingest, which is what a mailbox groups by. \
-`raw` is the whole MIME letter as a blob and sits last on purpose: a select \
-that does not need it should not name it.
+`from_email`, `to_addr` (its TO line, as addresses, read off the letter — \
+what a mailbox cannot answer for a letter in Sent), `subject`, `date`, \
+`body`, `html`, `message_id`, `topic` (the subject with its reply prefixes \
+stripped) and `thread` — the smallest id in its conversation, decided at \
+ingest, which is what a mailbox groups by. `raw` is the whole MIME letter as \
+a blob and sits last on purpose: a select that does not need it should not \
+name it.
 
 `reference` — `(message, mid)`, one row per id a letter claims to answer. \
 Threading is three lookups over this table and no subject guessing.
@@ -214,4 +216,5 @@ What must never be written directly:
 — marking a letter read is `message.unread`, not `server_msg.seen`;
 — `attachment`, `attachment_scan` and `message_fts` are derived from \
   `message` and are rebuilt from it; a row written into them is lost at the \
-  next walk.";
+  next walk, and so is a `to_addr` written by hand over a letter that keeps \
+  its `raw`.";

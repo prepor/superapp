@@ -58,6 +58,9 @@ pub struct SeedMail {
     pub status: Option<(&'static str, bool)>,
     /// The role of the folder it sits in.
     pub folder: &'static str,
+    /// Who it was addressed to — the account, for every letter that
+    /// arrived; the person it went to, for the one in Sent.
+    pub to: String,
     /// Message-ID and what it references — the threading headers; empty for
     /// a mail that stands alone.
     pub mid: String,
@@ -95,6 +98,7 @@ impl From<Static> for SeedMail {
             html: s.html,
             status: s.status,
             folder: s.folder,
+            to: ADDRESS.into(),
             mid: s.mid.into(),
             refs: s.refs.iter().map(|r| (*r).to_string()).collect(),
             forwarded: s.forwarded,
@@ -290,6 +294,7 @@ fn filler_mails() -> Vec<SeedMail> {
                 html: None,
                 status: None,
                 folder: "inbox",
+                to: ADDRESS.into(),
                 mid: String::new(),
                 refs: Vec::new(),
                 forwarded: false,
@@ -338,6 +343,17 @@ fn thread_mails() -> Vec<SeedMail> {
     ]
     .into_iter()
     .map(SeedMail::from)
+    .map(|m| SeedMail {
+        // The one demo letter that left rather than arrived: it is addressed
+        // to the person the conversation is with, not to the mailbox it sits
+        // in.
+        to: if m.folder == "sent" {
+            "max@ivanov.dev".into()
+        } else {
+            m.to
+        },
+        ..m
+    })
     .collect()
 }
 
@@ -427,6 +443,7 @@ fn ci_mails() -> Vec<SeedMail> {
                 html: None,
                 status: (failed && run == 4116).then_some(("ci: FAILED — tests (1m 02s)", true)),
                 folder: "archive",
+                to: ADDRESS.into(),
                 mid: format!("ci-{run}@github.com"),
                 refs: vec!["stelaxis-ci@github.com".into()],
                 forwarded: false,
@@ -548,9 +565,10 @@ pub fn sent_date() -> String {
 #[must_use]
 pub fn rfc822(m: &SeedMail) -> String {
     let mut raw = format!(
-        "From: {} <{}>\r\nTo: {ADDRESS}\r\nSubject: {}\r\nDate: {}\r\n",
+        "From: {} <{}>\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\n",
         m.from_name,
         m.from_email,
+        m.to,
         m.subject,
         header_date(m.date)
     );
@@ -644,15 +662,16 @@ pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
                 .find(|(role, _)| *role == m.folder)
                 .expect("a seeded mail names a seeded folder");
             c.execute(
-                "INSERT INTO message(account, folder, from_name, from_email, subject,
-                                     date, unread, body, status, status_err,
+                "INSERT INTO message(account, folder, from_name, from_email, to_addr,
+                                     subject, date, unread, body, status, status_err,
                                      message_id, topic, forwarded, html)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 rusqlite::params![
                     ACCOUNT,
                     fid,
                     m.from_name,
                     m.from_email,
+                    m.to,
                     m.subject,
                     m.date,
                     m.unread,

@@ -165,8 +165,9 @@ impl Smtp for RealServers {
     }
 }
 
-/// The RFC 822 message a draft goes out as. `In-Reply-To` names the parent a
-/// reply answers; `References` carries whatever chain the draft has — a
+/// The RFC 822 message a draft goes out as. The recipients are the TO field
+/// split on commas, as the sheet offers them. `In-Reply-To` names the parent
+/// a reply answers; `References` carries whatever chain the draft has — a
 /// reply's parent and what it referenced, a forward's source and what *it*
 /// referenced — so both thread for anyone who already has the conversation. A
 /// forward names no parent: it is not a reply.
@@ -176,7 +177,8 @@ impl Smtp for RealServers {
 ///
 /// # Errors
 ///
-/// If an address does not parse, or lettre refuses the body.
+/// If there is no recipient, if an address does not parse, or if lettre
+/// refuses the body.
 pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
     use lettre::message::header;
     use lettre::Message;
@@ -189,8 +191,22 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
     };
     let mut b = Message::builder()
         .from(from.parse().map_err(|e| s(&e))?)
-        .to(m.to.parse().map_err(|e| s(&e))?)
         .subject(m.subject.clone());
+    // The TO field holds a *list* — its completion is comma-separated, and a
+    // reply to one's own letter is prefilled with every address that letter
+    // went to. Each is added as a mailbox of its own, which is one `To`
+    // header with all of them and an envelope that names all of them.
+    let to: Vec<&str> =
+        m.to.split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .collect();
+    if to.is_empty() {
+        return Err("no recipient".into());
+    }
+    for addr in to {
+        b = b.to(addr.parse().map_err(|e| s(&e))?);
+    }
     if let Some(mid) = &m.in_reply_to {
         b = b.header(header::InReplyTo::from(bracket(mid)));
     }
@@ -760,6 +776,25 @@ mod tests {
             ..Outgoing::default()
         };
         assert!(rfc822("me@prepor.dev", &bad).is_err());
+
+        // A field holding a list — what a reply to one's own letter to three
+        // people is prefilled with — goes out to all of them, and an empty
+        // one is refused rather than sent to nobody.
+        let many = Outgoing {
+            to: "vera@kovac.io, max@ivanov.dev".into(),
+            subject: "the two of you".into(),
+            body: "hello".into(),
+            ..Outgoing::default()
+        };
+        let msg = rfc822("me@prepor.dev", &many).expect("a message");
+        assert_eq!(
+            msg.envelope().to().len(),
+            2,
+            "both are on the envelope, not only the header"
+        );
+        let raw = String::from_utf8_lossy(&msg.formatted()).into_owned();
+        assert!(raw.contains("To: vera@kovac.io, max@ivanov.dev"), "{raw}");
+        assert!(rfc822("me@prepor.dev", &Outgoing::default()).is_err());
     }
 
     /// A letter that carries something goes out as a `multipart/mixed`: the

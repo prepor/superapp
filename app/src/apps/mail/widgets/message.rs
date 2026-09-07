@@ -153,7 +153,9 @@ impl Widget for MessagePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
 
-        // The account this conversation came to, said once at the top.
+        // Who the conversation was addressed to, off its first letter, said
+        // once at the top: the account, for one that came in — the person it
+        // went to, for one this mailbox started.
         self.view
             .label(cx, ids!(to_lbl))
             .set_text(cx, msgs.first().map_or("", |t| t.mail.to.as_str()));

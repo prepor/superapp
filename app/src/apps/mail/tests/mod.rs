@@ -821,6 +821,228 @@ fn a_reply_goes_out_and_the_sent_copy_joins_the_thread() {
         "{:?}",
         thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
     );
+    // And it says who it went to. The account is who a letter that *arrived*
+    // is addressed to, and this one left.
+    let copy = thread.iter().find(|t| t.role == "sent").expect("the copy");
+    assert_eq!(copy.mail.to, "max@ivanov.dev");
+}
+
+/// Who a letter went to is the letter's own answer, not its mailbox's: a
+/// mail in Sent reads back with the person it was addressed to, while
+/// everything that arrived reads back with the account it arrived at.
+#[test]
+fn a_letter_in_sent_says_who_it_went_to_and_one_in_the_inbox_says_the_account() {
+    let (s, _clock) = session();
+    let named = |subject: &str| -> MailId {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT id FROM message WHERE subject = ?1",
+                [subject],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no seeded mail “{subject}”: {e}"))
+    };
+
+    let mine = model::mail(s.store(), named("superapp panel model")).expect("the sent letter");
+    assert_eq!(mine.to, "max@ivanov.dev");
+    let his = model::mail(s.store(), named("Re: superapp panel model")).expect("his reply");
+    assert_eq!(his.to, seed::ADDRESS);
+
+    // The forward header block is written off the same line, so passing on a
+    // letter one sent says where it went the first time.
+    assert!(
+        model::forwarded(&mine).contains("To: max@ivanov.dev"),
+        "{}",
+        model::forwarded(&mine)
+    );
+}
+
+/// Sent is a list of letters that left, so its rows name who they went to.
+/// Everywhere else a row names who wrote; here that would be the account,
+/// once per row, which says nothing about the letter.
+#[test]
+fn a_sent_row_names_who_the_letter_went_to() {
+    let (mut s, _clock) = session();
+    let sent = open_root(&mut s, Role::Sent.id());
+    let rows = with_mailbox(&s, sent, |m| m.rows(0, 10));
+    assert_eq!(rows.len(), 1, "{:?}", topics(&s, sent));
+    assert_eq!(rows[0].topic, "superapp panel model");
+    assert_eq!(rows[0].who, vec!["max@ivanov.dev".to_string()]);
+    assert_eq!(
+        rows[0].who_line(),
+        "max@ivanov.dev · 3",
+        "the recipient, then the whole conversation's count"
+    );
+
+    // The same line is what free text searches here — a list is searched by
+    // what it shows, and the sender of everything in this one is the
+    // account itself.
+    assert_eq!(
+        model::mailbox_filtered(s.store(), Role::Sent, "ivanov").len(),
+        1
+    );
+    assert!(model::mailbox_filtered(s.store(), Role::Sent, "kovac").is_empty());
+}
+
+/// Answering a letter one sent goes to the people it went to, not back to
+/// oneself: the sender of a letter in Sent is this account, and a reply to
+/// oneself is not what pressing *reply* over it means.
+#[test]
+fn a_reply_to_ones_own_letter_is_addressed_to_the_people_it_went_to() {
+    let (mut s, _clock) = session();
+    let sent = open_root(&mut s, Role::Sent.id());
+    let nav = with_mailbox(&s, sent, |m| m.go(0)).expect("the row");
+    go(&mut s, nav);
+    let reader = s.joined_child(sent).expect("a reader");
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    let inst = s.panel(sheet).expect("a compose panel");
+    let mut b = inst.borrow_mut();
+    let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+    assert_eq!(c.draft().to, "max@ivanov.dev");
+    assert!(
+        c.draft().subject.starts_with("Re: superapp panel model"),
+        "{}",
+        c.draft().subject
+    );
+}
+
+/// The TO line is derived, so a mailbox synced before this build recorded it
+/// answers off the letters it already keeps — at the next open, not at the
+/// next sync.
+#[test]
+fn a_stored_letter_gives_its_to_line_back_at_the_open() {
+    let (s, _clock) = session();
+    let raw = "From: Vera <vera@kovac.io>\r\nTo: team@kovac.io, me@prepor.dev\r\n\
+               Subject: the standup\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+               Message-ID: <standup-1@kovac.io>\r\n\r\nten sharp";
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", true, false, raw)
+    });
+    s.workers().kick_all();
+    let id: MailId = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE message_id = 'standup-1@kovac.io'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the letter landed");
+    let line = "team@kovac.io, me@prepor.dev";
+    assert_eq!(
+        model::mail(s.store(), id).expect("the letter").to,
+        line,
+        "every address of the header, in the order it was written"
+    );
+
+    // A store that has never run this walk: the lines blanked and the
+    // version gone with them, as an older build would have left it.
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE message SET to_addr = ''", [])?;
+            c.execute("DELETE FROM meta WHERE key = 'mail:recipients'", [])?;
+            Ok(())
+        })
+        .expect("the lines go");
+    s.store()
+        .write(|c| super::schema::SCHEMA.apply(c))
+        .expect("the ladder runs again");
+    let back: String = s
+        .store()
+        .conn()
+        .query_row("SELECT to_addr FROM message WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .expect("the letter");
+    assert_eq!(back, line);
+}
+
+/// The column is not appended, it is *placed*: `to_addr` sits with what a
+/// letter's head is made of and well before the blob, which is the rule the
+/// schema's own header states. A store an older build made climbs to the
+/// same table — the ladder rewrites it rather than adding a column past
+/// `raw` — so the two shapes are compared here rather than assumed.
+#[test]
+fn a_migrated_store_ends_with_the_same_message_table_a_new_one_starts_with() {
+    // Name, type, NOT NULL, default and key, in the order the record is
+    // written in — the shape itself, without the comments a `CREATE TABLE`
+    // carries and the quoting a rename leaves behind.
+    type Column = (String, String, bool, Option<String>, i64);
+    let columns = |s: &Session| -> Vec<Column> {
+        s.store()
+            .conn()
+            .prepare(
+                "SELECT name, type, \"notnull\", dflt_value, pk
+                   FROM pragma_table_info('message') ORDER BY cid",
+            )
+            .and_then(|mut q| {
+                q.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect()
+            })
+            .expect("the columns")
+    };
+
+    let (fresh, _clock) = session();
+    let cols = columns(&fresh);
+    let at = |name: &str| {
+        cols.iter()
+            .position(|c| c.0 == name)
+            .unwrap_or_else(|| panic!("no {name} column"))
+    };
+    assert!(at("to_addr") < at("html"), "{cols:?}");
+    assert!(at("to_addr") < at("raw"), "{cols:?}");
+
+    // The old shape, made by taking the column back out, and the ladder run
+    // over it from the step before this one.
+    let (old, _clock) = session();
+    let letters: i64 = old
+        .store()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .expect("the seeded letters");
+    old.store()
+        .write(|c| {
+            c.execute_batch("ALTER TABLE message DROP COLUMN to_addr")?;
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema:mail', ?1)",
+                [super::schema::BEFORE_TO_ADDR],
+            )?;
+            c.execute("DELETE FROM meta WHERE key = 'mail:recipients'", [])?;
+            Ok(())
+        })
+        .expect("the column comes out");
+    old.store()
+        .write(|c| super::schema::SCHEMA.apply(c))
+        .expect("the ladder climbs it");
+
+    assert_eq!(
+        columns(&old),
+        columns(&fresh),
+        "the same table, however it got there"
+    );
+    assert_eq!(
+        old.store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get::<_, i64>(0))
+            .expect("the letters"),
+        letters,
+        "and every letter still in it"
+    );
+    // The index the rewrite dropped with the table is back, and answers.
+    let found: i64 = old
+        .store()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'panel'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the index answers");
+    assert!(found > 0, "the search index came back with the table");
 }
 
 /// With the servers down, a send that failed stands as a problem — and the
