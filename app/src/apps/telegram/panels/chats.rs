@@ -283,6 +283,10 @@ impl Chats {
             s.notify("put the cursor on a chat to forward to", true);
             return;
         };
+        if model::peer(&self.store, peer).is_some_and(|c| c.blocked) {
+            s.notify("unblock this user before sending a message", false);
+            return;
+        }
         let name =
             model::peer(&self.store, peer).map_or_else(|| "the chat".to_string(), |c| c.name);
         let n = f.ids.len();

@@ -61,6 +61,10 @@ impl Line {
         model::line(self.world.store(), self.chat, self.msg)
     }
 
+    fn blocked(&self) -> bool {
+        model::peer(self.world.store(), self.chat).is_some_and(|c| c.blocked)
+    }
+
     /// Where the player stands, for a line with a recording.
     #[must_use]
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
@@ -136,9 +140,12 @@ impl Panel for Line {
     fn verbs(&self) -> Vec<Verb> {
         let m = self.msg();
         let mine = m.as_ref().is_some_and(|m| m.out);
-        let mut v = vec![Verb::run("telegram.reply", "reply", Some('r'))];
-        if mine {
-            v.push(Verb::run("telegram.edit", "edit", Some('e')));
+        let mut v = Vec::new();
+        if !self.blocked() {
+            v.push(Verb::run("telegram.reply", "reply", Some('r')));
+            if mine {
+                v.push(Verb::run("telegram.edit", "edit", Some('e')));
+            }
         }
         v.push(Verb::run("telegram.forward", "forward", Some('f')));
         v.push(Verb::run("telegram.copy", "copy", Some('c')));
@@ -188,11 +195,14 @@ impl Panel for Line {
             // and the keyboard with it: the composer is there, and both are
             // written.
             "telegram.reply" | "telegram.edit" => {
+                if self.blocked() {
+                    s.notify("unblock this user before replying or editing", false);
+                    return;
+                }
                 let msg = self.msg;
                 let told = self.tell_chat(s, |c| {
                     if verb == "telegram.reply" {
-                        c.reply(msg);
-                        true
+                        c.reply(msg)
                     } else {
                         c.edit(msg)
                     }

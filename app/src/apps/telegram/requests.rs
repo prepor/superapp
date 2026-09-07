@@ -448,6 +448,61 @@ pub fn delete_chat(chat_id: PeerId) -> String {
     delete_chat_history(chat_id, true)
 }
 
+/// Profile actions whose local result must wait for Telegram's acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAction {
+    Block,
+    Unblock,
+    DeleteContact,
+    DeleteChat,
+}
+
+impl PeerAction {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Block => "block user",
+            Self::Unblock => "unblock user",
+            Self::DeleteContact => "delete contact",
+            Self::DeleteChat => "delete chat",
+        }
+    }
+
+    pub fn request(self, peer: PeerId, id: u64) -> String {
+        let mut request = match self {
+            Self::Block | Self::Unblock => json!({
+                "@type": "setMessageSenderBlockList",
+                "sender_id": { "@type": "messageSenderUser", "user_id": peer },
+                "block_list": if self == Self::Block { json!({ "@type": "blockListMain" }) } else { Value::Null },
+            }),
+            Self::DeleteContact => json!({ "@type": "removeContacts", "user_ids": [peer] }),
+            Self::DeleteChat => serde_json::from_str(&delete_chat(peer)).expect("delete chat JSON"),
+        };
+        request["@extra"] = json!(format!("peer_action:{}:{peer}:{id}", self.word()));
+        request.to_string()
+    }
+
+    pub fn from_reply(reply: &Value) -> Option<(Self, PeerId, u64)> {
+        let (word, rest) = reply["@extra"].as_str()?.strip_prefix("peer_action:")?.split_once(':')?;
+        let (peer, id) = rest.split_once(':')?;
+        let action = match word {
+            "block user" => Self::Block,
+            "unblock user" => Self::Unblock,
+            "delete contact" => Self::DeleteContact,
+            "delete chat" => Self::DeleteChat,
+            _ => return None,
+        };
+        Some((action, peer.parse().ok()?, id.parse().ok()?))
+    }
+}
+
+/// A contact without a conversation still needs its current block state.
+pub fn get_user_full_info(peer: PeerId) -> String {
+    json!({
+        "@type": "getUserFullInfo", "user_id": peer,
+        "@extra": format!("user_full_info:{peer}"),
+    }).to_string()
+}
+
 /// Clears my side of a conversation's history and keeps the chat in the
 /// list, as the client's *clear history* does.
 #[must_use]

@@ -1,7 +1,7 @@
 //! A peer's card: who or what a chat is with, and the ways off it.
 //!
-//! The card owns nothing. Everything it shows is a cached query on the id it
-//! carries, so a flag that changes under it changes on the next draw.
+//! Facts come from cached queries; a destructive action's confirmation stays
+//! on this panel until it is confirmed or cancelled.
 
 use std::any::Any;
 use std::rc::Rc;
@@ -13,7 +13,8 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, PeerCard, PeerId, PeerKind as Kind};
-use super::super::requests;
+use super::super::requests::{self, PeerAction};
+use super::super::runtime;
 use super::{flip, told, Chat, Members, Messages};
 
 /// A peer's card.
@@ -22,6 +23,7 @@ pub struct Peer {
     peer: PeerId,
     store: Rc<Store>,
     slot: SlotId,
+    confirmation: Option<PeerAction>,
 }
 
 impl Peer {
@@ -46,6 +48,49 @@ impl Peer {
     pub fn card(&self) -> Option<PeerCard> {
         model::peer(&self.store, self.peer)
     }
+
+    /// The consequence being confirmed, or progress while Telegram answers.
+    pub fn prompt(&self) -> Option<String> {
+        if runtime::of(&self.store).peer_action_pending(self.peer) {
+            return Some("waiting for Telegram…".to_string());
+        }
+        let card = self.card()?;
+        Some(match self.confirmation? {
+            PeerAction::Block => format!("Block {}? They won't be able to message you or see your status and photo.", card.name),
+            PeerAction::DeleteContact => format!("Delete {} from your contacts? Your conversation will stay.", card.name),
+            PeerAction::DeleteChat => format!("Delete your chat with {}? This removes your messages and chat from your list. Their copy will stay.", card.name),
+            PeerAction::Unblock => return None,
+        })
+    }
+}
+
+fn allowed(card: &PeerCard, action: PeerAction) -> bool {
+    if card.kind != Kind::Person {
+        return false;
+    }
+    match action {
+        PeerAction::Block => !card.is_self && !card.blocked,
+        PeerAction::Unblock => !card.is_self && card.blocked,
+        PeerAction::DeleteContact => !card.is_self && card.is_contact,
+        PeerAction::DeleteChat => card.in_main || card.archived,
+    }
+}
+
+/// Used by the profile and the blocked conversation's unblock button.
+pub(super) fn perform(s: &mut Session, peer: PeerId, action: PeerAction) {
+    if !s.writable() {
+        s.notify("read-only — acquire the lease to write", true);
+        return;
+    }
+    let Some(card) = model::peer(s.store(), peer) else { return };
+    let runtime = runtime::of(s.store());
+    if !allowed(&card, action) || runtime.peer_action_pending(peer) {
+        return;
+    }
+    if !runtime.send_peer_action(peer, action) {
+        s.notify(super::super::draft_toast(action.word()), false);
+    }
+    s.redraw();
 }
 
 impl Panel for Peer {
@@ -66,11 +111,8 @@ impl Panel for Peer {
         self.slot = slot;
     }
 
-    /// Three buttons about the chat, and the links off the card: the chat,
-    /// its messages, and, for a group, who is in it. Last, the one verb that
-    /// ends or begins something, past the links: *leave* on a group or a
-    /// channel I am in, *join* on one I merely know of, *delete chat* on a
-    /// person I have a conversation with.
+    /// Chat flags and navigation, followed by profile actions. Blocking and
+    /// deleting ask for confirmation here, as in Telegram's user info view.
     ///
     /// A chat of mine is one with a place in a list — `in_main`, or the
     /// archive. A group the engine only learned of, through a forward or a
@@ -81,6 +123,15 @@ impl Panel for Peer {
     /// [`keys`](crate::shell::keys)), `e` is *members* and `a` is *archive*.
     /// *join* wears `j` and *delete chat* `d`, both free on this bar.
     fn verbs(&self) -> Vec<Verb> {
+        if runtime::of(&self.store).peer_action_pending(self.peer) {
+            return Vec::new();
+        }
+        if let Some(action) = self.confirmation {
+            return vec![
+                Verb::run("telegram.confirm", format!("confirm {}", action.word()), Some('f')),
+                Verb::run("telegram.cancel", "cancel", Some('c')),
+            ];
+        }
         let card = self.card();
         let (muted, pinned, archived, group) = card.as_ref().map_or(
             (false, false, false, false),
@@ -139,9 +190,16 @@ impl Panel for Peer {
                 },
             ));
         }
-        // The one that ends or begins something, where there is a peer to say
-        // it of: a person one has a conversation with, or a group and whether
-        // one is in it.
+        if let Some(c) = card.as_ref().filter(|c| c.kind == Kind::Person && !c.is_self) {
+            v.push(Verb::run(
+                if c.blocked { "telegram.unblock" } else { "telegram.block" },
+                if c.blocked { "unblock user" } else { "block user" },
+                Some('b'),
+            ));
+            if c.is_contact {
+                v.push(Verb::run("telegram.delete_contact", "delete contact", Some('e')));
+            }
+        }
         let standing = card
             .as_ref()
             .map(|c| (c.kind == Kind::Person, c.in_main || c.archived));
@@ -171,8 +229,8 @@ impl Panel for Peer {
     /// from the store whether or not there was a wire to tell, and the card
     /// closes behind it, there being nothing left to say about a group one is
     /// no longer in. The peer stays, so the close leaves no hole — anything
-    /// still pointing at the name finds it. *delete chat* is the same shape
-    /// over a person: the same removal, the same close, the peer still known.
+    /// still pointing at the name finds it. Profile actions wait for a server
+    /// acknowledgement; a failed request leaves the local data intact.
     ///
     /// *join* writes nothing at all. What follows a join is a chat with a
     /// place in my list, and the engine says so itself a moment later
@@ -181,7 +239,36 @@ impl Panel for Peer {
     fn run(&mut self, verb: &str, s: &mut Session) {
         let Some(card) = self.card() else { return };
         let peer = self.peer;
+        if runtime::of(&self.store).peer_action_pending(peer) {
+            return;
+        }
+        if verb == "telegram.cancel" {
+            self.confirmation = None;
+            s.redraw();
+            return;
+        }
+        if verb == "telegram.confirm" {
+            if let Some(action) = self.confirmation.take() {
+                perform(s, peer, action);
+            }
+            s.redraw();
+            return;
+        }
+        if self.confirmation.is_some() {
+            return;
+        }
         match verb {
+            "telegram.block" | "telegram.delete_contact" | "telegram.delete" => {
+                let action = match verb {
+                    "telegram.block" => PeerAction::Block,
+                    "telegram.delete_contact" => PeerAction::DeleteContact,
+                    _ => PeerAction::DeleteChat,
+                };
+                if allowed(&card, action) {
+                    self.confirmation = Some(action);
+                }
+            }
+            "telegram.unblock" => perform(s, peer, PeerAction::Unblock),
             "telegram.mute" => {
                 let on = !card.muted;
                 let word = if on { "mute" } else { "unmute" };
@@ -210,13 +297,8 @@ impl Panel for Peer {
                 told(s, &requests::clear_history(peer), "clear history");
                 flip(&self.store, move |c| model::clear_history_tx(c, peer));
             }
-            "telegram.leave" | "telegram.delete" => {
-                let (request, word) = if verb == "telegram.leave" {
-                    (requests::leave_chat(peer), "leave")
-                } else {
-                    (requests::delete_chat(peer), "delete chat")
-                };
-                told(s, &request, word);
+            "telegram.leave" => {
+                told(s, &requests::leave_chat(peer), "leave");
                 flip(&self.store, move |c| model::leave_chat_tx(c, peer));
                 s.nav(Nav::Close {
                     slot: self.slot,
@@ -242,11 +324,17 @@ impl PanelKind for PeerKind {
     }
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
+        let peer = Peer::of(id).unwrap_or_default();
+        let store = cx.session().store().clone();
+        if model::peer(&store, peer).is_some_and(|c| c.kind == Kind::Person && !c.is_self) {
+            let _ = super::wire(&store, &requests::get_user_full_info(peer));
+        }
         Box::new(Peer {
-            peer: Peer::of(id).unwrap_or_default(),
+            peer,
             id: id.clone(),
-            store: cx.session().store().clone(),
+            store,
             slot: 0,
+            confirmation: None,
         })
     }
 }

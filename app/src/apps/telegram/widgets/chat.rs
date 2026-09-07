@@ -348,7 +348,7 @@ impl Widget for ChatPanel {
                     }
                     // Enter is the way into the composer from the lines, as
                     // the placeholder says, and so is tab.
-                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab => {
+                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab if can_post(&props) => {
                         field.set_key_focus(cx);
                         self.view.redraw(cx);
                     }
@@ -543,8 +543,19 @@ impl Widget for ChatPanel {
         let can_post = card.as_ref().is_none_or(model::PeerCard::can_post);
         self.view.view(cx, COMPOSER).set_visible(cx, can_post);
         self.view.label(cx, CANNOT).set_visible(cx, !can_post);
+        self.view.label(cx, CANNOT).set_text(cx,
+            if card.as_ref().is_some_and(|c| c.blocked) {
+                "unblock this user to send messages"
+            } else {
+                "you can't post here"
+            }
+        );
         let field = self.view.text_input(cx, INPUT);
         props.keyboard.keep(&field, Letters::TEXT);
+        if !can_post && field.key_focus(cx) {
+            self.refocus = false;
+            leave_field(cx, &self.view);
+        }
         let placeholder = card
             .as_ref()
             .map_or("write a message…  ( enter )", model::PeerCard::placeholder);
@@ -562,7 +573,8 @@ impl Widget for ChatPanel {
         self.view
             .label(cx, REPLY)
             .set_text(cx, above.as_deref().unwrap_or(""));
-        self.carries(cx, &carrying, props.slot);
+        // Hide staged files with the composer; the chat keeps them for unblocking.
+        self.carries(cx, if can_post { &carrying } else { &[] }, props.slot);
 
         let n = rows.len();
         let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();

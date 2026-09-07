@@ -1,0 +1,17 @@
+# args: --library peer
+# The blocked fixtures share the production profile and conversation widgets.
+wait 8000
+click "peer/blocked conversation"
+wait 700
+shot telegram-blocked-conversation
+click "unblock user"
+wait 300
+key cmd+esc
+wait 500
+click "peer/blocked"
+wait 700
+click "@vera · blocked"
+shot telegram-blocked-profile
+click "unblock user"
+wait 300
+quit

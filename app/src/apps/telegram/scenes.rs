@@ -975,6 +975,19 @@ fn peer() -> Scene<Setup> {
         .note("The ways off it are on the bar: the chat, its messages, and, for a group, who is in it.")
         .node("person", panel(|_| Peer::id(VERA), ""))
         .about("a contact: the username, the presence, the number, the bio")
+        .node("confirm block", panel(|_| Peer::id(VERA), "click \"block user\"\nwait 300"))
+        .about("blocking names its consequence before confirmation")
+        .node("blocked", panel(|store| {
+            store.write(|c| model::set_blocked_tx(c, VERA, true)).expect("blocked fixture");
+            Peer::id(VERA)
+        }, ""))
+        .about("a blocked contact keeps its history and offers unblock")
+        .node("blocked conversation", panel(|store| {
+            store.write(|c| model::set_blocked_tx(c, VERA, true)).expect("blocked fixture");
+            Chat::id(VERA)
+        }, ""))
+        .sized((480.0, 600.0))
+        .about("the transcript stays readable; unblock restores the composer")
         .node("group", panel(|_| Peer::id(STELAXIS), ""))
         .about("a group: how many, how many online, the description — and members on the bar")
         .node("channel", panel(|_| Peer::id(RUST_WEEKLY), ""))

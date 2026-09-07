@@ -144,6 +144,10 @@ impl Chat {
         self.peer
     }
 
+    fn blocked(&self) -> bool {
+        model::peer(&self.store, self.peer).is_some_and(|c| c.blocked)
+    }
+
     pub fn play_on_open(&self, id: MsgId) {
         runtime::of(&self.store).play_on_open(self.peer, id);
     }
@@ -292,10 +296,14 @@ impl Chat {
 
     /// Replies to a line — the bar's verb over the cursor, or the card of
     /// one asking this of the chat it hangs under. A reply is written, so
-    /// the caret goes to the field with it.
-    pub fn reply(&mut self, msg: MsgId) {
+    /// the caret goes to the field with it. A blocked peer refuses the reply.
+    pub fn reply(&mut self, msg: MsgId) -> bool {
+        if self.blocked() {
+            return false;
+        }
         self.reply_to = Some(msg);
         self.wants_field = true;
+        true
     }
 
     // -- editing ------------------------------------------------------------------------
@@ -307,8 +315,11 @@ impl Chat {
 
     /// Starts editing one of my lines: the field takes its text, the reply
     /// line goes, and the caret follows. Answers whether it is a line of
-    /// mine at all.
+    /// mine and the peer is not blocked.
     pub fn edit(&mut self, msg: MsgId) -> bool {
+        if self.blocked() {
+            return false;
+        }
         let hist = self.history();
         let Some(m) = hist.iter().find(|m| m.id == msg && m.out && !m.service) else {
             return false;
@@ -349,9 +360,13 @@ impl Chat {
     }
 
     /// The line above the composer: *editing: …* while an edit is under
-    /// way, *reply to …* while replying.
+    /// way, *reply to …* while replying. Blocking hides it with the composer,
+    /// keeping the pending reply or edit for when the user is unblocked.
     #[must_use]
     pub fn above_line(&self, now: f64) -> Option<String> {
+        if self.blocked() {
+            return None;
+        }
         match &self.editing {
             Some(e) => Some(format!("editing: {}", model::one_line(&e.original))),
             None => self.reply_line(now),
@@ -552,6 +567,10 @@ impl Chat {
     /// toast says what would leave. The composer is emptied the way a send
     /// always empties it, wire or no.
     pub fn send(&mut self, s: &mut Session) {
+        if self.blocked() {
+            s.notify("unblock this user before sending a message", false);
+            return;
+        }
         if let Some(e) = self.editing.take() {
             let text = e.text.trim().to_string();
             if !text.is_empty() && text != e.original {
@@ -797,6 +816,7 @@ impl Panel for Chat {
     /// line is mine, and `clear`. A jump to an original offers `back` until
     /// the saved replies have been retraced, even while rows are marked.
     fn verbs(&self) -> Vec<Verb> {
+        let blocked = self.blocked();
         let n = self.marks.len();
         let k = self.carrying.len();
         let hist = self.history();
@@ -807,9 +827,13 @@ impl Panel for Chat {
         }
         if n == 0 {
             if let Some(m) = under {
-                v.push(Verb::run("telegram.reply", "reply", Some('r')));
+                if !blocked {
+                    v.push(Verb::run("telegram.reply", "reply", Some('r')));
+                }
                 if m.out {
-                    v.push(Verb::run("telegram.edit", "edit", Some('e')));
+                    if !blocked {
+                        v.push(Verb::run("telegram.edit", "edit", Some('e')));
+                    }
                     v.push(Verb::run("telegram.delete", "delete", Some('d')));
                 }
                 // A reply's original, to jump to — the way a press on the
@@ -820,16 +844,24 @@ impl Panel for Chat {
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
             }
         }
-        v.push(Verb::go(
-            "telegram.attach",
-            if k == 0 { "attach".to_string() } else { format!("attach {k}") },
-            Some('h'),
-            Nav::Open {
-                from: self.slot,
-                id: Attach::id(self.peer),
-                fresh: false,
-            },
-        ));
+        if blocked {
+            if !runtime::of(&self.store).peer_action_pending(self.peer) {
+                // Back keeps cmd+b even after the last return point, so
+                // another press cannot unexpectedly unblock the person.
+                v.push(Verb::run("telegram.unblock", "unblock user", Some('k')));
+            }
+        } else {
+            v.push(Verb::go(
+                "telegram.attach",
+                if k == 0 { "attach".to_string() } else { format!("attach {k}") },
+                Some('h'),
+                Nav::Open {
+                    from: self.slot,
+                    id: Attach::id(self.peer),
+                    fresh: false,
+                },
+            ));
+        }
         if let Some(m) = under {
             v.push(Verb::go(
                 "telegram.line",
@@ -868,10 +900,12 @@ impl Panel for Chat {
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
+            "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.reply" => {
                 if let Some(c) = self.cursor {
-                    self.reply(c);
-                    s.redraw();
+                    if self.reply(c) {
+                        s.redraw();
+                    }
                 }
             }
             "telegram.edit" => {

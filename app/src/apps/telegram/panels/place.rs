@@ -82,6 +82,10 @@ impl Panel for Place {
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if model::peer(&self.store, self.chat).is_some_and(|c| c.blocked) {
+            s.notify("unblock this user before sending a message", false);
+            return;
+        }
         let (lat, lon) = self.here();
         match verb {
             // The one-off share, over the wire where the build is signed in:

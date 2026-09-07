@@ -1772,6 +1772,48 @@ fn joining_deleting_and_the_draft_spell_their_requests() {
     }
 }
 
+#[test]
+fn block_state_survives_user_refreshes_and_tracks_chats_profiles_and_remote_unblocks() {
+    let acc = account(FakeTd::new(), None);
+    let w = world();
+    let blocked = || num(&w, "SELECT blocked FROM tg_peer WHERE id = 2");
+    let update = |kind: &str, list: serde_json::Value| json!({
+        "@type": kind, "chat_id": 2, "block_list": list,
+    }).to_string();
+
+    // The block can arrive before a person's name or any conversation.
+    acc.on_update(&w, &update("updateChatBlockList", json!({"@type": "blockListMain"})));
+    assert_eq!(blocked(), 1);
+    acc.on_update(&w, &user_update(2, "Vera", "Kovac", "vera"));
+    assert_eq!(blocked(), 1, "ordinary user updates do not carry block state");
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat"), 0);
+
+    let mut chat: serde_json::Value = serde_json::from_str(&private_chat_update(2, "Vera", 0)).unwrap();
+    chat["chat"]["block_list"] = json!({"@type": "blockListMain"});
+    acc.on_update(&w, &chat.to_string());
+    assert_eq!(blocked(), 1, "initial chat snapshots include existing blocks");
+    acc.on_update(&w, &update("updateChatBlockList", json!(null)));
+    assert_eq!(blocked(), 0, "unblocking on another device is visible here");
+
+    acc.on_update(&w, &json!({
+        "@type": "updateUserFullInfo", "user_id": 2,
+        "user_full_info": {"@type": "userFullInfo", "block_list": {"@type": "blockListMain"}},
+    }).to_string());
+    assert_eq!(blocked(), 1);
+    acc.on_update(&w, &json!({
+        "@type": "userFullInfo", "@extra": "user_full_info:2",
+        "block_list": {"@type": "blockListStories"},
+    }).to_string());
+    assert_eq!(blocked(), 0, "hiding stories does not block messages");
+
+    // Removing a contact elsewhere updates the address book but keeps the peer/chat.
+    let mut user: serde_json::Value = serde_json::from_str(&user_update(2, "Vera", "Kovac", "vera")).unwrap();
+    user["user"]["is_contact"] = json!(false);
+    acc.on_update(&w, &user.to_string());
+    assert_eq!(num(&w, "SELECT is_contact FROM tg_peer WHERE id = 2"), 0);
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat WHERE peer = 2"), 1);
+}
+
 /// A file that is not the engine's own — the account holder's picture,
 /// which TDLib names as the local copy of the photo it is sending — is
 /// copied into the cache and left exactly where it was. Moving it would
@@ -1805,6 +1847,67 @@ fn a_file_of_my_own_is_copied_in_and_left_where_it_is() {
         .expect("the cached file");
     assert_eq!(std::fs::read(held).unwrap(), b"my own picture");
     std::fs::remove_file(&mine).unwrap();
+}
+
+#[test]
+fn peer_actions_ignore_replies_from_an_ended_session_after_retrying() {
+    use super::PeerAction;
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let runtime = runtime::of(w.store());
+    acc.drain(&w);
+    assert!(runtime.send_peer_action(7, PeerAction::Block));
+    acc.drain(&w);
+    let first: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    acc.on_update(&w, &auth("authorizationStateClosed"));
+    assert!(!runtime.peer_action_pending(7));
+    acc.drain(&w);
+    assert!(!runtime.send_peer_action(7, PeerAction::Block), "a closed account stays disconnected");
+
+    let replacement = account(td.clone(), None);
+    replacement.drain(&w);
+    assert!(runtime.send_peer_action(7, PeerAction::Block));
+    replacement.drain(&w);
+    let retry: serde_json::Value = serde_json::from_str(&td.sent()[1]).unwrap();
+    assert_ne!(first["@extra"], retry["@extra"]);
+    runtime.take_notices();
+    for kind in ["ok", "error"] {
+        replacement.on_update(&w, &json!({
+            "@type": kind, "@extra": first["@extra"], "code": 400, "message": "stale error",
+        }).to_string());
+        assert!(runtime.peer_action_pending(7), "an old reply cannot complete the retry");
+        assert_eq!(num(&w, "SELECT count(*) FROM tg_peer WHERE blocked = 1"), 0);
+        assert!(runtime.take_notices().is_empty());
+    }
+    replacement.on_update(&w, &json!({"@type": "ok", "@extra": retry["@extra"]}).to_string());
+    assert!(!runtime.peer_action_pending(7));
+    assert_eq!(num(&w, "SELECT count(*) FROM tg_peer WHERE blocked = 1"), 1);
+}
+
+#[test]
+fn stopping_a_worker_releases_its_pending_peer_actions() {
+    use super::PeerAction;
+    let a = world();
+    let b = world();
+    let account_a = account(FakeTd::new(), None);
+    let account_b = account(FakeTd::new(), None);
+    account_a.drain(&a);
+    account_b.drain(&b);
+    let runtime_a = runtime::of(a.store());
+    let runtime_b = runtime::of(b.store());
+    assert!(runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_a.send_peer_action(8, PeerAction::DeleteContact));
+    assert!(runtime_b.send_peer_action(7, PeerAction::Block));
+    drop(account_a);
+    assert!(!runtime_a.peer_action_pending(7));
+    assert!(!runtime_a.peer_action_pending(8));
+    assert!(!runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_b.peer_action_pending(7), "another store's worker stays connected");
+    let replacement = account(FakeTd::new(), None);
+    replacement.drain(&a);
+    assert!(runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_a.send_peer_action(8, PeerAction::DeleteContact));
 }
 
 #[test]
