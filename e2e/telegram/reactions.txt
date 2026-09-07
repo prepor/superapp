@@ -1,6 +1,6 @@
 # args:
 # env:
-# The chat and line card share a reaction picker in their action bar.
+# The chat and line card share a reaction picker, reached with Cmd+J.
 wait 900
 key cmd 2
 wait 500
@@ -12,7 +12,7 @@ click "stelaxis"
 wait 900
 click "Ivan Petrov: meeting moved to 15:00"
 wait 400
-click "react"
+key cmd+j
 wait 400
 shot reactions-chat
 click "more"
@@ -22,26 +22,39 @@ wait 300
 click "👍"
 wait 400
 # Choosing a fixture emoji closes the picker; the normal actions return.
-click "react"
+key cmd+j
 wait 300
 key esc
 wait 300
-click "react"
+click "react (j)"
 wait 300
 click "cancel"
 wait 300
+# Cmd+J also reaches the bar while the composer holds a draft.
+click "write a message"
+wait 300
+type "a draft"
+wait 300
+key cmd+j
+wait 300
+click "👍"
+wait 300
+click "write a message"
+wait 300
+key esc
+wait 300
 click "line"
 wait 900
-click "react"
+key cmd+j
 wait 300
 shot reactions-card
 key esc
 wait 300
-click "react"
+key cmd+j
 wait 300
 click "❤️"
 wait 400
-click "react"
+click "react (j)"
 wait 300
 click "cancel"
 quit

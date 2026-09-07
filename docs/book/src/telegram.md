@@ -140,8 +140,9 @@ results remain queryable after their status line disappears.
 
 ## Reactions
 
-Select a message and choose **react** in the chat's bar, or use **react** on
-its line card. The bar shows the ordinary emoji Telegram allows for that
+Select a message and press **Cmd+J**, or choose **react (j)** in the chat's
+bar or its line card. The shortcut also works while the composer has focus.
+The bar shows the ordinary emoji Telegram allows for that
 message, six at a time; **more** and **back** move through them. Choose an
 emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
 cursor also closes it. Service messages and pending or failed sends do not

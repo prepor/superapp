@@ -163,7 +163,7 @@ impl Panel for Line {
         v.push(Verb::run("telegram.forward", "forward", Some('f')));
         v.push(Verb::run("telegram.copy", "copy", Some('c')));
         if m.as_ref().is_some_and(reactions::can_react) {
-            v.push(Verb::run("telegram.react", "react", None));
+            v.push(Verb::run("telegram.react", "react (j)", Some('j')));
         }
         if mine {
             v.push(Verb::run("telegram.delete", "delete", Some('d')));
