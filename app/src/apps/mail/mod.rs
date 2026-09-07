@@ -23,15 +23,16 @@ use kernel::tool::Tool;
 pub mod accounts;
 pub mod caps;
 pub mod carry;
+pub mod content;
 pub mod effects;
 pub mod html;
 pub mod model;
-pub mod panels;
 pub mod oauth;
+pub mod panels;
 pub mod parts;
 pub mod problems;
-pub mod real;
 pub mod reading;
+pub mod real;
 pub mod recipients;
 pub mod scenes;
 pub mod schema;
@@ -124,6 +125,16 @@ impl App for Mail {
         sync::workers(store)
     }
 
+    fn poll(&self, s: &mut kernel::session::Session) {
+        for (_, panel) in s.panels() {
+            if let Ok(mut p) = panel.try_borrow_mut() {
+                if let Some(card) = p.as_any().downcast_mut::<panels::Card>() {
+                    card.poll_open(s);
+                }
+            }
+        }
+    }
+
     fn tools(&self) -> Vec<Tool> {
         tools::all()
     }
@@ -184,9 +195,9 @@ which is where mail.put_back sends it. `uidvalidity` and `uidnext` are the sync 
 what a mailbox cannot answer for a letter in Sent), `subject`, `date`, \
 `body`, `html`, `message_id`, `topic` (the subject with its reply prefixes \
 stripped) and `thread` — the smallest id in its conversation, decided at \
-ingest, which is what a mailbox groups by. `raw` is the whole MIME letter as \
-a blob and sits last on purpose: a select that does not need it should not \
-name it.
+ingest, which is what a mailbox groups by. `raw` is a versioned content \
+snapshot: the MIME reading and remote part descriptors, without attachment \
+bodies. It sits last; a select that does not need it should not name it.
 
 `reference` — `(message, mid)`, one row per id a letter claims to answer. \
 Threading is three lookups over this table and no subject guessing.
@@ -194,10 +205,10 @@ Threading is three lookups over this table and no subject guessing.
 `server_msg` — the server's last word about a letter: `folder`, `uid`, \
 `seen`, `forwarded`, one row per message. It is a record, not an intent.
 
-`attachment` and `attachment_scan` — derived from `message.raw`: a part's \
+`attachment` — saved with the message: a part's \
 `name`, `mime`, `size`, `cid`, and the `part` index its bytes are read back \
-by. The bytes are never copied out of the letter; `attachment_scan` records \
-which walk made a letter's rows.
+by. Bytes download on demand via IMAP into the device-local file cache \
+shared with Telegram.
 
 `draft` and `draft_attachment` — a compose panel's unsent text and the \
 paths it will carry, both keyed by that panel's slot (`panel`), which is why \
@@ -218,7 +229,8 @@ What must never be written directly:
   writing `server_msg` by hand tells the app a change has already been \
   pushed when it has not;
 — marking a letter read is `message.unread`, not `server_msg.seen`;
-— `attachment`, `attachment_scan` and `message_fts` are derived from \
-  `message` and are rebuilt from it; a row written into them is lost at the \
-  next walk, and so is a `to_addr` written by hand over a letter that keeps \
-  its `raw`.";
+— `attachment` describes the remote parts of `message.raw` and is written \
+  by ingest together with the message;
+— `message_fts` is maintained from `message` by triggers; a `to_addr` \
+  written by hand over a letter that keeps its `raw` is lost at the next \
+  recipient rebuild.";

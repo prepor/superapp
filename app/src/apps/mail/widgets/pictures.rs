@@ -1,9 +1,9 @@
 //! The pictures an open letter shows, and the item that draws one.
 //!
 //! Nothing here happens in the frame that first shows a picture. A letter's
-//! own `cid:` parts come off a reader thread with its own connection to the
-//! database the asking panel reads; a `data:` payload is un-base64'd on that
-//! same thread; an image on the web is an ordinary HTTP request. All three
+//! own `cid:` parts come from the local file cache or IMAP on a reader thread
+//! with the requesting world's capabilities; a `data:` payload is decoded on
+//! that same thread; an image on the web is an ordinary HTTP request. All three
 //! land in [`landed`], which redraws. The decode from those bytes to a
 //! texture is makepad's, on its own pool, and lands there too.
 //!
@@ -17,7 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
-use kernel::store::{Db, Store};
+use kernel::effect::World;
+use kernel::store::Db;
 use makepad_widgets::image_cache::{
     looks_like_svg, process_async_image_load, AsyncImageLoad, AsyncLoadResult, ImageCacheImpl,
 };
@@ -26,7 +27,6 @@ use makepad_widgets::*;
 use super::super::html;
 use super::super::model::MailId;
 use super::super::parts;
-use super::super::sync;
 
 /// The bytes of every image an open letter refers to, by the name [`key`]
 /// files it under — fetched, read or un-base64'd by whoever has them, and
@@ -38,9 +38,12 @@ pub struct Pictures {
     inflight: HashMap<LiveId, String>,
     /// Sources that did not arrive or did not decode: asked once, not again.
     failed: HashSet<String>,
-    /// Jobs handed to the reader thread — a mail whose raw is being taken
-    /// apart (`m{id}`), a `data:` source being un-base64'd. Asked once.
+    /// Jobs handed to the reader thread: inline parts, file previews, and
+    /// `data:` sources. Deduplicated while in flight.
     asked: HashSet<String>,
+    /// Download failures can recover after connectivity or server location
+    /// changes. Retry on a later draw, with a delay to avoid a request loop.
+    retry_at: HashMap<String, std::time::Instant>,
     /// The reader thread, started with the first letter that has a picture
     /// in it.
     reader: Option<mpsc::Sender<Job>>,
@@ -51,24 +54,30 @@ pub struct Pictures {
     links: Vec<Rect>,
 }
 
-/// One piece of work for the reader thread — the two ways a picture's bytes
-/// are had without the network, and the third that reads a whole part.
+/// File retrieval and data-URL decoding, off the UI thread.
 enum Job {
-    /// Take one mail's raw apart: the `cid:` parts its HTML refers to.
+    /// Download or read one letter's inline images.
     ///
     /// The database comes with the job rather than being held here: a
     /// panels-library mount boots a stage over a world of its own, and a
     /// reader that had bound one database at startup would answer every later
     /// panel out of whichever store happened to ask first.
-    Cid { db: Arc<Db>, mid: MailId },
+    Cid {
+        db: Arc<Db>,
+        reader: parts::Reader,
+        mid: MailId,
+        key: String,
+    },
     /// Un-base64 one `data:` source, filed under `key`.
     Data { key: String, src: String },
-    /// Read one part of a letter back out of its raw, for the card that shows
-    /// it. The same read and the same MIME walk as `Cid`, asked for by row
-    /// rather than by mail — and off the frame for the same reason: an
-    /// attachment is exactly the megabyte-sized blob the rule about draws
-    /// exists for.
-    Part { db: Arc<Db>, mail: MailId, at: u32 },
+    /// Download or read one file for its card's preview.
+    Part {
+        db: Arc<Db>,
+        reader: parts::Reader,
+        mail: MailId,
+        at: u32,
+        key: String,
+    },
 }
 
 /// What the reader thread found, on its way back to the UI thread.
@@ -110,11 +119,22 @@ fn key(src: &str) -> String {
 /// The name one part of a letter is filed under — the same flat space a
 /// picture's source lives in, since both are "bytes a panel needs and must
 /// not read in its own frame".
-fn part_key(mail: MailId, at: u32) -> String {
-    format!("part:{mail}/{at}")
+fn part_key(scope: &str, at: u32) -> String {
+    format!("part:{scope}/{at}")
 }
 
 impl Pictures {
+    fn retry_due(&mut self, key: &str) {
+        if self
+            .retry_at
+            .get(key)
+            .is_some_and(|at| *at <= std::time::Instant::now())
+        {
+            self.retry_at.remove(key);
+            self.asked.remove(key);
+            self.failed.remove(key);
+        }
+    }
     /// The reader thread, started on first need. `None` under
     /// `MAKEPAD=headless`, where the caller does the work in the frame — a
     /// scripted run wants its pictures in the frame that drew them, which is
@@ -136,23 +156,23 @@ impl Pictures {
     fn take(&mut self, ready: &Ready) {
         for (k, bytes) in &ready.items {
             self.bytes.insert(k.clone(), bytes.clone());
+            self.failed.remove(k);
+            self.retry_at.remove(k);
         }
         for k in &ready.failed {
             self.failed.insert(k.clone());
         }
         for k in &ready.retry {
-            self.asked.remove(k);
+            self.retry_at.insert(
+                k.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            );
         }
     }
 }
 
-/// The reader thread: one mail's raw taken apart, one `data:` payload
-/// un-base64'd, one part read out — and back to the UI thread as an action.
-///
-/// All three used to run inside the frame that first drew the picture: the
-/// read is SQLite I/O over a whole RFC822 message, the MIME walk decodes every
-/// part of it, and a letter with three screenshots in it made the frame that
-/// opened it visibly late.
+/// Download, read and decode bytes, then return them as an action. Each
+/// requesting store gets its own world and IMAP session on this thread.
 ///
 /// # Panics
 ///
@@ -166,17 +186,32 @@ fn spawn() -> mpsc::Sender<Job> {
             // jobs keep naming it — one process can have several worlds open
             // at once (the panels library), and in every other run this opens
             // exactly once.
-            let mut held: Option<(Arc<Db>, Store)> = None;
-            fn hold(held: &mut Option<(Arc<Db>, Store)>, db: Arc<Db>) -> Option<&Store> {
+            let mut held: Option<(Arc<Db>, World)> = None;
+            fn hold(
+                held: &mut Option<(Arc<Db>, World)>,
+                db: Arc<Db>,
+                reader: parts::Reader,
+            ) -> Option<&World> {
                 if !held.as_ref().is_some_and(|(h, _)| Arc::ptr_eq(h, &db)) {
-                    *held = Store::with_db(db.clone()).ok().map(|s| (db, s));
+                    *held = reader.world(db.clone()).ok().map(|w| (db, w));
                 }
                 held.as_ref().map(|(_, s)| s)
             }
             while let Ok(job) = rx.recv() {
                 let ready = match job {
-                    Job::Cid { db, mid } => cid_parts(hold(&mut held, db), mid),
-                    Job::Part { db, mail, at } => letter_part(hold(&mut held, db), mail, at),
+                    Job::Cid {
+                        db,
+                        reader,
+                        mid,
+                        key,
+                    } => cid_parts(hold(&mut held, db, reader), mid, key),
+                    Job::Part {
+                        db,
+                        reader,
+                        mail,
+                        at,
+                        key,
+                    } => letter_part(hold(&mut held, db, reader), mail, at, key),
                     Job::Data { key, src } => data_bytes(key, &src),
                 };
                 Cx::post_action(ready);
@@ -186,44 +221,48 @@ fn spawn() -> mpsc::Sender<Job> {
     tx
 }
 
-/// One letter's own pictures: the `cid:` parts of its raw, under the names
-/// the narrowing wrote (see [`html::scope_cids`]). Pure, so the reader thread
-/// and a frame with no thread behind it can both run it.
-fn cid_parts(store: Option<&Store>, mid: MailId) -> Ready {
-    let items: Vec<_> = store
-        .and_then(|s| super::super::model::raw(s, mid))
-        .map(|raw| {
-            sync::inline_images(&raw)
-                .into_iter()
-                .map(|(cid, bytes)| (format!("cid:m{mid}/{cid}"), Arc::from(bytes)))
-                .collect()
-        })
-        .unwrap_or_default();
+/// One letter's inline images, under the names used by `html::scope_cids`.
+fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
+    let mut items = Vec::new();
+    let mut failed = Vec::new();
+    if let Some(w) = world {
+        if let Some(content) = super::super::model::raw(w.store(), mid)
+            .and_then(|raw| super::super::content::Content::read(&raw).ok())
+        {
+            for p in content
+                .parts
+                .iter()
+                .filter(|p| !p.part.cid.is_empty() && p.part.mime.starts_with("image/"))
+            {
+                let key = format!("cid:{scope}/{}", p.part.cid);
+                match parts::download(w, mid, p) {
+                    Ok(bytes) => items.push((key, Arc::from(bytes))),
+                    Err(_) => failed.push(key),
+                }
+            }
+        }
+    }
     // A letter with no raw stored for it yet has nothing to take apart — and
     // may well have it by the next time it opens, so the ask is not held
     // against it.
-    let retry = if items.is_empty() {
-        vec![format!("m{mid}")]
+    let retry = if items.is_empty() || !failed.is_empty() {
+        vec![scope]
     } else {
         Vec::new()
     };
     Ready {
         items,
-        failed: Vec::new(),
+        failed,
         retry,
     }
 }
 
-/// One part of a letter, by its row. Pure, as [`cid_parts`] — but a part that
-/// cannot be had lands in `failed`, not in `retry`: the row only exists
-/// because this device walked the letter's raw, so a raw that no longer
-/// yields it is an answer, not a delay, and asking again every frame would be
-/// a spin.
-fn letter_part(store: Option<&Store>, mail: MailId, at: u32) -> Ready {
-    let k = part_key(mail, at);
-    let bytes = store
-        .and_then(|s| parts::attachment(s, mail, at).map(|a| (s, a)))
-        .and_then(|(s, a)| parts::part(s, &a));
+/// One file preview. Failed downloads can retry after a delay; successful
+/// previews keep only as much data as the card can display.
+fn letter_part(world: Option<&World>, mail: MailId, at: u32, k: String) -> Ready {
+    let bytes = world
+        .and_then(|w| parts::attachment(w.store(), mail, at).map(|a| (w, a)))
+        .and_then(|(w, a)| parts::part(w, &a).ok());
     match bytes {
         // Cut to the preview's own ceiling before it is *kept*: this cache
         // outlives the card, and a card only ever draws the first
@@ -240,13 +279,13 @@ fn letter_part(store: Option<&Store>, mail: MailId, at: u32) -> Ready {
         },
         None => Ready {
             items: Vec::new(),
-            failed: vec![k],
-            retry: Vec::new(),
+            failed: vec![k.clone()],
+            retry: vec![k],
         },
     }
 }
 
-/// The bytes a `data:` source carries, un-base64'd. Pure, as [`cid_parts`].
+/// The bytes a `data:` source carries, un-base64'd.
 fn data_bytes(k: String, src: &str) -> Ready {
     match src
         .strip_prefix("data:")
@@ -279,12 +318,13 @@ pub enum PartBytes {
 /// Asks for one part's bytes, once, and answers with them when they are here.
 /// The card calls this every draw: asking is one lookup, and the answer
 /// arrives through [`landed`], which redraws.
-pub fn want_part(cx: &mut Cx, store: &Store, mail: MailId, at: u32) -> PartBytes {
-    let k = part_key(mail, at);
+pub fn want_part(cx: &mut Cx, world: &World, mail: MailId, at: u32) -> PartBytes {
+    let k = part_key(&parts::image_scope(world.store(), mail), at);
     let p = cx.global::<Pictures>();
     if let Some(b) = p.bytes.get(&k) {
         return PartBytes::Here(b.clone());
     }
+    p.retry_due(&k);
     if p.failed.contains(&k) {
         return PartBytes::Gone;
     }
@@ -292,16 +332,21 @@ pub fn want_part(cx: &mut Cx, store: &Store, mail: MailId, at: u32) -> PartBytes
         return PartBytes::Coming;
     }
     if let Some(tx) = p.reader() {
+        let Ok(reader) = world.with_cap::<parts::Reader, _>(|r| r.clone()) else {
+            return PartBytes::Gone;
+        };
         let _ = tx.send(Job::Part {
-            db: store.db(),
+            db: world.store().db(),
+            reader,
             mail,
             at,
+            key: k,
         });
         return PartBytes::Coming;
     }
     // No reader thread (headless): the run wants its bytes in the frame that
     // asked, which is the bargain the whole module strikes there.
-    let ready = letter_part(Some(store), mail, at);
+    let ready = letter_part(Some(world), mail, at, k.clone());
     let p = cx.global::<Pictures>();
     p.take(&ready);
     match p.bytes.get(&k) {
@@ -310,21 +355,28 @@ pub fn want_part(cx: &mut Cx, store: &Store, mail: MailId, at: u32) -> PartBytes
     }
 }
 
-/// Asks for one letter's own pictures, once. The read and the MIME walk go to
-/// the reader thread; the parts land in [`landed`].
-pub fn want_cid_parts(cx: &mut Cx, store: &Store, mid: MailId) {
+/// Asks for one letter's pictures, deduplicating requests and allowing failed
+/// downloads to retry. The results land in [`landed`].
+pub fn want_cid_parts(cx: &mut Cx, world: &World, mid: MailId) {
+    let key = parts::image_scope(world.store(), mid);
     let p = cx.global::<Pictures>();
-    if !p.asked.insert(format!("m{mid}")) {
+    p.retry_due(&key);
+    if !p.asked.insert(key.clone()) {
         return;
     }
     if let Some(tx) = p.reader() {
+        let Ok(reader) = world.with_cap::<parts::Reader, _>(|r| r.clone()) else {
+            return;
+        };
         let _ = tx.send(Job::Cid {
-            db: store.db(),
+            db: world.store().db(),
+            reader,
             mid,
+            key,
         });
         return;
     }
-    let ready = cid_parts(Some(store), mid);
+    let ready = cid_parts(Some(world), mid, key);
     cx.global::<Pictures>().take(&ready);
 }
 
@@ -556,7 +608,7 @@ enum Pic {
 /// An `<img>` in a letter: the image item the `Html` widget places in its
 /// flow for the tag, sized to its own pixels or its `width` hint and never
 /// wider than the column. Its bytes come from [`Pictures`] — a `cid:` part
-/// off a letter's raw, a `data:` payload, an HTTP reply, all of them found
+/// from the file cache or IMAP, a `data:` payload, an HTTP reply, all found
 /// off the frame — and the decode from those bytes runs on makepad's pool,
 /// keyed in its texture cache so the same picture in two panels is decoded
 /// once. Until the bytes come it is its alt text; once they do it holds the
@@ -659,7 +711,9 @@ impl Widget for HtmlImage {
         // one way back when a *finished* texture is evicted under the cache's
         // cap before this item next drew (which would otherwise hold the box
         // blank for good).
-        if matches!(self.state, Pic::Want | Pic::Loading) {
+        if matches!(self.state, Pic::Want | Pic::Loading)
+            || (self.state == Pic::Failed && self.src.starts_with("cid:"))
+        {
             self.load(cx);
         }
         match self.state {
@@ -880,7 +934,7 @@ mod tests {
         let named = key(&src);
         assert!(named.starts_with("data:") && named.len() == 21, "{named}");
         assert_eq!(key("https://x.dev/a.png"), "https://x.dev/a.png");
-        assert_eq!(part_key(7, 3), "part:7/3");
+        assert_eq!(part_key("m7", 3), "part:m7/3");
     }
 
     /// The bytes a `data:` source carries come back un-base64'd; one that is

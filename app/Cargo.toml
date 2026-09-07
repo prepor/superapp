@@ -37,6 +37,7 @@ serde = { version = "1", features = ["derive"] }
 # Mail's real protocols. `Mode::Real` outside a script reaches a server
 # through these; every scripted run keeps the fake.
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+imap-proto = "0.16.7"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 mail-parser = "0.11"
 

@@ -1952,6 +1952,7 @@ dependencies = [
  "base64 0.22.1",
  "html5ever",
  "imap",
+ "imap-proto",
  "lettre",
  "linkify",
  "mail-parser",

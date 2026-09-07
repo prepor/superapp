@@ -18,13 +18,13 @@ use kernel::time::fmt_date;
 use rusqlite::Transaction;
 
 use super::accounts;
-use super::parts;
 use super::caps::{Creds, OAuth, RemoteMail, UidSet, Watched};
 use super::effects::{
     account_entity, Backfill, Connect, Disconnect, Fetch, Folders, Forwarded, Meta, Move, Seen,
     Submit, Uids, Watch,
 };
 use super::model::{self, topic_of};
+use super::parts;
 
 /// How many older messages one pass reaches back for. Nothing is dropped: a
 /// folder is mirrored entire, newest first, a batch a turn — the batching is
@@ -303,7 +303,9 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
     for rf in w.run(&Folders { account })? {
-        let Some(role) = rf.role.clone() else { continue };
+        let Some(role) = rf.role.clone() else {
+            continue;
+        };
 
         // The folder row and what we last knew about it — a short write, no
         // network in sight. Owned copies cross to the writer thread; the
@@ -421,13 +423,13 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
 
         // Reach back, over the session this pass already holds. The `ALL`
         // search above is the folder entire, so what this store is missing
-        // is a set difference rather than a guess: one fetch and one commit
-        // a batch, which is what keeps a whole mailbox out of memory while
-        // still mirroring it in one sitting. A folder already whole asks
-        // for nothing and costs no round trip at all.
+        // is a set difference rather than a guess: one metadata fetch,
+        // grouped reading fetches, and one commit per batch. A folder
+        // already mirrored asks for nothing and costs no fetch at all.
         let until = w.now() + REACH_BUDGET.as_secs_f64();
+        let mut untried = server;
         loop {
-            let batch = missing(w.store(), fid, &server);
+            let batch = missing(w.store(), fid, &untried);
             if batch.is_empty() {
                 break;
             }
@@ -435,15 +437,19 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                 more = true;
                 break;
             }
+            // A missing or unusable message must not trap older mail
+            // behind this batch. Try each UID once this pass, then allow
+            // skipped UIDs to be retried on a later pass.
+            for uid in &batch {
+                untried.remove(uid);
+            }
             let got = w.run(&Backfill {
                 account,
                 folder: rf.name.clone(),
                 uids: batch,
             })?;
-            // Listed by the search and then not handed over: nothing this
-            // pass can do about it, and asking again in a loop is a spin.
             if got.is_empty() {
-                break;
+                continue;
             }
             w.store()
                 .write(move |tx| {
@@ -461,7 +467,7 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
 /// The uids the server still has and this store does not, newest first,
 /// capped at one batch — what the backfill asks for next. Read back out of
 /// the store after each commit, so a folder that was just reset counts as
-/// holding nothing and a batch already landed is never asked for twice.
+/// holding nothing. `server` excludes UIDs already attempted this pass.
 fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
     let mut have: HashSet<u32> = HashSet::new();
     if let Ok(mut stmt) = store
@@ -596,7 +602,8 @@ fn ingest_message(
     if exists {
         return Ok(());
     }
-    let p = parse_mail(&m.raw);
+    let p = parse_mail(&m.raw)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     if !p.message_id.is_empty() {
         // A uid-less twin in this account is the same mail, post-move.
         let orphan: Option<i64> = tx
@@ -680,26 +687,26 @@ pub struct ParsedMail {
     /// The subject with its reply and forward prefixes stripped.
     pub topic: String,
     /// The parts the letter carries beside its readings — what the message
-    /// panel lists and a card opens. The bytes stay in `raw`; only the
-    /// description is stored (see [`parts`](super::parts)).
+    /// panel lists and a card opens. Only the description is stored;
+    /// bytes download separately (see [`parts`](super::parts)).
     pub attachments: Vec<Part>,
 }
 
-/// MIME → panel text, through `mail-parser`. Paragraph structure survives as
-/// the `\n\n` convention the message panel already renders.
+/// Stored content → panel text, through `mail-parser`. Paragraph structure
+/// survives as the `\n\n` convention the message panel already renders.
 ///
 /// A multipart/alternative mail yields both halves: the plain text as `body`,
 /// the HTML as `html`. Both are kept because they answer different questions;
 /// quoting a reply wants the text.
-#[must_use]
-pub fn parse_mail(raw: &[u8]) -> ParsedMail {
-    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
-        return ParsedMail {
-            subject: "(unparseable message)".into(),
-            topic: "(unparseable message)".into(),
-            ..ParsedMail::default()
-        };
-    };
+///
+/// # Errors
+///
+/// If the snapshot or its MIME reading cannot be parsed.
+pub fn parse_mail(raw: &[u8]) -> Result<ParsedMail, String> {
+    let content = super::content::Content::read(raw)?;
+    let msg = mail_parser::MessageParser::default()
+        .parse(&content.reading)
+        .ok_or("cannot parse message reading")?;
     let (from_name, from_email) = msg
         .from()
         .and_then(|a| a.first())
@@ -738,8 +745,18 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
             references.push(id);
         }
     }
-    let attachments = parts_of(&msg, html.as_deref());
-    ParsedMail {
+    let attachments = content
+        .parts
+        .into_iter()
+        .map(|p| p.part)
+        .filter(|p| {
+            p.cid.is_empty()
+                || !html
+                    .as_deref()
+                    .is_some_and(|h| h.contains(&format!("cid:{}", p.cid)))
+        })
+        .collect();
+    Ok(ParsedMail {
         from_name,
         from_email,
         to: to_line(&msg),
@@ -754,7 +771,7 @@ pub fn parse_mail(raw: &[u8]) -> ParsedMail {
         message_id: norm_id(msg.message_id().unwrap_or_default()),
         references,
         attachments,
-    }
+    })
 }
 
 /// Who a letter was addressed to: the addresses of its `To` line, in header
@@ -776,22 +793,23 @@ fn to_line(msg: &mail_parser::Message<'_>) -> String {
 /// The same line off a letter's bytes, without walking its body — what the
 /// backfill over a mailbox already stored reads
 /// ([`schema`](super::schema)).
-#[must_use]
-pub fn to_of(raw: &[u8]) -> String {
+///
+/// # Errors
+///
+/// If the snapshot or its MIME headers cannot be parsed.
+pub fn to_of(raw: &[u8]) -> Result<String, String> {
+    let content = super::content::Content::read(raw)?;
     mail_parser::MessageParser::default()
-        .parse_headers(raw)
+        .parse_headers(&content.reading)
         .map(|m| to_line(&m))
-        .unwrap_or_default()
+        .ok_or_else(|| "cannot parse message headers".into())
 }
 
-/// One part of a letter, as a row describes it. The bytes are not here:
-/// they live in the `raw` the store already keeps, and [`part_bytes`] reads
-/// them back by `at` — which is what keeps a mailbox one copy of itself
-/// rather than two.
-#[derive(Debug, Clone, PartialEq)]
+/// One part's description. Its index is stable across conversion to a
+/// content snapshot; the snapshot maps that index to its IMAP section.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Part {
-    /// Which part of the parsed message it is — the index [`part_bytes`]
-    /// reads back by.
+    /// Which part of the original parsed message it is.
     pub at: u32,
     /// What to call it: the `filename`, else the `name`, else a made-up one
     /// — a part with no name is still a part.
@@ -808,7 +826,7 @@ pub struct Part {
 /// `html` is the letter's reading: a part it already draws inline is not
 /// also an attachment, or a pasted screenshot would be listed under the
 /// picture of itself.
-fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
+pub(super) fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
     use mail_parser::MimeHeaders;
     let mut out = Vec::new();
     for at in msg.attachments.iter().copied() {
@@ -817,7 +835,7 @@ fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
         };
         let cid = norm_id(p.content_id().unwrap_or_default());
         // Drawn in the letter already: the `multipart/related` a composer
-        // writes around a pasted screenshot (see [`inline_images`]).
+        // writes around a pasted screenshot.
         if !cid.is_empty() && html.is_some_and(|h| h.contains(&format!("cid:{cid}"))) {
             continue;
         }
@@ -848,35 +866,10 @@ fn parts_of(msg: &mail_parser::Message<'_>, html: Option<&str>) -> Vec<Part> {
 /// the raw no longer parses or no longer has that part — a row from a build
 /// whose walk numbered them differently, or a mail refetched.
 #[must_use]
+#[cfg(test)]
 pub fn part_bytes(raw: &[u8], at: u32) -> Option<Vec<u8>> {
     let msg = mail_parser::MessageParser::default().parse(raw)?;
     Some(msg.parts.get(at as usize)?.contents().to_vec())
-}
-
-/// The images a letter carries inside itself — its parts with a Content-ID
-/// and an image type, the `multipart/related` a composer writes around a
-/// pasted screenshot — as `(cid, bytes)`, brackets off: the names its HTML
-/// refers to them by (`src="cid:…"`).
-#[must_use]
-pub fn inline_images(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
-    use mail_parser::MimeHeaders;
-    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
-        return Vec::new();
-    };
-    msg.parts
-        .iter()
-        .filter_map(|p| {
-            let cid = p
-                .content_id()?
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>');
-            let image = p
-                .content_type()
-                .is_some_and(|t| t.ctype().eq_ignore_ascii_case("image"));
-            (image && !cid.is_empty()).then(|| (cid.to_string(), p.contents().to_vec()))
-        })
-        .collect()
 }
 
 /// One id out of an id header, as threading compares it: trimmed, and without
@@ -962,32 +955,6 @@ pub fn outbox_pass(w: &World) -> usize {
     });
 
     claimed
-}
-
-/// Walks the `raw` of every mail nobody has walked at this build's version,
-/// so its parts are rows a panel can list.
-///
-/// The ingest writes them in the transaction that stored the letter, and the
-/// schema's derived step covers a version bump — but a mail that arrives
-/// through **replication** runs no ingest code at all, and its `raw` is
-/// nobody's to walk until somebody looks. This is the somebody. It is an
-/// anti-join that reads no letter once they have all been walked, which is
-/// what makes running it every turn affordable.
-fn scan_pass(w: &World) {
-    let unwalked: bool = w
-        .store()
-        .conn()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM message m
-                           LEFT JOIN attachment_scan s ON s.message = m.id
-                           WHERE s.version IS NULL OR s.version != ?1)",
-            [parts::ATTACH_VERSION],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    if unwalked {
-        let _ = w.store().write(|tx| parts::scan(tx));
-    }
 }
 
 // -- the workers -----------------------------------------------------------------------
@@ -1133,7 +1100,6 @@ impl Worker for SenderPass {
         if outbox_pass(w) > 0 {
             pull_now();
         }
-        scan_pass(w);
         // Sleep until the next deadline, capped — kicks cut it short.
         let next: Option<f64> = w
             .store()

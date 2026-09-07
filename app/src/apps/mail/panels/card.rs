@@ -50,6 +50,7 @@ pub struct Card {
     with: String,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
+    pending: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
 }
 
 impl Card {
@@ -78,12 +79,6 @@ impl Card {
     #[must_use]
     pub fn part(&self) -> (MailId, u32) {
         (self.mail, self.at)
-    }
-
-    /// The store the part is read back out of.
-    #[must_use]
-    pub fn store(&self) -> &Rc<Store> {
-        &self.store
     }
 
     /// The big line: what the sender called it.
@@ -153,7 +148,50 @@ impl Card {
     /// `open`: the part written out to the app's scratch directory, and that
     /// path handed to whatever the OS opens it with.
     fn open(&mut self, s: &mut Session) {
-        match self.write_out(s.world()) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(a) = self.row.clone() else { return };
+        let reader = s.world().with_cap::<parts::Reader, _>(|r| r.clone());
+        match reader {
+            Ok(reader) if !reader.env.clock.is_virtual() => {
+                let db = self.store.db();
+                let (tx, rx) = std::sync::mpsc::channel();
+                match std::thread::Builder::new()
+                    .name("mail-open".into())
+                    .spawn(move || {
+                        let result = reader.world(db).and_then(|w| Self::write_out(&w, &a));
+                        let _ = tx.send(result);
+                    }) {
+                    Ok(_) => {
+                        self.pending = Some(rx);
+                        self.status = Some("downloading…".into());
+                        s.redraw();
+                    }
+                    Err(e) => self.finish_open(s, Err(e.to_string())),
+                }
+            }
+            _ => self.finish_open(s, Self::write_out(s.world(), &a)),
+        }
+    }
+
+    pub fn opening(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn poll_open(&mut self, s: &mut Session) {
+        let Some(rx) = &self.pending else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(_) => Err("attachment download stopped; try again".into()),
+        };
+        self.pending = None;
+        self.finish_open(s, result);
+    }
+
+    fn finish_open(&mut self, s: &mut Session, result: Result<std::path::PathBuf, String>) {
+        match result {
             Ok(path) => {
                 self.status = None;
                 let name = path
@@ -178,13 +216,8 @@ impl Card {
     /// The bytes on the disk, where the OS can reach them. Reads the whole
     /// part rather than the preview's ceiling: what is opened is the file the
     /// sender sent, not as much of it as a card would draw.
-    fn write_out(&self, world: &World) -> Result<std::path::PathBuf, String> {
-        let a = self
-            .row
-            .clone()
-            .ok_or("that part is no longer in the letter")?;
-        let bytes = parts::part(&self.store, &a)
-            .ok_or_else(|| format!("“{}” is not there any more", a.name))?;
+    fn write_out(world: &World, a: &Attachment) -> Result<std::path::PathBuf, String> {
+        let bytes = parts::part(world, a)?;
         let path = scratch(a.message, a.at, &a.name);
         world.run(&WriteFile {
             path: &path,
@@ -211,11 +244,11 @@ impl Panel for Card {
              with, and a preview when it is text or a picture. Its arguments \
              are the letter's `message.id`, {}, and the part's place in it, \
              {} — a part's own row in `attachment` is derived from the \
-             letter's raw MIME and local to a device, so the identity is the \
-             pair rather than that row's id. The bytes stay in `message.raw` \
-             and are never stored twice; there is no path either, so the one \
-             verb is *open*, which writes the part to a scratch directory and \
-             hands that to the operating system.",
+             content snapshot and local to a device, so the identity is the \
+             pair rather than that row's id. Bytes download on demand over \
+             IMAP and stay in the device-local file cache. The *open* verb \
+             saves a copy with the sender's filename and hands it to the \
+             operating system.",
             self.mail, self.at
         )
     }
@@ -273,6 +306,7 @@ impl PanelKind for CardKind {
             row: None,
             with: String::new(),
             status: None,
+            pending: None,
         };
         card.reread();
         Box::new(card)

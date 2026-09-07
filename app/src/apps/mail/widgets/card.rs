@@ -10,11 +10,8 @@
 //!
 //! The bar is the instance's, and it is one verb: `open`.
 
-use std::rc::Rc;
-
 use kernel::caps::{fmt_size, preview_of, FileKind, Preview as Read};
 use kernel::panel::PanelId;
-use kernel::store::Store;
 use makepad_widgets::*;
 
 use super::super::model::MailId;
@@ -45,6 +42,7 @@ const PICTURE: &[LiveId] = ids!(img_box.img_prev);
 #[derive(Clone, PartialEq, Eq)]
 struct Shown {
     id: PanelId,
+    source: String,
     waiting: bool,
 }
 
@@ -75,17 +73,29 @@ impl Widget for AttachmentPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        let opening = {
+            let mut panel = props.panel.borrow_mut();
+            if let Some(card) = panel.as_any().downcast_mut::<Card>() {
+                card.opening()
+            } else {
+                false
+            }
+        };
         let Some(r) = read(&props) else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        // Only a preview worth having is worth reading a whole letter for:
+        // Only a preview worth having is worth downloading a file for:
         // the kind decides whether to ask at all, so a card over a 4 MB PDF
         // costs nothing but its row.
         let mut waiting = false;
         let mut data = r.data;
         let (mail, at) = r.part;
+        let source = scope.data.get_mut::<kernel::session::Session>()
+            .map(|s| super::super::parts::image_scope(s.store(), mail))
+            .unwrap_or_default();
         data.preview = match preview_of(r.kind, &r.name, r.size, |max| {
-            match pictures::want_part(cx, &r.store, mail, at) {
+            let s = scope.data.get_mut::<kernel::session::Session>()?;
+            match pictures::want_part(cx, s.world(), mail, at) {
                 PartBytes::Here(b) => Some(b.iter().take(max).copied().collect()),
                 PartBytes::Coming => {
                     waiting = true;
@@ -96,17 +106,13 @@ impl Widget for AttachmentPanel {
         }) {
             Read::Text(t) => Preview::Text(t),
             Read::Image(b) => Preview::Image(b),
+            Read::None if waiting => Preview::Loading,
             Read::None => Preview::None,
         };
         let (id, status) = (r.id, r.status);
-        let shown = Shown { id, waiting };
+        let shown = Shown { id, source, waiting };
         if self.shown.as_ref() != Some(&shown) {
             card::fill(cx, &self.view, &data);
-            // Still coming is not the same as never: the line only claims
-            // there is nothing to show once the answer is in.
-            if waiting {
-                self.view.label(cx, ids!(none_lbl)).set_visible(cx, false);
-            }
             self.shown = Some(shown);
         }
         let lbl = self.view.label(cx, STATUS);
@@ -114,6 +120,9 @@ impl Widget for AttachmentPanel {
         lbl.set_visible(cx, status.is_some());
 
         let step = self.view.draw_walk(cx, scope, walk);
+        if opening {
+            self.view.redraw(cx);
+        }
 
         // The media-type line carries its own text as its label, the way a
         // disk card's path does, so a script can say which card this is.
@@ -141,7 +150,6 @@ struct Reading {
     kind: FileKind,
     size: u64,
     /// The store the bytes come back out of.
-    store: Rc<Store>,
     data: CardData,
     status: Option<String>,
 }
@@ -164,7 +172,6 @@ fn read(props: &PanelProps) -> Option<Reading> {
         name: c.name(),
         kind: c.kind(),
         size: c.size(),
-        store: c.store().clone(),
         data: CardData {
             name: c.name(),
             kind_word,
