@@ -709,9 +709,9 @@ impl Widget for ChatPanel {
                     self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), &render);
                 }
                 Row::Service(_) | Row::Day(_) | Row::Unread => {
-                    if let Some(rect) = visible(rect, clip) {
-                        props.hits.add(row_label(r, now), rect, MouseCursor::Default, props.slot);
-                    }
+                    props.hits.add_clipped(
+                        row_label(r, now), rect, clip, MouseCursor::Default, props.slot,
+                    );
                 }
             }
         }

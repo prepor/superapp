@@ -178,6 +178,7 @@ key cmd+left 2
 wait 500
 click "add 2"
 wait 700
+visible "screenshot-2026-08-30.png · photo"
 click "screenshot-2026-08-30.png · photo"
 wait 300
 shot t3e-carrying
@@ -185,6 +186,7 @@ click "earlier"
 wait 400
 click "remove"
 wait 400
+visible "report-q3.pdf · file"
 click "report-q3.pdf · file"
 wait 300
 key cmd+left

@@ -575,6 +575,11 @@ impl Stage {
     }
 
     pub(super) fn bar_letters(&self, cx: &Cx, sh: &Shell, slot: kernel::layout::SlotId) -> Letters {
+        // Check reach before snapshotting verbs or walking either widget tree.
+        let focus = sh.session.focus();
+        if Some(slot) != focus && Some(slot) != focus.and_then(|s| sh.session.joined_child(s)) {
+            return Letters::NONE;
+        }
         self.with_shortcuts(cx, sh, |focus, preview, keys| {
             if Some(slot) == focus { keys.bold(true) }
             else if Some(slot) == preview { keys.bold(false) }

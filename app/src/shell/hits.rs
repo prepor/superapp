@@ -86,7 +86,7 @@ pub struct Hit {
     /// The panel it belongs to, when it belongs to one.
     pub slot: Option<SlotId>,
     pub act: Act,
-    /// Full row bounds before clipping, for checking whether a reveal landed.
+    /// Full bounds before clipping, for checking whether a reveal landed.
     pub unclipped: Option<Rect>,
     /// The accelerator actually drawn on this element, if any.
     pub accel: Option<char>,
@@ -160,18 +160,26 @@ impl Hits {
         self.push(Hit::new(label, rect, cursor, slot));
     }
 
-    /// The same, for a row of a list.
-    pub fn add_row(&self, label: impl Into<String>, rect: Rect, cursor: MouseCursor, slot: SlotId) {
-        self.push(Hit::row(label, rect, cursor, slot));
+    /// A list element clipped to its viewport, retaining its full bounds.
+    pub fn add_clipped(
+        &self, label: impl Into<String>, rect: Rect, clip: Rect,
+        cursor: MouseCursor, slot: SlotId,
+    ) -> Option<Rect> {
+        self.push_clipped(Hit::new(label, rect, cursor, slot), clip)
     }
 
+    /// The same, for a row that participates in the shell's touch gestures.
     pub fn add_row_clipped(
         &self, label: impl Into<String>, rect: Rect, clip: Rect,
         cursor: MouseCursor, slot: SlotId,
     ) -> Option<Rect> {
-        let visible = visible(rect, clip)?;
-        let mut hit = Hit::row(label, visible, cursor, slot);
-        hit.unclipped = Some(rect);
+        self.push_clipped(Hit::row(label, rect, cursor, slot), clip)
+    }
+
+    fn push_clipped(&self, mut hit: Hit, clip: Rect) -> Option<Rect> {
+        let visible = visible(hit.rect, clip)?;
+        hit.unclipped = Some(hit.rect);
+        hit.rect = visible;
         self.push(hit);
         Some(visible)
     }

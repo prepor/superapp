@@ -17,6 +17,7 @@ use kernel::e2e::{Runner, Step};
 use makepad_widgets::*;
 
 use super::boot::{self, Frame};
+use super::hits::Hit;
 use super::keys::ChordExec;
 use super::stage::{Shell, Stage};
 
@@ -95,11 +96,8 @@ impl Stage {
         match step {
             Step::Visible(label) => match self.hits.by_label(&label) {
                 Some(hit) => {
-                    if hit.unclipped.is_some_and(|full| {
-                        (full.pos.y - hit.rect.pos.y).abs() > 1.0
-                            || full.size.y - hit.rect.size.y > 1.0
-                    }) {
-                        eprintln!("e2e: FAIL visible {label:?}: row is clipped");
+                    if let Err(reason) = check_visible(&hit) {
+                        eprintln!("e2e: FAIL visible {label:?}: {reason}");
                         r.failures += 1;
                     }
                 }
@@ -511,5 +509,66 @@ impl Stage {
             self.hits.labels().join(" · ")
         );
         r.failures += 1;
+    }
+}
+
+fn check_visible(hit: &Hit) -> Result<(), &'static str> {
+    let full = hit.unclipped.ok_or("full bounds were not recorded")?;
+    if (full.pos.y - hit.rect.pos.y).abs() > 1.0
+        || full.size.y - hit.rect.size.y > 1.0
+    {
+        Err("row is clipped")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visibility_requires_recorded_bounds() {
+        let rect = Rect { pos: dvec2(0.0, 0.0), size: dvec2(300.0, 40.0) };
+        for hit in [
+            Hit::new("day", rect, MouseCursor::Default, 1),
+            Hit::row("attachment", rect, MouseCursor::Hand, 1),
+        ] {
+            assert_eq!(check_visible(&hit), Err("full bounds were not recorded"));
+        }
+    }
+
+    #[test]
+    fn visibility_checks_full_bounds_for_rows_and_other_list_elements() {
+        use super::super::hits::{Act, Hits};
+
+        let rect = |y, h| Rect { pos: dvec2(0.0, y), size: dvec2(300.0, h) };
+        let clip = rect(100.0, 100.0);
+        for row in [true, false] {
+            let hits = Hits::default();
+            for (label, full, visible) in [
+                ("inside", rect(120.0, 40.0), Some(rect(120.0, 40.0))),
+                ("top", rect(80.0, 40.0), Some(rect(100.0, 20.0))),
+                ("bottom", rect(180.0, 40.0), Some(rect(180.0, 20.0))),
+                ("outside", rect(220.0, 40.0), None),
+            ] {
+                let registered = if row {
+                    hits.add_row_clipped(label, full, clip, MouseCursor::Hand, 1)
+                } else {
+                    hits.add_clipped(label, full, clip, MouseCursor::Default, 1)
+                };
+                assert_eq!(registered, visible);
+                let hit = hits.by_label(label);
+                if let Some(visible) = visible {
+                    let hit = hit.unwrap();
+                    assert_eq!(hit.rect, visible);
+                    assert_eq!(hit.unclipped, Some(full));
+                    assert_eq!(hit.act, if row { Act::Row(1) } else { Act::Widget });
+                    assert_eq!(check_visible(&hit), if label == "inside" { Ok(()) } else { Err("row is clipped") });
+                } else {
+                    assert!(hit.is_none());
+                }
+            }
+        }
     }
 }

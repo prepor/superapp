@@ -25,7 +25,7 @@
 //!   would reach;
 //! - [`keyboard::Keyboard`] reads live keyboard ownership for both routing
 //!   and accelerator marks; a composer can declare its input's policy;
-//! - a widget that draws rows registers them with [`hits::Hits::add_row`],
+//! - a widget that draws rows registers them with [`hits::Hits::add_row_clipped`],
 //!   and answers what a finger across one means through
 //!   [`hosted::Grab`].
 

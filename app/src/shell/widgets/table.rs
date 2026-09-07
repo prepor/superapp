@@ -15,7 +15,7 @@
 //! synthesized press must land the way a finger does.
 //!
 //! A finger is the shell's to arbitrate and the table's to answer: rows are
-//! registered as rows ([`Hits::add_row`](super::super::hits::Hits::add_row)),
+//! registered as rows ([`Hits::add_row_clipped`](super::super::hits::Hits::add_row_clipped)),
 //! and the three questions a gesture over one raises — which row, what a
 //! sweep would run, and run it — arrive through
 //! [`Grab`](super::super::hosted::Grab).
@@ -26,7 +26,6 @@ use kernel::richtable::{Datasource, ListState, MarkSlot, Table};
 use kernel::session::Session;
 use kernel::store::Store;
 use makepad_widgets::*;
-use crate::shell::hits::visible;
 
 use super::super::hosted::{Ask, PanelProps};
 use super::suggest::Suggest;
@@ -738,10 +737,11 @@ impl<S: RowSpec> TableView<S> {
         let clip = view.widget(cx, LIST).area().rect(cx);
         self.rows.clear();
         for (_, at, w, label, target) in drawn {
-            let Some(r) = visible(w.area().rect(cx), clip) else {
+            let Some(r) = props.hits.add_row_clipped(
+                label, w.area().rect(cx), clip, MouseCursor::Hand, props.slot,
+            ) else {
                 continue;
             };
-            props.hits.add_row_clipped(label, w.area().rect(cx), clip, MouseCursor::Hand, props.slot);
             self.rows.push((at, r, target));
         }
 
