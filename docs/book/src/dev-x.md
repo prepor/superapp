@@ -228,6 +228,13 @@ pointer hit testing.
 Add `wait` after a step that changes the workspace, because hit areas update on
 the next drawn frame. Use keyboard movement to select a distant list row.
 
+`visible "row label"` asserts that a row is fully inside its list without
+clicking it, and fails if its full bounds were not recorded through
+`Hits::add_row_clipped` or `Hits::add_clipped`. `accel "copy" c` checks the
+accelerator actually drawn on the control; `accel "copy" -` checks that it has
+no highlighted letter. Both wait for current hit areas and also work under
+`--no-draw`.
+
 `click` synthesizes a real press and release at the label's centre, so the
 widget under it handles it as it would a finger's. `mouse` sends the same pair
 through the shell's own mouse path, which also tests focus and input routing. A

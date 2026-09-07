@@ -71,8 +71,8 @@ control. A verb whose letter is not bold still fires on click.
 A chord is offered in one order and stops at the first taker:
 
 1. the workspace's **reserved** chords;
-2. the **focused widget**, which may take one (a live text field takes
-   `cmd+a`) and says so in the same event;
+2. the **focused widget**, for the chords its current input keeps
+   (a live text field keeps `cmd+a`);
 3. the **focused panel's bar**;
 4. the **previewed panel's own widget**, where a caret of its own is
    blinking — a click on a widget's element moves no focus, so a caret can
@@ -89,6 +89,20 @@ the keyboard; the bar of the panel it previews shows only the letters the
 focused bar leaves free, less whatever a caret in its *own* widget keeps; every
 other bar shows no letter at all. There is no lending rule and nothing to keep
 in step, because the drawing and the routing read the same order.
+
+The shell reads keyboard ownership from the live widget tree, using widget
+identity rather than rectangle overlap or a report cached from an earlier
+frame. Ordinary inputs keep all letter chords; selectable text keeps
+`cmd+x/c/v/a`. A composer can declare a narrower input policy through
+`PanelProps.keyboard.keep`. `bar::Shortcuts` makes the routing decision for
+both key presses and bold letters, and focus changes redraw the bars.
+
+Virtual lists reveal a requested row by its measured rectangle. The request
+remains pending until a draw confirms the row is visible, so different row
+heights and a bar wrapping to another line cannot strand the cursor outside
+the viewport. The transcript and shared tables use the same reveal helper.
+The helper explicitly schedules its next paint from inside the draw, so a
+quiet application finishes the reveal without waiting for another input event.
 
 Two more rules hold, and a debug build asserts both on every draw:
 

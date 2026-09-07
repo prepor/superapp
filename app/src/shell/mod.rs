@@ -21,11 +21,11 @@
 //!   [`hits::Hits`] on the props;
 //! - a verb reaches the bar through [`kernel::panel::Panel::verbs`], and its
 //!   letter through [`bar::chord`] in the order [`keys`] documents — which
-//!   [`bar::bold`] draws, so a bold letter promises only what that order
+//!   [`bar::Shortcuts::bold`] draws, so a bold letter promises only what that order
 //!   would reach;
-//! - a widget with a live text field says what it keeps from those bars
-//!   through [`hosted::Chord::field`];
-//! - a widget that draws rows registers them with [`hits::Hits::add_row`],
+//! - [`keyboard::Keyboard`] reads live keyboard ownership for both routing
+//!   and accelerator marks; a composer can declare its input's policy;
+//! - a widget that draws rows registers them with [`hits::Hits::add_row_clipped`],
 //!   and answers what a finger across one means through
 //!   [`hosted::Grab`].
 
@@ -40,6 +40,7 @@ pub mod dsl;
 pub mod e2e;
 pub mod hits;
 pub mod hosted;
+pub mod keyboard;
 pub mod keys;
 pub mod library;
 pub mod lock;

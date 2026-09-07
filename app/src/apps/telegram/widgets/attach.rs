@@ -25,6 +25,7 @@ const LEAD: &[LiveId] = ids!(lead_lbl);
 const EMPTY: &[LiveId] = ids!(empty_lbl);
 const GONE: &[LiveId] = ids!(gone_lbl);
 const LIST_WRAP: &[LiveId] = ids!(list_wrap);
+const LIST: &[LiveId] = ids!(list_wrap.list);
 const RECORDING: &[LiveId] = ids!(recording);
 const REC_LINE: &[LiveId] = ids!(recording.rec_lbl);
 const REC_KEYS: &[LiveId] = ids!(recording.keys_lbl);
@@ -175,14 +176,13 @@ impl Widget for AttachPanel {
         // The hits: every row by its name and what it goes as, and the
         // lines that stand where rows would.
         self.rows.clear();
+        let clip = self.view.widget(cx, LIST).area().rect(cx);
         for (idx, row) in drawn {
-            let rect = row.area().rect(cx);
-            if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            let Some(rect) = props.hits.add_row_clipped(
+                items[idx].label(), row.area().rect(cx), clip, MouseCursor::Hand, props.slot,
+            ) else {
                 continue;
-            }
-            props
-                .hits
-                .add_row(items[idx].label(), rect, MouseCursor::Hand, props.slot);
+            };
             self.rows.push(RowHit { idx, rect });
         }
         let lines: [(String, &[LiveId]); 4] = [

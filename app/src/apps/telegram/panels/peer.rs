@@ -200,10 +200,12 @@ impl Panel for Peer {
             ));
         }
         if let Some(c) = card.as_ref().filter(|c| c.kind == Kind::Person && !c.is_self) {
+            // Match the chat's shortcut; cmd+b belongs to reply navigation
+            // while this profile is previewed beside the conversation.
             v.push(Verb::run(
                 if c.blocked { "telegram.unblock" } else { "telegram.block" },
                 if c.blocked { "unblock user" } else { "block user" },
-                Some('b'),
+                Some('k'),
             ));
             if c.is_contact {
                 v.push(Verb::run("telegram.delete_contact", "delete contact", Some('e')));

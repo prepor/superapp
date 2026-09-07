@@ -34,11 +34,10 @@ wait 400
 # three are near the foot. The first press took the keyboard to the lines
 # — a press on a line is the way to the transcript's cursor, and the caret
 # a chat taking focus parks in the composer stays out of the way.
-click "Elena Petrova: the fold in motion · video"
+click "video"
 wait 600
-# A press lands at the label's centre, and this row's centre is its poster:
-# a press on a picture is the way to the viewer, which opened joined and is
-# closed again here.
+# Press the visible poster itself: clipping can leave the row's centre on
+# its caption. The picture opens the viewer joined, closed again here.
 key cmd+w
 wait 500
 click "Olga Novak: sticker 🙈"
@@ -179,6 +178,7 @@ key cmd+left 2
 wait 500
 click "add 2"
 wait 700
+visible "screenshot-2026-08-30.png · photo"
 click "screenshot-2026-08-30.png · photo"
 wait 300
 shot t3e-carrying
@@ -186,6 +186,7 @@ click "earlier"
 wait 400
 click "remove"
 wait 400
+visible "report-q3.pdf · file"
 click "report-q3.pdf · file"
 wait 300
 key cmd+left

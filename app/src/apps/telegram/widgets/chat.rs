@@ -34,10 +34,12 @@ use makepad_widgets::*;
 
 use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
+use crate::shell::hits::visible;
 use crate::shell::keys::Letters;
 use crate::shell::widgets::map::{self, FakeTiles};
 use crate::shell::widgets::media::{self, PlayerState};
 use crate::shell::widgets::table;
+use crate::shell::widgets::reveal::Reveal;
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgId};
 use super::super::panels::{Chat, Line, Row, Viewer};
@@ -72,6 +74,21 @@ const FILE_TAG: Tag = Tag("file");
 struct RowHit {
     id: MsgId,
     rect: Rect,
+    /// Mention acknowledgement measures how much of the full message was seen.
+    unclipped: Rect,
+}
+
+impl RowHit {
+    fn viewed_in(&self, viewport: Rect) -> bool {
+        let full = self.unclipped;
+        let height = (full.pos.y + full.size.y).min(viewport.pos.y + viewport.size.y)
+            - full.pos.y.max(viewport.pos.y);
+        // A long reply can be taller than the viewport; showing a
+        // substantial part of it must still let the reader dismiss it.
+        viewport.size.y > 0.0 && height + 1.0 >= full.size.y.min(viewport.size.y * 0.5)
+            && full.pos.x >= viewport.pos.x - 1.0
+            && full.pos.x + full.size.x <= viewport.pos.x + viewport.size.x + 1.0
+    }
 }
 
 /// A control inside a row, by the rectangle of the last draw.
@@ -147,6 +164,8 @@ pub struct ChatPanel {
     #[rust]
     anchor: Option<(MsgId, usize)>,
     #[rust]
+    reveal: Reveal<MsgId>,
+    #[rust]
     dragging_files: bool,
 }
 
@@ -156,6 +175,9 @@ impl Widget for ChatPanel {
             return;
         };
 
+        if matches!(event, Event::Scroll(_)) {
+            self.reveal.cancel();
+        }
         if matches!(event, Event::Drag(_) | Event::Drop(_) | Event::DragEnd) {
             match event.drag_hits(cx, self.view.area()) {
                 DragHit::Drag(e) => {
@@ -217,15 +239,8 @@ impl Widget for ChatPanel {
         self.had_focus = has_focus;
         if has_focus && self.mounted {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
-            let visible: Vec<MsgId> = self.rows.iter().filter(|r| {
-                let height = (r.rect.pos.y + r.rect.size.y).min(viewport.pos.y + viewport.size.y)
-                    - r.rect.pos.y.max(viewport.pos.y);
-                // A long reply can be taller than the viewport; showing a
-                // substantial part of it must still let the reader dismiss it.
-                viewport.size.y > 0.0 && height + 1.0 >= r.rect.size.y.min(viewport.size.y * 0.5)
-                    && r.rect.pos.x >= viewport.pos.x - 1.0
-                    && r.rect.pos.x + r.rect.size.x <= viewport.pos.x + viewport.size.x + 1.0
-            }).map(|r| r.id).collect();
+            let visible: Vec<MsgId> = self.rows.iter().filter(|r| r.viewed_in(viewport))
+                .map(|r| r.id).collect();
             with_chat(&props, |c| c.view_mentions(&visible, super::now(scope)));
         }
         // A reply or an edit asked for the caret — the bar's verb over the
@@ -249,18 +264,8 @@ impl Widget for ChatPanel {
         }
 
         let focused = field.key_focus(cx);
-        // A live field keeps the text chords and nothing else, said on every
-        // event and every draw: `cmd+h` in the composer is still *attach*,
-        // as a chord is on the client.
-        if focused {
-            props.chord.field(Letters::TEXT);
-        }
-
         if let Event::KeyDown(k) = event {
             if focused {
-                if k.modifiers.logo && text_chord(k.key_code) {
-                    props.chord.take();
-                }
                 match k.key_code {
                     // Enter sends; shift+enter is the field's newline, and
                     // cmd+enter is the workspace's.
@@ -343,7 +348,7 @@ impl Widget for ChatPanel {
                         })
                         .flatten();
                         if let Some(id) = landed {
-                            self.follow(cx, &props, id, super::now(scope));
+                            self.follow(cx, id);
                         }
                         self.view.redraw(cx);
                         // The cursor and the marks feed the bar, which the
@@ -370,13 +375,14 @@ impl Widget for ChatPanel {
                         .flatten();
                         if let Some(id) = landed {
                             if to_end {
+                                self.reveal.cancel();
                                 self.view
                                     .widget(cx, LIST)
                                     .as_portal_list()
                                     .set_tail_range(true);
                                 self.anchor = None;
                             } else {
-                                self.follow(cx, &props, id, super::now(scope));
+                                self.follow(cx, id);
                             }
                         }
                         self.view.redraw(cx);
@@ -414,15 +420,6 @@ impl Widget for ChatPanel {
 
         super::text::handle_event(&mut self.view, cx, event, scope);
         self.mount(cx, &props, scope);
-
-        // A verb moved the cursor — a reply's original — and asked for it
-        // on screen.
-        if self.mounted {
-            if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
-                self.follow(cx, &props, id, super::now(scope));
-                self.view.redraw(cx);
-            }
-        }
 
         // A press on the composer's field takes the keyboard, the way a
         // press on any field does. Makepad's own TextInput grabs focus off
@@ -552,6 +549,14 @@ impl Widget for ChatPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = render.now;
+        // A bar action runs after this widget handles its input event.
+        // Take its navigation request on the first draw it invalidated,
+        // without waiting for another key, pointer event or timer tick.
+        if self.mounted {
+            if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
+                self.reveal.request(id);
+            }
+        }
         self.view
             .label(cx, ids!(drop_hint))
             .set_visible(cx, self.dragging_files);
@@ -609,13 +614,10 @@ impl Widget for ChatPanel {
             }
         );
         let field = self.view.text_input(cx, INPUT);
-        // The bar is drawn off what the widget said this draw.
+        props.keyboard.keep(&field, Letters::TEXT);
         if !can_post && field.key_focus(cx) {
             self.refocus = false;
             leave_field(cx, &self.view);
-        }
-        if field.key_focus(cx) {
-            props.chord.field(Letters::TEXT);
         }
         let placeholder = card
             .as_ref()
@@ -693,32 +695,44 @@ impl Widget for ChatPanel {
             }
         }
 
+        let target_index = self.reveal.target().and_then(|id| {
+            rows.iter().position(|r| r.msg().is_some_and(|m| m.id == id))
+        });
+        let target_rect = target_index.and_then(|target| {
+            drawn.iter().find(|(idx, _)| *idx == target).map(|(_, row)| row.area().rect(cx))
+        });
+        let portal = self.view.widget(cx, LIST).as_portal_list();
+        if self.reveal.apply(cx, &portal, target_index, target_rect) {
+            self.anchor = None;
+        }
+
         // The hits, once the rows have landed: every line is addressable by
         // its writer and its first words, and a finger's mark lands on it;
         // the controls inside a line — the play button, the picture, the
         // map — are addressable by what they are, and answered first.
         self.rows.clear();
         self.inner.clear();
+        let clip = self.view.widget(cx, LIST).area().rect(cx);
         for (idx, row) in drawn {
             let Some(r) = rows.get(idx) else { continue };
-            let rect = row.area().rect(cx);
-            if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            let full = row.area().rect(cx);
+            if full.size.x <= 0.0 || full.size.y <= 0.0 {
                 continue;
             }
             match r {
                 Row::Message { msg, .. } => {
-                    props
-                        .hits
-                        .add_row(row_label(r, now), rect, MouseCursor::Hand, props.slot);
-                    self.rows.push(RowHit { id: msg.id, rect });
+                    let Some(rect) = props.hits.add_row_clipped(
+                        row_label(r, now), full, clip, MouseCursor::Hand, props.slot,
+                    ) else { continue };
+                    self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
                     self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), &render);
                 }
                 Row::Service(_) | Row::Day(_) | Row::Unread => {
-                    props
-                        .hits
-                        .add(row_label(r, now), rect, MouseCursor::Default, props.slot);
+                    props.hits.add_clipped(
+                        row_label(r, now), full, clip, MouseCursor::Default, props.slot,
+                    );
                 }
             }
         }
@@ -872,6 +886,7 @@ impl ChatPanel {
         render: &RenderContext,
     ) {
         let now = render.now;
+        let clip = self.view.widget(cx, LIST).area().rect(cx);
         const TWINS: [LiveId; 4] = [
             live_id!(line),
             live_id!(line_sel),
@@ -883,12 +898,12 @@ impl ChatPanel {
             cx,
             &line.widget(cx, ids!(body.text_wrap.body_txt)),
             props,
-            self.view.widget(cx, LIST).area().rect(cx),
+            clip,
         );
         // The quoted line a reply carries is the way to what it answers.
         if m.reply_to.is_some() {
             let quote = line.widget(cx, ids!(reply_lbl));
-            if let Some(r) = rect_of(cx, &quote) {
+            if let Some(r) = rect_of(cx, &quote).and_then(|r| visible(r, clip)) {
                 props
                     .hits
                     .add("the line it answers", r, MouseCursor::Hand, props.slot);
@@ -901,7 +916,7 @@ impl ChatPanel {
         let Some(md) = m.media.as_ref() else { return };
         if let Some(st) = player {
             let player_w = line.widget(cx, ids!(body.player));
-            if let Some(r) = media::play_rect(cx, &player_w) {
+            if let Some(r) = media::play_rect(cx, &player_w).and_then(|r| visible(r, clip)) {
                 props.hits.add(
                     if st.playing { "pause" } else { "play" },
                     r,
@@ -916,7 +931,7 @@ impl ChatPanel {
         }
         if md.picture_bytes(render.store_dir.as_deref()).is_some() {
             let img = line.widget(cx, ids!(body.img_box));
-            if let Some(r) = rect_of(cx, &img) {
+            if let Some(r) = rect_of(cx, &img).and_then(|r| visible(r, clip)) {
                 props.hits.add(md.word(), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
@@ -926,7 +941,7 @@ impl ChatPanel {
         }
         if matches!(md.kind.as_str(), "location" | "live") {
             let map_w = line.widget(cx, ids!(body.map));
-            if let Some(r) = rect_of(cx, &map_w) {
+            if let Some(r) = rect_of(cx, &map_w).and_then(|r| visible(r, clip)) {
                 props.hits.add(md.line(now), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
@@ -936,56 +951,10 @@ impl ChatPanel {
         }
     }
 
-    /// Keeps a line on screen as the cursor moves to it — a walk of the
-    /// arrows, a jump to a reply's original. On screen already, among the
-    /// rows the last draw laid out, it stays. Else the list is put where
-    /// the line is, in the index the list itself counts in: at the top when
-    /// the walk went up, and — when it went down — as far down as the rows
-    /// on screen reach, so the line lands at the bottom rather than the
-    /// whole page turning. Placed, not animated: a walk is a keystroke, and
-    /// a scroll still on its way when the next keystroke lands was where
-    /// the arrows lost the line. (The first version searched the drawn rows
-    /// alone and handed their position to the list, whose indices run over
-    /// the whole transcript: every walk off the screen scrolled to the top
-    /// few lines instead — the teleport of 2026-09-07.)
-    fn follow(&mut self, cx: &mut Cx, props: &PanelProps, id: MsgId, now: f64) {
-        // On screen means the row's rectangle sits inside the list's, not
-        // merely that the row was drawn: the list draws the row it is
-        // scrolled halfway into as well, and a cursor on the clipped part
-        // of it is a cursor nobody sees.
-        let list_rect = self.view.widget(cx, LIST).area().rect(cx);
-        let inside = |r: Rect| {
-            r.pos.y + 1.0 >= list_rect.pos.y
-                && r.pos.y + r.size.y <= list_rect.pos.y + list_rect.size.y + 1.0
-        };
-        if self.rows.iter().any(|r| r.id == id && inside(r.rect)) {
-            return;
-        }
-        let Some((idx, shown)) = with_chat(props, |c| {
-            let rows = c.rows(now);
-            let at = |id: MsgId| rows.iter().position(|r| r.msg().is_some_and(|m| m.id == id));
-            let idx = at(id)?;
-            let drawn: Vec<usize> = self.rows.iter().filter_map(|r| at(r.id)).collect();
-            let shown = drawn
-                .iter()
-                .min()
-                .zip(drawn.iter().max())
-                .map(|(lo, hi)| (*lo, *hi));
-            Some((idx, shown))
-        })
-        .flatten() else {
-            return;
-        };
-        let first = match shown {
-            Some((lo, hi)) if idx > hi => idx.saturating_sub(hi - lo),
-            _ => idx,
-        };
-        let list = self.view.widget(cx, LIST).as_portal_list();
-        list.set_tail_range(false);
-        if let Some(mut l) = list.borrow_mut() {
-            l.set_first_id_and_scroll(first, 0.0);
-        }
-        self.anchor = None;
+    /// The draw resolves the message's current index and measured rectangle,
+    /// including rows inserted by a backfill between the request and the draw.
+    fn follow(&mut self, cx: &mut Cx, id: MsgId) {
+        self.reveal.request(id);
         self.view.redraw(cx);
     }
 
@@ -1271,7 +1240,6 @@ fn leave_field(cx: &mut Cx, view: &View) {
     cx.set_key_focus(view.area());
 }
 
-/// The chords a caret keeps: cut, copy, paste, select-all.
 /// Whether a line is a moving picture of the wire's — a video, a circle or
 /// an animation whose poster is a `tg:` reference — as against the demo's.
 fn wire_clip(m: &Msg) -> bool {
@@ -1281,9 +1249,23 @@ fn wire_clip(m: &Msg) -> bool {
     })
 }
 
-fn text_chord(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::KeyX | KeyCode::KeyC | KeyCode::KeyV | KeyCode::KeyA
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipped_hits_only_acknowledge_mentions_after_enough_of_the_message_is_shown() {
+        let rect = |y, h| Rect { pos: dvec2(0.0, y), size: dvec2(300.0, h) };
+        let viewport = rect(100.0, 200.0);
+        for (full, viewed) in [
+            (rect(130.0, 40.0), true),
+            (rect(280.0, 60.0), false),
+            (rect(0.0, 120.0), false),
+            (rect(180.0, 400.0), true),
+            (rect(280.0, 400.0), false),
+        ] {
+            let row = RowHit { id: 1, rect: visible(full, viewport).unwrap(), unclipped: full };
+            assert_eq!(row.viewed_in(viewport), viewed, "full: {full:?}, hit: {:?}", row.rect);
+        }
+    }
 }

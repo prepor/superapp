@@ -347,6 +347,220 @@ fn the_cursor_walks_and_reply_takes_the_line_under_it() {
     assert!(with_chat(&s, slot, |c| c.reply_to().is_none()));
 }
 
+#[test]
+fn a_reply_original_has_a_way_back_after_walking_and_marking() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap();
+    let original = reply.reply_to.unwrap();
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+    with_chat(&s, chat, |c| {
+        c.set_cursor(reply.id);
+        c.set_draft("still writing");
+    });
+    verb(&mut s, chat, "telegram.original");
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.cursor(), Some(original));
+        assert_eq!(c.take_follow_wish(), Some(original));
+        assert_eq!(c.take_follow_wish(), None);
+        c.walk(-1);
+        c.toggle_mark();
+    });
+    let marks = with_chat(&s, chat, |c| c.marks().clone());
+    assert!(verb_ids(&s, chat).contains(&"telegram.back"));
+
+    // Another panel on this same conversation has its own reading history.
+    let other = open_root(&mut s, Chat::at(VERA, original));
+    assert!(!verb_ids(&s, other).contains(&"telegram.back"));
+    verb(&mut s, chat, "telegram.back");
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.cursor(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), None);
+        assert_eq!(c.marks(), &marks);
+        assert_eq!(c.draft(), "still writing");
+        assert!(!c.take_field_wish(), "returning does not ask for the composer");
+    });
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+}
+
+#[test]
+fn revisiting_a_reply_does_not_duplicate_the_return_point() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap();
+    let original = reply.reply_to.unwrap();
+
+    for _ in 0..2 {
+        // Clicking the reply again instead of using Back keeps its return point.
+        with_chat(&s, chat, |c| c.set_cursor(reply.id));
+        verb(&mut s, chat, "telegram.original");
+        with_chat(&s, chat, |c| {
+            assert_eq!(c.cursor(), Some(original));
+            assert_eq!(c.take_follow_wish(), Some(original));
+        });
+        assert!(verb_ids(&s, chat).contains(&"telegram.back"));
+    }
+
+    verb(&mut s, chat, "telegram.back");
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.cursor(), Some(reply.id));
+        assert_eq!(c.take_follow_wish(), Some(reply.id));
+    });
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+}
+
+#[test]
+fn reply_originals_are_retraced_in_order_and_skip_missing_return_points() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap().id;
+    let middle = hist.iter().find(|m| m.id == reply).unwrap().reply_to.unwrap();
+    let oldest = hist[0].id;
+    s.store().write(move |c| {
+        c.execute(
+            "UPDATE tg_message SET reply_to = ?1 WHERE chat = ?2 AND id = ?3",
+            [oldest, VERA, middle],
+        )?;
+        Ok(())
+    }).unwrap();
+    with_chat(&s, chat, |c| c.set_cursor(reply));
+    verb(&mut s, chat, "telegram.original");
+    verb(&mut s, chat, "telegram.original");
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(oldest));
+    for target in [middle, reply] {
+        verb(&mut s, chat, "telegram.back");
+        with_chat(&s, chat, |c| {
+            assert_eq!(c.cursor(), Some(target));
+            assert_eq!(c.take_follow_wish(), Some(target));
+        });
+    }
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+
+    // A server update can remove an intermediate reply while we read its
+    // original. One back skips it and still reaches the first reply.
+    verb(&mut s, chat, "telegram.original");
+    verb(&mut s, chat, "telegram.original");
+    s.store().write(move |c| {
+        c.execute("DELETE FROM tg_message WHERE chat = ?1 AND id = ?2", [VERA, middle])?;
+        Ok(())
+    }).unwrap();
+    verb(&mut s, chat, "telegram.back");
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), Some(reply));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+}
+
+#[test]
+fn a_failed_original_jump_does_not_add_a_return_point() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap().id;
+    let original = hist.iter().find(|m| m.id == reply).unwrap().reply_to.unwrap();
+    // Neither an unavailable original nor a malformed self-reply moves.
+    for target in [-1, reply] {
+        s.store().write(move |c| {
+            c.execute(
+                "UPDATE tg_message SET reply_to = ?1 WHERE chat = ?2 AND id = ?3",
+                [target, VERA, reply],
+            )?;
+            Ok(())
+        }).unwrap();
+        with_chat(&s, chat, |c| c.set_cursor(reply));
+        verb(&mut s, chat, "telegram.original");
+        assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+        assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+    }
+    assert!(s.notes().iter().any(|n| n.msg == "the line it answers is not loaded"));
+
+    // A failed jump also leaves an earlier, successful return point alone.
+    s.store().write(move |c| {
+        c.execute(
+            "UPDATE tg_message SET reply_to = ?1 WHERE chat = ?2 AND id = ?3",
+            [original, VERA, reply],
+        )?;
+        c.execute(
+            "UPDATE tg_message SET reply_to = -1 WHERE chat = ?1 AND id = ?2",
+            [VERA, original],
+        )?;
+        Ok(())
+    }).unwrap();
+    verb(&mut s, chat, "telegram.original");
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), Some(original));
+    verb(&mut s, chat, "telegram.original");
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+    verb(&mut s, chat, "telegram.back");
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+}
+
+#[test]
+fn deleting_the_last_return_point_clears_the_way_back() {
+    for local in [true, false] {
+        let mut s = session();
+        let chat = open_root(&mut s, Chat::id(VERA));
+        let hist = model::history(s.store(), VERA);
+        let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap().id;
+        with_chat(&s, chat, |c| c.set_cursor(reply));
+        verb(&mut s, chat, "telegram.original");
+        let original = with_chat(&s, chat, Chat::take_follow_wish);
+        if local {
+            with_chat(&s, chat, |c| c.lines_gone(&[reply]));
+        }
+        s.store().write(move |c| {
+            c.execute("DELETE FROM tg_message WHERE chat = ?1 AND id = ?2", [VERA, reply])?;
+            Ok(())
+        }).unwrap();
+        if !local {
+            verb(&mut s, chat, "telegram.back");
+            assert_eq!(s.notes().last().unwrap().msg, "the reply is no longer loaded");
+        }
+        assert_eq!(with_chat(&s, chat, |c| c.cursor()), original);
+        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+        assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
+    }
+}
+
+#[test]
+fn reply_back_keeps_its_shortcut_in_a_blocked_conversation() {
+    use crate::shell::bar;
+    use crate::shell::keys::Letters;
+
+    let mut s = session();
+    s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let profile = open_root(&mut s, Peer::id(VERA));
+    let reply = model::history(s.store(), VERA).iter()
+        .find(|m| m.reply_to.is_some()).unwrap().id;
+    let check = |s: &Session, returning| {
+        let verbs = s.panel(chat).unwrap().borrow().verbs();
+        let preview = s.panel(profile).unwrap().borrow().verbs();
+        bar::check(&verbs);
+        assert_eq!(bar::chord(&verbs, 'b'), returning);
+        assert_eq!(bar::chord(&verbs, 'k'), Some("telegram.unblock"));
+        assert_eq!(bar::chord(&preview, 'k'), Some("telegram.unblock"));
+        let keys = bar::Shortcuts {
+            focused: &verbs, focused_keeps: Letters::NONE,
+            preview: &preview, preview_keeps: Letters::NONE,
+        };
+        assert_eq!(keys.route('b'), returning.map(bar::Shortcut::FocusedVerb),
+            "an exhausted Back must not fall through to the profile's unblock");
+    };
+    check(&s, None);
+    with_chat(&s, chat, |c| c.set_cursor(reply));
+    verb(&mut s, chat, "telegram.original");
+    check(&s, Some("telegram.back"));
+    verb(&mut s, chat, "telegram.back");
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    check(&s, None);
+    assert!(model::peer(s.store(), VERA).unwrap().blocked);
+}
+
 /// What a chat is with says what the composer does.
 #[test]
 fn a_channel_i_do_not_run_has_no_composer() {

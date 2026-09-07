@@ -14,7 +14,6 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::Letters;
 
 use super::super::panels::{AddAccount, Form};
 
@@ -50,17 +49,6 @@ impl Widget for AddAccountPanel {
 
         let inputs = self.inputs(cx);
         let focused = inputs.iter().position(|t| t.key_focus(cx));
-        // A live field keeps every cmd chord, so no bar's letter is drawn as
-        // if it would fire — the promise a bold letter makes is about now.
-        if focused.is_some() {
-            props.chord.field(Letters::ALL);
-        }
-        if let Event::KeyDown(k) = event {
-            if focused.is_some() && k.modifiers.logo {
-                props.chord.take();
-            }
-        }
-
         self.view.handle_event(cx, event, scope);
         self.mount(cx, &props);
         wanted(&props, scope);

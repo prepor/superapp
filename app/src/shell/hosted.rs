@@ -16,7 +16,7 @@ use makepad_widgets::*;
 
 use super::hits::Hits;
 use super::keys::Letters;
-use super::overlays::Overlay;
+use super::keyboard::Keyboard;
 use super::stage::{Shell, Stage};
 
 /// What a hosted widget is handed beside the session.
@@ -29,61 +29,11 @@ pub struct PanelProps {
     pub slot: SlotId,
     pub panel: Instance,
     pub hits: Hits,
-    /// The chord the stage is offering, if it is offering one.
-    pub chord: Chord,
+    /// Shared keyboard policies for inputs that keep fewer chords.
+    pub keyboard: Keyboard,
     /// What the touch machine is asking of this widget, if it is asking
     /// anything. Empty on every event a pointer or a key drives.
     pub grab: Grab,
-}
-
-/// A chord offered to the focused widget before the bar sees it, and what
-/// the widget says about its own keyboard.
-///
-/// The widget takes the chord by calling [`Chord::take`] in the same event;
-/// the stage checks before it runs a verb. It reports a live field of its
-/// own through [`Chord::field`] — on every draw and every event, not only
-/// on the event it takes, because a bar has to draw the promise before the
-/// chord is pressed.
-///
-/// Shared cells rather than bubbled actions: makepad delivers actions on the
-/// *next* event, and the stage has to know now.
-#[derive(Clone, Default)]
-pub struct Chord {
-    taken: Rc<Cell<bool>>,
-    field: Rc<Cell<Option<Letters>>>,
-}
-
-impl Chord {
-    /// The widget handled it; nothing further should. The table's filter
-    /// field is the one that does: while it is live `cmd+a` is select-all,
-    /// not a verb on the bar.
-    pub fn take(&self) {
-        self.taken.set(true);
-    }
-
-    #[must_use]
-    pub fn taken(&self) -> bool {
-        self.taken.get()
-    }
-
-    /// A field of this widget has the keyboard. It keeps the text chords
-    /// while it does — `x`, `c`, `v`, `a`, which belong to a caret wherever
-    /// one blinks — and `extra` beside them: [`Letters::NONE`] for a field
-    /// that keeps only those, [`Letters::ALL`] for one that answers every
-    /// cmd chord itself.
-    ///
-    /// Said again on every draw and every event: it is a fact about now, and
-    /// the frame after the caret leaves must not still be drawn as if it
-    /// were there.
-    pub fn field(&self, extra: Letters) {
-        self.field.set(Some(extra.plus(Letters::TEXT)));
-    }
-
-    /// What the widget said, if it said anything this pass.
-    #[must_use]
-    pub fn field_keeps(&self) -> Option<Letters> {
-        self.field.get()
-    }
 }
 
 /// What the shell's touch machine is asking a panel's own widget about a
@@ -108,9 +58,8 @@ pub enum Ask {
 
 /// The question, and the shared cell the widget answers into.
 ///
-/// A cell rather than a bubbled action, for the reason [`Chord`] is one:
-/// makepad delivers actions on the *next* event, and a gesture has to be
-/// arbitrated now.
+/// Makepad delivers actions on the next event; the shared cell lets a
+/// gesture read its answer during the event being arbitrated.
 #[derive(Clone, Default)]
 pub struct Grab {
     ask: Option<Ask>,
@@ -235,7 +184,7 @@ impl Stage {
             slot,
             panel: inst,
             hits: self.hits.clone(),
-            chord: Chord::default(),
+            keyboard: self.keyboard.clone(),
             grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
@@ -252,46 +201,12 @@ impl Stage {
         // the edge of a list is cut off with everything else.
         self.draw_row_curtain(cx, slot, &w, body);
         cx.end_turtle();
-        // Right after the widget drew, when its rectangles are this frame's.
-        self.heard_field(cx, sh, slot, &w, &props.chord);
     }
 
-    /// Files what a widget's keyboard is doing: what it said through
-    /// [`Chord::field`] this draw, or — for one that has not been taught
-    /// that seam — what makepad's own key focus says.
-    ///
-    /// Called at the end of the widget's draw and nowhere else. A field's
-    /// rectangle is only its own frame's: read a moment later, from an
-    /// event, the very same area answers with nothing. So the answer is
-    /// taken where it is true and kept here until the next draw — which the
-    /// bars want anyway, being drawn before the bodies that report, and one
-    /// panel's bar while another panel's widget holds the caret.
-    fn heard_field(&mut self, cx: &Cx, sh: &Shell, slot: SlotId, w: &WidgetRef, chord: &Chord) {
-        // A widget that has not been taught the seam keeps the lot: each of
-        // the fields in this build answers any cmd chord while its caret
-        // blinks (`e2e/files/walk.txt` pins it), so no bar may promise one.
-        // One that keeps less says so, and keeps its other letters bold.
-        let keeps = chord.field_keeps().or_else(|| {
-            let own = sh.overlay == Overlay::None && field_focus(cx, w);
-            own.then_some(Letters::ALL)
-        });
-        match keeps {
-            Some(keeps) => {
-                self.field_keeps.insert(slot, keeps);
-            }
-            None => {
-                self.field_keeps.remove(&slot);
-            }
-        }
-    }
-
-    /// The letters the widget in `slot` keeps from every bar while one of its
-    /// fields has the keyboard: nothing at all when none has.
-    #[must_use]
-    pub(super) fn field_letters(&self, slot: Option<SlotId>) -> Letters {
-        slot.and_then(|s| self.field_keeps.get(&s))
-            .copied()
-            .unwrap_or(Letters::NONE)
+    /// The chords kept by the input that owns keyboard focus right now.
+    pub(super) fn field_letters(&self, cx: &Cx, slot: Option<SlotId>) -> Letters {
+        slot.and_then(|s| self.hosted.get(&s))
+            .map_or(Letters::NONE, |w| self.keyboard.kept(cx, w))
     }
 
     /// Forwards an event to every live content widget with its own slot's
@@ -315,16 +230,15 @@ impl Stage {
     }
 
     /// Keys and text go to the focused panel's widget alone: the pointer is
-    /// positional, but the keyboard belongs to one panel. Answers whether
-    /// the widget took the chord.
+    /// positional, but the keyboard belongs to one panel.
     pub(super) fn forward_to_focused(
         &mut self,
         cx: &mut Cx,
         sh: &mut Shell,
         event: &Event,
-    ) -> bool {
+    ) {
         let Some(f) = sh.session.focus() else {
-            return false;
+            return;
         };
         self.forward_to_slot(cx, sh, f, event)
     }
@@ -336,14 +250,14 @@ impl Stage {
         sh: &mut Shell,
         slot: SlotId,
         event: &Event,
-    ) -> bool {
+    ) {
         let Some(w) = self.hosted.get(&slot).cloned() else {
-            return false;
+            return;
         };
         self.forward_one(cx, sh, slot, &w, event)
     }
 
-    /// One widget, one event. Answers whether it took the chord.
+    /// One widget, one event; ownership has already been resolved by the shell.
     fn forward_one(
         &mut self,
         cx: &mut Cx,
@@ -351,20 +265,19 @@ impl Stage {
         slot: SlotId,
         w: &WidgetRef,
         event: &Event,
-    ) -> bool {
+    ) {
         let Some(panel) = sh.session.panel(slot) else {
-            return false;
+            return;
         };
         let props = PanelProps {
             slot,
             panel,
             hits: self.hits.clone(),
-            chord: Chord::default(),
+            keyboard: self.keyboard.clone(),
             grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
         w.handle_event(cx, event, &mut scope);
-        props.chord.taken()
     }
 
     /// Puts one of the touch machine's questions to a slot's widget and
@@ -390,7 +303,7 @@ impl Stage {
             slot,
             panel,
             hits: self.hits.clone(),
-            chord: Chord::default(),
+            keyboard: self.keyboard.clone(),
             grab: Grab::asking(ask),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
@@ -414,28 +327,7 @@ impl Stage {
         self.hosted
             .retain(|slot, _| is_overlay(*slot) || live.contains(slot));
         self.hosted_for.retain(|slot, _| live.contains(slot));
-        self.field_keeps.retain(|slot, _| live.contains(slot));
     }
-}
-
-/// Whether a field inside this widget has the keyboard, as makepad sees it —
-/// the answer for a widget that has not been taught to say so itself.
-///
-/// One area owns the keyboard at a time, and it is a field of this widget's
-/// when it is neither nothing, nor the widget's own root — where a panel
-/// parks the keyboard while its rows have it — nor anything outside the
-/// rectangle the widget drew into: the stage parks the keyboard on *itself*
-/// whenever a click lands on anything but a panel's own widget.
-///
-/// Both rectangles must be of the pass that just ran, which is why this is
-/// asked at the end of a draw. An area not drawn since gives none at all.
-fn field_focus(cx: &Cx, w: &WidgetRef) -> bool {
-    let (focus, root) = (cx.key_focus(), w.area());
-    if focus == Area::Empty || focus == root {
-        return false;
-    }
-    let (body, field) = (root.rect(cx), focus.rect(cx));
-    field.size.y > 0.0 && body.contains(field.center())
 }
 
 /// The widgets a stage is holding, by slot.

@@ -9,7 +9,8 @@ key enter
 wait 900
 click "stelaxis"
 wait 900
-click "Elena Petrova: the fold in motion · video"
+# Open the viewer through the visible poster, including when its row is clipped.
+click "video"
 wait 600
 
 # Clicking halfway seeks while paused, and waiting leaves it there.

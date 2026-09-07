@@ -10,8 +10,8 @@
 # Two bars is the whole point, so this suite keeps two of them on screen at
 # once and never addresses a verb by a label both wear. What a click can
 # assert it asserts: that the chord fired the *focused* panel's verb, proved
-# by an outcome only that panel could have produced. The rest is in the
-# pictures — `b1`…`b8` under `e2e/out`.
+# by an outcome only that panel could have produced. Accelerator assertions
+# check the actual marks; pictures `b1`…`b8` also capture the bars.
 
 wait 900
 
@@ -23,6 +23,8 @@ wait 900
 # free — and all four are drawn bold, because a chord reaches them.
 click "Q3 infra"
 wait 800
+accel "sync" s
+accel "reply" r
 shot b1-unmarked
 
 # -- and under a marked one ----------------------------------------------------
@@ -39,6 +41,9 @@ wait 800
 # `a` and `d` go plain — the same two buttons, the same two clicks, one
 # promise fewer — while its `r` and `f`, which the list does not wear, stay
 # bold.
+accel "archive 1" a
+accel "archive" -
+accel "reply" r
 shot b2-marked
 
 # The promise is kept: cmd+a fires the *list's* archive, over the marked
@@ -59,7 +64,7 @@ shot b3-filed
 
 # The second step of the order, which is the widget's: a row marked, and
 # then the caret put in the filter with `/`. While it is there the list
-# answers every cmd chord itself — the shell's table says so on every draw —
+# keeps every cmd chord — the shell reads the focused input's policy —
 # so the whole bar goes plain, the marked set's letters with it, and the
 # reader below is left with nothing to promise either.
 key space
@@ -68,6 +73,8 @@ key /
 wait 400
 type "vera"
 wait 700
+accel "sync" -
+accel "reply" -
 shot b4-filtering
 
 # -- three listings, three places in the order ---------------------------------
@@ -116,6 +123,7 @@ wait 500
 # While the caret is in that field the widget answers every cmd chord
 # itself, so no letter would fire and none is drawn: both bars are plain,
 # and the third was plain already.
+accel "copy here" -
 shot b6-typing
 
 # Enter hands the keyboard back — a one-line field submits and lets go — so
@@ -126,6 +134,7 @@ shot b6-typing
 # would have been made, and the field would have closed.
 key enter
 wait 800
+accel "new dir" n
 shot b7-refused
 click "new dir name"
 wait 400
