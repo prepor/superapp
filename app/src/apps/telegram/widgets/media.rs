@@ -280,8 +280,9 @@ impl Widget for ViewerPanel {
         // asked and says so to a box nobody has drawn, whose redraw is of
         // nothing: only this widget drawing again finds it playing and shows
         // it (2026-09-07: the clip downloaded, the player prepared, and the
-        // box stayed hidden).
-        if playing || note.is_some() || awaiting || (wanted && !rolling) || self.playback.awaiting_seek() {
+        // box stayed hidden). A paused seek also needs draws until its
+        // requested position gives way to the actual frame or times out.
+        if playing || note.is_some() || awaiting || (wanted && !rolling) || self.playback.seek_needs_redraw() {
             self.view.redraw(cx);
         }
         step
