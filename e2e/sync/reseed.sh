@@ -8,7 +8,7 @@
 # independent virtual clocks cannot race.
 #
 # Build headless first — `MAKEPAD=headless mise exec -- cargo build
-# -p superapp` — which runs the sync passes inline on the frame loop
+# -p superapp --no-default-features` — which runs sync passes on the frame loop
 # (deterministic) instead of on the driver thread; without it the take-over
 # is asynchronous and the final shot may precede it.
 #

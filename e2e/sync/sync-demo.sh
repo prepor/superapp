@@ -5,8 +5,8 @@
 # renders and the script never advances).
 #
 # Build headless first — `MAKEPAD=headless mise exec -- cargo build
-# -p superapp` — because that is what gives a run its virtual clock and
-# its inline sync passes, so a scripted `wait` advances a handoff.
+# -p superapp --no-default-features` — to use a virtual clock and inline
+# sync passes, so a scripted `wait` advances a handoff.
 #
 # Not in e2e/run-all.sh: it needs two processes and a daemon.
 set -e

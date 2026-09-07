@@ -10,6 +10,10 @@ mise exec -- cargo run -p superapp
 mise supplies the stable Rust toolchain and nothing else. The Makepad revision
 and its local patches are pinned in the root `Cargo.toml`.
 
+Normal builds enable the `tdlib` feature and link `libtdjson`; see
+[Telegram builds](./telegram.md#builds) for the native library path.
+`--no-default-features` omits that dependency for tests and demos.
+
 The normal database is
 `~/Library/Application Support/superapp/superapp.db`. `--db PATH` selects
 another file, and `--bucket URL` points a run at a
@@ -18,7 +22,7 @@ another file, and `--bucket URL` points a run at a
 ## Tests
 
 ```sh
-mise exec -- cargo test --workspace
+mise exec -- cargo test --workspace --no-default-features
 ```
 
 Both crates, no window, no network, no keychain. The kernel's tests are the
@@ -26,6 +30,9 @@ panel mechanics, springs, the store, effects, history, device sync, the HTTP
 reader and the SSE parser; the app's are the mail engine, the files model, the
 agent's wire and run loop, the bar, the catalogue, and the platform's own disk
 and keychain code. Everything runs against fakes.
+
+Omit `--no-default-features` on a machine with TDLib installed to include its
+FFI smoke tests. These tests do not log in to a real Telegram account.
 
 A test drives a `Session` with no widget at all. `Session::fake(apps)` opens an
 in-memory store, seeds it, builds a `Fake` world, and mounts the workers
@@ -92,9 +99,9 @@ One macOS job in `.github/workflows/ci.yml`, on every push to `main` and every
 pull request:
 
 ```sh
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-MAKEPAD=headless cargo build --locked -p superapp
+cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
+cargo test --workspace --locked --no-default-features
+MAKEPAD=headless cargo build --locked -p superapp --no-default-features
 ./e2e/run-all.sh
 ```
 
@@ -106,7 +113,7 @@ gate: several tables and comment columns are aligned by hand.
 ## End-to-end suites
 
 ```sh
-MAKEPAD=headless mise exec -- cargo build -p superapp
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
 ./e2e/run-all.sh
 ```
 
@@ -141,7 +148,7 @@ table of special cases anywhere else.
 Run one suite by hand:
 
 ```sh
-mise exec -- cargo run -p superapp -- --e2e e2e/mail/basic.txt --no-draw --draws 4000
+mise exec -- cargo run -p superapp --no-default-features -- --e2e e2e/mail/basic.txt --no-draw --draws 4000
 ```
 
 `--draws` belongs to Makepad's headless loop: it caps how many frames are
@@ -259,7 +266,7 @@ long press alone.
 ./e2e/sync/sync-demo.sh        # A bootstraps and archives; B locks, takes over, writes
 ./e2e/sync/bucket.sh           # a device gives itself a bucket from inside the app
 ./e2e/sync/reseed.sh           # a peer's edit reaches a running follower's live panel
-cargo run -p superapp --bin sync-demo   # the same lease lifecycle, narrated, with no window
+cargo run -p superapp --no-default-features --bin sync-demo   # the same lease lifecycle, narrated, with no window
 ```
 
 They gate on each device's store rather than on a wall clock, so two
@@ -307,8 +314,8 @@ the rasterizer's frames, and `MAKEPAD_HEADLESS_DPI` to fix the geometry.
 ## The panels library
 
 ```sh
-mise exec -- cargo run -p superapp -- --library
-mise exec -- cargo run -p superapp -- --library mailbox files
+mise exec -- cargo run -p superapp --no-default-features -- --library
+mise exec -- cargo run -p superapp --no-default-features -- --library mailbox files
 ```
 
 `--library` opens the window on a zoomable canvas instead of a workspace: every

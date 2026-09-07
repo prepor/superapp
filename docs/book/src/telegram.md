@@ -2,11 +2,31 @@
 
 Telegram is an app over a local SQLite projection. Panels read that projection
 and own their interaction state; a background worker owns the TDLib client and
-projects its updates. The `tdlib` feature enables the native client. Ordinary
-builds and library fixtures work offline with the demo data.
+projects its updates. The `tdlib` feature enables the native client and is on
+by default. Library fixtures and scripted runs stay offline with demo data
+even when the native client is linked.
 
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
+
+## Builds
+
+`cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.
+The build looks under `/opt/homebrew/opt/tdlib/lib` by default; set `TDLIB_DIR`
+to another installation prefix containing `lib/libtdjson.dylib` on macOS.
+The same path is added to the executable's runtime library search path.
+
+Tests, demos and targets without TDLib can drop the feature explicitly:
+
+```sh
+mise exec -- cargo test --workspace --no-default-features
+mise exec -- cargo run -p superapp --no-default-features -- --library
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
+```
+
+CI uses this opt-out for Clippy, tests and the headless suites. Plain
+`cargo test --workspace` also runs the TDLib FFI smoke tests; account tests
+still use fake transports and do not sign in.
 
 ## Ownership and data flow
 

@@ -8,8 +8,8 @@
 //! no window.
 //!
 //! Its second job is Telegram's engine: when the `tdlib` feature is on, link
-//! `libtdjson`. The feature is off by default, so a plain build emits none of
-//! this and needs no native library — see `Cargo.toml`.
+//! `libtdjson`. Normal builds enable it; `--no-default-features` lets tests
+//! and demos build without the native library.
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(headless)");

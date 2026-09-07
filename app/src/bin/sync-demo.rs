@@ -4,11 +4,11 @@
 //! works in a headless environment where the window event loop does not.
 //!
 //! ```sh
-//! cargo run --bin sync-demo
+//! cargo run --no-default-features --bin sync-demo
 //! # …or against a real Cloudflare R2 bucket, which is the same walk over
 //! # TLS and signed requests:
 //! export SUPERAPP_R2_ACCESS_KEY_ID=… SUPERAPP_R2_SECRET_ACCESS_KEY=…
-//! cargo run --bin sync-demo -- --bucket https://<account>.r2.cloudflarestorage.com/<bucket>
+//! cargo run --no-default-features --bin sync-demo -- --bucket https://<account>.r2.cloudflarestorage.com/<bucket>
 //! ```
 //!
 //! The real run puts its lineage under a fresh `sync-demo/<stamp>/` prefix

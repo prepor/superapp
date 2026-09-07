@@ -13,8 +13,11 @@ for R2/S3 with the same compare-and-swap contract; see
 
 ## 1. Build
 
+These sync examples use `--no-default-features` so they need no TDLib
+installation.
+
 ```sh
-mise exec -- cargo build -p superapp     # the app and bucketd
+mise exec -- cargo build -p superapp --no-default-features     # the app and bucketd
 ```
 
 ## 2. Start the bucket
@@ -38,7 +41,7 @@ The bucket URL is resolved, in order, from:
 ## 4. Device A — the first to run
 
 ```sh
-mise exec -- cargo run -p superapp -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
+mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
 ```
 
 A finds no lineage, so it **bootstraps**: it becomes the holder, seeds the
@@ -48,7 +51,7 @@ hold the lease*; the inbox is writable.
 ## 5. Device B — a second instance
 
 ```sh
-mise exec -- cargo run -p superapp -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
+mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
 ```
 
 B finds that A holds the lease. It **installs A's snapshot**, gaining the same
@@ -119,7 +122,7 @@ https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>[/<PREFIX>]
 ```sh
 export SUPERAPP_R2_ACCESS_KEY_ID=…      # the access key id
 export SUPERAPP_R2_SECRET_ACCESS_KEY=…  # the token's value
-mise exec -- cargo run -p superapp --bin sync-demo -- \
+mise exec -- cargo run -p superapp --no-default-features --bin sync-demo -- \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>
 ```
 
@@ -134,7 +137,7 @@ SignatureDoesNotMatch` rather than as a puzzling bootstrap four steps later.
 ### 3. Point the app at it
 
 ```sh
-mise exec -- cargo run -p superapp -- --db /tmp/superapp-A.db \
+mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-A.db \
   --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
 ```
 
@@ -146,7 +149,7 @@ The access key id and the token's value are resolved, in order, from:
    keychain, written by:
 
 ```sh
-mise exec -- cargo run -p superapp -- --r2-login    # reads the token's value from stdin, then exits
+mise exec -- cargo run -p superapp --no-default-features -- --r2-login    # reads the token's value from stdin, then exits
 ```
 
 Stdin, not a flag: an argument is in `ps` and in the shell's history, and this
@@ -244,7 +247,7 @@ is gated on each device's DB state, not wall-clock.
 Build for these with `MAKEPAD=headless` **set at build time**:
 
 ```sh
-MAKEPAD=headless mise exec -- cargo build -p superapp
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
 ```
 
 `app/build.rs` mirrors it into `cfg(headless)`, which makes the sync passes run
@@ -288,7 +291,7 @@ client at real AWS S3 with the documentation's example keys.
 SUPERAPP_R2_REGION=us-east-1 \
 SUPERAPP_R2_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
 SUPERAPP_R2_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
-mise exec -- cargo run -p superapp --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
+mise exec -- cargo run -p superapp --no-default-features --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
 # → bucket GET contract-check: 403 InvalidAccessKeyId
 ```
 

@@ -102,11 +102,14 @@ These are remaining limitations, not guarantees provided by this refactor.
 The default workspace tests passed before edits. After the refactor and rebase
 onto `origin/main` (`c78c5f3`):
 
-- Workspace tests: 778 passed without TDLib; 780 passed with `--features tdlib`.
+- Workspace tests: 780 passed with the default TDLib feature; 778 passed with
+  `--no-default-features`.
   Three existing tests remain ignored in each configuration.
 - Strict Clippy passed for all workspace targets in both configurations.
-- The headless build and all 52 end-to-end suites passed, including Telegram's
-  168-step suite and the agent app's suites.
+- Headless builds and all 52 end-to-end suites passed in both configurations,
+  including Telegram's 168-step suite and the agent app's suites.
+- The default executable links `libtdjson`; the opt-out executable does not.
+  The opt-out checks passed with `TDLIB_DIR` pointing to a nonexistent path.
 
 The rebase preserves the agent app and filesystem watchers, adapts both apps to
 the shared table contracts, and uses `SList` for Telegram's list input policy.
