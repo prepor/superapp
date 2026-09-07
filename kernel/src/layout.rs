@@ -413,10 +413,10 @@ impl Ws {
         self.focus = Some(sid);
     }
 
-    /// Closes a slot; focus falls to its nearest surviving neighbour, this
-    /// slot's or a chained descendant's. This one workspace only:
-    /// [`Wm::close`] is what everything outside the module says, and it
-    /// finds the workspace first.
+    /// Closes a slot; focus falls to the panel left of the one that went —
+    /// this slot's neighbour or a chained descendant's. This one workspace
+    /// only: [`Wm::close`] is what everything outside the module says, and
+    /// it finds the workspace first.
     pub fn close(&mut self, sid: SlotId) {
         // A join is one-way context: the child is what this panel pointed
         // at, so it goes with it, transitively — the same reason replacing
@@ -448,8 +448,21 @@ impl Ws {
         if self.focus == Some(sid) {
             self.focus = None;
             if !self.columns.is_empty() {
-                let c = c.min(self.columns.len() - 1);
+                // A column that survives still has a panel standing where
+                // this one did — the row below slid up into it, and focus
+                // stays in place. A column that went takes its place on the
+                // strip with it, and focus falls *left*, back the way the
+                // work came: what stood right of a closed panel is usually
+                // what it opened, and the columns after it merely slid over.
+                let c = if self.columns.len() == cols {
+                    c
+                } else {
+                    c.saturating_sub(1)
+                };
                 let col = &self.columns[c];
+                // Entered on its active tab, like any other arrival at a
+                // tabbed column — a hidden tab has no geometry to land on.
+                let r = if col.tabbed { col.active } else { r };
                 let r = r.min(col.slots.len().saturating_sub(1));
                 self.focus = col.slots.get(r).copied();
             }
@@ -1523,6 +1536,55 @@ mod tests {
         assert_eq!(tags(&ws), [vec!["help"]]);
     }
 
+    /// Closing a column in the middle of the strip hands focus *left*, not
+    /// to whatever slid over into the gap. The panel to the right is
+    /// usually what this one opened; the one to the left is where the work
+    /// came from, and it is what the eye is already on.
+    #[test]
+    fn close_hands_focus_left_not_to_what_slid_over() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let a = open(&mut ws, about(), Some(inbox_id), false);
+        ws.focus = Some(inbox_id);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["inbox"], vec!["about"]]);
+
+        ws.close(inbox_id);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["about"]]);
+        assert_eq!(ws.focus, Some(help_id), "left, not the slot that slid in");
+        assert!(ws.slots.contains_key(&a));
+    }
+
+    /// Nothing to the left: the leftmost column closing takes the next one
+    /// over, which is all there is.
+    #[test]
+    fn closing_the_leftmost_falls_to_what_is_left() {
+        let (mut ws, help_id, inbox_id) = boot();
+        ws.focus = Some(help_id);
+        ws.close(help_id);
+        assert_eq!(tags(&ws), [vec!["inbox"]]);
+        assert_eq!(ws.focus, Some(inbox_id));
+    }
+
+    /// A column that survives the close still has a panel standing where
+    /// the closed one did: focus stays in the column rather than leaving it
+    /// for the neighbour on the left.
+    #[test]
+    fn close_within_a_column_stays_in_the_column() {
+        let mut ws = Ws::new();
+        let h = open(&mut ws, help(), None, false);
+        let a = open(&mut ws, about(), Some(h), false);
+        let b = open(&mut ws, contact("e"), Some(h), false);
+        assert_eq!(
+            tags(&ws),
+            [vec!["help"], vec!["about", "contact"]],
+            "both fit the one column"
+        );
+        ws.focus = Some(a);
+
+        ws.close(a);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["contact"]]);
+        assert_eq!(ws.focus, Some(b), "the row that slid up into the place");
+    }
+
     /// Closing a slot takes its joined chain with it, transitively — the
     /// child is context this panel pointed at, exactly as with a replace.
     /// A panel opened for its own sake is nobody's context and stays.
@@ -1549,8 +1611,8 @@ mod tests {
         assert!(!ws.slots.contains_key(&m) && !ws.slots.contains_key(&c));
         assert!(ws.slots.contains_key(&a));
         assert!(ws.joins.is_empty());
-        // Focus falls to the slot now standing where the closed one
-        // did — the chain went with it, so that is `about`.
+        // Focus was on `about`, which is nobody's context and stayed: a
+        // close only moves focus when it takes the slot focus sat on.
         assert_eq!(ws.focus, Some(a));
         let _ = help_id;
     }
