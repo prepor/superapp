@@ -194,10 +194,14 @@ is not a multi-account dispatcher.
 
 Live commands have store-scoped request ids and pending, completed and failed
 outcomes. Sends wait for final delivery updates, and transfers display byte
-progress when TDLib supplies it. Every Telegram panel shares the status strip;
-failures also appear in Problems and announce a toast. Errors go to stderr and
-`tg-debug.log`, with the request type/id and chat, without command payloads or
-login credentials. Normal `loadChats` 404 replies mean the list is complete.
+progress when TDLib supplies it. Every Telegram panel shares the status strip
+for command progress and connection state. Background history, topic and media
+requests leave this strip unchanged; a chat's header shows loading for its whole
+history walk. Background failures still appear in the strip with recovery
+controls, and all failures also appear in Problems and announce a toast. Errors
+go to stderr and `tg-debug.log`, with the request type/id and chat, without
+command payloads or login credentials. Normal `loadChats` 404 replies mean the
+list is complete.
 
 Failed commands retain their input in memory for an explicit retry, including
 file paths, captions and replies. An accepted but failed send retries TDLib's
