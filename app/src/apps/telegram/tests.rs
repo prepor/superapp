@@ -1861,42 +1861,33 @@ fn nothing_of_a_fixture_session_reaches_the_engine() {
     assert_eq!(said, "draft: nothing leaves — mute");
 }
 
-/// A send the engine refuses — a line past the limit, an attachment that is
-/// not there — gives its words back. The composer is emptied the moment the
-/// request is queued, so the only copy of them is the `@extra` the send wore;
-/// the refusal writes them onto the chat as its draft, and the open composer
-/// takes them back on its next draw.
+/// A refused live send keeps its input in the operation tracker. Correlation
+/// contains no text, and the failure never overwrites a newer composer draft.
 #[test]
-fn a_refused_send_puts_its_words_back_in_the_composer() {
+fn a_refused_send_keeps_its_input_without_overwriting_the_composer() {
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(VERA));
+    let rt = runtime::of(s.store());
+    let inbox = rt.connect();
 
-    // Every send wears the extra, the words last so a line with colons in it
-    // comes home whole; a file's are its caption, and a place has none.
+    // Builders leave correlation to the tracker at the queue boundary.
     let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
-    let sent = v(requests::send_message(VERA, "17:00, or 18:00?", None));
-    assert_eq!(sent["@extra"], format!("send:{VERA}:17:00, or 18:00?"));
+    assert!(v(requests::send_message(VERA, "17:00, or 18:00?", None))["@extra"].is_null());
     let file = model::Carried {
         path: "~/Pictures/trail.png".to_string(),
     };
-    assert_eq!(
-        v(requests::send_file(VERA, None, &file, "under it"))["@extra"],
-        format!("send:{VERA}:under it")
-    );
-    assert_eq!(
-        v(requests::send_location(VERA, None, 48.1, 11.5))["@extra"],
-        format!("send:{VERA}:")
-    );
+    assert!(v(requests::send_file(VERA, None, &file, "under it"))["@extra"].is_null());
+    assert!(v(requests::send_location(VERA, None, 48.1, 11.5))["@extra"].is_null());
 
-    // Sent: the composer and the row are empty, the words in flight. Read
-    // without a draw, so what follows is the refusal arriving before the
-    // panel has looked at the row again — which is the way it arrives.
     with_chat(&s, chat, |c| c.set_draft("17:00, or 18:00?"));
     send(&mut s, chat);
     assert_eq!(draft_row(&s, VERA), "");
     assert_eq!(with_chat(&s, chat, |c| c.draft().to_string()), "");
+    let sent = v(inbox.try_recv().unwrap());
+    assert!(sent["@extra"]["operation"].is_u64());
+    assert!(sent["@extra"]["context"].is_null());
+    with_chat(&s, chat, |c| c.set_draft("never mind"));
 
-    // Refused: the words land back on the row and reach the field.
     let refusal = serde_json::json!({
         "@type": "error",
         "code": 400,
@@ -1904,14 +1895,13 @@ fn a_refused_send_puts_its_words_back_in_the_composer() {
         "@extra": sent["@extra"],
     });
     account().on_update(s.world(), &refusal.to_string());
-    assert_eq!(draft_row(&s, VERA), "17:00, or 18:00?");
-    assert_eq!(field_now(&s, chat), "17:00, or 18:00?");
-
-    // A composer typed in since is newer than the send that failed, and
-    // keeps what it holds.
-    write_draft(&s, VERA, "never mind");
-    account().on_update(s.world(), &refusal.to_string());
     assert_eq!(draft_row(&s, VERA), "never mind");
+    assert_eq!(field_now(&s, chat), "never mind");
+    let op = rt.operations.list().remove(0);
+    assert!(op.line().contains("MESSAGE_TOO_LONG"));
+    assert!(op.retryable());
+    let retry = v(rt.operations.retry(op.id).unwrap());
+    assert_eq!(retry["input_message_content"], sent["input_message_content"]);
 }
 
 /// `my_id` is the one thing that says who the account holder is. Until it

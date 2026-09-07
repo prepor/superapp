@@ -1922,6 +1922,43 @@ fn stopping_a_worker_releases_its_pending_peer_actions() {
 }
 
 #[test]
+fn tracked_profile_deletes_keep_their_own_retry_and_stale_reply_guards() {
+    use super::PeerAction;
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let rt = runtime::of(w.store());
+    acc.on_update(&w, &chat_object(7, "keep until confirmed", json!([])));
+    acc.drain(&w);
+    let last = || serde_json::from_str::<serde_json::Value>(td.sent().last().unwrap()).unwrap();
+
+    assert!(rt.send_peer_action(7, PeerAction::DeleteChat));
+    acc.drain(&w);
+    let refused = last();
+    acc.on_update(&w, &json!({"@type": "error", "code": 403, "message": "forbidden",
+        "@extra": refused["@extra"]}).to_string());
+    assert!(!rt.operations.list()[0].retryable(), "retry must create a new profile-action attempt");
+    assert!(!rt.peer_action_pending(7));
+
+    assert!(rt.send_peer_action(7, PeerAction::DeleteChat));
+    acc.drain(&w);
+    let retired = last();
+    rt.disconnect();
+    let replacement = account(td.clone(), None);
+    replacement.drain(&w);
+    assert!(rt.send_peer_action(7, PeerAction::DeleteChat));
+    replacement.drain(&w);
+    let current = last();
+    replacement.on_update(&w, &json!({"@type": "ok", "@extra": retired["@extra"]}).to_string());
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat WHERE peer = 7"), 1);
+    assert!(rt.peer_action_pending(7), "a stale reply cannot finish the current attempt");
+
+    replacement.on_update(&w, &json!({"@type": "ok", "@extra": current["@extra"]}).to_string());
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat WHERE peer = 7"), 0);
+    assert!(!rt.peer_action_pending(7));
+}
+
+#[test]
 fn workers_consume_only_their_own_stores_commands_and_download_requests() {
     let a = world();
     let b = world();
@@ -2028,6 +2065,31 @@ fn chat_mutations_are_applied_only_after_successful_acknowledgement() {
         &json!({"@type": "ok", "@extra": req["@extra"]}).to_string(),
     );
     assert!(model::peer(w.store(), 7).unwrap().muted);
+}
+
+#[test]
+fn acknowledgements_without_local_changes_never_enter_the_writer() {
+    let acc = account(FakeTd::new(), None);
+    let w = world();
+    // Even an empty write would fail at this gate and create a problem.
+    w.store().db().set_writable(false);
+    for kind in [
+        "getChatHistory",
+        "getMessage",
+        "viewMessages",
+        "deleteMessages",
+        "setChatDraftMessage",
+        "sendMessage",
+    ] {
+        acc.acknowledged(&w, &json!({"@type": kind, "chat_id": 7}));
+        assert!(runtime::of(w.store()).operations.list().is_empty(), "{kind}");
+    }
+    // A mutation still reaches that gate and reports its refusal.
+    acc.acknowledged(
+        &w,
+        &json!({"@type": "toggleChatIsPinned", "chat_id": 7, "is_pinned": true}),
+    );
+    assert!(runtime::of(w.store()).operations.list()[0].line().contains("read-only"));
 }
 
 #[test]

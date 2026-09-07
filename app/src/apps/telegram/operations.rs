@@ -5,7 +5,8 @@
 //! Credentials are never retained or logged. An uncertain send is never retried
 //! automatically: a missing answer does not establish that nothing was sent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
@@ -117,7 +118,7 @@ struct State {
     next: u64,
     operations: BTreeMap<u64, Operation>,
     // TDLib may deliver the final update before the sendMessage response.
-    settled: BTreeMap<(PeerId, i64), Option<String>>,
+    settled: VecDeque<((PeerId, i64), Option<String>)>,
 }
 
 impl Tracker {
@@ -152,13 +153,6 @@ impl Tracker {
         state.next += 1;
         let id = state.next;
         let context = v["@extra"].take();
-        // Older send correlation embeds the text; recovery is now the owned
-        // request, not an echo of the caption in diagnostic metadata.
-        let context = if context.as_str().is_some_and(|s| s.starts_with("send:")) {
-            Value::Null
-        } else {
-            context
-        };
         v["@extra"] = json!({"operation": id, "context": context});
         let secret = matches!(
             kind.as_str(),
@@ -242,7 +236,7 @@ impl Tracker {
         op.status = Status::Pending;
         op.changed = Instant::now();
         for key in previous {
-            state.settled.remove(&key);
+            state.settled.retain(|(saved, _)| *saved != key);
         }
         self.dirty.store(true, Ordering::Relaxed);
         Some(req.to_string())
@@ -255,6 +249,10 @@ impl Tracker {
     }
 
     pub fn fail(&self, store: &Store, id: u64, error: &str, uncertain: bool) {
+        self.fail_at(store.dir(), id, error, uncertain);
+    }
+
+    fn fail_at(&self, dir: Option<&Path>, id: u64, error: &str, uncertain: bool) {
         self.dirty.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         if let Some(op) = state.operations.get_mut(&id) {
@@ -268,7 +266,7 @@ impl Tracker {
             };
             op.changed = Instant::now();
             trace::error(
-                store.dir(),
+                dir,
                 &format!("request {id} {} chat={:?}: {error}", op.kind, op.chat),
             );
         }
@@ -348,7 +346,11 @@ impl Tracker {
                     failed = Some("Telegram did not confirm every message. Check the chat before sending again.".to_string());
                     continue;
                 };
-                match settled.get(&(chat, mid)) {
+                match settled
+                    .iter()
+                    .find(|(key, _)| *key == (chat, mid))
+                    .map(|(_, error)| error)
+                {
                     Some(Some(error)) => {
                         failed = Some(error.clone());
                         op.messages.push((chat, mid));
@@ -394,9 +396,11 @@ impl Tracker {
         let error =
             (update["@type"] == "updateMessageSendFailed").then(|| error_text(&update["error"]));
         let mut state = self.state.lock().unwrap();
-        state.settled.insert((chat, old), error.clone());
+        // Refresh duplicates and evict by arrival order, never by chat id.
+        state.settled.retain(|(key, _)| *key != (chat, old));
+        state.settled.push_back(((chat, old), error.clone()));
         while state.settled.len() > 256 {
-            state.settled.pop_first();
+            state.settled.pop_front();
         }
         let mut failures = Vec::new();
         for op in state
@@ -701,6 +705,64 @@ pub fn retry(store: &Store, id: u64) {
     }
 }
 
+/// Run blocking local work outside the UI thread, using the same visible
+/// progress and errors as wire operations. Only the runtime and log directory
+/// cross threads; the store's reader stays on its owning thread.
+pub fn run_local(
+    store: &Store,
+    chat: Option<PeerId>,
+    what: &str,
+    run: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    let rt = runtime::of(store);
+    let id = {
+        let mut state = rt.operations.state.lock().unwrap();
+        state.next += 1;
+        let id = state.next;
+        state.operations.insert(
+            id,
+            Operation {
+                id,
+                chat,
+                label: what.to_string(),
+                kind: what.to_string(),
+                status: Status::Pending,
+                request: None,
+                messages: Vec::new(),
+                failed_messages: Vec::new(),
+                incomplete_response: false,
+                files: BTreeMap::new(),
+                changed: Instant::now(),
+            },
+        );
+        id
+    };
+    rt.operations.changed();
+    let worker = rt.clone();
+    let dir = store.dir().map(Path::to_path_buf);
+    match std::thread::Builder::new()
+        .name(format!("telegram-{what}"))
+        .spawn(move || {
+            match run() {
+                Ok(()) => {
+                    let mut state = worker.operations.state.lock().unwrap();
+                    if let Some(op) = state.operations.get_mut(&id) {
+                        op.status = Status::Done;
+                        op.changed = Instant::now();
+                    }
+                }
+                Err(error) => worker.operations.fail_at(dir.as_deref(), id, &error, false),
+            }
+            worker.operations.changed();
+        }) {
+        Ok(thread) => Some(thread),
+        Err(error) => {
+            rt.operations.fail(store, id, &error.to_string(), false);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{model::Carried, requests};
@@ -807,6 +869,99 @@ mod tests {
         );
         t.reply(&s, &pending(&req));
         assert_eq!(t.list()[0].status, Status::Done);
+    }
+
+    #[test]
+    fn newest_confirmation_survives_a_full_cache_in_a_lower_id_chat() {
+        for failed in [false, true] {
+            let t = Tracker::default();
+            let s = store();
+            let chat = -1_000_123_456_789_i64;
+            let req = tracked(&t, requests::send_message(chat, "hi", None));
+            let mut update = json!({"@type": "updateMessageSendSucceeded", "old_message_id": 100,
+                "message": {"chat_id": 7, "id": 200}});
+            for id in 0..256 {
+                update["old_message_id"] = json!(id);
+                t.sent(&s, &update);
+            }
+            // Repeated updates refresh their age without consuming capacity.
+            update["old_message_id"] = json!(0);
+            t.sent(&s, &update);
+            update["message"]["chat_id"] = json!(chat);
+            update["old_message_id"] = json!(100);
+            if failed {
+                update["@type"] = json!("updateMessageSendFailed");
+                update["error"] = json!({"code": 403, "message": "CHAT_WRITE_FORBIDDEN"});
+            }
+            t.sent(&s, &update);
+            {
+                let state = t.state.lock().unwrap();
+                assert_eq!(state.settled.len(), 256);
+                assert!(state.settled.iter().any(|(key, _)| *key == (7, 0)));
+                assert!(!state.settled.iter().any(|(key, _)| *key == (7, 1)));
+            }
+            let mut reply = pending(&req);
+            reply["chat_id"] = json!(chat);
+            t.reply(&s, &reply);
+            let op = t.list().remove(0);
+            if failed {
+                assert!(op.retryable());
+                assert!(op.line().contains("CHAT_WRITE_FORBIDDEN"));
+            } else {
+                assert_eq!(op.status, Status::Done);
+            }
+        }
+    }
+
+    #[test]
+    fn local_work_returns_while_pending_then_reports_its_actual_outcome() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let s = store();
+        let rt = runtime::of(&s);
+        for result in [Ok(()), Err("handler refused the file".to_string())] {
+            let (started, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let outcome = result.clone();
+            let worker = run_local(&s, Some(7), "opening media", move || {
+                started.send(thread::current().id()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                outcome
+            })
+            .unwrap();
+            let thread_id = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(thread_id, thread::current().id());
+            let op = rt.operations.list().pop().unwrap();
+            assert_eq!(op.status, Status::Pending);
+            assert!(op.line().contains("opening media…"));
+            rt.operations.take_changed();
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(rt.operations.take_changed());
+            let op = rt.operations.list().pop().unwrap();
+            match result {
+                Ok(()) => assert_eq!(op.status, Status::Done),
+                Err(error) => {
+                    assert_eq!(
+                        op.status,
+                        Status::Failed {
+                            error,
+                            uncertain: false
+                        }
+                    );
+                    assert!(
+                        !op.retryable(),
+                        "local work never goes to the TDLib retry queue"
+                    );
+                    assert!(Failures.list(&s)[0]
+                        .announce
+                        .as_ref()
+                        .unwrap()
+                        .contains("handler refused"));
+                }
+            }
+        }
     }
 
     #[test]

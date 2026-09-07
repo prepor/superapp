@@ -136,38 +136,36 @@ impl<T: Td> Account<T> {
         let Some(chat) = request["chat_id"].as_i64() else {
             return;
         };
-        let request = request.clone();
-        self.filed(
-            w,
-            "applying confirmed change",
-            w.store().write(move |c| match request["@type"].as_str() {
-                Some("setChatNotificationSettings") => model::set_muted_tx(
-                    c,
-                    chat,
-                    request["notification_settings"]["mute_for"]
-                        .as_i64()
-                        .unwrap_or(0)
-                        > 0,
-                ),
-                Some("toggleChatIsPinned") => {
-                    model::set_pinned_tx(c, chat, request["is_pinned"] == true)
-                }
-                Some("addChatToList") => model::set_archived_tx(
-                    c,
-                    chat,
-                    request["chat_list"]["@type"] == "chatListArchive",
-                ),
-                Some("leaveChat") => model::leave_chat_tx(c, chat),
-                Some("deleteChatHistory") => {
+        let result = match request["@type"].as_str() {
+            Some("setChatNotificationSettings") => {
+                let muted = request["notification_settings"]["mute_for"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    > 0;
+                w.store().write(move |c| model::set_muted_tx(c, chat, muted))
+            }
+            Some("toggleChatIsPinned") => {
+                let pinned = request["is_pinned"] == true;
+                w.store().write(move |c| model::set_pinned_tx(c, chat, pinned))
+            }
+            Some("addChatToList") => {
+                let archived = request["chat_list"]["@type"] == "chatListArchive";
+                w.store().write(move |c| model::set_archived_tx(c, chat, archived))
+            }
+            Some("leaveChat") => w.store().write(move |c| model::leave_chat_tx(c, chat)),
+            Some("deleteChatHistory") => {
+                let remove = request["remove_from_chat_list"] == true;
+                w.store().write(move |c| {
                     model::clear_history_tx(c, chat)?;
-                    if request["remove_from_chat_list"] == true {
+                    if remove {
                         model::leave_chat_tx(c, chat)?;
                     }
                     Ok(())
-                }
-                _ => Ok(()),
-            }),
-        );
+                })
+            }
+            _ => return,
+        };
+        self.filed(w, "applying confirmed change", result);
     }
 
     #[must_use]
@@ -514,7 +512,7 @@ impl<T: Td> Account<T> {
 
     /// A plain reply — `ok` or an error — to one of this account's own
     /// requests, told apart by the `@extra` it wore: the chat-list load, a
-    /// history page, and a send.
+    /// history page. Send outcomes are handled by the operation tracker.
     ///
     /// The list load: `ok` says a page landed and there may be another, an
     /// error (TDLib's 404) that the list is complete — after the main list
@@ -586,45 +584,6 @@ impl<T: Td> Account<T> {
                     }
                     None => runtime::of(w.store()).set_loading(chat, false),
                 }
-            }
-            // A send refused — a line past the length limit, an attachment
-            // that is not there, a chat one may not write in. The composer
-            // was emptied the moment the request was queued, so the words are
-            // nowhere but in the `@extra`: they go back on the chat as its
-            // draft, and the open transcript takes them into the field on its
-            // next draw ([`Chat::card`](crate::apps::telegram::Chat)). Onto a
-            // composer somebody has typed in since they do not go — that
-            // draft is newer than this one.
-            //
-            // The line answered and the files carried are not given back:
-            // neither is on the row, and a send is the one place the panel
-            // lets go of them. What was written is the half that cannot be
-            // typed again from what is on the screen.
-            (Some(extra), true) if extra.starts_with("send:") => {
-                let Some((chat, text)) = parse_send_extra(extra) else {
-                    return;
-                };
-                self.log(&format!(
-                    "!! send to {chat} refused: {} {}",
-                    v["code"],
-                    v["message"].as_str().unwrap_or("")
-                ));
-                if text.is_empty() {
-                    return;
-                }
-                let text = text.to_string();
-                self.filed(
-                    w,
-                    "on_reply/send",
-                    w.store().write(move |c| {
-                        c.execute(
-                            "UPDATE tg_chat SET draft = ?2
-                             WHERE peer = ?1 AND COALESCE(draft, '') = ''",
-                            rusqlite::params![chat, text],
-                        )
-                        .map(|_| ())
-                    }),
-                );
             }
             _ => {}
         }

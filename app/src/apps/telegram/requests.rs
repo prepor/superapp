@@ -139,33 +139,7 @@ pub fn send_message(chat_id: PeerId, text: &str, reply_to: Option<MsgId>) -> Str
             "message_id": id,
         });
     }
-    req["@extra"] = json!(send_extra(chat_id, text));
     req.to_string()
-}
-
-/// What a send wears so a refusal can be answered for: the chat it was going
-/// to, and the words the composer held. TDLib echoes an `@extra` back on the
-/// response, error or not, and there is nothing else on a refusal that says
-/// which send it refused.
-///
-/// The words ride in it because the composer is emptied the moment the
-/// request is queued — a send is not a thing one waits on — so by the time
-/// the engine says *no* they are nowhere else. The text is last, and read
-/// back with a limit, so a line with colons in it comes home whole
-/// ([`parse_send_extra`]).
-pub(super) fn send_extra(chat_id: PeerId, text: &str) -> String {
-    format!("send:{chat_id}:{text}")
-}
-
-/// The chat a refused send was going to and the words it carried, or `None`
-/// for any other answer's `@extra`.
-pub(super) fn parse_send_extra(extra: &str) -> Option<(PeerId, &str)> {
-    let mut parts = extra.splitn(3, ':');
-    if parts.next()? != "send" {
-        return None;
-    }
-    let chat = parts.next()?.parse().ok()?;
-    Some((chat, parts.next().unwrap_or_default()))
 }
 
 /// The line a send answers, put on a request the way [`send_message`] puts it:
@@ -226,7 +200,6 @@ pub fn send_file(
         "@type": "sendMessage",
         "chat_id": chat_id,
         "input_message_content": content,
-        "@extra": send_extra(chat_id, caption),
     });
     with_reply(&mut req, reply_to);
     req.to_string()
@@ -255,7 +228,6 @@ pub fn send_location(chat_id: PeerId, reply_to: Option<MsgId>, lat: f64, lon: f6
             "heading": 0,
             "proximity_alert_radius": 0,
         },
-        "@extra": send_extra(chat_id, ""),
     });
     with_reply(&mut req, reply_to);
     req.to_string()
