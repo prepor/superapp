@@ -578,7 +578,8 @@ impl Widget for ChatPanel {
         self.view
             .label(cx, REPLY)
             .set_text(cx, above.as_deref().unwrap_or(""));
-        self.carries(cx, &carrying, props.slot);
+        // Hide staged files with the composer; the chat keeps them for unblocking.
+        self.carries(cx, if can_post { &carrying } else { &[] }, props.slot);
 
         let n = rows.len();
         let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();
