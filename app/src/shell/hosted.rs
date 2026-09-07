@@ -58,9 +58,8 @@ pub enum Ask {
 
 /// The question, and the shared cell the widget answers into.
 ///
-/// A cell rather than a bubbled action, for the reason [`Chord`] is one:
-/// makepad delivers actions on the *next* event, and a gesture has to be
-/// arbitrated now.
+/// Makepad delivers actions on the next event; the shared cell lets a
+/// gesture read its answer during the event being arbitrated.
 #[derive(Clone, Default)]
 pub struct Grab {
     ask: Option<Ask>,

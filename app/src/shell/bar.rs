@@ -276,7 +276,6 @@ mod tests {
         }
     }
 
-
     /// A bar as an app writes one: the label matters only for the drawing.
     fn bar(letters: &[char]) -> Vec<Verb> {
         letters

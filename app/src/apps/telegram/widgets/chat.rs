@@ -824,7 +824,7 @@ impl ChatPanel {
             cx,
             &line.widget(cx, ids!(body.text_wrap.body_txt)),
             props,
-            self.view.widget(cx, LIST).area().rect(cx),
+            clip,
         );
         // The quoted line a reply carries is the way to what it answers.
         if m.reply_to.is_some() {
@@ -842,7 +842,7 @@ impl ChatPanel {
         let Some(md) = m.media.as_ref() else { return };
         if let Some(st) = player {
             let player_w = line.widget(cx, ids!(body.player));
-            if let Some(r) = media::play_rect(cx, &player_w) {
+            if let Some(r) = media::play_rect(cx, &player_w).and_then(|r| visible(r, clip)) {
                 props.hits.add(
                     if st.playing { "pause" } else { "play" },
                     r,

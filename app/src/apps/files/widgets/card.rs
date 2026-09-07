@@ -239,8 +239,6 @@ fn renaming(props: &PanelProps) -> Option<String> {
         .map(str::to_string)
 }
 
-
-
 /// Which reading of which file the instance is holding right now.
 fn shown(props: &PanelProps) -> Option<Shown> {
     // The identity off the instance as a panel, the reading off it as a
