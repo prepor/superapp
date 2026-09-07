@@ -41,7 +41,8 @@ fn tdlib_dir() -> std::path::PathBuf {
 
 /// An account over a fake transport, with the api_id the demo file uses
 /// and a scratch tdlib directory (nothing is written to it but the files
-/// a download test plants — no client runs).
+/// a download test plants — no client runs). Most protocol tests start
+/// authorized; startup tests construct an Account directly or send auth updates.
 fn account(td: FakeTd, phone: Option<&str>) -> Account<FakeTd> {
     let account = Account::new(td, 17844, tdlib_dir(), phone.map(str::to_string));
     // Content fixtures begin connected. Startup tests construct a fresh
@@ -143,6 +144,38 @@ fn a_locked_telegram_session_reports_the_connection_failure_until_auth_resumes()
             "message": "Chat not found", "@extra": "unrelated"}).to_string(),
     );
     assert!(runtime.connection_error().is_none());
+}
+
+/// A retry belongs only to the parameters step. Advancing sign-in cancels
+/// it, and a late failure must not put that step back over the phone prompt.
+#[test]
+fn initialization_retries_stop_when_signin_advances() {
+    let td = FakeTd::new();
+    let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    acc.on_update(&w, &auth("authorizationStateWaitTdlibParameters"));
+    let parameters: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    let error = json!({
+        "@type": "error", "code": 400, "message": "Can't lock file: already in use",
+        "@extra": parameters["@extra"],
+    }).to_string();
+    acc.on_update(&w, &error);
+    acc.on_update(&w, &auth("authorizationStateWaitPhoneNumber"));
+    acc.on_update(&w, &error);
+    clock.advance(super::PARAMETERS_RETRY);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters"]);
+    assert_eq!(state(&w), "wait_phone");
+    assert_eq!(runtime::of(w.store()).connection_note().as_deref(),
+        Some("sign in to Telegram to download media"));
+
+    acc.on_update(&w, &auth("authorizationStateReady"));
+    acc.on_update(&w, &error);
+    clock.advance(super::PARAMETERS_RETRY);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters", "loadChats"]);
+    assert_eq!(runtime::of(w.store()).connection_note(), None);
 }
 
 /// A configured phone is sent the moment TDLib asks for one.

@@ -178,9 +178,13 @@ impl Viewer {
         } else {
             return None;
         };
+        let state = runtime::of(self.world.store());
+        if let Some(note) = state.connection_note() {
+            return Some(note);
+        }
         Some(
             reference
-                .and_then(|key| runtime::of(self.world.store()).download(key))
+                .and_then(|key| state.download(key))
                 .map_or_else(|| "downloading…".to_string(), |progress| progress.note()),
         )
     }

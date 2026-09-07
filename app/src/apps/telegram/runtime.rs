@@ -40,6 +40,7 @@ struct State {
     connection_error: Option<String>,
     list_syncing: bool,
     connection_status: Option<String>,
+    connection_note: Option<String>,
     downloads: HashMap<String, DownloadProgress>,
     wanted: Wanted,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
@@ -266,6 +267,16 @@ impl Runtime {
         self.state().list_syncing = on;
     }
 
+    /// This client's connection state, independent of another process's
+    /// writes to the shared session row. None once this client is ready.
+    pub fn connection_note(&self) -> Option<String> {
+        self.state().connection_note.clone()
+    }
+
+    pub fn set_connection_note(&self, note: Option<&str>) {
+        self.state().connection_note = note.map(str::to_string);
+    }
+
     /// Progress follows the same `tg:` key as the media cache, so a clip and
     /// its poster never share counts. Finished or stopped downloads are removed.
     pub fn set_download(&self, reference: &str, progress: Option<DownloadProgress>) {
@@ -394,6 +405,7 @@ mod tests {
         state.carry_forward(7, vec![42]);
         state.play_on_open(7, 42);
         state.set_list_syncing(true);
+        state.set_connection_note(Some("connecting to Telegram…"));
         let progress = DownloadProgress {
             downloaded: 1024,
             total: Some(4096),
@@ -419,6 +431,7 @@ mod tests {
             );
             assert!(state.loading(7));
             assert!(state.list_syncing());
+            assert_eq!(state.connection_note().as_deref(), Some("connecting to Telegram…"));
             assert_eq!(state.download("tg:photo"), Some(progress));
             let wanted = state.take_wanted();
             assert_eq!(wanted.chats, vec![7]);
@@ -438,6 +451,7 @@ mod tests {
         assert!(other.take_forward().is_none());
         assert!(!other.take_play_on_open(7, 42));
         assert!(!other.loading(7));
+        assert_eq!(other.connection_note(), None);
         assert_eq!(other.download("tg:photo"), None);
         assert_eq!(state.download("tg:photo"), Some(progress));
         assert!(other.take_wanted().files.is_empty());

@@ -1565,7 +1565,7 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
 #[test]
 fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     use kernel::app::{Apps, Env, Mode, Workers};
-    use kernel::caps::{BlobCache, BLOB_BUDGET_DEFAULT};
+    use kernel::caps::{BlobCache, ClockSource, FakeClock, BLOB_BUDGET_DEFAULT};
     use kernel::effect::World;
     use kernel::store::Store;
     use serde_json::json;
@@ -1579,14 +1579,17 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     let apps = Apps::new(APPS);
     let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap());
     apps.seed(&store, Mode::Fake).unwrap();
+    let clock = FakeClock::default();
     let env = Env {
         blobs: BlobCache::at(dir.join("blobs"), BLOB_BUDGET_DEFAULT),
+        clock: ClockSource::Virtual(clock.clone()),
         ..Env::default()
     };
     let world = Rc::new(World::new(store, apps.capabilities(Mode::Fake, &env), apps.registry()));
     let workers = Workers::inline(APPS, world.clone());
     let mut s = Session::new(apps, world, workers, Mode::Fake);
-    let acc = sync::Account::new(FakeTd::new(), 17844, engine.clone(), None);
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, engine.clone(), None);
     acc.drain(s.world());
 
     let history = model::history(s.store(), STELAXIS);
@@ -1606,6 +1609,7 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     }).unwrap();
     let viewer = open_root(&mut s, Viewer::id(STELAXIS, video));
     let picture = open_root(&mut s, Viewer::id(STELAXIS, photo));
+    let signin = open_root(&mut s, SignIn::id());
     let note = |s: &Session, slot| {
         let inst = s.panel(slot).unwrap();
         let mut borrow = inst.borrow_mut();
@@ -1615,6 +1619,43 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
         v.ask_for_picture(&m);
         v.download_note(&m)
     };
+    assert_eq!(note(&s, viewer).as_deref(), Some("connecting to Telegram…"));
+    assert_eq!(note(&s, picture).as_deref(), Some("connecting to Telegram…"));
+    runtime::of(s.store()).want_history(STELAXIS);
+    runtime::of(s.store()).want_line(STELAXIS, video);
+    acc.drain(s.world());
+    assert!(td.sent().is_empty(), "downloads and history must wait for authorization");
+
+    let auth = |state| json!({
+        "@type": "updateAuthorizationState", "authorization_state": {"@type": state}
+    }).to_string();
+    acc.on_update(s.world(), &auth("authorizationStateWaitTdlibParameters"));
+    let parameters: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    acc.on_update(s.world(), &json!({
+        "@type": "error", "code": 400, "message": "Can't lock file: already in use",
+        "@extra": parameters["@extra"]
+    }).to_string());
+    let blocked = "Telegram is open in another app instance · close it to continue";
+    assert_eq!(note(&s, viewer).as_deref(), Some(blocked));
+    assert_eq!(note(&s, picture).as_deref(), Some(blocked));
+    assert_eq!(with_signin(&s, signin, |p| p.note()).as_deref(), Some(blocked));
+
+    clock.advance(4.0);
+    acc.drain(s.world());
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters"]);
+    clock.advance(1.0);
+    acc.drain(s.world());
+    acc.drain(s.world());
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters", "setTdlibParameters"]);
+
+    // When the lock is released, the retry succeeds. The same open viewers
+    // receive their queued files without needing another play or reopen.
+    acc.on_update(s.world(), &auth("authorizationStateReady"));
+    acc.drain(s.world());
+    assert_eq!(td.sent_types(), vec![
+        "setTdlibParameters", "setTdlibParameters", "loadChats",
+        "getRemoteFile", "getRemoteFile", "getMessage", "getChatHistory",
+    ]);
     assert_eq!(note(&s, viewer).as_deref(), Some("downloading…"));
     assert_eq!(note(&s, picture).as_deref(), Some("downloading…"));
 

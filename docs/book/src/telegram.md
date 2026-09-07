@@ -178,6 +178,12 @@ keyed by the media's cache reference. Estimated totals are prefixed with `~`;
 an unknown total is shown as unknown. Finished and stopped downloads clear
 their progress, and the note disappears once the media is available locally.
 
+Downloads and history requested during startup stay queued until this client
+is authorized. If initialization fails, the viewer and sign-in panel show
+the connection problem, including a session held by another app instance.
+Initialization retries every five seconds after a failure; queued media
+starts automatically once Telegram is ready.
+
 ## Modules
 
 | Module | Responsibility |

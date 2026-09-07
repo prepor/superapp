@@ -30,6 +30,8 @@ pub struct ViewerPanel {
     #[rust]
     last_word: String,
     #[rust]
+    last_note: Option<String>,
+    #[rust]
     play: Option<Rect>,
     #[rust]
     seek_bar: Option<SeekBar>,
@@ -166,6 +168,13 @@ impl Widget for ViewerPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let v = &self.view;
+        if note != self.last_note {
+            super::super::trace::note(
+                store_dir.as_deref(),
+                &format!("media: line {} {}", m.id, note.as_deref().unwrap_or("download ready")),
+            );
+            self.last_note = note.clone();
+        }
         // What is on the picture box, by the line and the file it shows —
         // recorded only once the bytes decoded, so a photo that arrives
         // after the panel opened is decoded then, and a line whose media

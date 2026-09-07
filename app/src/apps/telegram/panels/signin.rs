@@ -119,13 +119,16 @@ impl SignIn {
         }
     }
 
-    /// The note under the line once signed in: what the store holds so far,
+    /// A connection problem, or once signed in, what the store holds so far,
     /// as counts — `syncing · 210 chats · 4 812 lines`. Counts rather than a
     /// sentence, so a sync that fills the list and never a transcript shows
     /// as what it is (2026-09-07: a night of *your chats are syncing* over
     /// zero lines).
     #[must_use]
     pub fn note(&self) -> Option<String> {
+        if let Some(note) = super::super::runtime::of(&self.store).connection_note() {
+            return Some(note);
+        }
         if self.state() != "ready" {
             return None;
         }
