@@ -3,13 +3,15 @@
 //! The store's readers share this value through `Store::local`. A fixture
 //! gets its own value even when it draws the same chat ids as the live app.
 //! Commands (including login secrets) stay in memory and go through the
-//! worker's inbox. Dropping that inbox disconnects the send side.
+//! worker's inbox. Closing the session or dropping that inbox disconnects
+//! the send side and releases actions whose replies can no longer arrive.
 
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
 use kernel::store::Store;
 
 use super::model::{MsgId, PeerId};
+use super::requests::PeerAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
@@ -25,11 +27,59 @@ pub struct Runtime {
 #[derive(Default)]
 struct State {
     sender: Option<mpsc::Sender<String>>,
+    connection: u64,
+    next_action: u64,
     forward: Option<Forward>,
     play_next: Option<(PeerId, MsgId)>,
     loading: Vec<PeerId>,
     list_syncing: bool,
     wanted: Wanted,
+    peer_actions: Vec<(PeerId, PeerAction, u64)>,
+    notices: Vec<(String, bool)>,
+}
+
+impl State {
+    fn disconnect(&mut self) {
+        self.sender = None;
+        if !self.peer_actions.is_empty() {
+            self.peer_actions.clear();
+            self.notices.push(("Telegram disconnected before confirming pending user actions".to_string(), true));
+        }
+    }
+}
+
+/// One worker's command connection. A replaced worker can neither drain old
+/// commands nor disconnect its successor when it stops.
+pub struct Inbox {
+    receiver: mpsc::Receiver<String>,
+    runtime: Weak<Runtime>,
+    connection: u64,
+}
+
+impl Inbox {
+    pub fn try_recv(&self) -> Result<String, mpsc::TryRecvError> {
+        let runtime = self.runtime.upgrade().ok_or(mpsc::TryRecvError::Disconnected)?;
+        let state = runtime.state();
+        if state.connection != self.connection || state.sender.is_none() {
+            return Err(mpsc::TryRecvError::Disconnected);
+        }
+        self.receiver.try_recv()
+    }
+
+    pub fn try_iter(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+}
+
+impl Drop for Inbox {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            let mut state = runtime.state();
+            if state.connection == self.connection {
+                state.disconnect();
+            }
+        }
+    }
 }
 
 /// Work requested since the last worker pass. Deduplicated at enqueue time.
@@ -50,10 +100,19 @@ impl Runtime {
     }
 
     /// Called by the worker on its first pass, never by a panel.
-    pub fn connect(&self) -> mpsc::Receiver<String> {
+    pub fn connect(self: &Arc<Self>) -> Inbox {
         let (sender, receiver) = mpsc::channel();
-        self.state().sender = Some(sender);
-        receiver
+        let mut state = self.state();
+        state.disconnect();
+        state.connection += 1;
+        state.sender = Some(sender);
+        Inbox { receiver, runtime: Arc::downgrade(self), connection: state.connection }
+    }
+
+    /// TDLib is logging out or closing. Keep the old inbox retired until a
+    /// new account connects, and leave durable peer state to server updates.
+    pub fn disconnect(&self) {
+        self.state().disconnect();
     }
 
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
@@ -62,6 +121,44 @@ impl Runtime {
             .sender
             .as_ref()
             .is_some_and(|sender| sender.send(request.to_string()).is_ok())
+    }
+
+    /// Serialize profile actions for each person until their reply arrives.
+    pub fn send_peer_action(&self, peer: PeerId, action: PeerAction) -> bool {
+        let mut state = self.state();
+        if state.peer_actions.iter().any(|(id, _, _)| *id == peer) {
+            return false;
+        }
+        state.next_action += 1;
+        let id = state.next_action;
+        if state.sender.as_ref().is_none_or(|s| s.send(action.request(peer, id)).is_err()) {
+            return false;
+        }
+        state.peer_actions.push((peer, action, id));
+        true
+    }
+
+    pub fn peer_action_pending(&self, peer: PeerId) -> bool {
+        self.state().peer_actions.iter().any(|(id, _, _)| *id == peer)
+    }
+
+    /// Only this attempt's reply may finish it; late replies after a
+    /// disconnect cannot complete a retry or change its projected state.
+    pub fn finish_peer_action(&self, peer: PeerId, action: PeerAction, id: u64) -> bool {
+        let mut state = self.state();
+        let Some(index) = state.peer_actions.iter().position(|p| *p == (peer, action, id)) else {
+            return false;
+        };
+        state.peer_actions.remove(index);
+        true
+    }
+
+    pub fn notice(&self, text: String, error: bool) {
+        self.state().notices.push((text, error));
+    }
+
+    pub fn take_notices(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.state().notices)
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {
@@ -139,6 +236,20 @@ fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_worker_releases_peer_actions_and_retires_its_inbox() {
+        let state = Arc::new(Runtime::default());
+        let old = state.connect();
+        assert!(state.send_peer_action(7, PeerAction::Block));
+        let new = state.connect();
+        assert!(!state.peer_action_pending(7));
+        assert!(old.try_recv().is_err(), "the retired inbox cannot send a cancelled request");
+        assert!(state.send_peer_action(7, PeerAction::Block));
+        drop(old);
+        assert!(state.peer_action_pending(7), "dropping an old inbox cannot reset its replacement");
+        assert!(new.try_recv().is_ok());
+    }
 
     #[test]
     fn coordination_follows_the_database_across_threads() {

@@ -1,0 +1,46 @@
+# Profile actions follow the chat's about link. Destructive actions explain
+# their scope and can be cancelled by button or Escape. This fixture has no
+# account, so confirming only toasts; protocol tests cover server replies.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+wait 700
+click "about"
+wait 700
+click "block user"
+wait 300
+click "Block Vera Kovac? They won't be able to message you or see your status and photo."
+shot telegram-block-confirm
+click "cancel"
+wait 300
+click "delete contact"
+wait 300
+click "Delete Vera Kovac from your contacts? Your conversation will stay."
+key esc
+wait 300
+click "delete chat"
+wait 300
+click "Delete your chat with Vera Kovac? This removes your messages and chat from your list. Their copy will stay."
+shot telegram-delete-confirm
+click "cancel"
+wait 300
+click "block user"
+wait 300
+click "confirm block user"
+wait 300
+click "delete contact"
+wait 300
+click "confirm delete contact"
+wait 300
+click "delete chat"
+wait 300
+click "confirm delete chat"
+wait 300
+click "chat"
+wait 500
+quit

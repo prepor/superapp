@@ -13,9 +13,10 @@ use rusqlite::Connection;
 /// status row the real client writes, then the repair of `V1`'s one
 /// in-place edit, the reply freed from the window, the clip a moving
 /// picture plays, whether a chat is mine at all, and the message given a row
-/// key of its own. A fresh store runs every rung, a store already at a rung
-/// only the later ones — which is why a rung, once run anywhere, must not
-/// change: see [`V4`](v4_media_columns).
+/// key of its own, message link metadata, and the person's block state. A
+/// fresh store runs every rung, a store already at a rung only the later
+/// ones — which is why a rung, once run anywhere, must not change: see
+/// [`V4`](v4_media_columns).
 pub static SCHEMA: Schema = Schema {
     app: "telegram",
     steps: &[
@@ -29,6 +30,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V8),
         Step::Sql(V9),
         Step::Sql(V10),
+        Step::Sql(V11),
     ],
 };
 
@@ -42,6 +44,9 @@ const V10: &str = "
 ALTER TABLE tg_message ADD COLUMN entities_known INTEGER NOT NULL DEFAULT 0;
 UPDATE tg_message SET entities_known = 1 WHERE entities != '[]';
 ";
+
+// Blocking belongs to the person, so deleting their chat keeps the block.
+const V11: &str = "ALTER TABLE tg_peer ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0";
 
 const V1: &str = "
 CREATE TABLE tg_peer(
@@ -587,6 +592,33 @@ mod tests {
         assert_eq!(known, vec![false, true]);
         let stored: String = c.query_row("SELECT entities FROM tg_message WHERE id = 2", [], |r| r.get(0)).unwrap();
         assert!(stored.contains("https://example.org"));
+    }
+
+    #[test]
+    fn v11_preserves_existing_contacts_messages_and_link_metadata() {
+        let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..10] };
+        let c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        old.apply(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO tg_peer(id, kind, name, is_contact) VALUES(10, 'person', 'Vera', 1);
+             INSERT INTO tg_chat(peer) VALUES(10);",
+        ).unwrap();
+        let entities = r#"[{"offset":0,"length":7,"type":{"@type":"textEntityTypeTextUrl","url":"https://example.org"}}]"#;
+        c.execute(
+            "INSERT INTO tg_message(id, chat, date, text, entities, entities_known) VALUES(1, 10, 1.0, 'keep me', ?1, 1)",
+            [entities],
+        ).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        assert_eq!(c.query_row("SELECT is_contact, blocked FROM tg_peer WHERE id = 10", [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap(), (1, 0));
+        let message: (String, String, bool) = c.query_row(
+            "SELECT text, entities, entities_known FROM tg_message WHERE chat = 10 AND id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(message, ("keep me".to_string(), entities.to_string(), true));
     }
 
     /// The upgrade path a fresh store never walks: a store already carrying

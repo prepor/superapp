@@ -140,6 +140,13 @@ impl App for Telegram {
         vec![Box::new(search::TelegramSearch)]
     }
 
+    fn poll(&self, s: &mut kernel::session::Session) {
+        for (text, error) in runtime::of(s.store()).take_notices() {
+            s.notify(text, error);
+            s.redraw();
+        }
+    }
+
     /// The list, the people, the chat with oneself, and the door an account
     /// signs in through.
     fn roots(&self) -> Vec<Root> {

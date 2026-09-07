@@ -571,6 +571,8 @@ pub struct PeerCard {
     pub admin: bool,
     pub is_contact: bool,
     pub is_self: bool,
+    /// On Telegram's main block list (the stories-only list is separate).
+    pub blocked: bool,
     /// The chat's, where I have one.
     pub muted: bool,
     pub pinned: i64,
@@ -592,6 +594,9 @@ impl PeerCard {
     /// name. `typing…` while somebody is.
     #[must_use]
     pub fn status_line(&self) -> String {
+        if self.blocked {
+            return "blocked".to_string();
+        }
         if let Some(who) = &self.typing {
             return match self.kind {
                 PeerKind::Person => "typing…".to_string(),
@@ -636,10 +641,10 @@ impl PeerCard {
         parts.join(" · ")
     }
 
-    /// Whether the composer stands: everywhere but a channel I do not run.
+    /// Whether the composer stands: unblock a person before writing to them.
     #[must_use]
     pub fn can_post(&self) -> bool {
-        self.kind != PeerKind::Channel || self.admin
+        !self.blocked && (self.kind != PeerKind::Channel || self.admin)
     }
 
     /// The composer's empty text, with the key that reaches it — the way
@@ -1128,7 +1133,7 @@ static Q_PEER: Q = Q {
                  p.online, p.admin, p.is_contact, p.is_self,
                  COALESCE(c.muted, 0), COALESCE(c.pinned, 0), COALESCE(c.archived, 0),
                  COALESCE(c.unread, 0), c.last_read, c.draft, c.typing, COALESCE(c.mention, 0),
-                 COALESCE(c.in_main, 0)
+                 COALESCE(c.in_main, 0), p.blocked
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           WHERE p.id = ?1",
     describe: "one peer, with the flags of the chat I have with it",
@@ -1157,6 +1162,7 @@ fn peer_card_row(r: &rusqlite::Row) -> rusqlite::Result<PeerCard> {
         typing: r.get(18)?,
         mention: r.get::<_, i64>(19)? != 0,
         in_main: r.get::<_, i64>(20)? != 0,
+        blocked: r.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -1729,6 +1735,24 @@ pub fn leave_chat_tx(c: &rusqlite::Connection, peer: PeerId) -> rusqlite::Result
     c.execute("DELETE FROM tg_member WHERE chat = ?1", [peer])?;
     c.execute("DELETE FROM tg_folder_chat WHERE chat = ?1", [peer])?;
     c.execute("DELETE FROM tg_chat WHERE peer = ?1", [peer])?;
+    Ok(())
+}
+
+/// Changes a person's block without touching their contact or conversation.
+pub fn set_blocked_tx(c: &rusqlite::Connection, peer: PeerId, blocked: bool) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE tg_peer SET blocked = ?2 WHERE id = ?1 AND id > 0 AND kind = 'person' AND is_self = 0",
+        rusqlite::params![peer, blocked],
+    )?;
+    Ok(())
+}
+
+/// Removes a contact while keeping their identity, messages and memberships.
+pub fn delete_contact_tx(c: &rusqlite::Connection, peer: PeerId) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE tg_peer SET is_contact = 0 WHERE id = ?1 AND kind = 'person' AND is_self = 0",
+        [peer],
+    )?;
     Ok(())
 }
 

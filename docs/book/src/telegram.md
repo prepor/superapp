@@ -19,6 +19,38 @@ and ordinary dotted words stay plain. Older cached labeled links and URLs withou
 a scheme become available when their entities are fetched again. Code spans stay
 literal.
 
+## User actions
+
+A conversation's **about** link opens the person's profile. **Block user**
+prevents incoming messages and hides your status and photo; **unblock user**
+reverses it. A blocked conversation keeps its history and draft, shows
+**blocked**, and offers **unblock user** in place of attachments and sending.
+Reply and edit actions also disappear from individual message cards; work
+already in progress stays hidden until the person is unblocked.
+Blocking and unblocking are unavailable on your own profile or on groups
+and channels.
+
+**Delete contact** removes the person from the address book and keeps their
+conversation. **Delete chat** removes your copy of the conversation from your
+chat list and local search, preserving the person's contact and blocked state.
+The other person's copy remains. Blocking, deleting a contact and deleting a
+chat first show their consequence, with **confirm** and **cancel**; Escape
+also cancels. Unblocking takes effect without another confirmation.
+Blocked people remain findable by name in search after deleting their contact
+and chat, so their profile still provides a way to unblock them.
+
+These distinctions follow the macOS reference client's
+[user info actions](https://github.com/overtake/TelegramSwift/blob/579cebbf0c01fd41b712eff3647fa7f69db9665d/Telegram-Mac/UserInfoEntries.swift#L662).
+Requests use TDLib's `setMessageSenderBlockList`, `removeContacts` and
+`deleteChatHistory` with `revoke: false`. Local changes wait for a successful
+reply or a server update; failures are shown in a toast. Offline fixtures
+describe the request without changing contacts, blocks or conversations.
+Ending a session or stopping its worker clears pending actions and reports
+the missing confirmation, so they can be retried after reconnecting. Late
+replies cannot complete a later attempt.
+Block state also follows chat snapshots and user full info, including changes
+made on another device; the stories-only block list does not block messages.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

@@ -1088,6 +1088,285 @@ fn the_card_links_to_the_chat_its_messages_and_the_members() {
     assert!(verb_ids(&s, old).contains(&"telegram.unarchive"));
 }
 
+#[test]
+fn blocked_lines_cannot_start_a_reply_or_edit() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let mine = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().id;
+    with_chat(&s, chat, |c| {
+        c.set_cursor(mine);
+        c.set_draft("keep this draft");
+    });
+    verb(&mut s, chat, "telegram.line");
+    let line = s.joined_child(chat).unwrap();
+    assert!(verb_ids(&s, line).contains(&"telegram.reply"));
+    assert!(verb_ids(&s, line).contains(&"telegram.edit"));
+
+    s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
+    for slot in [chat, line] {
+        for action in ["telegram.reply", "telegram.edit"] {
+            assert!(!verb_ids(&s, slot).contains(&action));
+            // A click already queued before the block must be refused too.
+            s.panel(slot).unwrap().borrow_mut().run(action, &mut s);
+            s.settle();
+        }
+    }
+    assert_eq!(s.focus(), Some(line), "a refused action never focuses the hidden composer");
+    with_chat(&s, chat, |c| {
+        c.reply(mine);
+        assert!(!c.edit(mine), "direct callers cannot bypass the block");
+        assert_eq!(c.reply_to(), None);
+        assert!(c.editing().is_none());
+        assert_eq!(c.field_text(), "keep this draft");
+        assert!(!c.take_field_wish());
+        assert!(c.above_line(s.now()).is_none());
+    });
+
+    s.store().write(|c| model::set_blocked_tx(c, VERA, false)).unwrap();
+    verb(&mut s, line, "telegram.reply");
+    assert_eq!(with_chat(&s, chat, |c| c.reply_to()), Some(mine));
+    verb(&mut s, line, "telegram.edit");
+    assert_eq!(with_chat(&s, chat, |c| c.editing().unwrap().msg), mine);
+}
+
+#[test]
+fn blocking_hides_existing_replies_and_edits_until_unblocked() {
+    for editing in [false, true] {
+        let mut s = session();
+        let chat = open_root(&mut s, Chat::id(VERA));
+        let mine = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().id;
+        with_chat(&s, chat, |c| {
+            c.set_draft("keep this draft");
+            if editing {
+                assert!(c.edit(mine));
+                c.typed("keep this edit");
+            } else {
+                c.reply(mine);
+            }
+        });
+        let text = field_now(&s, chat);
+        let above = with_chat(&s, chat, |c| c.above_line(s.now()));
+        assert!(above.is_some());
+        s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
+        assert!(with_chat(&s, chat, |c| c.above_line(s.now()).is_none()));
+        send(&mut s, chat);
+        assert_eq!(field_now(&s, chat), text, "blocking keeps unsent work");
+        assert_eq!(draft_row(&s, VERA), "keep this draft");
+        s.store().write(|c| model::set_blocked_tx(c, VERA, false)).unwrap();
+        assert_eq!(with_chat(&s, chat, |c| c.above_line(s.now())), above);
+        assert_eq!(field_now(&s, chat), text);
+    }
+}
+
+#[test]
+fn ended_sessions_release_pending_peer_actions_and_restore_the_bars() {
+    for state in ["authorizationStateLoggingOut", "authorizationStateClosing", "authorizationStateClosed"] {
+        let mut s = session();
+        let profile = open_root(&mut s, Peer::id(VERA));
+        let chat = open_root(&mut s, Chat::id(VERA));
+        let runtime = runtime::of(s.store());
+        let inbox = runtime.connect();
+        let acc = account();
+        verb(&mut s, profile, "telegram.block");
+        verb(&mut s, profile, "telegram.confirm");
+        let _request = inbox.try_recv().unwrap();
+        // Telegram can announce the block before acknowledging the request.
+        s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
+        assert!(verb_ids(&s, profile).is_empty());
+        assert!(!verb_ids(&s, chat).contains(&"telegram.unblock"));
+
+        acc.on_update(s.world(), &serde_json::json!({
+            "@type": "updateAuthorizationState", "authorization_state": { "@type": state },
+        }).to_string());
+        s.settle();
+        assert!(!runtime.peer_action_pending(VERA), "{state}");
+        assert!(verb_ids(&s, profile).contains(&"telegram.unblock"));
+        assert!(verb_ids(&s, chat).contains(&"telegram.unblock"));
+        assert!(s.notes().last().unwrap().msg.contains("disconnected"));
+        assert!(model::peer(s.store(), VERA).unwrap().blocked, "an interrupted request has no assumed result");
+        verb(&mut s, chat, "telegram.unblock");
+        assert!(!runtime.peer_action_pending(VERA), "a closed session cannot queue another action");
+
+        let reconnected = runtime.connect();
+        verb(&mut s, chat, "telegram.unblock");
+        assert!(runtime.peer_action_pending(VERA));
+        assert!(reconnected.try_recv().unwrap().contains("setMessageSenderBlockList"));
+    }
+}
+
+#[test]
+fn blocking_waits_for_confirmation_and_acknowledgement() {
+    use serde_json::{json, Value};
+    let mut s = session();
+    let profile = open_root(&mut s, Peer::id(VERA));
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let inbox = runtime::of(s.store()).connect();
+    let acc = account();
+
+    verb(&mut s, profile, "telegram.block");
+    assert_eq!(verb_ids(&s, profile), vec!["telegram.confirm", "telegram.cancel"]);
+    assert!(inbox.try_recv().is_err());
+    verb(&mut s, profile, "telegram.cancel");
+    assert!(!model::peer(s.store(), VERA).unwrap().blocked);
+
+    verb(&mut s, profile, "telegram.block");
+    verb(&mut s, profile, "telegram.confirm");
+    let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(req["@type"], "setMessageSenderBlockList");
+    assert_eq!(req["sender_id"], json!({"@type": "messageSenderUser", "user_id": VERA}));
+    assert_eq!(req["block_list"], json!({"@type": "blockListMain"}));
+    assert!(!model::peer(s.store(), VERA).unwrap().blocked, "queueing is not success");
+    assert!(verb_ids(&s, profile).is_empty(), "no duplicate action while waiting");
+    acc.on_update(s.world(), &json!({
+        "@type": "error", "code": 400, "message": "USER_ID_INVALID", "@extra": req["@extra"],
+    }).to_string());
+    s.settle();
+    assert!(!model::peer(s.store(), VERA).unwrap().blocked);
+    assert!(s.notes().last().unwrap().msg.contains("USER_ID_INVALID"));
+
+    verb(&mut s, profile, "telegram.block");
+    verb(&mut s, profile, "telegram.confirm");
+    let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    acc.on_update(s.world(), &json!({"@type": "ok", "@extra": req["@extra"]}).to_string());
+    s.settle();
+    let card = model::peer(s.store(), VERA).unwrap();
+    assert!(card.blocked && card.is_contact && card.in_main);
+    assert_eq!(card.status_line(), "blocked");
+    assert!(!card.can_post());
+    assert!(verb_ids(&s, profile).contains(&"telegram.unblock"));
+    assert!(verb_ids(&s, chat).contains(&"telegram.unblock"));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.attach"));
+
+    with_chat(&s, chat, |c| c.set_draft("keep these words"));
+    send(&mut s, chat);
+    assert_eq!(draft_row(&s, VERA), "keep these words");
+    assert!(inbox.try_recv().is_err(), "a blocked composer sends nothing");
+    let place = open_root(&mut s, Place::id(VERA));
+    verb(&mut s, place, "telegram.send_place");
+    assert!(inbox.try_recv().is_err(), "an open location panel cannot bypass the block");
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| {
+        let i = c.rows(0, 100).iter().position(|r| r.peer == VERA).unwrap();
+        c.go(i);
+    });
+    runtime::of(s.store()).carry_forward(STELAXIS, vec![1]);
+    verb(&mut s, list, "telegram.forward_here");
+    assert!(inbox.try_recv().is_err(), "forwarding to a blocked user sends nothing");
+    assert!(runtime::of(s.store()).pending_forward().is_some());
+    verb(&mut s, chat, "telegram.unblock");
+    let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(req["@type"], "setMessageSenderBlockList");
+    assert!(req["block_list"].is_null());
+    assert!(model::peer(s.store(), VERA).unwrap().blocked);
+    acc.on_update(s.world(), &json!({"@type": "ok", "@extra": req["@extra"]}).to_string());
+    s.settle();
+    assert!(model::peer(s.store(), VERA).unwrap().can_post());
+    assert_eq!(field_now(&s, chat), "keep these words");
+}
+
+#[test]
+fn deleting_a_contact_keeps_the_conversation_and_deleting_the_chat_keeps_the_block() {
+    use serde_json::{json, Value};
+    let mut s = session();
+    let profile = open_root(&mut s, Peer::id(VERA));
+    let contacts = open_root(&mut s, Contacts::id());
+    let history = model::history(s.store(), VERA);
+    let inbox = runtime::of(s.store()).connect();
+    let acc = account();
+    s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
+
+    verb(&mut s, profile, "telegram.delete_contact");
+    assert!(inbox.try_recv().is_err());
+    verb(&mut s, profile, "telegram.confirm");
+    let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(req["@type"], "removeContacts");
+    assert_eq!(req["user_ids"], json!([VERA]));
+    assert!(model::peer(s.store(), VERA).unwrap().is_contact);
+    acc.on_update(s.world(), &json!({"@type": "ok", "@extra": req["@extra"]}).to_string());
+    s.settle();
+    let card = model::peer(s.store(), VERA).unwrap();
+    assert!(!card.is_contact && card.blocked && card.in_main);
+    assert_eq!(model::history(s.store(), VERA), history);
+    assert!(!verb_ids(&s, profile).contains(&"telegram.delete_contact"));
+    let inst = s.panel(contacts).unwrap();
+    let mut people = inst.borrow_mut();
+    assert!(!people.as_any().downcast_mut::<People>().unwrap().rows(0, 100).iter().any(|p| p.id == VERA));
+    drop(people);
+
+    // A failed deletion must leave the chat, messages and search index intact.
+    for fail in [true, false] {
+        verb(&mut s, profile, "telegram.delete");
+        verb(&mut s, profile, "telegram.confirm");
+        let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        assert_eq!(req["@type"], "deleteChatHistory");
+        assert_eq!(req["chat_id"], VERA);
+        assert_eq!(req["remove_from_chat_list"], true);
+        assert_eq!(req["revoke"], false);
+        assert_eq!(model::history(s.store(), VERA), history);
+        acc.on_update(s.world(), &json!({
+            "@type": if fail { "error" } else { "ok" }, "@extra": req["@extra"],
+            "code": 400, "message": "CHAT_DELETE_FAILED",
+        }).to_string());
+        s.settle();
+        if fail {
+            assert_eq!(model::history(s.store(), VERA), history);
+            assert!(model::peer(s.store(), VERA).unwrap().in_main);
+            assert!(s.notes().last().unwrap().msg.contains("CHAT_DELETE_FAILED"));
+        }
+    }
+    let card = model::peer(s.store(), VERA).unwrap();
+    assert!(card.blocked && !card.in_main && !card.archived);
+    assert!(model::history(s.store(), VERA).is_empty());
+    assert!(super::project::search_local(s.store().conn(), Some(VERA), "thermos").is_empty());
+    assert!(verb_ids(&s, profile).contains(&"telegram.unblock"));
+    assert!(!verb_ids(&s, profile).contains(&"telegram.delete"));
+    let mut engine = Engine::inline(s.apps().providers());
+    engine.ask(s.store(), 1, "vera");
+    let hits: Vec<_> = engine.collect().into_iter().flat_map(|a| a.hits).collect();
+    let hit = hits.iter().find(|h| h.label == "Vera Kovac").unwrap();
+    assert_eq!(hit.detail, "blocked");
+    assert_eq!(hit.go, Go::Open(Peer::id(VERA)), "the user can still find and unblock them");
+}
+
+#[test]
+fn user_actions_exclude_self_and_groups_and_offline_actions_do_not_claim_success() {
+    let mut s = session();
+    for peer in [SELF, STELAXIS, RUST_WEEKLY] {
+        let profile = open_root(&mut s, Peer::id(peer));
+        for action in ["telegram.block", "telegram.unblock", "telegram.delete_contact"] {
+            assert!(!verb_ids(&s, profile).contains(&action));
+            s.panel(profile).unwrap().borrow_mut().run(action, &mut s);
+            assert!(!runtime::of(s.store()).peer_action_pending(peer));
+        }
+        assert!(!model::peer(s.store(), peer).unwrap().blocked);
+    }
+    let profile = open_root(&mut s, Peer::id(VERA));
+    for action in ["telegram.block", "telegram.delete_contact", "telegram.delete"] {
+        verb(&mut s, profile, action);
+        verb(&mut s, profile, "telegram.confirm");
+        assert!(s.notes().last().unwrap().msg.starts_with("draft: nothing leaves"));
+    }
+    let card = model::peer(s.store(), VERA).unwrap();
+    assert!(!card.blocked && card.is_contact && card.in_main);
+}
+
+#[test]
+fn a_contact_without_a_chat_fetches_their_block_state_on_open() {
+    use serde_json::{json, Value};
+    let mut s = session();
+    let inbox = runtime::of(s.store()).connect();
+    let profile = open_root(&mut s, Peer::id(IVAN));
+    let req: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(req["@type"], "getUserFullInfo");
+    assert_eq!(req["user_id"], IVAN);
+    account().on_update(s.world(), &json!({
+        "@type": "userFullInfo", "@extra": req["@extra"],
+        "block_list": {"@type": "blockListMain"},
+    }).to_string());
+    assert!(verb_ids(&s, profile).contains(&"telegram.unblock"));
+    assert!(!verb_ids(&s, profile).contains(&"telegram.delete"));
+}
+
 /// Off the wire the verbs about a chat say what would have left and change
 /// nothing — the demo world is what a store with no account shows. Leaving
 /// is the one that acts anyway: the conversation goes from the store, the

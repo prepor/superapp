@@ -50,7 +50,7 @@ const TYPING_FOR: f64 = 6.0;
 /// password) and waits for the UI to supply it — never guessing a secret.
 pub struct Account<T: Td> {
     td: T,
-    commands: std::cell::RefCell<Option<std::sync::mpsc::Receiver<String>>>,
+    commands: std::cell::RefCell<Option<runtime::Inbox>>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -336,8 +336,12 @@ impl<T: Td> Account<T> {
                 write(None, "ready", None);
                 self.on_ready(w);
             }
-            Some("authorizationStateLoggingOut") => write(None, "logging_out", None),
+            Some("authorizationStateLoggingOut") => {
+                runtime::of(w.store()).disconnect();
+                write(None, "logging_out", None);
+            }
             Some("authorizationStateClosing" | "authorizationStateClosed") => {
+                runtime::of(w.store()).disconnect();
                 write(None, "closed", None);
             }
             // States this phase does not sign in through — WaitRegistration,
@@ -405,6 +409,30 @@ impl<T: Td> Account<T> {
     /// error (TDLib's 404) that the list is complete — after the main list
     /// the archive is loaded the same way, and after the archive nothing.
     fn on_reply(&self, w: &World, v: &Value, failed: bool) {
+        if let Some((action, peer, id)) = PeerAction::from_reply(v) {
+            let runtime = runtime::of(w.store());
+            if !runtime.finish_peer_action(peer, action, id) {
+                return;
+            }
+            let name = model::peer(w.store(), peer).map_or_else(|| peer.to_string(), |p| p.name);
+            let result = if failed {
+                Err(v["message"].as_str().unwrap_or("request failed").to_string())
+            } else {
+                w.store().write(move |c| match action {
+                    PeerAction::Block | PeerAction::Unblock => {
+                        ensure_peer(c, peer)?;
+                        model::set_blocked_tx(c, peer, action == PeerAction::Block)
+                    }
+                    PeerAction::DeleteContact => model::delete_contact_tx(c, peer),
+                    PeerAction::DeleteChat => model::leave_chat_tx(c, peer),
+                }).map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(()) => runtime.notice(format!("{} · {name}: done", action.word()), false),
+                Err(error) => runtime.notice(format!("{} · {name}: {error}", action.word()), true),
+            }
+            return;
+        }
         match (v["@extra"].as_str(), failed) {
             (Some("load_chats:main"), false) => self.td.send(&load_chats(ChatList::Main)),
             (Some("load_chats:main"), true) | (Some("load_chats:archive"), false) => {
@@ -580,6 +608,24 @@ impl<T: Td> Account<T> {
             Some("updateOption") => self.on_option(w, update),
             Some("updateUser") => self.on_user(w, &update["user"]),
             Some("updateUserStatus") => self.on_user_status(w, update),
+            Some("updateChatBlockList") => {
+                if let Some(peer) = update["chat_id"].as_i64() {
+                    self.on_blocked(w, peer, updates::blocked(update));
+                }
+            }
+            Some("updateUserFullInfo") if update["user_full_info"].is_object() => {
+                if let Some(peer) = update["user_id"].as_i64() {
+                    self.on_blocked(w, peer, updates::blocked(&update["user_full_info"]));
+                }
+            }
+            Some("userFullInfo") => {
+                if let Some(peer) = update["@extra"].as_str()
+                    .and_then(|s| s.strip_prefix("user_full_info:"))
+                    .and_then(|s| s.parse().ok())
+                {
+                    self.on_blocked(w, peer, updates::blocked(update));
+                }
+            }
             // The groups behind the chats: how many are in one, how many are
             // here now, what it says about itself.
             Some("updateSupergroup") => self.on_counts(w, updates::supergroup(update)),
@@ -727,12 +773,14 @@ impl<T: Td> Account<T> {
         };
         let peer = ch.peer;
         let derived = updates::chat_peer(chat);
+        let blocked = updates::blocked(chat);
         let read_outbox = chat["last_read_outbox_message_id"].as_i64().filter(|&m| m != 0);
         self.filed("on_new_chat", w.store().write(move |c| {
             if let Some(p) = derived {
                 project_peers(c, &[p])?;
             }
             ensure_peer(c, peer)?;
+            model::set_blocked_tx(c, peer, blocked)?;
             project_chats(c, &[ch])?;
             if read_outbox.is_some() {
                 c.execute(
@@ -1048,6 +1096,13 @@ impl<T: Td> Account<T> {
             return;
         };
         self.filed("on_user", w.store().write(move |c| project_peers(c, &[p])));
+    }
+
+    fn on_blocked(&self, w: &World, peer: PeerId, blocked: bool) {
+        self.filed("on_blocked", w.store().write(move |c| {
+            ensure_peer(c, peer)?;
+            model::set_blocked_tx(c, peer, blocked)
+        }));
     }
 
     /// A person came online, or went away. The whole of `updateUserStatus`,
