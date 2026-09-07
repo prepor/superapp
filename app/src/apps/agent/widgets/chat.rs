@@ -29,7 +29,7 @@ use kernel::theme;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::{key_char, Letters};
+use crate::shell::keys::Letters;
 use crate::shell::widgets::suggest::Suggest;
 
 use super::super::chip::Chip;
@@ -238,20 +238,7 @@ impl Widget for AgentChatPanel {
         self.raise(cx, &props, &pick);
         self.picker.track(cx, &pick);
         let picking = self.pick_up && pick.key_focus(cx);
-        let focused = field.key_focus(cx);
-        if focused || picking {
-            // Exactly the text chords: a caret owns `cmd+x/c/v/a` wherever
-            // it blinks, and this bar's own letters stay bold and stay
-            // firing — `s`, `k`, `r` and `n` are what the panel is for.
-            props.chord.field(Letters::NONE);
-        }
         if let Event::KeyDown(k) = event {
-            if (focused || picking)
-                && k.modifiers.logo
-                && key_char(k.key_code).is_some_and(|c| Letters::TEXT.has(c))
-            {
-                props.chord.take();
-            }
             // The pick field owns its own keys while it has the keyboard:
             // enter takes what the offer is showing, esc puts the field
             // away whether the offer is up or not — a picker is one gesture
@@ -356,15 +343,9 @@ impl Widget for AgentChatPanel {
         // bar is being drawn, and its field is up in that very frame.
         let pick = self.view.text_input(cx, ids!(pick_input));
         self.raise(cx, &props, &pick);
-        // And what the caret keeps is said here too: the shell files a
-        // widget's answer at the end of its draw, and one that says nothing
-        // there is taken to keep every chord — which would put out every
-        // letter on this bar, and swallow every chord, while the person
-        // types. This composer keeps exactly the text chords.
         let field = self.view.text_input(cx, ids!(ask_input));
-        if field.key_focus(cx) || (self.pick_up && pick.key_focus(cx)) {
-            props.chord.field(Letters::NONE);
-        }
+        props.keyboard.keep(&field, Letters::TEXT);
+        props.keyboard.keep(&pick, Letters::TEXT);
 
         // The widest a person's block may be: most of the column, and the
         // block takes as much of that as its longest line asks for. The

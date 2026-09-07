@@ -22,7 +22,6 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::Letters;
 
 /// The three fields, in the order tab walks them.
 const FIELDS: [&[LiveId]; 3] = [ids!(url_input), ids!(key_input), ids!(secret_input)];
@@ -209,16 +208,6 @@ impl Widget for BucketPanel {
             return;
         };
         let fields = FIELDS.map(|p| self.view.text_input(cx, p));
-        let focused = fields.iter().any(|f| f.key_focus(cx));
-        // A live field keeps every cmd chord — the caret's own `cmd+a`
-        // included — so no bar may promise one while it blinks.
-        if focused {
-            props.chord.field(Letters::ALL);
-            if matches!(event, Event::KeyDown(k) if k.modifiers.logo) {
-                props.chord.take();
-            }
-        }
-
         self.view.handle_event(cx, event, scope);
 
         if let Event::Actions(actions) = event {
@@ -277,13 +266,6 @@ impl Widget for BucketPanel {
             self.view.text_input(cx, FIELDS[0]).set_text(cx, &url);
             self.view.text_input(cx, FIELDS[1]).set_text(cx, &key_id);
         }
-        // A field that has the keyboard says so again on every draw: the bar
-        // is drawn before this widget, and the promise is about now.
-        let fields = FIELDS.map(|p| self.view.text_input(cx, p));
-        if fields.iter().any(|f| f.key_focus(cx)) {
-            props.chord.field(Letters::ALL);
-        }
-
         let step = self.view.draw_walk(cx, scope, walk);
 
         // The fields, by the name a script calls them, once they have

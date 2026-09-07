@@ -20,7 +20,6 @@ use makepad_widgets::*;
 
 use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::Letters;
 use crate::shell::widgets::suggest::Suggest;
 use crate::shell::widgets::table::{self, RowSpec, TableView};
 
@@ -172,7 +171,6 @@ impl Widget for DirPanel {
         let path_live = self.path_field.live(cx, &path);
         let field_live =
             path_live || self.name_field.live(cx, &name) || self.rename_field.live(cx, &rename);
-        keeps(&props, field_live);
         self.pac.track(cx, &path);
 
         // The path box is drawn over the rows, so its rows answer first: the
@@ -189,11 +187,6 @@ impl Widget for DirPanel {
         }
 
         if let Event::KeyDown(k) = event {
-            // A live field keeps the chords it needs: `cmd+a` is select-all
-            // here, not a verb on the bar.
-            if field_live && k.modifiers.logo {
-                props.chord.take();
-            }
             if path_live {
                 if let Some(c) = completion(&props) {
                     // Enter goes to what is typed when that is a directory
@@ -281,15 +274,6 @@ impl Widget for DirPanel {
         let name = self.view.text_input(cx, NAME);
         let rename = self.view.text_input(cx, RENAME);
         self.sync(cx, &f, &path, &name, &rename);
-        // Said on the draw as well as on the event: a bar is drawn before
-        // the body that reports, and the promise a bold letter makes is
-        // about now.
-        keeps(
-            &props,
-            self.path_field.live(cx, &path)
-                || self.name_field.live(cx, &name)
-                || self.rename_field.live(cx, &rename),
-        );
         self.crumbs(cx, &props, &f);
         // The status line: what a run is doing, or what the last verb
         // refused until the next one.
@@ -540,21 +524,6 @@ fn observe(props: &PanelProps, scope: &mut Scope) -> Option<Fields> {
 /// *cancel* must not be able to do.
 fn drew(props: &PanelProps) {
     edit(props, super::super::panels::Dir::drawn);
-}
-
-/// What the three fields keep from the bars while one of them has the
-/// keyboard: every letter, because the keydown above answers *any* cmd
-/// chord while a caret blinks in `go to`, `new dir` or `rename` — so no
-/// bar's letter would fire and none may be drawn as if it would.
-///
-/// The table says the same of its filter; this is the other three, which
-/// are files' own. Said on every draw and every event, and said nothing at
-/// all when none is live: the frame after the caret leaves must not still
-/// be drawn as if it were there.
-fn keeps(props: &PanelProps, live: bool) {
-    if live {
-        props.chord.field(Letters::ALL);
-    }
 }
 
 /// Runs `f` on the instance, for the length of the call.

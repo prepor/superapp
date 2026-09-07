@@ -26,6 +26,7 @@ use super::e2e::E2E_TICK_MS;
 use super::hits::Hits;
 use super::hosted::{Hosted, OVERLAY_LAUNCHER};
 use super::keys::CmdTap;
+use super::keyboard::Keyboard;
 use super::menu::MenuSig;
 use super::overlays::Overlay;
 use super::touch::TouchNav;
@@ -143,11 +144,9 @@ pub struct Stage {
     /// the identity under that widget changed.
     #[rust]
     pub hosted_for: HashMap<SlotId, (LiveId, kernel::panel::PanelId)>,
-    /// What each hosted widget last said it keeps while one of its fields
-    /// has the keyboard ([`Chord::field`](super::hosted::Chord::field)).
-    /// Read by the bars, which are drawn before the bodies that report.
+    /// Keyboard policies, queried against the live widget that owns focus.
     #[rust]
-    pub field_keeps: HashMap<SlotId, super::keys::Letters>,
+    pub keyboard: Keyboard,
     /// A widget that wants the keyboard on the next event tick, rather than
     /// during the draw that created it.
     #[rust]
@@ -890,6 +889,10 @@ impl Stage {
             }
         }
         match event {
+            // Keyboard changes invalidate the whole bar, even when the widget
+            // only redraws its own caret. This applies to every hosted input.
+            Event::KeyFocus(_) | Event::KeyFocusLost(_) => sh.session.redraw(),
+
             Event::Actions(actions) => {
                 for a in actions {
                     if let Some(OverlayAction::Query(q)) = a.downcast_ref::<OverlayAction>() {
@@ -998,7 +1001,7 @@ impl Stage {
             // answers it itself, through its own hit path; when the keyboard
             // belongs to the shell it is this grammar's enter.
             Event::ImeAction(_) => {
-                let field = self.field_letters(sh.session.focus()) != super::keys::Letters::NONE;
+                let field = self.field_letters(cx, sh.session.focus()) != super::keys::Letters::NONE;
                 if !field && sh.overlay != Overlay::Launcher {
                     let k = KeyEvent {
                         key_code: KeyCode::ReturnKey,

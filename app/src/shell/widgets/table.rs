@@ -26,9 +26,9 @@ use kernel::richtable::{Datasource, ListState, MarkSlot, Table};
 use kernel::session::Session;
 use kernel::store::Store;
 use makepad_widgets::*;
+use crate::shell::hits::visible;
 
 use super::super::hosted::{Ask, PanelProps};
-use super::super::keys::Letters;
 use super::suggest::Suggest;
 
 /// The children a table expects in its panel's template.
@@ -140,6 +140,7 @@ pub fn line(cx: &mut Cx, row: &WidgetRef, selected: bool, marked: bool) -> Widge
 
 /// The shell half of one rich table.
 pub struct TableView<S: RowSpec> {
+    reveal: super::reveal::Reveal<usize>,
     ac: Suggest<Table<S::Src>>,
     /// Where each row of the last draw landed: the table index (`None` for
     /// a mark the filter hides, which is outside the table), the rectangle,
@@ -161,6 +162,7 @@ pub struct TableView<S: RowSpec> {
 impl<S: RowSpec> Default for TableView<S> {
     fn default() -> Self {
         TableView {
+            reveal: super::reveal::Reveal::default(),
             ac: Suggest::default(),
             rows: Vec::new(),
             picks: Vec::new(),
@@ -203,9 +205,9 @@ impl<S: RowSpec> TableView<S> {
             return;
         }
 
+        if matches!(event, Event::Scroll(_)) { self.reveal.cancel(); }
         let field = view.text_input(cx, FILTER);
         let focused = field.key_focus(cx);
-        filter_keeps(&props, focused);
         self.ac.track(cx, &field);
 
         // How many rows were marked before this event; see the redraw at the
@@ -235,11 +237,6 @@ impl<S: RowSpec> TableView<S> {
         }
 
         if let Event::KeyDown(k) = event {
-            // A live field keeps the chords it needs: `cmd+a` stays
-            // select-all rather than firing a verb on the bar.
-            if focused && k.modifiers.logo {
-                props.chord.take();
-            }
             // The completion owns the arrows, enter, tab and esc while it
             // is open; the field never sees them.
             let ac = &mut self.ac;
@@ -578,55 +575,11 @@ impl<S: RowSpec> TableView<S> {
         }
     }
 
-    /// Keeps the cursor's row on screen as the walk moves it: the least
-    /// scroll that brings the whole row inside the list's own rectangle.
-    ///
-    /// Drawn is not visible. A portal list draws the row that straddles
-    /// either edge and stops there, so "the walk landed on a row the last
-    /// draw touched" is true of the row half under the panel's foot as
-    /// well as of the ones in plain sight — which is how the cursor used to
-    /// walk off the bottom, and then jump a whole page when the row after
-    /// it was the first that had not been drawn. The rectangles of the last
-    /// draw settle it instead, the same ones a press resolves against, and
-    /// the list is nudged by the overlap alone.
-    ///
-    /// A row that was not drawn at all is a jump rather than a step, and
-    /// that one keeps the animation, which lands it at the top.
-    fn follow(&self, cx: &mut Cx, view: &View, li: usize) {
-        let w = view.widget(cx, LIST);
-        let clip = w.area().rect(cx);
-        let list = w.as_portal_list();
-        // Two ways to be a jump: a row the last draw never drew — the
-        // cursor is somewhere the eye is not — and an animation already
-        // under way, whose next frame would undo a nudge made beneath it.
-        // Both are the animation's, which re-aims rather than fights.
-        let row = list.get_item(li).map(|(_, w)| w.area().rect(cx));
-        let (Some(row), None) = (row, list.is_smooth_scrolling()) else {
-            list.smooth_scroll_to(cx, li, 90.0, None, 0.0);
-            return;
-        };
-        if row.size.y <= 0.0 || clip.size.y <= 0.0 {
-            return;
-        }
-        // How far the content has to travel, signed the way `first_scroll`
-        // is: down to uncover a row above, up to uncover one below. A row
-        // taller than the viewport shows its head.
-        let (top, bot) = (clip.pos.y, clip.pos.y + clip.size.y);
-        let shift = if row.pos.y < top {
-            top - row.pos.y
-        } else if row.pos.y + row.size.y > bot {
-            bot - (row.pos.y + row.size.y)
-        } else {
-            return;
-        };
-        if shift.abs() < 0.5 {
-            return;
-        }
-        let Some((first, scroll)) = list.borrow().map(|l| (l.first_id(), l.first_scroll())) else {
-            return;
-        };
-        list.set_first_id_and_scroll(first, scroll + shift);
-        list.redraw(cx);
+    /// Ask the shared reveal helper to keep this row on screen. The draw
+    /// measures it and confirms arrival, including after a jump.
+    fn follow(&mut self, cx: &mut Cx, view: &mut View, li: usize) {
+        self.reveal.request(li);
+        view.redraw(cx);
     }
 
     // -- the draw --------------------------------------------------------------
@@ -668,10 +621,10 @@ impl<S: RowSpec> TableView<S> {
         }
         let text = field.text();
         let focused = field.key_focus(cx);
-        filter_keeps(&props, focused);
         // A new query is a new list; the rows under the old one are gone.
         let requery = self.query != text;
         if requery {
+            self.reveal.cancel();
             self.query = text.clone();
         }
 
@@ -714,7 +667,7 @@ impl<S: RowSpec> TableView<S> {
         empty_lbl.set_text(cx, &said);
         empty_lbl.set_visible(cx, n == 0 && err.is_none() && !said.is_empty());
 
-        let mut drawn: Vec<(Option<usize>, WidgetRef, String, PanelId)> = Vec::new();
+        let mut drawn: Vec<(usize, Option<usize>, WidgetRef, String, PanelId)> = Vec::new();
         while let Some(item) = view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut pl) = list_ref.borrow_mut() else {
@@ -759,8 +712,17 @@ impl<S: RowSpec> TableView<S> {
                 let w = pl.item(cx, idx, S::row_tpl());
                 S::populate(cx, &w, &row, at.is_some() && at == cursor, marked, now);
                 w.draw_all(cx, scope);
-                drawn.push((at, w, S::label(&row, now), S::target(&row)));
+                drawn.push((idx, at, w, S::label(&row, now), S::target(&row)));
             }
+        }
+
+        let target = self.reveal.target().filter(|idx| *idx < n + pre);
+        let target_rect = target.and_then(|target| {
+            drawn.iter().find(|(idx, ..)| *idx == target).map(|(_, _, w, ..)| w.area().rect(cx))
+        });
+        let portal = view.widget(cx, LIST).as_portal_list();
+        if self.reveal.apply(cx, &portal, target, target_rect) {
+            view.redraw(cx);
         }
 
         // The hits: the filter, then every row by the label the panel gives
@@ -777,11 +739,11 @@ impl<S: RowSpec> TableView<S> {
         // hittable is what is visible.
         let clip = view.widget(cx, LIST).area().rect(cx);
         self.rows.clear();
-        for (at, w, label, target) in drawn {
+        for (_, at, w, label, target) in drawn {
             let Some(r) = visible(w.area().rect(cx), clip) else {
                 continue;
             };
-            props.hits.add_row(label, r, MouseCursor::Hand, props.slot);
+            props.hits.add_row_clipped(label, w.area().rect(cx), clip, MouseCursor::Hand, props.slot);
             self.rows.push((at, r, target));
         }
 
@@ -798,24 +760,6 @@ impl<S: RowSpec> TableView<S> {
     }
 }
 
-/// The part of a row that is on screen: `None` for one scrolled entirely
-/// out. A zero-sized clip means the list has not drawn yet, and the row
-/// stands as it is.
-fn visible(r: Rect, clip: Rect) -> Option<Rect> {
-    if r.size.x <= 0.0 {
-        return None;
-    }
-    if clip.size.y <= 0.0 {
-        return Some(r);
-    }
-    let top = r.pos.y.max(clip.pos.y);
-    let bot = (r.pos.y + r.size.y).min(clip.pos.y + clip.size.y);
-    (bot > top).then(|| Rect {
-        pos: dvec2(r.pos.x, top),
-        size: dvec2(r.size.x, bot - top),
-    })
-}
-
 /// What a sweep across this panel's rows would run, asked of the instance.
 fn swipe_verbs<S: RowSpec>(props: &PanelProps) -> [Option<&'static str>; 2] {
     let mut borrow = props.panel.borrow_mut();
@@ -823,19 +767,6 @@ fn swipe_verbs<S: RowSpec>(props: &PanelProps) -> [Option<&'static str>; 2] {
         .as_any()
         .downcast_mut::<S::Panel>()
         .map_or([None, None], |p| S::swipe_verbs(p))
-}
-
-/// What the filter keeps from the bars while it has the keyboard, said on
-/// every draw and every event — the promise a bold letter makes is about
-/// now, and the bar is drawn before this widget is.
-///
-/// Every letter, not only the text chords: the keydown above answers *any*
-/// cmd chord while the caret is in the filter, so no bar's letter would fire
-/// and none may be drawn as if it would.
-fn filter_keeps(props: &PanelProps, focused: bool) {
-    if focused {
-        props.chord.field(Letters::ALL);
-    }
 }
 
 /// Hands the keyboard from the filter back to the rows.

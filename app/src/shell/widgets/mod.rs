@@ -18,5 +18,6 @@ pub mod card;
 pub mod dsl;
 pub mod map;
 pub mod media;
+pub mod reveal;
 pub mod suggest;
 pub mod table;

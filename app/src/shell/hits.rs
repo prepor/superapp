@@ -86,6 +86,10 @@ pub struct Hit {
     /// The panel it belongs to, when it belongs to one.
     pub slot: Option<SlotId>,
     pub act: Act,
+    /// Full row bounds before clipping, for checking whether a reveal landed.
+    pub unclipped: Option<Rect>,
+    /// The accelerator actually drawn on this element, if any.
+    pub accel: Option<char>,
 }
 
 impl Hit {
@@ -99,6 +103,8 @@ impl Hit {
             cursor,
             slot: Some(slot),
             act: Act::Widget,
+            unclipped: None,
+            accel: None,
         }
     }
 
@@ -112,6 +118,8 @@ impl Hit {
             cursor,
             slot: Some(slot),
             act: Act::Row(slot),
+            unclipped: None,
+            accel: None,
         }
     }
 
@@ -125,6 +133,8 @@ impl Hit {
             cursor,
             slot: act.slot(),
             act,
+            unclipped: None,
+            accel: None,
         }
     }
 }
@@ -153,6 +163,23 @@ impl Hits {
     /// The same, for a row of a list.
     pub fn add_row(&self, label: impl Into<String>, rect: Rect, cursor: MouseCursor, slot: SlotId) {
         self.push(Hit::row(label, rect, cursor, slot));
+    }
+
+    pub fn add_row_clipped(
+        &self, label: impl Into<String>, rect: Rect, clip: Rect,
+        cursor: MouseCursor, slot: SlotId,
+    ) -> Option<Rect> {
+        let visible = visible(rect, clip)?;
+        let mut hit = Hit::row(label, visible, cursor, slot);
+        hit.unclipped = Some(rect);
+        self.push(hit);
+        Some(visible)
+    }
+
+    /// Annotate the element just drawn, so tests inspect the rendered mark
+    /// rather than recomputing the answer they are meant to check.
+    pub fn last_accel(&self, accel: Option<char>) {
+        if let Some(hit) = self.0.borrow_mut().last_mut() { hit.accel = accel; }
     }
 
     pub fn clear(&self) {
@@ -269,4 +296,22 @@ pub fn label_rank(h: &Hit, label: &str, needle: &str) -> Option<(u8, u8, usize)>
     };
     let focus = u8::from(matches!(h.act, Act::Focus(_)));
     Some((rung, focus, h.label.chars().count()))
+}
+
+/// The part of a row that is on screen: `None` for one scrolled entirely
+/// out. A zero-sized clip means the list has not drawn yet, and the row
+/// stands as it is.
+pub fn visible(r: Rect, clip: Rect) -> Option<Rect> {
+    if r.size.x <= 0.0 {
+        return None;
+    }
+    if clip.size.y <= 0.0 {
+        return Some(r);
+    }
+    let top = r.pos.y.max(clip.pos.y);
+    let bot = (r.pos.y + r.size.y).min(clip.pos.y + clip.size.y);
+    (bot > top).then(|| Rect {
+        pos: dvec2(r.pos.x, top),
+        size: dvec2(r.size.x, bot - top),
+    })
 }

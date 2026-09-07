@@ -46,6 +46,10 @@ use std::path::PathBuf;
 /// One script step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
+    /// Assert that a labelled row is fully visible, without clicking it.
+    Visible(String),
+    /// Assert the accelerator actually rendered on a labelled control.
+    Accel { label: String, letter: Option<char> },
     /// Sleep this many milliseconds.
     Wait(u64),
     /// Capture the window to `<out>/<name>.png`.
@@ -129,7 +133,9 @@ impl Step {
     pub fn needs_hits(&self) -> bool {
         matches!(
             self,
-            Step::Click { .. }
+            Step::Visible(_)
+                | Step::Accel { .. }
+                | Step::Click { .. }
                 | Step::Mouse { .. }
                 | Step::MultiClick { .. }
                 | Step::Drag { .. }
@@ -177,6 +183,17 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
         Ok(rest[a + 1..b].to_string())
     };
     Ok(Some(match cmd {
+        "visible" => Step::Visible(quoted()?),
+        "accel" => {
+            let letter = rest.rsplit_once('"').map(|(_, s)| s.trim())
+                .ok_or_else(|| err("expected an accelerator or - after the label"))?;
+            let letter = match letter {
+                "-" => None,
+                s if s.len() == 1 && s.as_bytes()[0].is_ascii_lowercase() => s.chars().next(),
+                _ => return Err(err("expected a lowercase accelerator or -")),
+            };
+            Step::Accel { label: quoted()?, letter }
+        }
         "wait" => Step::Wait(rest.parse().map_err(|_| err("expected milliseconds"))?),
         "shot" => {
             if rest.is_empty() {
@@ -415,6 +432,17 @@ mod tests {
         );
         assert_eq!(s[5], Step::Type("hello world".into()));
         assert_eq!(s[6], Step::Quit);
+    }
+
+    #[test]
+    fn visual_assertions_parse_and_require_a_current_draw() {
+        let steps = parse("visible \"a reply\"\naccel \"copy\" c\naccel \"about\" -").unwrap();
+        assert_eq!(steps[0], Step::Visible("a reply".into()));
+        assert_eq!(steps[1], Step::Accel { label: "copy".into(), letter: Some('c') });
+        assert_eq!(steps[2], Step::Accel { label: "about".into(), letter: None });
+        assert!(steps[..3].iter().all(Step::needs_hits));
+        assert!(parse("accel \"copy\" invalid").is_err());
+        assert!(parse("accel \"copy\"").is_err());
     }
 
     /// A paste is its own step because it is its own event: the text goes

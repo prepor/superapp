@@ -1,4 +1,4 @@
-# args:
+# args: --window 560x520 --grid 4x6
 # env:
 #
 # Original and back use the transcript's cursor and bring its line into view.
@@ -41,12 +41,20 @@ key home
 wait 400
 click "back"
 wait 400
+visible "me: yes — the trailhead car park"
+accel "original" o
+accel "copy" c
+accel "about" a
 click "me: yes — the trailhead car park"
 wait 300
 click "original"
 wait 400
 click "back"
 wait 400
+visible "me: yes — the trailhead car park"
+accel "original" o
+accel "copy" c
+accel "about" a
 
 # A quote press keeps the same way back. Enter puts the caret in the
 # composer; cmd+b still returns to the reply and keeps the draft intact.
@@ -60,11 +68,19 @@ type "still writing"
 wait 300
 key cmd+b
 wait 400
+visible "me: yes — the trailhead car park"
+accel "original" o
+accel "copy" -
+accel "about" -
 shot reply-returned
 click "original"
 wait 400
 click "back"
 wait 400
+visible "me: yes — the trailhead car park"
+accel "original" o
+accel "copy" c
+accel "about" a
 click "reply"
 wait 400
 click "reply to me: yes — the trailhead car park"

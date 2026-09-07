@@ -93,6 +93,26 @@ impl Stage {
             return true;
         }
         match step {
+            Step::Visible(label) => match self.hits.by_label(&label) {
+                Some(hit) => {
+                    if hit.unclipped.is_some_and(|full| {
+                        (full.pos.y - hit.rect.pos.y).abs() > 1.0
+                            || full.size.y - hit.rect.size.y > 1.0
+                    }) {
+                        eprintln!("e2e: FAIL visible {label:?}: row is clipped");
+                        r.failures += 1;
+                    }
+                }
+                None => self.no_such(r, "visible", &label),
+            },
+            Step::Accel { label, letter } => match self.hits.by_label(&label) {
+                Some(hit) if hit.accel == letter => {}
+                Some(hit) => {
+                    eprintln!("e2e: FAIL accel {label:?}: expected {letter:?}, drew {:?}", hit.accel);
+                    r.failures += 1;
+                }
+                None => self.no_such(r, "accel", &label),
+            },
             Step::Wait(_) => {}
 
             Step::Shot(name) if self.no_draw => {

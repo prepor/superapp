@@ -20,7 +20,6 @@ use makepad_widgets::*;
 
 use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
-use crate::shell::keys::Letters;
 use crate::shell::widgets::suggest::Suggest;
 
 use super::super::model::{Draft, Seed};
@@ -101,20 +100,6 @@ impl Widget for ComposePanel {
 
         let inputs = self.inputs(cx);
         let focused = inputs.iter().position(|t| t.key_focus(cx));
-        // A live field keeps every cmd chord, so no bar's letter is drawn as
-        // if it would fire — the promise a bold letter makes is about now.
-        if focused.is_some() {
-            props.chord.field(Letters::ALL);
-        }
-
-        if let Event::KeyDown(k) = event {
-            // A live field keeps its own chords: `cmd+a` is select-all here,
-            // not a verb on the bar.
-            if focused.is_some() && k.modifiers.logo {
-                props.chord.take();
-            }
-        }
-
         // The TO field's offer answers first, in both hands. A press on one
         // of its rows is a pick and neither half of it reaches what the box
         // hangs over — the release as much as the press, because a focused

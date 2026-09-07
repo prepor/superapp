@@ -169,40 +169,48 @@ pub fn letters(verbs: &[Verb]) -> Letters {
         .fold(Letters::NONE, Letters::with)
 }
 
-/// Where a bar stands in the chord routing order — which is the whole of
-/// what decides its bold letters.
-#[derive(Debug, Clone, Copy)]
-pub enum Reach<'a> {
-    /// The focused panel's own bar: the third step of the order, reached
-    /// unless the widget above it keeps the letter.
-    Focused { kept: Letters },
-    /// The bar of the panel the focused one previews: the fourth step, and
-    /// so reached only by what the two above it leave free.
-    Preview { kept: Letters, driver: &'a [Verb] },
-    /// Every other bar. A chord never arrives here at all.
-    Away,
+/// One routing decision, shared by key dispatch and accelerator rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    FocusedField,
+    FocusedVerb(&'static str),
+    PreviewField,
+    PreviewVerb(&'static str),
 }
 
-/// The letters this bar draws bold: the promise that the chord fires that
-/// verb *now*, and so exactly what [`keys`](super::keys) would route to it.
-///
-/// A verb whose letter is not in the set is still drawn, and still fires on
-/// click — the bar is the same bar either way. What goes is the mark that
-/// says a key would do it.
-#[must_use]
-pub fn bold(verbs: &[Verb], reach: Reach<'_>) -> Letters {
-    let mine = letters(verbs);
-    let free = match reach {
-        Reach::Away => return Letters::NONE,
-        Reach::Focused { kept } => mine.minus(kept),
-        // The focused bar takes the chord whether or not it drew the letter
-        // bold, so what it wears is gone from here as surely as what the
-        // widget keeps.
-        Reach::Preview { kept, driver } => mine.minus(kept).minus(letters(driver)),
-    };
-    // A reserved letter never arrives, whatever a bar wears: `check` is a
-    // debug assertion, and this holds in a release build too.
-    free.minus(Letters::RESERVED)
+pub struct Shortcuts<'a> {
+    pub focused: &'a [Verb],
+    pub focused_keeps: Letters,
+    pub preview: &'a [Verb],
+    pub preview_keeps: Letters,
+}
+
+impl Shortcuts<'_> {
+    #[must_use]
+    pub fn route(&self, c: char) -> Option<Shortcut> {
+        if Letters::RESERVED.has(c) {
+            None
+        } else if self.focused_keeps.has(c) {
+            Some(Shortcut::FocusedField)
+        } else if let Some(id) = chord(self.focused, c) {
+            Some(Shortcut::FocusedVerb(id))
+        } else if self.preview_keeps.has(c) {
+            Some(Shortcut::PreviewField)
+        } else {
+            chord(self.preview, c).map(Shortcut::PreviewVerb)
+        }
+    }
+
+    #[must_use]
+    pub fn bold(&self, focused: bool) -> Letters {
+        ('a'..='z').fold(Letters::NONE, |letters, c| {
+            match (focused, self.route(c)) {
+                (true, Some(Shortcut::FocusedVerb(_)))
+                | (false, Some(Shortcut::PreviewVerb(_))) => letters.with(c),
+                _ => letters,
+            }
+        })
+    }
 }
 
 /// A bar wears no reserved chord and no letter twice. Checked on every
@@ -233,12 +241,74 @@ pub fn check(verbs: &[Verb]) {
 mod tests {
     use super::*;
 
+    /// Where a bar stands in the chord routing order — which is the whole of
+    /// what decides its bold letters.
+    #[derive(Debug, Clone, Copy)]
+    enum Reach<'a> {
+        /// The focused panel's own bar: the third step of the order, reached
+        /// unless the widget above it keeps the letter.
+        Focused { kept: Letters },
+        /// The bar of the panel the focused one previews: the fourth step, and
+        /// so reached only by what the two above it leave free.
+        Preview { kept: Letters, driver: &'a [Verb] },
+        /// Every other bar. A chord never arrives here at all.
+        Away,
+    }
+
+    /// The letters this bar draws bold: the promise that the chord fires that
+    /// verb *now*, and so exactly what [`keys`](super::keys) would route to it.
+    ///
+    /// A verb whose letter is not in the set is still drawn, and still fires on
+    /// click — the bar is the same bar either way. What goes is the mark that
+    /// says a key would do it.
+    #[must_use]
+    fn bold(verbs: &[Verb], reach: Reach<'_>) -> Letters {
+        match reach {
+            Reach::Away => Letters::NONE,
+            Reach::Focused { kept } => Shortcuts {
+                focused: verbs, focused_keeps: kept,
+                preview: &[], preview_keeps: Letters::NONE,
+            }.bold(true),
+            Reach::Preview { kept, driver } => Shortcuts {
+                focused: driver, focused_keeps: kept,
+                preview: verbs, preview_keeps: Letters::NONE,
+            }.bold(false),
+        }
+    }
+
+
     /// A bar as an app writes one: the label matters only for the drawing.
     fn bar(letters: &[char]) -> Vec<Verb> {
         letters
             .iter()
             .map(|c| Verb::run("v", c.to_string(), Some(*c)))
             .collect()
+    }
+
+    #[test]
+    fn dispatch_and_marks_share_the_same_owner_after_focus_changes() {
+        let focused = vec![Verb::run("list.copy", "copy", Some('c'))];
+        let preview = vec![
+            Verb::run("preview.copy", "copy", Some('c')),
+            Verb::run("preview.reply", "reply", Some('r')),
+        ];
+        let mut keys = Shortcuts {
+            focused: &focused, focused_keeps: Letters::ALL,
+            preview: &preview, preview_keeps: Letters::NONE,
+        };
+        assert_eq!(keys.route('r'), Some(Shortcut::FocusedField));
+        assert!(!keys.bold(false).has('r'));
+        keys.focused_keeps = Letters::NONE;
+        assert_eq!(keys.route('r'), Some(Shortcut::PreviewVerb("preview.reply")));
+        assert!(keys.bold(false).has('r'));
+        keys.preview_keeps = Letters::TEXT;
+        assert_eq!(keys.route('c'), Some(Shortcut::FocusedVerb("list.copy")));
+        assert!(keys.bold(true).has('c'));
+        assert!(!keys.bold(false).has('c'));
+        keys.focused = &[];
+        assert_eq!(keys.route('c'), Some(Shortcut::PreviewField));
+        assert!(!keys.bold(false).has('c'));
+        assert_eq!(keys.route('w'), None, "reserved chords never reach a bar");
     }
 
     fn set(verbs: &[Verb], reach: Reach<'_>) -> String {

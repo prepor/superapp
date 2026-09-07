@@ -374,7 +374,7 @@ impl Stage {
     /// acts on the panel, links for where it goes.
     ///
     /// `bold` is the set of letters a chord would reach here now
-    /// ([`bar::bold`]); a verb whose letter is outside it is drawn without
+    /// ([`bar::Shortcuts::bold`]); a verb whose letter is outside it is drawn without
     /// its mark, and still fires on click.
     // The strip, its verbs and what they are drawn against, flat.
     #[allow(clippy::too_many_arguments)]
@@ -426,6 +426,7 @@ impl Stage {
                 self.hits
                     .push(Hit::act(label, e.rect, MouseCursor::Hand, act));
             }
+            self.hits.last_accel(v.accel.filter(|_| accel.is_some()));
         }
     }
 }
@@ -480,7 +481,6 @@ impl Stage {
         self.hosted
             .retain(|slot, _| super::hosted::is_overlay(*slot) || live.contains(slot));
         self.hosted_for.retain(|slot, _| live.contains(slot));
-        self.field_keeps.retain(|slot, _| live.contains(slot));
         sh.anim.retain(&live);
 
         let active = sh.session.ws().active;
@@ -640,48 +640,22 @@ impl Stage {
 
         // As tall as the wrap needs, which is what the body is drawn under.
         let bar_h = bar::height(&verbs, &self.cell, r);
-        if !verbs.is_empty() {
-            // Where this bar stands in the chord routing order, and so what
-            // it may promise: the focused panel's own letters less what its
-            // widget keeps, the previewed panel's less what the focused bar
-            // wears too, and nothing at all anywhere else.
-            let focus = sh.session.focus();
-            // What a caret keeps never reaches a bar. The focused panel's
-            // widget holds the keyboard for its own bar — and for a
-            // previewed one, whose widget may hold it instead: a click in a
-            // preview puts a caret there without moving focus.
-            let kept = self
-                .field_letters(focus)
-                .plus(self.field_letters(Some(slot)));
-            let driver = sh.session.join_parent_of(slot);
-            let driving = driver.filter(|d| Some(*d) == focus && !focused);
-            let driver_verbs = driving
-                .and_then(|d| sh.session.panel(d))
-                .map(|p| p.borrow().verbs())
-                .unwrap_or_default();
-            let reach = match (focused, driving.is_some()) {
-                (true, _) => bar::Reach::Focused { kept },
-                (false, true) => bar::Reach::Preview {
-                    kept,
-                    driver: &driver_verbs,
-                },
-                (false, false) => bar::Reach::Away,
-            };
-            let strip = bar::strip(r, bar_h);
-            let bold = bar::bold(&verbs, reach);
-            self.draw_bar(cx, slot, &verbs, strip, alpha, bold, hover.as_ref());
-        }
-
         let body = rect(
             r.pos.x + 1.0,
             r.pos.y + theme::HEAD_H,
             r.size.x - 2.0,
             (r.size.y - theme::HEAD_H - bar_h - 1.0).max(0.0),
         );
-        if body.size.y < 4.0 {
-            return;
+        if body.size.y >= 4.0 {
+            self.draw_hosted(cx, sh, slot, body);
         }
-        self.draw_hosted(cx, sh, slot, body);
+        // Bodies may change their fields while drawing. Query live ownership
+        // afterwards, and keep chrome hits above all content hits.
+        if !verbs.is_empty() {
+            let strip = bar::strip(r, bar_h);
+            let bold = self.bar_letters(cx, sh, slot);
+            self.draw_bar(cx, slot, &verbs, strip, alpha, bold, hover.as_ref());
+        }
     }
 
     /// Tab strips above tabbed columns: one title segment per slot, the

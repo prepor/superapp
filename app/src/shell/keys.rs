@@ -8,17 +8,17 @@
 //!    three shifted letters: `shift+l`, which puts the panels library up
 //!    over the workspace, `shift+s`, the search panel, and `shift+a`, which
 //!    offers the focused panel to whichever app takes one as context;
-//! 2. the **focused widget**, which may take one (a live text field takes
-//!    `cmd+a`) and says so in the same event;
+//! 2. the **focused widget**, for the chords its current input keeps;
 //! 3. the **focused panel's bar**;
-//! 4. the bar of the panel it **previews**, if it drives one — which is what
+//! 4. the **previewed widget**, for the chords its own input keeps;
+//! 5. the bar of the panel it **previews**, if it drives one — which is what
 //!    lets a list act on the thing under its cursor without moving focus.
 //!
 //! Nothing in that order names a kind.
 //!
 //! A bold letter is a promise that the chord fires that verb *now*, so the
 //! bars draw what this order would reach and nothing else: the set is
-//! [`bar::bold`], over the [`Letters`] a widget keeps while one of its
+//! [`bar::Shortcuts::bold`], over the [`Letters`] a widget keeps while one of its
 //! fields has the keyboard.
 
 use kernel::layout::Dir;
@@ -47,9 +47,7 @@ pub fn is_reserved(c: char) -> bool {
 /// A set of letters, as a mask over the alphabet: what a widget's live field
 /// keeps to itself, and what a bar draws bold.
 ///
-/// Copying and subtracting one is a couple of instructions, which is what the
-/// drawing wants: [`bar::bold`] takes one bar's letters away from another's
-/// on every draw of every panel.
+/// [`bar::Shortcuts`] uses these sets for both dispatch and rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Letters(u32);
 
@@ -344,36 +342,27 @@ impl Stage {
             return;
         }
         if k.modifiers.logo {
-            // Past the reserved set the chord belongs to the panel: its
-            // widget first, then its bar, then the bar of what it previews.
-            if self.forward_to_focused(cx, sh, &Event::KeyDown(*k)) {
-                return;
-            }
             if let Some(c) = key_char(k.key_code) {
-                let focus = sh.session.focus();
-                if let Some(f) = focus {
-                    if self.bar_chord(sh, f, c) {
-                        return;
+                let (focus, preview, route) = self.shortcut(cx, sh, c);
+                match route {
+                    Some(bar::Shortcut::FocusedField) => {
+                        self.forward_to_focused(cx, sh, &Event::KeyDown(*k));
                     }
-                    // The last step is what lets a list act on the thing
-                    // under its cursor without moving focus.
-                    //
-                    // A caret in that panel's own widget keeps its letters
-                    // there as surely as one on the focused panel does —
-                    // and a click puts a caret in a previewed panel without
-                    // moving focus at all, so this is the only place that
-                    // hears of it. The chord goes to the widget, its bar
-                    // never sees it, and `bar::bold` drew exactly that.
-                    if let Some(child) = sh.session.joined_child(f) {
-                        if self.field_letters(Some(child)).has(c) {
-                            self.forward_to_slot(cx, sh, child, &Event::KeyDown(*k));
-                            return;
-                        }
-                        if self.bar_chord(sh, child, c) {
-                            return;
+                    Some(bar::Shortcut::PreviewField) => {
+                        if let Some(slot) = preview {
+                            self.forward_to_slot(cx, sh, slot, &Event::KeyDown(*k));
                         }
                     }
+                    Some(bar::Shortcut::FocusedVerb(id)) => {
+                        if let Some(slot) = focus { self.run_verb(sh, slot, id); }
+                    }
+                    Some(bar::Shortcut::PreviewVerb(id)) => {
+                        if let Some(slot) = preview { self.run_verb(sh, slot, id); }
+                    }
+                    None => { self.forward_to_focused(cx, sh, &Event::KeyDown(*k)); }
                 }
+            } else {
+                self.forward_to_focused(cx, sh, &Event::KeyDown(*k));
             }
             return;
         }
@@ -560,19 +549,37 @@ impl Stage {
         }
     }
 
-    /// Fires the verb a letter names on one panel's bar. Answers whether
-    /// the bar had one.
-    fn bar_chord(&mut self, sh: &mut Shell, slot: kernel::layout::SlotId, c: char) -> bool {
-        let Some(inst) = sh.session.panel(slot) else {
-            return false;
-        };
-        let id = {
-            let verbs = inst.borrow().verbs();
-            bar::chord(&verbs, c)
-        };
-        let Some(id) = id else { return false };
-        self.run_verb(sh, slot, id);
-        true
+    /// Read live keyboard ownership once for both bars in the routing order.
+    fn with_shortcuts<R>(
+        &self, cx: &Cx, sh: &Shell,
+        read: impl FnOnce(Option<kernel::layout::SlotId>, Option<kernel::layout::SlotId>, bar::Shortcuts<'_>) -> R,
+    ) -> R {
+        let focus = sh.session.focus();
+        let preview = focus.and_then(|s| sh.session.joined_child(s));
+        let verbs = |slot: Option<kernel::layout::SlotId>| slot.and_then(|s| sh.session.panel(s))
+            .map(|p| p.borrow().verbs()).unwrap_or_default();
+        let focused_verbs = verbs(focus);
+        let preview_verbs = verbs(preview);
+        read(focus, preview, bar::Shortcuts {
+            focused: &focused_verbs,
+            focused_keeps: self.field_letters(cx, focus),
+            preview: &preview_verbs,
+            preview_keeps: self.field_letters(cx, preview),
+        })
+    }
+
+    fn shortcut(
+        &self, cx: &Cx, sh: &Shell, c: char,
+    ) -> (Option<kernel::layout::SlotId>, Option<kernel::layout::SlotId>, Option<bar::Shortcut>) {
+        self.with_shortcuts(cx, sh, |focus, preview, keys| (focus, preview, keys.route(c)))
+    }
+
+    pub(super) fn bar_letters(&self, cx: &Cx, sh: &Shell, slot: kernel::layout::SlotId) -> Letters {
+        self.with_shortcuts(cx, sh, |focus, preview, keys| {
+            if Some(slot) == focus { keys.bold(true) }
+            else if Some(slot) == preview { keys.bold(false) }
+            else { Letters::NONE }
+        })
     }
 
     /// Runs one verb by its id, pulling the bar again as it fires: the bar

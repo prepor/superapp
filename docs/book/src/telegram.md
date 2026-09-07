@@ -15,6 +15,11 @@ Following several originals keeps each return point, so repeated `back`
 retraces them in order. This history belongs to the open panel; replies that
 have been deleted or are no longer loaded are skipped.
 
+Returning or walking the transcript reveals the message using its measured
+height, including in a short window or among large media messages. The reveal
+stays pending until a draw confirms the message is visible; a new scroll
+gesture takes over from it.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.
