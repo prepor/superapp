@@ -37,11 +37,11 @@ impl Widget for LinePanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
-        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
-            .is_some_and(Line::poll_reactions);
-        if changed {
-            self.view.redraw(cx);
-            if let Some(s) = scope.data.get_mut::<Session>() {
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+                .is_some_and(|l| l.poll_reactions(s));
+            if changed {
+                self.view.redraw(cx);
                 s.redraw();
             }
         }

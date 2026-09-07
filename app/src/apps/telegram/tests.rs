@@ -2586,6 +2586,15 @@ fn account() -> sync::Account<FakeTd> {
     )
 }
 
+fn poll_reactions(s: &mut Session, slot: SlotId) -> bool {
+    let panel = s.panel(slot).unwrap();
+    let mut panel = panel.borrow_mut();
+    if let Some(chat) = panel.as_any().downcast_mut::<Chat>() {
+        return chat.poll_reactions(s);
+    }
+    panel.as_any().downcast_mut::<Line>().unwrap().poll_reactions(s)
+}
+
 fn last_reaction_request(td: &FakeTd, kind: &str) -> serde_json::Value {
     td.sent().iter().rev()
         .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
@@ -2620,7 +2629,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     assert_eq!(request["chat_id"], RUST_WEEKLY);
     assert_eq!(request["message_id"], m.id);
     assert_eq!(request["row_size"], 6);
-    assert!(!with_chat(&s, chat, Chat::poll_reactions));
+    assert!(!poll_reactions(&mut s, chat));
     let emoji = |text: &str| serde_json::json!({"type": {"@type": "reactionTypeEmoji", "emoji": text}});
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "availableReactions", "@extra": request["@extra"],
@@ -2633,8 +2642,8 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     }).to_string());
     let labels: Vec<_> = s.panel(chat).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
     assert_eq!(labels, vec!["👍", "❤️", "🔥", "👏", "cancel"]);
-    assert!(with_chat(&s, chat, Chat::poll_reactions));
-    assert!(!with_chat(&s, chat, Chat::poll_reactions));
+    assert!(poll_reactions(&mut s, chat));
+    assert!(!poll_reactions(&mut s, chat));
 
     verb(&mut s, chat, "telegram.reaction_1");
     assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_1"), "no duplicate send while waiting");
@@ -2648,7 +2657,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     assert_eq!(model::line(s.store(), m.chat, m.id).unwrap().reactions, m.reactions);
 
     acc.on_update(s.world(), &serde_json::json!({"@type": "ok", "@extra": request["@extra"]}).to_string());
-    assert!(with_chat(&s, chat, Chat::poll_reactions));
+    assert!(poll_reactions(&mut s, chat));
     assert!(verb_ids(&s, chat).contains(&"telegram.react"));
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "updateMessageInteractionInfo", "chat_id": m.chat, "message_id": m.id,
@@ -2660,7 +2669,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
 }
 
 #[test]
-fn reaction_failures_can_be_inspected_and_retried_without_changing_the_message() {
+fn reaction_failures_are_reported_once_and_can_be_inspected_and_retried() {
     let mut s = session();
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
@@ -2673,6 +2682,11 @@ fn reaction_failures_can_be_inspected_and_retried_without_changing_the_message()
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "error", "@extra": query["@extra"], "code": 400, "message": "MESSAGE_NOT_FOUND",
     }).to_string());
+    let notes = s.notes().len();
+    assert!(poll_reactions(&mut s, card));
+    assert_eq!(s.notes().last().unwrap().msg, "could not load reactions: MESSAGE_NOT_FOUND");
+    assert!(!poll_reactions(&mut s, card));
+    assert_eq!(s.notes().len(), notes + 1, "the failure is reported only once");
     assert!(verb_ids(&s, card).contains(&"telegram.reactions_retry"));
     verb(&mut s, card, "telegram.reactions_retry");
     acc.drain(s.world());
@@ -2685,6 +2699,8 @@ fn reaction_failures_can_be_inspected_and_retried_without_changing_the_message()
         "@type": "error", "@extra": request["@extra"], "code": 400, "message": "REACTION_INVALID",
     }).to_string());
     assert_eq!(model::line(s.store(), m.chat, m.id).unwrap(), m);
+    assert!(poll_reactions(&mut s, card));
+    assert_eq!(s.notes().last().unwrap().msg, "could not add reaction: REACTION_INVALID");
     verb(&mut s, card, "telegram.reaction_status");
     assert!(s.notes().last().unwrap().msg.contains("REACTION_INVALID"));
     verb(&mut s, card, "telegram.reactions_retry");
@@ -2706,6 +2722,65 @@ fn reaction_failures_can_be_inspected_and_retried_without_changing_the_message()
     assert!(s.notes().last().unwrap().msg.contains("disconnected"));
     verb(&mut s, card, "telegram.reactions_retry");
     assert!(verb_ids(&s, card).contains(&"telegram.reactions_retry"), "a disconnected live picker stays live");
+    assert_eq!(model::line(s.store(), m.chat, m.id).unwrap(), m);
+}
+
+#[test]
+fn a_reaction_reports_its_clients_startup_failure_until_authorization_recovers() {
+    let mut s = session();
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let chat = open_root(&mut s, Chat::at(VERA, m.id));
+    let signin = open_root(&mut s, SignIn::id());
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    td.push(serde_json::json!({
+        "@type": "updateAuthorizationState",
+        "authorization_state": {"@type": "authorizationStateWaitTdlibParameters"},
+    }).to_string());
+    acc.drain(s.world());
+    let parameters = last_reaction_request(&td, "setTdlibParameters");
+    acc.on_update(s.world(), &serde_json::json!({
+        "@type": "error", "@extra": parameters["@extra"], "code": 400,
+        "message": "Can't lock file \"/tmp/tdlib/td.binlog\", because it is already in use; check for another program instance running",
+    }).to_string());
+    let reason = "Telegram is open in another app window\nclose it and restart this app";
+    with_signin(&s, signin, |p| {
+        assert_eq!(p.state(), "error");
+        assert_eq!(p.line(), reason);
+        assert_eq!(p.note(), None);
+        assert_eq!(p.field_kind(), None);
+    });
+
+    // A second process can write the shared session row. The error must
+    // still describe the client that actually handles this reaction.
+    set_session(&s, "ready", None, None);
+    verb(&mut s, chat, "telegram.react");
+    acc.drain(s.world());
+    assert!(!td.sent_types().iter().any(|t| t == "getMessageAvailableReactions"),
+        "a known connection failure is reported without sending a request");
+    assert!(poll_reactions(&mut s, chat));
+    assert_eq!(s.notes().last().unwrap().msg, format!("could not load reactions: {reason}"));
+    let labels: Vec<_> = s.panel(chat).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, vec!["could not load reactions", "retry", "cancel"]);
+
+    // A recovered connection must not keep reporting the previous failure.
+    acc.on_update(s.world(), &serde_json::json!({
+        "@type": "updateAuthorizationState",
+        "authorization_state": {"@type": "authorizationStateReady"},
+    }).to_string());
+    verb(&mut s, chat, "telegram.reactions_retry");
+    acc.drain(s.world());
+    let query = last_reaction_request(&td, "getMessageAvailableReactions");
+    acc.on_update(s.world(), &serde_json::json!({
+        "@type": "error", "@extra": query["@extra"], "code": 400, "message": "MESSAGE_NOT_FOUND",
+    }).to_string());
+    assert!(poll_reactions(&mut s, chat));
+    assert_eq!(s.notes().last().unwrap().msg, "could not load reactions: MESSAGE_NOT_FOUND");
+    verb(&mut s, chat, "telegram.reactions_retry");
+    acc.drain(s.world());
+    let query = last_reaction_request(&td, "getMessageAvailableReactions");
+    offer_reactions(&acc, &s, &query, &["👍"]);
+    assert!(verb_ids(&s, chat).contains(&"telegram.reaction_0"));
     assert_eq!(model::line(s.store(), m.chat, m.id).unwrap(), m);
 }
 

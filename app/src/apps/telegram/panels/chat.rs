@@ -294,8 +294,8 @@ impl Chat {
         self.reactions.cancel()
     }
 
-    pub fn poll_reactions(&mut self) -> bool {
-        self.reactions.poll()
+    pub fn poll_reactions(&mut self, s: &mut Session) -> bool {
+        self.reactions.poll(s)
     }
 
     /// Steps the cursor over the messages, `d` rows: from nothing, either

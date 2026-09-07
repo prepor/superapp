@@ -662,8 +662,9 @@ impl<T: Td> Account<T> {
     }
 
     /// A plain reply — `ok` or an error — to one of this account's own
-    /// requests, told apart by the `@extra` it wore: the chat-list load, a
-    /// history page. Send outcomes are handled by the operation tracker.
+    /// requests, told apart by the `@extra` it wore: initialization,
+    /// reactions, the chat-list load, and history pages. Send outcomes are
+    /// handled by the operation tracker.
     ///
     /// The list load: `ok` says a page landed and there may be another, an
     /// error (TDLib's 404) that the list is complete — after the main list
@@ -705,7 +706,9 @@ impl<T: Td> Account<T> {
         if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
             let result = if failed {
                 runtime::ReactionResult::Error(
-                    v["message"].as_str().unwrap_or("reaction request failed").to_string(),
+                    runtime::of(w.store()).connection_error().unwrap_or_else(|| {
+                        v["message"].as_str().unwrap_or("reaction request failed").to_string()
+                    }),
                 )
             } else {
                 runtime::ReactionResult::Added

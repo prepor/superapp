@@ -151,8 +151,11 @@ offer reactions, and marking messages keeps the batch actions on the bar.
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
 requests. Counts follow the server's interaction updates. A refused request
-shows **reaction failed** (click for the reason) and **retry**. Offline demos
-offer a small fixture list and show a toast when an emoji is chosen.
+shows **could not load reactions** or **reaction failed**, plus **retry**, and
+automatically reports the reason in a notification; click the status to see it
+again. Startup failures also appear in the sign-in panel. If another app
+instance has locked Telegram's database, close it and restart this instance.
+Offline demos offer a small fixture list and show a toast when an emoji is chosen.
 Custom emoji and paid reactions are not offered.
 
 ## Builds

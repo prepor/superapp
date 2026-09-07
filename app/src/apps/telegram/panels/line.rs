@@ -71,8 +71,8 @@ impl Line {
         self.reactions.cancel()
     }
 
-    pub fn poll_reactions(&mut self) -> bool {
-        self.reactions.poll()
+    pub fn poll_reactions(&mut self, s: &mut Session) -> bool {
+        self.reactions.poll(s)
     }
 
     /// Where the player stands, for a line with a recording.

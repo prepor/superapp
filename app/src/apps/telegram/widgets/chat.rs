@@ -216,9 +216,9 @@ impl Widget for ChatPanel {
             self.view.redraw(cx);
         }
 
-        if with_chat(&props, Chat::poll_reactions).unwrap_or(false) {
-            self.view.redraw(cx);
-            if let Some(s) = scope.data.get_mut::<Session>() {
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if with_chat(&props, |c| c.poll_reactions(s)).unwrap_or(false) {
+                self.view.redraw(cx);
                 s.redraw();
             }
         }

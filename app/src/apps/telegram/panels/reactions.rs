@@ -43,6 +43,15 @@ impl Picker {
             Some(ReactionResult::Added)
         )
     }
+
+    fn error_message(&self, error: &str) -> String {
+        let action = if self.adding {
+            "add reaction"
+        } else {
+            "load reactions"
+        };
+        format!("could not {action}: {error}")
+    }
 }
 
 pub(super) fn can_react(m: &Msg) -> bool {
@@ -57,12 +66,14 @@ impl Reactions {
         let runtime = runtime::of(store);
         let (id, reply) = runtime.await_reaction();
         let was_live = self.0.as_ref().is_some_and(|p| p.live);
-        let live = wire(
+        let live = runtime.connection_error().is_none() && wire(
             store,
             &requests::get_message_available_reactions(m.chat, m.id, id),
         );
         if !live {
-            let result = if was_live {
+            let result = if let Some(error) = runtime.connection_error() {
+                ReactionResult::Error(error)
+            } else if was_live {
                 ReactionResult::Error("Telegram is disconnected".into())
             } else {
                 ReactionResult::Choices(
@@ -87,12 +98,19 @@ impl Reactions {
 
     /// Worker replies do not write SQLite. The widgets poll on the worker's
     /// signal and request one redraw when the in-memory answer arrives.
-    pub fn poll(&mut self) -> bool {
+    /// Report a failure once, without requiring a click on the status label.
+    pub fn poll(&mut self, s: &mut Session) -> bool {
         let Some(p) = self.0.as_mut() else {
             return false;
         };
-        if !p.seen_reply && p.reply.lock().expect("reaction reply").is_some() {
+        if p.seen_reply {
+            return false;
+        }
+        if let Some(result) = p.result() {
             p.seen_reply = true;
+            if let ReactionResult::Error(error) = result {
+                s.notify(p.error_message(&error), true);
+            }
             return true;
         }
         false
@@ -137,7 +155,11 @@ impl Reactions {
             Some(ReactionResult::Error(_)) => {
                 verbs.push(Verb::run(
                     "telegram.reaction_status",
-                    "reaction failed",
+                    if p.adding {
+                        "reaction failed"
+                    } else {
+                        "could not load reactions"
+                    },
                     None,
                 ));
                 verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')));
@@ -160,7 +182,7 @@ impl Reactions {
         match verb {
             "telegram.reaction_status" => {
                 if let Some(ReactionResult::Error(error)) = p.result() {
-                    s.notify(format!("could not add reaction: {error}"), true);
+                    s.notify(p.error_message(&error), true);
                 }
             }
             "telegram.reactions_cancel" => {
@@ -202,13 +224,14 @@ impl Reactions {
                     } else {
                         let runtime = runtime::of(store);
                         let (id, reply) = runtime.await_reaction();
-                        if !wire(
+                        if runtime.connection_error().is_some() || !wire(
                             store,
                             &requests::add_message_reaction(p.chat, p.msg, emoji, id),
                         ) {
                             runtime.finish_reaction(
                                 id,
-                                ReactionResult::Error("Telegram is disconnected".into()),
+                                ReactionResult::Error(runtime.connection_error()
+                                    .unwrap_or_else(|| "Telegram is disconnected".into())),
                             );
                         }
                         p.reply = reply;
