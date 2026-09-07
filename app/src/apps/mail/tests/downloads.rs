@@ -2,7 +2,7 @@
 //! downloads bytes, and subsequent requests can use the local cache offline.
 
 use super::*;
-use crate::apps::mail::{content, parts};
+use crate::apps::mail::{content, parts, schema};
 use base64::Engine as _;
 use kernel::caps::Blobs;
 
@@ -124,7 +124,7 @@ fn a_pending_move_downloads_from_the_servers_folder() {
 }
 
 #[test]
-fn old_raw_messages_are_converted_and_their_parts_remain_addressable() {
+fn opening_an_older_store_completes_attachment_lists_in_place() {
     let (s, _) = session();
     let m = seed::mails()
         .into_iter()
@@ -141,33 +141,122 @@ fn old_raw_messages_are_converted_and_their_parts_remain_addressable() {
         )
         .unwrap();
     let before = parts::attachments(s.store(), mail).as_ref().clone();
+    let row_id = |store: &Store| -> i64 {
+        store
+            .conn()
+            .query_row(
+                "SELECT id FROM attachment WHERE message = ?1 ORDER BY part LIMIT 1",
+                [mail],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let original_id = row_id(s.store());
+    let incomplete = deliver(&s, "missing-descriptors", b"already compacted");
+    let expected = parts::attachments(s.store(), incomplete).as_ref().clone();
     let raw = seed::rfc822(&m);
+    assert!(content::Content::read(raw.as_bytes()).is_err());
     s.store()
         .write(move |c| {
             c.execute(
                 "UPDATE message SET raw = ?2 WHERE id = ?1",
                 rusqlite::params![mail, raw.as_bytes()],
             )?;
+            c.execute("UPDATE attachment_scan SET version = 2", [])?;
+            c.execute("DELETE FROM attachment WHERE message = ?1", [incomplete])?;
             c.execute(
-                "UPDATE attachment_scan SET version = 1 WHERE message = ?1",
-                [mail],
+                "DELETE FROM attachment_scan WHERE message = ?1",
+                [incomplete],
             )?;
-            parts::scan(c)
+            c.execute("UPDATE meta SET value = 2 WHERE key = 'mail:attachments'", [])?;
+            Ok(())
         })
         .unwrap();
-    assert_eq!(*parts::attachments(s.store(), mail), before);
-    let compact = model::raw(s.store(), mail).unwrap();
+    assert!(parts::attachments(s.store(), incomplete).is_empty());
+
+    // Open a version-two store with no session or workers. Both legacy raw
+    // and an incomplete snapshot must be ready on the first read.
+    let dir = std::env::temp_dir().join(format!(
+        "superapp-mail-migration-{}",
+        s.store().device()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("store.db");
+    s.store().vacuum_into(&path).unwrap();
+    let migrated = Store::open(Some(&path), &[&schema::SCHEMA]).unwrap();
+    assert_eq!(*parts::attachments(&migrated, mail), before);
+    assert_eq!(*parts::attachments(&migrated, incomplete), expected);
+    assert_eq!(
+        row_id(&migrated), original_id,
+        "existing cards keep their rows"
+    );
+    let pending: i64 = migrated.conn().query_row(
+        "SELECT COUNT(*) FROM message m LEFT JOIN attachment_scan s ON s.message = m.id
+         WHERE s.version IS NULL OR s.version != ?1",
+        [parts::ATTACH_VERSION], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(pending, 0, "migration finishes before readers open");
+    assert!(servers(&s)
+        .with(seed::ACCOUNT, |s| s.part_fetches.is_empty())
+        .unwrap());
+    let compact = model::raw(&migrated, mail).unwrap();
     assert!(compact.starts_with(b"superapp-mail-1\n"));
+    s.store().write(|c| schema::SCHEMA.apply(c)).unwrap();
     assert_eq!(
         parts::part(s.world(), &before[0]).unwrap(),
         seed::parts_of(&subject)[0].1
     );
-    s.store().write(|c| parts::scan(c)).unwrap();
+    drop(migrated);
+    let reopened = Store::open(Some(&path), &[&schema::SCHEMA]).unwrap();
     assert_eq!(
-        model::raw(s.store(), mail).unwrap(),
+        model::raw(&reopened, mail).unwrap(),
         compact,
         "conversion is idempotent"
     );
+    assert_eq!(*parts::attachments(&reopened, incomplete), expected);
+    assert_eq!(row_id(&reopened), original_id);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn attachment_lists_arrive_in_the_same_commit_as_synced_and_replicated_mail() {
+    let (s, _) = session();
+    let peer = Store::open(None, &[&schema::SCHEMA]).unwrap();
+    let frames = s.store().pending_frames();
+    for (_, frame) in &frames {
+        peer.apply_frame(frame).unwrap();
+    }
+    let through = frames.last().map_or(0, |(seq, _)| *seq);
+
+    // Only sync runs: no sender pass, UI polling or download completes the
+    // attachment list after the message has become visible.
+    let mail = deliver(&s, "atomic-attachment-list", b"file contents");
+    let expected = parts::attachments(s.store(), mail);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(expected[0].name, "download.bin");
+    assert_eq!(expected[0].mime, "application/octet-stream");
+    assert_eq!(expected[0].size, 13);
+    assert!(model::mail(&peer, mail).is_none());
+    assert!(parts::attachments(&peer, mail).is_empty());
+    assert!(parts::thread_carriers(&peer, mail).is_empty());
+
+    for (_, frame) in s
+        .store()
+        .pending_frames()
+        .iter()
+        .filter(|(seq, _)| *seq > through)
+    {
+        peer.apply_frame(frame).unwrap();
+        if model::mail(&peer, mail).is_some() {
+            assert_eq!(parts::attachments(&peer, mail), expected);
+            assert!(parts::thread_carriers(&peer, mail).contains(&mail));
+        }
+    }
+    assert!(model::mail(&peer, mail).is_some());
+    assert!(servers(&s)
+        .with(seed::ACCOUNT, |s| s.part_fetches.is_empty())
+        .unwrap());
 }
 
 #[test]
@@ -286,7 +375,7 @@ fn unreadable_legacy_data_does_not_block_conversion_or_repeat_forever() {
     ).unwrap();
     assert_eq!(
         pending, 0,
-        "unreadable messages must not keep the sender busy"
+        "unreadable messages must not remain pending migration"
     );
     s.store().write(|c| parts::scan(c)).unwrap();
     assert_eq!(model::raw(s.store(), good).unwrap(), expected);

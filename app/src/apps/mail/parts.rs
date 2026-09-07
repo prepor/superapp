@@ -4,11 +4,11 @@
 //! File bodies live on the server and in the kernel's bounded blob cache,
 //! shared with Telegram. Neither downloads nor cache paths are replicated.
 //!
-//! The rows are derived, so they are versioned by the walk that made them
-//! ([`ATTACH_VERSION`]) rather than by the schema counter, and
-//! `attachment_scan` writes that version down **per mail**: a letter that
-//! arrives through replication has a `raw` nobody has walked, and this is what
-//! notices.
+//! Existing messages are converted in place when the store opens, before
+//! the UI or workers start. Ingest writes new messages and their attachment
+//! rows in the same transaction; replication carries that whole commit.
+//! `attachment_scan` records the derivation version per message so an
+//! interrupted migration can resume without converting finished rows again.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use super::model::{self, MailId};
 
 /// Which walk over `raw` the stored rows came out of. Bump it and every
 /// store re-derives every letter's parts on its next open.
-pub const ATTACH_VERSION: i64 = 2;
+pub const ATTACH_VERSION: i64 = 3;
 
 /// One part's description, derived from the stored content snapshot.
 /// [`part`] retrieves its bytes from the cache or the server.
@@ -379,19 +379,11 @@ pub fn mark_scanned_tx(c: &rusqlite::Connection, message: MailId) -> rusqlite::R
     Ok(())
 }
 
-/// Derives the rows of every mail nobody has walked at this version.
+/// Converts existing mail and rebuilds its attachment rows at store open.
 ///
-/// The schema's [`Step::Derived`](kernel::app::Step) runs it when the version
-/// moves; the sender pass runs it every turn, because a letter that arrives
-/// through replication runs no ingest code and its `raw` is nobody's to walk
-/// until somebody looks.
-///
-/// The anti-join is what makes running it every turn affordable. A
-/// `WHERE raw IS NOT NULL` would decode every record as far as the letter to
-/// answer, over the whole mailbox, every time; driving off `attachment_scan`
-/// instead reads no letter at all once they have all been walked. A mail
-/// *without* raw gets its scan row too — nothing to walk is an answer, and it
-/// should be given once.
+/// The schema's [`Step::Derived`](kernel::app::Step) runs this synchronously
+/// when the version moves. Per-message versions let an interrupted migration
+/// resume; ingest and replication already commit complete attachment rows.
 ///
 /// # Errors
 ///
@@ -434,19 +426,22 @@ pub fn scan(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
                     Err(e) => {
                         // Preserve unreadable legacy data for recovery,
                         // but finish its derivation so every later message
-                        // can convert and later sender passes do not spin.
+                        // can convert and a resumed migration can advance.
                         eprintln!("mail: cannot convert message {id}: {e}");
                         attach_tx(conn, id, &[])?;
                         continue;
                     }
                 };
-                attach_tx(conn, id, &super::sync::parse_mail(&compact).attachments)?;
+                let attachments = super::sync::parse_mail(&compact).attachments;
                 if raw != compact {
                     conn.execute(
                         "UPDATE message SET raw = ?2 WHERE id = ?1",
                         rusqlite::params![id, compact],
                     )?;
                 }
+                // Mark the message complete only after its stored content
+                // and attachment rows have both been converted.
+                attach_tx(conn, id, &attachments)?;
             }
             None => mark_scanned_tx(conn, id)?,
         }

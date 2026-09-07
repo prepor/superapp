@@ -962,32 +962,6 @@ pub fn outbox_pass(w: &World) -> usize {
     claimed
 }
 
-/// Walks the `raw` of every mail nobody has walked at this build's version,
-/// so its parts are rows a panel can list.
-///
-/// The ingest writes them in the transaction that stored the letter, and the
-/// schema's derived step covers a version bump — but a mail that arrives
-/// through **replication** runs no ingest code at all, and its `raw` is
-/// nobody's to walk until somebody looks. This is the somebody. It is an
-/// anti-join that reads no letter once they have all been walked, which is
-/// what makes running it every turn affordable.
-fn scan_pass(w: &World) {
-    let unwalked: bool = w
-        .store()
-        .conn()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM message m
-                           LEFT JOIN attachment_scan s ON s.message = m.id
-                           WHERE s.version IS NULL OR s.version != ?1)",
-            [parts::ATTACH_VERSION],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    if unwalked {
-        let _ = w.store().write(|tx| parts::scan(tx));
-    }
-}
-
 // -- the workers -----------------------------------------------------------------------
 
 /// Asks every sync pass to look outside on its next turn, whenever it comes.
@@ -1131,7 +1105,6 @@ impl Worker for SenderPass {
         if outbox_pass(w) > 0 {
             pull_now();
         }
-        scan_pass(w);
         // Sleep until the next deadline, capped — kicks cut it short.
         let next: Option<f64> = w
             .store()

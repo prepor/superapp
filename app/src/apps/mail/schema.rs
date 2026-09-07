@@ -195,10 +195,9 @@ CREATE TABLE draft_file(
 /// the stored content snapshot maps to an IMAP section. Attachment bodies are
 /// downloaded on demand into the local file cache, never into SQLite.
 ///
-/// `attachment_scan` is where the walk's version is written down, one row per
-/// mail. A **table** rather than one `meta` key, because the question is per
-/// mail and not per store: a letter that arrives through replication has a
-/// `raw` nobody has walked yet, and this is what notices.
+/// `attachment_scan` records the derivation version per mail, so a migration
+/// interrupted while converting an existing mailbox resumes where it left
+/// off. New mail and its attachment rows are committed and replicated together.
 ///
 /// `draft_attachment` is the other direction and is not derived at all: a
 /// compose panel's own list of files to carry out, keyed by its slot like the

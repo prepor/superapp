@@ -31,14 +31,13 @@ pub struct Content {
 }
 
 impl Content {
-    /// Also accepts legacy RFC822, for the one-time conversion on open and
-    /// for messages arriving from an older peer.
+    /// Reads the stored format. Legacy RFC822 is converted before the store
+    /// opens, not while a reading or attachment is being displayed.
     pub fn read(raw: &[u8]) -> Result<Self, String> {
-        if let Some(json) = raw.strip_prefix(PREFIX) {
-            serde_json::from_slice(json).map_err(|e| format!("cannot read stored mail: {e}"))
-        } else {
-            Self::from_raw(raw)
-        }
+        let json = raw
+            .strip_prefix(PREFIX)
+            .ok_or("mail is not a content snapshot")?;
+        serde_json::from_slice(json).map_err(|e| format!("cannot read stored mail: {e}"))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -81,7 +80,12 @@ impl Content {
 
 /// Compact at every ingest boundary, including fakes and legacy snapshots.
 pub fn compact(raw: &[u8]) -> Result<Vec<u8>, String> {
-    Content::read(raw).map(|c| c.encode())
+    if raw.starts_with(PREFIX) {
+        Content::read(raw)
+    } else {
+        Content::from_raw(raw)
+    }
+    .map(|c| c.encode())
 }
 
 /// MIME tree positions are IMAP section numbers, not parser part indices.
