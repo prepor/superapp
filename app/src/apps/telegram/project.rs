@@ -84,6 +84,18 @@ pub struct IncomingTopic {
     pub draft: Option<String>,
 }
 
+/// Forum capability comes from the chat's current metadata. A topic id on
+/// a message alone cannot turn a private chat into a forum. Repair cached
+/// membership when Telegram confirms that topics are not supported.
+pub fn set_forum(c: &Connection, chat: PeerId, forum: bool) -> rusqlite::Result<()> {
+    c.execute("UPDATE tg_peer SET is_forum = ?2 WHERE id = ?1",
+        rusqlite::params![chat, forum])?;
+    if !forum {
+        c.execute("UPDATE tg_message SET topic = 0 WHERE chat = ?1 AND topic != 0", [chat])?;
+    }
+    Ok(())
+}
+
 /// Metadata can arrive before the list response. Only fields supplied by the
 /// update change; selection, pinning and archiving belong to this app.
 pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> {
@@ -261,7 +273,8 @@ INSERT INTO tg_message(
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
   views, comments, reactions, service, entities, entities_known, topic, unread_mention)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1, ?28, ?29)
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1,
+       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
   text = excluded.text, entities = excluded.entities, entities_known = 1,

@@ -23,7 +23,7 @@ use serde_json::Value;
 use super::model::{self, Media, MsgId, PeerId};
 use super::project::{
     apply_read_outbox, history_window_in, project_chats, project_members, project_messages,
-    project_peers, project_topic, trim_topic, IncomingMessage, HISTORY_KEEP,
+    project_peers, project_topic, set_forum, trim_topic, IncomingMessage, HISTORY_KEEP,
 };
 use super::requests::*;
 use super::runtime;
@@ -53,6 +53,9 @@ const TYPING_FOR: f64 = 6.0;
 pub struct Account<T: Td> {
     td: T,
     commands: std::cell::RefCell<Option<runtime::Inbox>>,
+    /// Readiness belongs to this TDLib client, not the last process's
+    /// persisted authorization row.
+    auth_ready: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -196,6 +199,7 @@ impl<T: Td> Account<T> {
         Account {
             td,
             commands: std::cell::RefCell::new(None),
+            auth_ready: std::cell::Cell::new(false),
             api_id,
             tdlib_dir,
             phone,
@@ -233,9 +237,8 @@ impl<T: Td> Account<T> {
     /// honoured. The chats the panels wanted since the last pass go to the
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
-        if runtime::of(w.store()).connection_error().is_some()
-            || (super::Telegram::engine_store(w.store().dir())
-                && schema::session(w.store().conn()).state != "ready")
+        let rt = runtime::of(w.store());
+        if !self.auth_ready.get() || rt.connection_error().is_some() || rt.list_syncing()
         {
             return;
         }
@@ -257,8 +260,19 @@ impl<T: Td> Account<T> {
             }
         }
         for (chat, topic) in wanted.topic_chats {
+            if !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
+                rt.set_loading_in(chat, topic, false);
+                continue;
+            }
             self.want_in(w, chat, topic);
-            self.send(w, &get_forum_topic(chat, topic));
+            self.request_topic(w, chat, topic);
+        }
+        for chat in wanted.topic_lists {
+            if model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
+                self.send(w, &get_forum_topics(chat, 0, 0, 0));
+            } else {
+                rt.topics_loaded(chat, Err("this chat no longer has forum topics".into()));
+            }
         }
         let now = w.now();
         if let Some((page, sent)) = self.in_flight.get() {
@@ -425,6 +439,7 @@ impl<T: Td> Account<T> {
     /// One authorization state: fire what TDLib waits for, or record what the
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
+        self.auth_ready.set(false);
         runtime::of(w.store()).set_connection_error(None);
         let now = w.now();
         // The state row, written on the store's writer thread. Only the owned
@@ -541,6 +556,7 @@ impl<T: Td> Account<T> {
     /// Keep unconfirmed messages from a previous run visible. The projection
     /// cannot establish whether Telegram delivered them while we were away.
     pub fn on_ready(&self, w: &World) {
+        self.auth_ready.set(true);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -779,11 +795,9 @@ impl<T: Td> Account<T> {
                 self.on_counts(w, updates::supergroup(update));
                 if let Some(id) = update["supergroup"]["id"].as_i64() {
                     let chat = -1_000_000_000_000 - id;
-                    let forum = update["supergroup"]["is_forum"].as_bool().unwrap_or(false);
-                    self.filed(w, "forum", w.store().write(move |c| {
-                        c.execute("UPDATE tg_peer SET is_forum = ?2 WHERE id = ?1",
-                            rusqlite::params![chat, forum]).map(|_| ())
-                    }));
+                    if let Some(forum) = update["supergroup"]["is_forum"].as_bool() {
+                        self.filed(w, "forum", w.store().write(move |c| set_forum(c, chat, forum)));
+                    }
                 }
             }
             Some("updateSupergroupFullInfo") => self.on_counts(w, updates::supergroup_full(update)),
@@ -806,13 +820,21 @@ impl<T: Td> Account<T> {
             }
             Some("updateForumTopic") => {
                 if let Some(chat) = update["chat_id"].as_i64() {
+                    // getForumTopic itself emits this update. Applying it
+                    // must not request the same topic again.
                     self.on_topic(w, chat, update);
-                    if let Some(topic) = update["forum_topic_id"].as_i64() {
-                        self.send(w, &get_forum_topic(chat, topic));
-                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn request_topic(&self, w: &World, chat: PeerId, topic: i64) {
+        if self.auth_ready.get()
+            && model::peer(w.store(), chat).is_some_and(|p| p.is_forum)
+            && !runtime::of(w.store()).operations.pending_context(&format!("topic:{chat}:{topic}"))
+        {
+            self.send(w, &get_forum_topic(chat, topic));
         }
     }
 
@@ -823,11 +845,13 @@ impl<T: Td> Account<T> {
         self.filed(w, "topic", w.store().write(move |c| {
             ensure_peer(c, chat)?;
             model::ensure_chat_tx(c, chat)?;
+            project_topic(c, &topic)?;
             if let Some(m) = message {
                 if let Some(sender) = m.sender { ensure_peer(c, sender)?; }
                 project_messages(c, &[m])?;
+                apply_read_outbox(c, chat)?;
             }
-            project_topic(c, &topic)
+            Ok(())
         }));
     }
 
@@ -871,7 +895,7 @@ impl<T: Td> Account<T> {
             }),
         );
         if topic != 0 {
-            self.send(w, &get_forum_topic(chat, topic));
+            self.request_topic(w, chat, topic);
         }
         // Ask for the media, if any: TDLib downloads it, `updateFile`
         // completes, and [`on_file`](Account::on_file) ingests the bytes into
@@ -1034,7 +1058,7 @@ impl<T: Td> Account<T> {
         }
         self.want_mentions(w, peer);
         for topic in super::topics::list(w.store(), peer).iter().filter(|t| t.selected) {
-            self.send(w, &get_forum_topic(peer, topic.id));
+            self.request_topic(w, peer, topic.id);
         }
     }
 
@@ -1341,10 +1365,18 @@ impl<T: Td> Account<T> {
         let Some(p) = updates::peer(user) else {
             return;
         };
+        let forum = user["type"]["@type"].as_str().map(|kind| {
+            kind == "userTypeBot" && user["type"]["has_topics"].as_bool().unwrap_or(false)
+        });
         self.filed(
             w,
             "on_user",
-            w.store().write(move |c| project_peers(c, &[p])),
+            w.store().write(move |c| {
+                let peer = p.id;
+                project_peers(c, &[p])?;
+                if let Some(forum) = forum { set_forum(c, peer, forum)?; }
+                Ok(())
+            }),
         );
     }
 

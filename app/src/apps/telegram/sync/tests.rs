@@ -43,7 +43,11 @@ fn tdlib_dir() -> std::path::PathBuf {
 /// and a scratch tdlib directory (nothing is written to it but the files
 /// a download test plants — no client runs).
 fn account(td: FakeTd, phone: Option<&str>) -> Account<FakeTd> {
-    Account::new(td, 17844, tdlib_dir(), phone.map(str::to_string))
+    let account = Account::new(td, 17844, tdlib_dir(), phone.map(str::to_string));
+    // Content fixtures begin connected. Startup tests construct a fresh
+    // account explicitly or drive its authorization updates.
+    account.auth_ready.set(true);
+    account
 }
 
 /// A finished download on disk where the engine keeps them, named for
@@ -125,8 +129,14 @@ fn a_locked_telegram_session_reports_the_connection_failure_until_auth_resumes()
     assert!(runtime.list_syncing());
     assert_eq!(
         td.sent_types(),
-        vec!["setTdlibParameters", "loadChats", "getChatHistory"]
+        vec!["setTdlibParameters", "loadChats"]
     );
+    for list in ["main", "archive"] {
+        acc.on_update(&w, &json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")}).to_string());
+    }
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters", "loadChats", "loadChats", "getChatHistory"]);
     acc.on_update(
         &w,
         &json!({"@type": "error", "code": 404,

@@ -243,6 +243,56 @@ fn empty_topic_groups_show_the_local_connection_failure_over_shared_session_stat
 }
 
 #[test]
+fn a_topic_list_timeout_can_refresh_without_old_errors_overriding_it() {
+    let mut s = session();
+    let picker = open_root(&mut s, Topics::id(BERLIN));
+    let rt = runtime::of(s.store());
+    let _inbox = rt.connect();
+    rt.operations
+        .track(&requests::get_forum_topics(BERLIN, 10, 20, 2));
+    rt.topics_loaded(BERLIN, Ok(true));
+    rt.operations.expire(
+        s.store(),
+        std::time::Instant::now() + std::time::Duration::from_secs(121),
+    );
+    TELEGRAM.poll(&mut s);
+    assert!(with_topics(&s, picker, |p| p.status()).contains("refresh to try again"));
+
+    verb(&mut s, picker, "telegram.refresh_topics");
+    rt.operations.changed();
+    TELEGRAM.poll(&mut s);
+    assert_eq!(rt.topics_status(BERLIN), Ok(true), "the retry is queued");
+    assert_eq!(rt.take_wanted().topic_lists, vec![BERLIN]);
+    let next = rt
+        .operations
+        .track(&requests::get_forum_topics(BERLIN, 0, 0, 0));
+    TELEGRAM.poll(&mut s);
+    assert_eq!(
+        rt.topics_status(BERLIN),
+        Ok(true),
+        "the old page's failure cannot stop the new request"
+    );
+    let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+    rt.operations.reply(
+        s.store(),
+        &serde_json::json!({"@type": "forumTopics",
+        "topics": [], "@extra": next["@extra"]}),
+    );
+    rt.topics_loaded(BERLIN, Ok(false));
+    TELEGRAM.poll(&mut s);
+    assert_eq!(
+        rt.topics_status(BERLIN),
+        Ok(false),
+        "a successful refresh stays successful"
+    );
+    assert_eq!(
+        topics::list(s.store(), BERLIN).len(),
+        4,
+        "the cached catalog is preserved"
+    );
+}
+
+#[test]
 fn topic_history_read_claim_and_drafts_never_cross_topics() {
     let mut s = session();
     let list = open_root(&mut s, Chats::id());

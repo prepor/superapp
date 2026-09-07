@@ -115,11 +115,22 @@ impl App for Telegram {
         let rt = runtime::of(s.store());
         rt.operations.expire(s.store(), std::time::Instant::now());
         if rt.operations.take_changed() {
-            for op in rt.operations.list() {
+            let operations = rt.operations.list();
+            for op in &operations {
                 if matches!(op.status, operations::Status::Failed { .. }) {
                     if let Some(context) = op.context() {
                         if context.starts_with("load_chats:") {
                             rt.set_list_syncing(false);
+                        }
+                        if let Some(chat) = context.strip_prefix("topics:")
+                            .and_then(|s| s.split(':').next()?.parse().ok())
+                        {
+                            let pending = operations.iter().any(|op| op.chat == Some(chat)
+                                && op.status == operations::Status::Pending
+                                && op.context().is_some_and(|c| c.starts_with("topics:")));
+                            if rt.topics_status(chat) == Ok(true) && !rt.topic_list_queued(chat) && !pending {
+                                rt.topics_loaded(chat, Err("could not load topics · refresh to try again".into()));
+                            }
                         }
                     }
                 }

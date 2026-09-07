@@ -38,6 +38,223 @@ fn line(id: i64, topic: i64) -> serde_json::Value {
 }
 
 #[test]
+fn topic_responses_do_not_feed_a_request_loop() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    forum(&acc, &w);
+    for id in [20, 21, 22] {
+        acc.on_update(
+            &w,
+            &json!({"@type": "updateNewMessage", "message": line(id, 2)}).to_string(),
+        );
+    }
+    assert_eq!(
+        td.sent_types(),
+        vec!["getForumTopic"],
+        "one request covers the burst"
+    );
+    let request: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    let update = json!({"@type": "updateForumTopic", "chat_id": GROUP, "forum_topic_id": 2,
+        "last_read_inbox_message_id": 20, "last_read_outbox_message_id": 0,
+        "unread_mention_count": 1, "notification_settings": {"mute_for": 0}, "draft_message": null});
+    let mut answer = topic(2, "Meetups");
+    answer["@extra"] = request["@extra"].clone();
+    // TDLib emits updateForumTopic for a fetched topic, even if no fields
+    // changed. This is the sequence repeated thousands of times in the log.
+    for _ in 0..5 {
+        acc.on_update(&w, &update.to_string());
+        acc.on_update(&w, &answer.to_string());
+    }
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["getForumTopic"]);
+    assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().name, "Meetups");
+    assert_eq!(model::history_in(w.store(), GROUP, 2).len(), 3);
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": line(23, 2)}).to_string(),
+    );
+    assert_eq!(
+        td.sent_types(),
+        vec!["getForumTopic", "getForumTopic"],
+        "a later message can refresh counts"
+    );
+}
+
+#[test]
+fn private_chat_topic_ids_do_not_trigger_forum_requests_or_hide_messages() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    let user = json!({"@type": "updateUser", "user": {"id": 7, "first_name": "Person",
+        "type": {"@type": "userTypeRegular"}}});
+    acc.on_update(&w, &user.to_string());
+    let mut message = line(30, 2996);
+    message["chat_id"] = json!(7);
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": message}).to_string(),
+    );
+    assert!(td.sent().is_empty());
+    assert!(!model::peer(w.store(), 7).unwrap().is_forum);
+    assert_eq!(model::history(w.store(), 7).len(), 1);
+    assert_eq!(model::message_topic(w.store(), 7, 30), 0);
+
+    // Repair a message cached by the earlier build, keeping its content.
+    w.store()
+        .write(|c| {
+            c.execute("UPDATE tg_message SET topic = 2996 WHERE chat = 7", [])?;
+            Ok(())
+        })
+        .unwrap();
+    acc.on_update(&w, &user.to_string());
+    assert_eq!(model::history(w.store(), 7)[0].text, "topic 2996 line 30");
+    assert_eq!(model::message_topic(w.store(), 7, 30), 0);
+
+    // Bot forums remain valid: their user metadata advertises topics.
+    let bot = json!({"@type": "updateUser", "user": {"id": 8, "first_name": "Bot",
+        "type": {"@type": "userTypeBot", "has_topics": true}}});
+    acc.on_update(&w, &bot.to_string());
+    message["chat_id"] = json!(8);
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": message}).to_string(),
+    );
+    assert!(model::peer(w.store(), 8).unwrap().is_forum);
+    assert_eq!(model::history_in(w.store(), 8, 2996).len(), 1);
+    assert_eq!(td.sent_types(), vec!["getForumTopic"]);
+}
+
+#[test]
+fn cached_topic_panels_wait_for_this_clients_auth_and_chat_list() {
+    let td = FakeTd::new();
+    let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
+    let w = world();
+    // Both the cached forum and authorization row survived a previous run.
+    forum(&acc, &w);
+    w.store()
+        .write(|c| schema::set_session(c, None, "ready", None, 0.0))
+        .unwrap();
+    acc.drain(&w);
+    let rt = runtime::of(w.store());
+    rt.want_topic_history(GROUP, 2);
+    rt.refresh_topics(GROUP);
+    rt.refresh_topics(GROUP);
+    acc.drain(&w);
+    assert!(
+        td.sent().is_empty(),
+        "a persisted ready row cannot authorize the new client"
+    );
+    assert_eq!(rt.topics_status(GROUP), Ok(true));
+
+    acc.on_update(&w, &auth("authorizationStateWaitTdlibParameters"));
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters"]);
+    acc.on_update(&w, &auth("authorizationStateReady"));
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["setTdlibParameters", "loadChats"]);
+    for list in ["main", "archive"] {
+        acc.on_update(
+            &w,
+            &json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")})
+            .to_string(),
+        );
+    }
+    acc.drain(&w);
+    assert_eq!(
+        td.sent_types(),
+        vec![
+            "setTdlibParameters",
+            "loadChats",
+            "loadChats",
+            "getForumTopic",
+            "getForumTopics",
+            "getForumTopicHistory"
+        ]
+    );
+    let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(request["forum_topic_id"], 2);
+}
+
+#[test]
+fn a_timed_out_topic_lookup_can_refresh_again() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    forum(&acc, &w);
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": line(20, 2)}).to_string(),
+    );
+    let first: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    runtime::of(w.store()).operations.expire(
+        w.store(),
+        std::time::Instant::now() + std::time::Duration::from_secs(121),
+    );
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": line(21, 2)}).to_string(),
+    );
+    assert_eq!(td.sent_types(), vec!["getForumTopic", "getForumTopic"]);
+    let retry: serde_json::Value = serde_json::from_str(&td.sent()[1]).unwrap();
+    assert_eq!(first["@extra"], retry["@extra"]);
+    let mut answer = topic(2, "Meetups");
+    answer["@extra"] = retry["@extra"].clone();
+    acc.on_update(&w, &answer.to_string());
+    assert!(runtime::of(w.store())
+        .operations
+        .list()
+        .iter()
+        .all(|op| op.status == crate::apps::telegram::operations::Status::Done));
+}
+
+#[test]
+fn disabling_forum_mode_restores_the_chat_without_losing_topic_preferences() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    forum(&acc, &w);
+    acc.on_topic(&w, GROUP, &topic(2, "Meetups"));
+    w.store()
+        .write(|c| topics::select_tx(c, GROUP, &[2], true))
+        .unwrap();
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": line(20, 2)}).to_string(),
+    );
+    // A partial group update must not erase the known capability.
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateSupergroup", "supergroup": {"id": 42,
+        "member_count": 1001}})
+        .to_string(),
+    );
+    assert!(model::peer(w.store(), GROUP).unwrap().is_forum);
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateSupergroup", "supergroup": {"id": 42,
+        "is_forum": false}})
+        .to_string(),
+    );
+    assert!(!model::peer(w.store(), GROUP).unwrap().is_forum);
+    assert_eq!(model::history(w.store(), GROUP).len(), 1);
+    assert!(topics::get(w.store(), GROUP, 2).unwrap().selected);
+    acc.drain(&w);
+    runtime::of(w.store()).want_topic_history(GROUP, 2);
+    runtime::of(w.store()).refresh_topics(GROUP);
+    let sent = td.sent().len();
+    acc.drain(&w);
+    assert_eq!(
+        td.sent().len(),
+        sent,
+        "the cached topic cannot trigger invalid forum requests"
+    );
+    assert!(!runtime::of(w.store()).loading_in(GROUP, 2));
+    assert!(runtime::of(w.store()).topics_status(GROUP).is_err());
+}
+
+#[test]
 fn forum_discovery_pages_topics_and_preserves_selection_on_refresh() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);

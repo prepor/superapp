@@ -132,6 +132,12 @@ impl Tracker {
     pub fn take_changed(&self) -> bool {
         self.dirty.swap(false, Ordering::Relaxed)
     }
+
+    pub fn pending_context(&self, context: &str) -> bool {
+        self.state.lock().unwrap().operations.values().any(|op| {
+            op.status == Status::Pending && op.context() == Some(context)
+        })
+    }
     /// Add correlation without putting content or credentials in @extra.
     pub fn track(&self, request: &str) -> String {
         self.dirty.store(true, Ordering::Relaxed);
@@ -141,7 +147,10 @@ impl Tracker {
         if v["@extra"]["operation"].as_u64().is_some() {
             return request.to_string();
         }
-        if let Some(context) = v["@extra"].as_str().filter(|s| super::requests::parse_history_in(s).is_some()) {
+        if let Some(context) = v["@extra"].as_str().filter(|s| {
+            super::requests::parse_history_in(s).is_some()
+                || s.starts_with("topic:") || s.starts_with("topics:")
+        }) {
             if let Some(op) = self
                 .list()
                 .into_iter()

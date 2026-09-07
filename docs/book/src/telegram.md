@@ -87,6 +87,12 @@ they do not change the official Telegram client's topic layout. Muting and
 reading a topic do go to Telegram. Refresh reloads the group's topic catalog,
 including pages beyond the first hundred topics, without replacing the
 selection. A failed refresh keeps the cached catalog and offers a retry.
+Topic updates are applied directly; they never trigger another request for
+the same update. Metadata requests are deduplicated while pending, and topic
+refresh and history wait for the current client's sign-in and chat-list load.
+Forum capability follows group or bot metadata; ordinary-chat messages with
+stray topic ids stay in their normal chat, and refreshed metadata repairs
+earlier cached assignments.
 
 The topic protocol uses the installed TDLib API's `messageTopicForum`,
 `getForumTopics`, and `getForumTopicHistory` types. The V13 startup check adds

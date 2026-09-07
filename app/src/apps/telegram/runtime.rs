@@ -94,6 +94,7 @@ pub struct Wanted {
     pub chats: Vec<PeerId>,
     pub mentions: Vec<PeerId>,
     pub topic_chats: Vec<(PeerId, i64)>,
+    pub topic_lists: Vec<PeerId>,
     pub lines: Vec<(PeerId, MsgId)>,
     pub files: Vec<String>,
 }
@@ -278,16 +279,22 @@ impl Runtime {
     }
 
     pub fn refresh_topics(&self, chat: PeerId) {
-        if self.topics_status(chat) == Ok(true) {
+        let mut state = self.state();
+        if state.sender.is_none() || state.connection_error.is_some()
+            || state.topic_lists.get(&chat) == Some(&Ok(true))
+        {
             return;
         }
-        if self.send(&super::requests::get_forum_topics(chat, 0, 0, 0)) {
-            self.topics_loaded(chat, Ok(true));
-        }
+        push_unique(&mut state.wanted.topic_lists, chat);
+        state.topic_lists.insert(chat, Ok(true));
     }
 
     pub fn topics_loaded(&self, chat: PeerId, status: Result<bool, String>) {
         self.state().topic_lists.insert(chat, status);
+    }
+
+    pub fn topic_list_queued(&self, chat: PeerId) -> bool {
+        self.state().wanted.topic_lists.contains(&chat)
     }
 
     pub fn topics_status(&self, chat: PeerId) -> Result<bool, String> {
