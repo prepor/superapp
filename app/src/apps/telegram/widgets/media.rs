@@ -32,7 +32,25 @@ pub struct ViewerPanel {
     #[rust]
     play: Option<Rect>,
     #[rust]
+    seek_bar: Option<SeekBar>,
+    #[rust]
+    scrubbing: Option<SeekBar>,
+    #[rust]
     playback: VideoPlayback,
+}
+
+/// Keep the geometry and duration from the press for the whole drag, even
+/// outside the bar or while the time label changes width.
+#[derive(Clone, Copy)]
+struct SeekBar {
+    rect: Rect,
+    length: f64,
+}
+
+impl SeekBar {
+    fn position(self, x: f64) -> f64 {
+        ((x - self.rect.pos.x) / self.rect.size.x).clamp(0.0, 1.0) * self.length
+    }
 }
 
 impl Widget for ViewerPanel {
@@ -49,13 +67,35 @@ impl Widget for ViewerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
-        let Event::MouseDown(e) = event else { return };
-        if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
-            return;
-        }
-        if !self.play.is_some_and(|r| r.contains(e.abs)) {
-            return;
-        }
+        let position = match event {
+            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
+                self.scrubbing = None;
+                if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
+                    return;
+                }
+                if let Some(bar) = self.seek_bar.filter(|b| b.rect.contains(e.abs)) {
+                    self.scrubbing = Some(bar);
+                    Some(bar.position(e.abs.x))
+                } else if self.play.is_some_and(|r| r.contains(e.abs)) {
+                    None
+                } else {
+                    return;
+                }
+            }
+            Event::MouseMove(e) => {
+                let Some(bar) = self.scrubbing else { return };
+                Some(bar.position(e.abs.x))
+            }
+            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => {
+                let Some(bar) = self.scrubbing.take() else { return };
+                Some(bar.position(e.abs.x))
+            }
+            Event::WindowLostFocus(_) | Event::Background => {
+                self.scrubbing = None;
+                return;
+            }
+            _ => return,
+        };
         let Some(session) = scope.data.get_mut::<Session>() else {
             return;
         };
@@ -64,7 +104,15 @@ impl Widget for ViewerPanel {
             let mut borrow = props.panel.borrow_mut();
             if let Some(v) = borrow.as_any().downcast_mut::<Viewer>() {
                 if let Some(m) = v.msg() {
-                    v.toggle_play(&m, now);
+                    if let Some(position) = position {
+                        if v.plays_clip(&m) {
+                            self.playback.seek(position);
+                        } else {
+                            v.seek(&m, position, now);
+                        }
+                    } else {
+                        v.toggle_play(&m, now);
+                    }
                 }
             }
         }
@@ -141,9 +189,11 @@ impl Widget for ViewerPanel {
                 vw.set_running(drawn.playing);
             }
         }
-        if rolling {
+        if rolling || self.playback.awaiting_seek() {
             let secs = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0);
-            player = Some(media::video_state(cx, &clip_box, secs as f64));
+            let mut st = self.playback.state(cx, &clip_box, secs as f64);
+            st.playing = drawn.playing;
+            player = Some(st);
         }
         // The poster is the still of a clip, so it gives way to the moving
         // one; it stays for everything else.
@@ -189,6 +239,23 @@ impl Widget for ViewerPanel {
                 MouseCursor::Hand,
                 props.slot,
             );
+            props.hits.add(
+                st.time_line(),
+                player_w.label(cx, ids!(time_lbl)).area().rect(cx),
+                MouseCursor::Default,
+                props.slot,
+            );
+        }
+        self.seek_bar = player
+            .filter(|st| st.length.is_finite() && st.length > 0.0)
+            .and_then(|st| media::seek_rect(cx, &player_w).map(|rect| SeekBar {
+                rect,
+                length: st.length,
+            }));
+        if let Some(bar) = self.seek_bar {
+            props.hits.add("seek", bar.rect, MouseCursor::Hand, props.slot);
+        } else {
+            self.scrubbing = None;
         }
         if let Some(md) = m.media.as_ref() {
             let path = if rolling {
@@ -214,7 +281,7 @@ impl Widget for ViewerPanel {
         // nothing: only this widget drawing again finds it playing and shows
         // it (2026-09-07: the clip downloaded, the player prepared, and the
         // box stayed hidden).
-        if playing || note.is_some() || awaiting || (wanted && !rolling) {
+        if playing || note.is_some() || awaiting || (wanted && !rolling) || self.playback.awaiting_seek() {
             self.view.redraw(cx);
         }
         step

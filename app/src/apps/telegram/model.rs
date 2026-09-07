@@ -1370,6 +1370,16 @@ impl Player {
             self.started = Some(now);
         }
     }
+
+    /// Move along the timeline, preserving whether it is currently running.
+    pub fn seek(&mut self, position: f64, now: f64) {
+        if !position.is_finite() {
+            return;
+        }
+        let playing = self.state(now).playing;
+        self.offset = position.clamp(0.0, self.length.max(0.0));
+        self.started = playing.then_some(now);
+    }
 }
 
 /// What the attach panel is recording.
