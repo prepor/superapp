@@ -500,17 +500,27 @@ fn deleting_the_last_return_point_clears_the_way_back() {
 #[test]
 fn reply_back_keeps_its_shortcut_in_a_blocked_conversation() {
     use crate::shell::bar;
+    use crate::shell::keys::Letters;
 
     let mut s = session();
     s.store().write(|c| model::set_blocked_tx(c, VERA, true)).unwrap();
     let chat = open_root(&mut s, Chat::id(VERA));
+    let profile = open_root(&mut s, Peer::id(VERA));
     let reply = model::history(s.store(), VERA).iter()
         .find(|m| m.reply_to.is_some()).unwrap().id;
     let check = |s: &Session, returning| {
         let verbs = s.panel(chat).unwrap().borrow().verbs();
+        let preview = s.panel(profile).unwrap().borrow().verbs();
         bar::check(&verbs);
         assert_eq!(bar::chord(&verbs, 'b'), returning);
         assert_eq!(bar::chord(&verbs, 'k'), Some("telegram.unblock"));
+        assert_eq!(bar::chord(&preview, 'k'), Some("telegram.unblock"));
+        let keys = bar::Shortcuts {
+            focused: &verbs, focused_keeps: Letters::NONE,
+            preview: &preview, preview_keeps: Letters::NONE,
+        };
+        assert_eq!(keys.route('b'), returning.map(bar::Shortcut::FocusedVerb),
+            "an exhausted Back must not fall through to the profile's unblock");
     };
     check(&s, None);
     with_chat(&s, chat, |c| c.set_cursor(reply));
