@@ -2657,8 +2657,21 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     assert_eq!(model::line(s.store(), m.chat, m.id).unwrap().reactions, m.reactions);
 
     acc.on_update(s.world(), &serde_json::json!({"@type": "ok", "@extra": request["@extra"]}).to_string());
+    let refresh = last_reaction_request(&td, "getMessage");
+    assert_eq!(refresh["chat_id"], m.chat);
+    assert_eq!(refresh["message_id"], m.id);
     assert!(poll_reactions(&mut s, chat));
     assert!(verb_ids(&s, chat).contains(&"telegram.react"));
+    // A restored line may have no push update. The confirmed snapshot must
+    // update the footer on its own, without reopening the chat.
+    acc.on_update(s.world(), &serde_json::json!({
+        "@type": "message", "@extra": refresh["@extra"], "chat_id": m.chat, "id": m.id,
+        "date": m.date, "content": {"@type": "messageText", "text": {"text": m.text}},
+        "interaction_info": {"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "❤️"}, "total_count": 2},
+        ]}},
+    }).to_string());
+    assert_eq!(model::line(s.store(), m.chat, m.id).unwrap().reactions.as_deref(), Some("❤️ 2"));
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "updateMessageInteractionInfo", "chat_id": m.chat, "message_id": m.id,
         "interaction_info": {"reactions": {"@type": "messageReactions", "reactions": [
@@ -2666,6 +2679,43 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
         ]}},
     }).to_string());
     assert_eq!(model::line(s.store(), m.chat, m.id).unwrap().reactions.as_deref(), Some("❤️ 1"));
+}
+
+#[test]
+fn reaction_paging_reaches_every_choice_in_chat_and_card() {
+    let mut s = session();
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, chat, |c| c.set_cursor(m.id));
+    let card = open_root(&mut s, Line::id(m.chat, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    let choices = ["👍", "❤️", "🔥", "😂", "😮", "🙏", "🎉", "👏", "🤔", "🤯", "😢", "💯", "🦄", "🌚"];
+    for slot in [chat, card] {
+        verb(&mut s, slot, "telegram.react");
+        acc.drain(s.world());
+        offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &choices);
+        for page in 0..3 {
+            let shown: Vec<_> = s.panel(slot).unwrap().borrow().verbs().into_iter()
+                .filter(|v| v.style == kernel::panel::VerbStyle::Glyph).map(|v| v.label).collect();
+            assert_eq!(shown, choices[page * 6..choices.len().min((page + 1) * 6)]);
+            if page < 2 {
+                verb(&mut s, slot, "telegram.reactions_more");
+            }
+        }
+        assert!(!verb_ids(&s, slot).contains(&"telegram.reactions_more"));
+        verb(&mut s, slot, "telegram.reactions_back");
+        verb(&mut s, slot, "telegram.reactions_more");
+        verb(&mut s, slot, "telegram.reaction_1");
+        acc.drain(s.world());
+        let add = last_reaction_request(&td, "addMessageReaction");
+        assert_eq!(add["reaction_type"]["emoji"], "🌚");
+        verb(&mut s, slot, "telegram.reactions_cancel");
+        acc.on_update(s.world(), &serde_json::json!({"@type": "ok", "@extra": add["@extra"]}).to_string());
+        let refresh = last_reaction_request(&td, "getMessage");
+        assert_eq!((refresh["chat_id"].as_i64(), refresh["message_id"].as_i64()), (Some(m.chat), Some(m.id)));
+    }
 }
 
 #[test]

@@ -6,9 +6,10 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
+use kernel::effect::World;
 use kernel::store::Store;
 
 use super::model::{DownloadProgress, MsgId, PeerId};
@@ -38,6 +39,22 @@ pub enum ReactionResult {
 
 pub type ReactionReply = Arc<Mutex<Option<ReactionResult>>>;
 
+/// A widget owns its visible messages; dropping it releases the subscription.
+type ViewedMessages = Mutex<(PeerId, Vec<MsgId>)>;
+pub type MessageView = Arc<ViewedMessages>;
+
+pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, ids: Vec<MsgId>) {
+    if ids.is_empty() || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
+        *view = None;
+        return;
+    }
+    if let Some(view) = view {
+        *view.lock().expect("visible messages") = (chat, ids);
+    } else {
+        *view = Some(of(world.store()).watch_messages(chat, ids));
+    }
+}
+
 #[derive(Default)]
 pub struct Runtime {
     state: Mutex<State>,
@@ -66,6 +83,7 @@ struct State {
     demo_reactions: HashSet<(PeerId, MsgId, String)>,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
+    views: Vec<Weak<ViewedMessages>>,
 }
 
 impl State {
@@ -134,6 +152,30 @@ pub fn of(store: &Store) -> Arc<Runtime> {
 impl Runtime {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("Telegram runtime")
+    }
+
+    pub fn watch_messages(&self, chat: PeerId, ids: Vec<MsgId>) -> MessageView {
+        let view = Arc::new(Mutex::new((chat, ids)));
+        self.state().views.push(Arc::downgrade(&view));
+        view
+    }
+
+    /// Combine duplicate panels before the worker subscribes to a chat.
+    pub fn visible_messages(&self) -> BTreeMap<PeerId, Vec<MsgId>> {
+        let mut out: BTreeMap<PeerId, Vec<MsgId>> = BTreeMap::new();
+        self.state().views.retain(|view| {
+            let Some(view) = view.upgrade() else { return false };
+            let view = view.lock().expect("visible messages");
+            if !view.1.is_empty() {
+                out.entry(view.0).or_default().extend(&view.1);
+            }
+            true
+        });
+        for ids in out.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        out
     }
 
     /// Called by the worker on its first pass, never by a panel.

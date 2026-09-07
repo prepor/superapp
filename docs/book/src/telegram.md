@@ -140,7 +140,7 @@ results remain queryable after their status line disappears.
 
 ## Reactions
 
-Select a message and press **Cmd+J**, or choose **react (j)** in the chat's
+Select a message and press **Cmd+J**, or choose **react(j)** in the chat's
 bar or its line card. The shortcut also works while the composer has focus.
 The bar shows the ordinary emoji Telegram allows for that message in evenly
 spaced, borderless choices, six at a time; **more** and **back** move through
@@ -150,7 +150,10 @@ offer reactions, and marking messages keeps the batch actions on the bar.
 
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
-requests. Counts follow the server's interaction updates. A refused request
+requests. Visible messages load a fresh snapshot and subscribe to interaction
+updates while their chat or line card remains open; a successful add also
+refreshes that message. Counts wrap at the panel width, including paid stars
+and a text fallback for custom emoji. A refused request
 shows **could not load reactions** or **reaction failed**, plus **retry**, and
 automatically reports the reason in a notification; click the status to see it
 again. Startup failures also appear in the sign-in panel. If another app

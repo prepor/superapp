@@ -125,7 +125,7 @@ pub fn add_message_reaction(chat: PeerId, msg: MsgId, emoji: &str, request: u64)
         "reaction_type": {"@type": "reactionTypeEmoji", "emoji": emoji},
         "is_big": false,
         "update_recent_reactions": true,
-        "@extra": format!("reaction:{request}"),
+        "@extra": format!("reaction:{request}:{chat}:{msg}"),
     })
     .to_string()
 }
@@ -133,9 +133,14 @@ pub fn add_message_reaction(chat: PeerId, msg: MsgId, emoji: &str, request: u64)
 pub(super) fn parse_reaction_extra(extra: &str) -> Option<u64> {
     extra
         .strip_prefix("reactions:")
-        .or_else(|| extra.strip_prefix("reaction:"))?
-        .parse()
-        .ok()
+        .and_then(|id| id.parse().ok())
+        .or_else(|| parse_added_reaction_extra(extra).map(|(id, _, _)| id))
+}
+
+pub(super) fn parse_added_reaction_extra(extra: &str) -> Option<(u64, PeerId, MsgId)> {
+    let mut parts = extra.strip_prefix("reaction:")?.split(':');
+    let result = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    parts.next().is_none().then_some(result)
 }
 
 // -- the content verbs, live ---------------------------------------------------
@@ -351,6 +356,29 @@ pub fn view_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
         "force_read": true,
     })
     .to_string()
+}
+
+/// An open chat receives live interaction updates. Balanced by closeChat
+/// when its last message widget goes away.
+pub fn chat_open(chat_id: PeerId, open: bool) -> String {
+    json!({"@type": if open { "openChat" } else { "closeChat" }, "chat_id": chat_id}).to_string()
+}
+
+/// Load visible rows into TDLib as well as our durable projection before
+/// asking it to keep their reactions fresh.
+pub fn get_visible_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
+    json!({
+        "@type": "getMessages", "chat_id": chat_id, "message_ids": message_ids,
+        "@extra": format!("visible:{chat_id}"),
+    }).to_string()
+}
+
+/// Subscribe to counts without changing the existing read-cursor behavior.
+pub fn observe_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
+    json!({
+        "@type": "viewMessages", "chat_id": chat_id, "message_ids": message_ids,
+        "source": {"@type": "messageSourceOther"}, "force_read": false,
+    }).to_string()
 }
 
 // -- the verbs about a chat ----------------------------------------------------

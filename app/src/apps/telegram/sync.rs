@@ -92,6 +92,8 @@ pub struct Account<T: Td> {
     /// The earliest the next page may go: the pace, or the wait Telegram
     /// asked for.
     not_before: std::cell::Cell<f64>,
+    /// Chats and message rows currently displayed by the account's widgets.
+    viewed: std::cell::RefCell<std::collections::BTreeMap<PeerId, Vec<MsgId>>>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -235,6 +237,7 @@ impl<T: Td> Account<T> {
             mention_generation: std::cell::Cell::new(0),
             mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
+            viewed: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -275,6 +278,7 @@ impl<T: Td> Account<T> {
                 self.send(w, &request);
             }
         }
+        self.sync_views(w);
         // A viewer can fetch its media once that chat is known. Background
         // history and topic work wait until the chat lists finish loading.
         if rt.list_syncing() {
@@ -334,6 +338,49 @@ impl<T: Td> Account<T> {
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
         self.send(w, &get_history_in(page.chat, page.topic, page.from, page.walk));
+    }
+
+    fn sync_views(&self, w: &World) {
+        let next = runtime::of(w.store()).visible_messages();
+        let mut before = self.viewed.borrow_mut();
+        for chat in before.keys().filter(|chat| !next.contains_key(chat)) {
+            self.send(w, &chat_open(*chat, false));
+        }
+        for (chat, ids) in &next {
+            if !before.contains_key(chat) {
+                self.send(w, &chat_open(*chat, true));
+            }
+            let fresh: Vec<_> = ids.iter().copied()
+                .filter(|id| before.get(chat).is_none_or(|old| !old.contains(id)))
+                .collect();
+            for batch in fresh.chunks(100) {
+                self.send(w, &get_visible_messages(*chat, batch));
+            }
+        }
+        *before = next;
+    }
+
+    fn on_visible_messages(&self, w: &World, v: &Value, chat: PeerId) {
+        let messages: Vec<_> = v["messages"].as_array().into_iter().flatten()
+            .filter_map(updates::message).filter(|m| m.chat == chat).collect();
+        let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
+        if !messages.is_empty() {
+            self.filed(w, "visible messages", w.store().write(move |c| {
+                ensure_peer(c, chat)?;
+                model::ensure_chat_tx(c, chat)?;
+                for sender in messages.iter().filter_map(|m| m.sender) {
+                    ensure_peer(c, sender)?;
+                }
+                project_messages(c, &messages)?;
+                apply_read_outbox(c, chat)
+            }));
+        }
+        let visible = runtime::of(w.store()).visible_messages();
+        let ids: Vec<_> = ids.into_iter()
+            .filter(|id| visible.get(&chat).is_some_and(|shown| shown.contains(id))).collect();
+        if !ids.is_empty() {
+            self.send(w, &observe_messages(chat, &ids));
+        }
     }
 
     /// Files a write's outcome. A refused write goes to the trace and, once
@@ -651,6 +698,8 @@ impl<T: Td> Account<T> {
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
         runtime::of(w.store()).set_connection_note(None);
+        // Views may have been drawn while TDLib was still signing in.
+        self.viewed.borrow_mut().clear();
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -711,6 +760,12 @@ impl<T: Td> Account<T> {
                     }),
                 )
             } else {
+                if let Some((_, chat, msg)) = v["@extra"].as_str().and_then(parse_added_reaction_extra) {
+                    // A message restored from SQLite may not have emitted a
+                    // TDLib update yet. Always read the confirmed result too,
+                    // even if its picker was closed while the add was pending.
+                    self.send(w, &get_message(chat, msg));
+                }
                 runtime::ReactionResult::Added
             };
             runtime::of(w.store()).finish_reaction(id, result);
@@ -954,7 +1009,16 @@ impl<T: Td> Account<T> {
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
-            Some("messages" | "foundChatMessages") => self.on_history(w, update),
+            Some("messages") => {
+                if let Some(chat) = update["@extra"].as_str()
+                    .and_then(|s| s.strip_prefix("visible:")).and_then(|s| s.parse().ok())
+                {
+                    self.on_visible_messages(w, update, chat);
+                } else {
+                    self.on_history(w, update);
+                }
+            }
+            Some("foundChatMessages") => self.on_history(w, update),
             Some("forumTopics") => self.on_topics(w, update),
             Some("forumTopic") => {
                 if let Some(chat) = update["info"]["chat_id"].as_i64()

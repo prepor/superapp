@@ -51,6 +51,95 @@ fn account(td: FakeTd, phone: Option<&str>) -> Account<FakeTd> {
     account
 }
 
+#[test]
+fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let runtime = runtime::of(w.store());
+    let chat = runtime.watch_messages(-1005, vec![4200, 4300]);
+    let card = runtime.watch_messages(-1005, vec![4300]);
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["openChat", "getMessages"]);
+    let request: serde_json::Value = serde_json::from_str(&td.sent()[1]).unwrap();
+    assert_eq!(request["message_ids"], json!([4200, 4300]));
+    acc.on_update(&w, &json!({
+        "@type": "messages", "@extra": request["@extra"], "messages": [null, {
+            "@type": "message", "chat_id": -1005, "id": 4300, "date": 10,
+            "content": {"@type": "messageText", "text": {"text": "a post"}},
+            "interaction_info": {"view_count": 51, "reply_info": {"reply_count": 8},
+                "reactions": {"reactions": [
+                    {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 7},
+                    {"type": {"@type": "reactionTypeEmoji", "emoji": "🔥"}, "total_count": 4},
+                ]}},
+        }],
+    }).to_string());
+    let viewed: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(viewed["@type"], "viewMessages");
+    assert_eq!(viewed["message_ids"], json!([4300]));
+    assert_eq!(viewed["source"]["@type"], "messageSourceOther");
+    assert_eq!(viewed["force_read"], false);
+    let m = super::model::line(w.store(), -1005, 4300).unwrap();
+    assert_eq!((m.views, m.comments, m.reactions.as_deref()), (Some(51), Some(8), Some("👍 7 · 🔥 4")));
+
+    acc.on_update(&w, &json!({
+        "@type": "updateMessageInteractionInfo", "chat_id": -1005, "message_id": 4300,
+        "interaction_info": {"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 9},
+        ]}},
+    }).to_string());
+    assert_eq!(super::model::line(w.store(), -1005, 4300).unwrap().reactions.as_deref(), Some("👍 9"));
+    let n = td.sent().len();
+    acc.drain(&w);
+    assert_eq!(td.sent().len(), n, "a quiet viewport does not refetch every pass");
+    *chat.lock().unwrap() = (-1005, vec![4300, 4400]);
+    acc.drain(&w);
+    let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    assert_eq!(request["message_ids"], json!([4400]), "only newly visible rows are fetched");
+    drop(chat);
+    acc.drain(&w);
+    assert_eq!(td.sent().len(), n + 1, "the card still owns the open chat");
+    drop(card);
+    acc.drain(&w);
+    assert_eq!(td.sent_types().last().unwrap(), "closeChat");
+    let n = td.sent().len();
+    acc.drain(&w);
+    assert_eq!(td.sent().len(), n, "close only once");
+}
+
+#[test]
+fn visible_messages_are_replayed_after_sign_in_and_isolated_between_accounts() {
+    let a = world();
+    let b = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let view = runtime::of(a.store()).watch_messages(7, vec![42]);
+    let td_b = FakeTd::new();
+    let acc_b = account(td_b.clone(), None);
+    acc_b.drain(&b);
+    assert!(td_b.sent().is_empty(), "a fixture cannot subscribe another store's worker");
+    acc.drain(&a);
+    acc.on_ready(&a);
+    acc.drain(&a);
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 1,
+        "subscriptions wait until sign-in and the chat-list load finish");
+    for list in ["main", "archive"] {
+        acc.on_update(&a, &json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")}).to_string());
+    }
+    acc.drain(&a);
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 2);
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "getMessages").count(), 2);
+    drop(view);
+    let n = td.sent().len();
+    acc.on_update(&a, &json!({
+        "@type": "messages", "@extra": "visible:7", "messages": [{
+            "chat_id": 7, "id": 42, "content": {"@type": "messageText", "text": {"text": "late"}},
+        }],
+    }).to_string());
+    assert_eq!(td.sent().len(), n, "a late snapshot must not resubscribe a closed view");
+}
+
 /// A finished download on disk where the engine keeps them, named for
 /// the test that planted it.
 fn engine_file(name: &str) -> std::path::PathBuf {

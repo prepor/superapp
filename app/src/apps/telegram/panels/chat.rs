@@ -1110,7 +1110,7 @@ impl Panel for Chat {
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
                 if reactions::can_react(m) {
-                    v.push(Verb::run("telegram.react", "react (j)", Some('j')));
+                    v.push(Verb::run("telegram.react", "react(j)", Some('j')));
                 }
             }
         }

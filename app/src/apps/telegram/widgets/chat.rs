@@ -167,6 +167,8 @@ pub struct ChatPanel {
     reveal: Reveal<MsgId>,
     #[rust]
     dragging_files: bool,
+    #[rust]
+    viewed: Option<super::super::runtime::MessageView>,
 }
 
 impl Widget for ChatPanel {
@@ -729,6 +731,7 @@ impl Widget for ChatPanel {
         self.rows.clear();
         self.inner.clear();
         let clip = self.view.widget(cx, LIST).area().rect(cx);
+        let mut visible_ids = Vec::new();
         for (idx, row) in drawn {
             let Some(r) = rows.get(idx) else { continue };
             let full = row.area().rect(cx);
@@ -740,6 +743,10 @@ impl Widget for ChatPanel {
                     let Some(rect) = props.hits.add_row_clipped(
                         row_label(r, now), full, clip, MouseCursor::Hand, props.slot,
                     ) else { continue };
+                    if msg.id > 0 && !msg.service && !matches!(msg.state.as_deref(), Some("sending" | "failed"))
+                    {
+                        visible_ids.push(msg.id);
+                    }
                     self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
@@ -750,6 +757,11 @@ impl Widget for ChatPanel {
                         row_label(r, now), full, clip, MouseCursor::Default, props.slot,
                     );
                 }
+            }
+        }
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if let Some(chat) = with_chat(&props, |c| c.peer()) {
+                super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, visible_ids);
             }
         }
         for (label, path, cursor) in [

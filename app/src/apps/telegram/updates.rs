@@ -146,7 +146,14 @@ fn reactions_line(info: &Value) -> Option<String> {
             // later layer wrapped it in a `type` object. Read either.
             let emoji = r["reaction"]
                 .as_str()
-                .or_else(|| r["type"]["emoji"].as_str())?;
+                .or_else(|| r["type"]["emoji"].as_str())
+                .or_else(|| match r["type"]["@type"].as_str() {
+                    Some("reactionTypePaid") => Some("⭐"),
+                    // Custom artwork has no Unicode representation. Keep
+                    // its count visible until a sticker renderer is used.
+                    Some("reactionTypeCustomEmoji") => Some("custom emoji"),
+                    _ => None,
+                })?;
             let n = r["total_count"].as_i64().unwrap_or(0);
             Some(format!("{emoji} {n}"))
         })
@@ -1577,5 +1584,15 @@ mod tests {
         .expect("the info");
         assert_eq!((none.views, none.comments, none.reactions), (None, None, None));
         assert!(interaction(&json!({"@type": "updateMessageInteractionInfo", "chat_id": -1005})).is_none());
+    }
+
+    #[test]
+    fn reaction_counts_include_paid_and_custom_emoji_instead_of_dropping_them() {
+        let info = json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 12},
+            {"type": {"@type": "reactionTypePaid"}, "total_count": 30},
+            {"type": {"@type": "reactionTypeCustomEmoji", "custom_emoji_id": "123"}, "total_count": 4},
+        ]}});
+        assert_eq!(reactions_line(&info).as_deref(), Some("👍 12 · ⭐ 30 · custom emoji 4"));
     }
 }

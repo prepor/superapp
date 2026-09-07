@@ -1,0 +1,18 @@
+# args: --library reactions
+# The nodes page and choose an emoji with a long message behind the bar.
+wait 8000
+shot reaction-layout
+click "reactions/long chat"
+wait 700
+click "back"
+wait 300
+click "more"
+wait 300
+click "🎉"
+wait 300
+key cmd+esc
+wait 500
+click "reactions/counts"
+wait 700
+shot reaction-counts
+quit

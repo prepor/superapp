@@ -29,6 +29,8 @@ pub struct LinePanel {
     play: Option<Rect>,
     #[rust]
     picture: Option<Rect>,
+    #[rust]
+    viewed: Option<super::super::runtime::MessageView>,
 }
 
 impl Widget for LinePanel {
@@ -113,9 +115,18 @@ impl Widget for LinePanel {
                 Some((m, st, l.playing(now)))
             })
         }) else {
+            self.viewed = None;
             self.view.label(cx, ids!(gone_lbl)).set_visible(cx, true);
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            let ids = if m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
+                vec![m.id]
+            } else {
+                Vec::new()
+            };
+            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, ids);
+        }
         let v = &self.view;
         v.label(cx, ids!(gone_lbl)).set_visible(cx, false);
 

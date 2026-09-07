@@ -30,6 +30,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         chats(),
         topics(),
         message_row(),
+        reactions(),
         media(),
         chat(),
         attach(),
@@ -53,6 +54,33 @@ fn topics() -> Scene<Setup> {
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+fn reactions() -> Scene<Setup> {
+    let fixture = |card: bool, long: bool, script: &str| panel(move |store| {
+        let id = model::history(store, RUST_WEEKLY).last().expect("a post").id;
+        let text = if long {
+            format!("Long reaction post\n{}", "A message extending below the panel.\n".repeat(45))
+        } else {
+            "All reaction counts stay visible at this width.".to_string()
+        };
+        store.write(move |c| {
+            c.execute("UPDATE tg_message SET text = ?3, reactions = ?4 WHERE chat = ?1 AND id = ?2",
+                rusqlite::params![RUST_WEEKLY, id, text,
+                    "👍 12 · ❤️ 34 · 🔥 56 · 😂 7 · 😮 8 · 🙏 9 · 🎉 10 · 👏 11 · 🤔 12 · 🤯 13 · 😢 14 · 💯 15 · 🦄 16 · 🌚 17 · ⭐ 30 · custom emoji 4"])?;
+            Ok(())
+        }).expect("reaction fixture");
+        if card { Line::id(RUST_WEEKLY, id) } else { Chat::at(RUST_WEEKLY, id) }
+    }, script);
+    let page = "wait 600\nkey cmd+j\nwait 300\nclick \"more\"\nwait 300\nclick \"🎉\"\nwait 300\nkey cmd+j\nwait 300\nclick \"more\"\nwait 300";
+    Scene::new("reactions", (380.0, 360.0))
+        .node("long chat", fixture(false, true, page))
+        .about("A clipped message must leave the reaction bar clickable.")
+        .node("long card", fixture(true, true, page))
+        .about("The same picker remains clickable below a long message card.")
+        .node("counts", fixture(true, false, ""))
+        .sized((300.0, 360.0))
+        .about("All counts wrap, including stars and custom emoji.")
+}
 
 /// A time today, against the virtual epoch the canvas runs on.
 fn today(h: u32, min: u32) -> f64 {
