@@ -46,6 +46,15 @@ wait 300
 click "Max Ivanov: voice 0:42"
 wait 300
 
+# Space marks the transcript's cursor on the press. If a text event also
+# arrives, it must leave that mark in place: only a marked line offers clear.
+key space
+wait 300
+type " "
+wait 300
+click "clear"
+wait 300
+
 # -- reply -----------------------------------------------------------------------------
 
 # A press on a line puts the cursor there and the keyboard with the rows;
@@ -158,11 +167,11 @@ key enter
 wait 800
 click "report-q3.pdf"
 wait 500
-type " "
+key space
 wait 300
 click "screenshot-2026-08-30.png"
 wait 500
-type " "
+key space
 wait 300
 click "copy 2"
 wait 500

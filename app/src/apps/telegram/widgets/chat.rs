@@ -262,6 +262,18 @@ impl Widget for ChatPanel {
                 }
             } else {
                 match k.key_code {
+                    // Match the shared list grammar: the press marks once,
+                    // even if the input context also emits a space as text.
+                    KeyCode::Space
+                        if !(k.modifiers.shift || k.modifiers.control
+                            || k.modifiers.alt || k.modifiers.logo) =>
+                    {
+                        with_chat(&props, Chat::toggle_mark);
+                        self.view.redraw(cx);
+                        if let Some(s) = scope.data.get_mut::<Session>() {
+                            s.redraw();
+                        }
+                    }
                     KeyCode::ArrowDown | KeyCode::ArrowUp => {
                         let d: isize = if k.key_code == KeyCode::ArrowDown {
                             1
@@ -356,18 +368,6 @@ impl Widget for ChatPanel {
             if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
                 self.follow(cx, &props, id, super::now(scope));
                 self.view.redraw(cx);
-            }
-        }
-
-        // Space marks the cursor's line, arriving as text the way a letter
-        // does. In the live field it is a space.
-        if let Event::TextInput(t) = event {
-            if !focused && t.input == " " {
-                with_chat(&props, Chat::toggle_mark);
-                self.view.redraw(cx);
-                if let Some(s) = scope.data.get_mut::<Session>() {
-                    s.redraw();
-                }
             }
         }
 

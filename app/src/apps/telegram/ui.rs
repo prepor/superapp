@@ -175,7 +175,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
@@ -345,13 +345,10 @@ script_mod! {
         }
         mod.widgets.TblHairline {}
         empty_lbl := mod.widgets.TblEmpty { text: "no messages here yet" }
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
-            // A finger drags the transcript; a mouse button on it is a
-            // selection, never a scroll.
-            drag_scrolling: #(cfg!(target_os = "android"))
             // At the end, the transcript stays at the end as lines arrive;
             // scrolled up, it stays put. Scrolling back down to the end
             // re-arms it (Andrey, 2026-09-07: new messages follow if I am
@@ -471,7 +468,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
@@ -527,7 +524,7 @@ script_mod! {
         }
         mod.widgets.TblHeadRule {}
         empty_lbl := mod.widgets.TblEmpty {}
-        list := PortalList {
+        list := mod.widgets.SList {
             width: Fill, height: Fill
             flow: Down
             reuse_items: true
@@ -749,11 +746,10 @@ script_mod! {
            video message is a message of its own. */
         list_wrap := View {
             width: Fill, height: Fill
-            list := PortalList {
+            list := mod.widgets.SList {
                 width: Fill, height: Fill
                 flow: Down
                 reuse_items: true
-                drag_scrolling: #(cfg!(target_os = "android"))
                 row := mod.widgets.TelegramAttachRow {}
             }
         }

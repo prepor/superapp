@@ -47,7 +47,7 @@ and the effects a send and a read need.
 | Tag | Argument | What it shows |
 |---|---|---|
 | `chats` | none, or `archive` | every chat, pinned ones first; or the ones put away |
-| `chat` | a chat id, and optionally a message id | one conversation, with the composer at its foot |
+| `telegram-chat` | a chat id, and optionally a message id | one conversation, with the composer at its foot |
 | `line` | a chat id and a message id | one line, whole, with the verbs on one line |
 | `media` | a chat id and a message id | one line's media as large as the grid allows |
 | `attach` | a chat id | what goes with the next message, and the ways to make more of it |
@@ -103,7 +103,7 @@ the chord routing while it previews one.
 
 ### The chat
 
-A `chat` panel is one conversation, oldest at the top and the newest at the
+A `telegram-chat` panel is one conversation, oldest at the top and the newest at the
 bottom, with the composer at its foot. Its header is the chat's title. Under
 the header, a muted status line says what the macOS client's title bar says
 under the name: `online`, `last seen recently`, `last seen within a week`,

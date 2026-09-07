@@ -297,7 +297,7 @@ fn chats() -> Scene<Setup> {
         .about("a folder is a filter: the chats it holds")
         .node(
             "marked",
-            list("key down\nwait 300\ntype \" \"\nwait 300\nkey shift+down 2\nwait 500"),
+            list("key down\nwait 300\nkey space\nwait 300\nkey shift+down 2\nwait 500"),
         )
         .about("space marks the cursor's row, shift+↓ the two under it; the bar grows the batch verbs")
         .node("archive", panel(|_| Chats::archive(), ""))
@@ -722,11 +722,11 @@ key enter
 wait 800
 click \"report-q3.pdf\"
 wait 500
-type \" \"
+key space
 wait 300
 click \"screenshot-2026-08-30.png\"
 wait 500
-type \" \"
+key space
 wait 300
 key cmd+p
 wait 500

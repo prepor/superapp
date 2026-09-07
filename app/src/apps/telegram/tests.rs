@@ -139,8 +139,8 @@ fn the_app_registers_its_tags_and_roots() {
     assert_eq!(
         tags,
         vec![
-            "attach", "chat", "chats", "contacts", "line", "media", "members", "messages", "peer",
-            "place", "signin"
+            "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
+            "place", "signin", "telegram-chat"
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();

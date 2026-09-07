@@ -39,7 +39,7 @@ impl RowSpec for ChatRows {
 
     /// One line: the title, then the model, the run's word and the date on
     /// the columns the header draws.
-    fn populate(cx: &mut Cx, row: &WidgetRef, c: &ChatRow, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, c: &ChatRow, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         line.label(cx, ids!(body.title_lbl)).set_text(cx, &c.title);
         line.label(cx, ids!(body.model_lbl))
@@ -63,7 +63,7 @@ impl RowSpec for ChatRows {
 
     /// The chat's title: what a person calls the conversation, and what a
     /// script addresses the row by.
-    fn label(c: &ChatRow) -> String {
+    fn label(c: &ChatRow, _now: f64) -> String {
         c.title.clone()
     }
 

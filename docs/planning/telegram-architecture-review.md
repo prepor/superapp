@@ -99,13 +99,20 @@ These are remaining limitations, not guarantees provided by this refactor.
 
 ## Validation
 
-The default workspace tests passed before edits. After the refactor:
+The default workspace tests passed before edits. After the refactor and rebase
+onto `origin/main` (`c78c5f3`):
 
-- Workspace tests: 498 passed without TDLib; 500 passed with `--features tdlib`.
+- Workspace tests: 778 passed without TDLib; 780 passed with `--features tdlib`.
+  Three existing tests remain ignored in each configuration.
 - Strict Clippy passed for all workspace targets in both configurations.
-- The headless build and all 42 end-to-end suites passed, including Telegram's
-  162-step suite. The mail/triage expectation fix from `origin/main` commit
-  `f20ed0a` was applied before the final run.
+- The headless build and all 52 end-to-end suites passed, including Telegram's
+  168-step suite and the agent app's suites.
+
+The rebase preserves the agent app and filesystem watchers, adapts both apps to
+the shared table contracts, and uses `SList` for Telegram's list input policy.
+Telegram conversations use `telegram-chat` because the agent app already owns
+`chat`; space marks a transcript line on the press, with E2E coverage proving
+that a following text event does not toggle it a second time.
 
 Native-feature tests use fake accounts; the FFI smoke tests execute an offline
 TDLib request and allocate an idle client id. Live login, sending and media

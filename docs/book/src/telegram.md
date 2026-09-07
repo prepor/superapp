@@ -5,6 +5,9 @@ and own their interaction state; a background worker owns the TDLib client and
 projects its updates. The `tdlib` feature enables the native client. Ordinary
 builds and library fixtures work offline with the demo data.
 
+Conversation panels use the `telegram-chat` tag, distinct from the agent app's
+`chat` tag. List rows, search results and saved messages share that identity.
+
 ## Ownership and data flow
 
 | Owner | State | Lifetime |

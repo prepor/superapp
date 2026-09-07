@@ -808,6 +808,7 @@ macro_rules! chats_spec {
                    LEFT JOIN tg_peer s ON s.id = m.sender",
             base: $base,
             text: &["p.name", "m.text"],
+            index: None,
             tags: &[
                 ("unread", TagSql::Where("c.unread > 0")),
                 ("muted", TagSql::Where("c.muted = 1")),
@@ -961,6 +962,7 @@ static MESSAGES_SPEC: SqlSpec = SqlSpec {
     from: "tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
     base: "m.service = 0",
     text: &["m.text"],
+    index: None,
     tags: &[
         ("from", TagSql::Col("COALESCE(s.name, '')")),
         ("chat", TagSql::Col("p.name")),
@@ -1056,6 +1058,7 @@ static CONTACTS_SPEC: SqlSpec = SqlSpec {
     from: "tg_peer p",
     base: "p.kind = 'person' AND p.is_contact = 1 AND p.is_self = 0",
     text: &["p.name", "p.username"],
+    index: None,
     tags: &[("online", TagSql::Where("p.status = 'online'"))],
     order: &[("p.name", Dir::Asc), ("p.id", Dir::Asc)],
     group: None,
@@ -1070,6 +1073,7 @@ static MEMBERS_SPEC: SqlSpec = SqlSpec {
     from: "tg_member mb JOIN tg_peer p ON p.id = mb.peer JOIN tg_peer g ON g.id = mb.chat",
     base: "",
     text: &["p.name", "p.username"],
+    index: None,
     tags: &[
         ("online", TagSql::Where("p.status = 'online'")),
         ("admin", TagSql::Where("mb.admin = 1")),
@@ -1593,9 +1597,9 @@ pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
     history(store, chat).iter().find(|m| m.id == id).cloned()
 }
 
-/// The tag of the app's chat panel, spelled once for the identities the
-/// rows of every list open.
-pub const CHAT_TAG: Tag = Tag("chat");
+/// The Telegram conversation tag. The agent app owns the bare `chat` tag;
+/// every Telegram list and search result opens through this identity.
+pub const CHAT_TAG: Tag = Tag("telegram-chat");
 
 /// The identity of one chat, optionally opened at a message.
 #[must_use]
