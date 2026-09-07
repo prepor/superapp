@@ -20,10 +20,11 @@ wait 700
 
 # The search panel asks every app's source. Mail answers with the person
 # first — a contact is a fact about the mailbox, not a document in it — and
-# then with the letters, as the index ranks them.
+# then with the letters, as the index ranks them. Telegram answers the same
+# name with the chat with her, so `@app:mail` keeps this walk on mail's rows.
 key cmd+shift+s
 wait 900
-type "kovac"
+type "kovac @app:mail"
 wait 800
 shot c1-search
 click "Vera Kovac"

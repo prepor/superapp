@@ -5,3 +5,4 @@
 pub mod agent;
 pub mod files;
 pub mod mail;
+pub mod telegram;

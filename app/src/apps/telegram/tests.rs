@@ -1,0 +1,1721 @@
+//! Telegram, driven through a session with no widget in sight.
+//!
+//! `Session::fake` gives an in-memory store with the app's schema and its
+//! demo world, so every test starts from the same ten chats.
+
+use kernel::app::App;
+use kernel::layout::SlotId;
+use kernel::nav::Nav;
+use kernel::panel::{PanelId, VerbAct};
+use kernel::search::{Engine, Go};
+use kernel::session::{Action, Session};
+use kernel::time::{ts, virtual_epoch};
+
+use super::model::{self, PeerKind, RecKind};
+use super::panels::chat::rows_of;
+use super::panels::signin::Field;
+use super::panels::{
+    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, People, Place, Row, SignIn, Viewer,
+};
+use super::panels::told;
+use super::seed::{
+    ANNA, DEV, ELENA, FAMILY, HIKE, IVAN, MAX, OLD_FLAT, RUST_WEEKLY, SELF, STELAXIS, VERA,
+};
+use super::transport::FakeTd;
+use super::{runtime, schema, requests, sync, Telegram, TELEGRAM};
+
+static APPS: &[&dyn App] = &[&TELEGRAM];
+
+fn session() -> Session {
+    Session::fake(APPS)
+}
+
+/// Opens a root panel, as the launcher would.
+fn open_root(s: &mut Session, id: PanelId) -> SlotId {
+    let show = id.clone();
+    s.act(Action::new("open", format!("open “{id}”")).moving(move |wm| {
+        wm.open(show, None, false);
+    }));
+    s.settle();
+    s.focus().expect("the new slot has focus")
+}
+
+/// A navigation, settled.
+fn go(s: &mut Session, n: Nav) {
+    s.nav(n);
+    s.settle();
+}
+
+fn with_chats<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Chats) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<Chats>().expect("a chat list"))
+}
+
+fn with_chat<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Chat) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<Chat>().expect("a chat"))
+}
+
+fn with_attach<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Attach) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<Attach>().expect("an attach panel"))
+}
+
+/// What the widget does at the top of every draw: the attach panel looks
+/// through the join at the chat's list.
+fn observe(s: &Session, slot: SlotId) {
+    with_attach(s, slot, |a| a.observe(s));
+}
+
+/// A chat with its attach panel opened from the bar, joined.
+fn chat_with_attach(s: &mut Session, peer: i64) -> (SlotId, SlotId) {
+    let chat = open_root(s, Chat::id(peer));
+    verb(s, chat, "telegram.attach");
+    let attach = s.joined_child(chat).expect("the attach panel, joined");
+    observe(s, attach);
+    (chat, attach)
+}
+
+/// Enter in a chat's composer, settled.
+fn send(s: &mut Session, slot: SlotId) {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    {
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Chat>().expect("a chat").send(s);
+    }
+    s.settle();
+}
+
+/// Runs one of a panel's verbs by id, exactly as the bar does.
+fn verb(s: &mut Session, slot: SlotId, id: &str) {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let act = {
+        let b = inst.borrow();
+        b.verbs().into_iter().find(|v| v.id == id).map(|v| v.act)
+    };
+    match act {
+        Some(VerbAct::Run) => inst.borrow_mut().run(id, s),
+        Some(VerbAct::Call(f)) => f(s),
+        Some(VerbAct::Go(n)) => s.nav(n),
+        None => panic!("no verb {id} on slot {slot}"),
+    }
+    s.settle();
+}
+
+fn verb_ids(s: &Session, slot: SlotId) -> Vec<&'static str> {
+    s.panel(slot)
+        .expect("a panel in the slot")
+        .borrow()
+        .verbs()
+        .iter()
+        .map(|v| v.id)
+        .collect()
+}
+
+fn titles(s: &Session, slot: SlotId) -> Vec<String> {
+    with_chats(s, slot, |c| c.rows(0, 50).into_iter().map(|r| r.title).collect())
+}
+
+fn unread(s: &Session, peer: i64) -> (i64, bool) {
+    s.store()
+        .conn()
+        .query_row(
+            "SELECT unread, mention FROM tg_chat WHERE peer = ?1",
+            [peer],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+        )
+        .expect("a chat row")
+}
+
+// -- the app ------------------------------------------------------------------------
+
+#[test]
+fn the_app_registers_its_tags_and_roots() {
+    let s = session();
+    let tags: Vec<&str> = s.apps().tags().iter().map(|t| t.as_str()).collect();
+    assert_eq!(
+        tags,
+        vec![
+            "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
+            "place", "signin", "telegram-chat"
+        ]
+    );
+    let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
+    assert_eq!(roots, vec!["chats", "contacts", "saved messages", "sign in"]);
+    // No worker without the engine: the demo world runs no background sync,
+    // and the sign-in panel reads the 'closed' session row it leaves.
+    assert!(s.workers().names().is_empty(), "nothing runs in the background yet");
+}
+
+// -- the chat list ---------------------------------------------------------------------
+
+/// Pinned chats lead in their order, then the rest by the last line's
+/// time; the archive is its own list.
+#[test]
+fn the_list_puts_pinned_chats_first_and_the_archive_aside() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    assert_eq!(
+        titles(&s, list),
+        vec![
+            "Vera Kovac",
+            "stelaxis",
+            "Elena Petrova",
+            "Family",
+            "Rust Weekly",
+            "Hiking Saturday",
+            "superapp dev",
+            "Max Ivanov",
+            "Andrey Rudenko",
+            "Anna Schmidt",
+        ]
+    );
+    let archive = open_root(&mut s, Chats::archive());
+    assert_eq!(titles(&s, archive), vec!["Old flat"]);
+    let row = with_chats(&s, list, |c| c.rows(1, 2).remove(0));
+    assert_eq!(row.kind, PeerKind::Group);
+    assert!(row.muted && row.mention && row.pinned == 2);
+    assert_eq!(row.unread, 8);
+    assert_eq!(row.preview(s.now()), "Ivan: meeting moved to 15:00");
+}
+
+/// The filter's tags: unread, a folder, a kind.
+#[test]
+fn the_filter_narrows_by_tag() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    let under = |s: &Session, f: &str| -> Vec<String> {
+        with_chats(s, list, |c| {
+            c.list_mut().set_filter(f);
+            c.rows(0, 50).into_iter().map(|r| r.title).collect()
+        })
+    };
+    assert_eq!(
+        under(&s, "@unread"),
+        vec!["stelaxis", "Elena Petrova", "Family", "Rust Weekly"]
+    );
+    assert_eq!(
+        under(&s, "@folder:work"),
+        vec!["stelaxis", "Rust Weekly", "superapp dev", "Max Ivanov"]
+    );
+    assert_eq!(under(&s, "@kind:channel"), vec!["Rust Weekly", "superapp dev"]);
+    assert_eq!(under(&s, "thermos"), vec!["Hiking Saturday"]);
+    let src = model::chats(false);
+    let folders: Vec<String> = (src.suggest)(s.store(), "folder", "w")
+        .into_iter()
+        .map(|g| g.value)
+        .collect();
+    assert_eq!(folders, vec!["work".to_string()]);
+}
+
+/// A preview claims the read on the opening node, and undo gives the count
+/// back with the panel.
+#[test]
+fn a_preview_marks_the_chat_read_and_undo_gives_it_back() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    assert_eq!(unread(&s, STELAXIS), (8, true));
+    let nav = with_chats(&s, list, |c| c.go(1)).expect("a row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("the chat, joined");
+    assert_eq!(unread(&s, STELAXIS), (0, false));
+    // Where the reading started is kept on the instance for the unread
+    // line, and the cursor starts nowhere.
+    let (first, cursor) = with_chat(&s, reader, |c| (c.first_unread(), c.cursor()));
+    let first = first.expect("something was unread");
+    assert!(cursor.is_none());
+    let hist = model::history(s.store(), STELAXIS);
+    let i = hist.iter().position(|m| m.id == first).expect("a line");
+    assert_eq!(hist[i].text, "Q3 infra budget draft is ready for review");
+    assert_eq!(s.focus(), Some(list), "a preview leaves focus in the list");
+
+    s.undo();
+    s.settle();
+    assert_eq!(unread(&s, STELAXIS), (8, true));
+    assert!(s.joined_child(list).is_none(), "the preview went with it");
+}
+
+/// The transcript's rows: a day where the day changes, the unread line
+/// above the first unread line, a run where one writer goes on.
+#[test]
+fn the_transcript_is_days_runs_and_the_unread_line() {
+    let s = session();
+    let hist = model::history(s.store(), VERA);
+    let rows = rows_of(&hist, None, virtual_epoch());
+    let shape: Vec<String> = rows
+        .iter()
+        .map(|r| match r {
+            Row::Day(d) => format!("day {d}"),
+            Row::Unread => "unread".to_string(),
+            Row::Service(m) => format!("service {}", m.text),
+            Row::Message { msg, run } => {
+                format!("{}{}", if *run { "+ " } else { "" }, msg.writer())
+            }
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            "day 27 AUG",
+            "Vera Kovac",
+            "me",
+            "day YESTERDAY",
+            "Vera Kovac",
+            "me",
+            "day TODAY",
+            "Vera Kovac",
+            "+ Vera Kovac",
+            "me",
+            "Vera Kovac",
+            "+ Vera Kovac",
+            "me",
+        ]
+    );
+    // The reply's quote names the line it answers.
+    let reply = hist.iter().find(|m| m.reply_to.is_some()).expect("a reply");
+    assert_eq!(reply.reply_name, "Vera Kovac");
+    assert_eq!(reply.reply_text, "see you at 7:30 then?");
+
+    // The group: the unread line stands above the first unread line, and a
+    // service line breaks a run.
+    let hist = model::history(s.store(), STELAXIS);
+    let first = hist
+        .iter()
+        .find(|m| m.text.starts_with("Q3 infra"))
+        .map(|m| m.id);
+    let rows = rows_of(&hist, first, virtual_epoch());
+    let at = rows.iter().position(|r| *r == Row::Unread).expect("the line");
+    assert!(matches!(&rows[at + 1], Row::Message { msg, run: false } if msg.fwd_from.is_some()));
+    assert!(matches!(&rows[0], Row::Day(d) if d == "25 AUG"));
+    assert!(matches!(&rows[1], Row::Service(m) if m.text == "Ivan Petrov joined the group"));
+
+    // A line that never left keeps its own header, where `failed` is said,
+    // even five minutes after one of mine that did.
+    let hist = model::history(s.store(), HIKE);
+    let rows = rows_of(&hist, None, virtual_epoch());
+    let failed = rows
+        .iter()
+        .find(|r| matches!(r, Row::Message { msg, .. } if msg.state.as_deref() == Some("failed")))
+        .expect("the thermos");
+    assert!(matches!(failed, Row::Message { run: false, .. }));
+}
+
+/// The cursor walks the lines, marks follow it, and the reply line stands
+/// on the cursor's line.
+#[test]
+fn the_cursor_walks_and_reply_takes_the_line_under_it() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let hist = model::history(s.store(), VERA);
+    let last = hist.last().expect("lines").id;
+    with_chat(&s, slot, |c| {
+        assert_eq!(c.walk(-1), Some(last), "from nothing, the newest line");
+        assert_eq!(c.walk(-1), Some(last - 1));
+        c.toggle_mark();
+        c.mark_range(-1);
+        assert_eq!(c.marks().len(), 2);
+    });
+    // The batch has the bar while rows are marked — no reply — and the
+    // cursor's line has a card to go to; cleared, the cursor's verbs are
+    // back.
+    let bar = verb_ids(&s, slot);
+    assert!(bar.contains(&"telegram.forward") && bar.contains(&"telegram.clear"));
+    assert!(bar.contains(&"telegram.line") && !bar.contains(&"telegram.reply"));
+    verb(&mut s, slot, "telegram.clear");
+    assert!(with_chat(&s, slot, |c| c.marks().is_empty()));
+    verb(&mut s, slot, "telegram.reply");
+    let line = with_chat(&s, slot, |c| c.reply_line(s.now())).expect("replying");
+    assert!(line.starts_with("reply to "), "{line}");
+    // A draft is written behind the composer, and the list shows it.
+    with_chat(&s, slot, |c| c.set_draft("on my way"));
+    let list = open_root(&mut s, Chats::id());
+    let row = with_chats(&s, list, |c| c.rows(0, 1).remove(0));
+    assert_eq!(row.preview(s.now()), "draft: on my way");
+    // A send this round is a toast, and the field empties with it.
+    with_chat(&s, slot, |c| c.set_draft("on my way"));
+    {
+        let inst = s.panel(slot).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Chat>().unwrap().send(&mut s);
+    }
+    assert_eq!(with_chat(&s, slot, |c| c.draft().to_string()), "");
+    assert!(with_chat(&s, slot, |c| c.reply_to().is_none()));
+}
+
+/// What a chat is with says what the composer does.
+#[test]
+fn a_channel_i_do_not_run_has_no_composer() {
+    let s = session();
+    let card = |peer| model::peer(s.store(), peer).expect("a peer");
+    assert!(!card(RUST_WEEKLY).can_post());
+    assert!(card(DEV).can_post());
+    assert_eq!(card(DEV).placeholder(), "broadcast…  ( enter )");
+    assert_eq!(card(VERA).placeholder(), "write a message…  ( enter )");
+    assert_eq!(card(VERA).status_line(), "online");
+    assert_eq!(card(MAX).status_line(), "last seen within a week");
+    assert_eq!(card(STELAXIS).status_line(), "7 members, 3 online");
+    assert_eq!(card(RUST_WEEKLY).status_line(), "12.4k subscribers");
+    assert_eq!(card(SELF).status_line(), "saved messages");
+    assert_eq!(card(STELAXIS).kind_line(), "group · 7 members, 3 online");
+    assert_eq!(card(VERA).kind_line(), "@vera · online");
+    assert_eq!(
+        card(RUST_WEEKLY).kind_line(),
+        "channel · 12.4k subscribers · @rustweekly"
+    );
+    // A person with no chat still opens, on nothing.
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(IVAN));
+    assert!(with_chat(&s, slot, |c| c.rows(virtual_epoch()).is_empty()));
+    assert_eq!(s.panel(slot).unwrap().borrow().title(), "Ivan Petrov");
+}
+
+// -- the other lists -----------------------------------------------------------------------
+
+#[test]
+fn messages_are_found_everywhere_and_narrowed_to_a_chat() {
+    let mut s = session();
+    let all = open_root(&mut s, Messages::id());
+    let lines = |s: &Session, slot: SlotId, f: &str| -> Vec<String> {
+        let inst = s.panel(slot).unwrap();
+        let mut b = inst.borrow_mut();
+        let m = b.as_any().downcast_mut::<Messages>().unwrap();
+        m.list_mut().set_filter(f);
+        m.rows(0, 50).into_iter().map(|r| r.line(virtual_epoch())).collect()
+    };
+    assert_eq!(
+        lines(&s, all, "palette"),
+        vec!["new palette, what do you think · photo"]
+    );
+    assert_eq!(
+        lines(&s, all, "@from:\"ivan petrov\""),
+        vec![
+            "meeting moved to 15:00",
+            "location 47.0472, 8.3164",
+            "in, if the weather holds"
+        ]
+    );
+    assert_eq!(
+        lines(&s, all, "@media"),
+        vec![
+            "video message 0:08",
+            "voice 0:42",
+            "sticker 🙈",
+            "live location 55.7512, 37.6184 · 42 min left",
+            "voice 0:12",
+            "the numbers · file",
+            "the garden today · photo",
+            "location 47.0472, 8.3164",
+            "the fold in motion · video",
+            "new palette, what do you think · photo",
+            "audio Dry Cleaning — Scratchcard Lanyard · 3:41",
+            "file ticket-lisbon.pdf · 340 KB"
+        ]
+    );
+    let in_chat = open_root(&mut s, Messages::in_chat(STELAXIS));
+    let seed = {
+        let inst = s.panel(in_chat).unwrap();
+        let b = inst.borrow();
+        assert_eq!(b.title(), "messages · stelaxis");
+        drop(b);
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Messages>().unwrap().seed_filter()
+    };
+    assert_eq!(seed, "@chat:stelaxis ");
+    let n = lines(&s, in_chat, &seed).len();
+    assert_eq!(n, 13, "the group's lines, service ones left out");
+    assert!(verb_ids(&s, all).is_empty(), "a messages list wears no bar");
+}
+
+#[test]
+fn the_people_are_the_address_book_and_a_group() {
+    let mut s = session();
+    let contacts = open_root(&mut s, Contacts::id());
+    let names = |s: &Session, slot: SlotId, f: &str| -> Vec<String> {
+        let inst = s.panel(slot).unwrap();
+        let mut b = inst.borrow_mut();
+        let p = b.as_any().downcast_mut::<People>().unwrap();
+        p.list_mut().set_filter(f);
+        p.rows(0, 50).into_iter().map(|r| r.name).collect()
+    };
+    assert_eq!(
+        names(&s, contacts, ""),
+        vec![
+            "Elena Petrova",
+            "Irina Rudenko",
+            "Ivan Petrov",
+            "Max Ivanov",
+            "Olga Novak",
+            "Sergey Rudenko",
+            "Vera Kovac"
+        ]
+    );
+    assert_eq!(
+        names(&s, contacts, "@online"),
+        vec!["Irina Rudenko", "Ivan Petrov", "Vera Kovac"]
+    );
+    let members = open_root(&mut s, Members::id(STELAXIS));
+    assert_eq!(
+        s.panel(members).unwrap().borrow().title(),
+        "members · stelaxis"
+    );
+    let seed = {
+        let inst = s.panel(members).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<People>().unwrap().seed_filter()
+    };
+    assert_eq!(names(&s, members, &seed).len(), 7);
+    assert_eq!(
+        names(&s, members, &format!("{seed}@admin")),
+        vec!["Andrey Rudenko", "Vera Kovac"]
+    );
+    // A member's row says where it opens, and what it says under the name.
+    let member = {
+        let inst = s.panel(members).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<People>().unwrap().rows(0, 1).remove(0)
+    };
+    assert_eq!(member.group, Some(STELAXIS));
+    assert_eq!(member.detail(), "online · @prepor · admin");
+    names(&s, contacts, "");
+    let contact = {
+        let inst = s.panel(contacts).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<People>().unwrap().rows(0, 1).remove(0)
+    };
+    assert_eq!(contact.group, None);
+    assert_eq!(contact.detail(), "last seen recently · @elena_p");
+}
+
+// -- the bars ------------------------------------------------------------------------------
+
+/// Every bar telegram wears: no letter twice, and none of the ones the
+/// workspace keeps for itself.
+#[test]
+fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| {
+        c.go(0);
+        c.toggle_mark();
+    });
+    let archive = open_root(&mut s, Chats::archive());
+    with_chats(&s, archive, |c| {
+        c.go(0);
+        c.toggle_mark();
+    });
+    let mut slots = vec![list, archive];
+    for id in [
+        Chat::id(VERA),
+        Chat::id(STELAXIS),
+        Chat::id(RUST_WEEKLY),
+        Chat::id(DEV),
+        Peer::id(VERA),
+        Peer::id(STELAXIS),
+        Peer::id(RUST_WEEKLY),
+        Peer::id(OLD_FLAT),
+    ] {
+        slots.push(open_root(&mut s, id));
+    }
+    // The chat with the cursor on my own line, marked, wears *edit* and the
+    // batch twins too.
+    let mine = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, mine, |c| {
+        c.walk(-1);
+        c.toggle_mark();
+    });
+    slots.push(mine);
+    // The line's card over each kind of line, the viewer, and the place.
+    let hist = model::history(s.store(), STELAXIS);
+    for m in hist.iter().filter(|m| !m.service) {
+        slots.push(open_root(&mut s, Line::id(STELAXIS, m.id)));
+        if m.media.is_some() {
+            slots.push(open_root(&mut s, Viewer::id(STELAXIS, m.id)));
+        }
+    }
+    let hike = model::history(s.store(), HIKE);
+    let mine_line = hike.iter().find(|m| m.out).expect("my line");
+    slots.push(open_root(&mut s, Line::id(HIKE, mine_line.id)));
+    let place_line = hike.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location")).expect("a place");
+    slots.push(open_root(&mut s, Line::id(HIKE, place_line.id)));
+    slots.push(open_root(&mut s, Place::id(VERA)));
+    // The attach panel in each of its states: empty; carrying three with
+    // the cursor between them, so both trades are on the bar; with files
+    // held; recording.
+    let (_, empty) = chat_with_attach(&mut s, VERA);
+    slots.push(empty);
+    let (host, full) = chat_with_attach(&mut s, ELENA);
+    with_chat(&s, host, |c| {
+        c.carry(&["~/a.pdf".to_string(), "~/b.png".to_string(), "~/c.mp4".to_string()]);
+    });
+    observe(&s, full);
+    with_attach(&s, full, |a| a.set_cursor(1));
+    slots.push(full);
+    let (_, held) = chat_with_attach(&mut s, MAX);
+    with_attach(&s, held, |a| a.set_held(vec!["~/notes.md".to_string()]));
+    slots.push(held);
+    let (_, rec) = chat_with_attach(&mut s, ANNA);
+    verb(&mut s, rec, "telegram.voice");
+    slots.push(rec);
+
+    for slot in slots {
+        let verbs = s.panel(slot).unwrap().borrow().verbs();
+        assert!(!verbs.is_empty(), "slot {slot} wears nothing");
+        let mut seen: Vec<char> = Vec::new();
+        for v in &verbs {
+            let Some(c) = v.accel else { continue };
+            let c = c.to_ascii_lowercase();
+            assert!(
+                !crate::shell::keys::is_reserved(c),
+                "{} wears cmd+{c}, which the workspace keeps",
+                v.id
+            );
+            assert!(
+                !seen.contains(&c),
+                "two verbs on slot {slot} wear cmd+{c}: {:?}",
+                verbs.iter().map(|v| v.id).collect::<Vec<_>>()
+            );
+            seen.push(c);
+            assert!(
+                v.label.to_lowercase().contains(c),
+                "{}'s label {:?} does not carry its letter {c}",
+                v.id,
+                v.label
+            );
+        }
+    }
+    assert_eq!(
+        verb_ids(&s, mine),
+        vec![
+            "telegram.attach",
+            "telegram.line",
+            "telegram.about",
+            "telegram.forward",
+            "telegram.delete",
+            "telegram.clear"
+        ]
+    );
+    assert_eq!(
+        verb_ids(&s, full),
+        vec![
+            "telegram.browse",
+            "telegram.remove",
+            "telegram.earlier",
+            "telegram.later",
+            "telegram.voice",
+            "telegram.video",
+            "telegram.place"
+        ]
+    );
+    assert_eq!(verb_ids(&s, rec), vec!["telegram.send_rec", "telegram.discard"]);
+    // The rare verbs are on the line's card, edit only over mine.
+    let mine_card = open_root(&mut s, Line::id(HIKE, mine_line.id));
+    assert_eq!(
+        verb_ids(&s, mine_card),
+        vec![
+            "telegram.reply",
+            "telegram.edit",
+            "telegram.forward",
+            "telegram.copy",
+            "telegram.delete",
+            "telegram.pin"
+        ]
+    );
+    let place_card = open_root(&mut s, Line::id(HIKE, place_line.id));
+    assert!(verb_ids(&s, place_card).ends_with(&["telegram.maps", "telegram.browser"]));
+}
+
+/// The attach panel edits what the composer carries, through the join:
+/// what the files app holds is added in order, a row is traded with its
+/// neighbours and put down, and the chat's bar counts what waits. Its
+/// recordings run against the clock and end in a toast; its place opens
+/// joined to it. Away from its chat it says so.
+#[test]
+fn the_attach_panel_edits_what_the_composer_carries() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    assert_eq!(verb_ids(&s, chat), vec!["telegram.attach", "telegram.about"]);
+    verb(&mut s, chat, "telegram.attach");
+    let attach = s.joined_child(chat).expect("the attach panel, joined");
+    assert_eq!(s.panel(attach).unwrap().borrow().id(), &Attach::id(VERA));
+    observe(&s, attach);
+    assert!(with_attach(&s, attach, |a| a.joined()));
+    // Nothing held and no rows: the link to the files panel, the two
+    // recordings and the place.
+    assert_eq!(
+        verb_ids(&s, attach),
+        vec!["telegram.browse", "telegram.voice", "telegram.video", "telegram.place"]
+    );
+
+    // Held: `add` puts them on the chat's list in order, the cursor on the
+    // last one, and the chat's bar counts them.
+    let names = |s: &Session| {
+        with_chat(s, chat, |c| c.carrying().iter().map(model::Carried::label).collect::<Vec<_>>())
+    };
+    with_attach(&s, attach, |a| {
+        a.set_held(vec![
+            "~/Downloads/report-q3.pdf".to_string(),
+            "~/Downloads/screenshot-2026-08-30.png".to_string(),
+        ]);
+    });
+    assert!(verb_ids(&s, attach).contains(&"telegram.add"));
+    verb(&mut s, attach, "telegram.add");
+    assert_eq!(names(&s), vec!["report-q3.pdf · file", "screenshot-2026-08-30.png · photo"]);
+    assert_eq!(with_attach(&s, attach, |a| a.cursor()), Some(1));
+    let labels: Vec<String> = s.panel(chat).unwrap().borrow().verbs().iter().map(|v| v.label.clone()).collect();
+    assert!(labels.contains(&"attach 2".to_string()), "{labels:?}");
+    // The same path again is passed over.
+    with_attach(&s, attach, |a| a.set_held(vec!["~/Downloads/report-q3.pdf".to_string()]));
+    verb(&mut s, attach, "telegram.add");
+    assert_eq!(names(&s).len(), 2);
+
+    // The cursor on the last row: `earlier` and not `later`; the trade
+    // moves the row and the cursor with it, and the bar follows.
+    assert_eq!(
+        verb_ids(&s, attach),
+        vec![
+            "telegram.browse",
+            "telegram.remove",
+            "telegram.earlier",
+            "telegram.voice",
+            "telegram.video",
+            "telegram.place"
+        ]
+    );
+    verb(&mut s, attach, "telegram.earlier");
+    assert_eq!(names(&s)[0], "screenshot-2026-08-30.png · photo");
+    assert_eq!(with_attach(&s, attach, |a| a.cursor()), Some(0));
+    let bar = verb_ids(&s, attach);
+    assert!(!bar.contains(&"telegram.earlier") && bar.contains(&"telegram.later"));
+    verb(&mut s, attach, "telegram.later");
+    assert_eq!(names(&s)[1], "screenshot-2026-08-30.png · photo");
+    assert_eq!(with_attach(&s, attach, |a| a.cursor()), Some(1));
+
+    // `remove` puts the cursor's row down; the cursor stays in range, and
+    // goes when the list does.
+    verb(&mut s, attach, "telegram.remove");
+    assert_eq!(names(&s), vec!["report-q3.pdf · file"]);
+    assert_eq!(with_attach(&s, attach, |a| a.cursor()), Some(0));
+    verb(&mut s, attach, "telegram.remove");
+    assert!(names(&s).is_empty());
+    assert_eq!(with_attach(&s, attach, |a| a.cursor()), None);
+    assert!(!verb_ids(&s, attach).contains(&"telegram.remove"));
+
+    // The composer sends the files with the text, and both go.
+    with_attach(&s, attach, |a| a.set_held(vec!["~/notes.md".to_string()]));
+    verb(&mut s, attach, "telegram.add");
+    with_chat(&s, chat, |c| c.set_draft("here"));
+    {
+        let inst = s.panel(chat).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Chat>().unwrap().send(&mut s);
+    }
+    assert!(with_chat(&s, chat, |c| c.carrying().is_empty() && c.draft().is_empty()));
+
+    // A recording runs against the clock; while it runs the bar is its two
+    // ways out; enter sends it, `discard` throws the other away.
+    let t0 = s.now();
+    verb(&mut s, attach, "telegram.voice");
+    let rec = with_attach(&s, attach, |a| a.recording()).expect("recording");
+    assert_eq!(rec.kind, RecKind::Voice);
+    assert!(rec.line(t0 + 3.2).starts_with("recording voice 0:03"));
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.send_rec", "telegram.discard"]);
+    {
+        let inst = s.panel(attach).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Attach>().unwrap().send_recording(&mut s, t0 + 3.2);
+    }
+    assert!(with_attach(&s, attach, |a| a.recording().is_none()));
+    verb(&mut s, attach, "telegram.video");
+    assert_eq!(with_attach(&s, attach, |a| a.recording().map(|r| r.kind)), Some(RecKind::Video));
+    verb(&mut s, attach, "telegram.discard");
+    assert!(with_attach(&s, attach, |a| a.recording().is_none()));
+
+    // The place opens joined to the attach panel, with its two ways to send.
+    verb(&mut s, attach, "telegram.place");
+    let place = s.joined_child(attach).expect("the place, joined");
+    assert_eq!(verb_ids(&s, place), vec!["telegram.send_place", "telegram.send_live"]);
+    verb(&mut s, place, "telegram.send_place");
+
+    // Away from its chat: no list, and `add` says so rather than adding.
+    let alone = open_root(&mut s, Attach::id(VERA));
+    observe(&s, alone);
+    assert!(!with_attach(&s, alone, |a| a.joined()));
+    with_attach(&s, alone, |a| a.set_held(vec!["~/notes.md".to_string()]));
+    verb(&mut s, alone, "telegram.add");
+    assert!(with_chat(&s, chat, |c| c.carrying().is_empty()));
+}
+
+/// A reply asks for the caret: from the bar over the cursor, and from the
+/// line's card through the join, which takes the chat's focus too. The
+/// wish is answered once.
+#[test]
+fn a_reply_asks_for_the_caret() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    assert!(!with_chat(&s, chat, Chat::take_field_wish));
+    with_chat(&s, chat, |c| {
+        c.walk(-1);
+    });
+    verb(&mut s, chat, "telegram.reply");
+    assert!(with_chat(&s, chat, |c| c.reply_to().is_some()));
+    assert!(with_chat(&s, chat, Chat::take_field_wish));
+    assert!(!with_chat(&s, chat, Chat::take_field_wish), "answered once");
+    // No cursor: no reply on the bar at all.
+    let fresh = open_root(&mut s, Chat::id(VERA));
+    assert!(!verb_ids(&s, fresh).contains(&"telegram.reply"));
+    // From the card: the chat is told and focused.
+    verb(&mut s, chat, "telegram.line");
+    let card = s.joined_child(chat).expect("the card, joined");
+    assert_eq!(s.focus(), Some(card));
+    verb(&mut s, card, "telegram.reply");
+    assert_eq!(s.focus(), Some(chat));
+    assert!(with_chat(&s, chat, Chat::take_field_wish));
+}
+
+/// The cursor's verbs: `reply` over any line, `edit` and `delete` over
+/// mine, none without a cursor. Edit and delete are real on the store and
+/// undone whole; the marks' `delete n` only while every marked line is
+/// mine; the card edits through the join and deletes on its own.
+#[test]
+fn my_lines_are_edited_and_deleted_and_undone() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    assert_eq!(verb_ids(&s, chat), vec!["telegram.attach", "telegram.about"]);
+    let hist = model::history(s.store(), VERA);
+    let hers = hist.iter().find(|m| !m.out && !m.service).expect("her line").id;
+    let mine = hist.iter().rev().find(|m| m.out).expect("my line").clone();
+    with_chat(&s, chat, |c| c.set_cursor(hers));
+    assert_eq!(
+        verb_ids(&s, chat),
+        vec![
+            "telegram.reply",
+            "telegram.copy",
+            "telegram.attach",
+            "telegram.line",
+            "telegram.about"
+        ]
+    );
+    with_chat(&s, chat, |c| c.set_cursor(mine.id));
+    assert_eq!(
+        verb_ids(&s, chat),
+        vec![
+            "telegram.reply",
+            "telegram.edit",
+            "telegram.delete",
+            "telegram.copy",
+            "telegram.attach",
+            "telegram.line",
+            "telegram.about"
+        ]
+    );
+
+    // Edit: the field takes the text, the line above says which, the caret
+    // is asked for; enter writes it, and the draft comes back empty. Undo
+    // gives the old text and the old flag back.
+    with_chat(&s, chat, |c| c.set_draft("half a thought"));
+    verb(&mut s, chat, "telegram.edit");
+    assert_eq!(with_chat(&s, chat, |c| c.field_text().to_string()), mine.text);
+    let above = with_chat(&s, chat, |c| c.above_line(s.now())).expect("the editing line");
+    assert!(above.starts_with("editing: "), "{above}");
+    assert!(with_chat(&s, chat, Chat::take_field_wish));
+    with_chat(&s, chat, |c| c.typed("then we start at 7:00 sharp"));
+    send(&mut s, chat);
+    let text_of = |s: &Session| {
+        model::history(s.store(), VERA)
+            .iter()
+            .find(|m| m.id == mine.id)
+            .map(|m| (m.text.clone(), m.edited))
+    };
+    assert_eq!(text_of(&s), Some(("then we start at 7:00 sharp".to_string(), true)));
+    assert!(with_chat(&s, chat, |c| c.editing().is_none()));
+    assert_eq!(with_chat(&s, chat, |c| c.field_text().to_string()), "half a thought");
+    s.undo();
+    s.settle();
+    assert_eq!(text_of(&s), Some((mine.text.clone(), mine.edited)));
+    // An edit that changes nothing, or empties the line, writes nothing.
+    verb(&mut s, chat, "telegram.edit");
+    send(&mut s, chat);
+    verb(&mut s, chat, "telegram.edit");
+    with_chat(&s, chat, |c| c.typed("   "));
+    send(&mut s, chat);
+    assert_eq!(text_of(&s), Some((mine.text.clone(), mine.edited)));
+
+    // Delete: the line goes, the cursor steps to the line before it, and
+    // undo puts it back whole — the same id, the same date.
+    let len = hist.len();
+    with_chat(&s, chat, |c| c.set_cursor(mine.id));
+    verb(&mut s, chat, "telegram.delete");
+    let after = model::history(s.store(), VERA);
+    assert_eq!(after.len(), len - 1);
+    assert!(after.iter().all(|m| m.id != mine.id));
+    let at = hist.iter().position(|m| m.id == mine.id).unwrap();
+    let before = hist[..at].iter().rev().find(|m| !m.service).unwrap().id;
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(before));
+    s.undo();
+    s.settle();
+    let back = model::history(s.store(), VERA);
+    assert_eq!(back.len(), len);
+    let restored = back.iter().find(|m| m.id == mine.id).expect("the line, back");
+    assert_eq!((restored.text.as_str(), restored.date), (mine.text.as_str(), mine.date));
+
+    // Marks: the batch has the bar, and `delete n` only while every marked
+    // line is mine.
+    with_chat(&s, chat, |c| {
+        c.set_cursor(mine.id);
+        c.toggle_mark();
+    });
+    let bar = verb_ids(&s, chat);
+    assert!(bar.contains(&"telegram.delete") && !bar.contains(&"telegram.reply"));
+    with_chat(&s, chat, |c| {
+        c.set_cursor(hers);
+        c.toggle_mark();
+    });
+    let bar = verb_ids(&s, chat);
+    assert!(bar.contains(&"telegram.forward") && !bar.contains(&"telegram.delete"));
+
+    // From the card: edit through the join takes the chat's focus; delete
+    // on the card itself, the chat's cursor stepping off the line.
+    with_chat(&s, chat, |c| {
+        c.clear_marks();
+        c.set_cursor(mine.id);
+    });
+    verb(&mut s, chat, "telegram.line");
+    let card = s.joined_child(chat).expect("the card, joined");
+    assert_eq!(
+        verb_ids(&s, card),
+        vec![
+            "telegram.reply",
+            "telegram.edit",
+            "telegram.forward",
+            "telegram.copy",
+            "telegram.delete",
+            "telegram.pin"
+        ]
+    );
+    verb(&mut s, card, "telegram.edit");
+    assert_eq!(s.focus(), Some(chat));
+    assert!(with_chat(&s, chat, |c| c.editing().is_some()));
+    with_chat(&s, chat, Chat::cancel_edit);
+    verb(&mut s, card, "telegram.delete");
+    assert!(model::history(s.store(), VERA).iter().all(|m| m.id != mine.id));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(before));
+    // Another's line's card wears neither.
+    let hers_card = open_root(&mut s, Line::id(VERA, hers));
+    assert_eq!(
+        verb_ids(&s, hers_card),
+        vec!["telegram.reply", "telegram.forward", "telegram.copy", "telegram.pin"]
+    );
+}
+
+/// The viewer walks the chat's media in place; a line's card replies on
+/// the chat it hangs under and plays against the clock.
+#[test]
+fn the_viewer_walks_and_the_card_replies_and_plays() {
+    let mut s = session();
+    let hist = model::history(s.store(), STELAXIS);
+    let media: Vec<i64> = hist.iter().filter(|m| m.media.is_some()).map(|m| m.id).collect();
+    let viewer = open_root(&mut s, Viewer::id(STELAXIS, media[0]));
+    assert_eq!(verb_ids(&s, viewer), vec!["telegram.next", "telegram.open"]);
+    verb(&mut s, viewer, "telegram.next");
+    assert_eq!(s.panel(viewer).unwrap().borrow().id(), &Viewer::id(STELAXIS, media[1]));
+    assert!(verb_ids(&s, viewer).starts_with(&["telegram.previous", "telegram.next"]));
+
+    // A line's card, joined to its chat, replies on the chat's composer.
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    with_chat(&s, chat, |c| {
+        c.walk(-1);
+    });
+    verb(&mut s, chat, "telegram.line");
+    let card = s.joined_child(chat).expect("the card, joined");
+    verb(&mut s, card, "telegram.reply");
+    let line = with_chat(&s, chat, |c| c.reply_line(s.now())).expect("replying");
+    assert!(line.starts_with("reply to Ivan Petrov"), "{line}");
+    // Its player runs against the clock.
+    let voice = hist.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "voice")).unwrap();
+    let vcard = open_root(&mut s, Line::id(STELAXIS, voice.id));
+    let now = s.now();
+    verb(&mut s, vcard, "telegram.play");
+    let inst = s.panel(vcard).unwrap();
+    let mut b = inst.borrow_mut();
+    let l = b.as_any().downcast_mut::<Line>().unwrap();
+    let st = l.player_state(voice, now + 10.0).unwrap();
+    assert!(st.playing && (st.position - 10.0).abs() < 1e-6 && st.length == 42.0);
+}
+
+/// A clip nobody can play yet is still the round-one line.
+///
+/// The one thing a build with no engine can prove about video: a row that
+/// names a clip, with no file on the device and nothing to ask for it with,
+/// keeps its poster and its fake timeline — so the panels library, the demo
+/// world and the suites draw exactly what they drew before. What replaces
+/// them, the platform's player over the cached file, needs a signed-in run.
+#[test]
+fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
+    let mut s = session();
+    let hist = model::history(s.store(), STELAXIS);
+    let video = hist
+        .iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "video"))
+        .expect("a video line in the demo world")
+        .clone();
+    // Name the clip on it, the way the live projection would; nothing else
+    // about the row changes.
+    let id = video.id;
+    s.store()
+        .write(move |c| {
+            c.execute(
+                "UPDATE tg_message SET media_clip = 'tg:reef', media_clip_rid = 'RID' WHERE id = ?1",
+                [id],
+            )
+        })
+        .expect("name the clip");
+
+    let slot = open_root(&mut s, Viewer::id(STELAXIS, id));
+    let inst = s.panel(slot).expect("the viewer");
+    let now = s.now();
+    let line = model::line(s.store(), STELAXIS, id).expect("the line");
+    {
+        let mut b = inst.borrow_mut();
+        let v = b.as_any().downcast_mut::<Viewer>().unwrap();
+        assert_eq!(line.media.as_ref().unwrap().clip.as_deref(), Some("tg:reef"));
+        // Asking is a no-op with no engine, so the clip is never this
+        // panel's to play and there is no file to point a player at.
+        v.ask_for_clip(&line);
+        assert!(!v.plays_clip(&line), "nothing to play it with");
+        assert_eq!(v.clip_note(&line), None, "and nothing to wait for");
+        assert!(v.clip_file(&line).is_none(), "the store is in memory");
+    }
+    // So `play` runs the timeline against the clock, as it always has.
+    verb(&mut s, slot, "telegram.play");
+    let mut b = inst.borrow_mut();
+    let v = b.as_any().downcast_mut::<Viewer>().unwrap();
+    let st = v.player_state(&line, now + 4.0).expect("the fake timeline");
+    assert!(st.playing, "so the button reads pause");
+    assert!((st.position - 4.0).abs() < 1e-6, "four seconds in");
+}
+
+/// The links off a card go where they say.
+#[test]
+fn the_card_links_to_the_chat_its_messages_and_the_members() {
+    let mut s = session();
+    let card = open_root(&mut s, Peer::id(STELAXIS));
+    assert_eq!(
+        verb_ids(&s, card),
+        vec![
+            "telegram.mute",
+            "telegram.pin",
+            "telegram.archive",
+            "telegram.chat",
+            "telegram.search",
+            "telegram.members",
+            "telegram.leave"
+        ]
+    );
+    // `search` is the card's and not the chat's, since 2026-09-05.
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.search"));
+    verb(&mut s, card, "telegram.search");
+    assert_eq!(
+        s.panel(s.joined_child(card).expect("the messages, joined")).unwrap().borrow().id(),
+        &Messages::in_chat(STELAXIS)
+    );
+    verb(&mut s, card, "telegram.members");
+    let members = s.joined_child(card).expect("the members, joined");
+    assert_eq!(
+        s.panel(members).unwrap().borrow().id(),
+        &Members::id(STELAXIS)
+    );
+    // A person's card has no members and nothing to leave; a muted chat's
+    // says unmute; the archived one says unarchive.
+    let person = open_root(&mut s, Peer::id(ANNA));
+    assert!(!verb_ids(&s, person).contains(&"telegram.members"));
+    assert!(!verb_ids(&s, person).contains(&"telegram.leave"), "one leaves a group");
+    // A channel is left too, though nobody is listed in it.
+    let channel = open_root(&mut s, Peer::id(RUST_WEEKLY));
+    assert!(!verb_ids(&s, channel).contains(&"telegram.members"));
+    assert!(verb_ids(&s, channel).contains(&"telegram.leave"));
+    let group = open_root(&mut s, Peer::id(STELAXIS));
+    let labels: Vec<String> = s.panel(group).unwrap().borrow().verbs().iter().map(|v| v.label.clone()).collect();
+    assert_eq!(labels[0], "unmute");
+    assert_eq!(labels[1], "unpin");
+    let old = open_root(&mut s, Peer::id(OLD_FLAT));
+    assert!(verb_ids(&s, old).contains(&"telegram.unarchive"));
+}
+
+/// Off the wire the verbs about a chat say what would have left and change
+/// nothing — the demo world is what a store with no account shows. Leaving
+/// is the one that acts anyway: the conversation goes from the store, the
+/// peer stays, and the card closes behind it.
+#[test]
+fn the_chat_verbs_toast_off_the_wire_and_leaving_still_leaves() {
+    let mut s = session();
+    let card = open_root(&mut s, Peer::id(STELAXIS));
+    let muted = |s: &Session| model::peer(s.store(), STELAXIS).expect("the card").muted;
+    let was = muted(&s);
+    verb(&mut s, card, "telegram.mute");
+    assert_eq!(muted(&s), was, "nothing left the machine, so nothing flipped");
+    let said = |s: &Session| s.notes().last().map(|n| n.msg.clone()).unwrap_or_default();
+    assert!(
+        said(&s).contains("unmute"),
+        "the toast says what would have gone: {:?}",
+        said(&s)
+    );
+
+    // The batch verbs of the list say the same, over the count they name,
+    // and the marks stay for the retry that a signed-in build would make.
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| {
+        c.go(0);
+        c.toggle_mark();
+        c.go(1);
+        c.toggle_mark();
+    });
+    verb(&mut s, list, "telegram.read");
+    assert!(said(&s).contains("read 2 chats"), "{:?}", said(&s));
+    assert_eq!(unread(&s, STELAXIS).0, 8, "nothing was read: nothing left");
+    verb(&mut s, list, "telegram.archive");
+    assert!(said(&s).contains("archive 2 chats"), "{:?}", said(&s));
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().len()), 2, "the marks stay");
+
+    // Leaving: the lines, the membership and the chat row go; the peer, and
+    // everything that points at its name, stays.
+    let lines = |s: &Session| model::history(s.store(), STELAXIS).len();
+    assert!(lines(&s) > 0, "the group has a transcript to lose");
+    verb(&mut s, card, "telegram.leave");
+    s.settle();
+    assert_eq!(lines(&s), 0, "the transcript is gone");
+    let card_after = model::peer(s.store(), STELAXIS).expect("the peer stays known");
+    assert_eq!(card_after.name, "stelaxis");
+    assert_eq!(card_after.unread, 0, "a chat that is gone has no flags");
+    assert!(s.panel(card).is_none(), "the card closed behind it");
+    // The list has let it go, and nothing crashes on the way past.
+    assert!(!titles(&s, list).contains(&"stelaxis".to_string()));
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    assert_eq!(s.panel(chat).unwrap().borrow().title(), "stelaxis");
+}
+
+// -- the search source ---------------------------------------------------------------------
+
+#[test]
+fn the_search_source_finds_chats_people_and_lines() {
+    let s = session();
+    let mut engine = Engine::inline(s.apps().providers());
+    assert_eq!(engine.slots(), 1, "telegram supplies exactly one source");
+
+    // A name reaches the chat with them; a word reaches the lines that
+    // carry it, each opening its chat at that line.
+    engine.ask(s.store(), 1, "vera");
+    let hits: Vec<_> = engine.collect().into_iter().flat_map(|a| a.hits).collect();
+    assert!(hits.len() >= 2, "{hits:?}");
+    assert_eq!(hits[0].label, "Vera Kovac");
+    assert_eq!(hits[0].detail, "online");
+    assert_eq!(hits[0].go, Go::Open(Chat::id(VERA)));
+    assert!(hits[1].label.contains("Vera"), "{:?}", hits[1]);
+
+    engine.ask(s.store(), 2, "thermos");
+    let hits: Vec<_> = engine.collect().into_iter().flat_map(|a| a.hits).collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].label, "and the thermos");
+    assert_eq!(hits[0].detail, "me in Hiking Saturday");
+    let hist = model::history(s.store(), HIKE);
+    let id = hist.last().expect("lines").id;
+    assert_eq!(hits[0].go, Go::Open(Chat::at(HIKE, id)));
+
+    // A kind is a word too: `channel` finds both.
+    engine.ask(s.store(), 3, "channel");
+    let hits: Vec<_> = engine.collect().into_iter().flat_map(|a| a.hits).collect();
+    let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+    assert!(labels.contains(&"Rust Weekly") && labels.contains(&"superapp dev"), "{labels:?}");
+
+    // Nobody is offered whose page would be empty.
+    engine.ask(s.store(), 4, "elena");
+    let hits: Vec<_> = engine.collect().into_iter().flat_map(|a| a.hits).collect();
+    assert_eq!(hits[0].go, Go::Open(Chat::id(ELENA)));
+}
+
+/// The seed's clock: everything sits around the virtual epoch, so the list
+/// spells today's lines by the hour and yesterday's by the weekday.
+#[test]
+fn the_seed_sits_around_the_virtual_epoch() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    let rows = with_chats(&s, list, |c| c.rows(0, 50));
+    let when: Vec<String> = rows
+        .iter()
+        .map(|r| model::when(r.last, virtual_epoch()))
+        .collect();
+    assert_eq!(
+        when,
+        vec!["11:52", "11:40", "10:03", "09:30", "08:16", "mon", "mon", "sat", "thu", "12.08"]
+    );
+    assert_eq!(rows[0].last, ts(2026, 9, 1, 11, 52));
+}
+
+// -- signing in ----------------------------------------------------------------------------
+
+/// Writes the one session row the sign-in panel reads back, on the store's
+/// own writer — the seam the worker uses, exercised here with no worker.
+fn set_session(s: &Session, state: &str, phone: Option<&str>, detail: Option<&str>) {
+    let state = state.to_string();
+    let phone = phone.map(str::to_string);
+    let detail = detail.map(str::to_string);
+    s.store()
+        .write(move |c| schema::set_session(c, phone.as_deref(), &state, detail.as_deref(), 0.0))
+        .expect("write the session row");
+}
+
+fn with_signin<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut SignIn) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<SignIn>().expect("a sign-in panel"))
+}
+
+/// The panel maps each session state to the field it shows and the verb it
+/// wears: connecting has neither, each wait-state its own field and word, and
+/// ready says who signed in. The panel reads the row live, so one open reflects
+/// every state written under it.
+#[test]
+fn signin_maps_each_state_to_its_field_and_verb() {
+    let mut s = session();
+    let slot = open_root(&mut s, SignIn::id());
+    let labels = |s: &Session| -> Vec<String> {
+        s.panel(slot)
+            .unwrap()
+            .borrow()
+            .verbs()
+            .iter()
+            .map(|v| v.label.clone())
+            .collect()
+    };
+
+    // Closed by default — a store no account has touched.
+    with_signin(&s, slot, |p| {
+        assert_eq!(p.state(), "closed");
+        assert_eq!(p.field_kind(), None);
+        assert_eq!(p.line(), "not started");
+    });
+    assert!(labels(&s).is_empty(), "nothing to send while closed");
+
+    // Connecting: a line, still nothing to type.
+    set_session(&s, "connecting", None, None);
+    with_signin(&s, slot, |p| {
+        assert_eq!(p.field_kind(), None);
+        assert_eq!(p.line(), "connecting to Telegram…");
+    });
+    assert!(labels(&s).is_empty());
+
+    // The phone.
+    set_session(&s, "wait_phone", None, None);
+    with_signin(&s, slot, |p| assert_eq!(p.field_kind(), Some(Field::Phone)));
+    assert_eq!(labels(&s), vec!["send phone"]);
+
+    // The code, with the delivery hint beside the field.
+    set_session(&s, "wait_code", Some("+4915150525562"), Some("sms · 5"));
+    with_signin(&s, slot, |p| {
+        assert_eq!(p.field_kind(), Some(Field::Code));
+        assert_eq!(p.hint().as_deref(), Some("sms · 5"));
+    });
+    assert_eq!(labels(&s), vec!["send code"]);
+
+    // The two-factor password, with its own hint.
+    set_session(&s, "wait_password", None, Some("your cat"));
+    with_signin(&s, slot, |p| {
+        assert_eq!(p.field_kind(), Some(Field::Password));
+        assert_eq!(p.hint().as_deref(), Some("your cat"));
+    });
+    assert_eq!(labels(&s), vec!["send password"]);
+
+    // Signed in: who, and that the chats are coming down. The phone the code
+    // step filed rides through the later states that carry none.
+    set_session(&s, "ready", None, None);
+    with_signin(&s, slot, |p| {
+        assert_eq!(p.field_kind(), None);
+        assert_eq!(p.line(), "signed in as +4915150525562");
+        // The note counts what the store holds — the demo world's rows here.
+        let note = p.note().expect("a note once signed in");
+        assert!(note.starts_with("syncing · "), "{note}");
+        assert!(note.ends_with(" lines") && note.contains(" chats · "), "{note}");
+        assert!(!note.contains("· 0 lines"), "the demo world has lines: {note}");
+    });
+    assert!(labels(&s).is_empty());
+}
+
+/// The send writes nothing to the store itself: TDLib's answer is the worker's
+/// to project, so a press in 'wait_phone' leaves the session row exactly where
+/// it stood. Without the engine the send is an inert toast; with it, it reaches
+/// the shared client — neither touches `tg_session`.
+#[test]
+fn signin_send_leaves_the_session_row_to_the_worker() {
+    let mut s = session();
+    let slot = open_root(&mut s, SignIn::id());
+    set_session(&s, "wait_phone", None, None);
+    with_signin(&s, slot, |p| p.edited("+4915150525562".to_string()));
+    verb(&mut s, slot, "telegram.signin");
+    // The panel advanced nothing — the state is still the worker's to move.
+    assert_eq!(schema::session(s.store().conn()).state, "wait_phone");
+}
+
+/// The three request builders the panel shares with the state machine carry
+/// the right `@type` and the value they were handed — so the panel reuses the
+/// JSON rather than spelling it a second time.
+#[test]
+fn the_auth_builders_carry_their_type_and_value() {
+    let phone: serde_json::Value =
+        serde_json::from_str(&requests::set_authentication_phone("+4915150525562")).unwrap();
+    assert_eq!(phone["@type"], "setAuthenticationPhoneNumber");
+    assert_eq!(phone["phone_number"], "+4915150525562");
+
+    let code: serde_json::Value =
+        serde_json::from_str(&requests::check_authentication_code("12345")).unwrap();
+    assert_eq!(code["@type"], "checkAuthenticationCode");
+    assert_eq!(code["code"], "12345");
+
+    let pw: serde_json::Value =
+        serde_json::from_str(&requests::check_authentication_password("hunter2")).unwrap();
+    assert_eq!(pw["@type"], "checkAuthenticationPassword");
+    assert_eq!(pw["password"], "hunter2");
+}
+
+// -- the live verbs, off the wire ----------------------------------------------
+
+/// The phase-4 wire builders carry the right `@type` and fields: a send with
+/// and without the line it answers, an edit, a delete with its revoke flag, and
+/// a read. The reply rides the *input* form `inputMessageReplyToMessage` — the
+/// `InputMessageReplyTo` that `sendMessage` takes — not the received-message
+/// `messageReplyToMessage`, and is absent entirely when nothing is answered.
+#[test]
+fn the_wire_builders_carry_their_type_and_fields() {
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+
+    // A plain send: the text as a formattedText inside an inputMessageText, and
+    // no reply_to at all.
+    let send = v(requests::send_message(7, "on my way", None));
+    assert_eq!(send["@type"], "sendMessage");
+    assert_eq!(send["chat_id"], 7);
+    assert_eq!(send["input_message_content"]["@type"], "inputMessageText");
+    assert_eq!(send["input_message_content"]["text"]["@type"], "formattedText");
+    assert_eq!(send["input_message_content"]["text"]["text"], "on my way");
+    assert!(send.get("reply_to").is_none(), "no reply, no reply_to field");
+
+    // A reply: the input reply form, by message id.
+    let reply = v(requests::send_message(7, "yes", Some(42)));
+    assert_eq!(reply["reply_to"]["@type"], "inputMessageReplyToMessage");
+    assert_eq!(reply["reply_to"]["message_id"], 42);
+
+    // An edit reuses the same inputMessageText over a chat/message pair.
+    let edit = v(requests::edit_message_text(7, 42, "fixed"));
+    assert_eq!(edit["@type"], "editMessageText");
+    assert_eq!(edit["chat_id"], 7);
+    assert_eq!(edit["message_id"], 42);
+    assert_eq!(edit["input_message_content"]["text"]["text"], "fixed");
+
+    // A delete for everyone: the ids as an array, revoke true; and revoke false
+    // is the delete-for-me alone.
+    let del = v(requests::delete_messages(7, &[1, 2, 3], true));
+    assert_eq!(del["@type"], "deleteMessages");
+    assert_eq!(del["chat_id"], 7);
+    assert_eq!(del["message_ids"], serde_json::json!([1, 2, 3]));
+    assert_eq!(del["revoke"], true);
+    assert_eq!(v(requests::delete_messages(7, &[1], false))["revoke"], false);
+
+    // A read: force_read, so the chat's count clears, not merely that the line
+    // was shown.
+    let view = v(requests::view_messages(7, &[99]));
+    assert_eq!(view["@type"], "viewMessages");
+    assert_eq!(view["chat_id"], 7);
+    assert_eq!(view["message_ids"], serde_json::json!([99]));
+    assert_eq!(view["force_read"], true);
+}
+
+/// Off the wire — the default build links no engine — a send is the demo toast
+/// and empties the composer just the same: the draft, the line it answered and
+/// anything carried are all let go, and a plain send never panics. The wire
+/// gating never gets in the way of the clearing the demo has always done.
+#[test]
+fn a_send_clears_the_composer_with_no_engine() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+
+    // A reply with a draft: both the reply line and the text are set.
+    let hers = model::history(s.store(), VERA)
+        .iter()
+        .find(|m| !m.out && !m.service)
+        .expect("her line")
+        .id;
+    with_chat(&s, chat, |c| {
+        c.reply(hers);
+        c.set_draft("see you at seven");
+    });
+    assert_eq!(with_chat(&s, chat, |c| c.reply_to()), Some(hers));
+
+    send(&mut s, chat);
+
+    // The demo clearing, wire or no wire: nothing left in the composer.
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.draft(), "");
+        assert_eq!(c.reply_to(), None);
+        assert!(c.carrying().is_empty());
+    });
+
+    // Carrying files, the files are the message and the words their caption
+    // — so off the wire it is one toast counting them, and the list is put
+    // down with the draft.
+    with_chat(&s, chat, |c| {
+        c.carry(&["~/a.png".to_string(), "~/clip.mp4".to_string()]);
+        c.set_draft("here");
+    });
+    send(&mut s, chat);
+    let said = s.notes().last().map(|n| n.msg.clone()).unwrap_or_default();
+    assert!(said.contains("send with 2 files"), "{said}");
+    with_chat(&s, chat, |c| {
+        assert_eq!(c.draft(), "");
+        assert!(c.carrying().is_empty());
+    });
+}
+
+/// Forwarding is a pick of the chat, as the client's forward sheet is: the
+/// verb takes the marked lines out of the transcript and opens the list,
+/// which wears *forward here* only while lines wait for it. The pick spends
+/// them — off the wire nothing leaves and the toast says what would have,
+/// but a pick made is a pick made — and *clear* is the way out of one.
+#[test]
+fn forward_waits_for_a_chat_and_the_list_picks_it() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let list = open_root(&mut s, Chats::id());
+    assert!(
+        !verb_ids(&s, list).contains(&"telegram.forward_here"),
+        "nothing waits for a chat yet"
+    );
+
+    // Two lines marked, and forward: the marks have done their work, the
+    // lines wait on the app, and the list offers the pick.
+    let hist = model::history(s.store(), VERA);
+    let ids: Vec<i64> = hist.iter().filter(|m| !m.service).take(2).map(|m| m.id).collect();
+    let mark = |s: &Session| {
+        with_chat(s, chat, |c| {
+            for id in &ids {
+                c.set_cursor(*id);
+                c.toggle_mark();
+            }
+        });
+    };
+    mark(&s);
+    verb(&mut s, chat, "telegram.forward");
+    assert!(with_chat(&s, chat, |c| c.marks().is_empty()));
+    let waiting = runtime::of(s.store()).pending_forward().expect("the lines wait for a chat");
+    assert_eq!((waiting.from, waiting.ids), (VERA, ids.clone()));
+    assert!(verb_ids(&s, list).contains(&"telegram.forward_here"));
+
+    // The pick: the chat under the cursor takes them, and the waiting ends.
+    with_chats(&s, list, |c| {
+        c.go(0);
+    });
+    verb(&mut s, list, "telegram.forward_here");
+    let said = s.notes().last().map(|n| n.msg.clone()).unwrap_or_default();
+    assert!(said.contains("forward 2 lines to Vera Kovac"), "{said}");
+    assert!(runtime::of(s.store()).take_forward().is_none(), "the pick spent the forward");
+    assert!(!verb_ids(&s, list).contains(&"telegram.forward_here"));
+
+    // And the way out of one: *clear* lets the lines go without sending
+    // them anywhere.
+    mark(&s);
+    verb(&mut s, chat, "telegram.forward");
+    assert!(runtime::of(s.store()).pending_forward().is_some());
+    verb(&mut s, list, "telegram.clear");
+    assert!(runtime::of(s.store()).pending_forward().is_none());
+}
+
+/// *copy* puts the line's words on the clipboard, and a line with none —
+/// a picture — puts what the transcript says it is. It goes through the
+/// effect, so the log keeps the row and a world that may not touch a
+/// human's clipboard would refuse it out loud.
+#[test]
+fn copy_takes_the_line_through_the_clipboard() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    let hist = model::history(s.store(), STELAXIS);
+    let words = hist
+        .iter()
+        .find(|m| !m.service && !m.text.is_empty())
+        .expect("a line with words")
+        .clone();
+    with_chat(&s, chat, |c| c.set_cursor(words.id));
+    verb(&mut s, chat, "telegram.copy");
+    assert_eq!(s.notes().last().map(|n| n.msg.clone()).unwrap_or_default(), "copied");
+    // The ring the log reads in-memory effects out of: nothing is filed for
+    // one, so what it kept is the sentence the effect described itself with.
+    let clipped = |s: &Session| {
+        let ring: Vec<serde_json::Value> =
+            serde_json::from_str(&s.store().mem().json()).expect("the effect ring");
+        let last = ring.last().expect("the copy is in the ring").clone();
+        assert_eq!(last["kind"], "clip");
+        last["what"].as_str().unwrap_or_default().to_string()
+    };
+    assert_eq!(clipped(&s), format!("copy the line ({} bytes)", words.text.len()));
+
+    // A line with no words says what it is instead: the card's own copy,
+    // over the recording the transcript draws as *voice 0:12*.
+    let voice = model::history(s.store(), FAMILY)
+        .iter()
+        .find(|m| m.text.is_empty() && m.media.is_some())
+        .expect("a line with nothing written on it")
+        .clone();
+    let card = open_root(&mut s, Line::id(FAMILY, voice.id));
+    verb(&mut s, card, "telegram.copy");
+    let label = voice.media.expect("the recording").line(s.now());
+    assert_eq!(label, "voice 0:12");
+    assert_eq!(clipped(&s), format!("copy the line ({} bytes)", label.len()));
+}
+
+
+// -- whose session, whose engine ------------------------------------------------
+
+/// An account over a fake transport: what the *worker* does with an answer
+/// from the engine, which no panel can make happen. The api_id is the demo
+/// file's and the directory a scratch one — nothing opens a client.
+fn account() -> sync::Account<FakeTd> {
+    sync::Account::new(
+        FakeTd::new(),
+        17844,
+        std::env::temp_dir().join("superapp-tg-panel-tests"),
+        None,
+    )
+}
+
+/// One chat's draft, as the row holds it.
+fn draft_row(s: &Session, peer: i64) -> String {
+    s.store()
+        .conn()
+        .query_row(
+            "SELECT COALESCE(draft, '') FROM tg_chat WHERE peer = ?1",
+            [peer],
+            |r| r.get(0),
+        )
+        .expect("a chat row")
+}
+
+/// A draft written under an open panel — what `updateChatDraftMessage` does
+/// when the line was half-typed on the phone.
+fn write_draft(s: &Session, peer: i64, text: &str) {
+    let text = text.to_string();
+    s.store()
+        .write(move |c| model::set_draft_tx(c, peer, &text))
+        .expect("the draft written");
+}
+
+/// What the widget does at the top of every draw: read the card, which is
+/// where the draft is reconciled, then the field.
+fn field_now(s: &Session, slot: SlotId) -> String {
+    with_chat(s, slot, |c| {
+        let _ = c.card();
+        c.field_text().to_string()
+    })
+}
+
+/// A session of fixtures — every test's, and the Panels Library's — is not
+/// the account holder's, whatever this build links: no worker of ours runs
+/// in it, so no second TDLib client opens to drain the engine's process-wide
+/// queue into a store of demo rows; and no verb of its panels reaches the
+/// wire, so a scene pressing *mute* mutes nothing but its own fixture.
+#[test]
+fn nothing_of_a_fixture_session_reaches_the_engine() {
+    let mut s = session();
+    assert!(s.db_dir().is_none(), "a fixture session is in memory");
+    assert!(!Telegram::engine_store(s.db_dir()));
+    assert!(
+        TELEGRAM.workers(s.store()).is_empty(),
+        "no engine worker for a store that is not the account holder's"
+    );
+    assert!(s.workers().names().is_empty(), "and none running");
+
+    // The toast is the whole of it: nothing went, and the local flip a
+    // caller would make on `true` is not made.
+    assert!(!told(&mut s, &requests::set_chat_muted(VERA, true), "mute"));
+    let said = s.notes().last().map(|n| n.msg.clone()).unwrap_or_default();
+    assert_eq!(said, "draft: nothing leaves — mute");
+}
+
+/// A send the engine refuses — a line past the limit, an attachment that is
+/// not there — gives its words back. The composer is emptied the moment the
+/// request is queued, so the only copy of them is the `@extra` the send wore;
+/// the refusal writes them onto the chat as its draft, and the open composer
+/// takes them back on its next draw.
+#[test]
+fn a_refused_send_puts_its_words_back_in_the_composer() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+
+    // Every send wears the extra, the words last so a line with colons in it
+    // comes home whole; a file's are its caption, and a place has none.
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+    let sent = v(requests::send_message(VERA, "17:00, or 18:00?", None));
+    assert_eq!(sent["@extra"], format!("send:{VERA}:17:00, or 18:00?"));
+    let file = model::Carried {
+        path: "~/Pictures/trail.png".to_string(),
+    };
+    assert_eq!(
+        v(requests::send_file(VERA, None, &file, "under it"))["@extra"],
+        format!("send:{VERA}:under it")
+    );
+    assert_eq!(
+        v(requests::send_location(VERA, None, 48.1, 11.5))["@extra"],
+        format!("send:{VERA}:")
+    );
+
+    // Sent: the composer and the row are empty, the words in flight. Read
+    // without a draw, so what follows is the refusal arriving before the
+    // panel has looked at the row again — which is the way it arrives.
+    with_chat(&s, chat, |c| c.set_draft("17:00, or 18:00?"));
+    send(&mut s, chat);
+    assert_eq!(draft_row(&s, VERA), "");
+    assert_eq!(with_chat(&s, chat, |c| c.draft().to_string()), "");
+
+    // Refused: the words land back on the row and reach the field.
+    let refusal = serde_json::json!({
+        "@type": "error",
+        "code": 400,
+        "message": "MESSAGE_TOO_LONG",
+        "@extra": sent["@extra"],
+    });
+    account().on_update(s.world(), &refusal.to_string());
+    assert_eq!(draft_row(&s, VERA), "17:00, or 18:00?");
+    assert_eq!(field_now(&s, chat), "17:00, or 18:00?");
+
+    // A composer typed in since is newer than the send that failed, and
+    // keeps what it holds.
+    write_draft(&s, VERA, "never mind");
+    account().on_update(s.world(), &refusal.to_string());
+    assert_eq!(draft_row(&s, VERA), "never mind");
+}
+
+/// `my_id` is the one thing that says who the account holder is. Until it
+/// arrives, *saved messages* is the demo world's stand-in self — the only
+/// self a store with no account has — and after it, the real one's chat,
+/// with the stand-in's flag given up. The value crosses as a number or as a
+/// string, by build; both are read.
+#[test]
+fn my_id_names_the_account_holder_and_saved_messages_follows() {
+    let mut s = session();
+    assert_eq!(model::self_peer(s.store()), None, "nobody has signed in");
+    let saved = open_root(&mut s, Chat::id(SELF));
+    assert_eq!(with_chat(&s, saved, |c| c.peer()), SELF);
+
+    let option = |value: serde_json::Value| {
+        serde_json::json!({
+            "@type": "updateOption",
+            "name": "my_id",
+            "value": { "@type": "optionValueInteger", "value": value },
+        })
+        .to_string()
+    };
+    account().on_update(s.world(), &option(serde_json::json!(7_771)));
+    assert_eq!(model::self_peer(s.store()), Some(7_771));
+    assert!(
+        !model::peer(s.store(), SELF).expect("the demo self").is_self,
+        "one account holder, one row that says so"
+    );
+    // The string shape, and a second account over the same store.
+    account().on_update(s.world(), &option(serde_json::json!("7772")));
+    assert_eq!(model::self_peer(s.store()), Some(7_772));
+
+    let saved = open_root(&mut s, Chat::id(SELF));
+    assert_eq!(
+        with_chat(&s, saved, |c| c.peer()),
+        7_772,
+        "the notes-to-self open on the account holder's own chat"
+    );
+}
+
+/// A draft written under an open panel — the same line half-typed on the
+/// phone, arriving as `updateChatDraftMessage` — reaches the composer, which
+/// until now read the row once and never again. What has been typed here
+/// since is not the other device's to overwrite.
+#[test]
+fn a_draft_from_another_device_reaches_an_untouched_composer() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    assert_eq!(field_now(&s, chat), "");
+
+    write_draft(&s, VERA, "on the train, back at six");
+    assert_eq!(field_now(&s, chat), "on the train, back at six");
+
+    // Typed here: the local words stand, whatever the row says next — and
+    // whatever draws happen between, since typing writes the row too and
+    // a draw reads it back (review, 2026-09-07: a redraw between made the
+    // words look untouched and a phone's draft overwrote them).
+    with_chat(&s, chat, |c| c.typed("bringing the maps"));
+    with_chat(&s, chat, |c| {
+        let _ = c.card();
+    });
+    write_draft(&s, VERA, "and the thermos");
+    assert_eq!(field_now(&s, chat), "bringing the maps");
+
+    // And the first read is what it always was: a chat opened on a draft
+    // shows it, reconciled or not.
+    let hike = open_root(&mut s, Chat::id(HIKE));
+    assert_eq!(field_now(&s, hike), "I'll bring the thermos and");
+}
+
+#[test]
+fn forwarding_and_signin_stay_with_the_session_that_started_them() {
+    let mut a = session();
+    let mut b = session();
+    let a_list = open_root(&mut a, Chats::id());
+    let b_list = open_root(&mut b, Chats::id());
+    runtime::of(a.store()).carry_forward(VERA, vec![42]);
+    assert!(verb_ids(&a, a_list).contains(&"telegram.forward_here"));
+    assert!(!verb_ids(&b, b_list).contains(&"telegram.forward_here"));
+    assert!(runtime::of(b.store()).take_forward().is_none());
+    assert!(runtime::of(a.store()).pending_forward().is_some());
+
+    let inbox = runtime::of(a.store()).connect();
+    let a_signin = open_root(&mut a, SignIn::id());
+    let b_signin = open_root(&mut b, SignIn::id());
+    set_session(&a, "wait_code", None, None);
+    set_session(&b, "wait_code", None, None);
+    with_signin(&a, a_signin, |p| p.edited("11111".to_string()));
+    with_signin(&b, b_signin, |p| p.edited("22222".to_string()));
+    verb(&mut b, b_signin, "telegram.signin");
+    assert!(inbox.try_recv().is_err(), "a fixture cannot answer another session's login");
+    verb(&mut a, a_signin, "telegram.signin");
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "checkAuthenticationCode");
+    assert_eq!(request["code"], "11111");
+}
+
+#[test]
+fn player_verbs_follow_their_own_clock_without_a_widget_draw() {
+    use kernel::app::Env;
+    use kernel::caps::{ClockSource, FakeClock};
+    let clock_a = FakeClock::at(virtual_epoch());
+    let clock_b = FakeClock::at(virtual_epoch());
+    let make_session = |clock: &FakeClock| Session::fake_with(APPS, &Env {
+        clock: ClockSource::Virtual(clock.clone()),
+        ..Env::default()
+    });
+    let mut a = make_session(&clock_a);
+    let mut b = make_session(&clock_b);
+    let voice = model::history(a.store(), STELAXIS).iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "voice"))
+        .expect("a voice note in the fixture").id;
+    let a_line = open_root(&mut a, Line::id(STELAXIS, voice));
+    let b_line = open_root(&mut b, Line::id(STELAXIS, voice));
+    let a_viewer = open_root(&mut a, Viewer::id(STELAXIS, voice));
+    verb(&mut a, a_line, "telegram.play");
+    verb(&mut b, b_line, "telegram.play");
+    verb(&mut a, a_viewer, "telegram.play");
+    let label = |s: &Session, slot| {
+        s.panel(slot).unwrap().borrow().verbs().into_iter()
+            .find(|v| v.id == "telegram.play").unwrap().label
+    };
+    assert_eq!(label(&a, a_line), "pause");
+    assert_eq!(label(&a, a_viewer), "pause");
+    clock_a.advance(3600.0);
+    assert_eq!(label(&a, a_line), "play");
+    assert_eq!(label(&a, a_viewer), "play");
+    assert_eq!(label(&b, b_line), "pause");
+}

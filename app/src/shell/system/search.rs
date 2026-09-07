@@ -464,7 +464,7 @@ impl RowSpec for HitRows {
 
     /// One row: what was found, the source that found it on the right, and
     /// the source's own second line under both.
-    fn populate(cx: &mut Cx, row: &WidgetRef, f: &Found, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, f: &Found, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         line.label(cx, ids!(body.label_lbl)).set_text(cx, &f.label);
         line.label(cx, ids!(body.source_lbl)).set_text(cx, f.source);
@@ -473,7 +473,7 @@ impl RowSpec for HitRows {
         detail.set_visible(cx, !f.detail.is_empty());
     }
 
-    fn label(f: &Found) -> String {
+    fn label(f: &Found, _now: f64) -> String {
         f.label.clone()
     }
 

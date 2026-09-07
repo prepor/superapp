@@ -46,6 +46,19 @@ script_mod! {
                         mail_attachment_tpl := mod.widgets.MailAttachmentPanel{}
                         mail_settings_tpl := mod.widgets.MailSettingsPanel{}
                         mail_add_account_tpl := mod.widgets.MailAddAccountPanel{}
+                        // Telegram's ten tags: the address book and a
+                        // group's members draw with one widget, hung twice.
+                        telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
+                        telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
+                        telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}
+                        telegram_contacts_tpl := mod.widgets.TelegramPeoplePanel{}
+                        telegram_members_tpl := mod.widgets.TelegramPeoplePanel{}
+                        telegram_peer_tpl := mod.widgets.TelegramPeerPanel{}
+                        telegram_line_tpl := mod.widgets.TelegramLinePanel{}
+                        telegram_media_tpl := mod.widgets.TelegramViewerPanel{}
+                        telegram_place_tpl := mod.widgets.TelegramPlacePanel{}
+                        telegram_attach_tpl := mod.widgets.TelegramAttachPanel{}
+                        telegram_signin_tpl := mod.widgets.TelegramSigninPanel{}
                         // Files' two tags: a directory is a list, a file is
                         // a card.
                         files_dir_tpl := mod.widgets.FilesDirPanel{}
@@ -75,9 +88,17 @@ script_mod! {
                     // which apps exist.
                     library := mod.widgets.Library{
                         link_tpl := mod.widgets.SLink{}
+                        // The media kit, for the shell's own scene of it.
+                        media_player_tpl := mod.widgets.MediaPlayer{}
+                        media_meter_tpl := mod.widgets.MediaMeter{}
+                        media_map_tpl := mod.widgets.MediaMap{}
                         overlay_row_tpl := mod.widgets.OverlayRow{}
                         launcher_overlay_tpl := mod.widgets.LauncherOverlay{}
                         mail_row_tpl := mod.widgets.MailMailboxRow{}
+                        telegram_chat_row_tpl := mod.widgets.TelegramChatRow{}
+                        telegram_msg_row_tpl := mod.widgets.TelegramMsgRow{}
+                        telegram_person_row_tpl := mod.widgets.TelegramPersonRow{}
+                        telegram_attach_row_tpl := mod.widgets.TelegramAttachRow{}
                         files_row_tpl := mod.widgets.FilesDirRow{}
                         files_card_tpl := mod.widgets.CardFile{}
                         stage_tpl := mod.widgets.Stage{
@@ -92,6 +113,17 @@ script_mod! {
                             mail_attachment_tpl := mod.widgets.MailAttachmentPanel{}
                             mail_settings_tpl := mod.widgets.MailSettingsPanel{}
                             mail_add_account_tpl := mod.widgets.MailAddAccountPanel{}
+                            telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
+                            telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
+                            telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}
+                            telegram_contacts_tpl := mod.widgets.TelegramPeoplePanel{}
+                            telegram_members_tpl := mod.widgets.TelegramPeoplePanel{}
+                            telegram_peer_tpl := mod.widgets.TelegramPeerPanel{}
+                            telegram_line_tpl := mod.widgets.TelegramLinePanel{}
+                            telegram_media_tpl := mod.widgets.TelegramViewerPanel{}
+                            telegram_place_tpl := mod.widgets.TelegramPlacePanel{}
+                            telegram_attach_tpl := mod.widgets.TelegramAttachPanel{}
+                            telegram_signin_tpl := mod.widgets.TelegramSigninPanel{}
                             files_dir_tpl := mod.widgets.FilesDirPanel{}
                             files_card_tpl := mod.widgets.FilesCardPanel{}
                             agent_chat_tpl := mod.widgets.AgentChatPanel{}
@@ -270,6 +302,7 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        shell::widgets::media::cleanup_videos(cx, Some(event));
         self.match_event(cx, event);
         match event {
             // Opened on the library: it is up from the first frame, and the
@@ -292,6 +325,9 @@ impl AppMain for App {
             _ => {}
         }
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        // Drawing and navigation can drop a video owner. Queue its native
+        // cleanup now, before another platform frame can use its textures.
+        shell::widgets::media::cleanup_videos(cx, None);
         #[cfg(all(target_os = "macos", not(headless)))]
         self.keep_shape(cx, event);
     }

@@ -21,6 +21,10 @@ mise trust && mise install
 mise exec -- cargo run -p superapp
 ```
 
+Normal builds enable TDLib and require `libtdjson`; the [Telegram build
+instructions](docs/book/src/telegram.md#builds) explain the library path.
+Use `--no-default-features` for a build with Telegram's offline demo only.
+
 Borderless over the display's visible frame. `cmd` + arrows focus panels
 (`+shift` moves one, `cmd+1`…`9` walk the workspaces, `cmd+w` closes,
 `cmd+z` undoes and `shift` redoes, `cmd+u` opens the history, `cmd+i` writes
@@ -39,14 +43,18 @@ and exits 2 without opening a window.
 ## Develop
 
 ```sh
-mise exec -- cargo test --workspace                                  # both crates, no window
-mise exec -- cargo clippy --workspace --all-targets -- -D warnings   # the linter, as CI runs it
-mise exec -- cargo run -p superapp -- --e2e e2e/shell-basic.txt      # one scripted run (--front to watch)
-MAKEPAD=headless mise exec -- cargo build -p superapp && ./e2e/run-all.sh   # every suite, a couple of seconds
-mise exec -- cargo run -p superapp -- --library                      # the panels library (⇧⌘L in the app)
+mise exec -- cargo test --workspace --no-default-features
+mise exec -- cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+mise exec -- cargo run -p superapp --no-default-features -- --e2e e2e/shell-basic.txt
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features && ./e2e/run-all.sh
+mise exec -- cargo run -p superapp --no-default-features -- --library
 ```
 
-`cargo test` is the pure suite: the kernel's panel mechanics, springs, store,
+These commands omit the native TDLib dependency. Run `cargo test --workspace`
+without that flag to include the TDLib FFI smoke tests on a machine with the
+library installed; accounts still use fakes.
+
+The pure suite covers the kernel's panel mechanics, springs, store,
 effects, history and device sync, and the app's own — the mail engine, the
 files model — all against fakes, with no window, no network and no keychain.
 Two boundary tests come with it and keep the split honest by reading the
@@ -59,7 +67,7 @@ to `main` and every PR.
 ## The suites
 
 ```sh
-MAKEPAD=headless mise exec -- cargo build -p superapp
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
 ./e2e/run-all.sh
 ```
 
@@ -101,7 +109,7 @@ beside it. Their own scripts run them, and each is its own gate:
 ./e2e/sync/sync-demo.sh          # A bootstraps and archives; B locks, takes over, writes
 ./e2e/sync/bucket.sh             # a device gives itself a bucket from inside the app
 ./e2e/sync/reseed.sh             # a peer's edit reaches a running follower's live panel
-cargo run -p superapp --bin sync-demo   # the same lease lifecycle, narrated, with no window
+cargo run -p superapp --no-default-features --bin sync-demo   # the same lease lifecycle, narrated, with no window
 ```
 
 `app/src/bin/` holds the three programs they are driven with: `bucketd` (a

@@ -1,0 +1,321 @@
+//! The chat list: a rich table of chats, pinned ones first, and the batch
+//! verbs over what is marked in it.
+//!
+//! One instance type for the active chats and the archive: the argument
+//! picks the source and the one verb that differs, and nothing else about a
+//! list of chats changes with which of the two it is over.
+//!
+//! It is also the forward picker. Lines selected in a transcript wait in
+//! the store's runtime; *forward here* sends them to the chat under the cursor.
+
+use std::any::Any;
+use std::rc::Rc;
+
+use kernel::layout::SlotId;
+use kernel::nav::Nav;
+use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
+use kernel::richtable::{ListState, SqlSource};
+use kernel::session::Session;
+use kernel::store::Store;
+
+use super::super::model::{self, ChatRow, PeerId, PAGE};
+use super::super::{draft_toast, requests, runtime};
+#[cfg(test)]
+use super::Chat;
+use super::{flip, told, wire, Contacts};
+
+/// A chat list: the chats, its cursor, and its marks.
+pub struct Chats {
+    id: PanelId,
+    archive: bool,
+    store: Rc<Store>,
+    slot: SlotId,
+    list: ListState<&'static SqlSource<ChatRow, i64>>,
+}
+
+impl Chats {
+    pub const TAG: Tag = Tag("chats");
+
+    /// The active chats.
+    #[must_use]
+    pub fn id() -> PanelId {
+        PanelId::bare(Self::TAG)
+    }
+
+    /// The archived ones.
+    #[must_use]
+    pub fn archive() -> PanelId {
+        PanelId::new(Self::TAG, ["archive"])
+    }
+
+    /// Whether a `chats` panel is the archive.
+    #[must_use]
+    pub fn is_archive(id: &PanelId) -> bool {
+        id.tag == Self::TAG && id.arg(0) == Some("archive")
+    }
+
+    #[must_use]
+    pub fn archived(&self) -> bool {
+        self.archive
+    }
+
+    pub fn list_mut(&mut self) -> &mut ListState<&'static SqlSource<ChatRow, i64>> {
+        &mut self.list
+    }
+
+    /// Rows `lo..hi`, as far as the table has them.
+    #[cfg(test)]
+    #[must_use]
+    pub fn rows(&self, lo: usize, hi: usize) -> Vec<ChatRow> {
+        self.list.table().rows(&self.store, lo, hi)
+    }
+
+    /// Puts the cursor on row `i` — a click — and answers the preview.
+    #[cfg(test)]
+    pub fn go(&mut self, i: usize) -> Option<Nav> {
+        let store = self.store.clone();
+        let row = self.list.set_cursor(&store, i)?;
+        Some(self.preview(row.peer))
+    }
+
+    /// Space: the mark on the cursor's row, toggled.
+    #[cfg(test)]
+    pub fn toggle_mark(&mut self) -> bool {
+        let store = self.store.clone();
+        self.list.toggle_mark(&store)
+    }
+
+    #[cfg(test)]
+    fn preview(&self, peer: model::PeerId) -> Nav {
+        Nav::Preview {
+            from: self.slot,
+            id: Chat::id(peer),
+        }
+    }
+}
+
+impl Panel for Chats {
+    fn id(&self) -> &PanelId {
+        &self.id
+    }
+
+    /// The list's word — and, while the engine is still bringing the list
+    /// down page by page, *syncing…* beside it, so a list that is short is
+    /// seen to be short for now.
+    fn title(&self) -> String {
+        let word = if self.archive { "archive" } else { "chats" };
+        if runtime::of(&self.store).list_syncing() {
+            format!("{word} · syncing…")
+        } else {
+            word.to_string()
+        }
+    }
+
+    /// Four wide, six tall: a list wants the column.
+    fn wish(&self, _cols: usize) -> (u32, u32) {
+        (4, 6)
+    }
+
+    fn placed(&mut self, slot: SlotId) {
+        self.slot = slot;
+    }
+
+    /// One link always — the people, which is how a new conversation
+    /// starts — then, while lines wait for a chat to go to, the pick that
+    /// sends them here; and while there are marks, the batch verbs with
+    /// their count and the two verbs about the set itself.
+    ///
+    /// *mark all* wears `k` because `a` is *archive* and `m` is *mute*;
+    /// *forward here* wears `f`, which nothing else on this bar wants.
+    /// *clear* wears none, `esc` being the table's own — and it stands for
+    /// a waiting forward as well as for a marked set, being the way out of
+    /// either.
+    fn verbs(&self) -> Vec<Verb> {
+        let mut v = vec![Verb::go(
+            "telegram.new",
+            "new message",
+            Some('n'),
+            Nav::Open {
+                from: self.slot,
+                id: Contacts::id(),
+                fresh: false,
+            },
+        )];
+        let forwarding = runtime::of(&self.store).pending_forward().is_some();
+        if forwarding {
+            v.push(Verb::run("telegram.forward_here", "forward here", Some('f')));
+        }
+        let n = self.list.marks().len();
+        if n > 0 {
+            v.push(Verb::run("telegram.read", format!("read {n}"), Some('r')));
+            v.push(Verb::run("telegram.mute", format!("mute {n}"), Some('m')));
+            v.push(Verb::run("telegram.pin", format!("pin {n}"), Some('p')));
+            if self.archive {
+                v.push(Verb::run(
+                    "telegram.unarchive",
+                    format!("unarchive {n}"),
+                    Some('a'),
+                ));
+            } else {
+                v.push(Verb::run("telegram.archive", format!("archive {n}"), Some('a')));
+            }
+            v.push(Verb::run("telegram.all", "mark all", Some('k')));
+        }
+        if n > 0 || forwarding {
+            v.push(Verb::run("telegram.clear", "clear", None));
+        }
+        v
+    }
+
+    fn run(&mut self, verb: &str, s: &mut Session) {
+        let store = self.store.clone();
+        match verb {
+            "telegram.all" => {
+                if let Some(keys) = self.list.table().keys(&store) {
+                    self.list.marks_mut().extend(keys);
+                }
+                s.redraw();
+            }
+            // The way out of both states this bar can be in: the marked set,
+            // and a forward that has not found its chat. Letting the forward
+            // go is not sending it anywhere.
+            "telegram.clear" => {
+                self.list.clear_marks();
+                runtime::of(&self.store).take_forward();
+                s.redraw();
+            }
+            "telegram.forward_here" => self.forward_here(s),
+            "telegram.read" | "telegram.mute" | "telegram.pin" | "telegram.archive"
+            | "telegram.unarchive" => self.batch(s, verb),
+            _ => {}
+        }
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// -- the batch verbs ---------------------------------------------------------
+
+/// The local half of one batch verb, over one chat: a plain function, so the
+/// verb is chosen here and carried into the store's writer thread, which takes
+/// only what owns itself.
+type Flip = fn(&rusqlite::Connection, PeerId) -> rusqlite::Result<()>;
+
+impl Chats {
+    /// A batch verb over the marks: one request per chat, and — where they
+    /// went — the same flip on every marked row in one write, so the list
+    /// redraws read, muted, pinned or filed rather than waiting on the
+    /// engine's answer for each of them in turn.
+    ///
+    /// A set is too many states to toggle one by one, so the bar's word is
+    /// what happens: *mute 3* mutes three, and it is the archive's own bar
+    /// that says *unarchive*. The set being one gesture, it is one toast
+    /// where the build is not signed in — and then nothing is written and the
+    /// marks stay, there being nothing done to have finished with.
+    fn batch(&mut self, s: &mut Session, verb: &str) {
+        let peers: Vec<PeerId> = self.list.marks().keys();
+        if peers.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let archiving = verb == "telegram.archive";
+        let mut went = false;
+        for &peer in &peers {
+            let request = match verb {
+                // A read names the newest line the store holds for the chat,
+                // and everything under it is read with it. A chat holding no
+                // line yet has nothing to name — its count clears here and
+                // the wire hears of it when one arrives.
+                "telegram.read" => match model::newest_line(&store, peer) {
+                    Some(last) => requests::view_messages(peer, &[last]),
+                    None => continue,
+                },
+                "telegram.mute" => requests::set_chat_muted(peer, true),
+                "telegram.pin" => requests::toggle_chat_pinned(peer, true),
+                _ => requests::add_chat_to_list(peer, archiving),
+            };
+            if wire(&store, &request) {
+                went = true;
+            }
+        }
+        if !went {
+            let word = verb.rsplit('.').next().unwrap_or(verb);
+            let n = peers.len();
+            let what = if n == 1 { "chat" } else { "chats" };
+            s.notify(draft_toast(&format!("{word} {n} {what}")), false);
+            return;
+        }
+        let one: Flip = match verb {
+            "telegram.read" => model::mark_read_tx,
+            "telegram.mute" => |c, peer| model::set_muted_tx(c, peer, true),
+            "telegram.pin" => |c, peer| model::set_pinned_tx(c, peer, true),
+            "telegram.archive" => |c, peer| model::set_archived_tx(c, peer, true),
+            _ => |c, peer| model::set_archived_tx(c, peer, false),
+        };
+        flip(&store, move |c| {
+            for peer in peers {
+                one(c, peer)?;
+            }
+            Ok(())
+        });
+        // What was marked has been done with — and a chat just archived is
+        // not in this list to stay marked in.
+        self.list.clear_marks();
+        s.redraw();
+    }
+
+    /// The pick a waiting forward was opened for: the lines go to the chat
+    /// under the cursor, in one `forwardMessages`. Telegram makes the copies
+    /// and each comes back as its own `updateNewMessage`, so nothing local is
+    /// written here.
+    ///
+    /// The waiting ends either way — off the wire the toast says what would
+    /// have gone, and a pick that was made is a pick made. Leaving it waiting
+    /// would only mean the bar still offering a forward the person just
+    /// spent.
+    fn forward_here(&mut self, s: &mut Session) {
+        let Some(f) = runtime::of(&self.store).pending_forward() else {
+            return;
+        };
+        let Some(&peer) = self.list.cursor_key() else {
+            s.notify("put the cursor on a chat to forward to", true);
+            return;
+        };
+        let name =
+            model::peer(&self.store, peer).map_or_else(|| "the chat".to_string(), |c| c.name);
+        let n = f.ids.len();
+        let what = if n == 1 { "line" } else { "lines" };
+        let went = told(
+            s,
+            &requests::forward_messages(peer, f.from, &f.ids),
+            &format!("forward {n} {what} to {name}"),
+        );
+        runtime::of(&self.store).take_forward();
+        if went {
+            s.notify(format!("forwarded {n} {what} to {name}"), false);
+        }
+        s.redraw();
+    }
+}
+
+/// The factory.
+pub struct ChatsKind;
+
+impl PanelKind for ChatsKind {
+    fn tag(&self) -> Tag {
+        Chats::TAG
+    }
+
+    fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
+        let archive = Chats::is_archive(id);
+        Box::new(Chats {
+            id: id.clone(),
+            archive,
+            store: cx.session().store().clone(),
+            slot: 0,
+            list: ListState::new(model::chats(archive), PAGE),
+        })
+    }
+}

@@ -77,7 +77,7 @@ fn mail_like(store: &Store, pat: &str) -> i64 {
 fn inbox_row() -> Scene<Setup> {
     let row = |t: ThreadHead, selected: bool, marked: bool| {
         widget(live_id!(mail_row_tpl), move |cx, w| {
-            MailboxRows::populate(cx, w, &t, selected, marked);
+            MailboxRows::populate(cx, w, &t, selected, marked, kernel::time::virtual_epoch());
         })
     };
     let elena = || head(&["Elena Petrova"], "Sat hike — early start?", false, 1);

@@ -1,0 +1,255 @@
+# args: --demo-disk
+# env:
+#
+# Telegram's first round: the surface over the demo world. A store nobody
+# has booted comes up on mail's inbox, so the chat list is reached the way
+# a person reaches it — through the launcher. Assertions are the clicks: a
+# label that does not resolve fails the run, so "the chat opened on that
+# group" is checked by the run rather than by a human reading a screenshot.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+shot t1-chats
+
+# -- a row previews its chat, joined -------------------------------------------
+
+# A press on a row moves the cursor and previews the chat: it lands joined to
+# the right and the list keeps focus. The group's transcript is addressed by
+# its lines — writer and first words — which resolve only if it really
+# opened on that group.
+click "stelaxis"
+wait 900
+shot t2-group
+click "Ivan Petrov: meeting moved to 15:00"
+wait 400
+
+# What a line carries is in its label: a video is its caption and the word,
+# a sticker its emoji, a voice note its length. A line the list has drawn
+# resolves; one scrolled out of the viewport does not, which is why these
+# three are near the foot. The first press took the keyboard to the lines
+# — a press on a line is the way to the transcript's cursor, and the caret
+# a chat taking focus parks in the composer stays out of the way.
+click "Elena Petrova: the fold in motion · video"
+wait 600
+# A press lands at the label's centre, and this row's centre is its poster:
+# a press on a picture is the way to the viewer, which opened joined and is
+# closed again here.
+key cmd+w
+wait 500
+click "Olga Novak: sticker 🙈"
+wait 300
+click "Max Ivanov: voice 0:42"
+wait 300
+
+# Space marks the transcript's cursor on the press. If a text event also
+# arrives, it must leave that mark in place: only a marked line offers clear.
+key space
+wait 300
+type " "
+wait 300
+click "clear"
+wait 300
+
+# -- reply -----------------------------------------------------------------------------
+
+# A press on a line puts the cursor there and the keyboard with the rows;
+# `reply` on the bar takes that line — the voice note, the last one pressed
+# — the reply line stands above the composer, and the caret goes to the
+# composer, because a reply is written. Esc takes the reply line away.
+click "reply"
+wait 500
+click "reply to Max Ivanov: voice 0:42"
+wait 300
+shot t3-reply
+key esc
+wait 300
+
+# -- my own lines: edit and delete, undone ----------------------------------------------
+
+# The cursor on my own line puts `edit` and `delete` on the bar, and on no
+# other line. `edit` gives the composer the line's text under a line saying
+# which; a press on the field, then cmd+a — the caret's own chord, never
+# the bar's `about` — and typing replace it, enter writes it, and the
+# transcript reads the new text. cmd+z gives the old one back.
+click "me: the muted grey is too light on the fold"
+wait 400
+click "edit"
+wait 500
+click "editing: the muted grey is too light on the fold"
+wait 300
+click "write a message"
+wait 300
+key cmd+a
+wait 200
+type "the muted grey reads fine on the fold"
+wait 400
+shot t3f-editing
+key enter
+wait 800
+click "me: the muted grey reads fine on the fold"
+wait 300
+key cmd+z
+wait 800
+click "me: the muted grey is too light on the fold"
+wait 300
+
+# `delete` takes the line away as one undoable action, and cmd+z puts it
+# back whole — the label resolves again.
+click "delete"
+wait 800
+key cmd+z
+wait 800
+click "me: the muted grey is too light on the fold"
+wait 300
+
+# -- what a line carries, played and opened -----------------------------------------
+
+# The play button inside the voice note's line is addressable by its word,
+# and pressing it turns it into pause. `line` on the bar opens the cursor's
+# line as a card, joined to the chat, with the verbs on one line; `open` on
+# the card is the viewer, which asks for the whole grid and walks the chat's
+# media with `previous`.
+click "Max Ivanov: voice 0:42"
+wait 300
+click "play"
+wait 400
+click "pause"
+wait 300
+click "line"
+wait 900
+shot t3b-line-card
+click "open"
+wait 900
+click "voice 0:42"
+wait 300
+click "previous"
+wait 800
+click "sticker 🙈"
+wait 200
+shot t3c-viewer
+key cmd+w
+wait 600
+key cmd+w
+wait 600
+
+# -- what goes with the next message ---------------------------------------------------
+
+# `attach` on the bar is a link: the panel opens joined to the chat and says
+# nothing goes yet. `voice` records there — the strip says what and how
+# long, the level moves — and esc throws it away.
+click "attach"
+wait 900
+click "nothing goes with the next message yet"
+wait 300
+click "voice"
+wait 1500
+click "recording voice 0:01"
+wait 200
+shot t3d-recording
+key esc
+wait 400
+
+# `browse` is the link to the files panel — the demo tree, under
+# --demo-disk. Two files marked in Downloads and copied are what `add 2`
+# takes: the rows say what each goes as, `earlier` trades the cursor's row
+# with the one above, `remove` puts it down, and the chat's bar counts
+# what is left.
+click "browse"
+wait 900
+click "Downloads/"
+wait 600
+key enter
+wait 800
+click "report-q3.pdf"
+wait 500
+key space
+wait 300
+click "screenshot-2026-08-30.png"
+wait 500
+key space
+wait 300
+click "copy 2"
+wait 500
+key cmd+left 2
+wait 500
+click "add 2"
+wait 700
+click "screenshot-2026-08-30.png · photo"
+wait 300
+shot t3e-carrying
+click "earlier"
+wait 400
+click "remove"
+wait 400
+click "report-q3.pdf · file"
+wait 300
+key cmd+left
+wait 400
+click "attach 1"
+wait 600
+
+# The composer: a chat taking focus — cmd+arrows into it — puts the caret
+# in it, what is typed lands there and nowhere else, and enter sends: a
+# toast this round, with the one file, and the field empties. A click on the
+# field is the other way in.
+key cmd+left
+wait 400
+type "on it — after 15:00"
+wait 500
+
+# The caret keeps the text chords and nothing else: cmd+h from it is still
+# `attach`, which takes the panel already open — its own cmd+o records
+# there — and cmd+left comes back to the composer.
+key cmd+h
+wait 500
+key cmd+o
+wait 1200
+click "recording voice 0:01"
+wait 200
+key esc
+wait 300
+key cmd+left
+wait 400
+shot t4-typed
+key enter
+wait 600
+click "write a message"
+wait 300
+
+# -- the card, and who is in it ---------------------------------------------------
+
+# `about` is a link: the card opens joined to the chat, and says what the
+# group is. `members` off the card is another; a row of it previews the
+# member's card.
+click "about"
+wait 900
+click "group · 7 members, 3 online"
+wait 300
+shot t5-card
+click "members"
+wait 900
+click "Olga Novak"
+wait 900
+click "@olga · last seen recently"
+wait 300
+shot t6-member
+
+# -- the search panel knows the app ----------------------------------------------
+
+# The shell's search puts the question to every app's source at once; a word
+# out of a line reaches it, and the hit opens the chat at that line.
+key cmd+shift+s
+wait 700
+type "thermos"
+wait 900
+click "and the thermos"
+wait 900
+click "me: and the thermos"
+wait 300
+shot t7-found
+quit

@@ -62,6 +62,7 @@ use makepad_widgets::{ScriptValue, ScriptVm};
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     dsl::script_mod(vm);
     widgets::dsl::script_mod(vm);
+    widgets::media::script_mod(vm);
     library::script_mod(vm)
 }
 

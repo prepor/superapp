@@ -1,7 +1,8 @@
 #!/bin/bash
 # Every suite, in parallel, in the fast `--no-draw` mode.
 #
-# The binary must be built headless (`MAKEPAD=headless cargo build`):
+# Build headless without the native Telegram dependency:
+# `MAKEPAD=headless cargo build -p superapp --no-default-features`.
 # build.rs turns that into cfg(headless), which is what gives a run its
 # virtual clock and its inline passes. `--no-draw` then runs the full widget
 # draw pass — so hit resolution and label matching work exactly as they do
@@ -20,7 +21,7 @@ BIN=${BIN:-./target/debug/superapp}
 DRAWS=${DRAWS:-4000}
 
 if [ ! -x "$BIN" ]; then
-  echo "no binary at $BIN — MAKEPAD=headless mise exec -- cargo build -p superapp" >&2
+  echo "no binary at $BIN — MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features" >&2
   exit 2
 fi
 

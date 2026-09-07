@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::caps::{ClockSource, DiskFactory, MemSecrets, SecretsFactory};
+use crate::caps::{BlobCache, ClockSource, DiskFactory, MemSecrets, SecretsFactory};
 use crate::effect::{Job, Registry, World};
 use crate::panel::{PanelId, PanelKind, Tag};
 use crate::search;
@@ -431,6 +431,10 @@ pub struct Env {
     /// capability. Empty in a world that runs none, where a kick does
     /// nothing.
     pub kicks: Kicks,
+    /// The device-local blob cache, cloned into every world so a worker's
+    /// downloads and the window's reads meet one cache over one budget. The
+    /// real one sits beside the store; a test's is a temp dir it never fills.
+    pub blobs: BlobCache,
 }
 
 impl Default for Env {
@@ -446,8 +450,20 @@ impl Default for Env {
             disk: None,
             bucket: None,
             kicks: Kicks::default(),
+            blobs: BlobCache::at(default_blobs_dir(), crate::caps::BLOB_BUDGET_DEFAULT),
         }
     }
+}
+
+/// A cache directory of this world's own, under the temp root, unique per
+/// call so two test worlds never share one. It is only a path: the cache
+/// opens nothing until a blob is asked for, so a test that never touches one
+/// leaves the disk untouched.
+fn default_blobs_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("superapp-blobs-fake-{}-{n}", std::process::id()))
 }
 
 /// One world's backends, each under the trait it implements.

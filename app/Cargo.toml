@@ -19,6 +19,12 @@ path = "src/lib.rs"
 name = "superapp"
 path = "src/main.rs"
 
+# Normal builds link Telegram's native engine. Tests and demos can omit
+# libtdjson with `--no-default-features`; link setup lives in `build.rs`.
+[features]
+default = ["tdlib"]
+tdlib = []
+
 [dependencies]
 superapp-kernel = { path = "../kernel" }
 

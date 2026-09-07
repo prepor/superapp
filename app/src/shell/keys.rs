@@ -195,6 +195,8 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
         "down" => Some(KeyCode::ArrowDown),
         "enter" | "return" => Some(KeyCode::ReturnKey),
         "esc" | "escape" => Some(KeyCode::Escape),
+        "home" => Some(KeyCode::Home),
+        "end" => Some(KeyCode::End),
         "backspace" => Some(KeyCode::Backspace),
         "delete" => Some(KeyCode::Delete),
         "tab" => Some(KeyCode::Tab),
@@ -235,6 +237,8 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
                 | KeyCode::Backspace
                 | KeyCode::Delete
                 | KeyCode::Tab
+                | KeyCode::Home
+                | KeyCode::End
                 // The two plain keys of the list grammar. A press, not
                 // text: a platform only feeds its input context while a
                 // field has the keyboard, so with the rows holding it this

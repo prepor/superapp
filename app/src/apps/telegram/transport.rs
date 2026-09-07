@@ -1,0 +1,165 @@
+//! The worker's TDLib seam. `FakeTd` scripts updates and records sends;
+//! `RealTd` binds the optional native engine. Panels use neither transport.
+#![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
+
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// The two calls the worker loop makes on the engine. Object-safe, but the
+/// account and the worker are generic over it rather than boxed — a real
+/// transport is a plain int and a fake is an `Arc`, so there is nothing an
+/// allocation would buy.
+pub trait Td {
+    /// Fire one request — a JSON string in TDLib's type language. Fire and
+    /// forget: the reply, if any, returns through [`receive`](Td::receive).
+    fn send(&self, request: &str);
+
+    /// The next update or response the engine has ready, or `None` when
+    /// `timeout` seconds pass with nothing. The loop calls it with `0.0` and
+    /// drains until it answers `None`.
+    fn receive(&self, timeout: f64) -> Option<String>;
+}
+
+// -- the real transport --------------------------------------------------------
+
+/// A live TDLib client owned by the worker: its own id for [`send`](Td::send),
+/// the process-wide queue for [`receive`](Td::receive).
+#[cfg(feature = "tdlib")]
+#[derive(Debug)]
+pub struct RealTd {
+    client: super::tdjson::Client,
+}
+
+#[cfg(feature = "tdlib")]
+impl RealTd {
+    /// Opens the single native account client. Only the worker calls this.
+    #[allow(clippy::new_without_default)]
+    #[must_use]
+    pub fn new() -> RealTd {
+        // Send TDLib's own log to a file rather than the terminal (its
+        // default prints two lines on every `td_receive`, and the worker
+        // polls several times a second), at level 2 — errors and warnings,
+        // not the info spam. `execute` is synchronous and needs no client.
+        if let Some(home) = std::env::var_os("HOME") {
+            let path = std::path::Path::new(&home)
+                .join("Library/Application Support/superapp/td.log");
+            let stream = serde_json::json!({
+                "@type": "setLogStream",
+                "log_stream": {
+                    "@type": "logStreamFile",
+                    "path": path.to_string_lossy(),
+                    "max_file_size": 10_485_760,
+                    "redirect_stderr": false,
+                },
+            });
+            let _ = super::tdjson::execute(&stream.to_string());
+        }
+        let _ = super::tdjson::execute(
+            r#"{"@type":"setLogVerbosityLevel","new_verbosity_level":2}"#,
+        );
+        let td = RealTd {
+            client: super::tdjson::Client::new(),
+        };
+        // The client-id interface emits nothing until it has taken a first
+        // request: send a harmless one so TDLib draws its initial
+        // `updateAuthorizationState`, which is what moves the sign-in off
+        // `closed`. Without this the worker drains an empty queue forever and
+        // the panel reads "not started".
+        td.client
+            .send(r#"{"@type":"getOption","name":"version","@extra":"kick"}"#);
+        td
+    }
+}
+
+#[cfg(feature = "tdlib")]
+impl Td for RealTd {
+    fn send(&self, request: &str) {
+        self.client.send(request);
+    }
+
+    fn receive(&self, timeout: f64) -> Option<String> {
+        super::tdjson::receive(timeout)
+    }
+}
+
+// -- the fake transport --------------------------------------------------------
+
+/// The offline transport the state-machine tests drive. `Arc<Mutex<..>>` on
+/// purpose: a test and the account (or the worker) each hold a clone of the
+/// one shared state, so a [`push`](FakeTd::push) on the test's handle is seen
+/// by the account's `receive`, and a `send` from the account shows up in the
+/// test's [`sent`](FakeTd::sent).
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct FakeTd {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Inner {
+    /// Scripted updates `receive` pops, front first; `None` once drained.
+    inbound: VecDeque<String>,
+    /// Every request the account fired, in order.
+    sent: Vec<String>,
+}
+
+#[cfg(test)]
+impl FakeTd {
+    #[must_use]
+    pub fn new() -> FakeTd {
+        FakeTd::default()
+    }
+
+    /// Scripts one update the next `receive` will hand over.
+    pub fn push(&self, update: impl Into<String>) {
+        self.lock().inbound.push_back(update.into());
+    }
+
+    /// Every request the account sent, in order — the raw JSON.
+    #[must_use]
+    pub fn sent(&self) -> Vec<String> {
+        self.lock().sent.clone()
+    }
+
+    /// The `@type` of each sent request, so an assertion reads the verb it
+    /// expected rather than re-parsing the JSON at the call site.
+    #[must_use]
+    pub fn sent_types(&self) -> Vec<String> {
+        self.lock().sent.iter().map(|s| type_of(s)).collect()
+    }
+
+    /// A poisoned lock means a panic mid-write; the captured requests are
+    /// still readable, and a test learns more from the assertion that follows
+    /// than from a second panic here.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+impl Td for FakeTd {
+    fn send(&self, request: &str) {
+        self.lock().sent.push(request.to_string());
+    }
+
+    /// The timeout is ignored: a fake cannot block, so it answers what it has
+    /// and `None` the moment it is empty — which is exactly the drain
+    /// condition the loop reads.
+    fn receive(&self, _timeout: f64) -> Option<String> {
+        self.lock().inbound.pop_front()
+    }
+}
+
+/// The `@type` of a request or update, or `""` when it carries none — a fake
+/// helper for [`sent_types`](FakeTd::sent_types), so a test asserts on the
+/// verb.
+#[cfg(test)]
+fn type_of(json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v["@type"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}

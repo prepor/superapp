@@ -189,7 +189,7 @@ impl RowSpec for LogRows {
         live_id!(row)
     }
 
-    fn populate(cx: &mut Cx, row: &WidgetRef, j: &JobRow, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, j: &JobRow, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         line.label(cx, ids!(body.kind_lbl)).set_text(cx, &j.kind);
         line.label(cx, ids!(body.entity_lbl))
@@ -207,7 +207,7 @@ impl RowSpec for LogRows {
         err.set_visible(cx, j.error.is_some());
     }
 
-    fn label(j: &JobRow) -> String {
+    fn label(j: &JobRow, _now: f64) -> String {
         job_line(j)
     }
 

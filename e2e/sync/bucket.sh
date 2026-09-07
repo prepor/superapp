@@ -10,7 +10,7 @@
 # something and the device becomes canonical.
 #
 # Build headless first: `MAKEPAD=headless mise exec -- cargo build
-# -p superapp`.
+# -p superapp --no-default-features`.
 set -e
 cd "$(dirname "$0")/../.."
 # The port the walk types. Change both together.

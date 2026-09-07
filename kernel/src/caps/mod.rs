@@ -25,9 +25,11 @@ use crate::app::{Capabilities, Env, Mode};
 use crate::effect::{Ctx, Effect};
 use crate::time::ts;
 
+mod blobs;
 pub mod demo;
 mod preview;
 
+pub use blobs::{file_name, BlobCache, Blobs, BLOB_BUDGET_DEFAULT};
 pub use preview::{
     fmt_size, image_format, image_size, mime_of, preview_of, ImageFormat, Preview, ATTACH_MAX,
     IMAGE_PREVIEW_MAX, TEXT_PREVIEW_MAX,
@@ -967,6 +969,10 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
         None => Box::new(DemoDisk::new(env.clock.clone())),
     });
     caps.insert::<dyn Watcher>(Box::new(Watched::new()));
+    // The blob cache the env carries — the machine's own beside the store on a
+    // real boot, a fresh temp dir under a script — cloned so a worker's world
+    // and the window's share one cache over one budget, as they share secrets.
+    caps.insert::<dyn Blobs>(Box::new(env.blobs.clone()));
 }
 
 // -- the in-memory effects that wrap them --------------------------------------
@@ -1501,6 +1507,7 @@ mod tests {
         assert!(caps.get::<dyn Clock>().is_some());
         assert!(caps.get::<dyn Disk>().is_none());
         assert!(caps.get::<dyn Clipboard>().is_none());
+        assert!(caps.get::<dyn Blobs>().is_none());
 
         let mut caps = Capabilities::default();
         install(Mode::Fake, &env, &mut caps);
@@ -1508,6 +1515,7 @@ mod tests {
         assert!(caps.get::<dyn Secrets>().is_some());
         assert!(caps.get::<dyn Screen>().is_some());
         assert!(caps.get::<dyn Watcher>().is_some());
+        assert!(caps.get::<dyn Blobs>().is_some());
     }
 
     /// The books: a directory is watched while somebody is looking at it,
