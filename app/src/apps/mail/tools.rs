@@ -1,8 +1,8 @@
 //! What mail lets an agent do, by name.
 //!
 //! Each one is the verb's own code path over ids instead of over a cursor:
-//! the filing goes through [`model::file_tx`] and claims the same
-//! [`Filed`] intents the mailbox's *archive* claims, the marking goes
+//! the filing goes through [`move_tx`] and claims the same intents the
+//! mailbox's own *archive* and *put back* claim, the marking goes
 //! through [`model::mark_read_tx`] and claims the same [`MarkRead`] the
 //! reader's open does, and the send files the outbox row the compose
 //! sheet's *send* files. So a tool and a button cannot disagree, and `cmd+z`
@@ -24,8 +24,9 @@ use kernel::time::fmt_date_long;
 use kernel::tool::Tool;
 use serde_json::{json, Value};
 
-use super::effects::{outbox_entity, Filed, MarkRead, Sent};
+use super::effects::{outbox_entity, MarkRead, Sent};
 use super::model::{self, Draft, MailId, Role, Seed};
+use super::panels::mailbox::{movable, move_tx, moved, To};
 use super::panels::Compose;
 use super::reading;
 
@@ -41,7 +42,7 @@ const MAX_HITS: i64 = 100;
 const HITS: i64 = 20;
 
 /// Mail's tools, in the order a request lists them: the two that read, then
-/// the four that file, then the two that mark, then writing a letter.
+/// the five that file, then the two that mark, then writing a letter.
 #[must_use]
 pub fn all() -> Vec<Tool> {
     vec![
@@ -86,7 +87,7 @@ pub fn all() -> Vec<Tool> {
              nothing to archive.",
             one("the conversation to archive"),
             true,
-            |s, input| file(s, input, Role::Inbox, "archive"),
+            |s, input| file(s, input, Role::Inbox, To::Role("archive")),
         ),
         Tool::new(
             "mail.delete",
@@ -106,7 +107,17 @@ pub fn all() -> Vec<Tool> {
              has to be in the spam for there to be anything to do.",
             one("the conversation to take out of the spam"),
             true,
-            |s, input| file(s, input, Role::Spam, "inbox"),
+            |s, input| file(s, input, Role::Spam, To::Role("inbox")),
+        ),
+        Tool::new(
+            "mail.put_back",
+            "Take a conversation out of the trash and back where it was \
+             deleted from — the inbox for a letter that never passed through \
+             this device's own delete. It has to be in the trash for there to \
+             be anything to do.",
+            one("the conversation to put back"),
+            true,
+            |s, input| file(s, input, Role::Trash, To::Back),
         ),
         Tool::new(
             "mail.read",
@@ -267,85 +278,80 @@ fn thread(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// in two mailboxes at once, and archiving from the inbox takes the inbox
 /// copies. A tool has no cursor to read that off, so the verb that only
 /// makes sense from one mailbox names it here.
-fn file(s: &mut Session, input: &Value, from: Role, role: &'static str) -> Result<Value, String> {
+fn file(s: &mut Session, input: &Value, from: Role, to: To) -> Result<Value, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let moving = folder_mails(s.store(), from, thread);
     if moving.is_empty() {
         return Err(format!(
             "that conversation is not in the {} — nothing to {}",
             from.as_str(),
-            word_of(role)
+            to.word()
         ));
     }
-    filed(s, thread, &moving, role)
+    filed(s, thread, &moving, to)
 }
 
 /// *delete*: the trash is where mail goes from anywhere, so this takes the
 /// copies in whichever mailbox holds the conversation — the mailboxes asked
-/// in the order the launcher lists them.
+/// in the order the launcher lists them, the trash left out because that is
+/// where they are going.
 fn delete(s: &mut Session, input: &Value) -> Result<Value, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let moving = model::ROLES
         .into_iter()
+        .filter(|role| *role != Role::Trash)
         .map(|role| folder_mails(s.store(), role, thread))
         .find(|m| !m.is_empty())
         .unwrap_or_default();
     if moving.is_empty() {
         return Err(format!("no conversation at {thread} in any mailbox"));
     }
-    filed(s, thread, &moving, "trash")
+    filed(s, thread, &moving, To::Role("trash"))
 }
 
 /// The action itself, once the letters are known: one node, labelled by what
 /// the conversation is called, claiming the reversal of every move.
-fn filed(
-    s: &mut Session,
-    thread: i64,
-    letters: &[MailId],
-    role: &'static str,
-) -> Result<Value, String> {
+fn filed(s: &mut Session, thread: i64, letters: &[MailId], to: To) -> Result<Value, String> {
     let store = s.store().clone();
     let moving: Vec<(MailId, i64)> = letters
         .iter()
-        .filter(|id| {
-            model::can_file(&store, **id, role) && !model::already_filed(&store, **id, role)
-        })
+        .filter(|id| movable(&store, **id, to))
         .map(|id| (*id, model::folder_of(&store, *id)))
         .collect();
     if moving.is_empty() {
         return Err(format!(
             "there is nowhere to {} that conversation to",
-            word_of(role)
+            to.word()
         ));
     }
     let intents = moving
         .iter()
-        .map(|(mail, from_folder)| {
-            Box::new(Filed {
-                mail: *mail,
-                from_folder: *from_folder,
-                role,
-            }) as Box<dyn kernel::history::Intent>
-        })
+        .map(|(mail, from_folder)| moved(&store, *mail, *from_folder, to))
         .collect();
     let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
     let n = ids.len();
     let title = topic(&store, thread);
     let done = s.act(
-        Action::writing(
-            "file",
-            format!("{} “{title}”", word_of(role)),
-            move |tx| {
-                for id in &ids {
-                    model::file_tx(tx, *id, role)?;
-                }
-                Ok(())
-            },
-        )
+        Action::writing("file", format!("{} “{title}”", to.word()), move |tx| {
+            for id in &ids {
+                move_tx(tx, *id, to)?;
+            }
+            Ok(())
+        })
         .claiming(intents),
     );
     done.ok_or_else(|| kernel::tools::refused(s))?;
-    Ok(json!({"thread": thread, "letters": n, "mailbox": role}))
+    Ok(json!({"thread": thread, "letters": n, "mailbox": mailbox_of(to)}))
+}
+
+/// What the tool answers with as the mailbox a conversation landed in. A put
+/// back has no one answer — each letter went where it came from — so it says
+/// what it did instead.
+fn mailbox_of(to: To) -> &'static str {
+    match to {
+        To::Role(role) => role,
+        To::Back => "put back",
+    }
 }
 
 /// The mails of one conversation that sit in a mailbox of this role — what
@@ -358,15 +364,6 @@ fn folder_mails(store: &Store, role: Role, thread: i64) -> Vec<MailId> {
         return Vec::new();
     };
     model::thread_siblings(store, head.target)
-}
-
-/// The verb's own word for a role — what the history node says it did.
-fn word_of(role: &str) -> &'static str {
-    match role {
-        "trash" => "delete",
-        "inbox" => "not spam",
-        _ => "archive",
-    }
 }
 
 // -- marking -------------------------------------------------------------------------

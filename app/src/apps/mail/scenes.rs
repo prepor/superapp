@@ -138,6 +138,8 @@ fn mailbox() -> Scene<Setup> {
         .about("space marks the cursor's row, shift+↓ the two under it; the bar grows the batch verbs")
         .node("archive", panel(|_| Mailbox::id(Role::Archive), ""))
         .about("what was filed away — the same rows, another folder")
+        .node("trash", panel(|_| Mailbox::id(Role::Trash), ""))
+        .about("what was deleted; its bar keeps `put back` where the others keep `delete`")
         .node(
             "joined",
             workspace_on(|_| Mailbox::id(Role::Inbox), "key down\nwait 700"),

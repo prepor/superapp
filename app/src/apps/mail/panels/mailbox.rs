@@ -17,7 +17,7 @@ use kernel::richtable::{ListState, SqlSource};
 use kernel::session::{Action, Instance, Session};
 use kernel::store::Store;
 
-use super::super::effects::Filed;
+use super::super::effects::{Filed, PutBack};
 use super::super::model::{self, MailId, Role, ThreadHead, MAILBOX_PAGE};
 use super::Message;
 
@@ -118,6 +118,14 @@ impl Mailbox {
         keep_verb(self.role).map(|(id, ..)| id)
     }
 
+    /// The verb that files a conversation away, by id — *delete* everywhere
+    /// but in the trash, which is where delete goes. Asked by the bar and by
+    /// the sweep, for the same reason [`Mailbox::keeps`] is.
+    #[must_use]
+    pub fn deletes(&self) -> Option<&'static str> {
+        (self.role != Role::Trash).then_some("mail.delete")
+    }
+
     /// Marks the table again — what undo hands back after a batch verb took
     /// them off.
     pub fn restore_marks(&mut self, keys: &[i64]) {
@@ -160,6 +168,15 @@ impl Panel for Mailbox {
             Role::Archive => "the letters that were kept",
             Role::Sent => "the letters this account has sent",
             Role::Spam => "the letters a provider called junk",
+            Role::Trash => "the letters that were deleted, and can still be put back",
+        };
+        // What the marks are for here — a bar may not promise a verb this
+        // list does not wear.
+        let marked_for = match self.role {
+            Role::Inbox => "archive or delete them together",
+            Role::Spam => "un-junk or delete them together",
+            Role::Archive | Role::Sent => "delete them together",
+            Role::Trash => "put them back where they were deleted from",
         };
         let narrowed = match Role::sender_of(&self.id) {
             Some(who) => format!(
@@ -180,7 +197,7 @@ impl Panel for Mailbox {
              `message` joined to `folder` where the folder's role is \
              '{role}', grouped by `message.thread`. {narrowed} Here a person \
              walks the rows, opens one to read the whole conversation, and \
-             marks some to archive, un-junk or delete them together."
+             marks some to {marked_for}."
         )
     }
 
@@ -198,8 +215,9 @@ impl Panel for Mailbox {
     ///
     /// Which verb keeps a conversation is [`keep_verb`]'s answer, and a bar
     /// may not wear a verb that would do nothing (or, from Sent, something
-    /// nobody asked for). Delete is the one move every mailbox has — the
-    /// trash is where mail goes from anywhere.
+    /// nobody asked for). Delete is the move every mailbox has but the
+    /// trash, which is where delete goes: there the keeping verb is *put
+    /// back* and it stands alone.
     ///
     /// *mark all* wears `m` rather than the obvious `l`: this shell keeps
     /// `cmd+l` for itself (see [`keys`](crate::shell::keys)), and a bar may
@@ -214,7 +232,9 @@ impl Panel for Mailbox {
         if let Some((id, word, key)) = keep_verb(self.role) {
             v.push(Verb::run(id, format!("{word} {n}"), Some(key)));
         }
-        v.push(Verb::run("mail.delete", format!("delete {n}"), Some('d')));
+        if let Some(id) = self.deletes() {
+            v.push(Verb::run(id, format!("delete {n}"), Some('d')));
+        }
         v.push(Verb::run("mail.all", "mark all", Some('m')));
         v.push(Verb::run("mail.clear", "clear", None));
         v
@@ -232,9 +252,10 @@ impl Panel for Mailbox {
                 s.workers().kick_all();
                 s.notify("syncing", false);
             }
-            "mail.archive" => self.file_marked(s, "archive"),
-            "mail.not_spam" => self.file_marked(s, "inbox"),
-            "mail.delete" => self.file_marked(s, "trash"),
+            "mail.archive" => self.file_marked(s, To::Role("archive")),
+            "mail.not_spam" => self.file_marked(s, To::Role("inbox")),
+            "mail.delete" => self.file_marked(s, To::Role("trash")),
+            "mail.put_back" => self.file_marked(s, To::Back),
             "mail.all" => {
                 let store = self.store.clone();
                 self.list.mark_all(&store);
@@ -281,8 +302,43 @@ impl PanelKind for MailboxKind {
 
 // -- the batch verbs ---------------------------------------------------------
 
+/// Where a filing verb sends what it moves: a folder role, or back where
+/// each letter was deleted from.
+///
+/// The trash is the one mailbox whose keeping verb has no role to name —
+/// mail arrives in it from everywhere, so what a *put back* moves a letter
+/// to is a folder id per letter, read off the row the delete wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum To {
+    Role(&'static str),
+    Back,
+}
+
+impl To {
+    /// The verb's own word — what its button says, and what history calls
+    /// the node it recorded.
+    pub fn word(self) -> &'static str {
+        match self {
+            To::Role("trash") => "delete",
+            To::Role("inbox") => "not spam",
+            To::Role(_) => "archive",
+            To::Back => "put back",
+        }
+    }
+
+    /// What a verb with nothing left to move says instead. *not spam* is the
+    /// odd one out: "nothing to not spam" is not a sentence.
+    pub fn nothing_said(self) -> String {
+        if self == To::Role("inbox") {
+            "nothing to take out of the spam".to_string()
+        } else {
+            format!("nothing to {}", self.word())
+        }
+    }
+}
+
 impl Mailbox {
-    /// Files every marked conversation into `role`, as one undoable action:
+    /// Files every marked conversation into `to`, as one undoable action:
     /// the marks come off, the folder's own copies of each conversation
     /// move, and undo brings both back.
     ///
@@ -291,7 +347,7 @@ impl Mailbox {
     /// lands on the nearest row that stayed and previews it, and the join
     /// rule puts that preview where the old one was. That walk is part of
     /// the action, not a second one: one undo takes the whole gesture back.
-    fn file_marked(&mut self, s: &mut Session, role: &'static str) {
+    fn file_marked(&mut self, s: &mut Session, to: To) {
         let keys = self.list.marks().keys();
         if keys.is_empty() {
             return;
@@ -304,14 +360,14 @@ impl Mailbox {
         let mut moving: Vec<(MailId, i64)> = Vec::new();
         for th in &keys {
             for id in folder_mails(&store, self.role, *th) {
-                if !model::can_file(&store, id, role) || model::already_filed(&store, id, role) {
+                if !movable(&store, id, to) {
                     continue;
                 }
                 moving.push((id, model::folder_of(&store, id)));
             }
         }
         if moving.is_empty() {
-            s.notify(nothing_said(role), false);
+            s.notify(to.nothing_said(), false);
             return;
         }
 
@@ -329,20 +385,18 @@ impl Mailbox {
                 keys: keys.clone(),
             }));
         }
-        intents.extend(moving.iter().map(|(mail, from)| {
-            Box::new(Filed {
-                mail: *mail,
-                from_folder: *from,
-                role,
-            }) as Box<dyn Intent>
-        }));
+        intents.extend(
+            moving
+                .iter()
+                .map(|(mail, from)| moved(&store, *mail, *from, to)),
+        );
 
         let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
-        let label = format!("{} {}", word_of(role), threads_said(keys.len()));
+        let label = format!("{} {}", to.word(), threads_said(keys.len()));
         let done = s.act(
             Action::writing("file", label, move |tx| {
                 for id in &ids {
-                    model::file_tx(tx, *id, role)?;
+                    move_tx(tx, *id, to)?;
                 }
                 Ok(())
             })
@@ -373,38 +427,63 @@ fn folder_mails(store: &Store, role: Role, thread: i64) -> Vec<MailId> {
     model::thread_siblings(store, head.target)
 }
 
+/// Whether this move would actually move this letter: it needs somewhere to
+/// go, and it may not be there already.
+pub fn movable(store: &Store, id: MailId, to: To) -> bool {
+    match to {
+        To::Role(role) => {
+            model::can_file(store, id, role) && !model::already_filed(store, id, role)
+        }
+        To::Back => {
+            model::put_back_target(store, id).is_some_and(|f| f != model::folder_of(store, id))
+        }
+    }
+}
+
+/// The claim one letter's move makes on the world, ready to be reversed.
+pub fn moved(store: &Store, mail: MailId, from: i64, to: To) -> Box<dyn Intent> {
+    match to {
+        To::Role(role) => Box::new(Filed {
+            mail,
+            from_folder: from,
+            role,
+            was_trashed: model::trashed_from(store, mail),
+        }),
+        To::Back => Box::new(PutBack {
+            mail,
+            trash: from,
+            to: model::put_back_target(store, mail).unwrap_or(from),
+        }),
+    }
+}
+
+/// The move itself, inside the action's transaction.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn move_tx(c: &rusqlite::Connection, id: MailId, to: To) -> rusqlite::Result<()> {
+    match to {
+        To::Role(role) => model::file_tx(c, id, role).map(|_| ()),
+        To::Back => model::put_back_tx(c, id).map(|_| ()),
+    }
+}
+
 /// The verb a mailbox wears beside *delete* — its id, the word its button
 /// says, and the letter it wears — or `None` for a list that has none.
 ///
 /// The inbox archives; the spam list takes a conversation back out of the
-/// junk, which is the same move in the other direction. The archive has
-/// neither, because the mail is already out of the inbox, and Sent has
-/// neither, because filing what you wrote is not what anybody asked for.
+/// junk, which is the same move in the other direction; the trash puts a
+/// conversation back where it was deleted from, which is that move again
+/// and the only one it has. The archive has none, because the mail is
+/// already out of the inbox, and Sent has none, because filing what you
+/// wrote is not what anybody asked for.
 fn keep_verb(role: Role) -> Option<(&'static str, &'static str, char)> {
     match role {
         Role::Inbox => Some(("mail.archive", "archive", 'a')),
         Role::Spam => Some(("mail.not_spam", "not spam", 'n')),
+        Role::Trash => Some(("mail.put_back", "put back", 'p')),
         Role::Archive | Role::Sent => None,
-    }
-}
-
-/// The verb's own word for a role — what its button says, and what history
-/// calls the node it recorded.
-pub(super) fn word_of(role: &str) -> &'static str {
-    match role {
-        "trash" => "delete",
-        "inbox" => "not spam",
-        _ => "archive",
-    }
-}
-
-/// What a verb with nothing left to move says instead. *not spam* is the odd
-/// one out: "nothing to not spam" is not a sentence.
-pub(super) fn nothing_said(role: &str) -> String {
-    if role == "inbox" {
-        "nothing to take out of the spam".to_string()
-    } else {
-        format!("nothing to {}", word_of(role))
     }
 }
 

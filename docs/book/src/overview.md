@@ -28,7 +28,7 @@ describes the layers and [Apps](./apps.md) is the contract between them.
 
 ## The apps
 
-- [Mail](./mail.md): four mailboxes over one list, conversations,
+- [Mail](./mail.md): five mailboxes over one list, conversations,
   attachments, drafts, contacts, accounts, and real IMAP and SMTP.
 - [Files](./files.md): a directory as a list, a file as a card, and the disk
   operations that act on both.

@@ -648,16 +648,17 @@ impl AppUi for Ui {
         self::script_mod(vm)
     }
 
-    /// Ten tags, seven templates: a mailbox draws the same whichever folder
-    /// it is over, so all four of its tags name one widget — hung on the
-    /// stage four times, because a template is instantiated per slot and the
-    /// four lists are four panels.
+    /// Eleven tags, seven templates: a mailbox draws the same whichever
+    /// folder it is over, so all five of its tags name one widget — hung on
+    /// the stage five times, because a template is instantiated per slot and
+    /// the five lists are five panels.
     fn template(&self, tag: Tag) -> Option<LiveId> {
         match tag {
             Role::INBOX => Some(live_id!(mail_inbox_tpl)),
             Role::ARCHIVE => Some(live_id!(mail_archive_tpl)),
             Role::SENT => Some(live_id!(mail_sent_tpl)),
             Role::SPAM => Some(live_id!(mail_spam_tpl)),
+            Role::TRASH => Some(live_id!(mail_trash_tpl)),
             Message::TAG => Some(live_id!(mail_message_tpl)),
             Compose::TAG => Some(live_id!(mail_compose_tpl)),
             Contact::TAG => Some(live_id!(mail_contact_tpl)),

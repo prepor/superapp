@@ -733,6 +733,12 @@ pub struct Filed {
     /// The role it went to: `archive`, `trash`, or `inbox` for a letter taken
     /// back out of the spam.
     pub role: &'static str,
+    /// What its `trashed` row said before the move, if it had one — a letter
+    /// filed *out* of the trash. Undo puts the letter back in the trash, and
+    /// this is what it was going to be put back to; without it, a letter
+    /// archived out of the trash and then un-archived would have forgotten
+    /// where it was deleted from.
+    pub was_trashed: Option<i64>,
 }
 
 impl Intent for Filed {
@@ -745,14 +751,14 @@ impl Intent for Filed {
         format!("mail:{} {verb}", self.mail)
     }
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let (mail, from_folder) = (self.mail, self.from_folder);
+        let (mail, from_folder, was) = (self.mail, self.from_folder, self.was_trashed);
         w.store()
             .write(move |c| {
                 c.execute(
                     "UPDATE message SET folder = ?1 WHERE id = ?2",
                     rusqlite::params![from_folder, mail],
-                )
-                .map(|_| ())
+                )?;
+                model::set_trashed_tx(c, mail, was)
             })
             .map_err(|e| e.to_string())
     }
@@ -760,6 +766,36 @@ impl Intent for Filed {
         let (mail, role) = (self.mail, self.role);
         w.store()
             .write(move |c| model::file_tx(c, mail, role).map(|_| ()))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A letter taken back out of the trash, into the folder it was deleted
+/// from. The move a `Filed` cannot describe: its destination is per letter
+/// and a folder id rather than a role, because the trash is the one place
+/// mail arrives from everywhere.
+pub struct PutBack {
+    pub mail: MailId,
+    /// The trash it came out of, so undo can put it back in.
+    pub trash: i64,
+    /// Where it went — and, undone, what it remembers again.
+    pub to: i64,
+}
+
+impl Intent for PutBack {
+    fn describe(&self) -> String {
+        format!("mail:{} put back", self.mail)
+    }
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        let (mail, trash, to) = (self.mail, self.trash, self.to);
+        w.store()
+            .write(move |c| model::retrash_tx(c, mail, trash, to))
+            .map_err(|e| e.to_string())
+    }
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        let mail = self.mail;
+        w.store()
+            .write(move |c| model::put_back_tx(c, mail).map(|_| ()))
             .map_err(|e| e.to_string())
     }
 }

@@ -19,7 +19,8 @@ use kernel::app::{Schema, Step};
 /// against; step two is what a draft carries, which arrived with the compose
 /// panel's *attach*; step four is what a *letter* carries, and the draft rows
 /// as the send actually needs them; step seven is `to_addr` for a store built
-/// before [`V1`] had it.
+/// before [`V1`] had it; the last is where a deleted letter came from, which
+/// is what the trash gives back.
 ///
 /// The four derived steps are versioned by the walk that makes each rather
 /// than by the ladder's counter: an index, a narrowing, a set of derived rows
@@ -53,6 +54,7 @@ pub static SCHEMA: Schema = Schema {
             version: TO_VERSION,
             rebuild: rebuild_recipients,
         },
+        Step::Sql(V5),
     ],
 };
 
@@ -248,8 +250,9 @@ DROP TABLE draft_file;
 /// through a table of the right shape costs one rewrite, once, and leaves
 /// every store — new or old — the same `message`.
 ///
-/// Nothing declares a foreign key *to* `message`, so the drop needs no
-/// deferral; what it does take with it are the table's own indexes and the
+/// Nothing declared a foreign key *to* `message` when this step was written
+/// — [`V5`] is the first that does, and it climbs after this one, so the drop
+/// needs no deferral; what it does take with it are the table's own indexes and the
 /// FTS triggers, both put back after — the ids are copied as they stand, so
 /// the index over them is still the index of these letters.
 const V4: &str = "
@@ -309,6 +312,37 @@ fn add_to_addr(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     // rather than trusted, which costs one walk on one store, once.
     rebuild_fts(c)
 }
+
+/// Where a deleted letter was, so it can be put back there.
+///
+/// One row per letter currently in the trash, written when a letter is filed
+/// there and deleted when it leaves by any road — another filing, a tool, an
+/// undo. The undo tree knows this too, and better, but only until the
+/// process ends: history is in memory, keeps its last two hundred nodes, and
+/// never had a node at all for a letter deleted on another device and
+/// mirrored here. Two columns that survive a restart are what *put back*
+/// reads.
+///
+/// A table rather than a `message` column, because of the rule [`V1`] is
+/// built on: `raw` sits last so that everything a list reads is decoded
+/// before the letter's own bytes, and a column added to `message` now would
+/// land after it.
+///
+/// Both references cascade, because this table is a memory and a memory may
+/// not hold anything open. A letter the server drops is deleted locally in
+/// the middle of a sync pass's one commit, and a row that refused to go with
+/// it would fail the whole pass; a folder that a resync drops takes the
+/// memory of it with it, and the put back falls back to the inbox — which is
+/// what a letter with nowhere remembered gets anyway.
+/// `IF NOT EXISTS` because this step climbs after [`V4`], and a store wound
+/// back to before that rewrite — which is how the rewrite is tested — walks
+/// every step above it a second time.
+const V5: &str = "
+CREATE TABLE IF NOT EXISTS trashed(
+  message INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  folder  INTEGER NOT NULL REFERENCES folder(id) ON DELETE CASCADE
+);
+";
 
 /// Which walk over `message` the index came out of. Bump it and every store
 /// re-indexes on its next open.

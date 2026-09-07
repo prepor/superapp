@@ -83,7 +83,7 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `lib.rs` | The two app lists, `APPS` and `UIS`. The only place in the build that names an app |
 | `main.rs` | The desktop binary: one line |
 | `root.rs` | The window, and the app root that hangs every app's templates on the stage |
-| `apps/mail/` | [Mail](./mail.md): ten panel kinds, a schema, a seed, four deferred effects, three capabilities, a search source, two problem sources, and its workers |
+| `apps/mail/` | [Mail](./mail.md): eleven panel kinds, a schema, a seed, four deferred effects, three capabilities, a search source, two problem sources, and its workers |
 | `apps/files/` | [Files](./files.md): two panel kinds, one root, a clipboard other apps may read, and the worker that performs the verbs that write |
 | `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, and a window-layer screenshot |
 | `bin/` | `bucketd`, `sync-demo`, and `reseed-edit`, the programs the device-sync walks are driven with |

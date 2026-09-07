@@ -303,8 +303,9 @@ The verb is the panel's own, run over the swept row alone: the row is marked,
 the batch verb fires, and whatever was marked before goes back on. A list that
 offers no verb that way draws no curtain, and the lift does nothing. In a
 mailbox, a rightward sweep deletes and a leftward one keeps the conversation —
-which is *archive* in the inbox, *not spam* in the junk, and nothing in the
-other two.
+which is *archive* in the inbox, *not spam* in the junk, *put back* in the
+trash, and nothing in the archive or Sent. The trash sweeps the other way
+alone: deleting is what it already is.
 
 ## The soft keyboard
 

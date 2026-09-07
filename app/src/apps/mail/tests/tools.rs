@@ -150,6 +150,103 @@ fn the_not_spam_tool_takes_a_conversation_out_of_the_junk() {
     assert!(e.contains("not in the spam"), "{e}");
 }
 
+/// *put back* is the trash's own verb through the registry: it takes the
+/// conversation back to the folder the delete took it from, and a
+/// conversation that is only in the trash is no longer anything *delete* can
+/// find.
+#[test]
+fn the_put_back_tool_takes_a_conversation_out_of_the_trash() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let thread = top_thread(&s, inbox);
+    call(&mut s, "mail.delete", &json!({ "thread": thread })).expect("the tool deleted it");
+    assert_eq!(role_of(s.store(), 1), "trash");
+
+    let e = call(&mut s, "mail.delete", &json!({ "thread": thread })).expect_err("already gone");
+    assert!(e.contains("in any mailbox"), "{e}");
+
+    call(&mut s, "mail.put_back", &json!({ "thread": thread })).expect("out of the trash");
+    assert_eq!(role_of(s.store(), 1), "inbox");
+    assert_eq!(label(&s), "put back “Q3 infra budget draft”");
+    assert!(s.undo());
+    assert_eq!(role_of(s.store(), 1), "trash");
+
+    // And a conversation that is not in the trash has nothing to put back.
+    let spam = open_root(&mut s, Role::Spam.id());
+    let other = top_thread(&s, spam);
+    let e = call(&mut s, "mail.put_back", &json!({ "thread": other })).expect_err("not deleted");
+    assert!(e.contains("not in the trash"), "{e}");
+}
+
+/// A letter that sits in the account twice — mine, in Sent and back through
+/// a list — is one message in its conversation, and the copy that stands for
+/// it is never the deleted one. Only a conversation read out of the trash has
+/// both copies in front of it to choose between, and choosing the deleted one
+/// would leave every verb over the conversation acting on a letter no list
+/// shows.
+#[test]
+fn a_deleted_copy_never_stands_for_the_letter_that_is_still_filed() {
+    let (mut s, _clock) = session();
+    // My own note to Max, back through the list it was sent to: the same
+    // `Message-ID` in the inbox as in Sent.
+    let raw = "From: Andrey Rudenko <me@prepor.dev>\r\nTo: max@ivanov.dev\r\n\
+               Subject: superapp panel model\r\n\
+               Date: Sat, 29 Aug 2026 14:02:00 +0000\r\n\
+               Message-ID: <pm-0@prepor.dev>\r\n\r\nWrote up the panel model.";
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", false, false, raw)
+    });
+    sync::sync_account(s.world(), seed::ACCOUNT).expect("the copy lands");
+    s.settle();
+
+    // Deleting the conversation out of the inbox takes that copy and the
+    // conversation's own anchor with it, so what is left of it in the inbox
+    // is nothing and the anchor is a deleted letter.
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let anchor = with_mailbox(&s, inbox, |m| {
+        m.list_mut().set_filter("panel model");
+        assert_eq!(m.len(), 1);
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].thread
+    });
+    verb(&mut s, inbox, "mail.delete");
+    assert_eq!(role_of(s.store(), anchor), "trash", "the anchor went too");
+
+    let sent = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT m.id FROM message m JOIN folder f ON f.id = m.folder
+             WHERE m.message_id = 'pm-0@prepor.dev' AND f.role = 'sent'",
+            [],
+            |r| r.get::<_, MailId>(0),
+        )
+        .expect("the letter is still in Sent");
+    let shown = model::thread(s.store(), anchor);
+    assert!(
+        shown.iter().any(|t| t.mail.head.id == sent),
+        "the conversation shows the copy that is still filed"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|t| t.message_id == "pm-0@prepor.dev")
+            .count(),
+        1,
+        "and shows it once"
+    );
+
+    // Which is what a verb over the conversation then acts on: marking it
+    // unread has to reach the letter a person can see.
+    assert!(!unread(s.store(), sent));
+    call(&mut s, "mail.unread", &json!({ "thread": anchor })).expect("marked unread");
+    assert!(
+        unread(s.store(), sent),
+        "the Sent copy is the one it marked"
+    );
+}
+
 /// A conversation the inbox does not hold cannot be archived out of it, and
 /// the sentence says which mailbox was looked in. Which mailbox's copies a
 /// filing takes is the mailbox verb's rule, and *archive* is the inbox's
