@@ -357,7 +357,7 @@ impl Widget for ChatPanel {
             }
         }
 
-        self.view.handle_event(cx, event, scope);
+        super::text::handle_event(&mut self.view, cx, event, scope);
         self.mount(cx, &props, scope);
 
         // A verb moved the cursor — to a reply's original or back to the
@@ -820,6 +820,12 @@ impl ChatPanel {
             live_id!(line_mark_sel),
         ];
         let line = row.widget(cx, &[live_id!(msg), TWINS[twin.min(3)]]);
+        super::text::hits(
+            cx,
+            &line.widget(cx, ids!(body.text_wrap.body_txt)),
+            props,
+            self.view.widget(cx, LIST).area().rect(cx),
+        );
         // The quoted line a reply carries is the way to what it answers.
         if m.reply_to.is_some() {
             let quote = line.widget(cx, ids!(reply_lbl));
@@ -1033,8 +1039,13 @@ pub fn populate(
 
             let has_text = !m.text.trim().is_empty();
             line.view(cx, ids!(body.text_wrap)).set_visible(cx, has_text);
-            line.text_input(cx, ids!(body.text_wrap.body_txt))
-                .set_text(cx, if has_text { &m.text } else { "" });
+            let body = line.widget(cx, ids!(body.text_wrap.body_txt));
+            super::text::set(
+                cx,
+                &body,
+                if has_text { &m.text } else { "" },
+                m.entities.as_deref(),
+            );
 
             // The media, through the kit: a picture — a photo, or a video's
             // poster — decoded when this box's message changed, which the

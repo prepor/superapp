@@ -20,6 +20,16 @@ height, including in a short window or among large media messages. The reveal
 stays pending until a draw confirms the message is visible; a new scroll
 gesture takes over from it.
 
+Message text and media captions show selectable, underlined links in the
+transcript and line cards. Web URLs, labeled links, email addresses and Telegram
+links open their destination on a tap; dragging selects text. Incoming entities
+are retained with the message and replaced on content edits; their spans are
+authoritative even when the server reports no links. Only text without metadata
+uses local detection, which requires a URL scheme or an email address so filenames
+and ordinary dotted words stay plain. Older cached labeled links and URLs without
+a scheme become available when their entities are fetched again. Code spans stay
+literal.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

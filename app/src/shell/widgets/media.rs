@@ -34,6 +34,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use makepad_widgets::makepad_platform::{Texture, TextureFormat, TextureUpdated};
 use makepad_widgets::*;
@@ -206,6 +207,18 @@ pub fn play_rect(cx: &mut Cx, player: &WidgetRef) -> Option<Rect> {
     (r.size.x > 0.0 && r.size.y > 0.0).then_some(r)
 }
 
+/// The progress bar's width with the full control row as its hit height.
+/// The drawn hairline stays thin; seeking does not require hitting three pixels.
+#[must_use]
+pub fn seek_rect(cx: &Cx, player: &WidgetRef) -> Option<Rect> {
+    let bar = player.view(cx, ids!(bar)).area().rect(cx);
+    let row = player.area().rect(cx);
+    (bar.size.x > 0.0 && row.size.y > 0.0).then_some(Rect {
+        pos: dvec2(bar.pos.x, row.pos.y),
+        size: dvec2(bar.size.x, row.size.y),
+    })
+}
+
 /// Sets a `MediaMeter`'s level, 0 to 1.
 pub fn fill_meter(cx: &mut Cx, meter: &WidgetRef, level: f32) {
     if let Some(mut m) = meter.borrow_mut::<View>() {
@@ -256,6 +269,12 @@ pub struct VideoDrawn {
 #[derive(Default)]
 pub struct VideoPlayback {
     lease: Option<VideoLease>,
+    seek: Option<VideoSeek>,
+}
+
+struct VideoSeek {
+    position: f64,
+    sent: Option<Instant>,
 }
 
 struct VideoLease {
@@ -318,6 +337,66 @@ impl VideoPlayback {
         });
     }
 
+    /// Keeps the latest seek until the file and the native player are ready.
+    /// Seeking leaves the panel's play/pause wish alone.
+    pub fn seek(&mut self, position: f64) {
+        if position.is_finite() {
+            self.seek = Some(VideoSeek { position: position.max(0.0), sent: None });
+        }
+    }
+
+    /// A paused player still needs draws while a seek waits for preparation.
+    #[must_use]
+    pub fn awaiting_seek(&self) -> bool {
+        self.seek.as_ref().is_some_and(|s| s.sent.is_none())
+    }
+
+    /// Keep drawing until preparation finishes and the nonzero preview clears,
+    /// even if a paused player sends no further frames after landing on a keyframe.
+    #[must_use]
+    pub fn seek_needs_redraw(&self) -> bool {
+        self.seek.as_ref().is_some_and(|s| s.sent.is_none() || s.position > 0.0)
+    }
+
+    /// Show the requested position while the native seek catches up, with a
+    /// one-second timeout for nonzero targets even while paused: macOS may land
+    /// on a nearby keyframe. A paused seek to zero must keep that position,
+    /// since Makepad ignores zero timestamps.
+    #[must_use]
+    pub fn state(&mut self, cx: &Cx, video: &WidgetRef, length: f64) -> PlayerState {
+        let mut st = video_state(cx, video, length);
+        if let Some(seek) = &self.seek {
+            let position = seek.position.min(st.length.max(0.0));
+            if seek.sent.is_some_and(|sent| {
+                (st.position - position).abs() < 0.1
+                    || ((st.playing || position > 0.0) && sent.elapsed().as_secs_f64() > 1.0)
+            }) {
+                self.seek = None;
+            } else {
+                st.position = position;
+            }
+        }
+        st
+    }
+
+    fn apply_seek(&mut self, cx: &mut Cx, clip: &VideoRef) {
+        let Some(seek) = self.seek.as_mut().filter(|s| s.sent.is_none()) else { return };
+        if clip.is_unprepared() {
+            clip.prepare_playback(cx);
+        }
+        if clip.is_prepared() {
+            clip.pause_playback(cx);
+        }
+        if clip.is_playing() || clip.is_paused() {
+            let length = clip.total_duration_ms() as f64 / 1000.0;
+            if length > 0.0 {
+                seek.position = seek.position.min(length);
+            }
+            clip.seek_to(cx, (seek.position * 1000.0).round() as u64);
+            seek.sent = Some(Instant::now());
+        }
+    }
+
     /// Points a `MediaVideo` at the clip at `path` — at nothing, where there is
     /// no clip — and carries the panel's wish across to its player: `true` runs
     /// it, `false` holds it.
@@ -355,14 +434,20 @@ impl VideoPlayback {
                 if clip.has_completed() {
                     clip.stop_and_cleanup_resources(cx);
                     playing = false;
-                } else if playing {
-                    if clip.is_paused() {
-                        clip.resume_playback(cx);
-                    } else {
-                        clip.begin_playback(cx);
+                    if !self.awaiting_seek() {
+                        self.seek = None;
                     }
-                } else if clip.is_playing() {
-                    clip.pause_playback(cx);
+                } else {
+                    self.apply_seek(cx, &clip);
+                    if playing {
+                        if clip.is_paused() {
+                            clip.resume_playback(cx);
+                        } else {
+                            clip.begin_playback(cx);
+                        }
+                    } else if clip.is_playing() {
+                        clip.pause_playback(cx);
+                    }
                 }
             }
             // No clip on this line yet — a box left over a player from the
@@ -444,7 +529,8 @@ pub fn fill_map(cx: &mut Cx, map: &WidgetRef, snapshot: Option<&Snapshot>) {
 mod tests {
     use super::*;
     use makepad_widgets::makepad_platform::event::video_playback::{
-        VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoYuvTexturesReady,
+        VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoTextureUpdatedEvent,
+        VideoYuvTexturesReady,
     };
 
     fn test_video(cx: &mut Cx) -> WidgetRef {
@@ -467,6 +553,130 @@ mod tests {
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
         })
+    }
+
+    fn test_video_box(cx: &mut Cx) -> WidgetRef {
+        let clip = test_video(cx);
+        let video = cx.with_vm(|vm| {
+            let mut view = View::script_new(vm);
+            view.children.push((live_id!(clip), clip));
+            WidgetRef::new_with_inner(Box::new(view))
+        });
+        // Give this Cx its own tree, as the app root does. An uninitialized
+        // Cx's fallback tree is shared across concurrent tests.
+        makepad_widgets::widget_tree::set_ui_root(cx, &video);
+        video
+    }
+
+    fn position(position_ms: u128) -> Event {
+        Event::VideoTextureUpdated(VideoTextureUpdatedEvent {
+            video_id: LiveId(0),
+            current_position_ms: position_ms,
+            yuv: Default::default(),
+            rgba_gl_2d: false,
+        })
+    }
+
+    #[test]
+    fn seeking_waits_for_the_file_and_player_and_keeps_it_paused() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let video = test_video_box(cx);
+        let clip = video.widget(cx, ids!(clip));
+        let mut owner = VideoPlayback::default();
+        let path = Some(Path::new("test.mp4"));
+
+        owner.seek(0.75);
+        assert_eq!(owner.drive(cx, &video, None, false), VideoDrawn::default());
+        assert!(owner.awaiting_seek());
+        owner.drive(cx, &video, path, false);
+        assert!(clip.as_video().is_preparing());
+        owner.seek(0.4); // Only the latest position survives preparation.
+        clip.handle_event(cx, &prepared(), &mut Scope::empty());
+        assert_eq!(owner.drive(cx, &video, path, false), VideoDrawn { shown: true, playing: false });
+        assert!(clip.as_video().is_paused());
+        assert!(!owner.awaiting_seek());
+        assert_eq!(owner.state(cx, &video, 1.0).position, 0.4);
+
+        // A stale frame must not snap the progress back. Once the seek lands,
+        // subsequent frames control the position again.
+        clip.handle_event(cx, &position(100), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 1.0).position, 0.4);
+        clip.handle_event(cx, &position(400), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 1.0).position, 0.4);
+        clip.handle_event(cx, &position(550), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 1.0).position, 0.55);
+    }
+
+    #[test]
+    fn seeking_preserves_playback_and_clamps_to_the_native_duration() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let video = test_video_box(cx);
+        let clip = video.widget(cx, ids!(clip));
+        let mut owner = VideoPlayback::default();
+        let path = Some(Path::new("test.mp4"));
+        owner.drive(cx, &video, path, true);
+        clip.handle_event(cx, &prepared(), &mut Scope::empty());
+
+        owner.seek(5.0);
+        assert_eq!(owner.drive(cx, &video, path, true), VideoDrawn { shown: true, playing: true });
+        assert_eq!(owner.state(cx, &video, 14.0), PlayerState {
+            position: 1.0, length: 1.0, playing: true,
+        });
+
+        clip.handle_event(cx, &position(800), &mut Scope::empty());
+        owner.drive(cx, &video, path, false);
+        owner.seek(-1.0);
+        owner.drive(cx, &video, path, false);
+        clip.handle_event(cx, &position(0), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 14.0), PlayerState {
+            position: 0.0, length: 1.0, playing: false,
+        });
+        owner.drive(cx, &video, path, true);
+        clip.handle_event(cx, &position(50), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 14.0).position, 0.05);
+        assert!(clip.as_video().is_playing());
+    }
+
+    #[test]
+    fn a_paused_seek_adopts_the_native_position_after_the_preview_times_out() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let video = test_video_box(cx);
+        let clip = video.widget(cx, ids!(clip));
+        let mut owner = VideoPlayback::default();
+        let path = Some(Path::new("test.mp4"));
+        owner.seek(0.75);
+        assert!(owner.seek_needs_redraw());
+        owner.drive(cx, &video, path, false);
+        clip.handle_event(cx, &prepared(), &mut Scope::empty());
+        owner.drive(cx, &video, path, false);
+
+        // macOS can land on a sync frame outside the target's tolerance.
+        // Initially show the request, then the actual frame, still paused.
+        clip.handle_event(cx, &position(500), &mut Scope::empty());
+        assert_eq!(owner.state(cx, &video, 1.0).position, 0.75);
+        assert!(owner.seek_needs_redraw(), "a paused preview still needs a draw at timeout");
+        owner.seek.as_mut().unwrap().sent = Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert!(owner.seek_needs_redraw(), "the final draw must replace the expired preview");
+        assert_eq!(owner.state(cx, &video, 1.0), PlayerState {
+            position: 0.5, length: 1.0, playing: false,
+        });
+        assert!(!owner.seek_needs_redraw(), "the paused player can stop drawing once it settles");
+
+        // Zero is special: Makepad ignores its timestamp, so the old native
+        // position must not replace a paused seek to the start after timeout.
+        owner.seek(0.0);
+        assert!(owner.seek_needs_redraw(), "a queued zero seek still needs to be sent");
+        owner.drive(cx, &video, path, false);
+        clip.handle_event(cx, &position(0), &mut Scope::empty());
+        owner.seek.as_mut().unwrap().sent = Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert_eq!(owner.state(cx, &video, 1.0), PlayerState {
+            position: 0.0, length: 1.0, playing: false,
+        });
+        assert!(!owner.seek_needs_redraw(), "keeping zero pinned must not draw forever");
+        owner.drive(cx, &video, path, true);
+        assert_eq!(owner.state(cx, &video, 1.0), PlayerState {
+            position: 0.5, length: 1.0, playing: true,
+        });
     }
 
     #[test]

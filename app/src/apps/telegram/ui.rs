@@ -74,6 +74,25 @@ script_mod! {
         }
     }
 
+    /** A message's text and caption, with selectable, underlined links. */
+    mod.widgets.TelegramText = Html {
+        width: Fill, height: Fit
+        padding: 0, margin: 0
+        selectable: true
+        font_size: 10.5
+        font_color: #141414
+        draw_text +: { color: #141414 }
+        text_style_normal: mod.widgets.SMonoStyle{}
+        a := mod.widgets.HtmlLink {
+            color: #5a5a5a
+            pressed_color: #141414
+        }
+        draw_selection +: {
+            draw_call_group: @selection
+            color: #00000020
+        }
+    }
+
     // ---- the chat list ---------------------------------------------------------
 
     /** One chat as the list shows it, two lines: the title and the last
@@ -251,12 +270,10 @@ script_mod! {
             width: Fit, text: ""
             draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 30.0} }
         }
-        // A text input carries no `visible` of its own; the box around it
-        // is what shows and hides the text. Multiline, or it lays out on one
-        // row and honours neither wrap nor newline.
+        // Html has no `visible` of its own; the wrapper hides empty captions.
         text_wrap := View {
             width: Fill, height: Fit
-            body_txt := mod.widgets.SText { is_multiline: true }
+            body_txt := mod.widgets.TelegramText {}
         }
         media_lbl := mod.widgets.SLabel {
             visible: false
@@ -605,7 +622,7 @@ script_mod! {
         }
         text_wrap := View {
             width: Fill, height: Fit
-            body_txt := mod.widgets.SText { is_multiline: true }
+            body_txt := mod.widgets.TelegramText {}
         }
         media_lbl := mod.widgets.SLabel {
             visible: false

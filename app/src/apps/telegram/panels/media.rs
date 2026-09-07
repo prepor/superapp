@@ -264,6 +264,18 @@ impl Viewer {
         self.player = Some(p);
     }
 
+    /// Seek the demo or audio timeline; a real clip is sought by the widget's
+    /// native player, which needs a `Cx`.
+    pub fn seek(&mut self, m: &Msg, position: f64, now: f64) {
+        if self.plays_clip(m) {
+            return;
+        }
+        let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else { return };
+        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
+        p.seek(position, now);
+        self.player = Some(p);
+    }
+
     /// The wish the draw carries out over the clip's player.
     #[must_use]
     pub fn running(&self) -> bool {

@@ -30,6 +30,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
         sender: sender_id(&m["sender_id"], chat),
         date,
         text,
+        entities: content_entities(&m["content"]),
         out,
         // A read receipt needs the chat's read cursor, not one message, so a
         // sent line is 'sent' until `updateChatReadOutbox` says
@@ -243,6 +244,12 @@ pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
 /// A `formattedText`'s plain string — the `text` inside it — or empty.
 fn formatted_text(ft: &Value) -> String {
     ft["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// Message text and media captions both carry the same formatted-text shape.
+pub fn content_entities(content: &Value) -> Vec<super::text::Entity> {
+    let field = if content["@type"].as_str() == Some("messageText") { "text" } else { "caption" };
+    super::text::entities(&content[field]["entities"])
 }
 
 /// The largest of a photo's sizes: the biggest file the server offers, the

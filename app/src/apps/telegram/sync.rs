@@ -648,9 +648,10 @@ impl<T: Td> Account<T> {
             return;
         };
         let (text, media) = updates::content(&u["new_content"], 0.0);
+        let entities = updates::content_entities(&u["new_content"]);
         self.filed("on_message_content", w
             .store()
-            .write(move |c| set_content(c, chat, id, &text, media.as_ref())));
+            .write(move |c| set_content(c, chat, id, &text, media.as_ref(), &entities)));
         // A swapped-in photo or file is fetched the same way a new line's is.
         self.fetch(w, &u["new_content"]);
     }
@@ -1308,13 +1309,14 @@ fn set_content(
     id: MsgId,
     text: &str,
     media: Option<&Media>,
+    entities: &[super::text::Entity],
 ) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE tg_message SET
            text = ?3, media = ?4, media_label = ?5, media_ref = ?6, media_rid = ?7,
            media_w = ?8, media_h = ?9, media_secs = ?10,
            media_lat = ?11, media_lon = ?12, media_until = ?13,
-           media_clip = ?14, media_clip_rid = ?15
+           media_clip = ?14, media_clip_rid = ?15, entities = ?16, entities_known = 1
          WHERE chat = ?1 AND id = ?2",
         rusqlite::params![
             chat,
@@ -1332,6 +1334,7 @@ fn set_content(
             media.and_then(|m| m.until),
             media.and_then(|m| m.clip.as_deref()),
             media.and_then(|m| m.clip_rid.as_deref()),
+            serde_json::to_string(entities).expect("text entities serialize"),
         ],
     )?;
     Ok(())
