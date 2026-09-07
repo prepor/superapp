@@ -507,19 +507,65 @@ fn live_reply_views_wait_for_acknowledgment_and_can_retry() {
     assert!(inbox.try_recv().is_ok(), "an unacknowledged view can retry");
 }
 
-#[test]
-fn opening_a_group_does_not_acknowledge_an_unseen_reply_at_its_end() {
-    let mut s = session();
-    s.store().write(|c| {
+/// Leave an ordinary line before two unread mentions at the end of the group.
+fn add_trailing_mentions(s: &Session) -> i64 {
+    let history = model::history(s.store(), STELAXIS);
+    let ordinary = &history[history.len() - 3];
+    assert!(!ordinary.unread_mention);
+    let last = ordinary.id;
+    s.store().write(move |c| {
         c.execute("UPDATE tg_message SET unread_mention = 1
-            WHERE chat = ?1 AND id = (SELECT MAX(id) FROM tg_message WHERE chat = ?1)", [STELAXIS])?;
-        c.execute("UPDATE tg_chat SET mention = 3 WHERE peer = ?1", [STELAXIS])?;
+            WHERE chat = ?1 AND id > ?2", [STELAXIS, last])?;
+        c.execute("UPDATE tg_chat SET mention =
+            (SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND unread_mention = 1)
+            WHERE peer = ?1", [STELAXIS])?;
         Ok(())
     }).unwrap();
+    last
+}
+
+#[cfg(feature = "tdlib")]
+#[test]
+fn preview_reads_ordinary_messages_with_unread_mentions_at_the_end() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let list = open_root(&mut s, Chats::id());
     let inbox = runtime::of(s.store()).connect();
-    open_root(&mut s, Chat::id(STELAXIS));
-    assert_eq!(model::reply_count(s.store()), 3);
-    assert!(inbox.try_recv().is_err(), "viewMessages would prematurely acknowledge the final reply");
+    go(&mut s, Nav::Preview { from: list, id: Chat::id(STELAXIS) });
+    assert_eq!(s.focus(), Some(list), "the transcript has not been focused");
+    assert_eq!(unread(&s, STELAXIS).0, 0);
+    assert_eq!(model::reply_count(s.store()), 4);
+    let request: serde_json::Value = serde_json::from_str(
+        &inbox.try_recv().expect("the preview sends a read for the preceding ordinary message")
+    ).unwrap();
+    assert_eq!(request["@type"], "viewMessages");
+    assert_eq!(request["chat_id"], STELAXIS);
+    assert_eq!(request["message_ids"], serde_json::json!([last]));
+    assert_eq!(request["force_read"], true);
+    assert!(inbox.try_recv().is_err(), "unseen mentions have no acknowledgment");
+}
+
+#[test]
+fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
+    let mut s = session();
+    let last = add_trailing_mentions(&s);
+    let family_last = model::history(s.store(), FAMILY).last().unwrap().id;
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY]));
+    let inbox = runtime::of(s.store()).connect();
+    verb(&mut s, list, "telegram.read");
+    let requests: Vec<serde_json::Value> = inbox.try_iter()
+        .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    assert_eq!(requests.len(), 2, "one read for each marked group");
+    for (peer, last) in [(STELAXIS, last), (FAMILY, family_last)] {
+        let request = requests.iter().find(|r| r["chat_id"] == peer).unwrap();
+        assert_eq!(request["@type"], "viewMessages");
+        assert_eq!(request["message_ids"], serde_json::json!([last]));
+        assert_eq!(request["force_read"], true);
+        assert_eq!(unread(&s, peer).0, 0);
+    }
+    assert_eq!(model::reply_count(s.store()), 4, "read n preserves every mention");
+    assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().len()), 0);
 }
 
 #[test]

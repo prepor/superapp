@@ -1179,16 +1179,13 @@ impl PanelKind for ChatKind {
                 }) as Box<dyn Intent>],
             );
         }
-        // Where the build is signed in, carry that read through to Telegram
-        // too, so the count clears at the server as it just did locally. The
-        // newest ordinary line stands for the chat. If that line is an
-        // unread reply or mention, wait until it is actually visible:
-        // `viewMessages` would also acknowledge that notification.
+        // Carry the ordinary read through to Telegram even when the newest
+        // lines are unread replies or mentions. Name the preceding ordinary
+        // line: `viewMessages` would acknowledge a named notification too,
+        // which waits until it is visible in the focused transcript.
         #[cfg(feature = "tdlib")]
         if unread > 0 && at.is_none() {
-            if let Some(last) = model::history(&store, peer).iter().last()
-                .filter(|m| !m.unread_mention).map(|m| m.id)
-            {
+            if let Some(last) = model::newest_ordinary_line(&store, peer) {
                 let _ = wire(&store, &requests::view_messages(peer, &[last]));
             }
         }

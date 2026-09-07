@@ -224,11 +224,10 @@ impl Chats {
         let mut went = false;
         for &peer in &peers {
             let request = match verb {
-                // A read names the newest line the store holds for the chat,
-                // and everything under it is read with it. A chat holding no
-                // line yet has nothing to name — its count clears here and
-                // the wire hears of it when one arrives.
-                "telegram.read" => match model::newest_line(&store, peer) {
+                // Read through the newest ordinary line, preserving unread
+                // replies and mentions for the focused transcript. Without
+                // an ordinary line, there is no read to send yet.
+                "telegram.read" => match model::newest_ordinary_line(&store, peer) {
                     Some(last) => requests::view_messages(peer, &[last]),
                     None => continue,
                 },

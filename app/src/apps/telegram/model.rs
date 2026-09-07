@@ -1687,18 +1687,18 @@ pub fn chat_id(peer: PeerId, at: Option<MsgId>) -> PanelId {
 // give back — and a chat with no row of its own gets one first, since a peer
 // out of the address book has none until something is written to it.
 
-static Q_NEWEST_LINE: Q = Q {
-    id: "tg newest line",
-    sql: "SELECT MAX(id) FROM tg_message WHERE chat = ?1",
-    describe: "the newest line a chat holds, which stands for the chat in a read",
+static Q_NEWEST_ORDINARY_LINE: Q = Q {
+    id: "tg newest ordinary line",
+    sql: "SELECT MAX(id) FROM tg_message WHERE chat = ?1 AND unread_mention = 0",
+    describe: "the newest line a chat can read without acknowledging an unread mention",
 };
 
-/// The newest line a chat holds, or `None` where it holds none. It is what a
-/// read names: `viewMessages` up to the last line reads everything under it.
+/// The newest line that can advance a chat's read position without
+/// acknowledging an unread reply or mention, or `None` when none is cached.
 #[must_use]
-pub fn newest_line(store: &Store, chat: PeerId) -> Option<MsgId> {
+pub fn newest_ordinary_line(store: &Store, chat: PeerId) -> Option<MsgId> {
     store
-        .rows(&Q_NEWEST_LINE, &[Val::I(chat)], |r| {
+        .rows(&Q_NEWEST_ORDINARY_LINE, &[Val::I(chat)], |r| {
             r.get::<_, Option<MsgId>>(0)
         })
         .first()

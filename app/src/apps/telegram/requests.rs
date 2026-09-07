@@ -298,9 +298,9 @@ pub fn delete_messages(chat_id: PeerId, message_ids: &[MsgId], revoke: bool) -> 
     .to_string()
 }
 
-/// Marks lines seen. `force_read` reads them at the server — the chat's unread
-/// count clears, not merely that the lines were shown — so a chat read locally
-/// is read on Telegram too. The newest line stands for the whole chat.
+/// Marks the named lines seen, including their reply or mention notifications.
+/// `force_read` also advances the ordinary inbox's read position; callers
+/// reading a chat without viewing mentions name its newest ordinary line.
 #[must_use]
 pub fn view_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
     json!({
