@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kernel::app::{Capabilities, Env};
-use kernel::caps::{ClockSource, MemSecrets, Secrets};
+use kernel::caps::{ClockSource, MemSecrets, Secrets, SecretsFactory};
 
 use super::caps::{
     Auth, Creds, FolderMeta, Imap, MailFlag, OAuth, Outgoing, RemoteFolder, RemoteMail, Smtp,
@@ -37,11 +37,7 @@ const TOKEN_MARGIN: f64 = 120.0;
 pub fn install(env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Imap>(Box::new(RealServers::default()));
     caps.insert::<dyn Smtp>(Box::new(RealServers::default()));
-    caps.insert::<dyn OAuth>(Box::new(RealOAuth::new(
-        env.db_dir.clone(),
-        env.secrets.clone(),
-        env.clock.clone(),
-    )));
+    caps.insert::<dyn OAuth>(Box::new(RealOAuth::new(env)));
 }
 
 /// The sessions one world holds.
@@ -245,21 +241,45 @@ pub struct RealOAuth {
     /// [`oauth::Client::load`]). `None` for an in-memory run, which then has
     /// no Gmail either.
     dir: Option<PathBuf>,
-    secrets: MemSecrets,
+    /// The machine's own secret store, when the shell installed one. It has
+    /// to be *this* store and not the shared map: the sign-in form files the
+    /// refresh token through the [`Secrets`] capability, which in a real run
+    /// is the keychain — so a grant looked up in the map would be missing
+    /// from the one place it was never written.
+    backend: Option<SecretsFactory>,
+    /// The shared map otherwise — a scripted run, and a build with no
+    /// platform store.
+    memory: MemSecrets,
     clock: ClockSource,
     /// Access tokens by address, with the unix second each expires at.
     tokens: HashMap<String, (String, f64)>,
 }
 
 impl RealOAuth {
+    /// One for this world, out of what the shell put on the environment.
     #[must_use]
-    pub fn new(dir: Option<PathBuf>, secrets: MemSecrets, clock: ClockSource) -> RealOAuth {
+    pub fn new(env: &Env) -> RealOAuth {
         RealOAuth {
-            dir,
-            secrets,
-            clock,
+            dir: env.db_dir.clone(),
+            backend: env.secrets_backend.clone(),
+            memory: env.secrets.clone(),
+            clock: env.clock.clone(),
             tokens: HashMap::new(),
         }
+    }
+
+    /// A secret store for one lookup, the way every other world gets one.
+    fn secrets(&self) -> Box<dyn Secrets> {
+        match &self.backend {
+            Some(f) => f.make(),
+            None => Box::new(self.memory.clone()),
+        }
+    }
+
+    /// The refresh token this address signed in with, from wherever the
+    /// sign-in's write went.
+    fn grant(&self, email: &str) -> Option<String> {
+        self.secrets().get(&oauth::refresh_key(email))
     }
 }
 
@@ -277,8 +297,7 @@ impl OAuth for RealOAuth {
             .ok_or("this run has no store directory, so no google client")?;
         let client = oauth::Client::load(&dir)?;
         let refresh = self
-            .secrets
-            .get(&oauth::refresh_key(email))
+            .grant(email)
             .ok_or_else(|| format!("{email} has no google grant — sign in again"))?;
         let (tok, until) = oauth::refresh(&client, oauth::GOOGLE, &refresh, now)?;
         self.tokens.insert(email.to_string(), (tok.clone(), until));
@@ -655,6 +674,44 @@ mod session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grant is looked for where the sign-in put it. The form files the
+    /// refresh token through the [`Secrets`] capability, and in a real run
+    /// that capability is the machine's keychain — so an `OAuth` reading the
+    /// shared in-memory map would refuse every real Gmail account with *no
+    /// google grant — sign in again*, however freshly it had signed in.
+    #[test]
+    fn the_grant_comes_from_the_store_the_sign_in_wrote_to() {
+        // Stands in for the platform store: a map of its own, reached only
+        // through the factory, exactly as the keychain is.
+        let platform = MemSecrets::new();
+        let handed = platform.clone();
+        let env = Env {
+            secrets_backend: Some(SecretsFactory::new(move || Box::new(handed.clone()))),
+            ..Env::default()
+        };
+        let oauth = RealOAuth::new(&env);
+        assert_eq!(oauth.grant("vera@gmail.com"), None, "nothing signed in yet");
+        platform.plant(&oauth::refresh_key("vera@gmail.com"), "1//refresh");
+        assert_eq!(oauth.grant("vera@gmail.com"), Some("1//refresh".into()));
+        // And the map the env also carries is not that place.
+        env.secrets
+            .plant(&oauth::refresh_key("ana@gmail.com"), "1//other");
+        assert_eq!(oauth.grant("ana@gmail.com"), None);
+    }
+
+    /// With no platform store — a scripted run, a build without one — the
+    /// shared map is where the capability wrote, and where the grant is read.
+    #[test]
+    fn with_no_platform_store_the_shared_map_holds_the_grant() {
+        let env = Env::default();
+        env.secrets
+            .plant(&oauth::refresh_key("vera@gmail.com"), "1//refresh");
+        assert_eq!(
+            RealOAuth::new(&env).grant("vera@gmail.com"),
+            Some("1//refresh".into())
+        );
+    }
 
     /// The five roles, off the names and the special-use attributes a server
     /// advertises. Gmail's all-mail view plays archive and says so.
