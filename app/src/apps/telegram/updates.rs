@@ -415,6 +415,12 @@ pub fn peer(user: &Value) -> Option<IncomingPeer> {
     })
 }
 
+/// Both chat objects and userFullInfo carry this nullable block list.
+/// A stories-only block does not prevent messages.
+pub fn blocked(value: &Value) -> bool {
+    value["block_list"]["@type"].as_str() == Some("blockListMain")
+}
+
 /// A user's display name: first and last joined, falling back to the username
 /// where a bot or a deleted account has no name at all.
 fn full_name(user: &Value) -> String {

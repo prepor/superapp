@@ -6,6 +6,7 @@
 //! where every navigation is.
 
 use makepad_widgets::*;
+use kernel::session::Session;
 
 use crate::shell::hosted::PanelProps;
 
@@ -22,6 +23,17 @@ pub struct PeerPanel {
 
 impl Widget for PeerPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::KeyDown(k) = event {
+            if k.key_code == KeyCode::Escape {
+                if let (Some(props), Some(s)) = (
+                    scope.props.get::<PanelProps>(), scope.data.get_mut::<Session>(),
+                ) {
+                    if s.focus() == Some(props.slot) {
+                        props.panel.borrow_mut().run("telegram.cancel", s);
+                    }
+                }
+            }
+        }
         self.view.handle_event(cx, event, scope);
     }
 
@@ -29,9 +41,10 @@ impl Widget for PeerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let card = {
+        let (card, prompt) = {
             let mut borrow = props.panel.borrow_mut();
-            borrow.as_any().downcast_mut::<Peer>().and_then(|p| p.card())
+            borrow.as_any().downcast_mut::<Peer>()
+                .map_or((None, None), |p| (p.card(), p.prompt()))
         };
         let Some(card) = card else {
             self.view.label(cx, ids!(name_lbl)).set_text(cx, "nobody");
@@ -43,6 +56,9 @@ impl Widget for PeerPanel {
         let kind_line = card.kind_line();
         self.view.label(cx, ids!(name_lbl)).set_text(cx, &card.name);
         self.view.label(cx, ids!(kind_lbl)).set_text(cx, &kind_line);
+        let prompt = prompt.unwrap_or_default();
+        self.view.label(cx, ids!(prompt_lbl)).set_visible(cx, !prompt.is_empty());
+        self.view.label(cx, ids!(prompt_lbl)).set_text(cx, &prompt);
         let phone = card.phone.clone().unwrap_or_default();
         self.view
             .view(cx, ids!(phone_wrap))
@@ -69,6 +85,10 @@ impl Widget for PeerPanel {
             props
                 .hits
                 .add(kind_line, r, MouseCursor::Default, props.slot);
+        }
+        if !prompt.is_empty() {
+            let r = self.view.label(cx, ids!(prompt_lbl)).area().rect(cx);
+            props.hits.add(prompt, r, MouseCursor::Default, props.slot);
         }
         step
     }

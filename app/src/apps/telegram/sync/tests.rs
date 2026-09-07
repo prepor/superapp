@@ -1772,6 +1772,48 @@ fn joining_deleting_and_the_draft_spell_their_requests() {
     }
 }
 
+#[test]
+fn block_state_survives_user_refreshes_and_tracks_chats_profiles_and_remote_unblocks() {
+    let acc = account(FakeTd::new(), None);
+    let w = world();
+    let blocked = || num(&w, "SELECT blocked FROM tg_peer WHERE id = 2");
+    let update = |kind: &str, list: serde_json::Value| json!({
+        "@type": kind, "chat_id": 2, "block_list": list,
+    }).to_string();
+
+    // The block can arrive before a person's name or any conversation.
+    acc.on_update(&w, &update("updateChatBlockList", json!({"@type": "blockListMain"})));
+    assert_eq!(blocked(), 1);
+    acc.on_update(&w, &user_update(2, "Vera", "Kovac", "vera"));
+    assert_eq!(blocked(), 1, "ordinary user updates do not carry block state");
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat"), 0);
+
+    let mut chat: serde_json::Value = serde_json::from_str(&private_chat_update(2, "Vera", 0)).unwrap();
+    chat["chat"]["block_list"] = json!({"@type": "blockListMain"});
+    acc.on_update(&w, &chat.to_string());
+    assert_eq!(blocked(), 1, "initial chat snapshots include existing blocks");
+    acc.on_update(&w, &update("updateChatBlockList", json!(null)));
+    assert_eq!(blocked(), 0, "unblocking on another device is visible here");
+
+    acc.on_update(&w, &json!({
+        "@type": "updateUserFullInfo", "user_id": 2,
+        "user_full_info": {"@type": "userFullInfo", "block_list": {"@type": "blockListMain"}},
+    }).to_string());
+    assert_eq!(blocked(), 1);
+    acc.on_update(&w, &json!({
+        "@type": "userFullInfo", "@extra": "user_full_info:2",
+        "block_list": {"@type": "blockListStories"},
+    }).to_string());
+    assert_eq!(blocked(), 0, "hiding stories does not block messages");
+
+    // Removing a contact elsewhere updates the address book but keeps the peer/chat.
+    let mut user: serde_json::Value = serde_json::from_str(&user_update(2, "Vera", "Kovac", "vera")).unwrap();
+    user["user"]["is_contact"] = json!(false);
+    acc.on_update(&w, &user.to_string());
+    assert_eq!(num(&w, "SELECT is_contact FROM tg_peer WHERE id = 2"), 0);
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_chat WHERE peer = 2"), 1);
+}
+
 /// A file that is not the engine's own — the account holder's picture,
 /// which TDLib names as the local copy of the photo it is sending — is
 /// copied into the cache and left exactly where it was. Moving it would

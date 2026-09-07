@@ -9,7 +9,7 @@ use kernel::search::{Abandoned, Hit, Provider};
 use kernel::store::{Q, Store};
 
 use super::model::{self, first_name, one_line, PeerId, PeerKind};
-use super::panels::Chat;
+use super::panels::{Chat, Peer};
 
 /// How many messages one question is worth showing.
 const LIMIT: i64 = 100;
@@ -17,7 +17,7 @@ const LIMIT: i64 = 100;
 static Q_NAMES: Q = Q {
     id: "tg search names",
     sql: "SELECT p.id, p.kind, p.name, COALESCE(p.username, ''), COALESCE(p.status, ''),
-                 p.is_self, p.is_contact, c.peer IS NOT NULL
+                 p.is_self, p.is_contact, c.peer IS NOT NULL, p.blocked
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           ORDER BY p.name",
     describe: "every peer's name, kind and presence, for the search panel",
@@ -32,6 +32,7 @@ struct Named {
     is_self: bool,
     is_contact: bool,
     has_chat: bool,
+    blocked: bool,
 }
 
 fn named_row(r: &rusqlite::Row) -> rusqlite::Result<Named> {
@@ -44,6 +45,7 @@ fn named_row(r: &rusqlite::Row) -> rusqlite::Result<Named> {
         is_self: r.get::<_, i64>(5)? != 0,
         is_contact: r.get::<_, i64>(6)? != 0,
         has_chat: r.get::<_, i64>(7)? != 0,
+        blocked: r.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -79,20 +81,21 @@ impl Provider for TelegramSearch {
 }
 
 /// The peers whose name or username carries every word. A person out of
-/// the address book with no chat is not offered: nothing could be opened on
-/// them but an empty page. A person opens as their chat, a group or a
-/// channel too; saved messages is the chat with oneself.
+/// the address book with no chat is offered only while blocked, so their
+/// profile still provides a way to unblock them after deleting the chat.
 fn matching_names(store: &Store, terms: &[String]) -> Vec<Hit> {
     store
         .rows(&Q_NAMES, &[], named_row)
         .iter()
-        .filter(|n| n.is_self || n.is_contact || n.has_chat)
+        .filter(|n| n.is_self || n.is_contact || n.has_chat || n.blocked)
         .filter(|n| {
             kernel::search::matches(terms, &[&n.name, &n.username, n.kind.as_str()])
         })
         .map(|n| {
             let detail = if n.is_self {
                 "saved messages".to_string()
+            } else if n.blocked {
+                "blocked".to_string()
             } else {
                 match n.kind {
                     PeerKind::Person => model::presence(Some(n.status.as_str())),
@@ -100,7 +103,8 @@ fn matching_names(store: &Store, terms: &[String]) -> Vec<Hit> {
                     PeerKind::Channel => "channel".to_string(),
                 }
             };
-            Hit::found(&n.name, detail, Chat::id(n.id))
+            let target = if n.blocked && !n.has_chat { Peer::id(n.id) } else { Chat::id(n.id) };
+            Hit::found(&n.name, detail, target)
         })
         .collect()
 }

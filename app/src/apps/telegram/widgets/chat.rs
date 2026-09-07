@@ -350,7 +350,7 @@ impl Widget for ChatPanel {
                     }
                     // Enter is the way into the composer from the lines, as
                     // the placeholder says, and so is tab.
-                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab => {
+                    KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Tab if can_post(&props) => {
                         field.set_key_focus(cx);
                         self.view.redraw(cx);
                     }
@@ -545,8 +545,19 @@ impl Widget for ChatPanel {
         let can_post = card.as_ref().is_none_or(model::PeerCard::can_post);
         self.view.view(cx, COMPOSER).set_visible(cx, can_post);
         self.view.label(cx, CANNOT).set_visible(cx, !can_post);
+        self.view.label(cx, CANNOT).set_text(cx,
+            if card.as_ref().is_some_and(|c| c.blocked) {
+                "unblock this user to send messages"
+            } else {
+                "you can't post here"
+            }
+        );
         let field = self.view.text_input(cx, INPUT);
         // The bar is drawn off what the widget said this draw.
+        if !can_post && field.key_focus(cx) {
+            self.refocus = false;
+            leave_field(cx, &self.view);
+        }
         if field.key_focus(cx) {
             props.chord.field(Letters::TEXT);
         }

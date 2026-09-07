@@ -827,6 +827,11 @@ script_mod! {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
             draw_text +: { color: #5a5a5a }
         }
+        prompt_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, height: Fit, text: ""
+            draw_text +: { color: #a01500 }
+        }
         phone_wrap := View {
             visible: false
             width: Fill, height: Fit

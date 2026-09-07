@@ -527,6 +527,10 @@ impl Chat {
     /// toast says what would leave. The composer is emptied the way a send
     /// always empties it, wire or no.
     pub fn send(&mut self, s: &mut Session) {
+        if model::peer(&self.store, self.peer).is_some_and(|c| c.blocked) {
+            s.notify("unblock this user before sending a message", false);
+            return;
+        }
         if let Some(e) = self.editing.take() {
             let text = e.text.trim().to_string();
             if !text.is_empty() && text != e.original {
@@ -771,6 +775,7 @@ impl Panel for Chat {
     /// its search. With marks: `forward n`, `delete n` while every marked
     /// line is mine, and `clear`.
     fn verbs(&self) -> Vec<Verb> {
+        let blocked = model::peer(&self.store, self.peer).is_some_and(|c| c.blocked);
         let n = self.marks.len();
         let k = self.carrying.len();
         let hist = self.history();
@@ -778,9 +783,13 @@ impl Panel for Chat {
         let mut v = Vec::new();
         if n == 0 {
             if let Some(m) = under {
-                v.push(Verb::run("telegram.reply", "reply", Some('r')));
+                if !blocked {
+                    v.push(Verb::run("telegram.reply", "reply", Some('r')));
+                }
                 if m.out {
-                    v.push(Verb::run("telegram.edit", "edit", Some('e')));
+                    if !blocked {
+                        v.push(Verb::run("telegram.edit", "edit", Some('e')));
+                    }
                     v.push(Verb::run("telegram.delete", "delete", Some('d')));
                 }
                 // A reply's original, to jump to — the way a press on the
@@ -791,16 +800,22 @@ impl Panel for Chat {
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
             }
         }
-        v.push(Verb::go(
-            "telegram.attach",
-            if k == 0 { "attach".to_string() } else { format!("attach {k}") },
-            Some('h'),
-            Nav::Open {
-                from: self.slot,
-                id: Attach::id(self.peer),
-                fresh: false,
-            },
-        ));
+        if blocked {
+            if !runtime::of(&self.store).peer_action_pending(self.peer) {
+                v.push(Verb::run("telegram.unblock", "unblock user", Some('b')));
+            }
+        } else {
+            v.push(Verb::go(
+                "telegram.attach",
+                if k == 0 { "attach".to_string() } else { format!("attach {k}") },
+                Some('h'),
+                Nav::Open {
+                    from: self.slot,
+                    id: Attach::id(self.peer),
+                    fresh: false,
+                },
+            ));
+        }
         if let Some(m) = under {
             v.push(Verb::go(
                 "telegram.line",
@@ -839,6 +854,7 @@ impl Panel for Chat {
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
+            "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.reply" => {
                 if let Some(c) = self.cursor {
                     self.reply(c);

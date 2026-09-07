@@ -10,6 +10,7 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use kernel::store::Store;
 
 use super::model::{MsgId, PeerId};
+use super::requests::PeerAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
@@ -30,6 +31,8 @@ struct State {
     loading: Vec<PeerId>,
     list_syncing: bool,
     wanted: Wanted,
+    peer_actions: Vec<(PeerId, PeerAction)>,
+    notices: Vec<(String, bool)>,
 }
 
 /// Work requested since the last worker pass. Deduplicated at enqueue time.
@@ -62,6 +65,35 @@ impl Runtime {
             .sender
             .as_ref()
             .is_some_and(|sender| sender.send(request.to_string()).is_ok())
+    }
+
+    /// Serialize profile actions for each person until their reply arrives.
+    pub fn send_peer_action(&self, peer: PeerId, action: PeerAction) -> bool {
+        let mut state = self.state();
+        if state.peer_actions.iter().any(|(id, _)| *id == peer) {
+            return false;
+        }
+        if state.sender.as_ref().is_none_or(|s| s.send(action.request(peer)).is_err()) {
+            return false;
+        }
+        state.peer_actions.push((peer, action));
+        true
+    }
+
+    pub fn peer_action_pending(&self, peer: PeerId) -> bool {
+        self.state().peer_actions.iter().any(|(id, _)| *id == peer)
+    }
+
+    pub fn finish_peer_action(&self, peer: PeerId, action: PeerAction) {
+        self.state().peer_actions.retain(|p| *p != (peer, action));
+    }
+
+    pub fn notice(&self, text: String, error: bool) {
+        self.state().notices.push((text, error));
+    }
+
+    pub fn take_notices(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.state().notices)
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {
