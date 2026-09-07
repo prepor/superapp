@@ -400,15 +400,6 @@ impl Widget for ChatPanel {
         super::text::handle_event(&mut self.view, cx, event, scope);
         self.mount(cx, &props, scope);
 
-        // A verb moved the cursor — to a reply's original or back to the
-        // reply — and asked for it on screen.
-        if self.mounted {
-            if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
-                self.follow(cx, id);
-                self.view.redraw(cx);
-            }
-        }
-
         // A press on the composer's field takes the keyboard, the way a
         // press on any field does. Makepad's own TextInput grabs focus off
         // its finger-hit path, which a synthesized press does not drive, and
@@ -537,6 +528,14 @@ impl Widget for ChatPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = render.now;
+        // A bar action runs after this widget handles its input event.
+        // Take its navigation request on the first draw it invalidated,
+        // without waiting for another key, pointer event or timer tick.
+        if self.mounted {
+            if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
+                self.reveal.request(id);
+            }
+        }
         self.view
             .label(cx, ids!(drop_hint))
             .set_visible(cx, self.dragging_files);
@@ -684,7 +683,6 @@ impl Widget for ChatPanel {
         let portal = self.view.widget(cx, LIST).as_portal_list();
         if self.reveal.apply(cx, &portal, target_index, target_rect) {
             self.anchor = None;
-            self.view.redraw(cx);
         }
 
         // The hits, once the rows have landed: every line is addressable by

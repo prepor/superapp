@@ -73,9 +73,12 @@ jobs:
       #
       # `e2e/sync/` is not in it: those walks are two devices over one
       # bucket, so each needs a second process and a `bucketd` beside it.
+      # First check a reveal with no replay timer or forced draw loop;
+      # continuously drawn UI suites can hide a missing redraw request.
       - name: e2e
         env:
           MAKEPAD: headless
         run: |
+          cargo test --locked -p superapp --lib --no-default-features shell::widgets::reveal::tests::revealing_schedules_its_own_draws -- --exact
           cargo build --locked -p superapp --no-default-features
           ./e2e/run-all.sh

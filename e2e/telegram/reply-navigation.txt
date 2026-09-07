@@ -25,7 +25,8 @@ wait 400
 # Only the reply under the cursor offers original. Replying at the other
 # end proves that the jump selected the message the quote names.
 click "original"
-wait 400
+wait 50
+visible "Vera Kovac: see you at 7:30 then?"
 click "reply"
 wait 400
 click "reply to Vera Kovac: see you at 7:30 then?"
@@ -36,11 +37,11 @@ key esc
 wait 300
 
 # Reading elsewhere does not lose the return point. Back must scroll as
-# well as select: the reply's row resolves only when it is drawn again.
+# well as select, within a few frames rather than waiting for a later event.
 key home
 wait 400
 click "back"
-wait 400
+wait 50
 visible "me: yes — the trailhead car park"
 accel "original" o
 accel "copy" c
@@ -48,9 +49,9 @@ accel "about" a
 click "me: yes — the trailhead car park"
 wait 300
 click "original"
-wait 400
+wait 50
 click "back"
-wait 400
+wait 50
 visible "me: yes — the trailhead car park"
 accel "original" o
 accel "copy" c
@@ -67,16 +68,16 @@ wait 300
 type "still writing"
 wait 300
 key cmd+b
-wait 400
+wait 50
 visible "me: yes — the trailhead car park"
 accel "original" o
 accel "copy" -
 accel "about" -
 shot reply-returned
 click "original"
-wait 400
+wait 50
 click "back"
-wait 400
+wait 50
 visible "me: yes — the trailhead car park"
 accel "original" o
 accel "copy" c

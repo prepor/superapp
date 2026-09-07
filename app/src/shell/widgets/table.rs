@@ -721,9 +721,7 @@ impl<S: RowSpec> TableView<S> {
             drawn.iter().find(|(idx, ..)| *idx == target).map(|(_, _, w, ..)| w.area().rect(cx))
         });
         let portal = view.widget(cx, LIST).as_portal_list();
-        if self.reveal.apply(cx, &portal, target, target_rect) {
-            view.redraw(cx);
-        }
+        self.reveal.apply(cx, &portal, target, target_rect);
 
         // The hits: the filter, then every row by the label the panel gives
         // it. Later hits win where they overlap, so the completion's rows —

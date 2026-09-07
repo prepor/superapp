@@ -101,6 +101,8 @@ Virtual lists reveal a requested row by its measured rectangle. The request
 remains pending until a draw confirms the row is visible, so different row
 heights and a bar wrapping to another line cannot strand the cursor outside
 the viewport. The transcript and shared tables use the same reveal helper.
+The helper explicitly schedules its next paint from inside the draw, so a
+quiet application finishes the reveal without waiting for another input event.
 
 Two more rules hold, and a debug build asserts both on every draw:
 
