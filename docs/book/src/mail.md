@@ -116,7 +116,10 @@ A message panel shows the whole conversation oldest first, deduplicated by
 The deleted letters are left out of it — a conversation is what is left of it
 — unless the letter the panel was opened on is itself in the trash, and then
 it is drawn whole: the deleted letters beside the ones still filed, which is
-the conversation you asked to see.
+the conversation you asked to see. Where a letter has two copies, the one that
+stands for it is never the deleted one, and then it is the copy outside Sent:
+what was deleted is the copy that came back through the list, not the letter.
+That choice is also what a verb over the conversation acts on.
 The TO line of its first letter is at the top: the account's own address for a
 conversation that came in, and the person it went to for one this mailbox
 started — a letter's recipients are read off its own `To` header and kept on

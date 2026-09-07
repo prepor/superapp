@@ -828,7 +828,7 @@ pub fn thread(store: &Store, id: MailId) -> Vec<ThreadMail> {
     for m in rows.iter() {
         if !m.message_id.is_empty() {
             if let Some(i) = out.iter().position(|o| o.message_id == m.message_id) {
-                if out[i].role == "sent" && m.role != "sent" {
+                if stands_for(&m.role, &out[i].role) {
                     out[i] = m.clone();
                 }
                 continue;
@@ -837,6 +837,26 @@ pub fn thread(store: &Store, id: MailId) -> Vec<ThreadMail> {
         out.push(m.clone());
     }
     out
+}
+
+/// Which of two copies of one letter — the same `Message-ID` in two folders
+/// — the conversation shows, and so which one a verb over the conversation
+/// acts on.
+///
+/// A deleted copy never stands for a filed one, whichever arrives first: I
+/// deleted the copy that came back through the list, not the letter. Between
+/// the rest the copy outside Sent wins, so my own reply reads in the folder
+/// it came back to. Only a conversation read out of the trash has a deleted
+/// copy to weigh at all.
+fn stands_for(role: &str, over: &str) -> bool {
+    fn rank(role: &str) -> u8 {
+        match role {
+            "trash" => 0,
+            "sent" => 1,
+            _ => 2,
+        }
+    }
+    rank(role) > rank(over)
 }
 
 /// A conversation's subject, off its oldest mail, reply prefixes stripped.
