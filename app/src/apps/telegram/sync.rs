@@ -471,6 +471,14 @@ impl<T: Td> Account<T> {
                 self.on_file(w, &v);
                 self.on_file_answer(w, &v);
             }
+            Some("availableReactions") => {
+                if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
+                    runtime::of(w.store()).finish_reaction(
+                        id,
+                        runtime::ReactionResult::Choices(updates::available_reactions(&v)),
+                    );
+                }
+            }
             // A refreshed source message lands like a new line before its
             // viewer starts downloading the file registered by that message.
             Some("message") => {
@@ -692,6 +700,17 @@ impl<T: Td> Account<T> {
                 .is_some_and(|e| e.starts_with("load_chats:"))
         {
             runtime::of(w.store()).set_list_syncing(false);
+            return;
+        }
+        if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
+            let result = if failed {
+                runtime::ReactionResult::Error(
+                    v["message"].as_str().unwrap_or("reaction request failed").to_string(),
+                )
+            } else {
+                runtime::ReactionResult::Added
+            };
+            runtime::of(w.store()).finish_reaction(id, result);
             return;
         }
         match (v["@extra"].as_str(), failed) {

@@ -98,6 +98,46 @@ pub(super) fn load_chats(list: ChatList) -> String {
     .to_string()
 }
 
+// -- reactions ----------------------------------------------------------------
+
+/// Available reactions for this particular message, in Telegram's preferred
+/// order. The correlation id belongs to the panel's in-memory picker.
+#[must_use]
+pub fn get_message_available_reactions(chat: PeerId, msg: MsgId, request: u64) -> String {
+    json!({
+        "@type": "getMessageAvailableReactions",
+        "chat_id": chat,
+        "message_id": msg,
+        "row_size": 6,
+        "@extra": format!("reactions:{request}"),
+    })
+    .to_string()
+}
+
+/// Add one ordinary emoji. The interaction-info update supplies Telegram's
+/// resulting counts.
+#[must_use]
+pub fn add_message_reaction(chat: PeerId, msg: MsgId, emoji: &str, request: u64) -> String {
+    json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat,
+        "message_id": msg,
+        "reaction_type": {"@type": "reactionTypeEmoji", "emoji": emoji},
+        "is_big": false,
+        "update_recent_reactions": true,
+        "@extra": format!("reaction:{request}"),
+    })
+    .to_string()
+}
+
+pub(super) fn parse_reaction_extra(extra: &str) -> Option<u64> {
+    extra
+        .strip_prefix("reactions:")
+        .or_else(|| extra.strip_prefix("reaction:"))?
+        .parse()
+        .ok()
+}
+
 // -- the content verbs, live ---------------------------------------------------
 //
 // The phase-4 requests: the composer's send, reply and edit, and a line's

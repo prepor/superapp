@@ -20,6 +20,17 @@ pub struct Forward {
     pub ids: Vec<MsgId>,
 }
 
+/// A reaction picker waits in memory for either the available emoji or the
+/// acknowledgement of its choice. Closing the picker drops the reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionResult {
+    Choices(Vec<String>),
+    Added,
+    Error(String),
+}
+
+pub type ReactionReply = Arc<Mutex<Option<ReactionResult>>>;
+
 #[derive(Default)]
 pub struct Runtime {
     state: Mutex<State>,
@@ -43,6 +54,8 @@ struct State {
     downloads: HashMap<String, DownloadProgress>,
     connection_status: Option<String>,
     wanted: Wanted,
+    next_reaction: u64,
+    reactions: HashMap<u64, Weak<Mutex<Option<ReactionResult>>>>,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
 }
@@ -208,6 +221,24 @@ impl Runtime {
 
     pub fn take_notices(&self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.state().notices)
+    }
+
+    /// Each request has its own reply, even when two panels show the same
+    /// message. Late answers cannot change a newer picker or another store.
+    pub fn await_reaction(&self) -> (u64, ReactionReply) {
+        let reply = Arc::new(Mutex::new(None));
+        let mut state = self.state();
+        state.reactions.retain(|_, reply| reply.strong_count() > 0);
+        state.next_reaction += 1;
+        let id = state.next_reaction;
+        state.reactions.insert(id, Arc::downgrade(&reply));
+        (id, reply)
+    }
+
+    pub fn finish_reaction(&self, id: u64, result: ReactionResult) {
+        if let Some(reply) = self.state().reactions.remove(&id).and_then(|r| r.upgrade()) {
+            *reply.lock().expect("reaction reply") = Some(result);
+        }
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {

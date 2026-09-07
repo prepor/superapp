@@ -138,6 +138,22 @@ returned an error. Pending or uncertain delivery must not trigger an automatic
 second send. Operation ids last for the current app session; completed send
 results remain queryable after their status line disappears.
 
+## Reactions
+
+Select a message and choose **react** in the chat's bar, or use **react** on
+its line card. The bar shows the ordinary emoji Telegram allows for that
+message, six at a time; **more** and **back** move through them. Choose an
+emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
+cursor also closes it. Service messages and pending or failed sends do not
+offer reactions, and marking messages keeps the batch actions on the bar.
+
+The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
+and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
+requests. Counts follow the server's interaction updates. A refused request
+shows **reaction failed** (click for the reason) and **retry**. Offline demos
+offer a small fixture list and show a toast when an emoji is chosen.
+Custom emoji and paid reactions are not offered.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

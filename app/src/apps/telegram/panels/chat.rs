@@ -30,6 +30,7 @@ use super::super::model::{
     self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, Player, RUN_GAP,
 };
 use super::super::{requests, runtime, verbs};
+use super::reactions::{self, Reactions};
 use super::{wire, Attach, Chats, Line, Peer};
 
 /// An edit under way in the composer: which of my lines, what it said, and
@@ -110,6 +111,7 @@ pub struct Chat {
     wants_field: bool,
     /// The one line playing, or paused: a chat plays one thing at a time.
     player: Option<Player>,
+    reactions: Reactions,
 }
 
 impl Chat {
@@ -281,7 +283,19 @@ impl Chat {
     }
 
     pub fn set_cursor(&mut self, id: MsgId) {
+        if self.cursor != Some(id) {
+            self.cancel_reactions();
+        }
         self.cursor = Some(id);
+    }
+
+    /// Escape closes the reaction picker before touching the draft or marks.
+    pub fn cancel_reactions(&mut self) -> bool {
+        self.reactions.cancel()
+    }
+
+    pub fn poll_reactions(&mut self) -> bool {
+        self.reactions.poll()
     }
 
     /// Steps the cursor over the messages, `d` rows: from nothing, either
@@ -301,7 +315,7 @@ impl Chat {
             Some(i) => (i as isize + d).clamp(0, ids.len() as isize - 1) as usize,
             None => ids.len() - 1,
         };
-        self.cursor = Some(ids[at]);
+        self.set_cursor(ids[at]);
         self.cursor
     }
 
@@ -312,6 +326,7 @@ impl Chat {
 
     /// Space: the mark on the cursor's line, toggled.
     pub fn toggle_mark(&mut self) {
+        self.cancel_reactions();
         let Some(c) = self.cursor else { return };
         if !self.marks.remove(&c) {
             self.marks.insert(c);
@@ -321,6 +336,7 @@ impl Chat {
     /// Shift with an arrow: the line left and the line landed on, both
     /// marked.
     pub fn mark_range(&mut self, d: isize) {
+        self.cancel_reactions();
         if let Some(c) = self.cursor {
             self.marks.insert(c);
         }
@@ -1034,7 +1050,7 @@ impl Panel for Chat {
         self.slot = slot;
     }
 
-    /// What a chat is for, over the line under the cursor: `reply`, `copy`,
+    /// What a chat is for, over the line under the cursor: `reply`, `copy`, `react`,
     /// and on a line of mine `edit` and `delete` — none of them while there
     /// is no cursor, or while rows are marked and the batch has the bar. Then
     /// three links to the rest: `attach`, what goes with the next message
@@ -1046,6 +1062,9 @@ impl Panel for Chat {
     /// the saved replies have been retraced, even while rows are marked.
     fn verbs(&self) -> Vec<Verb> {
         let blocked = self.blocked();
+        if let Some(verbs) = self.reactions.verbs() {
+            return verbs;
+        }
         let n = self.marks.len();
         let k = self.carrying.len();
         let hist = self.history();
@@ -1090,6 +1109,9 @@ impl Panel for Chat {
                     v.push(Verb::run("telegram.original", "original", Some('o')));
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
+                if reactions::can_react(m) {
+                    v.push(Verb::run("telegram.react", "react", None));
+                }
             }
         }
         if blocked {
@@ -1147,8 +1169,17 @@ impl Panel for Chat {
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.reactions.run(&self.store, verb, s) {
+            return;
+        }
         match verb {
             "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
+            "telegram.react" if self.marks.is_empty() => {
+                if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, self.peer, id)) {
+                    self.reactions.open(&self.store, &m);
+                    s.redraw();
+                }
+            }
             "telegram.reply" => {
                 if let Some(c) = self.cursor {
                     if self.reply(c) {
@@ -1377,6 +1408,7 @@ impl PanelKind for ChatKind {
             carrying: Vec::new(),
             wants_field: false,
             player: None,
+            reactions: Reactions::default(),
         })
     }
 }

@@ -216,6 +216,13 @@ impl Widget for ChatPanel {
             self.view.redraw(cx);
         }
 
+        if with_chat(&props, Chat::poll_reactions).unwrap_or(false) {
+            self.view.redraw(cx);
+            if let Some(s) = scope.data.get_mut::<Session>() {
+                s.redraw();
+            }
+        }
+
         let field = self.view.text_input(cx, INPUT);
         // The panel taking focus puts the caret in the composer, the way
         // the client starts in its input: `enter` on the list's row, the
@@ -265,6 +272,15 @@ impl Widget for ChatPanel {
 
         let focused = field.key_focus(cx);
         if let Event::KeyDown(k) = event {
+            if has_focus && k.key_code == KeyCode::Escape
+                && with_chat(&props, Chat::cancel_reactions).unwrap_or(false)
+            {
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
             if focused {
                 match k.key_code {
                     // Enter sends; shift+enter is the field's newline, and

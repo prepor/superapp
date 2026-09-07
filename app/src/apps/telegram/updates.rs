@@ -165,6 +165,31 @@ pub struct Interaction {
     pub reactions: Option<String>,
 }
 
+/// Ordinary emoji available to this user, preserving Telegram's ordering.
+/// Custom emoji need their own renderer; paid reactions use a separate API.
+#[must_use]
+pub fn available_reactions(v: &Value) -> Vec<String> {
+    if !v["unavailability_reason"].is_null() {
+        return Vec::new();
+    }
+    let mut emojis = Vec::new();
+    for key in ["top_reactions", "recent_reactions", "popular_reactions"] {
+        for reaction in v[key].as_array().into_iter().flatten() {
+            if reaction["needs_premium"].as_bool() == Some(true)
+                || reaction["type"]["@type"].as_str() != Some("reactionTypeEmoji")
+            {
+                continue;
+            }
+            if let Some(emoji) = reaction["type"]["emoji"].as_str().filter(|e| !e.is_empty()) {
+                if !emojis.iter().any(|e| e == emoji) {
+                    emojis.push(emoji.to_string());
+                }
+            }
+        }
+    }
+    emojis
+}
+
 /// `updateMessageInteractionInfo`: a channel post counted again, a reaction
 /// added or taken back. Unlike a peer's counts this is the whole picture —
 /// TDLib sends the `interaction_info` entire, and `null` where a line has

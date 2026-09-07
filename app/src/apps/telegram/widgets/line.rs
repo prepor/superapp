@@ -37,6 +37,27 @@ impl Widget for LinePanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+            .is_some_and(Line::poll_reactions);
+        if changed {
+            self.view.redraw(cx);
+            if let Some(s) = scope.data.get_mut::<Session>() {
+                s.redraw();
+            }
+        }
+        if matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape)
+            && scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot))
+        {
+            let cancelled = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+                .is_some_and(Line::cancel_reactions);
+            if cancelled {
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
+        }
         let Event::MouseDown(e) = event else { return };
         if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
             return;

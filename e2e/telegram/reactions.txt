@@ -1,0 +1,47 @@
+# args:
+# env:
+# The chat and line card share a reaction picker in their action bar.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+click "Ivan Petrov: meeting moved to 15:00"
+wait 400
+click "react"
+wait 400
+shot reactions-chat
+click "more"
+wait 300
+click "back"
+wait 300
+click "👍"
+wait 400
+# Choosing a fixture emoji closes the picker; the normal actions return.
+click "react"
+wait 300
+key esc
+wait 300
+click "react"
+wait 300
+click "cancel"
+wait 300
+click "line"
+wait 900
+click "react"
+wait 300
+shot reactions-card
+key esc
+wait 300
+click "react"
+wait 300
+click "❤️"
+wait 400
+click "react"
+wait 300
+click "cancel"
+quit
