@@ -106,17 +106,13 @@ impl Widget for AttachmentPanel {
         }) {
             Read::Text(t) => Preview::Text(t),
             Read::Image(b) => Preview::Image(b),
+            Read::None if waiting => Preview::Loading,
             Read::None => Preview::None,
         };
         let (id, status) = (r.id, r.status);
         let shown = Shown { id, source, waiting };
         if self.shown.as_ref() != Some(&shown) {
             card::fill(cx, &self.view, &data);
-            // Still coming is not the same as never: the line only claims
-            // there is nothing to show once the answer is in.
-            if waiting {
-                self.view.label(cx, ids!(none_lbl)).set_visible(cx, false);
-            }
             self.shown = Some(shown);
         }
         let lbl = self.view.label(cx, STATUS);

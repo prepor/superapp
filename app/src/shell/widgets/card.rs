@@ -33,6 +33,8 @@ pub struct CardData {
 /// What there is to show of a file's contents.
 #[derive(Debug, Clone, Default)]
 pub enum Preview {
+    /// The contents are being retrieved in the background.
+    Loading,
     /// The first however-many bytes of a text file, in the app's one face.
     Text(String),
     /// A picture, as bytes: decoded here, by the two magic numbers below.
@@ -90,7 +92,7 @@ pub fn fill(cx: &mut Cx, card: &View, d: &CardData) {
 
     let text = match &d.preview {
         Preview::Text(t) => Some(t.as_str()),
-        Preview::Image(_) | Preview::None => None,
+        Preview::Loading | Preview::Image(_) | Preview::None => None,
     };
     // A picture the decoder refuses is a card with no preview, not a card
     // with an empty box: the bytes were read, and they were not one.
@@ -102,8 +104,13 @@ pub fn fill(cx: &mut Cx, card: &View, d: &CardData) {
         .set_text(cx, text.unwrap_or(""));
     card.view(cx, ids!(text_box)).set_visible(cx, text.is_some());
     card.view(cx, ids!(img_box)).set_visible(cx, image);
-    card.label(cx, ids!(none_lbl))
-        .set_visible(cx, text.is_none() && !image);
+    let placeholder = card.label(cx, ids!(none_lbl));
+    placeholder.set_text(cx, if matches!(d.preview, Preview::Loading) {
+        "loading preview…"
+    } else {
+        "no preview — open shows it"
+    });
+    placeholder.set_visible(cx, text.is_none() && !image);
 }
 
 /// The picture into the card's own image box, through makepad's image
