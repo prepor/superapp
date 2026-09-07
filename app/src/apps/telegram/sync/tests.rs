@@ -291,6 +291,45 @@ fn new_message(id: i64, chat: i64, sender: Option<i64>, text: &str) -> String {
     .to_string()
 }
 
+#[test]
+fn links_survive_projection_and_follow_content_edits_in_their_own_chat() {
+    use crate::apps::telegram::{model, text};
+
+    let td = FakeTd::new();
+    let acc = account(td, None);
+    let w = world();
+    let mut update: serde_json::Value = serde_json::from_str(&new_message(70, -1008, None, "👋 read this")).unwrap();
+    let entities = json!([{"offset": 3, "length": 9,
+        "type": {"@type": "textEntityTypeTextUrl", "url": "https://example.org/first"}}]);
+    update["message"]["content"]["text"]["entities"] = entities.clone();
+    acc.on_update(&w, &update.to_string());
+    // The same Telegram message id may belong to another chat too.
+    update["message"]["chat_id"] = json!(-1009);
+    acc.on_update(&w, &update.to_string());
+    let reading = |chat| {
+        let history = model::history(w.store(), chat);
+        let message = &history[0];
+        text::html(&message.text, &message.entities)
+    };
+    assert!(reading(-1008).contains("href=\"https://example.org/first\""));
+
+    // A resync replaces the target even when the visible text is identical.
+    update["message"]["chat_id"] = json!(-1008);
+    update["message"]["content"]["text"]["entities"][0]["type"]["url"] = json!("https://example.org/second");
+    acc.on_update(&w, &update.to_string());
+    assert!(reading(-1008).contains("href=\"https://example.org/second\""));
+
+    // Switching from text to a media caption retains the new caption entities.
+    let mut edit = json!({"@type": "updateMessageContent", "chat_id": -1008, "message_id": 70,
+        "new_content": {"@type": "messagePhoto", "caption": {"text": "👋 read this", "entities": entities}, "photo": {"sizes": []}}});
+    acc.on_update(&w, &edit.to_string());
+    assert!(reading(-1008).contains("href=\"https://example.org/first\""));
+    edit["new_content"]["caption"]["entities"] = json!([]);
+    acc.on_update(&w, &edit.to_string());
+    assert!(!reading(-1008).contains("<a "));
+    assert!(reading(-1009).contains("href=\"https://example.org/first\""));
+}
+
 /// An `updateNewMessage` carrying a photo whose file has the given remote
 /// unique id — the blob-cache key the row must resolve through.
 fn photo_message(id: i64, chat: i64, sender: i64, uid: &str) -> String {

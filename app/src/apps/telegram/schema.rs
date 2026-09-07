@@ -27,8 +27,13 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V6),
         Step::Run(v7_listing),
         Step::Sql(V8),
+        Step::Sql(V9),
     ],
 };
+
+// Existing cached text remains readable and can detect bare URLs locally.
+// New updates retain their entities, including destinations behind labels.
+const V9: &str = "ALTER TABLE tg_message ADD COLUMN entities TEXT NOT NULL DEFAULT '[]'";
 
 const V1: &str = "
 CREATE TABLE tg_peer(
@@ -525,6 +530,33 @@ pub fn set_session(
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+
+    #[test]
+    fn v9_keeps_cached_messages_and_their_search_index() {
+        let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..8] };
+        let c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        old.apply(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'Links');
+             INSERT INTO tg_chat(peer) VALUES(10);
+             INSERT INTO tg_message(id, chat, date, text) VALUES(1, 10, 1.0, 'cached https://example.org');"
+        ).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        let (text, entities): (String, String) = c.query_row(
+            "SELECT text, entities FROM tg_message WHERE chat = 10 AND id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?))
+        ).unwrap();
+        assert_eq!(text, "cached https://example.org");
+        assert_eq!(entities, "[]");
+        assert!(super::super::text::html(&text, &[]).contains("<a href="));
+        let matches: i64 = c.query_row(
+            "SELECT COUNT(*) FROM tg_message_fts WHERE tg_message_fts MATCH 'cached'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(matches, 1);
+    }
 
     /// The upgrade path a fresh store never walks: a store already carrying
     /// V1's messages runs only V2, and its `'rebuild'` must catch the lines

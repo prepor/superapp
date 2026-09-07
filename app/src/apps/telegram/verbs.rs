@@ -21,16 +21,19 @@ pub fn edit_line(
     after: &str,
 ) {
     let (before, after) = (before.to_string(), after.to_string());
+    let before_entities = model::history(s.store(), chat).iter()
+        .find(|m| m.id == msg).map(|m| m.entities.clone()).unwrap_or_default();
     let write = after.clone();
     let _ = s.act(
         Action::writing("edit", format!("edit “{}”", short(&before)), move |tx| {
-            model::edit_tx(tx, chat, msg, &write, true)
+            model::edit_tx(tx, chat, msg, &write, true, &[])
         })
         .about(format!("chat:{chat}"))
         .claiming(vec![Box::new(Edited {
             chat,
             msg,
             before,
+            before_entities,
             was_edited,
             after,
         })]),
@@ -78,6 +81,7 @@ struct Edited {
     chat: PeerId,
     msg: MsgId,
     before: String,
+    before_entities: Vec<super::text::Entity>,
     was_edited: bool,
     after: String,
 }
@@ -89,15 +93,16 @@ impl Intent for Edited {
 
     fn reverse(&self, w: &World) -> Result<(), String> {
         let (chat, msg, text, was) = (self.chat, self.msg, self.before.clone(), self.was_edited);
+        let entities = self.before_entities.clone();
         w.store()
-            .write(move |c| model::edit_tx(c, chat, msg, &text, was))
+            .write(move |c| model::edit_tx(c, chat, msg, &text, was, &entities))
             .map_err(|e| e.to_string())
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
         let (chat, msg, text) = (self.chat, self.msg, self.after.clone());
         w.store()
-            .write(move |c| model::edit_tx(c, chat, msg, &text, true))
+            .write(move |c| model::edit_tx(c, chat, msg, &text, true, &[]))
             .map_err(|e| e.to_string())
     }
 }

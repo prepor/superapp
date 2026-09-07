@@ -80,6 +80,7 @@ pub struct IncomingMessage {
     pub sender: Option<PeerId>,
     pub date: f64,
     pub text: String,
+    pub entities: Vec<super::text::Entity>,
     pub out: bool,
     /// Of mine: `sending`, `sent`, `read`, `failed`.
     pub state: Option<String>,
@@ -218,12 +219,13 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service)
+  views, comments, reactions, service, entities)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date,
-  text = excluded.text, out = excluded.out, state = excluded.state,
+  text = excluded.text, entities = excluded.entities,
+  out = excluded.out, state = excluded.state,
   edited = excluded.edited, reply_to = excluded.reply_to,
   fwd_from = excluded.fwd_from, media = excluded.media,
   media_label = excluded.media_label, media_ref = excluded.media_ref,
@@ -274,6 +276,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.comments,
             m.reactions,
             m.service,
+            serde_json::to_string(&m.entities).expect("text entities serialize"),
         ])?;
     }
     Ok(())
@@ -431,6 +434,7 @@ mod tests {
             sender: None,
             date: at,
             text: text.to_string(),
+            entities: Vec::new(),
             out: false,
             state: None,
             edited: false,

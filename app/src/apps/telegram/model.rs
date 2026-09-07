@@ -462,6 +462,7 @@ pub struct Msg {
     pub sender_name: String,
     pub date: f64,
     pub text: String,
+    pub entities: Vec<super::text::Entity>,
     pub out: bool,
     pub state: Option<String>,
     pub edited: bool,
@@ -1179,7 +1180,7 @@ static Q_HISTORY: Q = Q {
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid
+                 m.media_clip, m.media_clip_rid, m.entities
           FROM tg_message m
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = m.chat AND r.id = m.reply_to
@@ -1207,6 +1208,7 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         sender_name: r.get(3)?,
         date: r.get(4)?,
         text: r.get(5)?,
+        entities: serde_json::from_str(&r.get::<_, String>(31)?).unwrap_or_default(),
         out: r.get::<_, i64>(6)? != 0,
         state: r.get(7)?,
         edited: r.get::<_, i64>(8)? != 0,
@@ -1489,10 +1491,12 @@ pub fn edit_tx(
     msg: MsgId,
     text: &str,
     edited: bool,
+    entities: &[super::text::Entity],
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE tg_message SET text = ?3, edited = ?4 WHERE chat = ?1 AND id = ?2",
-        rusqlite::params![chat, msg, text, edited],
+        "UPDATE tg_message SET text = ?3, edited = ?4, entities = ?5 WHERE chat = ?1 AND id = ?2",
+        rusqlite::params![chat, msg, text, edited,
+            serde_json::to_string(entities).expect("text entities serialize")],
     )?;
     Ok(())
 }

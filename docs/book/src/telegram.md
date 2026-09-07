@@ -9,6 +9,13 @@ even when the native client is linked.
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
 
+Message text and media captions show selectable, underlined links in the
+transcript and line cards. Web URLs, labeled links, email addresses and Telegram
+links open their destination on a tap; dragging selects text. Incoming entities
+are retained with the message and replaced on content edits. Older cached text
+also recognizes URLs locally; labeled destinations lost by an earlier build
+become available when the message is fetched again. Code spans stay literal.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

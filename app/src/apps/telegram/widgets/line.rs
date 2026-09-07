@@ -33,7 +33,7 @@ pub struct LinePanel {
 
 impl Widget for LinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
+        super::text::handle_event(&mut self.view, cx, event, scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
@@ -179,8 +179,13 @@ impl Widget for LinePanel {
 
         let has_text = !m.text.trim().is_empty();
         v.view(cx, ids!(text_wrap)).set_visible(cx, has_text);
-        v.text_input(cx, ids!(text_wrap.body_txt))
-            .set_text(cx, if has_text { &m.text } else { "" });
+        let body = v.widget(cx, ids!(text_wrap.body_txt));
+        super::text::set(
+            cx,
+            &body,
+            if has_text { &m.text } else { "" },
+            &m.entities,
+        );
 
         let reactions = m.reactions.clone().unwrap_or_default();
         let comments = m
@@ -205,6 +210,7 @@ impl Widget for LinePanel {
         if let Some(r) = rect_of(cx, &text_w) {
             if has_text {
                 props.hits.add("line text", r, MouseCursor::Text, props.slot);
+                super::text::hits(cx, &text_w, &props, self.view.area().rect(cx));
             }
         }
         let player_w = self.view.widget(cx, ids!(player));
