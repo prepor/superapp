@@ -247,6 +247,7 @@ struct Line {
     sender: Option<PeerId>,
     at: f64,
     text: &'static str,
+    entities: Option<Vec<super::text::Entity>>,
     out: bool,
     state: Option<&'static str>,
     edited: bool,
@@ -589,6 +590,23 @@ fn chats() -> Vec<SeedChat> {
                     ..me(t(8, 20, 8, 31), "")
                 },
                 me(t(8, 27, 13, 0), "idea: a chat is a transcript, not bubbles"),
+                Line {
+                    entities: Some(vec![
+                        super::text::Entity { offset: 7, length: 33, kind: super::text::EntityKind::Url },
+                        super::text::Entity { offset: 45, length: 13, kind: super::text::EntityKind::Url },
+                    ]),
+                    ..me(t(8, 27, 13, 1), "links: https://example.org/notes?a=1&b=2 and t.me/telegram.")
+                },
+                Line {
+                    entities: Some(vec![super::text::Entity {
+                        offset: 3, length: 22,
+                        kind: super::text::EntityKind::TextUrl { url: "https://example.org/project".into() },
+                    }]),
+                    media: Some("photo"),
+                    media_ref: Some("demo:garden"),
+                    media_size: Some((1280, 850)),
+                    ..me(t(8, 27, 13, 2), "👋 Read the project notes\nand keep the garden photo.")
+                },
             ],
         },
         SeedChat {
@@ -718,9 +736,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                                             reply_to, fwd_from, media, media_label, views,
                                             comments, reactions, service, media_ref,
                                             media_w, media_h, media_secs, media_lat,
-                                            media_lon, media_until)
+                                            media_lon, media_until, entities, entities_known)
                      VALUES(?23, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                            ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?24, ?25)",
                     rusqlite::params![
                         chat.peer,
                         l.sender,
@@ -744,7 +762,9 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                         l.media_at.map(|(lat, _)| lat),
                         l.media_at.map(|(_, lon)| lon),
                         l.media_until,
-                        next_msg
+                        next_msg,
+                        serde_json::to_string(l.entities.as_deref().unwrap_or_default()).expect("text entities serialize"),
+                        l.entities.is_some()
                     ],
                 )?;
                 ids.push(next_msg);

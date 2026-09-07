@@ -27,8 +27,21 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V6),
         Step::Run(v7_listing),
         Step::Sql(V8),
+        Step::Sql(V9),
+        Step::Sql(V10),
     ],
 };
+
+// Existing cached text remains readable and can detect bare URLs locally.
+// New updates retain their entities, including destinations behind labels.
+const V9: &str = "ALTER TABLE tg_message ADD COLUMN entities TEXT NOT NULL DEFAULT '[]'";
+
+// V9 conflated unavailable metadata with TDLib's empty list. Nonempty lists
+// can be recognized on upgrade; empty ones remain unknown until refreshed.
+const V10: &str = "
+ALTER TABLE tg_message ADD COLUMN entities_known INTEGER NOT NULL DEFAULT 0;
+UPDATE tg_message SET entities_known = 1 WHERE entities != '[]';
+";
 
 const V1: &str = "
 CREATE TABLE tg_peer(
@@ -525,6 +538,56 @@ pub fn set_session(
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+
+    #[test]
+    fn v9_keeps_cached_messages_and_their_search_index() {
+        let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..8] };
+        let c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        old.apply(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'Links');
+             INSERT INTO tg_chat(peer) VALUES(10);
+             INSERT INTO tg_message(id, chat, date, text) VALUES(1, 10, 1.0, 'cached https://example.org');"
+        ).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        let (text, entities, known): (String, String, bool) = c.query_row(
+            "SELECT text, entities, entities_known FROM tg_message WHERE chat = 10 AND id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        ).unwrap();
+        assert_eq!(text, "cached https://example.org");
+        assert_eq!(entities, "[]");
+        assert!(!known);
+        assert!(super::super::text::html(&text, None).contains("<a href="));
+        let matches: i64 = c.query_row(
+            "SELECT COUNT(*) FROM tg_message_fts WHERE tg_message_fts MATCH 'cached'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn v10_distinguishes_known_entities_from_ambiguous_empty_v9_rows() {
+        let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..9] };
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        old.apply(&c).unwrap();
+        c.execute_batch(r#"
+            INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'Links');
+            INSERT INTO tg_chat(peer) VALUES(10);
+            INSERT INTO tg_message(id, chat, date, text) VALUES(1, 10, 1.0, 'main.rs');
+            INSERT INTO tg_message(id, chat, date, text, entities) VALUES(2, 10, 2.0, 'read',
+                '[{"offset":0,"length":4,"type":{"@type":"textEntityTypeTextUrl","url":"https://example.org"}}]');
+        "#).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        let known: Vec<bool> = c.prepare("SELECT entities_known FROM tg_message ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(known, vec![false, true]);
+        let stored: String = c.query_row("SELECT entities FROM tg_message WHERE id = 2", [], |r| r.get(0)).unwrap();
+        assert!(stored.contains("https://example.org"));
+    }
 
     /// The upgrade path a fresh store never walks: a store already carrying
     /// V1's messages runs only V2, and its `'rebuild'` must catch the lines

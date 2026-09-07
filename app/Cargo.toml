@@ -47,6 +47,10 @@ html5ever = "0.39"
 markup5ever_rcdom = "0.39.0"
 simplecss = "0.2"
 
+# Recognize links in cached Telegram text and validate their destinations.
+linkify = "0.11"
+url = "2"
+
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
 # POST the token endpoint takes.
 serde_json = "1"

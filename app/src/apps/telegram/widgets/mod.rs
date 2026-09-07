@@ -17,6 +17,7 @@ pub mod messages;
 pub mod peer;
 pub mod people;
 pub mod place;
+mod text;
 
 pub use attach::AttachPanel;
 pub use chat::ChatPanel;

@@ -1,0 +1,33 @@
+# args:
+# env:
+#
+# Bare URLs and labeled caption links in saved messages, then the same
+# caption on a line card. A drag resolves a link without opening a browser.
+
+wait 900
+key cmd 2
+wait 500
+type "saved messages"
+wait 500
+key enter
+wait 900
+shot links-transcript
+drag "message link" 30 0
+wait 400
+
+# Leave selection for the transcript cursor and walk to the last message,
+# whose caption has a labeled link after an emoji.
+key esc
+key end
+wait 400
+click "line"
+wait 700
+drag "message link" 30 0
+wait 400
+dblclick "line text"
+wait 400
+shot links-card
+# Both panels now contain live link widgets. One tap emits one browser request.
+click "message link"
+wait 400
+quit
