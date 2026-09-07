@@ -1850,6 +1850,67 @@ fn a_file_of_my_own_is_copied_in_and_left_where_it_is() {
 }
 
 #[test]
+fn peer_actions_ignore_replies_from_an_ended_session_after_retrying() {
+    use super::PeerAction;
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let runtime = runtime::of(w.store());
+    acc.drain(&w);
+    assert!(runtime.send_peer_action(7, PeerAction::Block));
+    acc.drain(&w);
+    let first: serde_json::Value = serde_json::from_str(&td.sent()[0]).unwrap();
+    acc.on_update(&w, &auth("authorizationStateClosed"));
+    assert!(!runtime.peer_action_pending(7));
+    acc.drain(&w);
+    assert!(!runtime.send_peer_action(7, PeerAction::Block), "a closed account stays disconnected");
+
+    let replacement = account(td.clone(), None);
+    replacement.drain(&w);
+    assert!(runtime.send_peer_action(7, PeerAction::Block));
+    replacement.drain(&w);
+    let retry: serde_json::Value = serde_json::from_str(&td.sent()[1]).unwrap();
+    assert_ne!(first["@extra"], retry["@extra"]);
+    runtime.take_notices();
+    for kind in ["ok", "error"] {
+        replacement.on_update(&w, &json!({
+            "@type": kind, "@extra": first["@extra"], "code": 400, "message": "stale error",
+        }).to_string());
+        assert!(runtime.peer_action_pending(7), "an old reply cannot complete the retry");
+        assert_eq!(num(&w, "SELECT count(*) FROM tg_peer WHERE blocked = 1"), 0);
+        assert!(runtime.take_notices().is_empty());
+    }
+    replacement.on_update(&w, &json!({"@type": "ok", "@extra": retry["@extra"]}).to_string());
+    assert!(!runtime.peer_action_pending(7));
+    assert_eq!(num(&w, "SELECT count(*) FROM tg_peer WHERE blocked = 1"), 1);
+}
+
+#[test]
+fn stopping_a_worker_releases_its_pending_peer_actions() {
+    use super::PeerAction;
+    let a = world();
+    let b = world();
+    let account_a = account(FakeTd::new(), None);
+    let account_b = account(FakeTd::new(), None);
+    account_a.drain(&a);
+    account_b.drain(&b);
+    let runtime_a = runtime::of(a.store());
+    let runtime_b = runtime::of(b.store());
+    assert!(runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_a.send_peer_action(8, PeerAction::DeleteContact));
+    assert!(runtime_b.send_peer_action(7, PeerAction::Block));
+    drop(account_a);
+    assert!(!runtime_a.peer_action_pending(7));
+    assert!(!runtime_a.peer_action_pending(8));
+    assert!(!runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_b.peer_action_pending(7), "another store's worker stays connected");
+    let replacement = account(FakeTd::new(), None);
+    replacement.drain(&a);
+    assert!(runtime_a.send_peer_action(7, PeerAction::Block));
+    assert!(runtime_a.send_peer_action(8, PeerAction::DeleteContact));
+}
+
+#[test]
 fn workers_consume_only_their_own_stores_commands_and_download_requests() {
     let a = world();
     let b = world();

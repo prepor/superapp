@@ -25,7 +25,10 @@ A conversation's **about** link opens the person's profile. **Block user**
 prevents incoming messages and hides your status and photo; **unblock user**
 reverses it. A blocked conversation keeps its history and draft, shows
 **blocked**, and offers **unblock user** in place of attachments and sending.
-These actions are unavailable on your own profile or on groups and channels.
+Reply and edit actions also disappear from individual message cards; work
+already in progress stays hidden until the person is unblocked.
+Blocking and unblocking are unavailable on your own profile or on groups
+and channels.
 
 **Delete contact** removes the person from the address book and keeps their
 conversation. **Delete chat** removes your copy of the conversation from your
@@ -42,6 +45,9 @@ Requests use TDLib's `setMessageSenderBlockList`, `removeContacts` and
 `deleteChatHistory` with `revoke: false`. Local changes wait for a successful
 reply or a server update; failures are shown in a toast. Offline fixtures
 describe the request without changing contacts, blocks or conversations.
+Ending a session or stopping its worker clears pending actions and reports
+the missing confirmation, so they can be retried after reconnecting. Late
+replies cannot complete a later attempt.
 Block state also follows chat snapshots and user full info, including changes
 made on another device; the stories-only block list does not block messages.
 

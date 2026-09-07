@@ -467,7 +467,7 @@ impl PeerAction {
         }
     }
 
-    pub fn request(self, peer: PeerId) -> String {
+    pub fn request(self, peer: PeerId, id: u64) -> String {
         let mut request = match self {
             Self::Block | Self::Unblock => json!({
                 "@type": "setMessageSenderBlockList",
@@ -477,12 +477,13 @@ impl PeerAction {
             Self::DeleteContact => json!({ "@type": "removeContacts", "user_ids": [peer] }),
             Self::DeleteChat => serde_json::from_str(&delete_chat(peer)).expect("delete chat JSON"),
         };
-        request["@extra"] = json!(format!("peer_action:{}:{peer}", self.word()));
+        request["@extra"] = json!(format!("peer_action:{}:{peer}:{id}", self.word()));
         request.to_string()
     }
 
-    pub fn from_reply(reply: &Value) -> Option<(Self, PeerId)> {
-        let (word, peer) = reply["@extra"].as_str()?.strip_prefix("peer_action:")?.split_once(':')?;
+    pub fn from_reply(reply: &Value) -> Option<(Self, PeerId, u64)> {
+        let (word, rest) = reply["@extra"].as_str()?.strip_prefix("peer_action:")?.split_once(':')?;
+        let (peer, id) = rest.split_once(':')?;
         let action = match word {
             "block user" => Self::Block,
             "unblock user" => Self::Unblock,
@@ -490,7 +491,7 @@ impl PeerAction {
             "delete chat" => Self::DeleteChat,
             _ => return None,
         };
-        Some((action, peer.parse().ok()?))
+        Some((action, peer.parse().ok()?, id.parse().ok()?))
     }
 }
 

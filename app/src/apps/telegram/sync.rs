@@ -50,7 +50,7 @@ const TYPING_FOR: f64 = 6.0;
 /// password) and waits for the UI to supply it — never guessing a secret.
 pub struct Account<T: Td> {
     td: T,
-    commands: std::cell::RefCell<Option<std::sync::mpsc::Receiver<String>>>,
+    commands: std::cell::RefCell<Option<runtime::Inbox>>,
     /// The application id — a small positive int Telegram assigns, not a
     /// secret, from the `telegram` file.
     api_id: i32,
@@ -336,8 +336,12 @@ impl<T: Td> Account<T> {
                 write(None, "ready", None);
                 self.on_ready(w);
             }
-            Some("authorizationStateLoggingOut") => write(None, "logging_out", None),
+            Some("authorizationStateLoggingOut") => {
+                runtime::of(w.store()).disconnect();
+                write(None, "logging_out", None);
+            }
             Some("authorizationStateClosing" | "authorizationStateClosed") => {
+                runtime::of(w.store()).disconnect();
                 write(None, "closed", None);
             }
             // States this phase does not sign in through — WaitRegistration,
@@ -405,8 +409,11 @@ impl<T: Td> Account<T> {
     /// error (TDLib's 404) that the list is complete — after the main list
     /// the archive is loaded the same way, and after the archive nothing.
     fn on_reply(&self, w: &World, v: &Value, failed: bool) {
-        if let Some((action, peer)) = PeerAction::from_reply(v) {
+        if let Some((action, peer, id)) = PeerAction::from_reply(v) {
             let runtime = runtime::of(w.store());
+            if !runtime.finish_peer_action(peer, action, id) {
+                return;
+            }
             let name = model::peer(w.store(), peer).map_or_else(|| peer.to_string(), |p| p.name);
             let result = if failed {
                 Err(v["message"].as_str().unwrap_or("request failed").to_string())
@@ -420,7 +427,6 @@ impl<T: Td> Account<T> {
                     PeerAction::DeleteChat => model::leave_chat_tx(c, peer),
                 }).map_err(|e| e.to_string())
             };
-            runtime.finish_peer_action(peer, action);
             match result {
                 Ok(()) => runtime.notice(format!("{} · {name}: done", action.word()), false),
                 Err(error) => runtime.notice(format!("{} · {name}: {error}", action.word()), true),
