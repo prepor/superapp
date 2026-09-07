@@ -91,4 +91,27 @@ wait 900
 click "back to help"
 wait 800
 shot f7-outlived-its-parent
+
+# -- what a close hands the keyboard to ---------------------------------------
+
+# The manual is the leftmost column and the log the one after it; *about*
+# opens un-joined between them and takes the keyboard. Closing it hands focus
+# left, to where the work came from — what stands to the right of a panel is
+# usually what that panel opened, and the columns after it merely slid over.
+cmdclick "about"
+wait 900
+shot f8-about-between-them
+key cmd+w
+wait 900
+shot f9-closed-the-middle
+
+# The proof, in one more close: `cmd+w` takes whatever has the keyboard, so
+# the manual goes and the log is what is left. Its filter is a run only it
+# draws — had focus fallen right, the log would have closed here instead and
+# this label would resolve against nothing.
+key cmd+w
+wait 900
+mouse "filter"
+wait 700
+shot f10-the-log-outlived-the-manual
 quit

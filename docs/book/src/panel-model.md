@@ -88,9 +88,11 @@ panel by vertical position in the neighboring column.
 
 Moving a panel can reorder its column, join another column, swap a whole column,
 or create a new edge column. Closing removes the panel and its joined
-descendants, moves focus to the nearest remaining panel, and removes empty
-columns. Moving a panel to another workspace is not a close, but it still
-breaks joins with panels that stay behind.
+descendants, and removes empty columns. Focus goes left: to the row that slid up
+into the place when the column survives, otherwise to the column on the left —
+what stood to the right is usually what the closed panel opened. Only a close at
+the left edge takes the column that is left. Moving a panel to another workspace
+is not a close, but it still breaks joins with panels that stay behind.
 
 Closing is one rule, and it belongs to the kernel. A close may come from the
 header's button, from a verb that removed what its own panel showed, or from a
