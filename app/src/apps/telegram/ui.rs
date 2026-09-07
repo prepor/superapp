@@ -260,9 +260,6 @@ script_mod! {
         width: Fill, height: Fill, flow: Down
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 8
-        hint_lbl := mod.widgets.SLabel {
-            width: Fill, text: "Select topics to show as chats. Click or press space to toggle."
-        }
         filter_input := mod.widgets.TblFilter { empty_text: "filter topics" }
         status_lbl := mod.widgets.SLabel { width: Fill, draw_text +: { color: #5a5a5a } }
         mod.widgets.TblHeadRule {}

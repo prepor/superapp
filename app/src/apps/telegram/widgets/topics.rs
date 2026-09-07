@@ -234,7 +234,7 @@ impl Widget for TopicsPanel {
             );
             self.rows.push((topics[index].id, rect));
         }
-        for path in [ids!(status_lbl), ids!(hint_lbl), ids!(empty_lbl)] {
+        for path in [ids!(status_lbl), ids!(empty_lbl)] {
             let label = self.view.label(cx, path);
             let rect = label.area().rect(cx);
             if rect.size.x > 0.0 && rect.size.y > 0.0 {

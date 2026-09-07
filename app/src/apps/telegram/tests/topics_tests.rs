@@ -215,6 +215,65 @@ fn filtering_and_archiving_change_only_the_named_topics() {
 }
 
 #[test]
+fn a_read_batch_keeps_unloaded_conversations_unread_and_marked() {
+    let mut s = session();
+    let inbox = runtime::of(s.store()).connect();
+    s.store()
+        .write(|c| {
+            c.execute(
+                "DELETE FROM tg_message WHERE chat = ?1 OR (chat = ?2 AND topic = 2)",
+                rusqlite::params![ANNA, BERLIN],
+            )?;
+            c.execute(
+                "UPDATE tg_chat SET unread = 3, mention = 1 WHERE peer = ?1",
+                [ANNA],
+            )?;
+            c.execute(
+                "UPDATE tg_topic SET selected = 1, unread = 5, mention = 1
+            WHERE chat = ?1 AND id = 2",
+                [BERLIN],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let last = model::newest_ordinary_line(s.store(), STELAXIS).unwrap();
+    let before = unread(&s, STELAXIS);
+    let list = open_root(&mut s, Chats::id());
+    for (peer, topic) in [(STELAXIS, 0), (ANNA, 0), (BERLIN, 2)] {
+        let index = with_chats(&s, list, |p| p.rows(0, 50))
+            .iter()
+            .position(|row| row.peer == peer && row.topic == topic)
+            .unwrap();
+        with_chats(&s, list, |p| {
+            p.go(index);
+            p.toggle_mark();
+        });
+    }
+
+    verb(&mut s, list, "telegram.read");
+
+    assert_eq!(unread(&s, ANNA), (3, 1));
+    assert_eq!(unread(&s, STELAXIS), before);
+    let meetup = topics::get(s.store(), BERLIN, 2).unwrap();
+    assert_eq!(meetup.unread, 5);
+    assert_eq!(meetup.unread_mentions, 1);
+    assert_eq!(topics::get(s.store(), BERLIN, 4).unwrap().unread, 1);
+    assert_eq!(with_chats(&s, list, |p| p.list_mut().marks().len()), 2);
+    let sent: Vec<serde_json::Value> = inbox
+        .try_iter()
+        .map(|r| serde_json::from_str(&r).unwrap())
+        .collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "only the chat with a message can send a read request"
+    );
+    assert_eq!(sent[0]["@type"], "viewMessages");
+    assert_eq!(sent[0]["chat_id"], STELAXIS);
+    assert_eq!(sent[0]["message_ids"], serde_json::json!([last]));
+}
+
+#[test]
 fn selections_survive_reopening_the_database() {
     use kernel::store::Store;
     let dir = std::env::temp_dir().join(format!("superapp-topic-selection-{}", std::process::id()));
