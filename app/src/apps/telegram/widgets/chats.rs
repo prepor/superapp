@@ -36,7 +36,7 @@ impl RowSpec for ChatsRows {
     /// twin, not a weight, because a label's style is not a runtime value.
     fn populate(cx: &mut Cx, row: &WidgetRef, r: &ChatRow, selected: bool, marked: bool, now: f64) {
         let line = table::line(cx, row, selected, marked);
-        let unread = r.unread > 0 || r.mention;
+        let unread = r.unread > 0 || r.unread_mentions > 0;
         for (path, on) in [(ids!(body.title_lbl), !unread), (ids!(body.title_b), unread)] {
             let lbl = line.label(cx, path);
             lbl.set_text(cx, if on { &r.title } else { "" });
@@ -56,14 +56,13 @@ impl RowSpec for ChatsRows {
             .set_text(cx, &r.preview(now));
         line.label(cx, ids!(body.pinned_lbl))
             .set_visible(cx, r.pinned > 0);
-        // The count: white on ink, outlined for a muted chat, `@` where one
-        // of them mentions me.
-        let count = if r.mention {
-            "@".to_string()
-        } else {
-            r.unread.to_string()
-        };
-        let (ink, outlined) = (unread && !r.muted, unread && r.muted);
+        // Personal replies and mentions stay visible beside the ordinary
+        // unread count, including in muted groups.
+        let mentions = line.view(cx, ids!(body.mentions));
+        mentions.set_visible(cx, r.unread_mentions > 0);
+        mentions.label(cx, ids!(lbl)).set_text(cx, &format!("@{}", r.unread_mentions));
+        let count = r.unread.to_string();
+        let (ink, outlined) = (r.unread > 0 && !r.muted, r.unread > 0 && r.muted);
         let badge = line.view(cx, ids!(body.badge));
         badge.set_visible(cx, ink);
         badge.label(cx, ids!(lbl)).set_text(cx, &count);

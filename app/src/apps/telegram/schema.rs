@@ -31,6 +31,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V9),
         Step::Sql(V10),
         Step::Sql(V11),
+        Step::Sql(V12),
     ],
 };
 
@@ -47,6 +48,15 @@ UPDATE tg_message SET entities_known = 1 WHERE entities != '[]';
 
 // Blocking belongs to the person, so deleting their chat keeps the block.
 const V11: &str = "ALTER TABLE tg_peer ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0";
+
+// `tg_chat.mention` now keeps TDLib's count, rather than a boolean. Existing
+// values remain a lower bound until the next chat update. Individual unread
+// mentions (which include replies to me) survive the ordinary inbox read.
+const V12: &str = "
+ALTER TABLE tg_message ADD COLUMN unread_mention INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tg_message ADD COLUMN mention_read INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX tg_message_unread_mention ON tg_message(chat, id) WHERE unread_mention = 1;
+";
 
 const V1: &str = "
 CREATE TABLE tg_peer(
@@ -619,6 +629,30 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
         assert_eq!(message, ("keep me".to_string(), entities.to_string(), true));
+    }
+
+    #[test]
+    fn v12_preserves_existing_messages_and_adds_unread_mention_state() {
+        let c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        for step in &super::SCHEMA.steps[..11] {
+            match step {
+                kernel::app::Step::Sql(sql) => c.execute_batch(sql).unwrap(),
+                kernel::app::Step::Run(run) => run(&c).unwrap(),
+                _ => unreachable!("the first eleven Telegram migrations are SQL or Run"),
+            }
+        }
+        c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'a group');
+            INSERT INTO tg_chat(peer, mention) VALUES(10, 1);
+            INSERT INTO tg_message(id, chat, date, text, reply_to) VALUES(20, 10, 1, 'old reply', 19);").unwrap();
+        c.execute_batch(super::V12).unwrap();
+        let row: (String, i64, bool, bool) = c.query_row(
+            "SELECT text, reply_to, unread_mention, mention_read FROM tg_message WHERE chat = 10 AND id = 20",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(row, ("old reply".to_string(), 19, false, false));
+        let indexed: i64 = c.query_row("SELECT COUNT(*) FROM tg_message_fts WHERE tg_message_fts MATCH 'reply'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 1);
     }
 
     /// The upgrade path a fresh store never walks: a store already carrying

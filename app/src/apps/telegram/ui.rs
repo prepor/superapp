@@ -181,6 +181,7 @@ script_mod! {
                 padding: 0, width: Fit, text: "pinned", margin: Inset{left: 10}
                 draw_text +: { color: #909090 }
             }
+            mentions := mod.widgets.TelegramBadge {}
             badge := mod.widgets.TelegramBadge {}
             badge_muted := mod.widgets.TelegramBadgeMuted {}
         }

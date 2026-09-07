@@ -57,7 +57,7 @@ fn chat_fixture(title: &str, kind: PeerKind, text: &str) -> ChatRow {
         pinned: 0,
         muted: false,
         unread: 0,
-        mention: false,
+        unread_mentions: 0,
         draft: None,
         typing: None,
         last: today(11, 52),
@@ -87,6 +87,7 @@ fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
         state: None,
         edited: false,
         reply_to: None,
+        unread_mention: false,
         reply_name: String::new(),
         reply_text: String::new(),
         fwd_from: None,
@@ -121,7 +122,7 @@ fn chat_row() -> Scene<Setup> {
     };
     Scene::new("chat row", (520.0, 52.0))
         .note("One chat as the list shows it: the title and when it last spoke, then what it said and how much of it is unread.")
-        .note("Bold is unread. The count is white on ink, outlined for a muted chat, @ where one of them mentions me.")
+        .note("Bold is unread. The ordinary count is outlined for a muted chat; a separate @ count highlights unread replies and mentions.")
         .node("read", row(vera(), false, false))
         .node(
             "unread",
@@ -141,7 +142,7 @@ fn chat_row() -> Scene<Setup> {
             row(
                 ChatRow {
                     unread: 8,
-                    mention: true,
+                    unread_mentions: 1,
                     muted: true,
                     pinned: 2,
                     last_text: "meeting moved to 15:00".into(),
@@ -264,7 +265,7 @@ fn chat_row() -> Scene<Setup> {
             row(
                 ChatRow {
                     unread: 8,
-                    mention: true,
+                    unread_mentions: 1,
                     pinned: 2,
                     last_text: "meeting moved to 15:00".into(),
                     last_from: "Ivan Petrov".into(),

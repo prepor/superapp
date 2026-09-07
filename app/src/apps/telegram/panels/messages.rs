@@ -8,16 +8,19 @@ use std::any::Any;
 use std::rc::Rc;
 
 use kernel::layout::SlotId;
-use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag};
+use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::richtable::{ListState, SqlSource};
+use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, MsgHit, PeerId, PAGE};
+use super::super::runtime;
 
 /// A messages panel.
 pub struct Messages {
     id: PanelId,
     chat: Option<PeerId>,
+    replies: bool,
     store: Rc<Store>,
     slot: SlotId,
     list: ListState<&'static SqlSource<MsgHit, i64>>,
@@ -38,11 +41,37 @@ impl Messages {
         PanelId::new(Self::TAG, [peer.to_string()])
     }
 
+    pub fn replies(chat: Option<PeerId>) -> PanelId {
+        PanelId::new(Self::TAG, std::iter::once("replies".to_string()).chain(chat.map(|p| p.to_string())))
+    }
+
+    pub fn is_replies(&self) -> bool {
+        self.replies
+    }
+
+    fn refresh(&self) {
+        for (chat, _) in model::reply_chats(&self.store).iter() {
+            if self.chat.is_none_or(|peer| peer == *chat) {
+                runtime::of(&self.store).want_mentions(*chat);
+            }
+        }
+    }
+
+    pub fn reply_status(&self) -> (bool, bool) {
+        runtime::of(&self.store).mentions_status(self.chat)
+    }
+
+    pub fn pending_count(&self) -> i64 {
+        model::reply_chats(&self.store).iter()
+            .filter(|(chat, _)| self.chat.is_none_or(|peer| peer == *chat))
+            .map(|(_, count)| count).sum()
+    }
+
     /// The chat a `messages` panel is about, if one.
     #[must_use]
     pub fn chat_of(id: &PanelId) -> Option<PeerId> {
         (id.tag == Self::TAG)
-            .then(|| id.arg(0)?.parse().ok())
+            .then(|| id.arg(usize::from(id.arg(0) == Some("replies")))?.parse().ok())
             .flatten()
     }
 
@@ -81,9 +110,30 @@ impl Panel for Messages {
 
     /// `messages`, or `messages · stelaxis`.
     fn title(&self) -> String {
+        let word = if self.replies { "replies & mentions" } else { "messages" };
+        let status = match (self.replies, self.reply_status()) {
+            (true, (true, _)) => " · loading…",
+            (true, (_, true)) => " · could not finish loading",
+            _ => "",
+        };
         match self.chat_title() {
-            Some(t) => format!("messages · {t}"),
-            None => "messages".to_string(),
+            Some(t) => format!("{word} · {t}{status}"),
+            None => format!("{word}{status}"),
+        }
+    }
+
+    fn verbs(&self) -> Vec<Verb> {
+        if self.replies {
+            vec![Verb::run("telegram.refresh_replies", "refresh", Some('r'))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn run(&mut self, verb: &str, s: &mut Session) {
+        if verb == "telegram.refresh_replies" {
+            self.refresh();
+            s.redraw();
         }
     }
 
@@ -109,12 +159,18 @@ impl PanelKind for MessagesKind {
     }
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
-        Box::new(Messages {
+        let replies = id.arg(0) == Some("replies");
+        let panel = Messages {
             id: id.clone(),
             chat: Messages::chat_of(id),
+            replies,
             store: cx.session().store().clone(),
             slot: 0,
-            list: ListState::new(&model::MESSAGES, PAGE),
-        })
+            list: ListState::new(if replies { &model::REPLIES } else { &model::MESSAGES }, PAGE),
+        };
+        if replies {
+            panel.refresh();
+        }
+        Box::new(panel)
     }
 }

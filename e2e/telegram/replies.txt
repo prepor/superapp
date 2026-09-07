@@ -1,0 +1,31 @@
+# args:
+# env:
+# Replies have their own count and inbox, even when the group is muted.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+shot replies-list
+click "replies & mentions 2"
+wait 900
+shot replies-inbox
+click "I saw it — the inset is 28 dp, it wants 34"
+wait 900
+# The preview must scroll to the selected reply rather than the chat's end.
+click "Vera Kovac: I saw it — the inset is 28 dp, it wants 34"
+wait 700
+shot replies-open
+# Focusing the visible reply acknowledges it (and any other visible mention).
+key cmd+left
+wait 500
+click "refresh"
+wait 500
+shot replies-read
+key cmd+left
+wait 500
+click "replies & mentions 0"
+wait 500
+quit

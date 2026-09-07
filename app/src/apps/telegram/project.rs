@@ -52,7 +52,7 @@ pub struct IncomingChat {
     /// never joined were in the list).
     pub in_main: bool,
     pub unread: i64,
-    pub mention: bool,
+    pub unread_mentions: i64,
     pub draft: Option<String>,
     pub typing: Option<String>,
     /// The last line I read, where the unread line is drawn.
@@ -86,6 +86,7 @@ pub struct IncomingMessage {
     pub state: Option<String>,
     pub edited: bool,
     pub reply_to: Option<MsgId>,
+    pub unread_mention: bool,
     pub fwd_from: Option<String>,
     /// The reference in `media.reference` is what the blob cache is keyed by
     /// once the file is fetched; the store holds no bytes.
@@ -182,7 +183,7 @@ pub fn project_chats(c: &Connection, chats: &[IncomingChat]) -> rusqlite::Result
             ch.muted,
             ch.archived,
             ch.unread,
-            ch.mention,
+            ch.unread_mentions,
             ch.draft,
             ch.typing,
             ch.last_read,
@@ -219,9 +220,9 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service, entities, entities_known)
+  views, comments, reactions, service, entities, entities_known, unread_mention)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1)
+       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1, ?28)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date,
   text = excluded.text, entities = excluded.entities, entities_known = 1,
@@ -235,7 +236,10 @@ ON CONFLICT(chat, id) DO UPDATE SET
   media_lon = excluded.media_lon, media_until = excluded.media_until,
   media_clip = excluded.media_clip, media_clip_rid = excluded.media_clip_rid,
   views = excluded.views, comments = excluded.comments,
-  reactions = excluded.reactions, service = excluded.service";
+  reactions = excluded.reactions, service = excluded.service,
+  unread_mention = excluded.unread_mention AND NOT tg_message.mention_read,
+  mention_read = tg_message.mention_read OR
+                 (tg_message.unread_mention AND NOT excluded.unread_mention)";
 
 /// Upserts a batch of a chat's messages. Idempotent on the chat and the
 /// message id together, so a re-sync of the same window writes the same rows;
@@ -277,12 +281,55 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.reactions,
             m.service,
             serde_json::to_string(&m.entities).expect("text entities serialize"),
+            m.unread_mention,
         ])?;
     }
     Ok(())
 }
 
 // -- the window ---------------------------------------------------------------------
+
+/// Apply Telegram's count independently of the ordinary inbox read cursor.
+pub fn set_mentions(c: &Connection, chat: PeerId, count: i64) -> rusqlite::Result<()> {
+    c.execute("UPDATE tg_chat SET mention = ?2 WHERE peer = ?1", (chat, count.max(0)))?;
+    if count <= 0 {
+        c.execute(
+            "UPDATE tg_message SET unread_mention = 0, mention_read = 1
+             WHERE chat = ?1 AND unread_mention = 1",
+            [chat],
+        )?;
+    }
+    Ok(())
+}
+
+/// Clear only the named mentions. Remember the read so a history response
+/// already in flight cannot resurrect the same notification.
+pub fn read_mentions(c: &Connection, chat: PeerId, ids: &[MsgId]) -> rusqlite::Result<()> {
+    let read = dismiss_mentions(c, chat, ids)?;
+    c.execute(
+        "UPDATE tg_chat SET mention = MAX(0, mention - ?2) WHERE peer = ?1",
+        (chat, read as i64),
+    )?;
+    Ok(())
+}
+
+/// Reconcile a completed search without changing Telegram's authoritative count.
+pub fn dismiss_mentions(c: &Connection, chat: PeerId, ids: &[MsgId]) -> rusqlite::Result<usize> {
+    let mut read = 0;
+    for id in ids {
+        read += c.execute(
+            "UPDATE tg_message SET unread_mention = 0, mention_read = 1
+             WHERE chat = ?1 AND id = ?2 AND unread_mention = 1",
+            (chat, id),
+        )?;
+    }
+    Ok(read)
+}
+
+pub fn unread_mention_ids(c: &Connection, chat: PeerId) -> rusqlite::Result<Vec<MsgId>> {
+    c.prepare_cached("SELECT id FROM tg_message WHERE chat = ?1 AND unread_mention = 1")?
+        .query_map([chat], |r| r.get(0))?.collect()
+}
 
 /// The history the store keeps per chat: the newest this many lines, trimmed
 /// as new ones arrive. Scrolling within the window is the store's; scrolling
@@ -322,7 +369,7 @@ pub fn history_window(c: &Connection, chat: PeerId) -> rusqlite::Result<(Option<
     )
 }
 
-/// Trims a chat to the newest [`HISTORY_KEEP`] lines, dropping the rest.
+/// Keeps the newest [`HISTORY_KEEP`] lines and any older unread mentions.
 /// Called after a batch is projected. The dropped rows' index entries follow
 /// through the AFTER DELETE trigger, so the window and its search stay the
 /// same size. Answers how many were dropped.
@@ -333,7 +380,7 @@ pub fn history_window(c: &Connection, chat: PeerId) -> rusqlite::Result<(Option<
 pub fn trim_chat(c: &Connection, chat: PeerId) -> rusqlite::Result<usize> {
     let gone = c.execute(
         "DELETE FROM tg_message
-         WHERE chat = ?1 AND seq NOT IN (
+         WHERE chat = ?1 AND unread_mention = 0 AND seq NOT IN (
            SELECT seq FROM tg_message WHERE chat = ?1
            ORDER BY date DESC, id DESC LIMIT ?2
          )",
@@ -439,6 +486,7 @@ mod tests {
             state: None,
             edited: false,
             reply_to: None,
+            unread_mention: false,
             fwd_from: None,
             media: None,
             views: None,
@@ -583,7 +631,7 @@ mod tests {
             archived: false,
             in_main: true,
             unread: 0,
-            mention: false,
+            unread_mentions: 0,
             draft: None,
             typing: None,
             last_read: None,
@@ -696,7 +744,7 @@ mod tests {
             archived: false,
             in_main: true,
             unread: 3,
-            mention: false,
+            unread_mentions: 0,
             draft: None,
             typing: None,
             last_read: None,
@@ -882,7 +930,7 @@ mod tests {
                     archived: false,
                     in_main: true,
                     unread: 0,
-                    mention: false,
+                    unread_mentions: 0,
                     draft: None,
                     typing: None,
                     last_read: None,
@@ -942,6 +990,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fts_n, 10_000, "the index holds only the window");
+
+        // An unread reply retrieved outside the window stays reachable
+        // until viewed, then becomes eligible for ordinary retention again.
+        let mut reply = msg(7_000, 6_000, base, "alpha unread reply");
+        reply.reply_to = Some(1);
+        reply.unread_mention = true;
+        s.write(move |c| {
+            project_messages(c, &[reply])?;
+            assert_eq!(trim_chat(c, 6_000)?, 0);
+            Ok(())
+        }).unwrap();
+        assert_eq!(search_local(s.conn(), Some(6_000), "alpha").len(), 1);
+        s.write(|c| {
+            read_mentions(c, 6_000, &[7_000])?;
+            assert_eq!(trim_chat(c, 6_000)?, 1);
+            Ok(())
+        }).unwrap();
+        assert!(search_local(s.conn(), Some(6_000), "alpha").is_empty());
     }
 
     /// Indexed queries return only the requested scope's matches.
@@ -1011,7 +1077,7 @@ mod tests {
                     archived: false,
                     in_main: true,
                     unread: 0,
-                    mention: false,
+                    unread_mentions: 0,
                     draft: None,
                     typing: None,
                     last_read: None,

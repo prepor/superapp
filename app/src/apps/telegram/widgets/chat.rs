@@ -215,6 +215,19 @@ impl Widget for ChatPanel {
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
+        if has_focus && self.mounted {
+            let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
+            let visible: Vec<MsgId> = self.rows.iter().filter(|r| {
+                let height = (r.rect.pos.y + r.rect.size.y).min(viewport.pos.y + viewport.size.y)
+                    - r.rect.pos.y.max(viewport.pos.y);
+                // A long reply can be taller than the viewport; showing a
+                // substantial part of it must still let the reader dismiss it.
+                viewport.size.y > 0.0 && height + 1.0 >= r.rect.size.y.min(viewport.size.y * 0.5)
+                    && r.rect.pos.x >= viewport.pos.x - 1.0
+                    && r.rect.pos.x + r.rect.size.x <= viewport.pos.x + viewport.size.x + 1.0
+            }).map(|r| r.id).collect();
+            with_chat(&props, |c| c.view_mentions(&visible, super::now(scope)));
+        }
         // A reply or an edit asked for the caret — the bar's verb over the
         // cursor, or the line's card through the join — since both are
         // written.

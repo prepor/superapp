@@ -170,6 +170,7 @@ impl App for Telegram {
     fn roots(&self) -> Vec<Root> {
         vec![
             Root::new(Chats::id(), "chats", "telegram"),
+            Root::new(panels::Messages::replies(None), "replies & mentions", "telegram unread groups"),
             Root::new(Contacts::id(), "contacts", "telegram people"),
             Root::new(Chat::id(seed::SELF), "saved messages", "telegram notes"),
             Root::new(SignIn::id(), "sign in", "telegram account login phone"),
