@@ -1,10 +1,7 @@
-//! The verbs on lines that are real this round, on the store: `edit` and
-//! `delete`, each one undoable action, run from the chat's bar over the
-//! cursor or the marks, or from a line's card.
+//! Undoable local edits and deletes for offline fixtures.
 //!
-//! Nothing reaches Telegram yet. The third phase puts an effect behind each
-//! with the same desired/actual split as mail's flags; the intents here are
-//! what that effect will read, and what undo flips today.
+//! Live panels queue requests instead and let TDLib updates settle the store.
+//! These intents reverse only the local fixture changes, not server actions.
 
 use std::sync::{Arc, Mutex};
 

@@ -18,30 +18,31 @@
 //! row already names. Then the platform's own player draws and plays it, and
 //! the one *play* button drives that instead of the timeline. A voice note
 //! and a track still run the fake timeline against the clock; playing a
-//! sound is a later phase.
+//! sound is not implemented.
 
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
-use kernel::store::Store;
 
 use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId, Player};
-use super::super::sync;
+use super::super::{requests, runtime};
+use super::wire;
 
 /// The viewer.
 pub struct Viewer {
     id: PanelId,
     chat: PeerId,
     msg: MsgId,
-    store: Rc<Store>,
+    world: Rc<World>,
     slot: SlotId,
     /// The fake timeline, for what this build cannot really play: a voice
     /// note, a track, and every clip in a build with no engine behind it.
@@ -85,14 +86,14 @@ impl Viewer {
     /// The line, off the store.
     #[must_use]
     pub fn msg(&self) -> Option<Msg> {
-        model::line(&self.store, self.chat, self.msg)
+        model::line(self.world.store(), self.chat, self.msg)
     }
 
     /// The line's neighbours among the chat's media: the one before and
     /// the one after, where there are any.
     #[must_use]
     pub fn neighbours(&self) -> (Option<MsgId>, Option<MsgId>) {
-        let ids = model::media_ids(&self.store, self.chat);
+        let ids = model::media_ids(self.world.store(), self.chat);
         let Some(i) = ids.iter().position(|id| *id == self.msg) else {
             return (None, None);
         };
@@ -135,7 +136,7 @@ impl Viewer {
     /// the poster gives way to the player the moment the bytes are here.
     #[must_use]
     pub fn clip_file(&self, m: &Msg) -> Option<PathBuf> {
-        model::playable_path(self.store.dir(), m.media.as_ref()?.clip.as_deref()?)
+        model::playable_path(self.world.store().dir(), m.media.as_ref()?.clip.as_deref()?)
     }
 
     /// The file on this device to hand the system — the clip where it has
@@ -143,7 +144,7 @@ impl Viewer {
     #[must_use]
     pub fn file_to_open(&self, m: &Msg) -> Option<PathBuf> {
         self.clip_file(m).or_else(|| {
-            model::media_path(self.store.dir(), m.media.as_ref()?.reference.as_deref()?)
+            model::media_path(self.world.store().dir(), m.media.as_ref()?.reference.as_deref()?)
         })
     }
 
@@ -182,7 +183,7 @@ impl Viewer {
     /// this build has no engine to ask.
     ///
     /// A line from before the remote id was kept on the row has none to ask
-    /// by; that line is fetched afresh from the engine ([`sync::want_line`])
+    /// by; that line is fetched afresh from the engine ([`runtime::Runtime::want_line`])
     /// and re-projected, and the next draw finds the id and asks.
     pub fn ask_for_clip(&mut self, m: &Msg) {
         if self.asked || self.clip_file(m).is_some() {
@@ -191,11 +192,11 @@ impl Viewer {
         let Some(rid) = m.media.as_ref().and_then(|md| md.clip_rid.as_deref()) else {
             if moving_picture_of_the_wire(m) && !self.refreshing {
                 self.refreshing = true;
-                sync::want_line(m.chat, m.id);
+                runtime::of(self.world.store()).want_line(m.chat, m.id);
             }
             return;
         };
-        self.asked = wire(&self.store, &sync::request_clip(rid));
+        self.asked = wire(self.world.store(), &requests::request_file(rid));
     }
 
     /// Asks the engine for the picture, once.
@@ -205,7 +206,7 @@ impl Viewer {
     /// so a picture opened on may well have no bytes on this device at all.
     /// The row keeps the file's durable remote id for exactly this
     /// ([`Media::rid`](model::Media::rid)): the worker turns it into a
-    /// download on its next pass ([`sync::want_file`]), which lands under the
+    /// download on its next pass ([`runtime::Runtime::want_file`]), which lands under the
     /// row's own key, where the draw is already looking. Nothing happens
     /// where the bytes are here, or where the row names no id — a demo line,
     /// or one projected before the column existed.
@@ -217,7 +218,7 @@ impl Viewer {
         // Only a kind that draws as a picture is waited for: a file's or a
         // sound's bytes would never decode into the box, and a viewer
         // waiting on them would draw forever (review, 2026-09-07).
-        if !md.has_picture() || md.picture_bytes(self.store.dir()).is_some() {
+        if !md.has_picture() || md.picture_bytes(self.world.store().dir()).is_some() {
             return;
         }
         let Some(rid) = md.rid.as_deref() else {
@@ -226,12 +227,12 @@ impl Viewer {
             let real = md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"));
             if real && !self.refreshing {
                 self.refreshing = true;
-                sync::want_line(m.chat, m.id);
+                runtime::of(self.world.store()).want_line(m.chat, m.id);
             }
             return;
         };
         self.wanted_pic = true;
-        sync::want_file(rid);
+        runtime::of(self.world.store()).want_file(rid);
     }
 
     /// Whether a picture was asked for and has not landed — what keeps the
@@ -242,7 +243,7 @@ impl Viewer {
         self.wanted_pic
             && m.media
                 .as_ref()
-                .is_some_and(|md| md.picture_bytes(self.store.dir()).is_none())
+                .is_some_and(|md| md.picture_bytes(self.world.store().dir()).is_none())
     }
 
     /// Play or pause. Pressing play on a clip is also the asking, since a
@@ -280,37 +281,6 @@ impl Viewer {
     pub fn playing(&self, now: f64) -> bool {
         self.running || self.player.is_some_and(|p| p.state(now).playing)
     }
-}
-
-/// Fires one request at the signed-in account's client, answering whether it
-/// went. `true` only where this build links the engine (the `tdlib` feature)
-/// and an account has signed in; on `false` the viewer keeps the demo path,
-/// the poster over the fake timeline. The chat panel's own `wire`, verbatim.
-#[cfg(feature = "tdlib")]
-#[must_use]
-fn wire(store: &kernel::store::Store, request: &str) -> bool {
-    use super::super::transport::{self, Td};
-    // Only the engine's own store may send: a fixture — the panels library,
-    // a test — holds a store of its own and must reach no real client
-    // (review, 2026-09-07).
-    if !super::super::Telegram::engine_store(store.dir()) {
-        return false;
-    }
-    match transport::shared() {
-        Some(td) => {
-            td.send(request);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Without the engine there is nothing to ask, so no clip is ever this
-/// panel's to play and the round-one drawing stands.
-#[cfg(not(feature = "tdlib"))]
-#[must_use]
-fn wire(_store: &kernel::store::Store, _request: &str) -> bool {
-    false
 }
 
 impl Panel for Viewer {
@@ -370,7 +340,7 @@ impl Panel for Viewer {
         }
         // The one button is wherever there is something to play: a
         // recording, or a clip this build can really play.
-        if let Some(st) = m.as_ref().and_then(|m| self.player_state(m, model::now())) {
+        if let Some(st) = m.as_ref().and_then(|m| self.player_state(m, self.world.now())) {
             v.push(Verb::run(
                 "telegram.play",
                 if st.playing { "pause" } else { "play" },
@@ -440,11 +410,11 @@ impl PanelKind for ViewerKind {
             id: id.clone(),
             chat,
             msg,
-            store: cx.session().store().clone(),
+            world: cx.session().world().clone(),
             slot: 0,
             player: None,
             // Opened from a line's own play button, it plays as it opens.
-            running: super::super::progress::take_play_on_open(chat, msg),
+            running: runtime::of(cx.session().store()).take_play_on_open(chat, msg),
             refreshing: false,
             asked: false,
             wanted_pic: false,

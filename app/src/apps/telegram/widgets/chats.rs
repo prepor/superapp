@@ -15,7 +15,6 @@ use crate::shell::widgets::table::{self, RowSpec, TableView};
 
 use super::super::model::{self, ChatRow};
 use super::super::panels::{Chat, Chats};
-use super::super::Telegram;
 
 /// What the table needs to know about a chat list's rows.
 pub struct ChatsRows;
@@ -35,7 +34,7 @@ impl RowSpec for ChatsRows {
     /// Two lines: the title and the last message's time, then what the
     /// chat last said and the count. Bold while anything is unread — a
     /// twin, not a weight, because a label's style is not a runtime value.
-    fn populate(cx: &mut Cx, row: &WidgetRef, r: &ChatRow, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, r: &ChatRow, selected: bool, marked: bool, now: f64) {
         let line = table::line(cx, row, selected, marked);
         let unread = r.unread > 0 || r.mention;
         for (path, on) in [(ids!(body.title_lbl), !unread), (ids!(body.title_b), unread)] {
@@ -52,9 +51,9 @@ impl RowSpec for ChatsRows {
         state.set_visible(cx, !mark.is_empty() && !failed);
         line.label(cx, ids!(body.state_err)).set_visible(cx, failed);
         line.label(cx, ids!(body.when_lbl))
-            .set_text(cx, &model::when(r.last, model::now()));
+            .set_text(cx, &model::when(r.last, now));
         line.label(cx, ids!(body.preview_lbl))
-            .set_text(cx, &r.preview());
+            .set_text(cx, &r.preview(now));
         line.label(cx, ids!(body.pinned_lbl))
             .set_visible(cx, r.pinned > 0);
         // The count: white on ink, outlined for a muted chat, `@` where one
@@ -73,7 +72,7 @@ impl RowSpec for ChatsRows {
         muted.label(cx, ids!(lbl)).set_text(cx, &count);
     }
 
-    fn label(r: &ChatRow) -> String {
+    fn label(r: &ChatRow, _now: f64) -> String {
         r.title.clone()
     }
 
@@ -130,7 +129,7 @@ impl Widget for ChatsPanel {
             if k.key_code == KeyCode::Escape {
                 let slot = scope.props.get::<PanelProps>().map(|p| p.slot);
                 if let Some(s) = scope.data.get_mut::<Session>() {
-                    if slot.is_some() && s.focus() == slot && Telegram::take_forward().is_some() {
+                    if slot.is_some() && s.focus() == slot && super::super::runtime::of(s.store()).take_forward().is_some() {
                         s.redraw();
                     }
                 }
@@ -141,7 +140,6 @@ impl Widget for ChatsPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         let Self {
             view,
             suggest,

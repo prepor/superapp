@@ -26,14 +26,14 @@ impl RowSpec for PeopleRows {
     }
 
     /// The name, and under it the presence and the username, muted.
-    fn populate(cx: &mut Cx, row: &WidgetRef, r: &Person, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, r: &Person, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         line.label(cx, ids!(body.name_lbl)).set_text(cx, &r.name);
         line.label(cx, ids!(body.detail_lbl))
             .set_text(cx, &r.detail());
     }
 
-    fn label(r: &Person) -> String {
+    fn label(r: &Person, _now: f64) -> String {
         r.name.clone()
     }
 
@@ -82,7 +82,6 @@ impl Widget for PeoplePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         let Self {
             view,
             suggest,

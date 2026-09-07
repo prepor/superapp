@@ -10,27 +10,27 @@
 use std::any::Any;
 use std::rc::Rc;
 
+use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
-use kernel::store::Store;
 
 use crate::shell::widgets::map;
 use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId, Player};
-use super::super::{sync, verbs, Telegram};
+use super::super::{requests, runtime, verbs};
 use super::chat::copy_line;
-use super::{Chat, Chats, Viewer};
+use super::{wire, Chat, Chats, Viewer};
 
 /// A line's card.
 pub struct Line {
     id: PanelId,
     chat: PeerId,
     msg: MsgId,
-    store: Rc<Store>,
+    world: Rc<World>,
     slot: SlotId,
     /// The card's own player, where the line has a recording.
     player: Option<Player>,
@@ -58,7 +58,7 @@ impl Line {
     /// The line, off the store. `None` for one the store does not have.
     #[must_use]
     pub fn msg(&self) -> Option<Msg> {
-        model::line(&self.store, self.chat, self.msg)
+        model::line(self.world.store(), self.chat, self.msg)
     }
 
     /// Where the player stands, for a line with a recording.
@@ -111,40 +111,6 @@ impl Line {
     }
 }
 
-/// Fires one request at the signed-in account's client, answering whether it
-/// went. `true` only where this build links the engine (the `tdlib` feature)
-/// and an account has signed in; the caller keeps the demo path — the local,
-/// undoable delete — on `false`, so a build with no engine is behaviourally
-/// unchanged. Mirrors the chat panel's own `wire`. Edit and reply on this card
-/// need none of their own: they tell the chat's composer, and the wire fires
-/// from [`Chat::send`](super::Chat) when that is entered.
-#[cfg(feature = "tdlib")]
-#[must_use]
-fn wire(store: &kernel::store::Store, request: &str) -> bool {
-    use super::super::transport::{self, Td};
-    // Only the engine's own store may send: a fixture — the panels library,
-    // a test — holds a store of its own and must reach no real client
-    // (review, 2026-09-07).
-    if !super::super::Telegram::engine_store(store.dir()) {
-        return false;
-    }
-    match transport::shared() {
-        Some(td) => {
-            td.send(request);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Without the engine there is nothing to send to: the delete keeps the demo
-/// path, so this answers `false` and never reaches for a client.
-#[cfg(not(feature = "tdlib"))]
-#[must_use]
-fn wire(_store: &kernel::store::Store, _request: &str) -> bool {
-    false
-}
-
 impl Panel for Line {
     fn id(&self) -> &PanelId {
         &self.id
@@ -189,7 +155,7 @@ impl Panel for Line {
                 _ => {
                     if md.secs.is_some() {
                         let playing = m.as_ref().is_some_and(|m| {
-                            self.player_state(m, model::now()).is_some_and(|s| s.playing)
+                            self.player_state(m, self.world.now()).is_some_and(|s| s.playing)
                         });
                         v.push(Verb::run(
                             "telegram.play",
@@ -254,7 +220,7 @@ impl Panel for Line {
             "telegram.delete" => {
                 let (chat, msg) = (self.chat, self.msg);
                 self.tell_chat(s, |c| c.lines_gone(&[msg]));
-                if !wire(&self.store, &sync::delete_messages(chat, &[msg], true)) {
+                if !wire(self.world.store(), &requests::delete_messages(chat, &[msg], true)) {
                     verbs::delete_lines(s, chat, vec![msg]);
                 }
                 s.redraw();
@@ -289,7 +255,7 @@ impl Panel for Line {
             // picked from — the same forward the transcript's bar starts, over
             // one line rather than the marks.
             "telegram.forward" => {
-                Telegram::carry_forward(self.chat, vec![self.msg]);
+                runtime::of(self.world.store()).carry_forward(self.chat, vec![self.msg]);
                 s.nav(Nav::Open {
                     from: self.slot,
                     id: Chats::id(),
@@ -322,7 +288,7 @@ impl PanelKind for LineKind {
             id: id.clone(),
             chat,
             msg,
-            store: cx.session().store().clone(),
+            world: cx.session().world().clone(),
             slot: 0,
             player: None,
         })

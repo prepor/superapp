@@ -14,7 +14,7 @@ use kernel::store::Store;
 
 use super::super::draft_toast;
 use super::super::model::{self, PeerId, HERE};
-use super::super::sync;
+use super::super::requests;
 use super::told;
 
 /// The place panel.
@@ -92,7 +92,7 @@ impl Panel for Place {
             "telegram.send_place" => {
                 told(
                     s,
-                    &sync::send_location(self.chat, None, lat, lon),
+                    &requests::send_location(self.chat, None, lat, lon),
                     &format!("place {lat:.4}, {lon:.4}"),
                 );
             }

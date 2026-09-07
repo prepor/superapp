@@ -1,24 +1,9 @@
-//! The inbound path: a server's updates become rows.
+//! Idempotent writes of normalized Telegram updates into the local projection.
 //!
-//! [`model`](super::model)'s write helpers are the outbound half — my edit,
-//! my delete, my draft, sent to the wire. This is the other direction: what
-//! comes down from an account — its dialogs, its peers, its history — landed
-//! in `tg_*`. The third phase's TDLib worker turns each update into one of
-//! the plain structs here and hands it over; this round the structs are
-//! synthetic and the tests are the only caller, so the store side is settled
-//! before a byte of network exists.
-//!
-//! Every projection upserts, so the same update twice leaves the same rows —
-//! a re-sync is not a duplication. The full-text index follows through the
-//! triggers V2 installs, so a projected line is searchable the moment it
-//! lands and a trimmed one is gone from the index with it.
-//!
-//! Nothing in this build calls the module yet: the phase-3 TDLib worker is
-//! its driver, and the tests stand in until then. Its items are allowed to
-//! read as unused rather than be wired to a caller that does not exist —
-//! `app`'s app modules are private, so a `pub` here is not reachable enough
-//! to count as used on its own.
-#![allow(dead_code)]
+//! The worker supplies `Incoming*` values decoded by `updates`. All writes
+//! run on the store's writer inside the caller's transaction; FTS triggers
+//! keep the search index in step with message upserts and retention.
+#![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
 use rusqlite::Connection;
 
@@ -298,7 +283,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
 
 /// The history the store keeps per chat: the newest this many lines, trimmed
 /// as new ones arrive. Scrolling within the window is the store's; scrolling
-/// past it is the wire's, and those lines are drawn but never kept.
+/// past it needs a separate paging path; the current UI reads this window.
 pub const HISTORY_KEEP: usize = 10_000;
 
 /// Marks read every sent line up to the chat's outbox cursor — where the far
@@ -354,7 +339,7 @@ pub fn trim_chat(c: &Connection, chat: PeerId) -> rusqlite::Result<usize> {
     Ok(gone)
 }
 
-// -- local search, and the seam to the wire -----------------------------------------
+// -- local indexed search -----------------------------------------
 
 /// How many local hits one question is worth returning before the list is
 /// paged.
@@ -395,6 +380,7 @@ fn match_query(term: &str) -> Option<String> {
 /// `None`. Over the full-text index, so it is instant and offline. The
 /// spellings are a [`MsgHit`]'s, the same a messages list draws.
 #[must_use]
+#[allow(dead_code)] // The current UI uses substring search; this is the indexed query API.
 pub fn search_local(conn: &Connection, chat: Option<PeerId>, term: &str) -> Vec<MsgHit> {
     let Some(query) = match_query(term) else {
         return Vec::new();
@@ -419,63 +405,10 @@ pub fn search_local(conn: &Connection, chat: Option<PeerId>, term: &str) -> Vec<
     }
 }
 
-/// What a search of the store turned up, and whether the wire still owes an
-/// answer. `exhausted` is the seam to TDLib: `true` when the local window is
-/// the whole of the scope's history and a miss is a real miss; `false` when
-/// older lines were trimmed away (or the sweep is global), so the third
-/// phase's [`WireSearch`] is asked and its hits merged in. No wire exists
-/// this round; a caller reads `local` as all there is.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchOutcome {
-    pub local: Vec<MsgHit>,
-    pub exhausted: bool,
-}
-
-/// The wire half of search, the third phase's to implement: TDLib's
-/// `searchChatMessages` for one chat, `searchMessages` across all. The seam
-/// stands here so the store side is proven first; nothing reaches the
-/// network this round.
-pub trait WireSearch {
-    /// The server's matches for a term, in one chat or across all, drawn the
-    /// same way a local hit is.
-    fn search_wire(&self, chat: Option<PeerId>, term: &str) -> Vec<MsgHit>;
-}
-
-/// Searches the store and says whether the wire need be asked. When the
-/// window holds the scope whole the answer is final; otherwise `exhausted`
-/// is `false` and phase 3 fills the rest through a [`WireSearch`].
-#[must_use]
-pub fn search_scope(conn: &Connection, chat: Option<PeerId>, term: &str) -> SearchOutcome {
-    SearchOutcome {
-        local: search_local(conn, chat, term),
-        exhausted: window_is_whole(conn, chat),
-    }
-}
-
-/// Whether the local window is the whole of a scope's history. A chat under
-/// the ceiling keeps every line it ever had, so a local miss is a real miss;
-/// at the ceiling, older lines were trimmed and only the wire holds them. A
-/// sweep across every chat is never whole on its own.
-fn window_is_whole(conn: &Connection, chat: Option<PeerId>) -> bool {
-    match chat {
-        Some(id) => {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM tg_message WHERE chat = ?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            n < HISTORY_KEEP as i64
-        }
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::schema::SCHEMA;
-    use super::super::seed::{self, HIKE, STELAXIS, VERA};
+    use super::super::seed::{self, HIKE, VERA};
     use super::*;
     use kernel::store::Store;
     use kernel::time::ts;
@@ -1007,11 +940,9 @@ mod tests {
         assert_eq!(fts_n, 10_000, "the index holds only the window");
     }
 
-    /// Local search is scoped to a chat or swept across all, and the
-    /// exhausted flag is the seam: a small chat is whole, a trimmed one is
-    /// not, a global sweep never is.
+    /// Indexed queries return only the requested scope's matches.
     #[test]
-    fn local_search_is_scoped_and_flags_the_wire() {
+    fn local_search_is_scoped() {
         let s = store();
         // A word the demo world carries in two different chats.
         s.write(|c| {
@@ -1029,10 +960,6 @@ mod tests {
         let scoped = search_local(s.conn(), Some(VERA), "pangolin");
         assert_eq!(scoped.len(), 1, "one chat");
         assert_eq!(scoped[0].chat, VERA);
-        // The seam: a demo chat is under the ceiling, so it is whole; a
-        // global sweep is never whole.
-        assert!(search_scope(s.conn(), Some(STELAXIS), "budget").exhausted);
-        assert!(!search_scope(s.conn(), None, "budget").exhausted);
     }
 
     /// Projecting into a new chat leaves the demo seed's own rows exactly as

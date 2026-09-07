@@ -9,8 +9,8 @@ use kernel::app::{Schema, Step};
 use rusqlite::Connection;
 
 /// Telegram's ladder: the demo shape this round was drawn against, then the
-/// full-text index the projected store searches over, then the device-local
-/// sign-in row the real client writes, then the repair of `V1`'s one
+/// full-text index the projected store searches over, then the authorization
+/// status row the real client writes, then the repair of `V1`'s one
 /// in-place edit, the reply freed from the window, the clip a moving
 /// picture plays, whether a chat is mine at all, and the message given a row
 /// key of its own. A fresh store runs every rung, a store already at a rung
@@ -465,10 +465,6 @@ fn v4_media_columns(c: &Connection) -> rusqlite::Result<()> {
 
 /// The single `tg_session` row, as the sign-in UI reads it.
 #[derive(Debug, Clone, PartialEq)]
-// The phase-3d sign-in panel reads this; there is no caller in the default
-// build yet, and the app modules are private, so a `pub` here is not reachable
-// enough to count as used on its own.
-#[allow(dead_code)]
 pub struct Session {
     pub phone: Option<String>,
     pub state: String,
@@ -479,7 +475,6 @@ pub struct Session {
 /// Reads the one session row, or the 'closed' default a store with no sign-in
 /// yet answers with — so a caller never has to special-case the empty table.
 #[must_use]
-#[allow(dead_code)] // the phase-3c worker and the phase-3d UI are the callers.
 pub fn session(conn: &Connection) -> Session {
     conn.query_row(
         "SELECT phone, state, detail, updated FROM tg_session WHERE id = 1",
@@ -508,7 +503,7 @@ pub fn session(conn: &Connection) -> Session {
 /// # Errors
 ///
 /// If the store refuses the write.
-#[allow(dead_code)] // the phase-3c auth state machine is the only writer.
+#[cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 pub fn set_session(
     conn: &Connection,
     phone: Option<&str>,

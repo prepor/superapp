@@ -2,16 +2,13 @@
 //! line, the draft in the composer or the edit under way in it, what the
 //! composer carries, and the one line playing.
 //!
-//! Opening it is what marks the chat read — claimed on the same undoable
-//! node as the layout change, so one undo closes the panel *and* gives the
-//! count back. Where the reading started is remembered on the instance for
-//! the panel's life, which is where the unread line is drawn.
+//! Opening marks the chat read locally on the layout action's undo node.
+//! The live read receipt is separate: undo restores only the local count.
+//! The panel remembers where reading started for its unread divider.
 //!
-//! The bar carries what a chat is for — replying, and over my own lines
-//! editing and deleting, which are real on the store and undoable — and
-//! three links to the rest: what goes with the next message, the line under
-//! the cursor as a card with the verbs that act on one line, and the peer's
-//! card with the verbs about the chat.
+//! The bar offers reply, edit and delete, and opens attachment, line and
+//! peer cards. Live edits and deletes go to the worker; offline fixture
+//! changes use local undoable intents.
 
 use std::any::Any;
 use std::collections::BTreeSet;
@@ -32,8 +29,8 @@ use super::super::draft_toast;
 use super::super::model::{
     self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, Player, RUN_GAP,
 };
-use super::super::{sync, verbs, Telegram};
-use super::{Attach, Chats, Line, Peer};
+use super::super::{requests, runtime, verbs};
+use super::{wire, Attach, Chats, Line, Peer};
 
 /// An edit under way in the composer: which of my lines, what it said, and
 /// what the field says now.
@@ -145,11 +142,19 @@ impl Chat {
         self.peer
     }
 
+    pub fn play_on_open(&self, id: MsgId) {
+        runtime::of(&self.store).play_on_open(self.peer, id);
+    }
+
+    pub fn want_file(&self, remote_id: &str) {
+        runtime::of(&self.store).want_file(remote_id);
+    }
+
     /// Whether the transcript is still being filled from the wire — the
     /// history walk a chat starts as it opens, until its last page lands.
     #[must_use]
     pub fn loading(&self) -> bool {
-        super::super::progress::loading(self.peer)
+        runtime::of(&self.store).loading(self.peer)
     }
 
     /// Who the chat is with, and its flags. `None` for a peer the store does
@@ -344,10 +349,10 @@ impl Chat {
     /// The line above the composer: *editing: …* while an edit is under
     /// way, *reply to …* while replying.
     #[must_use]
-    pub fn above_line(&self) -> Option<String> {
+    pub fn above_line(&self, now: f64) -> Option<String> {
         match &self.editing {
             Some(e) => Some(format!("editing: {}", model::one_line(&e.original))),
-            None => self.reply_line(),
+            None => self.reply_line(now),
         }
     }
 
@@ -365,7 +370,7 @@ impl Chat {
         // the wire — the demo, or signed out — the local action deletes them
         // and undo puts them back. One or the other, never both, so a line is
         // not deleted twice.
-        if !wire(&self.store, &sync::delete_messages(self.peer, &ids, true)) {
+        if !wire(&self.store, &requests::delete_messages(self.peer, &ids, true)) {
             verbs::delete_lines(s, self.peer, ids);
         }
         s.redraw();
@@ -438,14 +443,14 @@ impl Chat {
     /// What the line above the composer says while replying: *reply to
     /// Vera: the line*, shortened to one line.
     #[must_use]
-    pub fn reply_line(&self) -> Option<String> {
+    pub fn reply_line(&self, now: f64) -> Option<String> {
         let id = self.reply_to?;
         let hist = self.history();
         let m = hist.iter().find(|m| m.id == id)?;
         Some(format!(
             "reply to {}: {}",
             m.writer(),
-            model::media_or_text(m.media.as_ref(), &m.text, model::now())
+            model::media_or_text(m.media.as_ref(), &m.text, now)
         ))
     }
 
@@ -535,9 +540,9 @@ impl Chat {
                     .iter()
                     .any(|m| m.id == e.msg && m.media.is_some());
                 let request = if captioned {
-                    sync::edit_message_caption(self.peer, e.msg, &text)
+                    requests::edit_message_caption(self.peer, e.msg, &text)
                 } else {
-                    sync::edit_message_text(self.peer, e.msg, &text)
+                    requests::edit_message_text(self.peer, e.msg, &text)
                 };
                 if !wire(&self.store, &request) {
                     verbs::edit_line(s, self.peer, e.msg, &e.original, e.was_edited, &text);
@@ -557,7 +562,7 @@ impl Chat {
         let text = self.draft.trim().to_string();
         let wired = if self.carrying.is_empty() {
             !text.is_empty()
-                && wire(&self.store, &sync::send_message(self.peer, &text, self.reply_to))
+                && wire(&self.store, &requests::send_message(self.peer, &text, self.reply_to))
         } else {
             self.send_files(&text)
         };
@@ -601,7 +606,7 @@ impl Chat {
             let first = i == 0;
             let caption = if first { text } else { "" };
             let reply = if first { self.reply_to } else { None };
-            if wire(&self.store, &sync::send_file(self.peer, reply, file, caption)) {
+            if wire(&self.store, &requests::send_file(self.peer, reply, file, caption)) {
                 went = true;
             }
         }
@@ -622,7 +627,7 @@ impl Chat {
         let text = self.draft.trim();
         if wire(
             &self.store,
-            &sync::set_chat_draft(self.peer, (!text.is_empty()).then_some(text)),
+            &requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text)),
         ) {
             self.sent_draft.clone_from(&self.draft);
         }
@@ -715,7 +720,7 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgId>, now: f64) -> Vec<Ro
 /// is the effect's answer and not a foregone *copied*.
 pub fn copy_line(s: &mut Session, m: &Msg) {
     let text = if m.text.trim().is_empty() {
-        m.media.as_ref().map(|md| md.line(model::now())).unwrap_or_default()
+        m.media.as_ref().map(|md| md.line(s.now())).unwrap_or_default()
     } else {
         m.text.clone()
     };
@@ -732,38 +737,6 @@ pub fn copy_line(s: &mut Session, m: &Msg) {
         Err(e) => (e, true),
     };
     s.notify(said.0, said.1);
-}
-
-/// Fires one request at the signed-in account's client, answering whether it
-/// went. `true` only where this build links the engine (the `tdlib` feature),
-/// an account has signed in, and the transcript asking is over the account
-/// holder's own store; a caller keeps the demo path — the local, undoable
-/// action and its toast — on `false`, so a build with no engine is
-/// behaviourally unchanged. Mirrors the sign-in panel's own `deliver`, and
-/// gated on the store the way [`panels::wire`](super::wire) is: a Panels
-/// Library transcript pressing *send* must not put a line in a real chat.
-#[cfg(feature = "tdlib")]
-#[must_use]
-fn wire(store: &Store, request: &str) -> bool {
-    use super::super::transport::{self, Td};
-    if !Telegram::engine_store(store.dir()) {
-        return false;
-    }
-    match transport::shared() {
-        Some(td) => {
-            td.send(request);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Without the engine there is nothing to send to: every verb keeps the demo
-/// path, so this answers `false` and never reaches for a client.
-#[cfg(not(feature = "tdlib"))]
-#[must_use]
-fn wire(_store: &Store, _request: &str) -> bool {
-    false
 }
 
 impl Panel for Chat {
@@ -912,7 +885,7 @@ impl Panel for Chat {
                 if ids.is_empty() {
                     return;
                 }
-                Telegram::carry_forward(self.peer, ids);
+                runtime::of(&self.store).carry_forward(self.peer, ids);
                 self.marks.clear();
                 s.nav(Nav::Open {
                     from: self.slot,
@@ -1040,7 +1013,7 @@ impl PanelKind for ChatKind {
         #[cfg(feature = "tdlib")]
         if unread > 0 {
             if let Some(last) = model::history(&store, peer).iter().last().map(|m| m.id) {
-                let _ = wire(&store, &sync::view_messages(peer, &[last]));
+                let _ = wire(&store, &requests::view_messages(peer, &[last]));
             }
         }
         // And fill the transcript's window from the wire: the newest page
@@ -1050,8 +1023,8 @@ impl PanelKind for ChatKind {
         // The account holder's own store asks; a fixture's would be putting a
         // real chat's history on the engine's queue for a scene.
         #[cfg(feature = "tdlib")]
-        if Telegram::engine_store(store.dir()) {
-            sync::want_history(peer);
+        if super::super::Telegram::engine_store(store.dir()) {
+            runtime::of(&store).want_history(peer);
         }
         // Opened at a line — from a messages list — the cursor starts on
         // it; from a row of the chat list, nowhere.

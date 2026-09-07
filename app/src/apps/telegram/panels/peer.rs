@@ -13,7 +13,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, PeerCard, PeerId, PeerKind as Kind};
-use super::super::sync;
+use super::super::requests;
 use super::{flip, told, Chat, Members, Messages};
 
 /// A peer's card.
@@ -185,36 +185,36 @@ impl Panel for Peer {
             "telegram.mute" => {
                 let on = !card.muted;
                 let word = if on { "mute" } else { "unmute" };
-                if told(s, &sync::set_chat_muted(peer, on), word) {
+                if told(s, &requests::set_chat_muted(peer, on), word) {
                     flip(&self.store, move |c| model::set_muted_tx(c, peer, on));
                 }
             }
             "telegram.pin" => {
                 let on = card.pinned == 0;
                 let word = if on { "pin" } else { "unpin" };
-                if told(s, &sync::toggle_chat_pinned(peer, on), word) {
+                if told(s, &requests::toggle_chat_pinned(peer, on), word) {
                     flip(&self.store, move |c| model::set_pinned_tx(c, peer, on));
                 }
             }
             "telegram.archive" | "telegram.unarchive" => {
                 let on = verb == "telegram.archive";
                 let word = if on { "archive" } else { "unarchive" };
-                if told(s, &sync::add_chat_to_list(peer, on), word) {
+                if told(s, &requests::add_chat_to_list(peer, on), word) {
                     flip(&self.store, move |c| model::set_archived_tx(c, peer, on));
                 }
             }
             "telegram.join" => {
-                told(s, &sync::join_chat(peer), "join");
+                told(s, &requests::join_chat(peer), "join");
             }
             "telegram.clear_history" => {
-                told(s, &sync::clear_history(peer), "clear history");
+                told(s, &requests::clear_history(peer), "clear history");
                 flip(&self.store, move |c| model::clear_history_tx(c, peer));
             }
             "telegram.leave" | "telegram.delete" => {
                 let (request, word) = if verb == "telegram.leave" {
-                    (sync::leave_chat(peer), "leave")
+                    (requests::leave_chat(peer), "leave")
                 } else {
-                    (sync::delete_chat(peer), "delete chat")
+                    (requests::delete_chat(peer), "delete chat")
                 };
                 told(s, &request, word);
                 flip(&self.store, move |c| model::leave_chat_tx(c, peer));

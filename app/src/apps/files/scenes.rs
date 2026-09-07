@@ -44,7 +44,7 @@ fn row_of(name: &str, is_dir: bool, size: u64) -> DirRow {
 fn files_row() -> Scene<Setup> {
     let row = |r: DirRow, selected: bool, marked: bool| {
         widget(live_id!(files_row_tpl), move |cx, w| {
-            DirRows::populate(cx, w, &r, selected, marked);
+            DirRows::populate(cx, w, &r, selected, marked, kernel::time::virtual_epoch());
         })
     };
     Scene::new("files row", (520.0, 34.0))

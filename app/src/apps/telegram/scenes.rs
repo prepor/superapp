@@ -115,8 +115,7 @@ fn mine(text: &str, state: &str) -> Msg {
 fn chat_row() -> Scene<Setup> {
     let row = |r: ChatRow, selected: bool, marked: bool| {
         widget(live_id!(telegram_chat_row_tpl), move |cx, w| {
-            model::set_now(virtual_epoch());
-            ChatsRows::populate(cx, w, &r, selected, marked);
+            ChatsRows::populate(cx, w, &r, selected, marked, kernel::time::virtual_epoch());
         })
     };
     Scene::new("chat row", (520.0, 52.0))
@@ -321,8 +320,10 @@ fn chats() -> Scene<Setup> {
 fn message_row() -> Scene<Setup> {
     let row = |r: Row, selected: bool, marked: bool| {
         widget(live_id!(telegram_msg_row_tpl), move |cx, w| {
-            model::set_now(virtual_epoch());
-            super::widgets::chat::populate(cx, w, &r, selected, marked, None, None);
+            super::widgets::chat::populate(
+                cx, w, &r, (selected, marked), None, None,
+                &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
+            );
         })
     };
     let line = |m: Msg| Row::Message { msg: m, run: false };
@@ -453,7 +454,6 @@ fn message_row() -> Scene<Setup> {
 fn media() -> Scene<Setup> {
     let row = |r: Row| {
         widget(live_id!(telegram_msg_row_tpl), move |cx, w| {
-            model::set_now(virtual_epoch());
             let player = match &r {
                 Row::Message { msg, .. } => msg.media.as_ref().and_then(|md| md.secs).map(|s| PlayerState {
                     playing: false,
@@ -462,12 +462,14 @@ fn media() -> Scene<Setup> {
                 }),
                 _ => None,
             };
-            super::widgets::chat::populate(cx, w, &r, false, false, None, player);
+            super::widgets::chat::populate(
+                cx, w, &r, (false, false), None, player,
+                &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
+            );
         })
     };
     let playing = |r: Row, position: f64| {
         widget(live_id!(telegram_msg_row_tpl), move |cx, w| {
-            model::set_now(virtual_epoch());
             let player = match &r {
                 Row::Message { msg, .. } => msg.media.as_ref().and_then(|md| md.secs).map(|s| PlayerState {
                     playing: true,
@@ -476,7 +478,10 @@ fn media() -> Scene<Setup> {
                 }),
                 _ => None,
             };
-            super::widgets::chat::populate(cx, w, &r, false, false, None, player);
+            super::widgets::chat::populate(
+                cx, w, &r, (false, false), None, player,
+                &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
+            );
         })
     };
     let with = |m: Media, name: &str, text: &str, at: f64| {
@@ -893,7 +898,7 @@ fn messages() -> Scene<Setup> {
 fn people() -> Scene<Setup> {
     let row = |p: Person, selected: bool, marked: bool| {
         widget(live_id!(telegram_person_row_tpl), move |cx, w| {
-            PeopleRows::populate(cx, w, &p, selected, marked);
+            PeopleRows::populate(cx, w, &p, selected, marked, kernel::time::virtual_epoch());
         })
     };
     let person = |name: &str, username: &str, status: &str| Person {

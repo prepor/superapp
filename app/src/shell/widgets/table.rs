@@ -73,10 +73,11 @@ pub trait RowSpec: 'static {
 
     /// Fills one row. `row` is the item widget; [`line()`] answers the twin
     /// to write into and puts the cursor wash and the mark bar on it.
-    fn populate(cx: &mut Cx, row: &WidgetRef, r: &RowOf<Self>, selected: bool, marked: bool);
+    /// `now` is the owning session's clock for this draw.
+    fn populate(cx: &mut Cx, row: &WidgetRef, r: &RowOf<Self>, selected: bool, marked: bool, now: f64);
 
     /// What a script — and so the hit table — addresses this row by.
-    fn label(r: &RowOf<Self>) -> String;
+    fn label(r: &RowOf<Self>, now: f64) -> String;
 
     /// What the row opens, previews, and is replaced by.
     fn target(r: &RowOf<Self>) -> PanelId;
@@ -647,6 +648,7 @@ impl<S: RowSpec> TableView<S> {
             return view.draw_walk(cx, scope, walk);
         };
 
+        let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         let field = view.text_input(cx, FILTER);
         if !self.primed {
             self.primed = true;
@@ -755,9 +757,9 @@ impl<S: RowSpec> TableView<S> {
                     }
                 };
                 let w = pl.item(cx, idx, S::row_tpl());
-                S::populate(cx, &w, &row, at.is_some() && at == cursor, marked);
+                S::populate(cx, &w, &row, at.is_some() && at == cursor, marked, now);
                 w.draw_all(cx, scope);
-                drawn.push((at, w, S::label(&row), S::target(&row)));
+                drawn.push((at, w, S::label(&row, now), S::target(&row)));
             }
         }
 

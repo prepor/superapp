@@ -1,14 +1,12 @@
 //! The sign-in panel: what lets the account holder log in.
 //!
-//! It owns nothing the store does not. Each draw it reads the one
+//! It owns the input field. Each draw it reads the one
 //! [`tg_session`](super::super::schema) row the worker writes and shows, by
 //! the auth state, one line and — where a secret is wanted — one field and
 //! one verb: the phone, the login code, the two-factor password. The verb
-//! sends what the field holds to TDLib through the [shared
-//! transport](super::super::transport::shared), the same client the worker's
-//! loop drives; the panel writes nothing itself. TDLib's answer comes back as
-//! an update the worker projects into `tg_session`, and the next draw reflects
-//! where the flow now stands.
+//! sends what the field holds through its store's worker inbox. TDLib's
+//! answer comes back as an update the worker projects into `tg_session`,
+//! and the next draw reflects where the flow now stands.
 //!
 //! Without the `tdlib` feature there is no engine and no worker, so the row
 //! stays 'closed' and the verb is an inert toast — the panel still exists and
@@ -23,7 +21,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::schema::{self, Session as TgSession};
-use super::super::{config, sync};
+use super::super::{config, requests};
 
 /// The verb id the bar and [`run`](SignIn::run) share.
 const VERB: &str = "telegram.signin";
@@ -163,7 +161,7 @@ impl SignIn {
     }
 
     /// Sends what the field holds to TDLib, by the current state: the phone,
-    /// the code, or the password, each through [`sync`]'s own builder so the
+    /// the code, or the password, each through [`requests`]'s own builder so the
     /// wire's JSON lives in one place. The panel writes nothing to the store —
     /// TDLib's answer rides an update the worker projects into `tg_session`,
     /// and the next draw reflects it.
@@ -177,34 +175,23 @@ impl SignIn {
             return;
         }
         let req = match kind {
-            Field::Phone => sync::set_authentication_phone(&text),
-            Field::Code => sync::check_authentication_code(&text),
-            Field::Password => sync::check_authentication_password(&text),
+            Field::Phone => requests::set_authentication_phone(&text),
+            Field::Code => requests::check_authentication_code(&text),
+            Field::Password => requests::check_authentication_password(&text),
         };
         deliver(s, &req);
     }
 }
 
-/// Fires one request at the shared client, where a build has an engine. The
-/// redraw carries the panel forward to the next state once the worker projects
-/// TDLib's answer.
-#[cfg(feature = "tdlib")]
+/// Login uses the same store-scoped inbox as every other command.
 fn deliver(s: &mut Session, req: &str) {
-    use super::super::transport::{self, Td};
-    match transport::shared() {
-        Some(td) => {
-            td.send(req);
-            s.redraw();
-        }
-        None => s.notify("telegram is not connected yet", true),
+    if super::wire(s.store(), req) {
+        s.redraw();
+    } else if cfg!(feature = "tdlib") {
+        s.notify("telegram is not connected yet", true);
+    } else {
+        s.notify("this build has no Telegram engine", true);
     }
-}
-
-/// Without the feature there is no engine: the send is an inert toast, and the
-/// row stays where it was.
-#[cfg(not(feature = "tdlib"))]
-fn deliver(s: &mut Session, _req: &str) {
-    s.notify("this build has no Telegram engine", true);
 }
 
 impl Panel for SignIn {

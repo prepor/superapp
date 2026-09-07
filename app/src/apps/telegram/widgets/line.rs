@@ -74,7 +74,6 @@ impl Widget for LinePanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         // Where the blob cache sits, so a downloaded photo resolves; `None`
         // with the store in memory, and the demo pictures draw without it.
         let store_dir = scope
@@ -84,7 +83,7 @@ impl Widget for LinePanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let now = model::now();
+        let now = super::now(scope);
         let Some((m, player, playing)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Line>().and_then(|l| {

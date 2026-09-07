@@ -8,8 +8,8 @@
 //! the store it was opened with. The widget that draws one borrows it from
 //! the scope and calls its methods; a verb of the bar is
 //! [`Panel::run`](kernel::panel::Panel::run), and a verb that reaches
-//! Telegram sends through [`wire`] where the build is signed in and says
-//! what it *would* have sent, in a toast, where it is not.
+//! Telegram sends through [`wire`] when the store has a worker connected.
+//! Offline actions use fixture intents or a toast describing the request.
 
 use kernel::session::Session;
 use kernel::store::Store;
@@ -36,46 +36,15 @@ pub use people::{Contacts, Members, People};
 pub use place::Place;
 pub use signin::SignIn;
 
-/// Fires one request at the signed-in account's client, answering whether it
-/// went. `true` only where this build links the engine (the `tdlib` feature),
-/// an account has signed in, and the panel asking reads the account holder's
-/// own store; a caller keeps the demo path — the toast saying what would have
-/// left — on `false`, so a build with no engine is behaviourally unchanged.
-/// Mirrors the sign-in panel's own `deliver`.
-///
-/// The store is what says whose panel this is. The one client is filed in a
-/// process-wide cell, so a Panels Library mount drawn beside a signed-in
-/// window would otherwise reach it: a scene pressing *mute* would mute a real
-/// chat, and a fixture's send would be a message somebody receives
-/// ([`Telegram::engine_store`](super::Telegram::engine_store)).
-#[cfg(feature = "tdlib")]
+/// Queue a request for this store's worker. False means no worker is
+/// connected; true means queued, not acknowledged by Telegram.
 #[must_use]
 pub fn wire(store: &Store, request: &str) -> bool {
-    use super::transport::{self, Td};
-    if !super::Telegram::engine_store(store.dir()) {
-        return false;
-    }
-    match transport::shared() {
-        Some(td) => {
-            td.send(request);
-            true
-        }
-        None => false,
-    }
+    super::runtime::of(store).send(request)
 }
 
-/// Without the engine there is nothing to send to: every verb keeps the demo
-/// path, so this answers `false` and never reaches for a client.
-#[cfg(not(feature = "tdlib"))]
-#[must_use]
-pub fn wire(_store: &Store, _request: &str) -> bool {
-    false
-}
-
-/// One verb, told to Telegram: the request goes where the build is signed in;
-/// where it is not, the toast says what *would* have left. Answers whether it
-/// went — which is what tells a caller whether the flip beside it is a thing
-/// the engine will presently confirm, or a change nobody asked for.
+/// Queue a live verb, or show the offline toast. A true result permits an
+/// optimistic local change; the server can still reject the command.
 pub fn told(s: &mut Session, request: &str, what: &str) -> bool {
     if wire(s.store(), request) {
         return true;

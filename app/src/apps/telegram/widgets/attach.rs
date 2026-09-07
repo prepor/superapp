@@ -114,12 +114,11 @@ impl Widget for AttachPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
         observe(&props, scope);
-        let now = model::now();
+        let now = super::now(scope);
         let Some((items, cursor, joined, recording)) = with_attach(&props, |a| {
             (a.items().to_vec(), a.cursor(), a.joined(), a.recording())
         }) else {

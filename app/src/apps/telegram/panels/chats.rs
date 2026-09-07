@@ -5,10 +5,8 @@
 //! picks the source and the one verb that differs, and nothing else about a
 //! list of chats changes with which of the two it is over.
 //!
-//! It is also the forward sheet. Lines taken out of a transcript wait on the
-//! app, and while they wait this bar wears *forward here*, which sends them
-//! to the chat under the cursor — a picker being a panel here, where on the
-//! client it is a sheet over the one it was raised from.
+//! It is also the forward picker. Lines selected in a transcript wait in
+//! the store's runtime; *forward here* sends them to the chat under the cursor.
 
 use std::any::Any;
 use std::rc::Rc;
@@ -21,7 +19,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, ChatRow, PeerId, PAGE};
-use super::super::{draft_toast, sync, Telegram};
+use super::super::{draft_toast, requests, runtime};
 #[cfg(test)]
 use super::Chat;
 use super::{flip, told, wire, Contacts};
@@ -106,7 +104,7 @@ impl Panel for Chats {
     /// seen to be short for now.
     fn title(&self) -> String {
         let word = if self.archive { "archive" } else { "chats" };
-        if super::super::progress::list_syncing() {
+        if runtime::of(&self.store).list_syncing() {
             format!("{word} · syncing…")
         } else {
             word.to_string()
@@ -143,7 +141,7 @@ impl Panel for Chats {
                 fresh: false,
             },
         )];
-        let forwarding = Telegram::pending_forward().is_some();
+        let forwarding = runtime::of(&self.store).pending_forward().is_some();
         if forwarding {
             v.push(Verb::run("telegram.forward_here", "forward here", Some('f')));
         }
@@ -183,7 +181,7 @@ impl Panel for Chats {
             // go is not sending it anywhere.
             "telegram.clear" => {
                 self.list.clear_marks();
-                Telegram::take_forward();
+                runtime::of(&self.store).take_forward();
                 s.redraw();
             }
             "telegram.forward_here" => self.forward_here(s),
@@ -231,12 +229,12 @@ impl Chats {
                 // line yet has nothing to name — its count clears here and
                 // the wire hears of it when one arrives.
                 "telegram.read" => match model::newest_line(&store, peer) {
-                    Some(last) => sync::view_messages(peer, &[last]),
+                    Some(last) => requests::view_messages(peer, &[last]),
                     None => continue,
                 },
-                "telegram.mute" => sync::set_chat_muted(peer, true),
-                "telegram.pin" => sync::toggle_chat_pinned(peer, true),
-                _ => sync::add_chat_to_list(peer, archiving),
+                "telegram.mute" => requests::set_chat_muted(peer, true),
+                "telegram.pin" => requests::toggle_chat_pinned(peer, true),
+                _ => requests::add_chat_to_list(peer, archiving),
             };
             if wire(&store, &request) {
                 went = true;
@@ -278,7 +276,7 @@ impl Chats {
     /// would only mean the bar still offering a forward the person just
     /// spent.
     fn forward_here(&mut self, s: &mut Session) {
-        let Some(f) = Telegram::pending_forward() else {
+        let Some(f) = runtime::of(&self.store).pending_forward() else {
             return;
         };
         let Some(&peer) = self.list.cursor_key() else {
@@ -291,10 +289,10 @@ impl Chats {
         let what = if n == 1 { "line" } else { "lines" };
         let went = told(
             s,
-            &sync::forward_messages(peer, f.from, &f.ids),
+            &requests::forward_messages(peer, f.from, &f.ids),
             &format!("forward {n} {what} to {name}"),
         );
-        Telegram::take_forward();
+        runtime::of(&self.store).take_forward();
         if went {
             s.notify(format!("forwarded {n} {what} to {name}"), false);
         }

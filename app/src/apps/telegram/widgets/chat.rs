@@ -41,7 +41,7 @@ use crate::shell::widgets::table;
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgId};
 use super::super::panels::{Chat, Line, Row, Viewer};
-use super::super::sync;
+use super::RenderContext;
 
 /// The children the transcript expects in its template.
 const STATUS: &[LiveId] = ids!(status_lbl);
@@ -278,7 +278,7 @@ impl Widget for ChatPanel {
                         })
                         .flatten();
                         if let Some(id) = landed {
-                            self.follow(cx, &props, id);
+                            self.follow(cx, &props, id, super::now(scope));
                         }
                         self.view.redraw(cx);
                         // The cursor and the marks feed the bar, which the
@@ -311,7 +311,7 @@ impl Widget for ChatPanel {
                                     .set_tail_range(true);
                                 self.anchor = None;
                             } else {
-                                self.follow(cx, &props, id);
+                                self.follow(cx, &props, id, super::now(scope));
                             }
                         }
                         self.view.redraw(cx);
@@ -354,7 +354,7 @@ impl Widget for ChatPanel {
         // on screen.
         if self.mounted {
             if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
-                self.follow(cx, &props, id);
+                self.follow(cx, &props, id, super::now(scope));
                 self.view.redraw(cx);
             }
         }
@@ -420,7 +420,7 @@ impl Widget for ChatPanel {
                         // keeps the row's own timeline.
                         Inner::Play(m) if wire_clip(&m) => {
                             let target = with_chat(&props, |c| {
-                                super::super::progress::play_on_open(c.peer(), m.id);
+                                c.play_on_open(m.id);
                                 Viewer::id(c.peer(), m.id)
                             });
                             if let (Some(id), Some(s)) = (target, scope.data.get_mut::<Session>()) {
@@ -494,22 +494,11 @@ impl Widget for ChatPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
-        // The store's directory, for the static `populate` and the hits below
-        // to resolve a downloaded photo out of the blob cache beside it — the
-        // transcript has no session in reach where a row is filled, the way it
-        // has none for the time. `None` with the store in memory, and the demo
-        // pictures draw without it.
-        model::set_store_dir(
-            scope
-                .data
-                .get_mut::<Session>()
-                .and_then(|s| s.store().dir().map(std::path::Path::to_path_buf)),
-        );
+        let render = RenderContext::from_scope(scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let now = model::now();
+        let now = render.now;
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
         let Some((card, rows, cursor, marks, above, text, carrying, players, moving)) = ({
@@ -528,7 +517,7 @@ impl Widget for ChatPanel {
                     rows,
                     c.cursor(),
                     c.marks().clone(),
-                    c.above_line(),
+                    c.above_line(now),
                     c.field_text().to_string(),
                     c.carrying().iter().map(|f| (f.label(), f.path.clone())).collect::<Vec<_>>(),
                     players,
@@ -623,13 +612,13 @@ impl Widget for ChatPanel {
                     cx,
                     &row,
                     r,
-                    selected,
-                    marked,
+                    (selected, marked),
                     Some(&mut self.pictured),
                     players.get(idx).copied().flatten(),
+                    &render,
                 );
                 if let Some(m) = r.msg() {
-                    self.want_picture(m);
+                    self.want_picture(&props, m, &render);
                 }
                 row.draw_all(cx, scope);
                 drawn.push((idx, row));
@@ -652,16 +641,16 @@ impl Widget for ChatPanel {
                 Row::Message { msg, .. } => {
                     props
                         .hits
-                        .add_row(row_label(r), rect, MouseCursor::Hand, props.slot);
+                        .add_row(row_label(r, now), rect, MouseCursor::Hand, props.slot);
                     self.rows.push(RowHit { id: msg.id, rect });
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
-                    self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), now);
+                    self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), &render);
                 }
                 Row::Service(_) | Row::Day(_) | Row::Unread => {
                     props
                         .hits
-                        .add(row_label(r), rect, MouseCursor::Default, props.slot);
+                        .add(row_label(r, now), rect, MouseCursor::Default, props.slot);
                 }
             }
         }
@@ -715,7 +704,7 @@ impl ChatPanel {
         // above, as the client does — and at the end when nothing is unread.
         let list = self.view.widget(cx, LIST).as_portal_list();
         let unread_at = with_chat(props, |c| {
-            c.rows(model::now())
+            c.rows(super::now(scope))
                 .iter()
                 .position(|r| matches!(r, Row::Unread))
         })
@@ -812,8 +801,9 @@ impl ChatPanel {
         m: &Msg,
         twin: usize,
         player: Option<PlayerState>,
-        now: f64,
+        render: &RenderContext,
     ) {
+        let now = render.now;
         const TWINS: [LiveId; 4] = [
             live_id!(line),
             live_id!(line_sel),
@@ -850,7 +840,7 @@ impl ChatPanel {
                 });
             }
         }
-        if md.picture_bytes(model::store_dir().as_deref()).is_some() {
+        if md.picture_bytes(render.store_dir.as_deref()).is_some() {
             let img = line.widget(cx, ids!(body.img_box));
             if let Some(r) = rect_of(cx, &img) {
                 props.hits.add(md.word(), r, MouseCursor::Hand, props.slot);
@@ -884,7 +874,7 @@ impl ChatPanel {
     /// alone and handed their position to the list, whose indices run over
     /// the whole transcript: every walk off the screen scrolled to the top
     /// few lines instead — the teleport of 2026-09-07.)
-    fn follow(&mut self, cx: &mut Cx, props: &PanelProps, id: MsgId) {
+    fn follow(&mut self, cx: &mut Cx, props: &PanelProps, id: MsgId, now: f64) {
         // On screen means the row's rectangle sits inside the list's, not
         // merely that the row was drawn: the list draws the row it is
         // scrolled halfway into as well, and a cursor on the clipped part
@@ -897,7 +887,6 @@ impl ChatPanel {
         if self.rows.iter().any(|r| r.id == id && inside(r.rect)) {
             return;
         }
-        let now = model::now();
         let Some((idx, shown)) = with_chat(props, |c| {
             let rows = c.rows(now);
             let at = |id: MsgId| rows.iter().position(|r| r.msg().is_some_and(|m| m.id == id));
@@ -933,12 +922,12 @@ impl ChatPanel {
     /// evicts what it must, so a line further up may have no bytes on this
     /// device at all and no way to draw any. The row keeps the file's
     /// durable remote id for exactly this: the worker turns it into a
-    /// download on its next pass ([`sync::want_file`]), the bytes land under
+    /// download on its next pass ([`super::super::runtime::Runtime::want_file`]), the bytes land under
     /// the key the row already names, and the next draw finds them. Once per
     /// line, since a row without its picture is drawn again every frame; and
     /// only for what is drawn as a picture — a file's or a sticker's bytes
     /// are the opener's to ask for, not the transcript's.
-    fn want_picture(&mut self, m: &Msg) {
+    fn want_picture(&mut self, props: &PanelProps, m: &Msg, render: &RenderContext) {
         let Some(md) = m.media.as_ref() else { return };
         if !matches!(md.kind.as_str(), "photo" | "video" | "circle") {
             return;
@@ -951,11 +940,11 @@ impl ChatPanel {
         }
         // The cheap look: whether the cache has a file under that name, not
         // its bytes — the row's own draw reads those.
-        if model::media_path(model::store_dir().as_deref(), reference).is_some() {
+        if model::media_path(render.store_dir.as_deref(), reference).is_some() {
             return;
         }
         self.wanted.insert(m.id);
-        sync::want_file(rid);
+        with_chat(props, |c| c.want_file(rid));
     }
 
     /// The message whose rectangle the shell's hit is, by the rectangles
@@ -981,13 +970,13 @@ impl ChatPanel {
 /// What a script addresses a row by: the writer and the first words of the
 /// line, a caption's own word, a service line's text.
 #[must_use]
-pub fn row_label(r: &Row) -> String {
+pub fn row_label(r: &Row, now: f64) -> String {
     match r {
         Row::Day(caption) => caption.clone(),
         Row::Unread => "UNREAD".to_string(),
         Row::Service(m) => m.text.clone(),
         Row::Message { msg, .. } => {
-            let line = model::media_or_text(msg.media.as_ref(), &msg.text, model::now());
+            let line = model::media_or_text(msg.media.as_ref(), &msg.text, now);
             format!("{}: {line}", msg.writer())
         }
     }
@@ -1005,11 +994,12 @@ pub fn populate(
     cx: &mut Cx,
     row: &WidgetRef,
     r: &Row,
-    selected: bool,
-    marked: bool,
+    selection: (bool, bool),
     mut pictured: Option<&mut HashMap<u64, (MsgId, String)>>,
     player: Option<PlayerState>,
+    render: &RenderContext,
 ) {
+    let (selected, marked) = selection;
     let (day, unread, service, msg) = match r {
         Row::Day(_) => (true, false, false, false),
         Row::Unread => (false, true, false, false),
@@ -1030,7 +1020,7 @@ pub fn populate(
                 .set_text(cx, &m.text);
         }
         Row::Message { msg: m, run } => {
-            let now = model::now();
+            let now = render.now;
             let line = table::line(cx, &row.view(cx, ids!(msg)), selected, marked);
             // The header: the writer, then at the right what the line
             // carries about itself and the time. A run's second line has
@@ -1114,7 +1104,7 @@ pub fn populate(
             let bytes = m
                 .media
                 .as_ref()
-                .and_then(|md| md.picture_bytes(model::store_dir().as_deref()));
+                .and_then(|md| md.picture_bytes(render.store_dir.as_deref()));
             let img_box = line.widget(cx, ids!(body.img_box));
             let decode = bytes.is_some() && fresh(&img_box);
             let shown = media::fill_picture(cx, &img_box, bytes.as_deref(), decode);

@@ -6,7 +6,6 @@
 //! the weekday inside a week, the presence line, a count with its `k` — are
 //! pure functions here, and tested as such.
 
-use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use kernel::filter::Op;
@@ -90,7 +89,7 @@ impl ChatRow {
     /// The second line: what the chat last said, in a word or two. A draft
     /// or somebody typing takes the line over.
     #[must_use]
-    pub fn preview(&self) -> String {
+    pub fn preview(&self, now: f64) -> String {
         if let Some(who) = &self.typing {
             return match self.kind {
                 PeerKind::Person => "typing…".to_string(),
@@ -106,7 +105,7 @@ impl ChatRow {
         if self.last_service {
             return self.last_text.clone();
         }
-        let what = media_or_text(self.last_media.as_ref(), &self.last_text, now());
+        let what = media_or_text(self.last_media.as_ref(), &self.last_text, now);
         let who = if self.last_out {
             "me"
         } else if self.kind == PeerKind::Group {
@@ -736,50 +735,6 @@ pub fn same_day(a: f64, b: f64) -> bool {
 /// How long two messages by one writer may be apart and still share a
 /// header.
 pub const RUN_GAP: f64 = 5.0 * 60.0;
-
-thread_local! {
-    /// What the widgets last said the time was. A row is filled by a
-    /// function with no session in reach, and the time it spells is
-    /// relative — so a widget says *now* at the top of its draw and the
-    /// rows read it. One thread, one clock, always the last draw's.
-    static NOW: Cell<f64> = const { Cell::new(0.0) };
-}
-
-/// Sets the time the rows spell against. Called by every telegram widget
-/// at the top of its draw, from the session's clock.
-pub fn set_now(now: f64) {
-    NOW.with(|n| n.set(now));
-}
-
-/// The time the rows spell against.
-#[must_use]
-pub fn now() -> f64 {
-    NOW.with(Cell::get)
-}
-
-thread_local! {
-    /// The directory the store sits in, so the static [`populate`] the
-    /// transcript draws through — a function with no session in reach, like
-    /// the one that reads [`now`] — can resolve a downloaded photo out of the
-    /// blob cache beside it. The transcript widget sets it at the top of its
-    /// draw; a build with the store in memory leaves it `None`, and the demo
-    /// pictures resolve without it. See [`media_bytes`].
-    ///
-    /// [`populate`]: super::widgets::chat::populate
-    static STORE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
-
-/// Sets the store directory the transcript resolves live media against.
-pub fn set_store_dir(dir: Option<PathBuf>) {
-    STORE_DIR.with(|d| *d.borrow_mut() = dir);
-}
-
-/// The store directory, for the media resolver. `None` with the store in
-/// memory — then only the bundled demo pictures draw.
-#[must_use]
-pub fn store_dir() -> Option<PathBuf> {
-    STORE_DIR.with(|d| d.borrow().clone())
-}
 
 // -- the chat list --------------------------------------------------------------------
 
@@ -1877,13 +1832,13 @@ mod tests {
 
     #[test]
     fn the_preview_line_says_who_and_what() {
-        assert_eq!(row().preview(), "then we start earlier. 7:00?");
+        assert_eq!(row().preview(virtual_epoch()), "then we start earlier. 7:00?");
         let mine = ChatRow {
             last_out: true,
             last_state: Some("read".into()),
             ..row()
         };
-        assert_eq!(mine.preview(), "me: then we start earlier. 7:00?");
+        assert_eq!(mine.preview(virtual_epoch()), "me: then we start earlier. 7:00?");
         assert_eq!(mine.state_mark(), "read");
         let group = ChatRow {
             kind: PeerKind::Group,
@@ -1895,7 +1850,7 @@ mod tests {
             last_text: String::new(),
             ..row()
         };
-        assert_eq!(group.preview(), "Max: voice 0:42");
+        assert_eq!(group.preview(virtual_epoch()), "Max: voice 0:42");
         let captioned = ChatRow {
             last_media: Some(Media {
                 w: Some(480),
@@ -1905,24 +1860,24 @@ mod tests {
             last_text: "new palette, what do you think".into(),
             ..row()
         };
-        assert_eq!(captioned.preview(), "new palette, what do you think · photo");
+        assert_eq!(captioned.preview(virtual_epoch()), "new palette, what do you think · photo");
         let draft = ChatRow {
             draft: Some("I'll bring the thermos and".into()),
             ..row()
         };
-        assert_eq!(draft.preview(), "draft: I'll bring the thermos and");
+        assert_eq!(draft.preview(virtual_epoch()), "draft: I'll bring the thermos and");
         let typing = ChatRow {
             kind: PeerKind::Group,
             typing: Some("Irina".into()),
             ..row()
         };
-        assert_eq!(typing.preview(), "Irina is typing…");
+        assert_eq!(typing.preview(virtual_epoch()), "Irina is typing…");
         let service = ChatRow {
             last_service: true,
             last_text: "Anna Schmidt left the group".into(),
             ..row()
         };
-        assert_eq!(service.preview(), "Anna Schmidt left the group");
+        assert_eq!(service.preview(virtual_epoch()), "Anna Schmidt left the group");
     }
 
     #[test]

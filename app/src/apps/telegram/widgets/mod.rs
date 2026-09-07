@@ -6,10 +6,6 @@
 //! transcript is a list of its own kind, with the composer under it; the
 //! card is a card.
 //!
-//! Every draw starts by telling the [model](super::model) what time it is,
-//! because a row spells its time relative to now and is filled by a
-//! function with no session in reach.
-//!
 //! The templates they are built from are in [`ui`](super::ui).
 
 pub mod attach;
@@ -35,10 +31,24 @@ pub use place::PlacePanel;
 use kernel::session::Session;
 use makepad_widgets::Scope;
 
-/// Tells the model what time it is, off the session in the scope. Called
-/// at the top of every telegram widget's draw.
-pub fn tell_now(scope: &mut Scope) {
-    if let Some(s) = scope.data.get_mut::<Session>() {
-        super::model::set_now(s.now());
+/// The current event or draw's clock; a fixture without a session is inert.
+pub fn now(scope: &mut Scope) -> f64 {
+    scope.data.get_mut::<Session>().map_or(0.0, |s| s.now())
+}
+
+/// Inputs a transcript row needs from its owning session. Passed explicitly
+/// so nested library draws cannot change another panel's clock or media root.
+#[derive(Default)]
+pub struct RenderContext {
+    pub now: f64,
+    pub store_dir: Option<std::path::PathBuf>,
+}
+
+impl RenderContext {
+    pub fn from_scope(scope: &mut Scope) -> Self {
+        scope.data.get_mut::<Session>().map_or_else(Self::default, |s| Self {
+            now: s.now(),
+            store_dir: s.store().dir().map(std::path::Path::to_path_buf),
+        })
     }
 }

@@ -14,7 +14,7 @@
 //! app and arrives through that app's [`Schema`], applied
 //! after the kernel's ladder in app-list order.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -295,6 +295,9 @@ pub struct Db {
     /// thread's [`Store`] already shares, so the UI's log sees what a worker
     /// reached for. Every reader is taught to query it at open.
     mem: Arc<crate::effect::MemLog>,
+    /// Transient app state shared by this database's readers and workers.
+    /// The database owns these values; they never enter a snapshot.
+    local: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
 impl Db {
@@ -350,6 +353,7 @@ impl Db {
             dir,
             writable: Arc::new(AtomicBool::new(true)),
             mem: Arc::new(crate::effect::MemLog::new()),
+            local: Mutex::default(),
         }))
     }
 
@@ -658,6 +662,21 @@ impl Store {
     #[must_use]
     pub fn db(&self) -> Arc<Db> {
         self.db.clone()
+    }
+
+    /// One transient value per type and database handle, shared across readers.
+    /// Use this for app coordination that must neither persist nor leak into
+    /// another store. `T` owns its synchronization; keep its default inert.
+    #[must_use]
+    pub fn local<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        self.db.local
+            .lock()
+            .expect("database local state")
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()))
+            .clone()
+            .downcast::<T>()
+            .expect("local state is indexed by its type")
     }
 
     /// The directory beside the store; `None` in memory.

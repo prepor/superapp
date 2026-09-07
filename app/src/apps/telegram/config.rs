@@ -1,22 +1,8 @@
-//! The account's non-secret Telegram settings: the api_id and the phone,
-//! from a `telegram` file beside the store.
-//!
-//! The api_hash is the secret half and lives in the platform's keychain under
-//! a `tg/` key (see [`platform::secret`](crate::platform::secret)); this
-//! reader never touches it. The api_id is not a secret — Telegram prints it on
-//! the account's own dashboard — so it may sit in a plain file, the trade
-//! [`r2`'s bucket reader](kernel::repl::r2) makes for a key id: a device
-//! configured by `adb push` has no environment and no keychain, and the app
-//! sandbox is its perimeter. Positional lines, blank and `#`-comment lines
-//! skipped so the file can carry a note — line 1 the api_id, line 2 the
-//! account phone.
-//!
-//! Nothing in this build calls the module yet: the phase-3 TDLib worker is
-//! its reader, and the tests stand in until then. Its items are allowed to
-//! read as unused rather than be wired to a caller that does not exist —
-//! `app`'s app modules are private, so a `pub` here is not reachable enough
-//! to count as used on its own.
-#![allow(dead_code)]
+//! Device-local Telegram settings: api_id and phone from the `telegram` file
+//! beside the store, overridden by `SUPERAPP_TG_API_ID` and `SUPERAPP_TG_PHONE`.
+//! Blank lines and comments are skipped. The api_hash is read separately from
+//! the `tg/api_hash` keychain entry by the worker.
+#![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
 use std::path::Path;
 

@@ -26,7 +26,7 @@ impl RowSpec for MessagesRows {
     }
 
     /// Two lines: where and who with the time, then the line itself.
-    fn populate(cx: &mut Cx, row: &WidgetRef, r: &MsgHit, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, r: &MsgHit, selected: bool, marked: bool, now: f64) {
         let line = table::line(cx, row, selected, marked);
         let who = r.writer();
         let place = if who.is_empty() || who == r.chat_title {
@@ -36,13 +36,13 @@ impl RowSpec for MessagesRows {
         };
         line.label(cx, ids!(body.where_lbl)).set_text(cx, &place);
         line.label(cx, ids!(body.when_lbl))
-            .set_text(cx, &model::when(r.date, model::now()));
+            .set_text(cx, &model::when(r.date, now));
         line.label(cx, ids!(body.line_lbl))
-            .set_text(cx, &r.line(model::now()));
+            .set_text(cx, &r.line(now));
     }
 
-    fn label(r: &MsgHit) -> String {
-        r.line(model::now())
+    fn label(r: &MsgHit, now: f64) -> String {
+        r.line(now)
     }
 
     /// The chat, opened at that line.
@@ -83,7 +83,6 @@ impl Widget for MessagesPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         let Self {
             view,
             suggest,

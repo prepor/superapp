@@ -38,7 +38,7 @@ impl RowSpec for MailboxRows {
     /// Two lines: who wrote in the conversation and when, then the topic
     /// under them. A conversation with anything unread in it is bold — both
     /// lines, so the row reads as one thing.
-    fn populate(cx: &mut Cx, row: &WidgetRef, t: &ThreadHead, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, t: &ThreadHead, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         let who = t.who_line();
         // Bold is a twin, not a runtime weight. The hidden one is emptied
@@ -60,7 +60,7 @@ impl RowSpec for MailboxRows {
 
     /// The topic: what a conversation is called, whichever of its letters
     /// you read it off.
-    fn label(t: &ThreadHead) -> String {
+    fn label(t: &ThreadHead, _now: f64) -> String {
         t.topic.clone()
     }
 

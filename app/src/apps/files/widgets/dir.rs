@@ -68,7 +68,7 @@ impl RowSpec for DirRows {
     /// One line: the name, then the size and the date on the columns the
     /// header draws. A directory wears its slash and no size — it is not a
     /// number of bytes — and the source lists directories first.
-    fn populate(cx: &mut Cx, row: &WidgetRef, r: &DirRow, selected: bool, marked: bool) {
+    fn populate(cx: &mut Cx, row: &WidgetRef, r: &DirRow, selected: bool, marked: bool, _now: f64) {
         let line = table::line(cx, row, selected, marked);
         let e = &r.entry;
         line.label(cx, ids!(body.name_lbl)).set_text(cx, &e.label());
@@ -84,7 +84,7 @@ impl RowSpec for DirRows {
 
     /// The name as the row draws it, slash and all: what a script addresses
     /// a row by, and unique within the one directory a listing shows.
-    fn label(r: &DirRow) -> String {
+    fn label(r: &DirRow, _now: f64) -> String {
         r.entry.label()
     }
 

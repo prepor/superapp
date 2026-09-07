@@ -73,7 +73,6 @@ impl Widget for ViewerPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        super::tell_now(scope);
         // Where the blob cache sits, so a downloaded photo resolves; `None`
         // with the store in memory, and the demo pictures draw without it.
         let store_dir = scope
@@ -83,7 +82,7 @@ impl Widget for ViewerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let now = model::now();
+        let now = super::now(scope);
         // Everything this draw needs, in one borrow of the panel — and the
         // asking with it: opening the viewer on a clip is what fetches it,
         // and the first draw is the opening.
@@ -123,7 +122,7 @@ impl Widget for ViewerPanel {
         // to tell a clip that never prepared from one playing unseen.
         let word = media::video_word(cx, &clip_box);
         if word != self.last_word {
-            super::super::progress::note(
+            super::super::trace::note(
                 store_dir.as_deref(),
                 &format!(
                     "video: line {} player {} (wanted={wanted}, file={})",

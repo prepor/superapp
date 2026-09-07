@@ -1,24 +1,8 @@
-//! The TDLib binding: its modern JSON interface, and a thin safe skin.
+//! Safe wrappers for TDLib's modern JSON C interface, behind `tdlib`.
 //!
-//! TDLib is Telegram's own client — MTProto, the auth flow, the type language,
-//! layer upgrades — reached through four C functions, so none of that is ours
-//! to keep correct. This module is only the binding: [`Client`] to open a
-//! client and [`send`](Client::send) a request, [`receive`] to pump the one
-//! queue every client shares, [`execute`] for the synchronous, network-free
-//! requests. The per-account worker that drives them is phase 3c; here the
-//! unsafe is confined to these wrappers and each call is proven to link by an
-//! offline test.
-//!
-//! Gated behind the `tdlib` feature so the default tree builds with no native
-//! dependency and Telegram runs the demo world — `app/build.rs` carries the
-//! link plumbing that the feature turns on.
-//!
-//! Nothing in this build calls the module yet: the phase-3c worker is its
-//! driver, and the offline test stands in until then. Its items are allowed to
-//! read as unused rather than be wired to a caller that does not exist —
-//! `app`'s app modules are private, so a `pub` here is not reachable enough to
-//! count as used on its own.
-#![allow(dead_code)]
+//! TDLib owns the returned C strings until the next call on the same thread;
+//! these wrappers copy them before returning. `receive` serves a process-wide
+//! queue, so this build admits only one real account worker.
 
 use std::ffi::{c_char, c_double, c_int, CStr, CString};
 

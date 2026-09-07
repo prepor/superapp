@@ -1,23 +1,10 @@
-//! The shapes the wire carries, mapped to the plain [`project`] structs.
+//! Pure decoders from TDLib JSON to the projection's `Incoming*` values.
 //!
-//! [`sync`](super::sync) drives TDLib's update stream; this module is where a
-//! raw [`serde_json::Value`] — a `message`, a `user`, a `chat` — becomes one
-//! of [`project`](super::project)'s `Incoming*` structs, ready to upsert. The
-//! field names follow TDLib 1.8.0's type language, kept here in one greppable
-//! place rather than scattered through the state machine, and every mapper is
-//! total: a missing or malformed field is a default or a `None`, never a
-//! panic, because the wire is not ours to trust.
-//!
-//! Bytes are not carried here. A message with media names it by its
-//! blob-cache key — `tg:<remote unique id>` — and the file itself arrives
-//! later through `updateFile`, ingested under that same key; see
-//! [`sync`](super::sync).
-//!
-//! Nothing in this build calls the module outside [`sync`](super::sync) and
-//! the tests, and that worker is not registered until phase 3d, so its items
-//! are allowed to read as unused rather than be wired to a caller that does
-//! not exist.
-#![allow(dead_code)]
+//! Missing optional fields become defaults or `None`; messages without an
+//! identity are rejected. Media carries cache keys and remote ids, never
+//! bytes. The worker handles downloading and persistence.
+#![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
+
 
 use serde_json::Value;
 
@@ -45,7 +32,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
         text,
         out,
         // A read receipt needs the chat's read cursor, not one message, so a
-        // sent line is 'sent' until `updateChatReadOutbox` (phase 3d) says
+        // sent line is 'sent' until `updateChatReadOutbox` says
         // otherwise.
         state: out.then(|| send_state(&m["sending_state"]).to_string()),
         edited: m["edit_date"].as_i64().unwrap_or(0) > 0,
@@ -63,8 +50,8 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
             .filter(|&n| n > 0),
         reactions: reactions_line(info),
         // Service lines (a member joined, a title changed) are a content kind
-        // this phase draws as a plain line; marking them service is a phase-3d
-        // refinement once each such content @type is spelled.
+        // currently maps to fallback text. Dedicated service-message decoding
+        // is not implemented yet.
         service: false,
     })
 }
@@ -416,7 +403,7 @@ pub fn peer(user: &Value) -> Option<IncomingPeer> {
         admin: false,
         is_contact: user["is_contact"].as_bool().unwrap_or(false),
         // Self is the account holder, known from `my_id`, not from a user
-        // object; the saved-messages peer is settled in phase 3d.
+        // object; the worker settles the saved-messages peer from my_id.
         is_self: false,
     })
 }
