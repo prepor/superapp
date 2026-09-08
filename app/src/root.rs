@@ -46,6 +46,11 @@ script_mod! {
                         mail_attachment_tpl := mod.widgets.MailAttachmentPanel{}
                         mail_settings_tpl := mod.widgets.MailSettingsPanel{}
                         mail_add_account_tpl := mod.widgets.MailAddAccountPanel{}
+                        rss_feeds_tpl := mod.widgets.RssFeedsPanel{}
+                        rss_articles_tpl := mod.widgets.RssArticlesPanel{}
+                        rss_article_tpl := mod.widgets.RssArticlePanel{}
+                        rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
+                        rss_import_tpl := mod.widgets.RssImportPanel{}
                         // Telegram's ten tags: the address book and a
                         // group's members draw with one widget, hung twice.
                         telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
@@ -114,6 +119,11 @@ script_mod! {
                             mail_attachment_tpl := mod.widgets.MailAttachmentPanel{}
                             mail_settings_tpl := mod.widgets.MailSettingsPanel{}
                             mail_add_account_tpl := mod.widgets.MailAddAccountPanel{}
+                            rss_feeds_tpl := mod.widgets.RssFeedsPanel{}
+                            rss_articles_tpl := mod.widgets.RssArticlesPanel{}
+                            rss_article_tpl := mod.widgets.RssArticlePanel{}
+                            rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
+                            rss_import_tpl := mod.widgets.RssImportPanel{}
                             telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
                             telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
                             telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}
@@ -297,6 +307,7 @@ impl AppMain for App {
         crate::install();
         makepad_widgets::script_mod(vm);
         shell::script_mod(vm);
+        crate::reader::ui::script_mod(vm);
         for ui in shell::uis() {
             ui.script_mod(vm);
         }

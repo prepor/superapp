@@ -25,7 +25,7 @@ pub mod caps;
 pub mod carry;
 pub mod content;
 pub mod effects;
-pub mod html;
+pub use crate::reader::html;
 pub mod model;
 pub mod oauth;
 pub mod panels;

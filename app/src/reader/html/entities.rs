@@ -168,16 +168,16 @@ fn fix_numeric_entities(src: &str) -> String {
 
 /// The last thing between stored HTML and the widget.
 ///
-/// [`sanitize`] runs at **ingest**, so what the store holds was narrowed by
-/// whichever version was current when the mail arrived. Rows written by a
+/// [`sanitize`](super::sanitize) runs at **ingest**, so stored HTML was
+/// narrowed by the version current when the mail arrived. Rows written by a
 /// build that passed character references through untouched may still carry
 /// one the widget's parser unwraps into a panic — and a mail that crashes
 /// the parser crashes it on every frame that draws it, which means the app
 /// cannot be opened rather than that one letter looks wrong. So the
 /// guarantee has to hold at the point of use and not only at the point of
-/// writing. [`sanitize`] uses the same repair on its way in, since the
-/// browser-grade parser would otherwise read each half of a surrogate pair
-/// as U+FFFD.
+/// writing. [`sanitize`](super::sanitize) uses the same repair on its way in:
+/// the browser-grade parser would otherwise read each half of a surrogate
+/// pair as U+FFFD.
 ///
 /// Borrows unless there is something to repair, so a letter that is fine
 /// costs one scan and no allocation.

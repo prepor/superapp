@@ -17,12 +17,13 @@
 // outside this crate needs to either.
 mod apps;
 pub mod platform;
+mod reader;
 pub mod root;
 pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{agent, files, mail, telegram};
+use crate::apps::{agent, files, mail, rss, telegram};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
@@ -30,11 +31,23 @@ use crate::shell::system;
 /// roots keep their order: an app's own panels lead, help and about close.
 /// Mail leads, so a store nobody has booted comes up on the inbox.
 static APPS: &[&dyn App] = &[
-    &mail::MAIL, &telegram::TELEGRAM, &files::FILES, &agent::AGENT, &system::SYSTEM,
+    &mail::MAIL,
+    &telegram::TELEGRAM,
+    &rss::RSS,
+    &files::FILES,
+    &agent::AGENT,
+    &system::SYSTEM,
 ];
 
 /// Their Makepad halves, in the same order.
-static UIS: &[&dyn AppUi] = &[&mail::UI, &telegram::UI, &files::UI, &agent::UI, &system::UI];
+static UIS: &[&dyn AppUi] = &[
+    &mail::UI,
+    &telegram::UI,
+    &rss::UI,
+    &files::UI,
+    &agent::UI,
+    &system::UI,
+];
 
 /// Hands the shell the app list.
 ///
@@ -87,7 +100,11 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "two tools of one name: {names:?}");
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "two tools of one name: {names:?}"
+        );
         for name in &names {
             assert!(
                 name.split_once('.')
