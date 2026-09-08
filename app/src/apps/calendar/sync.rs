@@ -478,10 +478,20 @@ fn split(
         .filter(|p| !p.starts_with("UNTIL=") && !p.starts_with("COUNT="))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    pieces.push(format!(
-        "UNTIL={}",
-        dates::utc(start - 1.0).format("%Y%m%dT%H%M%SZ")
-    ));
+    // UNTIL is inclusive and must have the original DTSTART's value type.
+    // Use the occurrence's original civil date even if this edit moves it.
+    let until = if master_form.all_day {
+        dates::date(model::text(&instance["originalStartTime"], "date"))?
+            .pred_opt()
+            .ok_or("cannot trim before the first supported date")?
+            .format("%Y%m%d")
+            .to_string()
+    } else {
+        dates::utc(start - 1.0)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string()
+    };
+    pieces.push(format!("UNTIL={until}"));
     let trimmed = format!("RRULE:{}", pieces.join(";"));
     let result = if kind == "save" {
         if form.recurrence == "unchanged" {

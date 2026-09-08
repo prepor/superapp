@@ -61,12 +61,18 @@ pub fn label(t: f64, tz: &str) -> String {
         .format("%a %d %b · %H:%M %Z")
         .to_string()
 }
+/// The first instant of a civil date, including dates whose midnight is
+/// skipped or repeated by an offset change. A completely skipped date has
+/// no such instant and must not silently become the following date.
 pub fn midnight(d: NaiveDate, tz: &str) -> Result<f64, String> {
-    zone(tz)?
-        .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+    let tz = zone(tz)?;
+    let local = d.and_hms_opt(0, 0, 0).unwrap();
+    tz.from_local_datetime(&local)
         .earliest()
+        .or_else(|| chrono_tz::GapInfo::new(&local, &tz)?.end)
+        .filter(|t| t.date_naive() == d)
         .map(|t| t.timestamp() as f64)
-        .ok_or("this date has no midnight in its time zone".into())
+        .ok_or("this date does not exist in its time zone".into())
 }
 pub fn read(v: &Value, fallback: &str) -> Result<(f64, bool), String> {
     if let Some(d) = v["date"].as_str() {

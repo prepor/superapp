@@ -56,14 +56,15 @@ pub const GOOGLE: Provider = Provider {
     files_sent_itself: true,
 };
 
-/// The `account.auth` value for a password account. `NULL` means the same —
-/// every row written before Gmail existed here.
+/// Access to the calendar list, event edits, and participant free/busy.
 pub const CALENDAR_SCOPES: [&str; 3] = [
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.events.freebusy",
 ];
 
+/// The `account.auth` value for a password account. `NULL` means the same —
+/// every row written before Gmail existed here.
 pub const PASSWORD: &str = "password";
 
 /// How long the loopback listener waits for the browser to come back before

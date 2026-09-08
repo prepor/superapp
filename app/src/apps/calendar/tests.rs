@@ -241,6 +241,190 @@ fn date_math_observes_exclusive_ends_leap_days_and_dst() {
     assert!(f.validate().is_err());
     assert_eq!(dates::grid("2026-09-01").len(), 42);
 }
+
+const MIDNIGHT_GAPS: [(&str, &str); 3] = [
+    ("America/Santiago", "2026-09-06"),
+    ("Asia/Beirut", "2026-03-29"),
+    ("America/Havana", "2026-03-08"),
+];
+
+#[test]
+fn all_day_bounds_use_the_first_valid_instant_on_midnight_gap_dates() {
+    for (zone, day) in MIDNIGHT_GAPS {
+        let next = dates::date(day).unwrap().succ_opt().unwrap().to_string();
+        let form = edit::Form {
+            title: "DST day".into(),
+            start: day.into(),
+            end: next.clone(),
+            zone: zone.into(),
+            all_day: true,
+            ..Default::default()
+        };
+        form.validate().unwrap();
+        let (a, b) = form.bounds().unwrap();
+        assert_eq!(dates::local(a, zone), format!("{day}T01:00"), "{zone}");
+        assert_eq!(dates::local(b, zone), format!("{next}T00:00"), "{zone}");
+        assert_eq!(b - a, 23.0 * 3600.0, "{zone}");
+        let body = form.patch(&json!({}), "test").unwrap();
+        assert_eq!(body["start"], json!({"date":day}));
+        assert_eq!(body["end"], json!({"date":next}));
+        // Timed inputs in the gap still need an explicit offset.
+        assert!(dates::instant(&format!("{day}T00:30"), zone).is_err());
+    }
+    let repeated = dates::midnight(dates::date("2026-11-01").unwrap(), "America/Havana").unwrap();
+    assert_eq!(
+        repeated,
+        dates::instant("2026-11-01T04:00:00Z", "UTC").unwrap()
+    );
+    assert!(dates::midnight(dates::date("2011-12-30").unwrap(), "Pacific/Apia").is_err());
+}
+
+/// Google supplies expanded occurrences. Keep that snapshot independent of
+/// the fake's recurrence parser so these tests exercise the sync transaction
+/// and the exact outgoing series changes, including Google's DATE fields.
+struct CalendarSnapshot {
+    zone: String,
+    events: Vec<Value>,
+    fake: api::Fake,
+    reject_trim: bool,
+}
+impl api::Api for CalendarSnapshot {
+    fn call(&mut self, r: &api::Request) -> Result<Value, String> {
+        if r.method == "GET" && r.path == "/users/me/calendarList" {
+            return Ok(json!({"items":[{
+                "id":"primary", "summary":"Work", "timeZone":self.zone,
+                "accessRole":"owner"
+            }]}));
+        }
+        if r.method == "GET" && r.path == api::events("primary") {
+            return Ok(json!({"items":self.events}));
+        }
+        if self.reject_trim && r.method == "PATCH" && r.body["recurrence"].is_array() {
+            self.reject_trim = false;
+            return Err("HTTP 400: series trim rejected".into());
+        }
+        api::Api::call(&mut self.fake, r)
+    }
+}
+
+#[test]
+fn calendar_sync_caches_all_day_events_on_midnight_gap_dates() {
+    for (zone, day) in MIDNIGHT_GAPS {
+        let mut s = session();
+        let next = dates::date(day).unwrap().succ_opt().unwrap().to_string();
+        let events = vec![
+            json!({"id":"gap", "summary":"DST day", "start":{"date":day}, "end":{"date":next}}),
+            json!({"id":"normal", "summary":"Normal event", "start":{"dateTime":format!("{day}T12:00"),"timeZone":zone}, "end":{"dateTime":format!("{day}T13:00"),"timeZone":zone}}),
+        ];
+        s.world().caps(|caps| {
+            caps.insert::<dyn api::Api>(Box::new(CalendarSnapshot {
+                zone: zone.into(),
+                events,
+                fake: api::Fake::default(),
+                reject_trim: false,
+            }));
+        });
+        let noon = dates::instant(&format!("{day}T12:00"), zone).unwrap();
+        model::cover(&mut s, noon - 86400.0, noon + 86400.0);
+        model::refresh(&mut s);
+        refresh(&s);
+        let rows = model::EVENTS.page(s.store(), None, 0, 100);
+        assert_eq!(rows.len(), 2, "{zone}: entire page must be committed");
+        let all_day = rows.iter().find(|e| e.remote == "gap").unwrap();
+        assert!(all_day.all_day);
+        assert_eq!(all_day.day, day);
+        assert_eq!(all_day.end - all_day.start, 23.0 * 3600.0);
+        let source = model::source(s.store(), all_day.source).unwrap();
+        assert!(source.checked.is_some());
+        assert!(source.error.is_empty());
+    }
+}
+
+#[test]
+fn all_day_following_edits_and_deletes_use_an_inclusive_date_cutoff() {
+    for (kind, reject_trim) in [("save", false), ("delete", false), ("save", true)] {
+        let mut s = session();
+        let master = json!({
+            "id":"allday", "summary":"Daily all day", "etag":"\"1\"",
+            "start":{"date":"2026-09-08"}, "end":{"date":"2026-09-09"},
+            "recurrence":["RRULE:FREQ=DAILY;COUNT=8"], "organizer":{"self":true}
+        });
+        // The selected occurrence was already moved; its original date is
+        // still where the old series must stop, regardless of the new edit.
+        let instance = json!({
+            "id":"allday-occurrence", "summary":"Daily all day", "etag":"\"1\"",
+            "start":{"date":"2026-09-12"}, "end":{"date":"2026-09-13"},
+            "originalStartTime":{"date":"2026-09-10"}, "recurringEventId":"allday",
+            "organizer":{"self":true}
+        });
+        let fake = api::Fake::default();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.insert("allday".into(), master);
+            state.insert("allday-occurrence".into(), instance.clone());
+        }
+        s.world().caps(|caps| {
+            caps.insert::<dyn api::Api>(Box::new(CalendarSnapshot {
+                zone: "Europe/Berlin".into(),
+                events: vec![instance],
+                fake: fake.clone(),
+                reject_trim,
+            }));
+        });
+        model::refresh(&mut s);
+        refresh(&s);
+        let e = event(&s, "Daily all day");
+        let job = if kind == "save" {
+            let id = edit::create(&mut s, e.source, Some(e.id)).unwrap();
+            let mut form = edit::draft(s.store(), id).unwrap().form;
+            form.title = "Later days".into();
+            form.scope = "following".into();
+            form.start = "2026-09-13".into();
+            form.end = "2026-09-14".into();
+            edit::save(&mut s, id, 1, e.source, form).unwrap();
+            edit::commit(&mut s, id, 2).unwrap()
+        } else {
+            edit::command(&mut s, e.id, &e.etag, "delete", "following", "", false).unwrap()
+        };
+        refresh(&s);
+        if reject_trim {
+            assert_eq!(operation(&s, job).0, "failed");
+            {
+                let state = fake.state.lock().unwrap();
+                assert_eq!(
+                    state["allday"]["recurrence"],
+                    json!(["RRULE:FREQ=DAILY;COUNT=8"])
+                );
+                assert_eq!(
+                    state
+                        .values()
+                        .filter(|v| v["summary"] == "Later days")
+                        .count(),
+                    1
+                );
+            }
+            sync::retry(&mut s, job).unwrap();
+            refresh(&s);
+        }
+        assert_eq!(operation(&s, job), ("done".into(), String::new()));
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state["allday"]["recurrence"],
+            json!(["RRULE:FREQ=DAILY;UNTIL=20260909"])
+        );
+        assert_eq!(state["allday"]["start"], json!({"date":"2026-09-08"}));
+        let replacements: Vec<_> = state
+            .values()
+            .filter(|v| v["summary"] == "Later days")
+            .collect();
+        assert_eq!(replacements.len(), usize::from(kind == "save"));
+        if let Some(new) = replacements.first() {
+            assert_eq!(new["recurrence"], json!(["RRULE:FREQ=DAILY;COUNT=6"]));
+            assert_eq!(new["start"], json!({"date":"2026-09-13"}));
+        }
+    }
+}
+
 #[test]
 fn unknown_and_malformed_freebusy_never_become_free() {
     let q = availability::Query {
