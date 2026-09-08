@@ -27,7 +27,7 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{
-    self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, RUN_GAP,
+    self, day_caption, same_day, Carried, Msg, MsgId, MsgKey, PeerCard, PeerId, RUN_GAP,
 };
 use super::super::{downloads, requests, runtime, verbs};
 use super::reactions::{self, Reactions};
@@ -38,7 +38,7 @@ use super::{wire, Attach, Chats, Line, Peer};
 /// what the field says now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Editing {
-    pub msg: MsgId,
+    pub msg: MsgKey,
     pub original: String,
     pub was_edited: bool,
     pub text: String,
@@ -76,14 +76,14 @@ pub struct Chat {
     topic: i64,
     store: Rc<Store>,
     slot: SlotId,
-    cursor: Option<MsgId>,
+    cursor: Option<MsgKey>,
     /// A line the transcript is asked to bring on screen — a reply's
     /// original or the way back — taken once by the widget.
-    follow_wish: Option<MsgId>,
+    follow_wish: Option<MsgKey>,
     /// Replies left by successful jumps to their originals, newest last.
-    reply_back: Vec<MsgId>,
-    marks: BTreeSet<MsgId>,
-    reply_to: Option<MsgId>,
+    reply_back: Vec<MsgKey>,
+    marks: BTreeSet<MsgKey>,
+    reply_to: Option<MsgKey>,
     /// The composer's text. Written to the chat's row behind it, so the list
     /// shows *draft: …*.
     draft: String,
@@ -106,7 +106,7 @@ pub struct Chat {
     first_unread: Option<MsgId>,
     /// Retry unacknowledged views after a short delay; a queued command is
     /// not enough to dismiss a server notification.
-    viewed_mentions: std::collections::BTreeMap<MsgId, f64>,
+    viewed_mentions: std::collections::BTreeMap<MsgKey, f64>,
     /// What the composer will send with the text, in the order it will go.
     /// Edited from the attach panel, through the join.
     carrying: Vec<Carried>,
@@ -177,7 +177,7 @@ impl Chat {
     pub fn topic_id(&self) -> i64 { self.topic }
 
     fn request(&self, request: String) -> String {
-        requests::in_topic(request, self.topic)
+        requests::reply_in_chat(requests::in_topic(request, self.topic), self.peer, self.reply_to)
     }
 
     /// Whether the transcript is still being filled from the wire — the
@@ -185,6 +185,8 @@ impl Chat {
     #[must_use]
     pub fn loading(&self) -> bool {
         !self.transcript_ready() || runtime::of(&self.store).loading_in(self.peer, self.topic)
+            || (self.topic == 0 && super::super::upgrades::original(&self.store, self.peer)
+                .is_some_and(|old| runtime::of(&self.store).loading_in(old, 0)))
     }
 
     pub fn transcript_ready(&self) -> bool { self.transcript.get(&self.store).ready }
@@ -241,25 +243,22 @@ impl Chat {
     }
 
     /// The widget supplies only messages visible in the focused transcript.
-    pub fn view_mentions(&mut self, visible: &[MsgId], now: f64) {
+    pub fn view_mentions(&mut self, visible: &[MsgKey], now: f64) {
         if visible.is_empty() { return; }
         let snapshot = self.transcript.get(&self.store);
-        let ids: Vec<MsgId> = visible.iter().filter_map(|&id| snapshot.message(id))
+        let keys = visible.iter().filter_map(|&key| snapshot.message(key))
             .filter(|m| m.unread_mention)
-            .filter(|m| self.viewed_mentions.get(&m.id).is_none_or(|at| now - at >= 5.0))
-            .map(|m| m.id).collect::<BTreeSet<_>>().into_iter().collect();
-        if ids.is_empty() {
-            return;
-        }
-        if wire(&self.store, &requests::in_topic(requests::view_messages(self.peer, &ids), self.topic)) {
-            for id in ids {
-                self.viewed_mentions.insert(id, now);
+            .filter(|m| self.viewed_mentions.get(&m.key()).is_none_or(|at| now - at >= 5.0))
+            .map(Msg::key);
+        for (chat, ids) in model::message_groups(keys) {
+            let topic = if chat == self.peer { self.topic } else { 0 };
+            if wire(&self.store, &requests::in_topic(requests::view_messages(chat, &ids), topic)) {
+                for id in ids { self.viewed_mentions.insert((chat, id), now); }
+            } else if !super::super::Telegram::engine_store(self.store.dir())
+                && super::super::schema::session(self.store.conn()).state == "closed"
+            {
+                super::flip(&self.store, move |c| super::super::project::read_mentions(c, chat, &ids));
             }
-        } else if !super::super::Telegram::engine_store(self.store.dir())
-            && super::super::schema::session(self.store.conn()).state == "closed"
-        {
-            let peer = self.peer;
-            super::flip(&self.store, move |c| super::super::project::read_mentions(c, peer, &ids));
         }
     }
 
@@ -288,11 +287,11 @@ impl Chat {
     // -- the cursor and the marks -----------------------------------------------
 
     #[must_use]
-    pub fn cursor(&self) -> Option<MsgId> {
+    pub fn cursor(&self) -> Option<MsgKey> {
         self.cursor
     }
 
-    pub fn set_cursor(&mut self, id: MsgId) {
+    pub fn set_cursor(&mut self, id: MsgKey) {
         if self.cursor != Some(id) {
             self.cancel_reactions();
         }
@@ -311,12 +310,12 @@ impl Chat {
     /// Steps the cursor over the messages, `d` rows: from nothing, either
     /// way lands on the newest line, which is where a chat is read from.
     /// Answers what it landed on.
-    pub fn walk(&mut self, d: isize) -> Option<MsgId> {
-        let ids: Vec<MsgId> = self
+    pub fn walk(&mut self, d: isize) -> Option<MsgKey> {
+        let ids: Vec<MsgKey> = self
             .history()
             .iter()
             .filter(|m| !m.service)
-            .map(|m| m.id)
+            .map(|m| m.key())
             .collect();
         if ids.is_empty() {
             return None;
@@ -330,7 +329,7 @@ impl Chat {
     }
 
     #[must_use]
-    pub fn marks(&self) -> &BTreeSet<MsgId> {
+    pub fn marks(&self) -> &BTreeSet<MsgKey> {
         &self.marks
     }
 
@@ -362,14 +361,16 @@ impl Chat {
     // -- the reply line and the draft -------------------------------------------
 
     #[must_use]
+    pub fn reply_key(&self) -> Option<MsgKey> { self.reply_to }
+
     pub fn reply_to(&self) -> Option<MsgId> {
-        self.reply_to
+        self.reply_to.map(|(_, id)| id)
     }
 
     /// Replies to a line — the bar's verb over the cursor, or the card of
     /// one asking this of the chat it hangs under. A reply is written, so
     /// the caret goes to the field with it. A blocked peer refuses the reply.
-    pub fn reply(&mut self, msg: MsgId) -> bool {
+    pub fn reply(&mut self, msg: MsgKey) -> bool {
         if self.blocked() {
             return false;
         }
@@ -388,12 +389,12 @@ impl Chat {
     /// Starts editing one of my lines: the field takes its text, the reply
     /// line goes, and the caret follows. Answers whether it is a line of
     /// mine and the peer is not blocked.
-    pub fn edit(&mut self, msg: MsgId) -> bool {
+    pub fn edit(&mut self, msg: MsgKey) -> bool {
         if self.blocked() {
             return false;
         }
         let hist = self.history();
-        let Some(m) = hist.iter().find(|m| m.id == msg && m.out && !m.service) else {
+        let Some(m) = hist.iter().find(|m| m.key() == msg && m.out && !m.service) else {
             return false;
         };
         self.editing = Some(Editing {
@@ -459,18 +460,21 @@ impl Chat {
 
     /// Records deletion; live undo resends saved copies of supported outgoing
     /// messages. Only the offline fixture restores the original identities.
-    pub fn delete(&mut self, s: &mut Session, ids: Vec<MsgId>) {
+    pub fn delete(&mut self, s: &mut Session, ids: Vec<MsgKey>) {
         if ids.is_empty() {
             return;
         }
-        if super::live(&self.store) {
-            match super::super::history::command(s, &requests::delete_messages(self.peer, &ids, true)) {
-                Ok(_) => self.lines_gone(&ids),
-                Err(error) => error.notify(s, "delete"),
+        for (chat, messages) in model::message_groups(ids) {
+            let keys: Vec<_> = messages.iter().map(|&id| (chat, id)).collect();
+            if super::live(&self.store) {
+                match super::super::history::command(s, &requests::delete_messages(chat, &messages, true)) {
+                    Ok(_) => self.lines_gone(&keys),
+                    Err(error) => error.notify(s, "delete"),
+                }
+            } else {
+                self.lines_gone(&keys);
+                verbs::delete_lines(s, chat, messages);
             }
-        } else {
-            self.lines_gone(&ids);
-            verbs::delete_lines(s, self.peer, ids);
         }
         s.redraw();
     }
@@ -479,17 +483,17 @@ impl Chat {
     /// after, at the top — the marks let go of them, and a reply to one or
     /// an edit of one is dropped. Called before the store hears of it, so
     /// the neighbours are still in the history.
-    pub fn lines_gone(&mut self, ids: &[MsgId]) {
+    pub fn lines_gone(&mut self, ids: &[MsgKey]) {
         if let Some(c) = self.cursor.filter(|c| ids.contains(c)) {
             let hist = self.history();
-            let stays = |m: &&Msg| !m.service && !ids.contains(&m.id);
-            self.cursor = hist.iter().position(|m| m.id == c).and_then(|i| {
+            let stays = |m: &&Msg| !m.service && !ids.contains(&m.key());
+            self.cursor = hist.iter().position(|m| m.key() == c).and_then(|i| {
                 hist[..i]
                     .iter()
                     .rev()
                     .find(stays)
                     .or_else(|| hist[i + 1..].iter().find(stays))
-                    .map(|m| m.id)
+                    .map(|m| m.key())
             });
         }
         for id in ids {
@@ -513,7 +517,7 @@ impl Chat {
 
     /// The line a verb asked the transcript to bring on screen, if one did
     /// since the last look. Answered once: the widget that reads it scrolls.
-    pub fn take_follow_wish(&mut self) -> Option<MsgId> {
+    pub fn take_follow_wish(&mut self) -> Option<MsgKey> {
         self.follow_wish.take()
     }
 
@@ -526,16 +530,16 @@ impl Chat {
         let hist = self.history();
         let Some(reply) = self
             .cursor
-            .and_then(|c| hist.iter().find(|m| m.id == c))
+            .and_then(|c| hist.iter().find(|m| m.key() == c))
         else {
             return;
         };
-        let Some(target) = reply.reply_to.filter(|id| *id != reply.id) else {
+        let Some(target) = reply.reply_key().filter(|id| *id != reply.key()) else {
             return;
         };
-        if hist.iter().any(|m| m.id == target) {
-            if self.reply_back.last() != Some(&reply.id) {
-                self.reply_back.push(reply.id);
+        if hist.iter().any(|m| m.key() == target) {
+            if self.reply_back.last() != Some(&reply.key()) {
+                self.reply_back.push(reply.key());
             }
             self.cursor = Some(target);
             self.follow_wish = Some(target);
@@ -554,7 +558,7 @@ impl Chat {
         }
         let hist = self.history();
         while let Some(target) = self.reply_back.pop() {
-            if hist.iter().any(|m| m.id == target) {
+            if hist.iter().any(|m| m.key() == target) {
                 self.cursor = Some(target);
                 self.follow_wish = Some(target);
                 s.redraw();
@@ -621,14 +625,14 @@ impl Chat {
     /// words on its next focus or send.
     pub fn stage_draft(&mut self, text: &str, reply_to: Option<MsgId>, focus: bool) -> Result<(), String> {
         self.save_draft(text)?;
-        self.reply_to = reply_to;
+        self.reply_to = reply_to.map(|id| (self.peer, id));
         self.wants_field = focus;
         Ok(())
     }
 
     /// Another open copy sent this exact draft. Its send already cleared
     /// the row; forget our copy without a second write or a focus change.
-    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgId>) {
+    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgKey>) {
         if self.editing.is_none() && self.carrying.is_empty()
             && self.draft == text && self.reply_to == reply_to
         {
@@ -757,18 +761,18 @@ impl Chat {
                 let captioned = self
                     .history()
                     .iter()
-                    .any(|m| m.id == e.msg && m.media.is_some());
+                    .any(|m| m.key() == e.msg && m.media.is_some());
                 let request = if captioned {
-                    requests::edit_message_caption(self.peer, e.msg, &text)
+                    requests::edit_message_caption(e.msg.0, e.msg.1, &text)
                 } else {
-                    requests::edit_message_text(self.peer, e.msg, &text)
+                    requests::edit_message_text(e.msg.0, e.msg.1, &text)
                 };
                 if let Err(error) = super::super::history::command(s, &request) {
                     if super::live(&self.store) {
                         self.editing = Some(e);
                         error.notify(s, "edit");
                     } else {
-                        verbs::edit_line(s, self.peer, e.msg, &e.original, e.was_edited, &text);
+                        verbs::edit_line(s, e.msg.0, e.msg.1, &e.original, e.was_edited, &text);
                     }
                 }
             }
@@ -790,7 +794,7 @@ impl Chat {
         let text = self.draft.trim().to_string();
         let wired = if self.carrying.is_empty() {
             !text.is_empty()
-                && wire(&self.store, &self.request(requests::send_message(self.peer, &text, self.reply_to)))
+                && wire(&self.store, &self.request(requests::send_message(self.peer, &text, self.reply_to())))
         } else {
             self.send_files(&text)
         };
@@ -838,7 +842,7 @@ impl Chat {
         let reply = self.reply_to;
         let operation = match super::super::history::command(
             s,
-            &self.request(requests::send_message(self.peer, text.trim(), reply)),
+            &self.request(requests::send_message(self.peer, text.trim(), reply.map(|(_, id)| id))),
         ) {
             Ok(id) => Some(id),
             Err(error) => { error.notify(s, "send"); None }
@@ -876,7 +880,7 @@ impl Chat {
         while let Some((i, file)) = files.next() {
             let request = requests::send_file(
                 self.peer,
-                if i == 0 { self.reply_to } else { None },
+                if i == 0 { self.reply_to() } else { None },
                 &file,
                 if i == 0 { &text } else { "" },
             );
@@ -911,7 +915,7 @@ impl Chat {
         for (i, file) in self.carrying.iter().enumerate() {
             let first = i == 0;
             let caption = if first { text } else { "" };
-            let reply = if first { self.reply_to } else { None };
+            let reply = if first { self.reply_to() } else { None };
             if wire(&self.store, &self.request(requests::send_file(self.peer, reply, file, caption))) {
                 went = true;
             }
@@ -946,7 +950,7 @@ impl Chat {
     /// or paused; the line's own length at rest otherwise.
     #[must_use]
     pub fn player_state(&self, msg: &Msg, now: f64) -> Option<PlayerState> {
-        if let Some(player) = self.player.as_ref().filter(|p| p.msg == msg.id) {
+        if let Some(player) = self.player.as_ref().filter(|p| p.msg == msg.key()) {
             return player.player_state(msg, now);
         }
         let md = msg.media.as_ref()?;
@@ -956,22 +960,22 @@ impl Chat {
 
     /// Play or pause a line: the one playing pauses, any other takes over.
     pub fn toggle_play(&mut self, msg: &Msg, now: f64) {
-        self.select_playback(msg.id).toggle_play(msg, now);
+        self.select_playback(msg.key()).toggle_play(msg, now);
     }
 
     /// A progress-bar press can select a line before its first play.
-    pub fn select_playback(&mut self, id: MsgId) -> &mut Playback {
+    pub fn select_playback(&mut self, id: MsgKey) -> &mut Playback {
         if self.player.as_ref().is_none_or(|p| p.msg != id) {
             self.player = Some(Playback::new(self.store.clone(), id));
         }
         self.player.as_mut().unwrap()
     }
 
-    pub fn playback(&mut self, id: MsgId) -> Option<&mut Playback> {
+    pub fn playback(&mut self, id: MsgKey) -> Option<&mut Playback> {
         self.player.as_mut().filter(|p| p.msg == id)
     }
 
-    pub fn active_media(&self) -> Option<MsgId> {
+    pub fn active_media(&self) -> Option<MsgKey> {
         self.player.as_ref().map(|p| p.msg)
     }
 
@@ -990,7 +994,7 @@ impl Chat {
 /// the day changes, the unread line above `first_unread`, a run where one
 /// writer goes on within [`RUN_GAP`].
 #[must_use]
-pub fn rows_of(history: &[Msg], first_unread: Option<MsgId>, now: f64) -> Vec<Row> {
+pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, now: f64) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::with_capacity(history.len() + 8);
     let mut prev: Option<&Msg> = None;
     let mut run_with: Option<&Msg> = None;
@@ -999,7 +1003,7 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgId>, now: f64) -> Vec<Ro
             rows.push(Row::Day(day_caption(m.date, now)));
             run_with = None;
         }
-        if first_unread == Some(m.id) {
+        if first_unread == Some(m.key()) {
             rows.push(Row::Unread);
             run_with = None;
         }
@@ -1013,7 +1017,7 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgId>, now: f64) -> Vec<Ro
                 || m.reply_to.is_some()
                 || matches!(m.state.as_deref(), Some("failed" | "sending"));
             let run = run_with.is_some_and(|r| {
-                r.out == m.out && r.sender == m.sender && m.date - r.date <= RUN_GAP && !stands_out
+                r.chat == m.chat && r.out == m.out && r.sender == m.sender && m.date - r.date <= RUN_GAP && !stands_out
             });
             rows.push(Row::Message {
                 msg: m.clone(),
@@ -1167,7 +1171,7 @@ impl Panel for Chat {
                 Some('n'),
                 Nav::Open {
                     from: self.slot,
-                    id: Line::id(self.peer, m.id),
+                    id: Line::id(m.chat, m.id),
                     fresh: false,
                 },
             ));
@@ -1203,7 +1207,7 @@ impl Panel for Chat {
         match verb {
             "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.react" if self.marks.is_empty() => {
-                if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, self.peer, id)) {
+                if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, id.0, id.1)) {
                     self.reactions.open(s, &m);
                     s.redraw();
                 }
@@ -1226,7 +1230,7 @@ impl Panel for Chat {
             "telegram.back" => self.jump_back(s),
             // The marks, or the cursor's own line.
             "telegram.delete" => {
-                let ids: Vec<MsgId> = if self.marks.is_empty() {
+                let ids: Vec<MsgKey> = if self.marks.is_empty() {
                     self.cursor.into_iter().collect()
                 } else {
                     self.marks.iter().copied().collect()
@@ -1239,13 +1243,13 @@ impl Panel for Chat {
             }
             "telegram.copy" => {
                 let hist = self.history();
-                if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c)) {
+                if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.key() == c)) {
                     copy_line(s, m);
                 }
             }
             "telegram.download" if self.marks.is_empty() => {
                 let hist = self.history();
-                if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c)) {
+                if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.key() == c)) {
                     downloads::request(s, m);
                 }
             }
@@ -1254,7 +1258,7 @@ impl Panel for Chat {
             // list of chats: the pick outlives this panel, so it is the
             // app's to hold. The marks have done their work here.
             "telegram.forward" => {
-                let ids: Vec<MsgId> = if self.marks.is_empty() {
+                let ids: Vec<MsgKey> = if self.marks.is_empty() {
                     self.cursor.into_iter().collect()
                 } else {
                     self.marks.iter().copied().collect()
@@ -1262,7 +1266,9 @@ impl Panel for Chat {
                 if ids.is_empty() {
                     return;
                 }
-                runtime::of(&self.store).carry_forward(self.peer, ids);
+                let selected: BTreeSet<_> = ids.into_iter().collect();
+                let ordered = self.history().iter().map(Msg::key).filter(|key| selected.contains(key)).collect();
+                runtime::of(&self.store).carry_forward_messages(ordered);
                 self.marks.clear();
                 s.nav(Nav::Open {
                     from: self.slot,
@@ -1413,8 +1419,8 @@ impl PanelKind for ChatKind {
             topic,
             store,
             slot: 0,
-            cursor: at,
-            follow_wish: at,
+            cursor: at.map(|id| (peer, id)),
+            follow_wish: at.map(|id| (peer, id)),
             reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,

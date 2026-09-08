@@ -331,16 +331,19 @@ impl Chats {
         }
         let name =
             super::super::topics::card(&self.store, peer, topic).map_or_else(|| "the chat".to_string(), |c| c.name);
-        let n = f.ids.len();
+        let n = f.messages.len();
         let what = if n == 1 { "line" } else { "lines" };
-        let went = told(
-            s,
-            &requests::in_topic(requests::forward_messages(peer, f.from, &f.ids), topic),
-            &format!("forward {n} {what} to {name}"),
-        );
-        if went || !super::live(&self.store) {
-            runtime::of(&self.store).take_forward();
+        let mut remaining = Vec::new();
+        let mut groups: Vec<_> = model::message_groups(f.messages.iter().copied()).into_iter().collect();
+        groups.sort_by_key(|(chat, _)| f.messages.iter().position(|(source, _)| source == chat));
+        for (from, ids) in groups {
+            let went = told(s, &requests::in_topic(requests::forward_messages(peer, from, &ids), topic),
+                &format!("forward {} {what} to {name}", ids.len()));
+            if !went && super::live(&self.store) { remaining.extend(ids.into_iter().map(|id| (from, id))); }
         }
+        let went = remaining.len() < n && super::live(&self.store);
+        if remaining.is_empty() { runtime::of(&self.store).take_forward(); }
+        else { runtime::of(&self.store).carry_forward_messages(remaining); }
         if went {
             s.notify(format!("forwarding {n} {what} to {name}…"), false);
         }

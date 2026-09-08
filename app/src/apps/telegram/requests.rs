@@ -202,6 +202,18 @@ pub fn send_message(chat_id: PeerId, text: &str, reply_to: Option<MsgId>) -> Str
     req.to_string()
 }
 
+/// An old basic-group message retains its source identity when answered from
+/// the upgraded group's composer (TDLib's inputMessageReplyToExternalMessage).
+pub(super) fn reply_in_chat(request: String, chat: PeerId, reply: Option<model::MsgKey>) -> String {
+    let Some((source, id)) = reply.filter(|(source, _)| *source != chat) else { return request };
+    let mut v: Value = serde_json::from_str(&request).expect("Telegram request");
+    if v["reply_to"]["message_id"] == id {
+        v["reply_to"]["@type"] = json!("inputMessageReplyToExternalMessage");
+        v["reply_to"]["chat_id"] = json!(source);
+    }
+    v.to_string()
+}
+
 /// The line a send answers, put on a request the way [`send_message`] puts it:
 /// the *input* form, by message id, absent entirely when nothing is answered.
 /// Shared by the sends that carry something other than text, so all of them

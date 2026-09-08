@@ -20,8 +20,10 @@ people, groups and channels: `id`, `name`, `username`, `kind`, `is_self`, \
 text draft, keyed by `peer` = `tg_peer.id`. `tg_topic` holds forum topics \
 keyed by (`chat`, `id`), each with its own name and draft. `tg_message` is \
 keyed by (`chat`, `id`): `topic` (0 outside a forum topic), `sender`, \
-`date`, `text`, `out`, `reply_to`, and media metadata. Message ids are \
-only unique within a chat. Use sql.query to find a recipient by name or \
+`date`, `text`, `out`, `reply_to`, `reply_chat`, and media metadata. Message ids are \
+only unique within a chat. `tg_chat_upgrade` links `old_chat` to `new_chat`; \
+include both chat ids when reading an upgraded group's history. Replies use \
+`reply_chat` when present, otherwise the message's own `chat`. Use sql.query to find a recipient by name or \
 username and read their cached messages; the cache may be incomplete.
 
 Use telegram.draft to put text in the correct chat's composer for review, \
@@ -221,7 +223,7 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
         text_composer(c)?;
         if !replace
             && ((!c.field_text().is_empty() && c.field_text() != msg.text)
-                || (c.reply_to().is_some() && c.reply_to() != msg.reply_to))
+                || (c.reply_to().is_some() && c.reply_key() != msg.reply_to.map(|id| (msg.chat, id))))
         {
             return Err(
                 "an open composer has unsent work; use replace only to intentionally replace it"
@@ -288,7 +290,7 @@ fn send(s: &mut Session, input: &Value) -> Result<Value, String> {
         .ok_or("that slot is not a Telegram composer")?;
     let _ = c.card();
     text_composer(c)?;
-    if !msg.matches(c) || c.field_text() != msg.text || c.reply_to() != msg.reply_to {
+    if !msg.matches(c) || c.field_text() != msg.text || c.reply_key() != msg.reply_to.map(|id| (msg.chat, id)) {
         return Err("the Telegram draft changed; review it and request a new send with its current contents".into());
     }
     if !super::panels::live(s.store()) {

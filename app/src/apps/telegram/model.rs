@@ -485,6 +485,17 @@ pub fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
 }
 
+/// A message is identified by its source chat as well as its message id.
+pub type MsgKey = (PeerId, MsgId);
+
+/// Group a selection by its original chat before issuing Telegram requests.
+pub fn message_groups(keys: impl IntoIterator<Item = MsgKey>) -> std::collections::BTreeMap<PeerId, Vec<MsgId>> {
+    let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (chat, id) in keys { groups.entry(chat).or_default().push(id); }
+    for ids in groups.values_mut() { ids.sort_unstable(); ids.dedup(); }
+    groups
+}
+
 /// One message as the transcript draws it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Msg {
@@ -502,6 +513,7 @@ pub struct Msg {
     pub state: Option<String>,
     pub edited: bool,
     pub reply_to: Option<MsgId>,
+    pub reply_chat: Option<PeerId>,
     pub unread_mention: bool,
     /// Who wrote what it answers, and what they wrote.
     pub reply_name: String,
@@ -515,6 +527,12 @@ pub struct Msg {
 }
 
 impl Msg {
+    pub fn key(&self) -> MsgKey { (self.chat, self.id) }
+
+    pub fn reply_key(&self) -> Option<MsgKey> {
+        self.reply_to.map(|id| (self.reply_chat.unwrap_or(self.chat), id))
+    }
+
     /// The writer's name as the header draws it: `me` for mine.
     #[must_use]
     pub fn writer(&self) -> &str {
@@ -1270,9 +1288,8 @@ pub fn peer(store: &Store, id: PeerId) -> Option<PeerCard> {
 
 static Q_HISTORY: Q = Q {
     id: "tg history",
-    // A reply answers a line of the *same chat*: the id it names means
-    // nothing outside it, and joining on the id alone quoted whichever chat's
-    // line happened to wear that number (V8).
+    // Both halves retain their source chat and message ids. Replies can also
+    // cross the upgrade boundary; an absent reply_chat means the same chat.
     sql: "SELECT m.id, m.chat, m.sender, COALESCE(s.name, ''), m.date, m.text, m.out, m.state,
                  m.edited, m.reply_to, COALESCE(rs.name, ''), COALESCE(r.text, '') AS reply_text,
                  m.fwd_from, m.views, m.comments,
@@ -1280,14 +1297,16 @@ static Q_HISTORY: Q = Q {
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic
+                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
           FROM tg_message m
           LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
-          LEFT JOIN tg_message r ON r.chat = m.chat AND r.id = m.reply_to
+          LEFT JOIN tg_message r ON r.chat = COALESCE(m.reply_chat, m.chat) AND r.id = m.reply_to
           LEFT JOIN tg_peer rs ON rs.id = r.sender
-          WHERE m.chat = ?1 AND (?2 = 0 OR m.topic = ?2)
-          ORDER BY m.date, m.id",
+          WHERE (m.chat = ?1 OR (?2 = 0 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))
+            AND (?2 = 0 OR m.topic = ?2)
+            AND (m.chat = ?1 OR COALESCE(m.content_type, '') != 'messageChatUpgradeTo')
+          ORDER BY m.date, m.chat DESC, m.id",
     describe: "one chat's lines, oldest first, each with what it answers",
 };
 
@@ -1320,6 +1339,7 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         state: r.get(7)?,
         edited: r.get::<_, i64>(8)? != 0,
         reply_to: r.get(9)?,
+        reply_chat: r.get(36)?,
         unread_mention: r.get(33)?,
         reply_name,
         reply_text,
@@ -1765,7 +1785,7 @@ pub fn message_topic(store: &Store, chat: PeerId, id: MsgId) -> i64 {
 #[must_use]
 pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
     let sql = Q_HISTORY.sql.replace(
-        "WHERE m.chat = ?1 AND (?2 = 0 OR m.topic = ?2)",
+        "WHERE (m.chat = ?1 OR (?2 = 0 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))\n            AND (?2 = 0 OR m.topic = ?2)",
         "WHERE m.chat = ?1 AND m.id = ?2",
     );
     store.rows_sql("tg line", "one message and its reply", &sql, &[Val::I(chat), Val::I(id)], msg_row)

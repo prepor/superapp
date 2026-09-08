@@ -8,10 +8,10 @@ use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, OnceLock};
 
 use kernel::store::Store;
 
-use super::model::{self, Msg, MsgId, PeerId};
+use super::model::{self, Msg, MsgId, MsgKey, PeerId};
 use super::panels::chat::{rows_of, Row};
 
-const DEPENDENCIES: &[&str] = &["tg_message", "tg_message_reaction", "tg_peer"];
+const DEPENDENCIES: &[&str] = &["tg_message", "tg_message_reaction", "tg_peer", "tg_chat_upgrade"];
 const CAPACITY: usize = 8;
 
 #[derive(Default)]
@@ -19,24 +19,24 @@ pub struct Snapshot {
     pub ready: bool,
     pub history: Arc<Vec<Msg>>,
     pub rows: Arc<Vec<Row>>,
-    messages: HashMap<MsgId, usize>,
-    row_indices: HashMap<MsgId, usize>,
+    messages: HashMap<MsgKey, usize>,
+    row_indices: HashMap<MsgKey, usize>,
 }
 
 impl Snapshot {
-    fn new(history: Vec<Msg>, first_unread: Option<MsgId>, now: f64) -> Self {
+    fn new(history: Vec<Msg>, first_unread: Option<MsgKey>, now: f64) -> Self {
         let rows = Arc::new(rows_of(&history, first_unread, now));
-        let messages = history.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+        let messages = history.iter().enumerate().map(|(i, m)| (m.key(), i)).collect();
         let row_indices = rows.iter().enumerate()
-            .filter_map(|(i, r)| r.msg().map(|m| (m.id, i))).collect();
+            .filter_map(|(i, r)| r.msg().map(|m| (m.key(), i))).collect();
         Self { ready: true, history: Arc::new(history), rows, messages, row_indices }
     }
 
-    pub fn message(&self, id: MsgId) -> Option<&Msg> {
+    pub fn message(&self, id: MsgKey) -> Option<&Msg> {
         self.messages.get(&id).and_then(|&i| self.history.get(i))
     }
 
-    pub fn row_index(&self, id: MsgId) -> Option<usize> {
+    pub fn row_index(&self, id: MsgKey) -> Option<usize> {
         self.row_indices.get(&id).copied()
     }
 }
@@ -138,7 +138,7 @@ impl Loader {
                             });
                             match result {
                                 Ok(history) => {
-                                    let snapshot = Snapshot::new(history, job.key.first_unread, job.now);
+                                    let snapshot = Snapshot::new(history, job.key.first_unread.map(|id| (job.key.peer, id)), job.now);
                                     *load.snapshot.lock().expect("transcript result") = Arc::new(snapshot);
                                 }
                                 Err(error) => {
@@ -208,7 +208,7 @@ impl Transcript {
             }
         }
         let history = model::history_in(store, key.peer, key.topic);
-        let snapshot = Arc::new(Snapshot::new((*history).clone(), key.first_unread, self.now.get()));
+        let snapshot = Arc::new(Snapshot::new((*history).clone(), key.first_unread.map(|id| (key.peer, id)), self.now.get()));
         *inline = Some(Inline { revision, key, snapshot: snapshot.clone() });
         snapshot
     }
@@ -232,24 +232,24 @@ mod tests {
     fn message_lookups_follow_backfills_deletions_and_dividers() {
         let store = store();
         let mut history = model::history(&store, seed::VERA).as_ref().clone();
-        let id = history.last().unwrap().id;
+        let id = history.last().unwrap().key();
         let before = Snapshot::new(history.clone(), Some(id), 0.0);
         let mut older = history[0].clone();
         older.id = -1;
         older.date -= 86400.0;
         older.text = "backfilled".into();
         history.insert(0, older);
-        history.retain(|m| m.id != id);
+        history.retain(|m| m.key() != id);
         let after = Snapshot::new(history, None, 0.0);
         assert!(before.message(id).is_some());
         assert!(after.message(id).is_none());
         assert!(after.row_index(id).is_none());
-        assert_eq!(after.message(-1).unwrap().text, "backfilled");
+        assert_eq!(after.message((seed::VERA, -1)).unwrap().text, "backfilled");
         for snapshot in [&before, &after] {
             for (i, row) in snapshot.rows.iter().enumerate() {
                 if let Some(msg) = row.msg() {
-                    assert_eq!(snapshot.row_index(msg.id), Some(i));
-                    assert_eq!(snapshot.message(msg.id), Some(msg));
+                    assert_eq!(snapshot.row_index(msg.key()), Some(i));
+                    assert_eq!(snapshot.message(msg.key()), Some(msg));
                 }
             }
         }

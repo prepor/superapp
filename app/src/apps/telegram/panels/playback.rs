@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use kernel::store::Store;
 
 use crate::shell::widgets::media::PlayerState;
-use super::super::model::{self, Msg, MsgId, Player};
+use super::super::model::{self, Msg, MsgKey, Player};
 use super::super::{requests, runtime};
 use super::wire;
 
@@ -35,7 +35,7 @@ impl Transport {
 
 pub struct Playback {
     store: Rc<Store>,
-    pub msg: MsgId,
+    pub msg: MsgKey,
     transport: Arc<Mutex<Transport>>,
     active: Arc<ActivePlayback>,
     native: PlayerState,
@@ -44,7 +44,7 @@ pub struct Playback {
 }
 
 impl Playback {
-    pub fn new(store: Rc<Store>, msg: MsgId) -> Self {
+    pub fn new(store: Rc<Store>, msg: MsgKey) -> Self {
         let active = store.local();
         Self { store, msg, transport: Arc::default(), active, native: PlayerState::default(),
             asked: false, wanted_pic: false }

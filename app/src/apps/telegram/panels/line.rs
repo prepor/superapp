@@ -230,9 +230,9 @@ impl Panel for Line {
                 let msg = self.msg;
                 let told = self.tell_chat(s, |c| {
                     if verb == "telegram.reply" {
-                        c.reply(msg)
+                        c.reply((self.chat, msg))
                     } else {
-                        c.edit(msg)
+                        c.edit((self.chat, msg))
                     }
                 });
                 match told {
@@ -259,11 +259,11 @@ impl Panel for Line {
                 let (chat, msg) = (self.chat, self.msg);
                 if super::live(self.world.store()) {
                     match super::super::history::command(s, &requests::delete_messages(chat, &[msg], true)) {
-                        Ok(_) => { self.tell_chat(s, |c| c.lines_gone(&[msg])); }
+                        Ok(_) => { self.tell_chat(s, |c| c.lines_gone(&[(self.chat, msg)])); }
                         Err(error) => error.notify(s, "delete"),
                     }
                 } else {
-                    self.tell_chat(s, |c| c.lines_gone(&[msg]));
+                    self.tell_chat(s, |c| c.lines_gone(&[(self.chat, msg)]));
                     verbs::delete_lines(s, chat, vec![msg]);
                 }
                 s.redraw();
@@ -338,7 +338,7 @@ impl PanelKind for LineKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
-            playback: Playback::new(cx.session().store().clone(), msg),
+            playback: Playback::new(cx.session().store().clone(), (chat, msg)),
             reactions: Reactions::default(),
         })
     }

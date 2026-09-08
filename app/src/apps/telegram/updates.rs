@@ -45,6 +45,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
             .as_i64()
             .or_else(|| m["reply_to"]["message_id"].as_i64())
             .filter(|&r| r != 0),
+        reply_chat: m["reply_to"]["chat_id"].as_i64().filter(|id| *id != 0 && *id != chat),
         unread_mention: !out && m["contains_unread_mention"].as_bool().unwrap_or(false),
         fwd_from: forward_from(&m["forward_info"]),
         media,
@@ -53,10 +54,8 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
             .as_i64()
             .filter(|&n| n > 0),
         reactions: reactions_line(info),
-        // Service lines (a member joined, a title changed) are a content kind
-        // currently maps to fallback text. Dedicated service-message decoding
-        // is not implemented yet.
-        service: false,
+        // Upgrade boundaries are service lines, not messages to react to.
+        service: matches!(m["content"]["@type"].as_str(), Some("messageChatUpgradeFrom" | "messageChatUpgradeTo")),
     })
 }
 
@@ -263,6 +262,7 @@ pub fn interaction(u: &Value) -> Option<Interaction> {
 pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
     let caption = || formatted_text(&content["caption"]);
     match content["@type"].as_str() {
+        Some("messageChatUpgradeFrom" | "messageChatUpgradeTo") => ("group upgraded".into(), None),
         Some("messageText") => (formatted_text(&content["text"]), None),
         Some("messagePhoto") => (caption(), photo_media(&content["photo"])),
         // A moving picture's reference is its thumbnail, the poster the

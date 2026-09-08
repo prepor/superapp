@@ -120,6 +120,8 @@ impl Operation {
             self.kind.as_str(),
             "loadChats"
                 | "getChatHistory"
+                | "getSupergroupFullInfo"
+                | "createBasicGroupChat"
                 | "searchChatMessages"
                 | "getForumTopicHistory"
                 | "getForumTopic"
@@ -772,6 +774,7 @@ fn label(v: &Value) -> String {
         | "checkAuthenticationPassword" => "signing in".into(),
         "loadChats" => "loading chats".into(),
         "getChatHistory" | "getForumTopicHistory" => "loading messages".into(),
+        "getSupergroupFullInfo" | "createBasicGroupChat" => "loading group information".into(),
         "getForumTopic" | "getForumTopics" => "loading topics".into(),
         "setForumTopicNotificationSettings" => "updating topic notifications".into(),
         "getMessage" => "loading message".into(),

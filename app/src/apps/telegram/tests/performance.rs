@@ -260,12 +260,12 @@ fn chat_interaction_timing() {
     large_history(&s);
     let slot = open_root(&mut s, Chat::id(VERA));
     let snapshot = with_chat(&s, slot, |c| c.snapshot(s.now()));
-    let visible: Vec<_> = snapshot.history.iter().rev().take(12).map(|m| m.id).collect();
+    let visible: Vec<_> = snapshot.history.iter().rev().take(12).map(|m| m.key()).collect();
     let start = Instant::now();
     for _ in 0..1000 {
         let history = with_chat(&s, slot, |c| c.history());
-        black_box(history.iter().filter(|m| m.unread_mention && visible.contains(&m.id)).count());
-        black_box(snapshot.rows.iter().position(|r| r.msg().is_some_and(|m| m.id == visible[0])));
+        black_box(history.iter().filter(|m| m.unread_mention && visible.contains(&m.key())).count());
+        black_box(snapshot.rows.iter().position(|r| r.msg().is_some_and(|m| m.key() == visible[0])));
     }
     eprintln!("10,000 messages: previous history scans per input/frame = {:?}", start.elapsed() / 1000);
     let start = Instant::now();

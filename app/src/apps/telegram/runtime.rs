@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 use kernel::effect::World;
 use kernel::store::Store;
 
-use super::model::{DownloadProgress, MsgId, PeerId};
+use super::model::{DownloadProgress, MsgId, MsgKey, PeerId};
 use super::requests::PeerAction;
 
 /// Chosen when the world is created, independently of worker availability.
@@ -24,8 +24,7 @@ pub enum Delivery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
-    pub from: PeerId,
-    pub ids: Vec<MsgId>,
+    pub messages: Vec<MsgKey>,
 }
 
 /// A reaction picker waits in memory for either the available emoji or the
@@ -72,6 +71,20 @@ pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId
         view.ids = ids;
     } else {
         *view = Some(of(world.store()).watch_messages(chat, topic, ids, world.now()));
+    }
+}
+
+/// The main viewport owns history; inherited rows subscribe to their source
+/// chats for media and reactions without starting separate background walks.
+pub fn show_history_messages(view: &mut Option<MessageView>, inherited: &mut BTreeMap<PeerId, MessageView>,
+    world: &World, chat: PeerId, topic: i64, keys: Vec<MsgKey>) {
+    let mut groups = super::model::message_groups(keys);
+    show_messages(view, world, chat, Some(topic), groups.remove(&chat).unwrap_or_default());
+    inherited.retain(|chat, _| groups.contains_key(chat));
+    for (source, ids) in groups {
+        let mut row_view = inherited.remove(&source);
+        show_messages(&mut row_view, world, source, None, ids);
+        if let Some(row_view) = row_view { inherited.insert(source, row_view); }
     }
 }
 
@@ -395,7 +408,11 @@ impl Runtime {
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {
-        self.state().forward = Some(Forward { from, ids });
+        self.carry_forward_messages(ids.into_iter().map(|id| (from, id)).collect());
+    }
+
+    pub fn carry_forward_messages(&self, messages: Vec<MsgKey>) {
+        self.state().forward = Some(Forward { messages });
     }
 
     pub fn pending_forward(&self) -> Option<Forward> {
@@ -589,8 +606,7 @@ mod tests {
             assert_eq!(
                 state.pending_forward(),
                 Some(Forward {
-                    from: 7,
-                    ids: vec![42]
+                    messages: vec![(7, 42)]
                 })
             );
             assert!(state.loading(7));

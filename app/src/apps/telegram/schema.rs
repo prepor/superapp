@@ -39,8 +39,22 @@ pub static SCHEMA: Schema = Schema {
             version: 1,
             rebuild: rebuild_message_substr,
         },
+        Step::Always(v17_chat_upgrades),
     ],
 };
+
+fn v17_chat_upgrades(c: &Connection) -> rusqlite::Result<()> {
+    if columns(c, "tg_chat_upgrade")?.is_empty() {
+        c.execute_batch("CREATE TABLE tg_chat_upgrade(
+            old_chat INTEGER PRIMARY KEY, new_chat INTEGER NOT NULL UNIQUE)")?;
+    }
+    if !columns(c, "tg_message")?.contains("reply_chat") {
+        c.execute_batch("ALTER TABLE tg_message ADD COLUMN reply_chat INTEGER;
+            UPDATE tg_message SET service = 1, text = 'group upgraded'
+            WHERE content_type IN ('messageChatUpgradeFrom', 'messageChatUpgradeTo')")?;
+    }
+    Ok(())
+}
 
 fn v15_message_search(c: &Connection) -> rusqlite::Result<()> {
     super::search_index::register(c)?;

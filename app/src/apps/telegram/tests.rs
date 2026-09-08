@@ -33,6 +33,7 @@ mod performance;
 mod downloads_tests;
 mod history;
 mod context_tests;
+mod upgrades_tests;
 
 fn session() -> Session {
     Session::fake(APPS)
@@ -232,7 +233,7 @@ fn a_preview_marks_the_chat_read_and_undo_gives_it_back() {
     assert_eq!(unread(&s, STELAXIS), (0, true));
     // Where the reading started is kept on the instance for the unread
     // line, and the cursor starts nowhere.
-    let (first, cursor) = with_chat(&s, reader, |c| (c.first_unread(), c.cursor()));
+    let (first, cursor) = with_chat(&s, reader, |c| (c.first_unread(), c.cursor().map(|(_, id)| id)));
     let first = first.expect("something was unread");
     assert!(cursor.is_none());
     let hist = model::history(s.store(), STELAXIS);
@@ -327,7 +328,7 @@ fn the_transcript_is_days_runs_and_the_unread_line() {
         .iter()
         .find(|m| m.text.starts_with("Q3 infra"))
         .map(|m| m.id);
-    let rows = rows_of(&hist, first, virtual_epoch());
+    let rows = rows_of(&hist, first.map(|id| (STELAXIS, id)), virtual_epoch());
     let at = rows.iter().position(|r| *r == Row::Unread).expect("the line");
     assert!(matches!(&rows[at + 1], Row::Message { msg, run: false } if msg.fwd_from.is_some()));
     assert!(matches!(&rows[0], Row::Day(d) if d == "25 AUG"));
@@ -353,8 +354,8 @@ fn the_cursor_walks_and_reply_takes_the_line_under_it() {
     let hist = model::history(s.store(), VERA);
     let last = hist.last().expect("lines").id;
     with_chat(&s, slot, |c| {
-        assert_eq!(c.walk(-1), Some(last), "from nothing, the newest line");
-        assert_eq!(c.walk(-1), Some(last - 1));
+        assert_eq!(c.walk(-1).map(|(_, id)| id), Some(last), "from nothing, the newest line");
+        assert_eq!(c.walk(-1).map(|(_, id)| id), Some(last - 1));
         c.toggle_mark();
         c.mark_range(-1);
         assert_eq!(c.marks().len(), 2);
@@ -395,15 +396,15 @@ fn a_reply_original_has_a_way_back_after_walking_and_marking() {
     let original = reply.reply_to.unwrap();
     assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
     with_chat(&s, chat, |c| {
-        c.set_cursor(reply.id);
+        c.set_cursor((c.peer(), reply.id));
         c.set_draft("still writing");
     });
     verb(&mut s, chat, "telegram.original");
     with_chat(&s, chat, |c| {
-        assert_eq!(c.cursor(), Some(original));
-        assert_eq!(c.take_follow_wish(), Some(original));
-        assert_eq!(c.take_follow_wish(), None);
-        c.walk(-1);
+        assert_eq!(c.cursor().map(|(_, id)| id), Some(original));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(original));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), None);
+        c.walk(-1).map(|(_, id)| id);
         c.toggle_mark();
     });
     let marks = with_chat(&s, chat, |c| c.marks().clone());
@@ -414,9 +415,9 @@ fn a_reply_original_has_a_way_back_after_walking_and_marking() {
     assert!(!verb_ids(&s, other).contains(&"telegram.back"));
     verb(&mut s, chat, "telegram.back");
     with_chat(&s, chat, |c| {
-        assert_eq!(c.cursor(), Some(reply.id));
-        assert_eq!(c.take_follow_wish(), Some(reply.id));
-        assert_eq!(c.take_follow_wish(), None);
+        assert_eq!(c.cursor().map(|(_, id)| id), Some(reply.id));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(reply.id));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), None);
         assert_eq!(c.marks(), &marks);
         assert_eq!(c.draft(), "still writing");
         assert!(!c.take_field_wish(), "returning does not ask for the composer");
@@ -434,19 +435,19 @@ fn revisiting_a_reply_does_not_duplicate_the_return_point() {
 
     for _ in 0..2 {
         // Clicking the reply again instead of using Back keeps its return point.
-        with_chat(&s, chat, |c| c.set_cursor(reply.id));
+        with_chat(&s, chat, |c| c.set_cursor((c.peer(), reply.id)));
         verb(&mut s, chat, "telegram.original");
         with_chat(&s, chat, |c| {
-            assert_eq!(c.cursor(), Some(original));
-            assert_eq!(c.take_follow_wish(), Some(original));
+            assert_eq!(c.cursor().map(|(_, id)| id), Some(original));
+            assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(original));
         });
         assert!(verb_ids(&s, chat).contains(&"telegram.back"));
     }
 
     verb(&mut s, chat, "telegram.back");
     with_chat(&s, chat, |c| {
-        assert_eq!(c.cursor(), Some(reply.id));
-        assert_eq!(c.take_follow_wish(), Some(reply.id));
+        assert_eq!(c.cursor().map(|(_, id)| id), Some(reply.id));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(reply.id));
     });
     assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
 }
@@ -466,15 +467,15 @@ fn reply_originals_are_retraced_in_order_and_skip_missing_return_points() {
         )?;
         Ok(())
     }).unwrap();
-    with_chat(&s, chat, |c| c.set_cursor(reply));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), reply)));
     verb(&mut s, chat, "telegram.original");
     verb(&mut s, chat, "telegram.original");
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(oldest));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(oldest));
     for target in [middle, reply] {
         verb(&mut s, chat, "telegram.back");
         with_chat(&s, chat, |c| {
-            assert_eq!(c.cursor(), Some(target));
-            assert_eq!(c.take_follow_wish(), Some(target));
+            assert_eq!(c.cursor().map(|(_, id)| id), Some(target));
+            assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(target));
         });
     }
     assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
@@ -488,8 +489,8 @@ fn reply_originals_are_retraced_in_order_and_skip_missing_return_points() {
         Ok(())
     }).unwrap();
     verb(&mut s, chat, "telegram.back");
-    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), Some(reply));
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id), Some(reply));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(reply));
     assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
 }
 
@@ -509,10 +510,10 @@ fn a_failed_original_jump_does_not_add_a_return_point() {
             )?;
             Ok(())
         }).unwrap();
-        with_chat(&s, chat, |c| c.set_cursor(reply));
+        with_chat(&s, chat, |c| c.set_cursor((c.peer(), reply)));
         verb(&mut s, chat, "telegram.original");
-        assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
-        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+        assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(reply));
+        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id), None);
         assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
     }
     assert!(s.notes().iter().any(|n| n.msg == "the line it answers is not loaded"));
@@ -530,11 +531,11 @@ fn a_failed_original_jump_does_not_add_a_return_point() {
         Ok(())
     }).unwrap();
     verb(&mut s, chat, "telegram.original");
-    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), Some(original));
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id), Some(original));
     verb(&mut s, chat, "telegram.original");
-    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+    assert_eq!(with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id), None);
     verb(&mut s, chat, "telegram.back");
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(reply));
     assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
 }
 
@@ -545,11 +546,11 @@ fn deleting_the_last_return_point_clears_the_way_back() {
         let chat = open_root(&mut s, Chat::id(VERA));
         let hist = model::history(s.store(), VERA);
         let reply = hist.iter().find(|m| m.reply_to.is_some()).unwrap().id;
-        with_chat(&s, chat, |c| c.set_cursor(reply));
+        with_chat(&s, chat, |c| c.set_cursor((c.peer(), reply)));
         verb(&mut s, chat, "telegram.original");
-        let original = with_chat(&s, chat, Chat::take_follow_wish);
+        let original = with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id);
         if local {
-            with_chat(&s, chat, |c| c.lines_gone(&[reply]));
+            with_chat(&s, chat, |c| c.lines_gone(&[(c.peer(), reply)]));
         }
         s.store().write(move |c| {
             c.execute("DELETE FROM tg_message WHERE chat = ?1 AND id = ?2", [VERA, reply])?;
@@ -559,8 +560,8 @@ fn deleting_the_last_return_point_clears_the_way_back() {
             verb(&mut s, chat, "telegram.back");
             assert_eq!(s.notes().last().unwrap().msg, "the reply is no longer loaded");
         }
-        assert_eq!(with_chat(&s, chat, |c| c.cursor()), original);
-        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish), None);
+        assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), original);
+        assert_eq!(with_chat(&s, chat, Chat::take_follow_wish).map(|(_, id)| id), None);
         assert!(!verb_ids(&s, chat).contains(&"telegram.back"));
     }
 }
@@ -591,11 +592,11 @@ fn reply_back_keeps_its_shortcut_in_a_blocked_conversation() {
             "an exhausted Back must not fall through to the profile's unblock");
     };
     check(&s, None);
-    with_chat(&s, chat, |c| c.set_cursor(reply));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), reply)));
     verb(&mut s, chat, "telegram.original");
     check(&s, Some("telegram.back"));
     verb(&mut s, chat, "telegram.back");
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(reply));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(reply));
     check(&s, None);
     assert!(model::peer(s.store(), VERA).unwrap().blocked);
 }
@@ -706,17 +707,17 @@ fn unread_replies_open_at_the_message_and_only_visible_items_are_read() {
     go(&mut s, Nav::Open { from: inbox, id: Chat::at(reply.chat, reply.id), fresh: false });
     let reader = s.joined_child(inbox).unwrap();
     with_chat(&s, reader, |c| {
-        assert_eq!(c.cursor(), Some(reply.id));
-        assert_eq!(c.take_follow_wish(), Some(reply.id), "the transcript scrolls to the reply");
+        assert_eq!(c.cursor().map(|(_, id)| id), Some(reply.id));
+        assert_eq!(c.take_follow_wish().map(|(_, id)| id), Some(reply.id), "the transcript scrolls to the reply");
         c.view_mentions(&[], s.now());
     });
     assert_eq!(model::reply_count(s.store()), 2, "opening alone reads no notification");
     assert_eq!(unread(&s, STELAXIS).0, 8, "a targeted opening does not read the whole chat");
-    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now()));
+    with_chat(&s, reader, |c| c.view_mentions(&[(c.peer(), reply.id)], s.now()));
     assert_eq!(model::reply_count(s.store()), 1);
     assert!(!model::line(s.store(), reply.chat, reply.id).unwrap().unread_mention);
     assert!(model::line(s.store(), rows[1].chat, rows[1].id).unwrap().unread_mention);
-    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now() + 10.0));
+    with_chat(&s, reader, |c| c.view_mentions(&[(c.peer(), reply.id)], s.now() + 10.0));
     assert_eq!(model::reply_count(s.store()), 1, "repeat views cannot decrement twice");
 }
 
@@ -751,14 +752,14 @@ fn live_reply_views_wait_for_acknowledgment_and_can_retry() {
         .filter(|m| m.unread_mention).map(|m| m.id).collect();
     let reader = open_root(&mut s, Chat::at(STELAXIS, unread_ids[0]));
     let inbox = runtime::of(s.store()).connect();
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now()));
+    with_chat(&s, reader, |c| c.view_mentions(&[(c.peer(), unread_ids[0])], s.now()));
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@type"], "viewMessages");
     assert_eq!(request["message_ids"], serde_json::json!([unread_ids[0]]));
     assert_eq!(model::reply_count(s.store()), 2, "enqueue is not acknowledgment");
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 1.0));
+    with_chat(&s, reader, |c| c.view_mentions(&[(c.peer(), unread_ids[0])], s.now() + 1.0));
     assert!(inbox.try_recv().is_err(), "views are deduplicated while pending");
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 6.0));
+    with_chat(&s, reader, |c| c.view_mentions(&[(c.peer(), unread_ids[0])], s.now() + 6.0));
     assert!(inbox.try_recv().is_ok(), "an unacknowledged view can retry");
 }
 
@@ -1085,7 +1086,7 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     // batch twins too.
     let mine = open_root(&mut s, Chat::id(VERA));
     with_chat(&s, mine, |c| {
-        c.walk(-1);
+        c.walk(-1).map(|(_, id)| id);
         c.toggle_mark();
     });
     slots.push(mine);
@@ -1320,7 +1321,7 @@ fn a_reply_asks_for_the_caret() {
     let chat = open_root(&mut s, Chat::id(STELAXIS));
     assert!(!with_chat(&s, chat, Chat::take_field_wish));
     with_chat(&s, chat, |c| {
-        c.walk(-1);
+        c.walk(-1).map(|(_, id)| id);
     });
     verb(&mut s, chat, "telegram.reply");
     assert!(with_chat(&s, chat, |c| c.reply_to().is_some()));
@@ -1350,7 +1351,7 @@ fn my_lines_are_edited_and_deleted_and_undone() {
     let hist = model::history(s.store(), VERA);
     let hers = hist.iter().find(|m| !m.out && !m.service).expect("her line").id;
     let mine = hist.iter().rev().find(|m| m.out).expect("my line").clone();
-    with_chat(&s, chat, |c| c.set_cursor(hers));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), hers)));
     assert_eq!(
         verb_ids(&s, chat),
         vec![
@@ -1362,7 +1363,7 @@ fn my_lines_are_edited_and_deleted_and_undone() {
             "telegram.about"
         ]
     );
-    with_chat(&s, chat, |c| c.set_cursor(mine.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), mine.id)));
     assert_eq!(
         verb_ids(&s, chat),
         vec![
@@ -1411,14 +1412,14 @@ fn my_lines_are_edited_and_deleted_and_undone() {
     // Delete: the line goes, the cursor steps to the line before it, and
     // undo puts it back whole — the same id, the same date.
     let len = hist.len();
-    with_chat(&s, chat, |c| c.set_cursor(mine.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), mine.id)));
     verb(&mut s, chat, "telegram.delete");
     let after = model::history(s.store(), VERA);
     assert_eq!(after.len(), len - 1);
     assert!(after.iter().all(|m| m.id != mine.id));
     let at = hist.iter().position(|m| m.id == mine.id).unwrap();
     let before = hist[..at].iter().rev().find(|m| !m.service).unwrap().id;
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(before));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(before));
     s.undo();
     s.settle();
     let back = model::history(s.store(), VERA);
@@ -1429,13 +1430,13 @@ fn my_lines_are_edited_and_deleted_and_undone() {
     // Marks: the batch has the bar, and `delete n` only while every marked
     // line is mine.
     with_chat(&s, chat, |c| {
-        c.set_cursor(mine.id);
+        c.set_cursor((c.peer(), mine.id));
         c.toggle_mark();
     });
     let bar = verb_ids(&s, chat);
     assert!(bar.contains(&"telegram.delete") && !bar.contains(&"telegram.reply"));
     with_chat(&s, chat, |c| {
-        c.set_cursor(hers);
+        c.set_cursor((c.peer(), hers));
         c.toggle_mark();
     });
     let bar = verb_ids(&s, chat);
@@ -1445,7 +1446,7 @@ fn my_lines_are_edited_and_deleted_and_undone() {
     // on the card itself, the chat's cursor stepping off the line.
     with_chat(&s, chat, |c| {
         c.clear_marks();
-        c.set_cursor(mine.id);
+        c.set_cursor((c.peer(), mine.id));
     });
     verb(&mut s, chat, "telegram.line");
     let card = s.joined_child(chat).expect("the card, joined");
@@ -1467,7 +1468,7 @@ fn my_lines_are_edited_and_deleted_and_undone() {
     with_chat(&s, chat, Chat::cancel_edit);
     verb(&mut s, card, "telegram.delete");
     assert!(model::history(s.store(), VERA).iter().all(|m| m.id != mine.id));
-    assert_eq!(with_chat(&s, chat, |c| c.cursor()), Some(before));
+    assert_eq!(with_chat(&s, chat, |c| c.cursor().map(|(_, id)| id)), Some(before));
     // Another's line's card wears neither.
     let hers_card = open_root(&mut s, Line::id(VERA, hers));
     assert_eq!(
@@ -1534,7 +1535,7 @@ fn the_viewer_walks_and_the_card_replies_and_plays() {
     // A line's card, joined to its chat, replies on the chat's composer.
     let chat = open_root(&mut s, Chat::id(STELAXIS));
     with_chat(&s, chat, |c| {
-        c.walk(-1);
+        c.walk(-1).map(|(_, id)| id);
     });
     verb(&mut s, chat, "telegram.line");
     let card = s.joined_child(chat).expect("the card, joined");
@@ -1626,7 +1627,7 @@ fn inline_video_play_downloads_on_demand_and_stays_in_the_chat() {
     with_chat(&s, chat, |c| {
         assert!(c.player_state(&video, now).is_some(), "play remains available without a duration");
         c.toggle_play(&video, now);
-        let player = c.playback(video.id).unwrap();
+        let player = c.playback((c.peer(), video.id)).unwrap();
         assert!(player.plays_clip(&video));
         assert!(player.running());
         assert_eq!(player.player_state(&video, now + 8.0).unwrap().position, 0.0);
@@ -1639,12 +1640,12 @@ fn inline_video_play_downloads_on_demand_and_stays_in_the_chat() {
     assert_eq!(request["message_id"], video.id);
     with_chat(&s, chat, |c| {
         c.toggle_play(&video, now + 1.0);
-        assert!(!c.playback(video.id).unwrap().running(), "pause while downloading must stick");
+        assert!(!c.playback((c.peer(), video.id)).unwrap().running(), "pause while downloading must stick");
         c.toggle_play(&video, now + 2.0);
-        c.playback(video.id).unwrap().set_native_state(PlayerState {
+        c.playback((c.peer(), video.id)).unwrap().set_native_state(PlayerState {
             playing: true, position: 3.5, length: 14.0,
         });
-        c.set_cursor(video.id);
+        c.set_cursor((c.peer(), video.id));
         let state = c.player_state(&video, now + 20.0).unwrap();
         assert_eq!(state.position, 3.5, "the native frame owns the clock, even after selection");
         c.pause(now + 20.0);
@@ -1659,7 +1660,7 @@ fn inline_video_play_downloads_on_demand_and_stays_in_the_chat() {
         c.toggle_play(&voice, now + 30.0);
         assert!(c.player_state(&voice, now + 31.0).unwrap().playing);
         assert!(!c.player_state(&video, now + 31.0).unwrap().playing);
-        assert!(c.playback(video.id).is_none(), "another message takes over the player");
+        assert!(c.playback((c.peer(), video.id)).is_none(), "another message takes over the player");
     });
 }
 
@@ -1684,10 +1685,10 @@ fn telegram_panels_transfer_playback_without_overlapping() {
         let _inbox = native.then(|| runtime::of(s.store()).connect());
         let now = s.now();
         with_chat(&s, chat, |c| {
-            c.set_cursor(video.id);
+            c.set_cursor((c.peer(), video.id));
             c.toggle_play(&video, now);
             if native {
-                c.playback(video.id).unwrap().set_native_state(PlayerState {
+                c.playback((c.peer(), video.id)).unwrap().set_native_state(PlayerState {
                     playing: true, position: 3.5, length: 14.0,
                 });
             }
@@ -1699,7 +1700,7 @@ fn telegram_panels_transfer_playback_without_overlapping() {
         with_chat(&s, chat, |c| {
             assert!(!c.player_state(&video, now).unwrap().playing);
             if native {
-                let p = c.playback(video.id).unwrap();
+                let p = c.playback((c.peer(), video.id)).unwrap();
                 // A late native update cannot reclaim another panel's turn.
                 p.set_native_state(PlayerState { playing: true, position: 3.5, length: 14.0 });
                 assert!(!p.running());
@@ -1729,7 +1730,7 @@ fn telegram_panels_transfer_playback_without_overlapping() {
 
         // An isolated fixture/session with the same message id owns its own audio.
         let other = session();
-        let mut other_player = super::panels::playback::Playback::new(other.store().clone(), video.id);
+        let mut other_player = super::panels::playback::Playback::new(other.store().clone(), video.key());
         other_player.toggle_play(&video, now);
         assert!(b.as_any().downcast_mut::<Viewer>().unwrap().player_state(&video, now).unwrap().playing);
     }
@@ -2008,7 +2009,7 @@ fn blocked_lines_cannot_start_a_reply_or_edit() {
     let chat = open_root(&mut s, Chat::id(VERA));
     let mine = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().id;
     with_chat(&s, chat, |c| {
-        c.set_cursor(mine);
+        c.set_cursor((c.peer(), mine));
         c.set_draft("keep this draft");
     });
     verb(&mut s, chat, "telegram.line");
@@ -2027,8 +2028,8 @@ fn blocked_lines_cannot_start_a_reply_or_edit() {
     }
     assert_eq!(s.focus(), Some(line), "a refused action never focuses the hidden composer");
     with_chat(&s, chat, |c| {
-        c.reply(mine);
-        assert!(!c.edit(mine), "direct callers cannot bypass the block");
+        c.reply((c.peer(), mine));
+        assert!(!c.edit((c.peer(), mine)), "direct callers cannot bypass the block");
         assert_eq!(c.reply_to(), None);
         assert!(c.editing().is_none());
         assert_eq!(c.field_text(), "keep this draft");
@@ -2040,7 +2041,7 @@ fn blocked_lines_cannot_start_a_reply_or_edit() {
     verb(&mut s, line, "telegram.reply");
     assert_eq!(with_chat(&s, chat, |c| c.reply_to()), Some(mine));
     verb(&mut s, line, "telegram.edit");
-    assert_eq!(with_chat(&s, chat, |c| c.editing().unwrap().msg), mine);
+    assert_eq!(with_chat(&s, chat, |c| c.editing().unwrap().msg.1), mine);
 }
 
 #[test]
@@ -2052,10 +2053,10 @@ fn blocking_hides_existing_replies_and_edits_until_unblocked() {
         with_chat(&s, chat, |c| {
             c.set_draft("keep this draft");
             if editing {
-                assert!(c.edit(mine));
+                assert!(c.edit((c.peer(), mine)));
                 c.typed("keep this edit");
             } else {
-                c.reply(mine);
+                c.reply((c.peer(), mine));
             }
         });
         let text = field_now(&s, chat);
@@ -2582,7 +2583,7 @@ fn a_send_clears_the_composer_with_no_engine() {
         .expect("her line")
         .id;
     with_chat(&s, chat, |c| {
-        c.reply(hers);
+        c.reply((c.peer(), hers));
         c.set_draft("see you at seven");
     });
     assert_eq!(with_chat(&s, chat, |c| c.reply_to()), Some(hers));
@@ -2634,7 +2635,7 @@ fn forward_waits_for_a_chat_and_the_list_picks_it() {
     let mark = |s: &Session| {
         with_chat(s, chat, |c| {
             for id in &ids {
-                c.set_cursor(*id);
+                c.set_cursor((c.peer(), *id));
                 c.toggle_mark();
             }
         });
@@ -2643,7 +2644,7 @@ fn forward_waits_for_a_chat_and_the_list_picks_it() {
     verb(&mut s, chat, "telegram.forward");
     assert!(with_chat(&s, chat, |c| c.marks().is_empty()));
     let waiting = runtime::of(s.store()).pending_forward().expect("the lines wait for a chat");
-    assert_eq!((waiting.from, waiting.ids), (VERA, ids.clone()));
+    assert_eq!(waiting.messages, ids.iter().map(|&id| (VERA, id)).collect::<Vec<_>>());
     assert!(verb_ids(&s, list).contains(&"telegram.forward_here"));
 
     // The pick: the chat under the cursor takes them, and the waiting ends.
@@ -2679,7 +2680,7 @@ fn copy_takes_the_line_through_the_clipboard() {
         .find(|m| !m.service && !m.text.is_empty())
         .expect("a line with words")
         .clone();
-    with_chat(&s, chat, |c| c.set_cursor(words.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), words.id)));
     verb(&mut s, chat, "telegram.copy");
     assert_eq!(s.notes().last().map(|n| n.msg.clone()).unwrap_or_default(), "copied");
     // The ring the log reads in-memory effects out of: nothing is filed for
@@ -2950,7 +2951,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(RUST_WEEKLY));
     let m = model::history(s.store(), RUST_WEEKLY).iter().find(|m| !m.service).unwrap().clone();
-    with_chat(&s, chat, |c| c.set_cursor(m.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), m.id)));
     let td = FakeTd::new();
     let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
@@ -3021,7 +3022,7 @@ fn reaction_paging_reaches_every_choice_in_chat_and_card() {
     let mut s = session();
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let chat = open_root(&mut s, Chat::id(VERA));
-    with_chat(&s, chat, |c| c.set_cursor(m.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), m.id)));
     let card = open_root(&mut s, Line::id(m.chat, m.id));
     let td = FakeTd::new();
     let acc = connected_reaction_account(&s, td.clone());
@@ -3202,7 +3203,7 @@ fn reaction_pickers_ignore_late_answers_and_keep_panels_and_stores_separate() {
     offer_reactions(&acc, &session(), &third, &["👍"]);
     assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_0"));
     offer_reactions(&acc, &s, &third, &["👍"]);
-    with_chat(&s, chat, |c| { c.walk(1); });
+    with_chat(&s, chat, |c| { c.walk(1).map(|(_, id)| id); });
     assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_0"));
     assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"));
 }
@@ -3258,7 +3259,7 @@ fn demo_reactions_page_and_cancel_without_touching_the_composer_or_service_messa
         c.execute("UPDATE tg_message SET reactions = '👍 3 · ❤️ 1' WHERE chat = ?1 AND id = ?2",
             [STELAXIS, id]).map(|_| ())
     }).unwrap();
-    with_chat(&s, chat, |c| { c.set_cursor(m.id); c.set_draft("a draft"); c.reply(m.id); });
+    with_chat(&s, chat, |c| { c.set_cursor((c.peer(), m.id)); c.set_draft("a draft"); c.reply((c.peer(), m.id)); });
     verb(&mut s, chat, "telegram.react");
     verb(&mut s, chat, "telegram.reactions_more");
     assert!(!verb_ids(&s, chat).contains(&"telegram.reactions_more"));
@@ -3287,7 +3288,7 @@ fn demo_reactions_page_and_cancel_without_touching_the_composer_or_service_messa
     assert!(!verb_ids(&s, chat).contains(&"telegram.react"));
     with_chat(&s, chat, Chat::clear_marks);
     let service = hist.iter().find(|m| m.service).unwrap();
-    with_chat(&s, chat, |c| c.set_cursor(service.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), service.id)));
     assert!(!verb_ids(&s, chat).contains(&"telegram.react"));
     let card = open_root(&mut s, Line::id(STELAXIS, service.id));
     assert!(!verb_ids(&s, card).contains(&"telegram.react"));
@@ -3296,7 +3297,7 @@ fn demo_reactions_page_and_cancel_without_touching_the_composer_or_service_messa
 
     // Unsent lines cannot receive a reaction, and a stale picker cannot
     // send after its message disappears.
-    with_chat(&s, chat, |c| c.set_cursor(m.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), m.id)));
     let card = open_root(&mut s, Line::id(STELAXIS, m.id));
     for state in ["sending", "failed"] {
         let id = m.id;
