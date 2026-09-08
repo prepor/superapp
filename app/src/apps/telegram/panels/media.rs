@@ -45,7 +45,7 @@ pub struct Viewer {
     slot: SlotId,
     playback: Playback,
     measure: Measure,
-    file_request: Option<(String, u64)>,
+    file_request: Option<String>,
     file_ready: Option<(String, PathBuf)>,
 }
 
@@ -113,23 +113,22 @@ impl Viewer {
             }
             let rt = runtime::of(self.world.store());
             let context = format!("cache:{}:{}", m.chat, m.id);
-            if self.file_request.as_ref().is_none_or(|(source, _)| source != &key) {
+            if self.file_request.as_ref().is_none_or(|source| source != &key) {
                 if !rt.can_send() {
                     let error = "Telegram is not connected; reconnect to load this file";
                     return (format!("{key}:{error}"), Preview::Error(error.into()));
                 }
-                let existing = rt.operations.list().into_iter().rev()
-                    .find(|o| o.context() == Some(&context) && o.status == Status::Pending);
-                let id = if let Some(operation) = existing { operation.id } else {
+                let existing = rt.operations.list().into_iter()
+                    .any(|o| o.context() == Some(&context) && o.status == Status::Pending);
+                if !existing {
                     let request = rt.operations.track(&requests::cache_file(m.chat, m.id));
                     let value: serde_json::Value = serde_json::from_str(&request).expect("tracked request");
                     let id = value["@extra"]["operation"].as_u64().expect("operation id");
                     if !rt.send(&request) {
                         rt.operations.fail(self.world.store(), id, "Telegram disconnected; try again", false);
                     }
-                    id
-                };
-                self.file_request = Some((key.clone(), id));
+                }
+                self.file_request = Some(key.clone());
             }
             // A retry from the shared feedback strip owns the latest status.
             let latest = rt.operations.list().into_iter().rev().find(|o| o.context() == Some(&context));
