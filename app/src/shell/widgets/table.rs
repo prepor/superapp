@@ -127,12 +127,17 @@ pub trait RowSpec: 'static {
 pub fn line(cx: &mut Cx, row: &WidgetRef, selected: bool, marked: bool) -> WidgetRef {
     let at = usize::from(selected) + 2 * usize::from(marked);
     let mut out = WidgetRef::empty();
+    let mut previous = None;
     for (i, id) in TWINS.iter().enumerate() {
         let w = row.widget(cx, &[*id]);
+        if w.visible() && previous.is_none() { previous = Some(w.clone()); }
         w.set_visible(cx, i == at);
         if i == at {
             out = w;
         }
+    }
+    if let Some(previous) = previous {
+        super::super::keyboard::retain_text(cx, &previous, &out);
     }
     out
 }

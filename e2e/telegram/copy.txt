@@ -11,7 +11,7 @@ wait 900
 click "stelaxis"
 wait 900
 
-dblclick "message text: meeting moved to 15:00"
+dblclick "text: meeting moved to 15:00"
 wait 400
 copy "meeting"
 accel "copy" -
@@ -28,7 +28,7 @@ wait 300
 copy "meeting"
 
 # A single click collapses the selection, so the panel can copy the message.
-click "message text: meeting moved to 15:00"
+click "text: meeting moved to 15:00"
 wait 400
 accel "copy" c
 key cmd+c
@@ -41,7 +41,7 @@ copy "meeting moved to 15:00"
 accel "copy" -
 
 # Dragging across a different message also moves the cursor and keeps selection.
-drag "message text: the muted grey is too light on the fold" 1200 0
+drag "text: the muted grey is too light on the fold" 1200 0
 wait 300
 copy "the muted grey is too light on the fold"
 accel "copy" -

@@ -101,8 +101,6 @@ struct InnerHit {
 /// What a press inside a row does.
 #[derive(Clone)]
 enum Inner {
-    /// Select text while keeping the message cursor on this line.
-    Text(MsgId, WidgetRef),
     /// Play or pause in the line.
     Play(Box<Msg>),
     /// Seek this line using the full bar, even when its hit is clipped.
@@ -571,12 +569,6 @@ impl Widget for ChatPanel {
                     if e.button != MouseButton::PRIMARY { return; }
                     let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
                     match act {
-                        Inner::Text(id, ref text) => {
-                            with_chat(&props, |c| c.set_cursor(id));
-                            self.refocus = false;
-                            self.had_focus = true;
-                            text.set_key_focus(cx);
-                        }
                         Inner::Play(m) => {
                             with_chat(&props, |c| c.toggle_play(&m, now));
                         }
@@ -1033,18 +1025,9 @@ impl ChatPanel {
             live_id!(line_mark_sel),
         ];
         let line = row.widget(cx, &[live_id!(msg), TWINS[twin.min(3)]]);
-        let text = line.widget(cx, ids!(body.text_wrap.body_txt));
-        if !m.text.trim().is_empty() {
-            if let Some(rect) = visible(text.area().rect(cx), clip) {
-                props.hits.add(
-                    format!("message text: {}", m.text), rect, MouseCursor::Text, props.slot,
-                );
-                self.inner.push(InnerHit { rect, act: Inner::Text(m.id, text.clone()) });
-            }
-        }
         super::text::hits(
             cx,
-            &text,
+            &line.widget(cx, ids!(body.text_wrap.body_txt)),
             props,
             clip,
         );
@@ -1221,7 +1204,7 @@ pub fn populate(
         }
         Row::Message { msg: m, run } => {
             let now = render.now;
-            let line = message_line(cx, &row.view(cx, ids!(msg)), selected, marked);
+            let line = table::line(cx, &row.view(cx, ids!(msg)), selected, marked);
             // The header: the writer, then at the right what the line
             // carries about itself and the time. A run's second line has
             // none of it.
@@ -1318,34 +1301,6 @@ pub fn populate(
             co.set_visible(cx, !comments.is_empty());
         }
     }
-}
-
-/// Keep the same text widget when the cursor or mark changes the row's
-/// background. Replacing it would drop keyboard focus and an ongoing drag.
-fn message_line(cx: &mut Cx, row: &WidgetRef, selected: bool, marked: bool) -> WidgetRef {
-    use makepad_widgets::widget_tree::CxWidgetExt;
-
-    let mut previous = None;
-    row.children(&mut |_, child| {
-        if child.visible() && previous.is_none() {
-            previous = Some(child);
-        }
-    });
-    let line = table::line(cx, row, selected, marked);
-    if let Some(previous) = previous.filter(|previous| *previous != line) {
-        let from = previous.view(cx, ids!(body.text_wrap));
-        let to = line.view(cx, ids!(body.text_wrap));
-        if let (Some(mut from), Some(mut to)) = (from.borrow_mut(), to.borrow_mut()) {
-            let source = from.children.iter_mut().find(|(id, _)| *id == live_id!(body_txt));
-            let target = to.children.iter_mut().find(|(id, _)| *id == live_id!(body_txt));
-            if let (Some((_, source)), Some((_, target))) = (source, target) {
-                std::mem::swap(source, target);
-                cx.widget_tree_mark_dirty(from.widget_uid());
-                cx.widget_tree_mark_dirty(to.widget_uid());
-            }
-        };
-    }
-    line
 }
 
 /// Whether two rectangles are the one rectangle, give or take a hair.

@@ -41,8 +41,10 @@
 //! ```
 //!
 //! Labels match case-insensitively by substring against links, buttons,
-//! fields, rows and panel titles. Steps that mutate the workspace need a
-//! `wait` after them: hits refresh on the next drawn frame.
+//! fields, rows and panel titles. A `text: ` prefix matches the exact text
+//! of a visible native text widget without a panel-defined label.
+//! Steps that mutate the workspace need a `wait` after them: hits refresh
+//! on the next drawn frame.
 
 use std::path::PathBuf;
 

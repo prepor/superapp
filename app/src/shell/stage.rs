@@ -1059,5 +1059,13 @@ impl Stage {
 
             _ => {}
         }
+        let text_root = match sh.overlay {
+            Overlay::None => sh.session.focus(),
+            Overlay::Launcher => Some(OVERLAY_LAUNCHER),
+            _ => None,
+        }.and_then(|slot| self.hosted.get(&slot));
+        if let Some(root) = text_root {
+            super::keyboard::focus_captured(cx, root, event);
+        }
     }
 }
