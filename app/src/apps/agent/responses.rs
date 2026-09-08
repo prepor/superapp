@@ -64,7 +64,7 @@ pub(super) fn request_body(req: &ChatRequest) -> Value {
         "include": ["reasoning.encrypted_content"],
     });
     if let Some(effort) = &req.reasoning_effort {
-        body["reasoning"] = json!({"effort": effort});
+        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
     }
     if !req.tools.is_empty() {
         body["tools"] = req
@@ -305,19 +305,28 @@ mod tests {
 
     #[test]
     fn responses_stream_into_the_live_tail_and_keep_usage() {
+        let mut output = text_output();
+        output.as_array_mut().unwrap().insert(0, json!({
+            "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque",
+            "summary": [{"type": "summary_text", "text": "Checking the request."}],
+        }));
         let events = vec![
             json!({"type": "response.created", "response": {"status": "in_progress"}}),
+            json!({"type": "response.reasoning_summary_text.delta", "delta": "Checking "}),
+            json!({"type": "response.reasoning_summary_text.delta", "delta": "the request."}),
             json!({"type": "response.output_text.delta", "delta": "Hel"}),
             json!({"type": "response.output_text.delta", "delta": "lo."}),
-            done(text_output()),
+            done(output),
         ];
         let mut tail = String::new();
+        let mut reasoning = String::new();
         let answer = stream(
             events.into_iter().map(|e| Ok(e.to_string())),
             "gpt-6-astra",
             &mut |c| {
                 for choice in &c.choices {
                     tail.push_str(choice.delta.content.as_deref().unwrap_or(""));
+                    reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
                 }
                 Flow::Go
             },
@@ -328,6 +337,10 @@ mod tests {
             "the terminal event does not duplicate the deltas"
         );
         assert_eq!(answer.message.text(), tail);
+        assert_eq!(reasoning, "Checking the request.");
+        assert_eq!(answer.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+        let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
+        assert_eq!(turn.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
         assert_eq!(answer.finish, Finish::Stop);
         let usage = answer.usage.unwrap();
         assert_eq!(

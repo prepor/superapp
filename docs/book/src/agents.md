@@ -211,7 +211,10 @@ stored key. See [Cloudflare's BYOK documentation](https://developers.cloudflare.
 
 OpenAI uses Responses because [Astra's tool calling requires it](https://developers.openai.com/api/docs/guides/latest-model).
 The adapter streams text into the same live tail, translates function calls
-and their results, and keeps usage and failure reasons. Dotted app tool names
+and their results, and keeps usage and failure reasons. Requests opt in to
+[readable reasoning summaries](https://developers.openai.com/api/docs/guides/reasoning#reasoning-summaries)
+with `reasoning.summary: "auto"`; these stream into the folded reasoning view
+and are saved on the turn. Dotted app tool names
 are reversibly escaped for OpenAI's function-name syntax. Each request sets
 `store: false` and replays the local transcript. Completed Responses output is
 kept on the turn, including encrypted reasoning and assistant message phases,

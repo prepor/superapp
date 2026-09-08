@@ -355,6 +355,7 @@ fn openai_models_use_the_stored_gateway_key_and_responses_route() {
         let body: Value = serde_json::from_slice(&parts.body).expect("JSON");
         assert_eq!(body["model"], model.id);
         assert_eq!(body["reasoning"]["effort"], REASONING_EFFORT);
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["store"], false);
         assert_eq!(body["tools"][0]["name"], "test_2elook");
         assert_eq!(body["tools"][0]["strict"], false);
