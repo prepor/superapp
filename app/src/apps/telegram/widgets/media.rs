@@ -358,8 +358,12 @@ impl ViewerPanel {
             if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
         }
         if let Some(md) = &message.media {
-            props.hits.add(md.line(super::now(scope)),
-                self.view.widget(cx, ids!(file_view.image_box.image)).area().rect(cx), MouseCursor::Default, props.slot);
+            if self.view.widget(cx, ids!(file_view.image_box)).visible() {
+                let r = self.view.widget(cx, ids!(file_view.image_box.image)).area().rect(cx);
+                if r.size.x > 0.0 && r.size.y > 0.0 {
+                    props.hits.add(md.line(super::now(scope)), r, MouseCursor::Default, props.slot);
+                }
+            }
         }
         step
     }

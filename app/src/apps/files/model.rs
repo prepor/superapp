@@ -24,7 +24,7 @@ use kernel::store::Store;
 // app may carry out — is the kernel's, beside `FileKind`: mail asks the
 // same questions of a part of a letter that this app asks of a path.
 pub use kernel::caps::{
-    basename, display_path, fmt_size, image_size, is_root, join, parent, preview_of, real_path,
+    basename, display_path, fmt_size, is_root, join, parent, preview_of, real_path,
     Entry, FileId, FileKind, Preview, HOME, ROOT,
 };
 

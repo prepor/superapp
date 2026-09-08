@@ -11,7 +11,7 @@ use kernel::session::Session;
 use kernel::time::fmt_date;
 
 use super::super::model::{
-    basename, image_size, parent, preview_of, read_in, stat_in, Entry,
+    basename, parent, preview_of, read_in, stat_in, Entry,
     FileKind, Preview, Watch,
 };
 use super::super::ops;
@@ -40,10 +40,6 @@ pub struct Card {
     preview: Preview,
     measure: Measure,
     viewer_disk: Option<kernel::caps::DiskFactory>,
-    /// A picture's `(width, height)`, off the header of the bytes above.
-    /// Kept because [`Panel::wish`] is asked on every relayout, and reading
-    /// a header on each of them would be a read a frame.
-    pixels: Option<(u32, u32)>,
     /// The `rename` field, while it is open: the new name as typed.
     renaming: Option<String>,
     /// The line under the header: what a verb refused, until the next one.
@@ -166,23 +162,6 @@ impl Card {
         }
     }
 
-    /// The bytes, where it is a picture's. Decoded by whoever draws it, off
-    /// their own account of themselves rather than off the name.
-    #[must_use]
-    pub fn image(&self) -> Option<&[u8]> {
-        match &self.preview {
-            Preview::Image(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// A picture's size in pixels, where the preview is one.
-    #[cfg(test)]
-    #[must_use]
-    pub fn pixels(&self) -> Option<(u32, u32)> {
-        self.pixels
-    }
-
     /// Which reading is on the card. The widget decodes a picture once per
     /// reading rather than once a frame, so it needs to know when the
     /// reading *changed* — which is not the same question as whether
@@ -245,9 +224,8 @@ impl Card {
     /// Refresh metadata and invalidate the viewer only when this file changed.
     ///
     /// The kind decides whether anything is read at all, so a card over a
-    /// 38 MB disk image costs one `stat`; a picture's size is taken off the
-    /// same bytes the card will draw, so the header is read once and not
-    /// again on every wish.
+    /// 38 MB disk image costs one `stat`. The viewer measures loaded content;
+    /// demo worlds seed the measurement from their inline preview.
     ///
     /// And a `stat` is all it costs when the file has not moved. Every path
     /// a run performs bumps the count that brings the card back here — a
@@ -273,7 +251,6 @@ impl Card {
             }),
             None => Preview::None,
         };
-        self.pixels = self.image().and_then(image_size);
         self.measure = Measure::of(&self.preview);
     }
 
@@ -477,7 +454,6 @@ impl PanelKind for CardKind {
             preview: Preview::None,
             measure: Measure::Empty,
             viewer_disk: cx.session().world().with_cap::<super::super::ViewerDisk, _>(|r| r.0.clone()).ok(),
-            pixels: None,
             renaming: None,
             status: None,
             seen: Seen::default(),
@@ -490,4 +466,3 @@ impl PanelKind for CardKind {
         Box::new(card)
     }
 }
-

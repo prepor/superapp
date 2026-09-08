@@ -13,7 +13,7 @@ use kernel::session::{Action, Instance, Session};
 use kernel::store::Store;
 
 use super::model::{
-    crumbs, fmt_size, image_size, normalize, preview_of, read_in, real_path, stat_in,
+    crumbs, fmt_size, normalize, preview_of, read_in, real_path, stat_in,
     watched_at, Entry, FileKind, Preview, HOME,
 };
 // The kernel's, beside `FileKind`: what a name claims and how much of it a
@@ -2280,10 +2280,11 @@ fn a_card_reads_what_its_kind_is_worth_and_no_more() {
     assert_eq!(preview_of(FileKind::Text, "a.txt", 5, |_| None), Preview::None);
 }
 
-/// The card's wish reads a picture's size off its header alone, so the rows
-/// are asked for before anything is decoded.
+/// Image dimensions can be read from the header without decoding the pixels.
 #[test]
 fn a_picture_is_measured_by_its_header() {
+    use kernel::caps::image_size;
+
     let _alone = alone();
     let icon = kernel::caps::demo::bytes_of("~/Pictures/fold-cover.png").expect("the fixture");
     assert_eq!(image_size(&icon), Some((32, 32)));
@@ -2298,9 +2299,6 @@ fn a_picture_is_measured_by_its_header() {
     assert_eq!(image_format("a.jpeg"), Some(ImageFormat::Jpeg));
     assert_eq!(image_format("a.png"), Some(ImageFormat::Png));
     assert_eq!(image_format("a.gif"), None, "an image the card cannot draw");
-
-    // Drawn at the text's width, a square picture is that width tall: at 60
-    // characters, 60 · 0.8 / 2.0 = 24 lines. Half as tall, half as many.
 }
 
 /// The card over each of the three previews, on the demo tree: what it
@@ -2322,7 +2320,6 @@ fn a_card_previews_text_images_and_pdfs() {
     let c = card(&mut s, "~/notes.md");
     with_card(&s, c, |c| {
         assert!(matches!(c.preview(), Preview::Text(t) if t.starts_with("# notes")));
-        assert_eq!(c.pixels(), None);
         assert_eq!(c.kind_line(), "text · 2.1 KB");
     });
     assert_eq!(inst(&s, c).borrow().wish(60), (4, 3), "seven lines of chrome");
@@ -2333,9 +2330,8 @@ fn a_card_previews_text_images_and_pdfs() {
     let c = card(&mut s, "~/Pictures/fold-cover.png");
     with_card(&s, c, |c| {
         assert_eq!(c.kind_word(), "image");
-        assert_eq!(c.pixels(), Some((32, 32)));
         assert!(
-            c.image().is_some_and(|b| b.starts_with(b"\x89PNG\r\n\x1a\n")),
+            matches!(c.preview(), Preview::Image(b) if b.starts_with(b"\x89PNG\r\n\x1a\n")),
             "the fixture's own bytes, whatever the name says"
         );
     });
@@ -2346,7 +2342,7 @@ fn a_card_previews_text_images_and_pdfs() {
     // says whether to read, the bytes say how to decode.
     let c = card(&mut s, "~/Downloads/2026/photo-lisbon.jpg");
     with_card(&s, c, |c| {
-        assert!(c.image().is_some_and(|b| b.starts_with(b"\x89PNG\r\n\x1a\n")));
+        assert!(matches!(c.preview(), Preview::Image(b) if b.starts_with(b"\x89PNG\r\n\x1a\n")));
     });
 
     // PDF bytes go to the renderer; its measurement arrives after rendering.
