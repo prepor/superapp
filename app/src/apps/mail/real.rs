@@ -861,6 +861,34 @@ mod session {
         }
 
         #[test]
+        fn quoted_printable_html_is_fetched_as_the_message_body() {
+            let body = "<p>caf=C3=A9</p>";
+            let structure = format!(
+                "(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"QUOTED-PRINTABLE\" {} 1)",
+                body.len()
+            );
+            let (mut adapter, server) = scripted(vec![
+                ("SELECT \"INBOX\"", SELECTED.into()),
+                (
+                    "UID FETCH 42 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])",
+                    metadata(42, &structure),
+                ),
+                (
+                    "UID FETCH 42 (UID BODY.PEEK[1])",
+                    format!("* 1 FETCH (UID 42 BODY[1] {{{}}}\r\n{body})\r\n", body.len()),
+                ),
+            ]);
+            let mails = adapter.fetch_set("INBOX", "42").unwrap();
+            assert_eq!(mails.len(), 1);
+            assert!(mails[0].unread);
+            let parsed = super::super::super::sync::parse_mail(&mails[0].raw).unwrap();
+            assert_eq!(parsed.body, "café");
+            assert_eq!(parsed.html.as_deref(), Some("<p>café</p>"));
+            assert!(parsed.attachments.is_empty());
+            server.join().unwrap();
+        }
+
+        #[test]
         fn readings_are_batched_by_section_list_and_matched_by_uid() {
             // Two hundred common layouts cost one reading fetch. A second
             // layout costs one more, and a standalone file costs neither.
