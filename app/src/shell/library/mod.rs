@@ -1227,6 +1227,7 @@ impl Library {
             // The same press bookkeeping a click outside a mount gets.
             super::pointer::pointer_before(cx, &ev);
             self.send(cx, i, &ev);
+            super::pointer::pointer_after(cx, &ev);
         }
     }
 }

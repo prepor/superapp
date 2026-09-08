@@ -50,9 +50,21 @@ shot f2-manual-had-the-keyboard
 # it, so what is typed narrows this list.
 mouse "filter"
 wait 600
+accel "try it" -
+
+# A workspace focus walk leaves the field's caret in place. Clicking the
+# same field again must take the panel back even without a new caret focus.
+key cmd+left
+wait 600
+accel "try it" y
+mouse "filter"
+wait 600
+accel "try it" -
 key cmd+a
-type "@memory"
+type "@mem"
 wait 900
+click "@memory"
+wait 600
 shot f3-filter-typed
 
 # The row the chord left is here under it — both halves of the proof at once.

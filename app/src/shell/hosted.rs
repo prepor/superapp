@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use kernel::layout::SlotId;
+use kernel::nav::Nav;
 use kernel::session::Instance;
 use makepad_widgets::*;
 
-use super::hits::Hits;
+use super::hits::{Act, Hits};
 use super::keys::Letters;
 use super::keyboard::Keyboard;
 use super::stage::{Shell, Stage};
@@ -217,6 +218,18 @@ impl Stage {
     pub(super) fn forward_to_hosted(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
         if self.hosted.is_empty() {
             return;
+        }
+        // A press in a hosted control takes its panel with it while the
+        // widget keeps the caret. Do this before forwarding: a row or link
+        // may open another panel, whose focus must survive the press.
+        if let Event::MouseDown(e) = event {
+            if let Some(slot) = self.hits.at(e.abs)
+                .filter(|h| matches!(h.act, Act::Widget | Act::Row(_)))
+                .and_then(|h| h.slot)
+                .filter(|s| !is_overlay(*s))
+            {
+                sh.session.nav(Nav::Focus(slot));
+            }
         }
         let live: Vec<(SlotId, WidgetRef)> = self
             .hosted

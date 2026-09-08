@@ -56,6 +56,10 @@ wait 900
 click "GitHub · aug 31 08:02"
 wait 500
 
+# Folding the reader focuses it; return to the list for the marks and keys.
+key cmd+left
+wait 500
+
 # The marks are gone with what they named, so the inbox is back to `sync`
 # and the reader's letters are free again.
 shot b3-filed
