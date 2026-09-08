@@ -21,7 +21,7 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId};
-use super::super::{requests, runtime, verbs};
+use super::super::{downloads, requests, runtime, verbs};
 use super::chat::copy_line;
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
@@ -144,6 +144,7 @@ impl Panel for Line {
         }
         v.push(Verb::run("telegram.forward", "forward", Some('f')));
         v.push(Verb::run("telegram.copy", "copy", Some('c')));
+        v.extend(m.as_ref().and_then(downloads::verb));
         if m.as_ref().is_some_and(reactions::can_react) {
             v.push(Verb::run("telegram.react", "react(j)", Some('j')));
         }
@@ -270,6 +271,11 @@ impl Panel for Line {
             "telegram.copy" => {
                 if let Some(m) = self.msg() {
                     copy_line(s, &m);
+                }
+            }
+            "telegram.download" => {
+                if let Some(m) = self.msg() {
+                    downloads::request(s, &m);
                 }
             }
             // The line waits for the chat it goes to and the list opens to be

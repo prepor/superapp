@@ -479,6 +479,31 @@ pub fn viewer_file(content: &Value, clip: bool) -> Option<&Value> {
     Some(file)
 }
 
+/// The full attachment, including documents and sounds that the transcript
+/// never downloads automatically. A video's thumbnail is not its attachment.
+pub fn attachment_file(content: &Value) -> Option<&Value> {
+    let file = match content["@type"].as_str()? {
+        "messageDocument" => &content["document"]["document"],
+        "messageAudio" => &content["audio"]["audio"],
+        "messageVoiceNote" => &content["voice_note"]["voice"],
+        "messagePhoto" => return viewer_file(content, false),
+        _ => return viewer_file(content, true),
+    };
+    file_id(file).filter(|id| *id > 0)?;
+    Some(file)
+}
+
+pub fn attachment_name(content: &Value) -> Option<&str> {
+    let field = match content["@type"].as_str()? {
+        "messageDocument" => "document",
+        "messageAudio" => "audio",
+        "messageVideo" => "video",
+        "messageAnimation" => "animation",
+        _ => return None,
+    };
+    content[field]["file_name"].as_str().filter(|name| !name.is_empty())
+}
+
 /// The session-local id the worker fires `downloadFile` on, for the file
 /// [`download_target`] picks. The finished file lands in the blob cache under
 /// the same `tg:` key the row already names, and the next redraw resolves it.

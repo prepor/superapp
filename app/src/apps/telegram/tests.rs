@@ -30,6 +30,7 @@ mod filter_tests;
 mod topics_tests;
 mod tools;
 mod performance;
+mod downloads_tests;
 
 fn session() -> Session {
     Session::fake(APPS)

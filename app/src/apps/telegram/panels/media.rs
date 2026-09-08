@@ -34,6 +34,7 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId};
+use super::super::downloads;
 use super::playback::Playback;
 
 /// The viewer.
@@ -203,12 +204,18 @@ impl Panel for Viewer {
             ));
         }
         v.push(Verb::run("telegram.open", "open", Some('o')));
+        v.extend(m.as_ref().and_then(downloads::verb));
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         let now = s.now();
         match verb {
+            "telegram.download" => {
+                if let Some(m) = self.msg() {
+                    downloads::request(s, &m);
+                }
+            }
             "telegram.play" => {
                 if let Some(m) = self.msg() {
                     self.toggle_play(&m, now);

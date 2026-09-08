@@ -278,6 +278,23 @@ keyed by the media's cache reference. Estimated totals are prefixed with `~`;
 an unknown total is shown as unknown. Finished and stopped downloads clear
 their progress, and the note disappears once the media is available locally.
 
+The **download** action on a chat's selected message, its line card, and the
+media viewer saves an attachment to `~/Downloads`. Documents, photos, videos,
+animations, video messages, voice notes and audio tracks can be saved. Documents
+and named media keep the sender's filename; unnamed media gets a name based on
+the chat and message. Paths, control characters and Unicode format characters
+(including bidi overrides) in filenames are removed,
+and an existing `report.pdf` makes the next copy `report (1).pdf`.
+
+Saving runs on the account worker and continues after the panel closes. The
+shared status strip shows progress and the saved path. It reports success only
+after the copy reaches Downloads; download and disk failures offer **retry**.
+Pressing **download** again after a failure retries the same operation.
+Retries refresh the source message to repair expired file references, and late
+answers from an earlier attempt cannot complete a newer one. Cached documents
+can be saved without a network request. Documents and recordings are fetched
+only on request, and the exported copy survives media cache eviction.
+
 Downloads and history requested during startup stay queued until this client
 is authorized. If initialization fails, the viewer and sign-in panel show
 the connection problem, including a session held by another app instance.
