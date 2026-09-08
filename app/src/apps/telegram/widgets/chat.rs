@@ -34,7 +34,7 @@ use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
 use crate::shell::hits::visible;
 use crate::shell::keys::Letters;
-use crate::shell::widgets::media::{self, PlayerState};
+use crate::shell::widgets::media::{self, PlayerState, SeekBar};
 use crate::shell::widgets::table;
 use crate::shell::widgets::reveal::Reveal;
 
@@ -100,6 +100,8 @@ struct InnerHit {
 enum Inner {
     /// Play or pause in the line.
     Play(Box<Msg>),
+    /// Seek this line using the full bar, even when its hit is clipped.
+    Seek(Box<Msg>, SeekBar),
     /// Open the line's media in the viewer.
     View(MsgId),
     /// Open the line's card — a place's ways out are on it.
@@ -160,6 +162,8 @@ pub struct ChatPanel {
     background: bool,
     #[rust]
     video: InlineVideo,
+    #[rust]
+    scrubbing: Option<(Box<Msg>, SeekBar)>,
 }
 
 impl Widget for ChatPanel {
@@ -173,6 +177,7 @@ impl Widget for ChatPanel {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
                 self.viewed = None;
+                self.scrubbing = None;
             }
             Event::WindowGotFocus(_) | Event::Foreground => {
                 self.background = false;
@@ -470,9 +475,31 @@ impl Widget for ChatPanel {
             if self.background || !super::message_panel_visible(s, props.slot) {
                 with_chat(&props, |c| c.pause(s.now()));
                 media::pause_video(cx, &clip_box);
+                self.scrubbing = None;
             }
         }
         self.mount(cx, &props, scope);
+
+        // Once a bar owns the drag, keep seeking outside its rectangle.
+        // A fresh press or release ends that capture.
+        let seek = match event {
+            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
+                self.scrubbing = None;
+                None
+            }
+            Event::MouseMove(e) => self.scrubbing.as_ref()
+                .map(|(m, bar)| (m.clone(), bar.position(e.abs.x))),
+            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => self.scrubbing.take()
+                .map(|(m, bar)| (m, bar.position(e.abs.x))),
+            _ => None,
+        };
+        if let Some((m, position)) = seek {
+            let now = super::now(scope);
+            with_chat(&props, |c| self.video.seek(cx, c.select_playback(m.id), &m, position, now));
+            self.view.redraw(cx);
+            if let Some(s) = scope.data.get_mut::<Session>() { s.redraw(); }
+            return;
+        }
 
         // A press on the composer's field takes the keyboard, the way a
         // press on any field does. Makepad's own TextInput grabs focus off
@@ -519,6 +546,12 @@ impl Widget for ChatPanel {
                     match act {
                         Inner::Play(m) => {
                             with_chat(&props, |c| c.toggle_play(&m, now));
+                        }
+                        Inner::Seek(m, bar) => {
+                            with_chat(&props, |c| self.video.seek(
+                                cx, c.select_playback(m.id), &m, bar.position(e.abs.x), now,
+                            ));
+                            self.scrubbing = Some((m, bar));
                         }
                         Inner::Original(id) => {
                             if let Some(s) = scope.data.get_mut::<Session>() {
@@ -815,6 +848,7 @@ impl Widget for ChatPanel {
         if !video_drawn || !active_visible {
             with_chat(&props, |c| c.pause(now));
             media::pause_video(cx, &video);
+            self.scrubbing = None;
             video_redraw = false;
         }
         if let Some(s) = scope.data.get_mut::<Session>() {
@@ -1007,6 +1041,12 @@ impl ChatPanel {
                     st.time_line(), player_w.label(cx, ids!(time_lbl)).area().rect(cx),
                     clip, MouseCursor::Default, props.slot,
                 );
+            }
+            if let Some(bar) = SeekBar::from_player(cx, &player_w, st) {
+                if let Some(r) = visible(bar.rect, clip) {
+                    props.hits.add(format!("seek {}", md.word()), r, MouseCursor::Hand, props.slot);
+                    self.inner.push(InnerHit { rect: r, act: Inner::Seek(Box::new(m.clone()), bar) });
+                }
             }
         }
         let video = line.widget(cx, ids!(body.clip_box));

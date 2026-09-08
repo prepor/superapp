@@ -930,10 +930,15 @@ impl Chat {
 
     /// Play or pause a line: the one playing pauses, any other takes over.
     pub fn toggle_play(&mut self, msg: &Msg, now: f64) {
-        if self.player.as_ref().is_none_or(|p| p.msg != msg.id) {
-            self.player = Some(Playback::new(self.store.clone(), msg.id));
+        self.select_playback(msg.id).toggle_play(msg, now);
+    }
+
+    /// A progress-bar press can select a line before its first play.
+    pub fn select_playback(&mut self, id: MsgId) -> &mut Playback {
+        if self.player.as_ref().is_none_or(|p| p.msg != id) {
+            self.player = Some(Playback::new(self.store.clone(), id));
         }
-        self.player.as_mut().unwrap().toggle_play(msg, now);
+        self.player.as_mut().unwrap()
     }
 
     pub fn playback(&mut self, id: MsgId) -> Option<&mut Playback> {

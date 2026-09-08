@@ -243,6 +243,27 @@ pub fn seek_rect(cx: &Cx, player: &WidgetRef) -> Option<Rect> {
     })
 }
 
+/// Keep the full bar's geometry and duration from the press for the whole
+/// drag, even outside the bar, through clipping or a changing time label.
+#[derive(Clone, Copy)]
+pub struct SeekBar {
+    pub rect: Rect,
+    length: f64,
+}
+
+impl SeekBar {
+    pub fn from_player(cx: &Cx, player: &WidgetRef, state: PlayerState) -> Option<Self> {
+        if !state.length.is_finite() || state.length <= 0.0 {
+            return None;
+        }
+        seek_rect(cx, player).map(|rect| Self { rect, length: state.length })
+    }
+
+    pub fn position(self, x: f64) -> f64 {
+        ((x - self.rect.pos.x) / self.rect.size.x).clamp(0.0, 1.0) * self.length
+    }
+}
+
 /// Sets a `MediaMeter`'s level, 0 to 1.
 pub fn fill_meter(cx: &mut Cx, meter: &WidgetRef, level: f32) {
     if let Some(mut m) = meter.borrow_mut::<View>() {

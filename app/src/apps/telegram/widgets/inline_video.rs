@@ -93,6 +93,27 @@ impl InlineVideo {
         self.frame_ready = false;
     }
 
+    fn set_source(&mut self, cx: &mut Cx, m: &Msg) {
+        let source = (m.id, m.media.as_ref().and_then(|md| md.clip.clone()));
+        if self.source.as_ref() != Some(&source) {
+            self.playback.reset(cx);
+            self.source = Some(source);
+            self.frame_ready = false;
+        }
+    }
+
+    /// Seeking can be the first interaction with a clip. Fetch it and keep
+    /// the request through preparation without changing play/pause state.
+    pub fn seek(&mut self, cx: &mut Cx, player: &mut Playback, m: &Msg, position: f64, now: f64) {
+        self.set_source(cx, m);
+        player.ask_for_clip(m);
+        if player.plays_clip(m) {
+            self.playback.seek(position);
+        } else {
+            player.seek(m, position, now);
+        }
+    }
+
     /// Prepared/playing only says the decoder has started. Keep the poster
     /// until this particular player has delivered its first texture, even
     /// when that frame's timestamp is zero.
@@ -113,12 +134,7 @@ impl InlineVideo {
     pub fn drive(
         &mut self, cx: &mut Cx, video: &WidgetRef, player: &mut Playback, m: &Msg, now: f64,
     ) -> InlineDrawn {
-        let source = (m.id, m.media.as_ref().and_then(|md| md.clip.clone()));
-        if self.source.as_ref() != Some(&source) {
-            self.playback.reset(cx);
-            self.source = Some(source);
-            self.frame_ready = false;
-        }
+        self.set_source(cx, m);
         let native = player.plays_clip(m);
         let file = native.then(|| player.clip_file(m)).flatten();
         let drawn = self.playback.drive(cx, video, file.as_deref(), player.running());
@@ -137,7 +153,7 @@ impl InlineVideo {
             }
         }
         player.set_running(drawn.playing);
-        if drawn.shown {
+        if drawn.shown || self.playback.awaiting_seek() {
             let length = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0) as f64;
             let mut state = self.playback.state(cx, video, length);
             state.playing = drawn.playing;
@@ -147,7 +163,7 @@ impl InlineVideo {
         InlineDrawn {
             shown,
             player: player.player_state(m, now),
-            redraw: player.playing(now) || note.is_some(),
+            redraw: player.playing(now) || note.is_some() || self.playback.seek_needs_redraw(),
             note,
         }
     }
@@ -424,6 +440,90 @@ mod tests {
         assert!(clip.is_preparing());
         drop(owner);
         media_cleanup(cx, &root);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inline_seek_waits_for_download_and_preparation_without_starting_playback() {
+        static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+        let session = Session::fake(APPS);
+        let mut msg = model::history(session.store(), STELAXIS).iter()
+            .find(|m| has_video(m)).unwrap().clone();
+        let reference = "tg:inline-seek";
+        msg.media.as_mut().unwrap().clip = Some(reference.into());
+        let dir = std::env::temp_dir().join(format!("superapp-inline-seek-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
+        let inbox = super::super::super::runtime::of(&store).connect();
+        let mut player = Playback::new(store.clone(), msg.id);
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let video = cx.with_vm(|vm| {
+            let mut view = View::script_new(vm);
+            view.children.push((live_id!(clip), WidgetRef::new_with_inner(Box::new(Video::script_new(vm)))));
+            WidgetRef::new_with_inner(Box::new(view))
+        });
+        makepad_widgets::widget_tree::set_ui_root(cx, &video);
+        let clip = video.widget(cx, ids!(clip)).as_video();
+        let mut owner = InlineVideo::default();
+
+        owner.seek(cx, &mut player, &msg, 7.0, 0.0);
+        let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        assert_eq!(request["@type"], "getMessage");
+        assert_eq!(request["message_id"], msg.id);
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 1.0);
+        assert_eq!(drawn.player.unwrap(), PlayerState { playing: false, position: 7.0, length: 14.0 });
+        assert!(!drawn.shown && drawn.redraw && drawn.note.is_some());
+        assert!(clip.is_unprepared());
+
+        std::fs::write(dir.join("blobs").join(kernel::caps::file_name(reference)),
+            b"\x00\x00\x00\x18ftypisom").unwrap();
+        owner.drive(cx, &video, &mut player, &msg, 2.0);
+        assert!(clip.is_preparing());
+        owner.seek(cx, &mut player, &msg, 4.0, 2.0);
+        assert!(inbox.try_recv().is_err(), "seeking again reuses the same download");
+        video.handle_event(cx, &Event::VideoPlaybackPrepared(VideoPlaybackPreparedEvent {
+            video_id: LiveId(0), video_width: 480, video_height: 300, duration: 14_000,
+            is_seekable: true, video_tracks: Vec::new(), audio_tracks: Vec::new(),
+        }), &mut Scope::empty());
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 3.0);
+        assert!(clip.is_paused());
+        assert!(!owner.playback.awaiting_seek(), "the prepared player must receive the seek");
+        assert_eq!(drawn.player.unwrap().position, 4.0, "the latest seek survives preparation");
+        assert!(!drawn.shown && drawn.redraw, "keep the poster until a decoded frame arrives");
+
+        for position in [1000, 4000] {
+            let event = Event::VideoTextureUpdated(VideoTextureUpdatedEvent {
+                video_id: LiveId(0), current_position_ms: position, yuv: Default::default(), rgba_gl_2d: false,
+            });
+            let actions = cx.capture_actions(|cx| video.handle_event(cx, &event, &mut Scope::empty()));
+            owner.handle_actions(cx, &video, &actions);
+            let drawn = owner.drive(cx, &video, &mut player, &msg, 4.0);
+            assert!(drawn.shown);
+            assert_eq!(drawn.player.unwrap(), PlayerState { playing: false, position: 4.0, length: 14.0 });
+            assert_eq!(drawn.redraw, position != 4000, "draw until the paused seek settles");
+        }
+
+        owner.seek(cx, &mut player, &msg, -1.0, 5.0);
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 5.0);
+        assert_eq!(drawn.player.unwrap(), PlayerState { playing: false, position: 0.0, length: 14.0 });
+        assert!(!drawn.redraw, "a paused seek to zero must not draw forever");
+        player.toggle_play(&msg, 6.0);
+        owner.seek(cx, &mut player, &msg, 9.0, 6.0);
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 6.0);
+        assert!(clip.is_playing());
+        assert_eq!(drawn.player.unwrap(), PlayerState { playing: true, position: 9.0, length: 14.0 });
+
+        // A queued seek belongs to its message, not the next source to reuse
+        // this transcript's native player.
+        owner.seek(cx, &mut player, &msg, 6.0, 7.0);
+        msg.id += 1;
+        let mut next = Playback::new(store, msg.id);
+        let drawn = owner.drive(cx, &video, &mut next, &msg, 7.0);
+        assert!(!drawn.shown);
+        assert!(!owner.playback.awaiting_seek());
+        assert_eq!(drawn.player.unwrap().position, 0.0);
+        drop(owner);
+        media_cleanup(cx, &video);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

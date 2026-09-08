@@ -1,0 +1,74 @@
+# Inline timelines seek in place, before play and while playing or paused.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+
+# A click before the first play creates a paused player in the transcript.
+mouse "seek video"
+wait 1200
+click "0:07 / 0:14"
+click "write a message"
+
+# Keep dragging outside the bar, and clamp at both ends.
+drag "seek video" 1000 60
+wait 300
+click "0:14 / 0:14"
+drag "seek video" -100 -60
+wait 300
+click "0:00 / 0:14"
+
+# The selected/marked row uses the same player and progress-bar input.
+click "Elena Petrova: the fold in motion"
+wait 300
+key space
+wait 300
+click "play video"
+wait 1200
+mouse "seek video"
+wait 1200
+click "pause video"
+wait 300
+click "0:08 / 0:14"
+mouse "seek video"
+wait 1200
+click "0:07 / 0:14"
+
+# The message card can seek before play without opening the viewer.
+click "line"
+wait 900
+mouse "seek in card"
+wait 1200
+click "0:07 / 0:14"
+drag "seek in card" 1000 60
+wait 300
+click "0:14 / 0:14"
+drag "seek in card" -100 -60
+wait 300
+click "0:00 / 0:14"
+
+# Seeking a playing card preserves playback, including a drag to zero.
+click "play in card"
+wait 300
+mouse "seek in card"
+wait 1200
+click "pause in card"
+wait 300
+click "0:08 / 0:14"
+click "play in card"
+wait 300
+drag "seek in card" -100 60
+wait 1200
+click "pause in card"
+wait 300
+click "0:01 / 0:14"
+mouse "seek in card"
+wait 1200
+click "0:07 / 0:14"
+shot telegram-inline-seek
+quit
