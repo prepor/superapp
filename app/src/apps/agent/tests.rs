@@ -1876,6 +1876,56 @@ fn a_call_that_cannot_be_undone_waits_for_the_person_instead_of_running() {
 }
 
 #[test]
+fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
+    use crate::apps::telegram::{self, Chat as TelegramChat};
+    static WITH_TELEGRAM: &[&dyn App] = &[&AGENT, &telegram::TELEGRAM];
+    for decision in ["allow", "refuse", "edit"] {
+        let mut s = Session::fake(WITH_TELEGRAM);
+        open_root(&mut s, Agents::id());
+        let inbox = telegram::runtime::of(s.store()).connect();
+        let drafted = one_call(&mut s, "write a Telegram draft", "telegram.draft",
+            json!({"chat": telegram::seed::VERA, "text": "see you at seven"}));
+        assert_eq!(drafted.status, model::CALL_DONE, "{}", drafted.said());
+        let args: Value = serde_json::from_str(drafted.output.as_deref().unwrap()).unwrap();
+        let slot = args["slot"].as_u64().unwrap();
+        let panel = s.panel(slot).unwrap();
+        assert_eq!(panel.borrow().id(), &TelegramChat::id(telegram::seed::VERA));
+        assert!(inbox.try_recv().is_err());
+
+        plant(&s, vec![Reply::always(Answer::Call {
+            name: "telegram.send".into(), arguments: args, then: "The call finished.".into(),
+        })]);
+        let chat = send_new(&mut s, "send the Telegram draft");
+        assert_eq!(calls::run_pending_calls(&mut s, chat), 1);
+        let waiting = asked_call(&s, chat).unwrap();
+        assert_eq!(waiting.tool, "telegram.send");
+        assert!(inbox.try_recv().is_err(), "no message before approval");
+
+        if decision == "edit" {
+            panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().typed("changed while waiting");
+        }
+        if decision == "refuse" {
+            assert!(calls::refuse(&mut s, chat, waiting.id));
+        } else {
+            assert!(calls::allow(&mut s, chat, waiting.id));
+        }
+        s.settle();
+        let answered = model::calls(s.store(), waiting.run).iter()
+            .find(|c| c.id == waiting.id).unwrap().clone();
+        if decision == "allow" {
+            assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
+            let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+            assert_eq!(request["@type"], "sendMessage");
+            assert_eq!(request["input_message_content"]["text"]["text"], "see you at seven");
+        } else {
+            assert_eq!(answered.status, if decision == "refuse" { model::CALL_REFUSED } else { model::CALL_FAILED });
+            assert!(inbox.try_recv().is_err(), "{decision}: nothing sent");
+            assert!(!panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().field_text().is_empty());
+        }
+    }
+}
+
+#[test]
 fn allow_runs_the_call_and_the_round_goes_on() {
     let mut s = session();
     let chat = asking_chat(&mut s);

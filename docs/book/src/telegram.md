@@ -113,6 +113,30 @@ unread-mention migrations also check their columns, including topic builds
 that already used V12, so upgrades preserve messages, link metadata, drafts
 and selections.
 
+## Agent drafts and sends
+
+Agents find recipients and read cached history with `sql.query`. Telegram's
+data dictionary explains chat and topic ids, the cache's limits, and why raw
+SQL writes cannot send messages or manage the live composer.
+
+`telegram.draft` opens or reuses the destination's composer with the requested
+text and optional reply. Forum topics keep their own destination. Existing
+draft text requires explicit `replace: true`; edits and attachments are kept
+and must be finished in the panel. All open copies of the composer receive
+the staged draft, and long drafts scroll inside a bounded field. Draft text
+persists like typing; the reply selection belongs to the open composer.
+
+`telegram.send` takes the returned slot, chat, topic, text and reply target.
+It uses the same send path as Enter, after the agent's ordinary approval card.
+If the contents or destination changed while approval was pending, it refuses
+the send. Offline failures keep the draft. These tools compose text messages;
+attachments and edits remain available in the Telegram panel.
+
+A successful tool call reports **queued**, with an operation id.
+`telegram.status` reports whether Telegram has confirmed that operation or
+returned an error. Pending or uncertain delivery must not trigger an automatic
+second send. Operation ids last for the current app session.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

@@ -139,6 +139,18 @@ impl FakeGateway {
             Reply::when("fail", Answer::Fail("the gateway is down".into())),
             Reply::when("cut", Answer::Cut("This answer is long and it".into())),
             Reply::when(
+                "telegram draft",
+                Answer::Call {
+                    name: "telegram.draft".into(),
+                    arguments: serde_json::json!({
+                        "chat": 10,
+                        "reply_to": 17,
+                        "text": "A long draft from the agent.\n".repeat(40),
+                    }),
+                    then: "The Telegram draft is ready to review.".into(),
+                },
+            ),
+            Reply::when(
                 "rename",
                 Answer::Call {
                     name: "files.rename".into(),

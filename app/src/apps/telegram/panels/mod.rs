@@ -42,32 +42,37 @@ pub use topics::Topics;
 /// connected; true means queued, not acknowledged by Telegram.
 #[must_use]
 pub fn wire(store: &Store, request: &str) -> bool {
+    queue(store, request).is_some()
+}
+
+/// The same queue boundary, returning this request's operation id. The
+/// worker can register other operations concurrently, so a caller must not
+/// infer its send's id by reading the tracker's newest entry afterwards.
+pub fn queue(store: &Store, request: &str) -> Option<u64> {
     let rt = super::runtime::of(store);
     if !live(store) {
-        return false;
+        return None;
     }
     let tracked = rt.operations.track(request);
+    let v: serde_json::Value = serde_json::from_str(&tracked).ok()?;
+    let id = v["@extra"]["operation"].as_u64()?;
     let sent = rt.send(&tracked);
     if !sent {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tracked) {
-            if let Some(id) = v["@extra"]["operation"].as_u64() {
-                rt.operations.fail(
-                    store,
-                    id,
-                    "Telegram is not connected. Your request was not sent.",
-                    false,
-                );
-                // The composer still owns these; its Enter is the retry.
-                if v["@type"] == "sendMessage"
-                    || v["@type"] == "editMessageText"
-                    || v["@type"] == "editMessageCaption"
-                {
-                    rt.operations.forget_payload(id);
-                }
-            }
+        rt.operations.fail(
+            store,
+            id,
+            "Telegram is not connected. Your request was not sent.",
+            false,
+        );
+        // The composer still owns these; its Enter is the retry.
+        if v["@type"] == "sendMessage"
+            || v["@type"] == "editMessageText"
+            || v["@type"] == "editMessageCaption"
+        {
+            rt.operations.forget_payload(id);
         }
     }
-    sent
+    sent.then_some(id)
 }
 
 pub fn live(store: &Store) -> bool {

@@ -144,6 +144,7 @@ mod tests {
                 "sql.write",
                 "mail.delete",
                 "mail.send",
+                "telegram.send",
                 "files.trash",
                 "files.write"
             ]

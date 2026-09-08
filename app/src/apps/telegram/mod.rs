@@ -33,6 +33,7 @@ pub mod text;
 pub mod tdjson;
 pub mod trace;
 pub mod topics;
+pub mod tools;
 /// The engine seam the loop drives: the real transport, and a fake for tests.
 pub mod transport;
 pub mod ui;
@@ -145,6 +146,14 @@ impl App for Telegram {
 
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         KINDS
+    }
+
+    fn tools(&self) -> Vec<kernel::tool::Tool> {
+        tools::all()
+    }
+
+    fn describe(&self) -> Option<&'static str> {
+        Some(tools::DESCRIBE)
     }
 
     fn schema(&self) -> Option<&'static Schema> {

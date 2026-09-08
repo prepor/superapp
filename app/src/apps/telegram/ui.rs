@@ -480,6 +480,9 @@ script_mod! {
             width: Fill, height: Fit
             margin: Inset{top: 8}
             input := mod.widgets.SField {
+                // Long pasted, synced or agent-written drafts scroll inside
+                // the field instead of taking the transcript off the panel.
+                height: Fit{max: FitBound.Abs(110)}
                 is_multiline: true
                 empty_text: "write a message…  ( enter )"
                 // Enter is answered by the panel — it sends — before the

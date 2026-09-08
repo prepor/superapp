@@ -167,7 +167,6 @@ impl Chat {
         model::peer(&self.store, self.peer).is_some_and(|c| c.blocked)
     }
 
-    #[cfg(test)]
     pub fn topic_id(&self) -> i64 { self.topic }
 
     fn request(&self, request: String) -> String {
@@ -561,15 +560,48 @@ impl Chat {
     /// The composer changed: the row follows, straight through the store
     /// rather than as an action — a draft is not something one undoes.
     pub fn set_draft(&mut self, text: &str) {
-        if self.draft == text {
-            return;
-        }
-        self.draft = text.to_string();
-        let (peer, topic, d) = (self.peer, self.topic, self.draft.clone());
-        if let Err(e) = self.store.write(move |c| super::super::topics::draft_tx(c, peer, topic, &d)) {
+        if let Err(e) = self.save_draft(text) {
+            // A failed persistence write must not erase what was typed.
+            self.draft = text.to_string();
             runtime::of(&self.store)
                 .operations
-                .report(&self.store, "saving draft", &e.to_string());
+                .report(&self.store, "saving draft", &e);
+        }
+    }
+
+    fn save_draft(&mut self, text: &str) -> Result<(), String> {
+        if self.draft == text && self.seen_draft == text {
+            return Ok(());
+        }
+        let (peer, topic, d) = (self.peer, self.topic, text.to_string());
+        self.store.write(move |c| super::super::topics::draft_tx(c, peer, topic, &d))
+            .map_err(|e| e.to_string())?;
+        self.draft = text.to_string();
+        self.seen_draft.clone_from(&self.draft);
+        Ok(())
+    }
+
+    /// An agent's explicit draft replacement uses the composer's own write.
+    /// Unlike a remote update, it replaces local text after the tool checks
+    /// for unsent work. Each open copy is updated, so none can restore stale
+    /// words on its next focus or send.
+    pub fn stage_draft(&mut self, text: &str, reply_to: Option<MsgId>, focus: bool) -> Result<(), String> {
+        self.save_draft(text)?;
+        self.reply_to = reply_to;
+        self.wants_field = focus;
+        Ok(())
+    }
+
+    /// Another open copy sent this exact draft. Its send already cleared
+    /// the row; forget our copy without a second write or a focus change.
+    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgId>) {
+        if self.editing.is_none() && self.carrying.is_empty()
+            && self.draft == text && self.reply_to == reply_to
+        {
+            self.draft.clear();
+            self.sent_draft.clear();
+            self.seen_draft.clear();
+            self.reply_to = None;
         }
     }
 
@@ -675,6 +707,10 @@ impl Chat {
             s.notify("unblock this user before sending a message", false);
             return;
         }
+        if self.card().is_some_and(|c| !c.can_post()) {
+            s.notify("you can't post here", false);
+            return;
+        }
         if let Some(e) = self.editing.take() {
             let text = e.text.trim().to_string();
             if !text.is_empty() && text != e.original {
@@ -749,34 +785,71 @@ impl Chat {
         s.redraw();
     }
 
+    /// A live text send, shared by Enter and the agent's approved send.
+    /// Its operation id is captured at the queue boundary, not guessed from
+    /// later tracker state. A failure leaves the composer intact.
+    pub fn send_text_draft(&mut self, s: &mut Session) -> Option<u64> {
+        // Read permission without reconciling a newer remote draft: the
+        // caller has already read the composer, and the tool approved that
+        // exact text. Nothing may substitute other words at this boundary.
+        if super::super::topics::card(&self.store, self.peer, self.topic)
+            .is_some_and(|c| !c.can_post()) || self.editing.is_some()
+            || !self.carrying.is_empty() || self.draft.trim().is_empty()
+        {
+            return None;
+        }
+        let text = self.draft.clone();
+        let reply = self.reply_to;
+        let operation = super::queue(
+            &self.store,
+            &self.request(requests::send_message(self.peer, text.trim(), reply)),
+        );
+        if operation.is_some() {
+            self.set_draft("");
+            self.sent_draft.clear();
+            self.seen_draft.clear();
+            self.reply_to = None;
+            for (slot, panel) in s.panels() {
+                if slot == self.slot { continue; }
+                let mut p = panel.borrow_mut();
+                if let Some(c) = p.as_any().downcast_mut::<Chat>()
+                    .filter(|c| c.peer == self.peer && c.topic == self.topic)
+                {
+                    c.forget_sent_draft(&text, reply);
+                }
+            }
+        } else {
+            s.notify("send failed: Telegram is not connected; your draft is kept", true);
+        }
+        s.redraw();
+        operation
+    }
+
     /// Only queued files leave the composer. Each queued request owns its
     /// caption, reply and source path until Telegram confirms delivery.
     fn send_live(&mut self, s: &mut Session) {
+        if self.carrying.is_empty() {
+            self.send_text_draft(s);
+            return;
+        }
         let text = self.draft.trim().to_string();
         let mut sent_first = false;
-        if self.carrying.is_empty() {
-            sent_first = wire(
-                &self.store,
-                &self.request(requests::send_message(self.peer, &text, self.reply_to)),
+        let files = std::mem::take(&mut self.carrying);
+        let mut files = files.into_iter().enumerate();
+        while let Some((i, file)) = files.next() {
+            let request = requests::send_file(
+                self.peer,
+                if i == 0 { self.reply_to } else { None },
+                &file,
+                if i == 0 { &text } else { "" },
             );
-        } else {
-            let files = std::mem::take(&mut self.carrying);
-            let mut files = files.into_iter().enumerate();
-            while let Some((i, file)) = files.next() {
-                let request = requests::send_file(
-                    self.peer,
-                    if i == 0 { self.reply_to } else { None },
-                    &file,
-                    if i == 0 { &text } else { "" },
-                );
-                if !wire(&self.store, &self.request(request)) {
-                    self.carrying.push(file);
-                    self.carrying.extend(files.map(|(_, file)| file));
-                    break;
-                }
-                if i == 0 {
-                    sent_first = true;
-                }
+            if !wire(&self.store, &self.request(request)) {
+                self.carrying.push(file);
+                self.carrying.extend(files.map(|(_, file)| file));
+                break;
+            }
+            if i == 0 {
+                sent_first = true;
             }
         }
         if sent_first {
