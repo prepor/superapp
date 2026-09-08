@@ -8,7 +8,7 @@ use kernel::session::{Action, Session};
 use kernel::store::{Store, Val};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::parse;
+use super::{opml, parse};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Feed {
@@ -184,10 +184,7 @@ pub fn add(s: &mut Session, raw: &str) -> Result<i64, String> {
     if existing.is_some_and(|(_, active)| active) {
         return Err("already subscribed to this feed".into());
     }
-    let title = url::Url::parse(&url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| url.clone());
+    let title = initial_title(&url);
     let id = s.act(Action::writing("rss.add",format!("subscribe to {title}"),move |c| {
         c.execute("INSERT INTO rss_feed(url,title) VALUES(?1,?2) ON CONFLICT(url) DO UPDATE SET subscribed=1,requested=requested+1", params![url,title])?;
         c.query_row("SELECT id FROM rss_feed WHERE url=?",[url],|r|r.get(0))
@@ -198,6 +195,75 @@ pub fn add(s: &mut Session, raw: &str) -> Result<i64, String> {
         after: true,
     }));
     Ok(id)
+}
+
+pub(super) fn initial_title(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.into())
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Imported {
+    pub added: usize,
+    pub existing: usize,
+    pub skipped: usize,
+}
+
+impl Imported {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} feeds imported · {} already subscribed · {} skipped",
+            self.added, self.existing, self.skipped
+        )
+    }
+}
+
+/// One import is one undoable subscription change. Existing subscriptions
+/// are untouched; removed ones return with their cached articles and flags.
+pub(super) fn import(s: &mut Session, doc: opml::Document) -> Result<Imported, String> {
+    let active = s.store().rows_sql(
+        "rss import existing",
+        "subscribed feed URLs",
+        "SELECT url FROM rss_feed WHERE subscribed=1",
+        &[],
+        |r| r.get::<_, String>(0),
+    );
+    let active = active.iter().collect::<std::collections::HashSet<_>>();
+    let mut result = Imported {
+        added: 0,
+        existing: 0,
+        skipped: doc.skipped,
+    };
+    let mut pending = Vec::new();
+    for feed in doc.feeds {
+        if active.contains(&feed.url) {
+            result.existing += 1;
+        } else {
+            pending.push(feed);
+        }
+    }
+    if pending.is_empty() {
+        return Ok(result);
+    }
+    let ids = s.act(Action::writing("rss.import_opml", format!("import {} feeds", pending.len()), move |c| {
+        let mut ids = Vec::new();
+        for feed in pending {
+            let id = c.query_row(
+                "INSERT INTO rss_feed(url,title) VALUES(?1,?2) ON CONFLICT(url) DO UPDATE SET subscribed=1,requested=requested+1 WHERE subscribed=0 RETURNING id",
+                params![feed.url, feed.title], |r| r.get::<_, i64>(0)).optional()?;
+            if let Some(id) = id { ids.push(id); }
+        }
+        Ok(ids)
+    })).ok_or("could not import feeds")?;
+    result.added = ids.len();
+    s.claim(Box::new(Flags {
+        kind: Flag::Subscribed,
+        before: ids.into_iter().map(|id| (id, false)).collect(),
+        after: true,
+    }));
+    Ok(result)
 }
 
 #[derive(Clone, Copy)]

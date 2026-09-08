@@ -6,6 +6,7 @@ use kernel::store::Store;
 use std::any::Any;
 
 pub mod model;
+mod opml;
 pub mod panels;
 pub mod parse;
 mod schema;

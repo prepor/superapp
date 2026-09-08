@@ -1,5 +1,7 @@
-use super::panels::{AddFeed, Article, Articles, Feeds};
-use super::widgets::{RssAddFeedPanel, RssArticlePanel, RssArticlesPanel, RssFeedsPanel};
+use super::panels::{AddFeed, Article, Articles, Feeds, ImportFeeds};
+use super::widgets::{
+    RssAddFeedPanel, RssArticlePanel, RssArticlesPanel, RssFeedsPanel, RssImportPanel,
+};
 use crate::shell::app_ui::{AppUi, Setup};
 use crate::shell::catalog::{panel, workspace_on};
 use kernel::panel::Tag;
@@ -99,6 +101,16 @@ script_mod! {
         mod.widgets.SLabel { width: Fill, text: "Paste an RSS or Atom feed URL, then subscribe.", draw_text +: { color: #909090 } }
         error_lbl := mod.widgets.SLabel { width: Fill, text: "", draw_text +: { color: #a01500 } }
     }
+    mod.widgets.RssImportPanel = set_type_default() do #(RssImportPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down, spacing: 10
+        padding: Inset{left: 16, right: 16, top: 16, bottom: 16}
+        mod.widgets.SSection { text: "OPML FILE" }
+        path_input := mod.widgets.SField { width: Fill, empty_text: "~/Downloads/feeds.opml" }
+        mod.widgets.SLabel { width: Fill, text: "Paste an OPML file path, then import. Existing subscriptions are skipped. Undo removes this import.", draw_text +: { color: #909090 } }
+        error_lbl := mod.widgets.SLabel { width: Fill, text: "", draw_text +: { color: #a01500 } }
+        status_lbl := mod.widgets.SLabel { width: Fill, text: "" }
+    }
     mod.widgets.RssArticlePanel = set_type_default() do #(RssArticlePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill, flow: Down
@@ -130,6 +142,7 @@ impl AppUi for Ui {
             Articles::TAG => Some(live_id!(rss_articles_tpl)),
             Article::TAG => Some(live_id!(rss_article_tpl)),
             AddFeed::TAG => Some(live_id!(rss_add_feed_tpl)),
+            ImportFeeds::TAG => Some(live_id!(rss_import_tpl)),
             _ => None,
         }
     }
@@ -138,6 +151,7 @@ impl AppUi for Ui {
             .node("unseen", panel(|_| Articles::id(), ""))
             .node("feeds", panel(|_| Feeds::id(), ""))
             .node("subscribe", panel(|_| AddFeed::id(), ""))
+            .node("import", panel(|_| ImportFeeds::id(), ""))
             .node(
                 "reading",
                 workspace_on(|_| Articles::id(), "key down\nwait 600"),

@@ -50,6 +50,7 @@ script_mod! {
                         rss_articles_tpl := mod.widgets.RssArticlesPanel{}
                         rss_article_tpl := mod.widgets.RssArticlePanel{}
                         rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
+                        rss_import_tpl := mod.widgets.RssImportPanel{}
                         // Telegram's ten tags: the address book and a
                         // group's members draw with one widget, hung twice.
                         telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
@@ -122,6 +123,7 @@ script_mod! {
                             rss_articles_tpl := mod.widgets.RssArticlesPanel{}
                             rss_article_tpl := mod.widgets.RssArticlePanel{}
                             rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
+                            rss_import_tpl := mod.widgets.RssImportPanel{}
                             telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
                             telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
                             telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}

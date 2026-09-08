@@ -10,7 +10,13 @@ use kernel::store::Store;
 use std::any::Any;
 use std::rc::Rc;
 
-pub static KINDS: &[&dyn PanelKind] = &[&FeedsKind, &ArticlesKind, &ArticleKind, &AddFeedKind];
+pub static KINDS: &[&dyn PanelKind] = &[
+    &FeedsKind,
+    &ArticlesKind,
+    &ArticleKind,
+    &AddFeedKind,
+    &ImportFeedsKind,
+];
 pub type FeedList = ListState<&'static SqlSource<model::Feed, i64>>;
 pub type ArticleList = ListState<&'static SqlSource<model::Article, i64>>;
 
@@ -117,6 +123,16 @@ impl Panel for Feeds {
                 },
             ),
             Verb::run("rss.refresh", "refresh", Some('r')),
+            Verb::go(
+                "rss.import",
+                "import OPML",
+                Some('o'),
+                Nav::Open {
+                    from: self.slot,
+                    id: ImportFeeds::id(),
+                    fresh: false,
+                },
+            ),
             Verb::go(
                 "rss.articles",
                 "articles",
@@ -403,6 +419,88 @@ impl PanelKind for AddFeedKind {
             slot: 0,
             url: String::new(),
             error: String::new(),
+        })
+    }
+}
+
+pub struct ImportFeeds {
+    id: PanelId,
+    slot: SlotId,
+    pub path: String,
+    pub error: String,
+    pub status: String,
+}
+impl ImportFeeds {
+    pub const TAG: Tag = Tag("rss-import");
+    pub fn id() -> PanelId {
+        PanelId::bare(Self::TAG)
+    }
+    pub fn submit(&mut self, s: &mut Session) {
+        let result = s
+            .world()
+            .run(&super::opml::Read(self.path.clone()))
+            .and_then(|doc| model::import(s, doc));
+        self.error.clear();
+        self.status.clear();
+        match result {
+            Ok(imported) => self.status = imported.summary(),
+            Err(why) => self.error = why,
+        }
+        s.redraw();
+    }
+}
+impl Panel for ImportFeeds {
+    fn id(&self) -> &PanelId {
+        &self.id
+    }
+    fn title(&self) -> String {
+        "import OPML".into()
+    }
+    fn about(&self) -> String {
+        "Import feed subscriptions from a local OPML file. Paste its path, then import. Nested folders are flattened, duplicates are skipped, and existing read state is preserved. One undo removes the imported subscriptions.".into()
+    }
+    fn wish(&self, _: usize) -> (u32, u32) {
+        (4, 3)
+    }
+    fn placed(&mut self, slot: SlotId) {
+        self.slot = slot;
+    }
+    fn verbs(&self) -> Vec<Verb> {
+        vec![
+            Verb::run("rss.import_opml", "import", Some('o')),
+            Verb::go(
+                "rss.feeds",
+                "feeds",
+                Some('f'),
+                Nav::Open {
+                    from: self.slot,
+                    id: Feeds::id(),
+                    fresh: false,
+                },
+            ),
+        ]
+    }
+    fn run(&mut self, verb: &str, s: &mut Session) {
+        if verb == "rss.import_opml" {
+            self.submit(s);
+        }
+    }
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+pub struct ImportFeedsKind;
+impl PanelKind for ImportFeedsKind {
+    fn tag(&self) -> Tag {
+        ImportFeeds::TAG
+    }
+    fn open(&self, id: &PanelId, _: &mut Opening<'_>) -> Box<dyn Panel> {
+        Box::new(ImportFeeds {
+            id: id.clone(),
+            slot: 0,
+            path: String::new(),
+            error: String::new(),
+            status: String::new(),
         })
     }
 }

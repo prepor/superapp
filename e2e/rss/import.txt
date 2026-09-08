@@ -1,0 +1,34 @@
+# args:
+# env:
+# Import a nested OPML export, then repeat it and undo the original batch.
+wait 900
+key cmd 2
+wait 400
+type "feeds"
+wait 400
+key enter
+wait 600
+click "import OPML"
+wait 400
+click "import"
+wait 300
+visible "enter the path to an OPML file"
+click "OPML path"
+type "e2e/rss/fixtures/subscriptions.opml"
+key enter
+wait 600
+visible "2 feeds imported · 1 already subscribed · 2 skipped"
+click "import"
+wait 500
+visible "0 feeds imported · 3 already subscribed · 2 skipped"
+key cmd+z
+wait 400
+visible "Field notes"
+key cmd+shift+z
+wait 400
+visible "A new subscription"
+click "feeds"
+wait 600
+visible "Field notes"
+visible "A new subscription"
+quit

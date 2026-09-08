@@ -1,4 +1,4 @@
-use super::{model, panels, parse, seed, sync, RSS};
+use super::{model, opml, panels, parse, seed, sync, RSS};
 use kernel::app::{App, Worker};
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
@@ -345,4 +345,162 @@ fn real_feed_can_be_fetched_and_parsed() {
     let parsed = parse::parse(&bytes, &url).unwrap();
     assert!(!parsed.articles.is_empty());
     assert!(parsed.articles.iter().any(|a| !a.html.is_empty()));
+}
+
+const OPML: &[u8] = include_bytes!("../../../../e2e/rss/fixtures/subscriptions.opml");
+
+#[test]
+fn opml_reads_nested_feeds_and_preserves_exported_titles_and_query_strings() {
+    let doc = opml::parse(OPML).unwrap();
+    assert_eq!(doc.feeds.len(), 3);
+    assert_eq!(doc.skipped, 2); // one duplicate and one unusable URL
+    assert_eq!(doc.feeds[0].url, seed::NOTES);
+    assert_eq!(doc.feeds[1].title, "A new subscription");
+    assert_eq!(doc.feeds[2].title, "Reader \"notes\" & <ideas>");
+    assert_eq!(
+        doc.feeds[2].url,
+        "https://example.com/other.xml?one=1&two=2"
+    );
+    let clean = br#"<opml version="2.0"><head/><body><outline text="Folders">
+        <outline title="" text="News &amp; ideas" xmlUrl="https://example.org/rss?a=1&amp;b=2"/>
+        <outline title="" xmlUrl="https://untitled.example/rss"/>
+        <outline title="A backslash\" xmlUrl="https://example.net/rss"/>
+        <outline isComment="true"><outline xmlUrl="https://ignored.example/rss"/></outline>
+        </outline></body></opml>"#;
+    let doc = opml::parse(clean).unwrap();
+    assert_eq!(doc.feeds.len(), 3);
+    assert_eq!(doc.feeds[0].title, "News & ideas");
+    assert_eq!(doc.feeds[0].url, "https://example.org/rss?a=1&b=2");
+    assert_eq!(doc.feeds[1].title, "untitled.example");
+    assert_eq!(doc.feeds[2].title, "A backslash\\");
+}
+
+#[test]
+fn opml_refuses_incomplete_documents_and_external_entities() {
+    for bad in [
+        "<html><body><outline xmlUrl='https://example.com/rss'/></body></html>",
+        "<opml><body><outline xmlUrl='https://example.com/rss'/>",
+        "<opml><body><outline xmlUrl='https://example.com/rss'/></opml>",
+        "<opml><body><outline xmlUrl='file:///tmp/feed'/></body></opml>",
+        "<!DOCTYPE opml [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><opml><body><outline xmlUrl='https://example.com/rss'/></body></opml>",
+        "<opml><body/></opml><opml><body><outline xmlUrl='https://example.com/rss'/></body></opml>",
+    ] {
+        assert!(opml::parse(bad.as_bytes()).is_err(), "{bad}");
+    }
+    assert!(opml::parse(&vec![b' '; opml::MAX_OPML + 1])
+        .unwrap_err()
+        .contains("2 MiB"));
+}
+
+#[test]
+fn opml_import_is_one_undoable_batch_and_reimport_is_a_noop() {
+    let mut s = session();
+    let read = id(&s, "notes-3");
+    let result = model::import(&mut s, opml::parse(OPML).unwrap()).unwrap();
+    assert_eq!(
+        result,
+        model::Imported {
+            added: 2,
+            existing: 1,
+            skipped: 2
+        }
+    );
+    assert_eq!(model::FEEDS.count(s.store(), None), Some(4));
+    assert!(model::article(s.store(), read).unwrap().seen);
+    assert_eq!(
+        model::article(s.store(), read).unwrap().feed_title,
+        "Field notes"
+    );
+    let again = model::import(&mut s, opml::parse(OPML).unwrap()).unwrap();
+    assert_eq!(
+        again,
+        model::Imported {
+            added: 0,
+            existing: 3,
+            skipped: 2
+        }
+    );
+    // Re-import made no history entry: one undo reverses the original batch.
+    s.undo();
+    assert_eq!(model::FEEDS.count(s.store(), None), Some(2));
+    assert!(model::article(s.store(), read).unwrap().seen);
+    s.redo();
+    assert_eq!(model::FEEDS.count(s.store(), None), Some(4));
+}
+
+#[test]
+fn opml_restores_removed_subscriptions_without_resetting_the_cache() {
+    let mut s = session();
+    let read = id(&s, "notes-3");
+    let feed = model::article(s.store(), read).unwrap().feed;
+    model::change(&mut s, model::Flag::Subscribed, &[feed], false);
+    let result = model::import(&mut s, opml::parse(OPML).unwrap()).unwrap();
+    assert_eq!(result.added, 3);
+    assert_eq!(model::article(s.store(), read).unwrap().feed, feed);
+    assert!(model::article(s.store(), read).unwrap().seen);
+    s.undo();
+    assert_eq!(model::FEEDS.count(s.store(), None), Some(1));
+    s.redo();
+    assert!(model::article(s.store(), read).unwrap().seen);
+}
+
+#[test]
+fn opml_import_rolls_back_the_whole_batch_on_a_write_failure() {
+    let mut s = session();
+    s.store().write(|c| c.execute_batch("CREATE TEMP TRIGGER reject_import BEFORE INSERT ON rss_feed WHEN NEW.url LIKE '%other.xml%' BEGIN SELECT RAISE(ABORT,'test failure'); END;")).unwrap();
+    assert!(model::import(&mut s, opml::parse(OPML).unwrap()).is_err());
+    assert_eq!(model::FEEDS.count(s.store(), None), Some(2));
+    assert_eq!(
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM rss_feed WHERE url=?",
+                [seed::EXTRA],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn opml_form_reads_through_the_disk_capability_and_reports_the_result() {
+    use kernel::caps::{real_path, Disk};
+    let mut s = session();
+    s.world()
+        .with_cap::<dyn Disk, _>(|d| d.write_file(&real_path("~/feeds.opml"), OPML))
+        .unwrap()
+        .unwrap();
+    let slot = open(&mut s, panels::ImportFeeds::id());
+    let panel = s.panel(slot).unwrap();
+    let mut borrow = panel.borrow_mut();
+    let p = borrow
+        .as_any()
+        .downcast_mut::<panels::ImportFeeds>()
+        .unwrap();
+    p.submit(&mut s);
+    assert!(p.error.contains("enter the path"));
+    p.path = "~/feeds.opml".into();
+    p.submit(&mut s);
+    assert_eq!(p.error, "");
+    assert_eq!(
+        p.status,
+        "2 feeds imported · 1 already subscribed · 2 skipped"
+    );
+}
+
+#[test]
+#[ignore = "reads the OPML path supplied in RSS_OPML_TEST_FILE; run explicitly"]
+fn supplied_opml_imports_and_reimports_without_duplicates() {
+    let path = std::env::var("RSS_OPML_TEST_FILE").expect("RSS_OPML_TEST_FILE");
+    let bytes = std::fs::read(path).unwrap();
+    let doc = opml::parse(&bytes).unwrap();
+    let count = doc.feeds.len();
+    assert_eq!(doc.skipped, 0);
+    let mut s = session();
+    assert_eq!(model::import(&mut s, doc).unwrap().added, count);
+    let again = model::import(&mut s, opml::parse(&bytes).unwrap()).unwrap();
+    assert_eq!(again.added, 0);
+    assert_eq!(again.existing, count);
+    println!("imported {count} feeds; re-import added no duplicates");
 }

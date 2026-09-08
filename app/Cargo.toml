@@ -59,6 +59,7 @@ regex = { version = "1", default-features = false, features = ["std", "unicode-g
 # Syndication parsing and bounded HTTP fetching for the RSS reader.
 feed-rs = "2.4"
 ureq = "3.4"
+quick-xml = "0.41"
 
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
 # POST the token endpoint takes.

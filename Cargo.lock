@@ -2213,6 +2213,7 @@ dependencies = [
  "makepad-widgets",
  "markup5ever_rcdom",
  "pulldown-cmark",
+ "quick-xml",
  "regex",
  "ring",
  "rusqlite",

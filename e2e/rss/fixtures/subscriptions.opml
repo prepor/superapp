@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+  <head><title>Example subscriptions</title></head>
+  <body>
+    <outline text="Folders">
+      <outline text="Existing feed" type="rss" xmlUrl="https://example.com/field-notes.xml" />
+      <outline text="Nested folder">
+        <outline title="A new subscription" type="rss" xmlUrl="https://example.com/new-feed.xml" />
+        <outline title="Reader \"notes\" & <ideas>" type="rss" xmlUrl="https://example.com/other.xml?one=1&two=2" />
+        <outline title="Duplicate" type="rss" xmlUrl="https://example.com/new-feed.xml#fragment" />
+        <outline title="Invalid source" type="rss" xmlUrl="file:///tmp/feed.xml" />
+      </outline>
+    </outline>
+  </body>
+</opml>

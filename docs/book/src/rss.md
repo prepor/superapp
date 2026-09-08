@@ -6,6 +6,15 @@ subscriptions. Feeds accepts an RSS or Atom URL through **add feed**;
 subscriptions are undoable. Removing keeps the cache and read state, so
 undo or subscribing to the same URL restores them.
 
+**feeds → import OPML** accepts a local OPML file path (`~/Downloads/feeds.opml`
+works). Import reads feeds from nested folders, uses their exported titles,
+and reports how many were imported, already subscribed, or skipped. It skips
+duplicate and invalid URLs, preserves existing subscriptions and read state,
+and restores removed subscriptions from their cache. The whole batch is one
+undoable action; importing the same file again adds nothing. Folders are
+flattened into the feed list. The importer accepts UTF-8 files up to two MiB
+and tolerates unescaped title text and query strings in older exports.
+
 Articles use the shared [rich table](./richtable.md), ordered from oldest
 to newest, with `@unseen` in the filter by default. Clear that filter to see
 the archive. The table supports free text over titles, authors and feed
