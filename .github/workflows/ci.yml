@@ -81,5 +81,6 @@ jobs:
         run: |
           cargo test --locked -p superapp --lib --no-default-features shell::widgets::reveal::tests::revealing_schedules_its_own_draws -- --exact
           cargo test --locked -p superapp --lib --no-default-features apps::telegram::widgets::inline_video::tests::inline_media_keeps_its_rectangle_through_playback -- --exact
+          cargo test --locked -p superapp --lib --no-default-features apps::telegram::widgets::chat::scroll_tests
           cargo build --locked -p superapp --no-default-features
           ./e2e/run-all.sh

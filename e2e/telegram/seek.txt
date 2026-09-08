@@ -9,6 +9,10 @@ key enter
 wait 900
 click "stelaxis"
 wait 900
+# The demo video precedes the unread run the chat opens on.
+click "me: the muted grey is too light on the fold"
+key up
+wait 300
 # Open the viewer through the visible poster, including when its row is clipped.
 click "video"
 wait 600

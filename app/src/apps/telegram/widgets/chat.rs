@@ -43,6 +43,10 @@ use super::super::panels::{Chat, Line, Row, Viewer};
 use super::RenderContext;
 use super::inline_video::{self, InlineVideo};
 
+#[cfg(all(test, headless))]
+#[path = "chat_scroll_tests.rs"]
+mod scroll_tests;
+
 /// The children the transcript expects in its template.
 const STATUS: &[LiveId] = ids!(status_lbl);
 const EMPTY: &[LiveId] = ids!(empty_lbl);
@@ -123,12 +127,16 @@ pub struct ChatPanel {
     #[rust]
     inner: Vec<InnerHit>,
     /// The first look at a live panel has happened: the field took the
-    /// draft, the list went to its end, and — where the panel had focus —
-    /// the field took the keyboard.
+    /// draft and, where the panel had focus, the keyboard.
     #[rust]
     mounted: bool,
     #[rust]
     positioned: bool,
+    /// Space below a short unread run keeps its divider near the top on
+    /// opening. It shrinks as messages arrive and ends when reading reaches
+    /// the bottom explicitly, by scrolling down there, sending, or End.
+    #[rust]
+    unread_space: Option<f64>,
     /// The draft as this widget last wrote it into the field, so the field
     /// is only rewritten when the instance's text moved without a keystroke
     /// of this widget's.
@@ -202,8 +210,17 @@ impl Widget for ChatPanel {
             self.viewed = None;
         }
 
-        if matches!(event, Event::Scroll(_)) {
+        if let Event::Scroll(e) = event {
             self.reveal.cancel();
+            let list = self.view.widget(cx, LIST).as_portal_list();
+            if self.unread_space.is_some() && e.scroll.y > 0.0
+                && list.area().clipped_rect(cx).contains(e.abs) && list.is_at_end()
+            {
+                self.unread_space = None;
+                list.set_tail_range(true);
+                self.anchor = None;
+                self.view.redraw(cx);
+            }
         }
         if matches!(event, Event::Drag(_) | Event::Drop(_) | Event::DragEnd) {
             match event.drag_hits(cx, self.view.area()) {
@@ -330,6 +347,7 @@ impl Widget for ChatPanel {
                 .flatten();
                 if to_end {
                     self.reveal.cancel();
+                    self.unread_space = None;
                     let list = self.view.widget(cx, LIST).as_portal_list();
                     list.scroll_to_end(cx);
                     list.set_tail_range(true);
@@ -639,6 +657,7 @@ impl Widget for ChatPanel {
         // without waiting for another key, pointer event or timer tick.
         if self.mounted && with_chat(&props, |c| c.transcript_ready()).unwrap_or(false) {
             if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
+                self.unread_space = None;
                 self.reveal.request(id);
             }
         }
@@ -726,19 +745,6 @@ impl Widget for ChatPanel {
         let active = with_chat(&props, |c| c.active_media()).flatten();
         let mut video_drawn = false;
         let mut video_redraw = false;
-        if !self.positioned && n > 0 {
-            let list = self.view.widget(cx, LIST).as_portal_list();
-            match rows.iter().position(|r| matches!(r, Row::Unread)) {
-                Some(idx) => {
-                    list.set_tail_range(false);
-                    if let Some(mut list) = list.borrow_mut() {
-                        list.set_first_id_and_scroll(idx.saturating_sub(1), 0.0);
-                    }
-                }
-                None => list.set_tail_range(true),
-            }
-            self.positioned = true;
-        }
         let mut drawn: Vec<(usize, WidgetRef, Option<PlayerState>)> = Vec::new();
         let anchor = self.anchor.take();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
@@ -746,6 +752,22 @@ impl Widget for ChatPanel {
             let Some(mut list) = list_ref.borrow_mut() else {
                 continue;
             };
+            if !self.positioned && n > 0 {
+                let unread = rows.iter().position(|r| matches!(r, Row::Unread));
+                match unread.filter(|_| cursor.is_none() && self.reveal.target().is_none()) {
+                    Some(idx) => {
+                        let height = cx.turtle().inner_rect().size.y;
+                        let offset = unread_offset(height);
+                        self.unread_space = Some((height - offset).max(0.0));
+                        list.set_tail_range(false);
+                        // Bound the context in pixels: the preceding message
+                        // may be a tall picture or several screens of text.
+                        list.set_first_id_and_scroll(idx, offset);
+                    }
+                    None => list.set_tail_range(true),
+                }
+                self.positioned = true;
+            }
             // Rows shifted under a view that is not following the end — a
             // backfill landed older lines above it — so the line that stood
             // at the list's first row now has another index: move the list
@@ -753,7 +775,7 @@ impl Widget for ChatPanel {
             // the shift is corrected; a scroll of the reader's, or one still
             // animating towards a cursor, is left exactly where it got to.
             if let Some((id, first_then)) = anchor {
-                if !list.is_at_end() {
+                if !list.is_at_end() || self.unread_space.is_some() {
                     let now_at = snapshot.row_index(id);
                     if let Some(shift) = now_at.map(|i| i as isize - first_then as isize).filter(|&d| d != 0) {
                         let first = (list.first_id() as isize + shift).max(0) as usize;
@@ -762,7 +784,10 @@ impl Widget for ChatPanel {
                     }
                 }
             }
-            list.set_item_range(cx, 0, n);
+            if self.unread_space.is_some() {
+                list.set_tail_range(false);
+            }
+            list.set_item_range(cx, 0, n + usize::from(self.unread_space.is_some()));
             let first = list.first_id();
             self.anchor = rows
                 .iter()
@@ -770,6 +795,16 @@ impl Widget for ChatPanel {
                 .skip(first)
                 .find_map(|(i, r)| r.msg().map(|m| (m.id, i)));
             while let Some(idx) = list.next_visible_item(cx) {
+                if idx == n {
+                    if let Some(height) = self.unread_space {
+                        let space = list.item(cx, idx, live_id!(end_space));
+                        if let Some(mut view) = space.borrow_mut::<View>() {
+                            view.walk.height = Size::Fixed(height);
+                        }
+                        space.draw_all(cx, scope);
+                    }
+                    continue;
+                }
                 let Some(r) = rows.get(idx) else { continue };
                 let row = list.item(cx, idx, live_id!(row));
                 let id = r.msg().map(|m| m.id);
@@ -808,11 +843,29 @@ impl Widget for ChatPanel {
             }
         }
 
+        let portal = self.view.widget(cx, LIST).as_portal_list();
+        if let Some(space) = self.unread_space {
+            if let Some((unread_idx, unread, _)) = drawn.iter().find(|(idx, _, _)| matches!(rows[*idx], Row::Unread)) {
+                let height = portal.area().rect(cx).size.y;
+                let top = unread.area().rect(cx).pos.y;
+                let content = drawn.iter().filter(|(idx, _, _)| idx >= unread_idx)
+                    .map(|(_, row, _)| { let r = row.area().rect(cx); r.pos.y + r.size.y - top })
+                    .fold(0.0, f64::max);
+                let needed = (height - unread_offset(height) - content).max(0.0);
+                // Measure the complete run, or enough of it to fill the view.
+                // Scrolling up may leave only the divider at the bottom;
+                // that partial reading cannot resize the space below it.
+                let complete = drawn.iter().any(|(idx, _, _)| *idx == n - 1);
+                if needed == 0.0 || complete && (needed - space).abs() > 0.5 {
+                    self.unread_space = (needed > 0.0).then_some(needed);
+                    cx.redraw_area_in_draw(portal.area());
+                }
+            }
+        }
         let target_index = self.reveal.target().and_then(|id| snapshot.row_index(id));
         let target_rect = target_index.and_then(|target| {
             drawn.iter().find(|(idx, _, _)| *idx == target).map(|(_, row, _)| row.area().rect(cx))
         });
-        let portal = self.view.widget(cx, LIST).as_portal_list();
         if self.reveal.apply(cx, &portal, target_index, target_rect) {
             self.anchor = None;
         }
@@ -892,9 +945,8 @@ impl Widget for ChatPanel {
 }
 
 impl ChatPanel {
-    /// The first look at a live panel: the field takes the draft, the list
-    /// goes to its end, and — where the panel has focus — the field takes
-    /// the keyboard, the way the client starts in its input. Held until the
+    /// The first look at a live panel: the field takes the draft and,
+    /// where the panel has focus, the keyboard. Held until the
     /// field has a rectangle: focus on a field that has never been drawn is
     /// focus on nothing.
     fn mount(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
@@ -946,6 +998,7 @@ impl ChatPanel {
         }
         // The sent line lands at the end; the transcript goes there to meet
         // it, and stays there as the echo settles into the server's copy.
+        self.unread_space = None;
         self.view
             .widget(cx, LIST)
             .as_portal_list()
@@ -1137,6 +1190,9 @@ impl ChatPanel {
             .map(|h| h.act.clone())
     }
 }
+
+/// A little preceding context, independent of that message's height.
+fn unread_offset(height: f64) -> f64 { (height * 0.1).min(64.0) }
 
 /// What a script addresses a row by: the writer and the first words of the
 /// line, a caption's own word, a service line's text.

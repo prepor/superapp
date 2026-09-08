@@ -8,13 +8,18 @@ key enter
 wait 900
 click "stelaxis"
 wait 900
+# The demo video precedes the unread run the chat opens on.
+click "me: the muted grey is too light on the fold"
+key up
+wait 300
 click "play video"
 wait 1200
 click "write a message"
 click "0:01 / 0:14"
 
 # Selecting and marking a playing message keeps its player.
-click "Elena Petrova: the fold in motion"
+# The cursor is on the video; leave the composer to mark that row.
+key esc
 wait 300
 key space
 wait 300
@@ -35,7 +40,7 @@ click "write a message"
 
 # Opening a card while the transcript plays must still allow playback
 # handoffs in both directions, with only one panel playing at a time.
-click "Elena Petrova: the fold in motion"
+key esc
 wait 300
 click "play video"
 wait 300

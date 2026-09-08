@@ -477,6 +477,7 @@ script_mod! {
             // at the bottom).
             auto_tail: true
             row := mod.widgets.TelegramMsgRow {}
+            end_space := View { width: Fill, height: 0 }
         }
         drop_hint := mod.widgets.SLabel {
             visible: false, width: Fill, text: "drop files to attach · enter to send"

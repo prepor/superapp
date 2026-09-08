@@ -17,6 +17,11 @@ visible while its replacement loads. Photo reads, decoding and map rendering
 also run on workers, with a bounded texture cache shared across chats. Opening
 an unread chat still records its read claim and preserves its unread divider.
 
+Unread chats open with the divider near the top and a small amount of context
+above it. Short unread runs leave space below; incoming messages fill that
+space without moving the reading position. Scrolling down at the end, sending,
+or explicitly jumping to the newest message resumes the usual bottom view.
+
 Scrolling and mention checks look up messages in the prepared transcript, and
 unchanged message text reuses its formatted links. Typing updates the composer
 immediately; local drafts save after a 300 ms pause or when leaving the chat.
