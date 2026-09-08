@@ -3512,16 +3512,30 @@ fn player_verbs_follow_their_own_clock_without_a_widget_draw() {
     let a_viewer = open_root(&mut a, Viewer::id(STELAXIS, voice));
     verb(&mut a, a_line, "telegram.play");
     verb(&mut b, b_line, "telegram.play");
-    verb(&mut a, a_viewer, "telegram.play");
     let label = |s: &Session, slot| {
         s.panel(slot).unwrap().borrow().verbs().into_iter()
             .find(|v| v.id == "telegram.play").unwrap().label
     };
     assert_eq!(label(&a, a_line), "pause");
+    clock_a.advance(2.0);
+    verb(&mut a, a_viewer, "telegram.play");
+    assert_eq!(label(&a, a_line), "play", "the viewer takes over without a widget draw");
     assert_eq!(label(&a, a_viewer), "pause");
     clock_a.advance(3600.0);
     assert_eq!(label(&a, a_line), "play");
     assert_eq!(label(&a, a_viewer), "play");
+    assert_eq!(label(&b, b_line), "pause");
+    {
+        let panel = a.panel(a_line).unwrap();
+        let mut b = panel.borrow_mut();
+        let line = b.as_any().downcast_mut::<Line>().unwrap();
+        assert_eq!(line.player_state(&line.msg().unwrap(), a.now()).unwrap().position, 2.0,
+            "the old timeline must stop at the handoff, not keep advancing behind its play label");
+    }
+    verb(&mut a, a_line, "telegram.play");
+    assert_eq!(label(&a, a_line), "pause");
+    clock_a.advance(3600.0);
+    assert_eq!(label(&a, a_line), "play");
     assert_eq!(label(&b, b_line), "pause");
 }
 
