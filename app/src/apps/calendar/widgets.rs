@@ -1,4 +1,8 @@
-use super::{availability, dates, edit, model, panels, scoped};
+use super::{
+    completion::{self, Field as CompletionField},
+    completion_ui::Offers,
+    dates, edit, model, panels, scoped,
+};
 use crate::reader::{self, pictures};
 use crate::shell::{
     hosted::PanelProps,
@@ -153,6 +157,8 @@ pub struct CalendarMonthPanel {
     days: Vec<(Rect, String)>,
     #[rust]
     mounted: bool,
+    #[rust]
+    selected_day: String,
 }
 impl Widget for CalendarMonthPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
@@ -190,6 +196,7 @@ impl Widget for CalendarMonthPanel {
                 return;
             }
             if let Some((_, day)) = self.days.iter().find(|(r, _)| r.contains(e.abs)) {
+                self.selected_day = day.clone();
                 let target = props
                     .panel
                     .borrow_mut()
@@ -235,7 +242,14 @@ impl Widget for CalendarMonthPanel {
                 .join("; "),
         );
         let grid = dates::grid(&month);
-        let cell_height = ((cx.peek_walk_turtle(walk).size.y - 86.0) / 6.0).max(86.0);
+        self.view
+            .label(cx, ids!(month_lbl))
+            .set_text(cx, &dates::month(&month, 0).format("%B %Y").to_string());
+        self.view
+            .label(cx, ids!(month_detail_lbl))
+            .set_text(cx, &format!("{} · {} events in view", zone, rows.len()));
+        let cell_height = ((cx.peek_walk_turtle(walk).size.y - 152.0) / 6.0).max(94.0);
+        let capacity = ((cell_height - 52.0) / 23.0).floor().clamp(1.0, 3.0) as usize;
         let today = scope
             .data
             .get::<Session>()
@@ -276,40 +290,67 @@ impl Widget for CalendarMonthPanel {
                     let cell = week.widget(cx, *path);
                     if let Some(mut view) = cell.as_view().borrow_mut() {
                         view.walk.height = Size::Fixed(cell_height);
+                        view.draw_bg.set_uniform(
+                            cx,
+                            live_id!(quiet),
+                            &[f32::from(col >= 5 || !day.starts_with(&month[..7]))],
+                        );
+                        view.draw_bg.set_uniform(
+                            cx,
+                            live_id!(selected),
+                            &[f32::from(
+                                day == self.selected_day
+                                    || (self.selected_day.is_empty() && day == today),
+                            )],
+                        );
                     }
-
-                    cell.label(cx, ids!(day_lbl)).set_text(
+                    let label = cell.label(cx, ids!(day_lbl));
+                    label.set_text(cx, &date.format("%-d").to_string());
+                    label.set_visible(cx, day != today);
+                    label.set_text_color(
                         cx,
-                        &format!(
-                            "{}{}",
-                            date.format("%d"),
-                            if day == today { " ·" } else { "" }
-                        ),
+                        if day.starts_with(&month[..7]) {
+                            vec4(0.078, 0.078, 0.078, 1.0)
+                        } else {
+                            vec4(0.565, 0.565, 0.565, 1.0)
+                        },
                     );
-                    let mut lines = events
-                        .iter()
-                        .take(3)
-                        .map(|e| {
+                    cell.widget(cx, ids!(today_badge))
+                        .set_visible(cx, day == today);
+                    cell.label(cx, ids!(today_lbl))
+                        .set_text(cx, &date.format("%-d").to_string());
+                    for (n, path) in [ids!(e0), ids!(e1), ids!(e2)].into_iter().enumerate() {
+                        let row = cell.widget(cx, path);
+                        row.set_visible(cx, n < capacity && n < events.len());
+                        let Some(e) = events.get(n).filter(|_| n < capacity) else {
+                            continue;
+                        };
+                        let text = if e.all_day {
+                            e.title.clone()
+                        } else {
                             format!(
                                 "{} {}",
-                                if e.all_day {
-                                    "—".into()
-                                } else {
-                                    dates::local(e.start, &zone)
-                                        .split('T')
-                                        .nth(1)
-                                        .unwrap_or("")
-                                        .to_string()
-                                },
+                                dates::utc(e.start)
+                                    .with_timezone(&dates::zone(&zone).unwrap_or(chrono_tz::UTC))
+                                    .format("%H:%M"),
                                 e.title
                             )
-                        })
-                        .collect::<Vec<_>>();
-                    if events.len() > 3 {
-                        lines.push(format!("+{} more", events.len() - 3));
+                        };
+                        row.label(cx, ids!(title_lbl)).set_text(cx, &text);
+                        if let Some(mut view) = row.as_view().borrow_mut() {
+                            view.draw_bg.set_uniform(
+                                cx,
+                                live_id!(dotted),
+                                &[(e.source % 2) as f32],
+                            );
+                        }
                     }
-                    cell.label(cx, ids!(events_lbl))
-                        .set_text(cx, &lines.join("\n"));
+                    let more = cell.label(cx, ids!(more_lbl));
+                    more.set_visible(cx, events.len() > capacity);
+                    more.set_text(
+                        cx,
+                        &format!("+{} more", events.len().saturating_sub(capacity)),
+                    );
                     drawn.push((cell, day));
                 }
                 week.draw_all(cx, scope);
@@ -610,12 +651,29 @@ const FIELDS: [(&str, &[LiveId]); 9] = [
     ("event reminders", ids!(reminders_input)),
     ("event notes", ids!(notes_input)),
 ];
+fn editor_offers(cx: &mut Cx, form: &WidgetRef) -> Vec<(CompletionField, TextInputRef)> {
+    [
+        (CompletionField::Guests, ids!(guests_input)),
+        (CompletionField::Zone, ids!(zone_input)),
+        (CompletionField::Location, ids!(location_input)),
+        (CompletionField::Repeat, ids!(recurrence_input)),
+        (CompletionField::Reminders, ids!(reminders_input)),
+    ]
+    .into_iter()
+    .map(|(kind, path)| (kind, form.text_input(cx, path)))
+    .collect()
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct CalendarEditorPanel {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[live]
+    suggest: View,
+    #[rust]
+    offers: Offers,
     #[rust]
     form: WidgetRef,
     #[rust]
@@ -623,7 +681,6 @@ pub struct CalendarEditorPanel {
 }
 impl Widget for CalendarEditorPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
@@ -631,8 +688,19 @@ impl Widget for CalendarEditorPanel {
             .iter()
             .map(|(_, p)| self.form.text_input(cx, p))
             .collect::<Vec<_>>();
-        if let Some(i) = form::tab(cx, event, &inputs) {
-            form::reveal(cx, &self.view.portal_list(cx, ids!(list)), &inputs[i]);
+        let fields = editor_offers(cx, &self.form);
+        let completion = self.offers.handle(cx, event, &props, &fields);
+        if completion == Some(false) {
+            self.view.redraw(cx);
+            return;
+        }
+        if completion.is_none() {
+            self.view.handle_event(cx, event, scope);
+        }
+        if completion.is_none() {
+            if let Some(i) = form::tab(cx, event, &inputs) {
+                form::reveal(cx, &self.view.portal_list(cx, ids!(list)), &inputs[i]);
+            }
         }
         // Portal items may redraw between press and release. Resolve form
         // controls from the last visible rectangles, as the Accounts form does.
@@ -657,7 +725,7 @@ impl Widget for CalendarEditorPanel {
         } else {
             None
         };
-        if actions.is_none() && pressed.is_none() {
+        if actions.is_none() && pressed.is_none() && completion != Some(true) {
             return;
         }
         let mut borrow = props.panel.borrow_mut();
@@ -670,7 +738,8 @@ impl Widget for CalendarEditorPanel {
         }
         let mut f = d.form.clone();
         let mut source = d.source;
-        let mut changed = actions.is_some_and(|a| inputs.iter().any(|t| t.changed(a).is_some()));
+        let mut changed = completion == Some(true)
+            || actions.is_some_and(|a| inputs.iter().any(|t| t.changed(a).is_some()));
         if changed {
             f.title = inputs[0].text();
             f.start = inputs[1].text();
@@ -876,14 +945,8 @@ impl Widget for CalendarEditorPanel {
                     ] {
                         w.button(cx, path).set_text(cx, text);
                     }
-                    w.button(cx, ids!(repeat_btn)).set_text(
-                        cx,
-                        if f.recurrence.is_empty() {
-                            "does not repeat"
-                        } else {
-                            &f.recurrence
-                        },
-                    );
+                    w.button(cx, ids!(repeat_btn))
+                        .set_text(cx, completion::repeat_label(&f.recurrence));
                     w.label(cx, ids!(day_hint)).set_visible(cx, f.all_day);
                     w.widget(cx, ids!(scope_row))
                         .set_visible(cx, !model::text(&d.base, "recurringEventId").is_empty());
@@ -932,227 +995,10 @@ impl Widget for CalendarEditorPanel {
                 );
             }
         }
-        DrawStep::done()
-    }
-}
-
-#[derive(Script, ScriptHook, Widget)]
-pub struct CalendarAvailabilityPanel {
-    #[source]
-    source: ScriptObjectRef,
-    #[deref]
-    view: View,
-    #[rust]
-    request: i64,
-    #[rust]
-    click_focus: ClickFocus,
-    #[rust]
-    slots: Vec<(Rect, usize)>,
-}
-impl Widget for CalendarAvailabilityPanel {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-        let Some(props) = scope.props.get::<PanelProps>().cloned() else {
-            return;
-        };
-        let inputs = [
-            self.view.text_input(cx, ids!(start_input)),
-            self.view.text_input(cx, ids!(end_input)),
-            self.view.text_input(cx, ids!(duration_input)),
-        ];
-        form::tab(cx, event, &inputs);
-        self.click_focus.handle(
-            cx,
-            event,
-            &props,
-            &inputs,
-            &[
-                "availability start",
-                "availability end",
-                "availability duration",
-            ],
-        );
-        if let Event::Actions(a) = event {
-            if inputs.iter().any(|t| t.changed(a).is_some()) {
-                if let Some(p) = props
-                    .panel
-                    .borrow_mut()
-                    .as_any()
-                    .downcast_mut::<panels::Availability>()
-                {
-                    if let Some((mut q, _, _, _)) = availability::load(&p.store, p.request) {
-                        q.start = inputs[0].text();
-                        q.end = inputs[1].text();
-                        q.minutes = inputs[2].text().parse().unwrap_or(0);
-                        let request = p.request;
-                        let body = serde_json::to_string(&q).unwrap();
-                        let _=p.store.write(move|c|{c.execute("UPDATE calendar_availability SET request=?1,response=NULL WHERE id=?2",rusqlite::params![body,request])?;Ok(())});
-                    }
-                    self.view.redraw(cx);
-                }
-            }
-        }
-        if let Event::MouseDown(e) = event {
-            if !mine(&props, e.abs) {
-                return;
-            }
-            if let Some((_, i)) = self.slots.iter().find(|(r, _)| r.contains(e.abs)) {
-                if let Some(s) = scope.data.get_mut::<Session>() {
-                    if let Some(p) = props
-                        .panel
-                        .borrow_mut()
-                        .as_any()
-                        .downcast_mut::<panels::Availability>()
-                    {
-                        p.apply(s, *i);
-                    }
-                }
-            }
-        }
-    }
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let Some(props) = scope.props.get::<PanelProps>().cloned() else {
-            return self.view.draw_walk(cx, scope, walk);
-        };
-        let Some((id, data, error)) = props
-            .panel
-            .borrow_mut()
-            .as_any()
-            .downcast_mut::<panels::Availability>()
-            .map(|p| {
-                (
-                    p.request,
-                    availability::load(&p.store, p.request),
-                    p.error.clone(),
-                )
-            })
-        else {
-            return self.view.draw_walk(cx, scope, walk);
-        };
-        let Some((q, result, err, _)) = data else {
-            return self.view.draw_walk(cx, scope, walk);
-        };
-        if self.request != id {
-            self.view
-                .text_input(cx, ids!(start_input))
-                .set_text(cx, &q.start);
-            self.view
-                .text_input(cx, ids!(end_input))
-                .set_text(cx, &q.end);
-            self.view
-                .text_input(cx, ids!(duration_input))
-                .set_text(cx, &q.minutes.to_string());
-            self.request = id;
-        }
-        let line = if !error.is_empty() {
-            error
-        } else if !err.is_empty() {
-            err
-        } else if let Some(r) = &result {
-            format!(
-                "{} · {}\n{} candidate times · {}",
-                if r.complete {
-                    "all calendars checked"
-                } else {
-                    "partial availability — some calendars are unknown"
-                },
-                q.zone,
-                r.slots.len(),
-                dates::label(r.checked, &q.zone)
-            )
-        } else {
-            "checking availability; after editing the window, press check availability".into()
-        };
-        self.view.label(cx, ids!(status_lbl)).set_text(cx, &line);
-        let mut drawn = Vec::new();
-        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
-            let lr = item.as_portal_list();
-            let Some(mut list) = lr.borrow_mut() else {
-                continue;
-            };
-            let n = result
-                .as_ref()
-                .map(|r| r.people.len() + r.slots.len())
-                .unwrap_or(0);
-            list.set_item_range(cx, 0, n);
-            while let Some(i) = list.next_visible_item(cx) {
-                let Some(r) = &result else { continue };
-                if i < r.people.len() {
-                    let p = &r.people[i];
-                    let w = list.item(cx, i, live_id!(person));
-                    w.label(cx, ids!(title_lbl)).set_text(cx, &p.calendar);
-                    w.label(cx, ids!(detail_lbl)).set_text(
-                        cx,
-                        &if p.known {
-                            if p.busy.is_empty() {
-                                "free in this window".into()
-                            } else {
-                                p.busy
-                                    .iter()
-                                    .map(|(a, b)| {
-                                        format!(
-                                            "busy {} – {}",
-                                            dates::label(*a, &q.zone),
-                                            dates::local(*b, &q.zone)
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
-                        } else {
-                            format!("unknown · {}", p.error)
-                        },
-                    );
-                    w.draw_all(cx, scope);
-                } else if let Some((a, b)) = r.slots.get(i - r.people.len()) {
-                    let w = list.item(cx, i, live_id!(slot));
-                    w.as_button().set_text(
-                        cx,
-                        &format!(
-                            "{} – {}{}",
-                            dates::label(*a, &q.zone),
-                            dates::local(*b, &q.zone).split('T').nth(1).unwrap_or(""),
-                            if r.complete { "" } else { " · partial" }
-                        ),
-                    );
-                    w.draw_all(cx, scope);
-                    drawn.push((w, i - r.people.len()));
-                }
-            }
-        }
-        self.slots.clear();
-        let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
-        for (w, i) in drawn {
-            if let Some(r) = props.hits.add_row_clipped(
-                format!("use time {}", i + 1),
-                w.area().rect(cx),
-                clip,
-                MouseCursor::Hand,
-                props.slot,
-            ) {
-                self.slots.push((r, i));
-            }
-        }
-        for (name, path) in [
-            ("availability start", ids!(start_input)),
-            ("availability end", ids!(end_input)),
-            ("availability duration", ids!(duration_input)),
-        ] {
-            props.hits.add_clipped(
-                name,
-                self.view.widget(cx, path).area().rect(cx),
-                self.view.area().rect(cx),
-                MouseCursor::Text,
-                props.slot,
-            );
-        }
-        props.hits.add_clipped(
-            line,
-            self.view.label(cx, ids!(status_lbl)).area().rect(cx),
-            self.view.area().rect(cx),
-            MouseCursor::Default,
-            props.slot,
-        );
+        let fields = editor_offers(cx, &self.form);
+        let clip = self.view.area().rect(cx);
+        self.offers
+            .draw(cx, scope, &props, &fields, &mut self.suggest, clip);
         DrawStep::done()
     }
 }

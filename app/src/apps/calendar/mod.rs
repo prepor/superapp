@@ -8,6 +8,9 @@ use kernel::{
 use std::any::Any;
 mod api;
 mod availability;
+mod availability_ui;
+mod completion;
+mod completion_ui;
 mod dates;
 mod edit;
 mod model;
@@ -72,7 +75,7 @@ impl App for Calendar {
         PROBLEMS
     }
     fn describe(&self) -> Option<&'static str> {
-        Some("Calendar uses shared account identities managed in Accounts. calendar_source holds Google calendar IDs, account IDs, access roles, time zones, Meet support and freshness. calendar_event holds expanded cached occurrences keyed by (source,remote); times are Unix seconds, all-day end dates are exclusive, series is the recurringEventId, raw preserves Google's complete event and ETag. Disconnected accounts and cancelled events are excluded. calendar_sync states the bounded cache coverage; absence from cache does not prove someone is free. calendar_draft is a persistent local form with revision, base snapshot and state; calendar_change is a durable queue (pending/processing/done/failed). Use calendar.draft and calendar.update_draft for local edits, calendar.commit for the exact reviewed revision, and calendar.operation for completion. Never write these tables directly to simulate a successful Google change. Attendee writes can send mail; commit/delete/respond/retry require approval. Google Meet creation is asynchronous: only a returned video entry point is a usable link. calendar_availability stores checked free/busy and per-calendar errors; unknown availability is not free and a suggested slot is not a reservation. Read-only and special Google event types retain their provider fields and may require the Google Calendar website for editing.")
+        Some("Calendar uses shared account identities managed in Accounts. calendar_source holds Google calendar IDs, account IDs, access roles, time zones, Meet support and freshness. calendar_event holds expanded cached occurrences keyed by (source,remote); times are Unix seconds, all-day end dates are exclusive, series is the recurringEventId, raw preserves Google's complete event and ETag. Disconnected accounts and cancelled events are excluded. calendar_sync states the bounded cache coverage; absence from cache does not prove someone is free. calendar_draft is a persistent local form with revision, base snapshot and state; calendar_change is a durable queue (pending/processing/done/failed). Use calendar.draft and calendar.update_draft for local edits, calendar.commit for the exact reviewed revision, and calendar.operation for completion. calendar.suggest returns the editor’s cached guest/name, location, time zone, recurrence, reminder and duration suggestions; it performs no external contact lookup. Never write these tables directly to simulate a successful Google change. Attendee writes can send mail; commit/delete/respond/retry require approval. Google Meet creation is asynchronous: only a returned video entry point is a usable link. calendar_availability stores checked free/busy and per-calendar errors; unknown availability is not free and a suggested slot is not a reservation. Find a time shows participant tracks and an explicit slot selection before applying to the original draft. Search controls are separate from immutable requests; changed guests, account or settings require another check, as do results older than five minutes. Read-only and special Google event types retain their provider fields and may require the Google Calendar website for editing.")
     }
     fn as_any(&self) -> &dyn Any {
         self

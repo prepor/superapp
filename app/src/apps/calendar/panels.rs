@@ -505,20 +505,22 @@ impl Editor {
     pub fn availability(&mut self, s: &mut Session) {
         let Some(d) = self.reading() else { return };
         let r = (|| {
-            let (a, _) = d.form.bounds()?;
-            let day = dates::day(a, &d.form.zone);
+            let (a, b) = d.form.bounds()?;
+            let mut day = dates::day(a.max(s.now()), &d.form.zone);
+            if dates::instant(&format!("{day}T17:00"), &d.form.zone)? <= s.now() {
+                day = (dates::date(&day)? + chrono::Duration::days(1)).to_string();
+            }
             let q = availability::Query {
                 start: format!("{day}T09:00"),
-                end: format!("{day}T18:00"),
+                end: format!("{day}T17:00"),
                 zone: d.form.zone.clone(),
-                minutes: ((d.form.bounds()?.1 - a) / 60.0).clamp(15.0, 480.0) as u32,
-                guests: d
-                    .form
-                    .guests
-                    .split([',', ';', '\n'])
-                    .map(|e| e.trim().trim_start_matches('?').to_string())
-                    .filter(|e| !e.is_empty())
-                    .collect(),
+                minutes: if d.form.all_day {
+                    30
+                } else {
+                    ((b - a) / 60.0).clamp(15.0, 480.0) as u32
+                },
+                guests: availability::guests(&d.form),
+                draft_guests: None,
             };
             let c = model::source(s.store(), d.source).ok_or("calendar disconnected")?;
             let id = availability::request(s, c.account, q, Some(d.id))?;
@@ -528,6 +530,7 @@ impl Editor {
         say(s, r);
     }
 }
+
 impl Panel for Editor {
     fn id(&self) -> &PanelId {
         &self.id
@@ -547,7 +550,7 @@ impl Panel for Editor {
             .unwrap_or("event draft".into())
     }
     fn about(&self) -> String {
-        self.reading().map(|d|format!("Persistent Google Calendar draft {} revision {} on source {}. State: {}. {}. It has not been sent until calendar.commit succeeds. Form: {}",d.id,d.revision,d.source,d.state,d.error,serde_json::to_string(&d.form).unwrap())).unwrap_or(self.error.clone())
+        self.reading().map(|d|format!("Persistent Google Calendar draft {} revision {} on source {}. State: {}. {}. It has not been sent until calendar.commit succeeds. calendar.suggest provides the same guest, location, zone, repeat and reminder choices as the editor. Find a time opens participant tracks beside this draft; choosing a time requires an explicit use this time action. Form: {}",d.id,d.revision,d.source,d.state,d.error,serde_json::to_string(&d.form).unwrap())).unwrap_or(self.error.clone())
     }
     fn wish(&self, _: usize) -> (u32, u32) {
         (5, 6)
@@ -646,17 +649,61 @@ pub struct Availability {
     pub slot: SlotId,
     pub store: Rc<Store>,
     pub error: String,
+    pub search: availability::Search,
+    pub dirty: bool,
+    pub selected: Option<usize>,
 }
 impl Availability {
     pub const TAG: Tag = Tag("calendar-availability");
     pub fn id(id: i64) -> PanelId {
         PanelId::new(Self::TAG, [id.to_string()])
     }
+    pub fn edit_search(&mut self, search: availability::Search) {
+        self.search = search;
+        self.dirty = true;
+        self.selected = None;
+        self.error.clear();
+    }
+    pub fn check(&mut self, s: &mut Session) {
+        match availability::recheck(s, self.request, &self.search) {
+            Ok(id) => {
+                self.request = id;
+                self.dirty = false;
+                self.selected = None;
+                self.error.clear();
+            }
+            Err(e) => self.error = e,
+        }
+        s.redraw();
+    }
     pub fn apply(&mut self, s: &mut Session, index: usize) {
-        let r = availability::apply(s, self.request, index).map(|id| {
-            s.nav_within(open(self.slot, Editor::id(id)));
-        });
-        say(s, r);
+        if self.dirty {
+            self.error = "check availability for these settings first".into();
+            s.redraw();
+            return;
+        }
+        match availability::apply(s, self.request, index) {
+            Ok(id) => {
+                let parent = s.join_parent_of(self.slot).filter(|slot| {
+                    s.panel(*slot)
+                        .is_some_and(|p| p.borrow().persist() == Editor::id(id))
+                });
+                if let Some(parent) = parent {
+                    s.nav_within(Nav::Close {
+                        slot: self.slot,
+                        label: Some("find a time".into()),
+                    });
+                    s.nav(Nav::Focus(parent));
+                } else {
+                    s.nav_within(Nav::Replace {
+                        slot: self.slot,
+                        id: Editor::id(id),
+                    });
+                }
+            }
+            Err(e) => self.error = e,
+        }
+        s.redraw();
     }
 }
 impl Panel for Availability {
@@ -664,44 +711,48 @@ impl Panel for Availability {
         &self.id
     }
     fn persist(&self) -> PanelId {
-        Self::id(self.request)
+        let mut id = Self::id(self.request);
+        id.args.push(serde_json::to_string(&self.search).unwrap());
+        id
     }
     fn title(&self) -> String {
         "find a time".into()
     }
     fn about(&self) -> String {
-        format!("Google free/busy request {}. Unknown calendars are never treated as free. Suggestions are not reservations and may have partial coverage. Result: {}",self.request,availability::load(&self.store,self.request).and_then(|(_,r,_,_)|r).map(|r|serde_json::to_string(&r).unwrap()).unwrap_or("pending".into()))
+        format!("Google free/busy request {}. Search controls: {}. Unchecked edits: {}. Selected slot: {:?}. Select a suggested time, then use this time to update the original draft. Unknown calendars are never free; partial suggestions work only for checked calendars. Result: {}", self.request, serde_json::to_string(&self.search).unwrap(), self.dirty, self.selected, availability::load(&self.store,self.request).and_then(|(_,r,_,_)|r).map(|r|serde_json::to_string(&r).unwrap()).unwrap_or("pending".into()))
     }
     fn wish(&self, _: usize) -> (u32, u32) {
-        (5, 6)
+        (6, 6)
     }
     fn placed(&mut self, slot: SlotId) {
         self.slot = slot;
     }
     fn verbs(&self) -> Vec<Verb> {
-        vec![Verb::run("calendar.check", "check availability", Some('c'))]
+        let mut verbs = Vec::new();
+        if !self.dirty && self.selected.is_some() {
+            verbs.push(Verb::run("calendar.use_time", "use this time", Some('s')));
+        }
+        verbs.push(Verb::run("calendar.check", "check availability", Some('c')));
+        verbs.push(Verb::go(
+            "calendar.cancel_time",
+            "cancel",
+            None,
+            Nav::Close {
+                slot: self.slot,
+                label: Some("find a time".into()),
+            },
+        ));
+        verbs
     }
     fn run(&mut self, v: &str, s: &mut Session) {
-        if v == "calendar.check" {
-            if let Some((q, _, _, draft)) = availability::load(&self.store, self.request) {
-                let account = self
-                    .store
-                    .conn()
-                    .query_row(
-                        "SELECT account FROM calendar_availability WHERE id=?",
-                        [self.request],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0);
-                match availability::request(s, account, q, draft) {
-                    Ok(id) => {
-                        self.request = id;
-                        self.error.clear();
-                    }
-                    Err(e) => self.error = e,
+        match v {
+            "calendar.check" => self.check(s),
+            "calendar.use_time" => {
+                if let Some(i) = self.selected {
+                    self.apply(s, i);
                 }
-                s.redraw();
             }
+            _ => {}
         }
     }
     fn as_any(&mut self) -> &mut dyn Any {
@@ -714,12 +765,26 @@ impl PanelKind for AvailabilityKind {
         Availability::TAG
     }
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
+        let store = cx.session().store().clone();
+        let request = id.args.first().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let original = availability::load(&store, request)
+            .map(|(q, _, _, _)| availability::Search::from_query(&q))
+            .unwrap_or_default();
+        let search = id
+            .args
+            .get(1)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| original.clone());
+        let dirty = search != original;
         Box::new(Availability {
             id: id.clone(),
-            request: id.args.first().and_then(|n| n.parse().ok()).unwrap_or(0),
+            request,
             slot: 0,
-            store: cx.session().store().clone(),
+            store,
             error: String::new(),
+            search,
+            dirty,
+            selected: None,
         })
     }
 }

@@ -433,6 +433,7 @@ fn unknown_and_malformed_freebusy_never_become_free() {
         zone: "UTC".into(),
         minutes: 30,
         guests: vec!["known".into(), "unknown".into()],
+        draft_guests: None,
     };
     let result=availability::calculate(&q,&json!({"calendars":{"known":{"busy":[{"start":"2026-09-08T09:00:00Z","end":"2026-09-08T10:00:00Z"}]},"unknown":{"errors":[{"reason":"notFound"}]}}}),0.0).unwrap();
     assert!(!result.complete);
@@ -462,6 +463,7 @@ fn availability_includes_owner_and_applies_to_persistent_draft() {
         zone: f.zone,
         minutes: 30,
         guests: vec!["external@example.com".into()],
+        draft_guests: None,
     };
     let request = availability::request(&mut s, 1, q, Some(id)).unwrap();
     refresh(&s);
@@ -517,7 +519,26 @@ fn tools_have_strict_schemas_and_external_writes_ask() {
     assert!(!s.apps().tool("calendar.draft").unwrap().asks);
     let result = run(&mut s, "calendar.calendars", json!({})).unwrap();
     assert_eq!(result.as_array().unwrap().len(), 2);
+    let result = run(
+        &mut s,
+        "calendar.suggest",
+        json!({"field":"guests","text":"nor"}),
+    )
+    .unwrap();
+    assert!(result["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["value"] == "nora@studio.example"));
+    assert!(!s.apps().tool("calendar.suggest").unwrap().asks);
+    assert!(run(
+        &mut s,
+        "calendar.suggest",
+        json!({"field":"title","text":"nor"})
+    )
+    .is_err());
 }
+
 #[test]
 fn ui_opening_creates_and_restores_the_same_draft() {
     let mut s = session();
@@ -702,6 +723,7 @@ fn availability_cannot_apply_an_old_guest_list() {
         zone: f.zone,
         minutes: 30,
         guests: vec![],
+        draft_guests: None,
     };
     let request = availability::request(&mut s, 1, q, Some(id)).unwrap();
     refresh(&s);
@@ -751,6 +773,7 @@ fn rechecking_availability_keeps_the_latest_request_on_screen_and_restore() {
         zone: f.zone,
         minutes: 30,
         guests: vec![],
+        draft_guests: None,
     };
     let old = availability::request(&mut s, 1, q, Some(draft)).unwrap();
     refresh(&s);
@@ -774,4 +797,319 @@ fn rechecking_availability_keeps_the_latest_request_on_screen_and_restore() {
         s.panel(restored).unwrap().borrow().persist().args[0],
         new.to_string()
     );
+}
+
+#[test]
+fn guests_complete_names_and_emails_without_repeating_existing_guests() {
+    use kernel::richtable::Completion;
+    let s = session();
+    let field = completion::Field::Guests;
+    let ctx = field.context("nor", 3).unwrap();
+    let choices = field.offer(s.store(), &ctx);
+    let nora = choices
+        .iter()
+        .find(|v| v.value == "nora@studio.example")
+        .unwrap();
+    assert_eq!(nora.label, "Nora");
+    assert_eq!(
+        field.splice("nor", 3, &ctx, nora),
+        ("nora@studio.example, ".into(), 21)
+    );
+    let text = "leo@studio.example; ?nora-old@example.com, somebody@example.com";
+    let at = text.find("nora").unwrap() + 2;
+    let ctx = field.context(text, at).unwrap();
+    let (line, cursor) = field.splice(text, at, &ctx, nora);
+    assert_eq!(
+        line,
+        "leo@studio.example; ?nora@studio.example, somebody@example.com"
+    );
+    assert_eq!(&line[..cursor], "leo@studio.example; ?nora@studio.example");
+    let already = "?NORA@studio.example; no";
+    let ctx = field.context(already, already.len()).unwrap();
+    assert!(field
+        .offer(s.store(), &ctx)
+        .iter()
+        .all(|v| v.value != "nora@studio.example"));
+    let ctx = field.context("Kovac", 5).unwrap();
+    assert!(field
+        .offer(s.store(), &ctx)
+        .iter()
+        .any(|v| v.label.contains("Kovac")));
+    let text = "léa@example.com, ?nor";
+    let ctx = field.context(text, text.len()).unwrap();
+    assert_eq!(
+        field.splice(text, text.len(), &ctx, nora).0,
+        "léa@example.com, ?nora@studio.example, "
+    );
+}
+
+#[test]
+fn calendar_only_stores_offer_guests_and_useful_field_presets() {
+    use kernel::richtable::Completion;
+    static APPS: &[&dyn App] = &[&crate::apps::accounts::ACCOUNTS, &CALENDAR];
+    let s = Session::fake(APPS);
+    refresh(&s);
+    let field = completion::Field::Guests;
+    assert!(field
+        .offer(s.store(), &field.context("nor", 3).unwrap())
+        .iter()
+        .any(|v| v.value == "nora@studio.example"));
+    for (field, text, expected) in [
+        (completion::Field::Zone, "berlin", "Europe/Berlin"),
+        (
+            completion::Field::Location,
+            "meeting-room",
+            "https://example.com/meeting-room",
+        ),
+        (
+            completion::Field::Repeat,
+            "weekday",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        ),
+        (completion::Field::Reminders, "10", "popup:10"),
+        (completion::Field::Reminders, "No reminders", ""),
+        (completion::Field::Duration, "45", "45"),
+    ] {
+        let ctx = field.context(text, text.len()).unwrap();
+        let choices = field.offer(s.store(), &ctx);
+        assert!(
+            choices.iter().any(|v| v.value == expected),
+            "{field:?}: {choices:?}"
+        );
+    }
+    let field = completion::Field::Repeat;
+    let choices = field.offer(s.store(), &field.context("RRULE:FREQ=WEEKLY", 17).unwrap());
+    assert_eq!(choices[0].value, "RRULE:FREQ=WEEKLY");
+    assert!(choices.iter().all(|v| v.describe.is_empty()));
+}
+
+#[test]
+fn edited_search_settings_do_not_change_pending_queries_and_rechecks_use_current_guests() {
+    let mut s = session();
+    let (draft, mut f) = form(&mut s);
+    f.guests = "nora@studio.example".into();
+    edit::save(&mut s, draft, 1, 1, f.clone()).unwrap();
+    let day = &f.start[..10];
+    let q = availability::Query {
+        start: format!("{day}T09:00"),
+        end: format!("{day}T18:00"),
+        zone: f.zone.clone(),
+        minutes: 30,
+        guests: availability::guests(&f),
+        draft_guests: None,
+    };
+    let request = availability::request(&mut s, 1, q, Some(draft)).unwrap();
+    let slot = open(&mut s, panels::Availability::id(request));
+    let panel = s.panel(slot).unwrap();
+    {
+        let mut panel = panel.borrow_mut();
+        let p = panel
+            .as_any()
+            .downcast_mut::<panels::Availability>()
+            .unwrap();
+        let mut search = p.search.clone();
+        search.minutes = "oops".into();
+        p.edit_search(search);
+        p.check(&mut s);
+        assert_eq!(p.request, request);
+        assert!(!p.error.is_empty());
+    }
+    refresh(&s);
+    let (old, result, _, _) = availability::load(s.store(), request).unwrap();
+    assert_eq!(old.minutes, 30);
+    assert!(result.is_some());
+    let d = edit::draft(s.store(), draft).unwrap();
+    let mut form = d.form;
+    form.guests = "leo@studio.example".into();
+    edit::save(&mut s, draft, d.revision, 1, form).unwrap();
+    assert!(
+        availability::draft_error(s.store(), request, &old, Some(draft))
+            .unwrap()
+            .contains("guest list changed")
+    );
+    {
+        let mut panel = panel.borrow_mut();
+        let p = panel
+            .as_any()
+            .downcast_mut::<panels::Availability>()
+            .unwrap();
+        p.search.minutes = "45".into();
+        p.check(&mut s);
+        assert_ne!(p.request, request);
+        assert!(!p.dirty);
+        assert!(p.error.is_empty());
+        let (new, _, _, _) = availability::load(s.store(), p.request).unwrap();
+        assert_eq!(new.minutes, 45);
+        assert!(new.guests.contains(&"leo@studio.example".into()));
+        assert!(!new.guests.contains(&"nora@studio.example".into()));
+    }
+    assert_eq!(
+        availability::load(s.store(), request).unwrap().0.minutes,
+        30
+    );
+}
+
+#[test]
+fn availability_tracks_removed_guests_and_account_changes_but_allows_title_edits() {
+    let mut s = session();
+    let (draft, mut f) = form(&mut s);
+    f.guests = "nora@studio.example".into();
+    edit::save(&mut s, draft, 1, 1, f.clone()).unwrap();
+    let search = availability::Search {
+        day: f.start[..10].into(),
+        end_day: f.start[..10].into(),
+        from: "09:00".into(),
+        until: "17:00".into(),
+        minutes: "30".into(),
+        zone: f.zone.clone(),
+    };
+    // Draft guests must be checked even if a tool only supplies extra calendars.
+    let request =
+        availability::request(&mut s, 1, search.query(vec![]).unwrap(), Some(draft)).unwrap();
+    refresh(&s);
+    let (q, result, _, _) = availability::load(s.store(), request).unwrap();
+    assert!(q.guests.contains(&"nora@studio.example".into()));
+    assert!(!result.unwrap().slots.is_empty());
+    let d = edit::draft(s.store(), draft).unwrap();
+    f.title = "Renamed review".into();
+    edit::save(&mut s, draft, d.revision, 1, f.clone()).unwrap();
+    assert!(availability::draft_error(s.store(), request, &q, Some(draft)).is_none());
+    f.guests.clear();
+    let d = edit::draft(s.store(), draft).unwrap();
+    edit::save(&mut s, draft, d.revision, 1, f.clone()).unwrap();
+    assert!(availability::apply(&mut s, request, 0)
+        .unwrap_err()
+        .contains("guest list changed"));
+    let new = availability::recheck(&mut s, request, &search).unwrap();
+    let (q, _, _, _) = availability::load(s.store(), new).unwrap();
+    assert!(!q.guests.contains(&"nora@studio.example".into()));
+    let source = s.store()
+        .write(|c| {
+            let account = crate::identity::accounts::add_account_tx(c, "other@example.com", "", "", "google")?;
+            crate::identity::set_services(c, account, false, true)?;
+            c.execute("INSERT INTO calendar_source(account,remote,title,role) VALUES(?,'other@example.com','Other','owner')", [account])?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap();
+    let d = edit::draft(s.store(), draft).unwrap();
+    edit::save(&mut s, draft, d.revision, source, f).unwrap();
+    assert!(availability::draft_error(s.store(), new, &q, Some(draft))
+        .unwrap()
+        .contains("account changed"));
+}
+
+#[test]
+fn choosing_a_time_updates_the_original_editor_and_closes_the_scheduling_sheet() {
+    let mut s = session();
+    let (draft, _) = form(&mut s);
+    let editor = open(&mut s, panels::Editor::id(draft));
+    s.panel(editor)
+        .unwrap()
+        .borrow_mut()
+        .run("calendar.find", &mut s);
+    s.settle();
+    refresh(&s);
+    let slot = s.focus().unwrap();
+    assert_ne!(slot, editor);
+    assert_eq!(s.join_parent_of(slot), Some(editor));
+    let panel = s.panel(slot).unwrap();
+    {
+        let mut panel = panel.borrow_mut();
+        let p = panel
+            .as_any()
+            .downcast_mut::<panels::Availability>()
+            .unwrap();
+        let (_, r, _, _) = availability::load(s.store(), p.request).unwrap();
+        assert!(!r.unwrap().slots.is_empty());
+        p.selected = Some(0);
+        crate::shell::bar::check(&p.verbs());
+        p.run("calendar.use_time", &mut s);
+    }
+    s.settle();
+    assert_eq!(s.focus(), Some(editor));
+    assert!(s.panel(slot).is_none());
+    assert_eq!(
+        s.panel(editor).unwrap().borrow().persist(),
+        panels::Editor::id(draft)
+    );
+    assert_eq!(edit::draft(s.store(), draft).unwrap().revision, 2);
+}
+
+#[test]
+fn unavailable_calendars_offer_no_unchecked_times_and_tracks_clip_to_the_window() {
+    let q = availability::Query {
+        start: "2026-09-08T09:00".into(),
+        end: "2026-09-08T17:00".into(),
+        zone: "Europe/Berlin".into(),
+        minutes: 30,
+        guests: vec!["private@example.com".into()],
+        draft_guests: None,
+    };
+    let r = availability::calculate(&q, &json!({"calendars":{}}), 0.0).unwrap();
+    assert!(!r.complete);
+    assert!(r.slots.is_empty());
+    assert_eq!(
+        availability_ui::fraction(8.0, 10.0, 9.0, 17.0),
+        Some((0.0, 0.125))
+    );
+    assert_eq!(
+        availability_ui::fraction(16.0, 19.0, 9.0, 17.0),
+        Some((0.875, 1.0))
+    );
+    assert_eq!(availability_ui::fraction(6.0, 8.0, 9.0, 17.0), None);
+    assert_eq!(availability_ui::fraction(12.0, 11.0, 9.0, 17.0), None);
+    let mut search = availability::Search::from_query(&q);
+    search.shift(1).unwrap();
+    let moved = search.query(q.guests).unwrap();
+    assert_eq!(moved.start, "2026-09-09T09:00");
+    search.minutes = "480".into();
+    search.until = "10:00".into();
+    assert!(search.query(vec![]).is_err());
+    let repeated = availability::Query {
+        start: "2026-10-25T02:15:00+02:00".into(),
+        end: "2026-10-25T02:15:00+01:00".into(),
+        zone: "Europe/Berlin".into(),
+        minutes: 30,
+        guests: vec![],
+        draft_guests: None,
+    };
+    let restored = availability::Search::from_query(&repeated)
+        .query(vec![])
+        .unwrap();
+    assert_eq!(restored.validate().unwrap(), repeated.validate().unwrap());
+}
+
+#[cfg(headless)]
+#[test]
+fn scheduling_templates_load_without_a_window_or_event_loop() {
+    use makepad_widgets::*;
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let (editor, availability, track, month) = cx.with_vm(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::shell::script_mod(vm);
+        crate::reader::ui::script_mod(vm);
+        super::ui::script_mod(vm);
+        let editor = script_eval!(vm,{mod.widgets.CalendarEditorPanel{}});
+        let availability = script_eval!(vm,{mod.widgets.CalendarAvailabilityPanel{}});
+        let track = script_eval!(vm,{mod.widgets.CalendarTimeTrack{}});
+        let month = script_eval!(vm,{mod.widgets.CalendarMonthPanel{}});
+        (
+            WidgetRef::script_from_value(vm, editor),
+            WidgetRef::script_from_value(vm, availability),
+            WidgetRef::script_from_value(vm, track),
+            WidgetRef::script_from_value(vm, month),
+        )
+    });
+    assert!(editor
+        .borrow::<super::widgets::CalendarEditorPanel>()
+        .is_some());
+    assert!(availability
+        .borrow::<super::availability_ui::CalendarAvailabilityPanel>()
+        .is_some());
+    assert!(track
+        .borrow::<super::availability_ui::CalendarTimeTrack>()
+        .is_some());
+    assert!(month
+        .borrow::<super::widgets::CalendarMonthPanel>()
+        .is_some());
 }

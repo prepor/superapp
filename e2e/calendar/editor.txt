@@ -18,15 +18,16 @@ click "event Meet"
 shot calendar-editor
 click "find a time"
 wait 900
-visible "partial availability"
+visible "Partial availability"
 click "availability duration"
 key cmd+a
 type "30"
 click "check availability"
 wait 800
-visible "9 candidate times"
+visible "candidate times"
 shot calendar-availability
-click "use time 1"
+click "select time 1"
+click "use this time"
 wait 600
 click "save event"
 wait 1000

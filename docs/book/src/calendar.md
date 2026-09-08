@@ -10,6 +10,9 @@ of calendar checkboxes beneath it.
 next, and today move through months. Selecting a date opens that day's agenda;
 selecting an agenda row previews its event in a joined panel. Both views keep
 the filter when switching. Multi-day events occupy every overlapping date.
+The grid gives each event its own padded row and calendar accent, marks today
+with a dark date badge, and softens weekends and dates outside the current month.
+Busy dates show an overflow count; opening the day reveals every event.
 
 Event details use the shared rich-text reader: links in descriptions, locations,
 and Meet URLs are clickable. Descriptions retain HTML formatting and labelled
@@ -52,6 +55,17 @@ guests and optional guests, location, notes, Meet, recurrence, visibility,
 busy/free, reminders, guest permissions, and whether to notify guests. Tab and
 Shift-Tab move among fields and reveal the focused field when necessary.
 
+Guests autocomplete by name or email using cached event guests and organizers,
+non-spam Mail correspondents, and connected account addresses. Suggestions omit
+people already invited and preserve the `?` prefix for optional guests. Choose
+with the arrow keys and Enter or Tab, or click a suggestion; Escape dismisses it.
+This uses local data and does not require Google Contacts access.
+
+Time zones are searchable by IANA name or city. Locations suggest recently used
+event locations, and repeat and reminder fields offer readable presets while
+retaining custom values. A completed preset closes its suggestion box so Tab can
+continue through the form.
+
 Start and end accept `YYYY-MM-DDTHH:MM`, or an RFC3339 timestamp with an explicit
 offset. Ambiguous and skipped local times around daylight saving are rejected;
 an existing event in a repeated hour retains its offset. All-day events use an
@@ -91,13 +105,28 @@ Meet uses `conferenceData.createRequest` with `conferenceDataVersion=1`. Google
 can return a pending conference request; only a returned video entry point is
 shown as a join link. The source must advertise Meet support.
 
-**find a time** checks Google's FreeBusy endpoint for the draft's guests and
-all connected owned calendars, regardless of display filters. Other connected
-accounts use their own grants. The scheduling panel shows busy intervals and
-whether each calendar's availability could be read. Unknown or inaccessible
-calendars remain unknown. Suggested times with partial coverage are labelled
-as such; a suggestion is not a reservation. Applying a time updates the same
-local draft. A changed guest list or stale result requires another check.
+**find a time** opens a scheduling sheet beside the draft. Choose the date,
+meeting length, search hours and time zone, then **check availability**. Date
+arrows check the previous or next day; meeting lengths and times offer presets.
+The default search covers 09:00–17:00 on the draft's date, or the next applicable
+date when that window has passed.
+
+The sheet checks Google's FreeBusy endpoint for the draft's guests and all
+connected owned calendars, regardless of display filters. Other connected
+accounts use their own grants. Participant rows share a single time axis, with
+busy blocks, striped unknown availability, and the selected time outlined across
+every row. Owned calendars are combined in the **You** row.
+
+Select a suggested time, then **use this time** to update the original local
+draft and return to its editor. Selecting a row alone does not change the draft.
+Unknown calendars stay unknown; partial suggestions only cover readable
+calendars, and no suggestions appear if none can be checked. A suggestion is
+not a reservation.
+
+Editing search controls does not alter an in-flight request. Each check creates
+a new request using the draft's current guests and account. Changed settings,
+changed participants or account, and results older than five minutes require
+another check before applying a time. Search controls survive panel restoration.
 
 Google's API supports both features. Reading another person's free/busy depends
 on sharing and Workspace permissions; knowing an email address grants no access.
@@ -140,6 +169,7 @@ and the same draft/queue implementation used by the UI.
 | Tools | Purpose |
 |---|---|
 | `calendar.calendars`, `calendar.events`, `calendar.event` | sources, bounded cached occurrences, full event and revision |
+| `calendar.suggest` | the editor's guest, location, time zone and field preset suggestions |
 | `calendar.draft`, `calendar.update_draft` | create, read and edit a persistent local draft |
 | `calendar.commit` | queue the exact reviewed draft revision |
 | `calendar.delete`, `calendar.respond` | delete with explicit scope, or send RSVP |
@@ -159,7 +189,8 @@ are launcher roots. The panel library includes native scenes.
 
 The deterministic fake supplies recurrence expansion, ETags, CRUD, Meet and
 permission-dependent free/busy. Unit tests cover the write queue, recurring
-scopes, conflicts, time zones, permission preservation and strict tools. Native
+scopes, conflicts, time zones, guest completion, immutable availability requests,
+stale participants, original-draft updates, permission preservation and strict tools. Native
 scripts in `e2e/calendar/` exercise filtering, month navigation, RSVP, editing,
 availability and saving through real widget input paths. Live Google consent
 and an actual account round trip require a configured desktop OAuth client.
