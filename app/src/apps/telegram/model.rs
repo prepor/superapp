@@ -1333,6 +1333,28 @@ pub fn history_in(store: &Store, chat: PeerId, topic: i64) -> std::rc::Rc<Vec<Ms
     store.rows(&Q_HISTORY, &[Val::I(chat), Val::I(topic)], msg_row)
 }
 
+pub(super) fn read_history(conn: &rusqlite::Connection, chat: PeerId, topic: i64) -> rusqlite::Result<Vec<Msg>> {
+    let mut statement = conn.prepare_cached(Q_HISTORY.sql)?;
+    let rows = statement.query_map([chat, topic], msg_row)?;
+    rows.collect()
+}
+
+pub(super) fn trace_history(store: &Store, chat: PeerId, topic: i64, rows: usize) {
+    store.trace_rows(&Q_HISTORY, &[Val::I(chat), Val::I(topic)], rows);
+}
+
+static Q_FIRST_UNREAD: Q = Q {
+    id: "tg first unread",
+    sql: "SELECT id FROM tg_message WHERE chat = ?1 AND (?2 = 0 OR topic = ?2)
+          AND id > ?3 AND out = 0 AND service = 0 ORDER BY date, id LIMIT 1",
+    describe: "the unread divider, without loading the transcript",
+};
+
+pub fn first_unread_in(store: &Store, chat: PeerId, topic: i64, last_read: MsgId) -> Option<MsgId> {
+    store.rows(&Q_FIRST_UNREAD, &[Val::I(chat), Val::I(topic), Val::I(last_read)], |r| r.get(0))
+        .first().copied()
+}
+
 static Q_FOLDERS: Q = Q {
     id: "tg folders",
     sql: "SELECT name FROM tg_folder ORDER BY id",
@@ -1733,7 +1755,12 @@ pub fn message_topic(store: &Store, chat: PeerId, id: MsgId) -> i64 {
 /// One line, by id.
 #[must_use]
 pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
-    history(store, chat).iter().find(|m| m.id == id).cloned()
+    let sql = Q_HISTORY.sql.replace(
+        "WHERE m.chat = ?1 AND (?2 = 0 OR m.topic = ?2)",
+        "WHERE m.chat = ?1 AND m.id = ?2",
+    );
+    store.rows_sql("tg line", "one message and its reply", &sql, &[Val::I(chat), Val::I(id)], msg_row)
+        .first().cloned()
 }
 
 /// The Telegram conversation tag. The agent app owns the bare `chat` tag;

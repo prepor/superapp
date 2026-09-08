@@ -9,6 +9,14 @@ even when the native client is linked.
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
 
+Chat previews prepare their cached transcript on a background reader. Draws
+reuse those rows and prepare players only for visible messages. Rapid cursor
+walks prioritize the latest chat and discard obsolete queued reads; the eight
+most recent transcripts remain cached. Updates keep the current transcript
+visible while its replacement loads. Photo reads, decoding and map rendering
+also run on workers, with a bounded texture cache shared across chats. Opening
+an unread chat still records its read claim and preserves its unread divider.
+
 Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
 answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
 Following several originals keeps each return point, so repeated `back`

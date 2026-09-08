@@ -1,0 +1,28 @@
+# A burst of previews must finish on the latest chat, with working transcript
+# navigation and the correct peer. No waits between the arrow-key bursts.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+key down 9
+key up 9
+key down 9
+key up 9
+key down 9
+key up 9
+wait 100
+key enter
+wait 100
+key esc
+key home
+wait 100
+visible "Vera Kovac: see you at 7:30 then?"
+click "about"
+wait 100
+click "@vera"
+quit
