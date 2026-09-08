@@ -18,6 +18,7 @@
 # Apps
 
 - [Mail](./mail.md)
+- [RSS](./rss.md)
 - [Telegram](./telegram.md)
 - [Files](./files.md)
 - [Agents](./agents.md)

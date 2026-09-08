@@ -395,6 +395,9 @@ work rather than losing it.
 
 ## HTML and pictures
 
+The HTML cleanup, typography and image cache live in `app/src/reader/`,
+shared with [RSS](./rss.md). Mail supplies the inline MIME file adapter.
+
 A letter arrives as text, or as text and HTML. A reader draws the HTML when
 there is one; a reply quotes the text.
 

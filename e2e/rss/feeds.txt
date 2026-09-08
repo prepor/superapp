@@ -1,0 +1,47 @@
+# args:
+# env:
+# Subscribe, fetch through the fake capability, remove, and undo.
+wait 900
+key cmd 2
+wait 400
+type "feeds"
+wait 400
+key enter
+wait 600
+visible "Field notes"
+visible "The workshop"
+click "add feed"
+wait 500
+click "feed URL"
+type "not a feed URL"
+key enter
+wait 400
+visible "enter a full feed URL"
+click "feed URL"
+key cmd+a
+type "https://example.com/new-feed.xml"
+key enter
+wait 1000
+visible "Your first new article"
+shot f1-added
+click "Your first new article"
+wait 600
+visible "article body"
+
+# Return to the subscriptions through the launcher.
+key cmd 2
+wait 400
+type "feeds"
+wait 400
+key enter
+wait 600
+visible "A new subscription"
+click "A new subscription"
+wait 500
+click "remove 1"
+wait 600
+key cmd+z
+wait 600
+visible "A new subscription"
+shot f2-undo
+quit

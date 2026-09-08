@@ -1404,6 +1404,11 @@ fn href(attrs: &[(String, String)]) -> Option<String> {
 /// decode.
 #[must_use]
 pub fn sanitize(src: &str) -> String {
+    sanitize_with_base(src, None)
+}
+
+/// Narrow a document and resolve relative links and images against its source.
+pub fn sanitize_with_base(src: &str, base: Option<&str>) -> String {
     let mut src = src;
     if src.len() > MAX_IN {
         let mut end = MAX_IN;
@@ -1416,7 +1421,21 @@ pub fn sanitize(src: &str) -> String {
     // spec says; composers send emoji that way, so the pairs are put back
     // together first.
     let fixed = entities::guard(src);
-    let doc = parse(&fixed);
+    let mut doc = parse(&fixed);
+    if let Some(base) = base.and_then(|s| url::Url::parse(s).ok()) {
+        for node in &mut doc.nodes {
+            let Kind::Element { attrs, .. } = &mut node.kind else {
+                continue;
+            };
+            for (name, value) in attrs {
+                if matches!(name.as_str(), "href" | "src") {
+                    if let Ok(url) = base.join(value.trim()) {
+                        *value = url.to_string();
+                    }
+                }
+            }
+        }
+    }
     let sheet = StyleSheet::parse(&doc.css);
     let mut walk = Walk {
         doc: &doc,
@@ -1425,6 +1444,30 @@ pub fn sanitize(src: &str) -> String {
     };
     walk.node(0, &Ctx::default());
     walk.out.finish()
+}
+
+/// Literal feed text must stay text even when it contains HTML-looking syntax.
+pub fn from_text(src: &str) -> String {
+    let mut escaped = String::new();
+    esc(&mut escaped, src);
+    sanitize(&format!("<p>{}</p>", escaped.replace('\n', "<br>")))
+}
+
+/// Display text from a short, narrowed reading, with entities decoded.
+/// `plain` instead estimates layout and substitutes entities with a dot.
+pub fn text_content(src: &str) -> String {
+    let doc = parse(src);
+    let mut out = String::new();
+    for node in &doc.nodes {
+        match &node.kind {
+            Kind::Text(text) => out.push_str(text),
+            Kind::Element { name, .. } if name == "br" || BLOCKS.contains(&name.as_str()) => {
+                out.push(' ')
+            }
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A narrowed document as plain lines: tags go, the ones that stand on their

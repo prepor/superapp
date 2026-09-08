@@ -44,7 +44,7 @@ mail-parser = "0.11"
 
 # The HTML reading of a letter: parse it the way a browser would, read the
 # author's stylesheet for what it hides, and narrow the result to what the
-# `Html` widget draws (`apps/mail/html.rs`).
+# `Html` widget draws (`reader/html.rs`), shared by mail and RSS.
 html5ever = "0.39"
 markup5ever_rcdom = "0.39.0"
 simplecss = "0.2"
@@ -55,6 +55,10 @@ url = "2"
 
 # Unicode control and format categories in downloaded filenames.
 regex = { version = "1", default-features = false, features = ["std", "unicode-gencat"] }
+
+# Syndication parsing and bounded HTTP fetching for the RSS reader.
+feed-rs = "2.4"
+ureq = "3.4"
 
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
 # POST the token endpoint takes.

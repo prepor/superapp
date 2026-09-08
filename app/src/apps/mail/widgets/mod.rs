@@ -29,5 +29,4 @@ pub use compose::ComposePanel;
 pub use contact::ContactPanel;
 pub use mailbox::MailboxPanel;
 pub use message::MessagePanel;
-pub use pictures::HtmlImage;
 pub use settings::SettingsPanel;

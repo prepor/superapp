@@ -1,0 +1,38 @@
+# args:
+# env:
+# RSS uses the shared table, opens a selectable reader, and keeps the
+# selected article under @unseen until the cursor moves.
+wait 900
+key cmd 2
+wait 400
+type "rss"
+wait 400
+key enter
+wait 700
+visible "Make room for reading"
+visible "Small tools, lasting habits"
+key down
+wait 700
+visible "article body"
+shot r1-reading
+click "article body"
+wait 200
+key cmd+left
+wait 300
+key down
+wait 600
+visible "Small tools, lasting habits"
+visible "article body"
+shot r2-next
+
+# The archive is just an empty filter.
+click "filter"
+key cmd+a
+key backspace
+wait 600
+visible "Already on the bookshelf"
+type "@feed:Field"
+wait 500
+visible "Make room for reading"
+shot r3-filtered
+quit
