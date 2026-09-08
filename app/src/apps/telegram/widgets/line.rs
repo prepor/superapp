@@ -12,6 +12,7 @@ use crate::shell::widgets::media;
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark};
 use super::super::panels::{Line, Viewer};
+use super::inline_video::InlineVideo;
 
 /// The widget.
 #[derive(Script, ScriptHook, Widget)]
@@ -33,10 +34,14 @@ pub struct LinePanel {
     viewed: Option<super::super::runtime::MessageView>,
     #[rust]
     background: bool,
+    #[rust]
+    video: InlineVideo,
 }
 
 impl Widget for LinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let clip_box = self.view.widget(cx, ids!(clip_box));
+        let before = media::video_word(cx, &clip_box);
         match event {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
@@ -52,7 +57,27 @@ impl Widget for LinePanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if media::video_word(cx, &clip_box) != before {
+            self.view.redraw(cx);
+            if let Event::VideoDecodingError(error) = event {
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    if let Some(l) = props.panel.borrow_mut().as_any().downcast_mut::<Line>() {
+                        l.playback.pause(s.now());
+                    }
+                    super::super::runtime::of(s.store()).operations.report(
+                        s.store(), "playing video", &error.error,
+                    );
+                    s.redraw();
+                }
+            }
+        }
         if let Some(s) = scope.data.get_mut::<Session>() {
+            if self.background || !super::message_panel_visible(s, props.slot) {
+                if let Some(l) = props.panel.borrow_mut().as_any().downcast_mut::<Line>() {
+                    l.playback.pause(s.now());
+                }
+                media::pause_video(cx, &clip_box);
+            }
             if !super::message_panel_visible(s, props.slot) { self.viewed = None; }
             let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
                 .is_some_and(|l| l.poll_reactions(s));
@@ -75,6 +100,7 @@ impl Widget for LinePanel {
             }
         }
         let Event::MouseDown(e) = event else { return };
+        if e.button != MouseButton::PRIMARY { return; }
         if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
             return;
         }
@@ -97,6 +123,8 @@ impl Widget for LinePanel {
                 let mut borrow = props.panel.borrow_mut();
                 borrow.as_any().downcast_mut::<Line>().and_then(|l| {
                     let m = l.msg()?;
+                    l.playback.pause(now);
+                    media::pause_video(cx, &clip_box);
                     Some(Viewer::id(m.chat, m.id))
                 })
             };
@@ -121,18 +149,24 @@ impl Widget for LinePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = super::now(scope);
-        let Some((m, player, playing)) = ({
+        let clip_box = self.view.widget(cx, ids!(clip_box));
+        let Some((m, drawn)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Line>().and_then(|l| {
                 let m = l.msg()?;
-                let st = l.player_state(&m, now);
-                Some((m, st, l.playing(now)))
+                let drawn = self.video.drive(cx, &clip_box, &mut l.playback, &m, now);
+                Some((m, drawn))
             })
         }) else {
             self.viewed = None;
+            self.video.reset(cx);
             self.view.label(cx, ids!(gone_lbl)).set_visible(cx, true);
             return self.view.draw_walk(cx, scope, walk);
         };
+        let player = drawn.player;
+        if let Some(mut video) = clip_box.borrow_mut::<View>() {
+            video.walk.height = Size::Fixed(super::inline_video::height(&m));
+        }
         if let Some(s) = scope.data.get_mut::<Session>() {
             let ids = if !self.background && super::message_panel_visible(s, props.slot)
                 && m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
@@ -190,10 +224,10 @@ impl Widget for LinePanel {
             m.media.as_ref().and_then(|md| md.reference.as_deref()).unwrap_or("")
         );
         let fresh = self.shown.as_deref() != Some(key.as_str());
-        let bytes = m
+        let bytes = (!drawn.shown).then(|| m
             .media
             .as_ref()
-            .and_then(|md| md.picture_bytes(store_dir.as_deref()));
+            .and_then(|md| md.picture_bytes(store_dir.as_deref()))).flatten();
         let img_box = v.widget(cx, ids!(img_box));
         let decoded = media::fill_picture(cx, &img_box, bytes.as_deref(), fresh);
         self.shown = decoded.then_some(key);
@@ -211,6 +245,9 @@ impl Widget for LinePanel {
         }
         let player_w = v.widget(cx, ids!(player));
         media::fill_player(cx, &player_w, player.as_ref());
+        let note = v.label(cx, ids!(download_lbl));
+        note.set_text(cx, drawn.note.as_deref().unwrap_or(""));
+        note.set_visible(cx, drawn.note.is_some());
         let sticker = m.media.as_ref().filter(|md| md.is_sticker());
         let sticker_lbl = v.label(cx, ids!(sticker_lbl));
         sticker_lbl.set_text(cx, sticker.and_then(|s| s.label.as_deref()).unwrap_or(""));
@@ -269,14 +306,22 @@ impl Widget for LinePanel {
                 MouseCursor::Hand,
                 props.slot,
             );
+            props.hits.add(st.time_line(), player_w.label(cx, ids!(time_lbl)).area().rect(cx),
+                MouseCursor::Default, props.slot);
         }
-        let img_w = self.view.widget(cx, ids!(img_box));
-        self.picture = bytes.and(rect_of(cx, &img_w));
+        let img_w = if drawn.shown { clip_box } else { self.view.widget(cx, ids!(img_box)) };
+        self.picture = if drawn.shown || decoded {
+            rect_of(cx, &img_w)
+        } else if m.media.as_ref().is_some_and(|md| matches!(md.kind.as_str(), "video" | "circle" | "animation")) {
+            rect_of(cx, &self.view.widget(cx, ids!(media_lbl)))
+        } else {
+            None
+        };
         if let Some(r) = self.picture {
             let word = m.media.as_ref().map_or("picture", |md| md.word());
             props.hits.add(word, r, MouseCursor::Hand, props.slot);
         }
-        if playing {
+        if drawn.redraw {
             self.view.redraw(cx);
         }
         step
@@ -284,7 +329,7 @@ impl Widget for LinePanel {
 }
 
 /// A drawn widget's rectangle, or none for one that took no space.
-fn rect_of(cx: &mut Cx, w: &WidgetRef) -> Option<Rect> {
+fn rect_of(cx: &Cx, w: &WidgetRef) -> Option<Rect> {
     let r = w.area().rect(cx);
     (r.size.x > 0.0 && r.size.y > 0.0).then_some(r)
 }

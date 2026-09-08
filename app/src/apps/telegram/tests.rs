@@ -1599,6 +1599,64 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
     assert!((st.position - 4.0).abs() < 1e-6, "four seconds in");
 }
 
+/// Inline play requests the clip without navigating or pretending the
+/// native video has advanced while its download is still pending.
+#[test]
+fn inline_video_play_downloads_on_demand_and_stays_in_the_chat() {
+    use crate::shell::widgets::media::PlayerState;
+
+    let mut s = session();
+    let mut video = model::history(s.store(), STELAXIS).iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "video")).unwrap().clone();
+    // No poster: the full clip alone must still identify a real video.
+    let md = video.media.as_mut().unwrap();
+    md.reference = None;
+    md.clip = Some("tg:inline-clip".into());
+    md.secs = None;
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    let inbox = runtime::of(s.store()).connect();
+    let now = s.now();
+    assert!(inbox.try_recv().is_err(), "opening a chat must not download its videos");
+    with_chat(&s, chat, |c| {
+        assert!(c.player_state(&video, now).is_some(), "play remains available without a duration");
+        c.toggle_play(&video, now);
+        let player = c.playback(video.id).unwrap();
+        assert!(player.plays_clip(&video));
+        assert!(player.running());
+        assert_eq!(player.player_state(&video, now + 8.0).unwrap().position, 0.0);
+        assert!(player.download_note(&video).is_some());
+    });
+    assert_eq!(s.focus(), Some(chat));
+    assert_eq!(s.panel(chat).unwrap().borrow().id(), &Chat::id(STELAXIS));
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "getMessage");
+    assert_eq!(request["message_id"], video.id);
+    with_chat(&s, chat, |c| {
+        c.toggle_play(&video, now + 1.0);
+        assert!(!c.playback(video.id).unwrap().running(), "pause while downloading must stick");
+        c.toggle_play(&video, now + 2.0);
+        c.playback(video.id).unwrap().set_native_state(PlayerState {
+            playing: true, position: 3.5, length: 14.0,
+        });
+        c.set_cursor(video.id);
+        let state = c.player_state(&video, now + 20.0).unwrap();
+        assert_eq!(state.position, 3.5, "the native frame owns the clock, even after selection");
+        c.pause(now + 20.0);
+        assert!(!c.player_state(&video, now + 30.0).unwrap().playing);
+        assert_eq!(c.player_state(&video, now + 30.0).unwrap().position, 3.5);
+    });
+    assert!(inbox.try_recv().is_err(), "toggles reuse the pending download");
+
+    let voice = model::history(s.store(), STELAXIS).iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "voice")).unwrap().clone();
+    with_chat(&s, chat, |c| {
+        c.toggle_play(&voice, now + 30.0);
+        assert!(c.player_state(&voice, now + 31.0).unwrap().playing);
+        assert!(!c.player_state(&video, now + 31.0).unwrap().playing);
+        assert!(c.playback(video.id).is_none(), "another message takes over the player");
+    });
+}
+
 /// The viewer reads live byte counts for its own file, including before the
 /// first bytes arrive and when Telegram only knows an approximate size.
 #[test]

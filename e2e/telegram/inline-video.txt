@@ -1,0 +1,49 @@
+# Play stays in the transcript. Only the video picture opens the viewer.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+click "play video"
+wait 1200
+click "write a message"
+click "0:01 / 0:14"
+
+# Selecting and marking a playing message keeps its player.
+click "Elena Petrova: the fold in motion"
+wait 300
+key space
+wait 300
+click "pause video"
+wait 300
+shot telegram-inline-video
+
+# The picture opens the viewer, whose timeline is addressable there.
+click "video"
+wait 900
+click "seek"
+key cmd+w
+wait 900
+click "play video"
+wait 300
+click "pause video"
+click "write a message"
+
+# Message cards use the same inline playback controls.
+click "Elena Petrova: the fold in motion"
+wait 300
+click "line"
+wait 900
+click "play"
+wait 1200
+click "pause"
+wait 300
+click "0:01 / 0:14"
+click "video"
+wait 900
+click "seek"
+quit

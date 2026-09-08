@@ -27,10 +27,11 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{
-    self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, Player, RUN_GAP,
+    self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, RUN_GAP,
 };
 use super::super::{requests, runtime, verbs};
 use super::reactions::{self, Reactions};
+use super::playback::Playback;
 use super::{wire, Attach, Chats, Line, Peer};
 
 /// An edit under way in the composer: which of my lines, what it said, and
@@ -110,7 +111,7 @@ pub struct Chat {
     /// keyboard in the field, whatever had it.
     wants_field: bool,
     /// The one line playing, or paused: a chat plays one thing at a time.
-    player: Option<Player>,
+    player: Option<Playback>,
     reactions: Reactions,
 }
 
@@ -173,10 +174,6 @@ impl Chat {
 
     fn request(&self, request: String) -> String {
         requests::in_topic(request, self.topic)
-    }
-
-    pub fn play_on_open(&self, id: MsgId) {
-        runtime::of(&self.store).play_on_open(self.peer, id);
     }
 
     pub fn want_file(&self, remote_id: &str) {
@@ -928,34 +925,38 @@ impl Chat {
     /// or paused; the line's own length at rest otherwise.
     #[must_use]
     pub fn player_state(&self, msg: &Msg, now: f64) -> Option<PlayerState> {
-        let secs = msg.media.as_ref()?.secs?;
-        Some(match self.player {
-            Some(p) if p.msg == msg.id => p.state(now),
-            _ => PlayerState {
-                playing: false,
-                position: 0.0,
-                length: secs as f64,
-            },
-        })
+        if let Some(player) = self.player.as_ref().filter(|p| p.msg == msg.id) {
+            return player.player_state(msg, now);
+        }
+        let md = msg.media.as_ref()?;
+        let length = md.secs.or_else(|| super::playback::moving_picture_of_the_wire(msg).then_some(0))?;
+        Some(PlayerState { length: length as f64, ..PlayerState::default() })
     }
 
     /// Play or pause a line: the one playing pauses, any other takes over.
     pub fn toggle_play(&mut self, msg: &Msg, now: f64) {
-        let Some(secs) = msg.media.as_ref().and_then(|m| m.secs) else {
-            return;
-        };
-        let mut p = match self.player {
-            Some(p) if p.msg == msg.id => p,
-            _ => Player::over(msg.id, secs as f64),
-        };
-        p.toggle(now);
-        self.player = Some(p);
+        if self.player.as_ref().is_none_or(|p| p.msg != msg.id) {
+            self.player = Some(Playback::new(self.store.clone(), msg.id));
+        }
+        self.player.as_mut().unwrap().toggle_play(msg, now);
+    }
+
+    pub fn playback(&mut self, id: MsgId) -> Option<&mut Playback> {
+        self.player.as_mut().filter(|p| p.msg == id)
+    }
+
+    pub fn active_media(&self) -> Option<MsgId> {
+        self.player.as_ref().map(|p| p.msg)
+    }
+
+    pub fn pause(&mut self, now: f64) {
+        if let Some(player) = &mut self.player { player.pause(now); }
     }
 
     /// Whether anything runs — what asks for the next frame.
     #[must_use]
     pub fn playing(&self, now: f64) -> bool {
-        self.player.is_some_and(|p| p.state(now).playing)
+        self.player.as_ref().is_some_and(|p| p.playing(now))
     }
 }
 

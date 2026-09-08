@@ -272,8 +272,14 @@ fresh file at priority 32 with a completion response, while `updateFile` keeps
 the byte counts current. Source errors, download failures and timeouts appear
 in the viewer; the shared feedback controls offer an explicit retry.
 
-Playing videos fit inside the viewer at their original aspect ratio, including
-when the window is resized, with empty space around the frame where needed.
+The play button plays videos inline in the transcript or message card. It
+downloads an uncached clip on demand and shows its progress under the controls.
+Clicking the video itself opens the dedicated viewer. Inline playback pauses
+when its message leaves the viewport or the viewer opens; a chat plays one
+message at a time. Selecting or marking a message keeps the same native player.
+
+Playing videos retain their original aspect ratio, both inline and inside the
+viewer, including when the window is resized.
 
 ## Modules
 

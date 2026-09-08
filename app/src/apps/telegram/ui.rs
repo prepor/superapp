@@ -18,6 +18,7 @@ use super::panels::{
     Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
 };
 use super::widgets::feedback::TelegramFeedback;
+use super::widgets::inline_video::InlineVideoSlot;
 use super::widgets::{
     AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
     PlacePanel, ViewerPanel,
@@ -27,6 +28,13 @@ use super::{panels::Topics, widgets::TopicsPanel};
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
+
+    mod.widgets.TelegramInlineVideo = set_type_default() do #(InlineVideoSlot::register_widget(vm)) {
+        ..mod.widgets.View
+        visible: false
+        width: 320, height: 180
+        margin: Inset{top: 2, bottom: 2}
+    }
 
     mod.widgets.TelegramFeedback = set_type_default() do #(TelegramFeedback::register_widget(vm)) {
         ..mod.widgets.View
@@ -328,6 +336,7 @@ script_mod! {
            a recording, and a sticker as its emoji drawn large until stickers
            are drawn. */
         img_box := mod.widgets.MediaPicture {}
+        clip_box := mod.widgets.TelegramInlineVideo {}
         map := mod.widgets.MediaMap {}
         sticker_lbl := mod.widgets.SLabel {
             visible: false
@@ -345,6 +354,10 @@ script_mod! {
             draw_text +: { color: #5a5a5a }
         }
         player := mod.widgets.MediaPlayer {}
+        download_lbl := mod.widgets.SLabel {
+            visible: false, width: Fill, text: ""
+            draw_text +: { color: #909090 }
+        }
         foot := View {
             visible: false
             width: Fill, height: Fit
@@ -420,6 +433,12 @@ script_mod! {
         feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
+
+        // Native events reach one stable player, independent of virtual rows.
+        video_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo {}
+        }
 
         status_lbl := mod.widgets.SLabel {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
@@ -690,6 +709,10 @@ script_mod! {
             draw_text +: { color: #909090 }
         }
         img_box := mod.widgets.MediaPicture {}
+        clip_box := mod.widgets.MediaVideo {
+            width: 320, height: 180
+            margin: Inset{top: 2, bottom: 2}
+        }
         map := mod.widgets.MediaMap {}
         sticker_lbl := mod.widgets.SLabel {
             visible: false
@@ -706,6 +729,10 @@ script_mod! {
             draw_text +: { color: #5a5a5a }
         }
         player := mod.widgets.MediaPlayer {}
+        download_lbl := mod.widgets.SLabel {
+            visible: false, width: Fill, text: ""
+            draw_text +: { color: #909090 }
+        }
         foot := View {
             visible: false
             width: Fill, height: Fit
