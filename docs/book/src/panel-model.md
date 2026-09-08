@@ -82,9 +82,10 @@ existing joined pair.
 
 ## Focus, movement, and closing
 
-Exactly one panel has focus, shown by its inverted header. With the workspace
-modifier, up and down move through a column; left and right choose the closest
-panel by vertical position in the neighboring column.
+Exactly one panel has focus, shown by its inverted header. Clicking inside a
+panel focuses it, including when the click places a caret in a text field.
+With the workspace modifier, up and down move through a column; left and right
+choose the closest panel by vertical position in the neighboring column.
 
 Moving a panel can reorder its column, join another column, swap a whole column,
 or create a new edge column. Closing removes the panel and its joined

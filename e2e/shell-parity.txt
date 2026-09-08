@@ -27,7 +27,10 @@ wait 700
 # down and drags the view; the filter and the header are pinned and stay put.
 click "filter"
 wait 700
-key down 40
+# Let the field hand off keyboard focus before the repeated row keys.
+key down
+wait 400
+key down 39
 wait 900
 shot p2-scrolled
 key up 40

@@ -18,17 +18,25 @@ key enter
 wait 900
 shot c1-new-mail
 
-# Into TO by tab — the ring wraps from the body. Not by a press: a
-# synthesized press captures the field and the harness has no way to release
-# it. A fragment of the name offers the sender; enter takes the address and
-# the box closes behind it, since an address typed out in full needs no
-# completing.
+# Move panel focus to the inbox, then click back into the compose body. Its
+# caret was already there: the press must restore the panel's focus too, so
+# the inbox loses its shortcut and the tab and typing below reach the form.
+key cmd+left
+wait 600
+accel "sync" s
+mouse "body"
+wait 400
+accel "sync" -
+
+# Tab wraps from the body to TO. A fragment of the name offers the sender;
+# a click takes the address and the box closes behind it, since an address
+# typed out in full needs no completing.
 key tab
 wait 400
 type "kov"
 wait 500
 shot c2-offer
-key enter
+click "Vera Kovac"
 wait 500
 shot c3-taken
 

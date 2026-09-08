@@ -39,7 +39,10 @@ wait 500
 shot g3-kept
 
 # A tag no mailbox has reads as an error under the field, once the caret has
-# left it — not while it is still being typed.
+# left it — not while it is still being typed. Return from the reader to
+# the list before editing its filter.
+key cmd+left
+wait 400
 key /
 wait 400
 key cmd+a
@@ -64,8 +67,10 @@ shot g6-down-leaves-filter
 click "Vera Kovac · aug 31 09:14"
 wait 500
 
-# The rows have the keyboard now, so the walk carries on from where it
-# landed.
+# Folding the letter focused the reader. Return to the rows and carry on
+# from where the cursor landed.
+key cmd+left
+wait 400
 key down
 wait 800
 click "GitHub · aug 31 08:02"
@@ -78,6 +83,8 @@ shot g7-walked
 # the filter asked the index for the body — and the click on it is what says
 # it is. It is typed a letter short of the word on purpose: the index answers
 # a prefix, as it does for the launcher.
+key cmd+left
+wait 400
 key /
 wait 400
 key cmd+a

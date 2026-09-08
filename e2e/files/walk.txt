@@ -111,8 +111,10 @@ shot w6-joined
 
 # -- what the filter shows -------------------------------------------------------
 
-# cmd+w closes the panel the cursor was walking and the card under it, which
-# leaves one listing to address again.
+# The path click focused the card. Return to its listing, then cmd+w closes
+# that listing and its card, leaving one listing to address again.
+key cmd+left
+wait 400
 key cmd+w
 wait 900
 
@@ -133,8 +135,9 @@ wait 400
 shot w7-hidden
 
 # `@kind:` asks what a file **is**, which is not what it is called: the pdf
-# stays and everything else goes, dot-file and directory alike.
-key /
+# stays and everything else goes, dot-file and directory alike. Clicking
+# the filter returns from the card to the listing.
+mouse "filter"
 wait 300
 key cmd+a
 type "@kind:pdf"
