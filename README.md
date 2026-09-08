@@ -27,7 +27,8 @@ Use `--no-default-features` for a build with Telegram's offline demo only.
 
 Borderless over the display's visible frame. `cmd` + arrows focus panels
 (`+shift` moves one, `cmd+1`…`9` walk the workspaces, `cmd+w` closes,
-`cmd+z` undoes and `shift` redoes, `cmd+u` opens the history, `cmd+i` writes
+`cmd+z` undoes and `shift` redoes text edits while an input has the caret,
+or workspace actions otherwise, `cmd+u` opens the history, `cmd+i` writes
 the focused panel's provenance to the clipboard); plain keys belong to the
 focused panel, and the help panel documents the rest.
 

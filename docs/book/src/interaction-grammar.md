@@ -97,6 +97,11 @@ frame. Ordinary inputs keep all letter chords; selectable text keeps
 `PanelProps.keyboard.keep`. `bar::Shortcuts` makes the routing decision for
 both key presses and bold letters, and focus changes redraw the bars.
 
+Text undo and redo take priority over workspace history while an editable
+input has the caret, including composers with a narrower letter policy.
+They stay with that input when its undo or redo stack is empty. Read-only
+text and focus outside an editable input leave them with the workspace.
+
 Virtual lists reveal a requested row by its measured rectangle. The request
 remains pending until a draw confirms the row is visible, so different row
 heights and a bar wrapping to another line cannot strand the cursor outside
@@ -121,7 +126,8 @@ Cmd is the workspace modifier. The reserved chords are:
 - `cmd+arrows`: move focus; add Shift to move the focused panel;
 - `cmd+1…9`: switch workspace; add Shift to send the panel there and follow;
 - `cmd+w`: close the focused panel and its joined chain;
-- `cmd+z` and `cmd+shift+z`: undo and redo;
+- `cmd+z` and `cmd+shift+z`: undo and redo text edits in the active input,
+  or workspace actions when no editable input has the caret;
 - `cmd+[` and `cmd+]`: move a panel into or out of a neighboring column;
 - `cmd+,` and `cmd+.`: pull from or push to the right column;
 - `cmd+t`: toggle tabs for the column;

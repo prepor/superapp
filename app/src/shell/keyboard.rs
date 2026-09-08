@@ -19,6 +19,11 @@ pub struct Keyboard {
     policies: Rc<RefCell<HashMap<WidgetUid, (WidgetWeakRef, Letters)>>>,
 }
 
+struct Owner {
+    letters: Letters,
+    editable: bool,
+}
+
 impl Keyboard {
     pub fn keep(&self, widget: &WidgetRef, letters: Letters) {
         let mut policies = self.policies.borrow_mut();
@@ -28,28 +33,36 @@ impl Keyboard {
 
     /// No geometry, and no draw needed between a focus change and this read.
     pub fn kept(&self, cx: &Cx, root: &WidgetRef) -> Letters {
-        if cx.key_focus() == Area::Empty {
-            return Letters::NONE;
-        }
-        self.find(cx, root).unwrap_or(Letters::NONE)
+        self.find(cx, root).map_or(Letters::NONE, |owner| owner.letters)
     }
 
-    fn find(&self, cx: &Cx, widget: &WidgetRef) -> Option<Letters> {
-        if !widget.visible() {
+    /// Text undo belongs to an editable input regardless of its letter
+    /// policy or whether it has any edits left to undo.
+    pub fn editing(&self, cx: &Cx, root: &WidgetRef) -> bool {
+        self.find(cx, root).is_some_and(|owner| owner.editable)
+    }
+
+    fn find(&self, cx: &Cx, widget: &WidgetRef) -> Option<Owner> {
+        if cx.key_focus() == Area::Empty || !widget.visible() {
             return None;
         }
         if widget.key_focus(cx) {
+            let input = widget.borrow::<TextInput>();
+            let editable = input.as_ref().is_some_and(|input| !input.is_read_only());
             if let Some((_, letters)) = self.policies.borrow().get(&widget.widget_uid()) {
-                return Some(*letters);
+                return Some(Owner { letters: *letters, editable });
             }
-            if let Some(input) = widget.borrow::<TextInput>() {
-                return Some(if input.is_read_only() { Letters::TEXT } else { Letters::ALL });
+            if input.is_some() {
+                return Some(Owner {
+                    letters: if editable { Letters::ALL } else { Letters::TEXT },
+                    editable,
+                });
             }
             if widget.borrow::<TextFlow>().is_some()
                 || widget.borrow::<Html>().is_some()
                 || widget.borrow::<Markdown>().is_some()
             {
-                return Some(Letters::TEXT);
+                return Some(Owner { letters: Letters::TEXT, editable: false });
             }
         }
         let mut found = None;
