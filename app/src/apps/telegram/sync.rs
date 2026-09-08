@@ -35,6 +35,7 @@ use super::updates;
 
 mod mentions;
 mod counts;
+mod downloads;
 mod reactions;
 mod views;
 mod history;
@@ -101,6 +102,7 @@ pub struct Account<T: Td> {
     viewed: std::cell::RefCell<views::Views>,
     reactions: std::cell::RefCell<reactions::Reactions>,
     counts: std::cell::RefCell<counts::Counts>,
+    downloads: std::cell::RefCell<std::collections::HashMap<u64, downloads::Download>>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -148,6 +150,7 @@ impl<T: Td> Account<T> {
                 .report(w.store(), "sending request", "Invalid request JSON");
             return;
         };
+        if self.cached_download(w, &v) { return; }
         if matches!(v["@type"].as_str(), Some("getMessage" | "getMessageAvailableReactions"))
             && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
@@ -256,6 +259,7 @@ impl<T: Td> Account<T> {
             not_before: std::cell::Cell::new(0.0),
             viewed: std::cell::RefCell::new(views::Views::default()),
             counts: std::cell::RefCell::new(counts::Counts::default()),
+            downloads: std::cell::RefCell::new(std::collections::HashMap::new()),
             reactions: std::cell::RefCell::new(reactions::Reactions::default()),
         }
     }
@@ -420,6 +424,7 @@ impl<T: Td> Account<T> {
         runtime::of(w.store())
             .operations
             .expire(w.store(), std::time::Instant::now());
+        self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
         let mut n = 0;
         while let Some(raw) = self.td.receive(0.0) {
@@ -449,6 +454,7 @@ impl<T: Td> Account<T> {
             );
             return;
         };
+        if self.on_download_reply(w, &v) { return; }
         let rt = runtime::of(w.store());
         let context = v["@extra"]["context"].as_str().or_else(|| v["@extra"].as_str());
         if v["@type"] == "message" {
@@ -1119,7 +1125,9 @@ impl<T: Td> Account<T> {
         // the blob cache under the same tg: key the row names — the next
         // redraw draws the photo.
         let clip = message["@extra"].as_str().and_then(parse_media_extra).map(|(_, _, clip)| clip);
-        if message["sending_state"].is_null() && clip != Some(false) {
+        let saving = message["@extra"]["context"].as_str()
+            .and_then(parse_save_extra).is_some();
+        if message["sending_state"].is_null() && clip != Some(false) && !saving {
             self.fetch(w, &message["content"]);
         }
     }

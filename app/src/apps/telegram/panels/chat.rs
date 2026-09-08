@@ -29,7 +29,7 @@ use super::super::draft_toast;
 use super::super::model::{
     self, day_caption, same_day, Carried, Msg, MsgId, PeerCard, PeerId, Player, RUN_GAP,
 };
-use super::super::{requests, runtime, verbs};
+use super::super::{downloads, requests, runtime, verbs};
 use super::reactions::{self, Reactions};
 use super::{wire, Attach, Chats, Line, Peer};
 
@@ -1110,6 +1110,7 @@ impl Panel for Chat {
                     v.push(Verb::run("telegram.original", "original", Some('o')));
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
+                v.extend(downloads::verb(m));
                 if reactions::can_react(m) {
                     v.push(Verb::run("telegram.react", "react(j)", Some('j')));
                 }
@@ -1214,6 +1215,12 @@ impl Panel for Chat {
                 let hist = self.history();
                 if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c)) {
                     copy_line(s, m);
+                }
+            }
+            "telegram.download" if self.marks.is_empty() => {
+                let hist = self.history();
+                if let Some(m) = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c)) {
+                    downloads::request(s, m);
                 }
             }
             // The lines are taken out of the transcript and the chat list

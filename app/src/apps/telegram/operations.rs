@@ -204,7 +204,8 @@ impl Tracker {
                 }
             }
         }
-        let kind = v["@type"].as_str().unwrap_or("request").to_string();
+        let saving = v["@extra"].as_str().and_then(super::requests::parse_save_extra).is_some();
+        let kind = if saving { "saveFile" } else { v["@type"].as_str().unwrap_or("request") }.to_string();
         let mut state = self.state.lock().unwrap();
         state.next += 1;
         let id = state.next;
@@ -222,7 +223,7 @@ impl Tracker {
             Operation {
                 id,
                 chat: v["chat_id"].as_i64(),
-                label: label(&v),
+                label: if saving { "downloading to ~/Downloads".into() } else { label(&v) },
                 status: Status::Pending,
                 request: (!secret).then(|| v.clone()),
                 kind,
@@ -272,6 +273,33 @@ impl Tracker {
         self.state.lock().unwrap().operations.get(&id).is_some_and(|o| o.status == Status::Pending)
     }
 
+    /// A save retains its source request for retry while tracking the file's
+    /// byte counts. Cache arrival alone must not mark the exported copy done.
+    pub(super) fn saving_file(&self, id: u64, file: &Value) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            collect_files(file, &mut op.files, false);
+            op.changed = Instant::now();
+        }
+        self.changed();
+    }
+
+    pub(super) fn saving_attempt(&self, extra: &Value) -> bool {
+        let Some(id) = extra["operation"].as_u64() else { return false; };
+        self.state.lock().unwrap().operations.get(&id).is_some_and(|op| {
+            op.status == Status::Pending && op.request.as_ref().is_some_and(|r| r["@extra"] == *extra)
+        })
+    }
+
+    pub(super) fn saved(&self, id: u64, path: &Path) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            op.status = Status::Done;
+            op.label = format!("saved {}", kernel::caps::display_path(path));
+            op.request = None;
+            op.changed = Instant::now();
+        }
+        self.changed();
+    }
+
     pub fn dismiss(&self, id: u64) {
         self.dirty.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
@@ -316,7 +344,12 @@ impl Tracker {
                 "message_ids": previous.iter().map(|(_, id)| id).collect::<Vec<_>>(),
                 "@extra": {"operation": id, "context": null}});
         }
-        op.kind = req["@type"].as_str()?.to_string();
+        if req["@extra"]["context"].as_str().and_then(super::requests::parse_save_extra).is_some() {
+            req["@extra"]["attempt"] = json!(req["@extra"]["attempt"].as_u64().unwrap_or(0) + 1);
+        }
+        op.kind = if req["@extra"]["context"].as_str().and_then(super::requests::parse_save_extra).is_some() {
+            "saveFile"
+        } else { req["@type"].as_str()? }.to_string();
         op.request = Some(req.clone());
         op.messages.clear();
         op.failed_messages.clear();
