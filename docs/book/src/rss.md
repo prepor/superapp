@@ -38,6 +38,8 @@ missing entry ID; subscription URLs ignore fragments for deduplication.
 Full feed content takes precedence over the publisher's summary; feeds
 that only publish a summary show that summary. **open original** opens the
 publisher's page in the browser.
+The article bar also offers **show original** (`cmd+o`), available from the
+article list while that article is previewed.
 
 Each article retains the publisher's content before HTML cleanup, its
 content type, and its effective base URL. A shared sanitizer version change

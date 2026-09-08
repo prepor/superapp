@@ -336,6 +336,16 @@ impl Widget for RssArticlePanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        // The verb requests a draw, so opening needs no further input event.
+        let url = props
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Article>()
+            .and_then(Article::take_url);
+        if let Some(url) = url {
+            cx.open_url(&url, OpenUrlInPlace::No);
+        }
         let reading = props
             .panel
             .borrow_mut()

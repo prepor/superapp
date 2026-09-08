@@ -255,6 +255,7 @@ pub struct Article {
     article: i64,
     store: Rc<Store>,
     slot: SlotId,
+    open_url: Option<String>,
 }
 impl Article {
     pub const TAG: Tag = Tag("rss-article");
@@ -264,6 +265,10 @@ impl Article {
     pub fn reading(&self) -> Option<(model::Article, String)> {
         model::article(&self.store, self.article)
             .map(|a| (a, model::body(&self.store, self.article)))
+    }
+    /// The widget opens the requested publisher page once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 }
 impl Panel for Article {
@@ -288,7 +293,11 @@ impl Panel for Article {
         let Some(a) = model::article(&self.store, self.article) else {
             return Vec::new();
         };
-        vec![Verb::go(
+        let mut verbs = Vec::new();
+        if !a.url.is_empty() {
+            verbs.push(Verb::run("rss.original", "show original", Some('o')));
+        }
+        verbs.push(Verb::go(
             "rss.feed",
             "feed",
             Some('f'),
@@ -297,7 +306,16 @@ impl Panel for Article {
                 id: Articles::for_feed(a.feed),
                 fresh: false,
             },
-        )]
+        ));
+        verbs
+    }
+    fn run(&mut self, verb: &str, s: &mut Session) {
+        if verb == "rss.original" {
+            self.open_url = model::article(&self.store, self.article)
+                .map(|a| a.url)
+                .filter(|url| !url.is_empty());
+            s.redraw();
+        }
     }
     fn as_any(&mut self) -> &mut dyn Any {
         self
@@ -322,6 +340,7 @@ impl PanelKind for ArticleKind {
             article,
             store,
             slot: 0,
+            open_url: None,
         })
     }
 }
