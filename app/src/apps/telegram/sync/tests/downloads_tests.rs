@@ -297,6 +297,129 @@ fn missing_source_is_an_actionable_failure_and_never_creates_a_file() {
 }
 
 #[test]
+fn download_button_retries_failed_save_without_leaving_stale_failures() {
+    use crate::apps::telegram::{operations, panels};
+
+    for disk_failure in [false, true] {
+        let t = DownloadTest::new();
+        let source = t.start();
+        t.source(&source, "report.pdf");
+        let transfer = last_request(&t.td, "downloadFile");
+        if disk_failure {
+            t.denied.store(true, Ordering::Relaxed);
+            t.acc.on_update(&t.w, &t.complete(&transfer).to_string());
+            t.denied.store(false, Ordering::Relaxed);
+        } else {
+            t.acc.on_update(
+                &t.w,
+                &json!({"@type": "error", "code": 400,
+                "message": "download canceled", "@extra": transfer["@extra"]})
+                .to_string(),
+            );
+        }
+        let failed_id = t.op(&source).id;
+        assert!(t.op(&source).retryable());
+        let sent = t.td.sent().len();
+        // This is the same queue boundary used by another press of download.
+        let id = panels::queue(t.w.store(), &requests::save_file(7, 42)).unwrap();
+        assert_eq!(
+            id, failed_id,
+            "download must retry the existing failed save"
+        );
+        assert_eq!(t.op(&source).status, Status::Pending);
+        let rt = runtime::of(t.w.store());
+        assert!(!rt
+            .operations
+            .list()
+            .iter()
+            .any(|op| matches!(op.status, Status::Failed { .. })));
+        t.acc.drain(&t.w);
+        if disk_failure {
+            assert_eq!(t.td.sent().len(), sent, "retry uses the cached document");
+        } else {
+            let retry = last_request(&t.td, "getMessage");
+            assert_eq!(retry["@extra"]["operation"], failed_id);
+            assert_eq!(retry["@extra"]["attempt"], 1);
+            t.source(&retry, "report.pdf");
+            t.acc.on_update(&t.w, &t.complete(&retry).to_string());
+        }
+        assert_eq!(t.op(&source).status, Status::Done);
+        assert!(!t.op(&source).retryable());
+        // A click queued from the old feedback strip cannot write a second copy.
+        operations::retry(t.w.store(), failed_id);
+        t.acc.drain(&t.w);
+        assert!(!rt
+            .operations
+            .list()
+            .iter()
+            .any(|op| matches!(op.status, Status::Failed { .. })));
+        assert_eq!(
+            std::fs::read(t.dir.join("Downloads/report.pdf")).unwrap(),
+            b"original document"
+        );
+        assert_eq!(
+            std::fs::read_dir(t.dir.join("Downloads")).unwrap().count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn download_names_reject_unicode_format_controls() {
+    // Overrides, embeddings, isolates and marks must not disguise an extension.
+    // Cover other format controls too, including characters beyond the BMP.
+    let controls = [
+        '\u{061c}',
+        '\u{200e}',
+        '\u{200f}',
+        '\u{202a}',
+        '\u{202b}',
+        '\u{202c}',
+        '\u{202d}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{2067}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{00ad}',
+        '\u{200b}',
+        '\u{200c}',
+        '\u{200d}',
+        '\u{2060}',
+        '\u{feff}',
+        '\u{fff9}',
+        '\u{fffb}',
+        '\u{1d173}',
+        '\u{e0001}',
+        '\u{e007f}',
+    ];
+    for c in controls {
+        assert_eq!(
+            downloads::safe_name(&format!("invoice{c}gpj.exe")),
+            "invoice_gpj.exe",
+            "{c:?}"
+        );
+    }
+    let ordinary = "résumé-עברית-العربية.pdf";
+    assert_eq!(
+        downloads::safe_name(ordinary),
+        ordinary,
+        "visible Unicode is retained"
+    );
+
+    let t = DownloadTest::new();
+    let source = t.start();
+    t.source(&source, "invoice\u{202e}gpj.exe");
+    let transfer = last_request(&t.td, "downloadFile");
+    t.acc.on_update(&t.w, &t.complete(&transfer).to_string());
+    assert_eq!(
+        std::fs::read(t.dir.join("Downloads/invoice_gpj.exe")).unwrap(),
+        b"original document"
+    );
+    assert!(t.op(&source).line().contains("~/Downloads/invoice_gpj.exe"));
+}
+
+#[test]
 fn download_names_strip_paths_and_control_characters() {
     for (input, expected) in [
         ("../../report.pdf", "report.pdf"),

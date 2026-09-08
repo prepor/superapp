@@ -282,12 +282,14 @@ The **download** action on a chat's selected message, its line card, and the
 media viewer saves an attachment to `~/Downloads`. Documents, photos, videos,
 animations, video messages, voice notes and audio tracks can be saved. Documents
 and named media keep the sender's filename; unnamed media gets a name based on
-the chat and message. Paths and control characters in filenames are removed,
+the chat and message. Paths, control characters and Unicode format characters
+(including bidi overrides) in filenames are removed,
 and an existing `report.pdf` makes the next copy `report (1).pdf`.
 
 Saving runs on the account worker and continues after the panel closes. The
 shared status strip shows progress and the saved path. It reports success only
 after the copy reaches Downloads; download and disk failures offer **retry**.
+Pressing **download** again after a failure retries the same operation.
 Retries refresh the source message to repair expired file references, and late
 answers from an earlier attempt cannot complete a newer one. Cached documents
 can be saved without a network request. Documents and recordings are fetched

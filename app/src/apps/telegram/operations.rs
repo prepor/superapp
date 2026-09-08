@@ -192,6 +192,7 @@ impl Tracker {
         }
         if let Some(context) = v["@extra"].as_str().filter(|s| {
             super::requests::parse_history_in(s).is_some()
+                || super::requests::parse_save_extra(s).is_some()
                 || s.starts_with("topic:") || s.starts_with("topics:")
         }) {
             if let Some(op) = self

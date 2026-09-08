@@ -2,6 +2,7 @@
 //! The account worker owns the transfer, so closing a panel does not cancel it.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use kernel::caps::{self, CopyPath, Disk, MakeDir};
 use kernel::effect::World;
@@ -65,11 +66,14 @@ pub fn name(m: &Msg) -> String {
 
 /// A sender's filename is a basename, never a path on this device.
 pub fn safe_name(name: &str) -> String {
+    // char::is_control covers Cc only; Cf includes bidi overrides, isolates,
+    // invisible format marks and other ways to disguise a file's extension.
+    static UNSAFE: OnceLock<regex::Regex> = OnceLock::new();
+    let unsafe_chars = UNSAFE.get_or_init(|| {
+        regex::Regex::new(r"[\p{Cc}\p{Cf}:]").expect("Unicode filename character classes")
+    });
     let name = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let name: String = name
-        .chars()
-        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
-        .collect();
+    let name = unsafe_chars.replace_all(name, "_");
     let name = name.trim().trim_start_matches('.');
     if name.is_empty() {
         return "telegram-file".into();
