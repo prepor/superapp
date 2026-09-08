@@ -784,10 +784,11 @@ mod tests {
     /// S256, and the offline/consent pair that yields a refresh token.
     #[test]
     fn the_consent_url_asks_for_a_refresh_token() {
+        const SECRET: &str = "test-client-secret:must-stay-local";
         let f = Flow::start(
             Client {
                 id: "cid.apps.googleusercontent.com".into(),
-                secret: "shh".into(),
+                secret: SECRET.into(),
             },
             GOOGLE,
         )
@@ -805,8 +806,12 @@ mod tests {
         ] {
             assert!(u.contains(want), "{want} missing from {u}");
         }
-        // The secret is the one thing the browser must never see.
-        assert!(!u.contains("shh"));
+        // Inspect decoded values, with a fixture that cannot appear by
+        // chance in the random state or PKCE challenge.
+        let url = url::Url::parse(&u).unwrap();
+        assert!(url
+            .query_pairs()
+            .all(|(key, value)| key != "client_secret" && !value.contains(SECRET)));
     }
 
     /// The console's downloaded json, both shapes, and a flat one.
