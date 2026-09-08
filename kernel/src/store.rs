@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::session::Session as Capture;
+use rusqlite::types::ToSqlOutput;
 use rusqlite::{Connection, OpenFlags, Transaction};
 
 use crate::app::Schema;
@@ -481,7 +482,9 @@ fn open_reader(target: &Target) -> rusqlite::Result<Connection> {
 
 /// SQLite's built-in LIKE only folds ASCII. Fold both operands explicitly
 /// for Unicode text filters, retaining NULL for missing text. Determinism
-/// lets SQLite fold a bound search pattern once per query.
+/// lets SQLite fold a bound search pattern once per query. ASCII stays as
+/// supplied: LIKE already handles its case, so those values can pass through
+/// without allocating a Rust string or walking the Unicode case tables.
 fn register_text_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "casefold",
@@ -490,8 +493,13 @@ fn register_text_functions(conn: &Connection) -> rusqlite::Result<()> {
             | FunctionFlags::SQLITE_DETERMINISTIC
             | FunctionFlags::SQLITE_INNOCUOUS,
         |ctx| {
-            let text = ctx.get::<Option<String>>(0)?;
-            Ok(text.as_deref().map(caseless::default_case_fold_str))
+            let text = ctx.get_raw(0).as_str_or_null()?;
+            Ok(match text {
+                Some(text) if !text.is_ascii() => {
+                    ToSqlOutput::from(caseless::default_case_fold_str(text))
+                }
+                _ => ToSqlOutput::Arg(0),
+            })
         },
     )
 }
@@ -1256,6 +1264,27 @@ mod tests {
         assert_eq!(folded(s.conn()).unwrap(), expected);
         let worker = Store::with_db(s.db()).unwrap();
         assert_eq!(folded(worker.conn()).unwrap(), expected);
+    }
+
+    #[test]
+    fn casefold_like_matches_across_ascii_and_unicode() {
+        let s = store();
+        for (text, pattern, expected) in [
+            ("ASCII TEXT", "%ascii text%", true),
+            ("STRASSE", "%straße%", true),
+            ("Straße", "%STRASSE%", true),
+            ("KELVIN", "%Kelvin%", true),
+            ("Kelvin", "%KELVIN%", true),
+            ("Привет", "%пРиВеТ%", true),
+            ("Straße", "%STRESS%", false),
+        ] {
+            let found: bool = s.conn().query_row(
+                "SELECT casefold(?1) LIKE casefold(?2)",
+                [text, pattern],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(found, expected, "{text:?} LIKE {pattern:?}");
+        }
     }
 
     /// The reactive contract: cached until a commit touches a dependency,

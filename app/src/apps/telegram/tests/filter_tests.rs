@@ -87,3 +87,53 @@ fn message_and_people_filters_ignore_unicode_case() {
         assert_eq!(people[0].id, IVAN);
     }
 }
+
+#[test]
+fn search_panel_finds_unicode_names_and_messages() {
+    const CASES: &[(&str, &str)] = &[
+        ("Привет", "пРиВеТ"),
+        ("ÉCOLE", "école"),
+        ("ΟΔΟΣ", "οδος"),
+        ("Straße", "STRASSE"),
+        (r"Путь 100%_\Файл", r"пУТЬ 100%_\фАЙЛ"),
+    ];
+    let s = session();
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE tg_peer SET name = 'Привет' WHERE id = ?1", [VERA])?;
+            for (i, (text, _)) in CASES.iter().enumerate() {
+                c.execute(
+                    "INSERT INTO tg_message(id, chat, sender, date, text)
+                 VALUES(?1, ?2, ?2, 9999999999, ?3)",
+                    rusqlite::params![900001 + i as i64, VERA, text],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO tg_message(id, chat, sender, date, text, service)
+             VALUES(900010, ?1, ?1, 9999999999, 'Привет', 1),
+                   (900011, ?1, ?1, 9999999999, 'Путь 100XY\\Файл', 0)",
+                [VERA],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut engine = Engine::inline(s.apps().providers());
+    for (i, (text, query)) in CASES.iter().enumerate() {
+        engine.ask(s.store(), i as u64 + 1, query);
+        let hits: Vec<_> = engine
+            .collect()
+            .into_iter()
+            .flat_map(|a| a.hits)
+            .map(|hit| (hit.label, hit.go))
+            .collect();
+        let mut expected = Vec::new();
+        if i == 0 {
+            expected.push((text.to_string(), Go::Open(Chat::id(VERA))));
+        }
+        expected.push((
+            text.to_string(),
+            Go::Open(Chat::at(VERA, 900001 + i as i64)),
+        ));
+        assert_eq!(hits, expected, "{query}");
+    }
+}
