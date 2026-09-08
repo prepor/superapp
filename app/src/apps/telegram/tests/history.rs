@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 mod deletion;
+mod review;
 
 fn receive(inbox: &runtime::Inbox) -> Value {
     serde_json::from_str(&inbox.try_recv().expect("queued command")).unwrap()
@@ -349,14 +350,16 @@ fn chat_preferences_restore_complete_settings_and_previous_list() {
 }
 
 #[test]
-fn missing_reaction_ownership_is_not_assumed_to_mean_no_reaction() {
+fn malformed_reaction_ownership_is_not_assumed_to_mean_no_reaction() {
     let mut s = session();
     let td = FakeTd::new();
     let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     history::command(&mut s, &requests::add_message_reaction(VERA, 42, "👍", 1)).unwrap();
     acc.drain(s.world());
-    snapshot(&acc, &s, &td, json!({"interaction_info": null}));
+    snapshot(&acc, &s, &td, json!({"interaction_info": {"reactions": {"reactions": [
+        {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 1}
+    ]}}}));
     ok(&acc, &s, &last_reaction_request(&td, "addMessageReaction"));
     s.undo();
     acc.drain(s.world());

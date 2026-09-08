@@ -15,9 +15,44 @@ use super::operations::{Receipt, Status};
 use super::{model, panels, requests, runtime};
 
 mod deletion;
+mod reaction;
 
-pub(super) fn command(s: &mut Session, request: &str) -> Option<u64> {
-    let v: Value = serde_json::from_str(request).ok()?;
+/// The caller owns refusal feedback, including offline/demo behavior. Session
+/// transaction failures have already been reported and must not toast twice.
+#[derive(Debug)]
+pub(super) enum Refusal {
+    Offline,
+    Failed(String),
+    Reported,
+}
+
+impl Refusal {
+    pub(super) fn reason(&self) -> &str {
+        match self {
+            Self::Offline => "Telegram is not connected",
+            Self::Failed(reason) => reason,
+            Self::Reported => "the action could not be recorded; nothing was sent",
+        }
+    }
+
+    pub(super) fn notify(self, s: &mut Session, what: &str) {
+        match self {
+            Self::Offline => s.notify(super::draft_toast(what), false),
+            Self::Failed(reason) => s.notify(format!("{what} failed: {reason}"), true),
+            Self::Reported => {}
+        }
+    }
+}
+
+pub(super) fn command(s: &mut Session, request: &str) -> Result<u64, Refusal> {
+    submit(s, &[request.to_string()], None).map(|ids| ids[0])
+}
+
+pub(super) fn batch(s: &mut Session, requests: &[String], label: String) -> Result<Vec<u64>, Refusal> {
+    submit(s, requests, Some(label))
+}
+
+fn describe(store: &Store, v: &Value) -> Option<(&'static str, String, Undo)> {
     let (kind, label, undo) = match v["@type"].as_str()? {
         "sendMessage" => {
             let text = v["input_message_content"]["text"]["text"].as_str().unwrap_or("");
@@ -27,24 +62,25 @@ pub(super) fn command(s: &mut Session, request: &str) -> Option<u64> {
         }
         "forwardMessages" => ("forward", "forward messages".into(), Undo::Send),
         "editMessageText" | "editMessageCaption" => ("edit", "edit message".into(), Undo::Edit),
-        "deleteMessages" if deletion::eligible(s.store(), &v) =>
+        "deleteMessages" if deletion::eligible(store, v) =>
             ("delete", "delete messages (undo resends copies)".into(), Undo::Delete(None)),
         "deleteMessages" => ("delete", "delete messages (cannot undo)".into(), Undo::Impossible),
-        "addMessageReaction" => ("react", format!("react {}", v["reaction_type"]["emoji"].as_str().unwrap_or("")), Undo::Reaction),
+        "addMessageReaction" => ("react", format!("react {}", v["reaction_type"]["emoji"].as_str().unwrap_or("")),
+            Undo::Reaction(reaction::Snapshot::default())),
         "setChatNotificationSettings" => ("mute", "change chat notifications".into(), Undo::Chat),
         "toggleChatIsPinned" => ("pin", "change chat pin".into(), Undo::Chat),
         "addChatToList" => ("archive", "move chat".into(), Undo::Chat),
-        _ => return panels::queue(s.store(), request),
+        _ => return None,
     };
-    let label = v["chat_id"].as_i64().and_then(|chat| model::peer(s.store(), chat))
+    let label = v["chat_id"].as_i64().and_then(|chat| model::peer(store, chat))
         .map_or(label.clone(), |peer| format!("{label} · {}", peer.name));
-    submit(s, request, kind, label, undo)
+    Some((kind, label, undo))
 }
 
 enum Undo {
     Send,
     Edit,
-    Reaction,
+    Reaction(reaction::Snapshot),
     Chat,
     Delete(Option<deletion::Saved>),
     Commands(Vec<Value>),
@@ -83,57 +119,77 @@ struct Change {
 
 /// Only deliberate user commands enter here. Reads, typing and projection
 /// updates keep using the ordinary queue and create no history nodes.
-fn submit(
-    s: &mut Session, request: &str, kind: &'static str, label: String, undo: Undo,
-) -> Option<u64> {
-    if !panels::live(s.store()) { return None; }
-    if !s.writable() {
-        s.notify("another device holds the lease — nothing was sent", true);
-        return None;
-    }
+fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result<Vec<u64>, Refusal> {
+    if requests.is_empty() { return Ok(Vec::new()); }
+    if !panels::live(s.store()) { return Err(Refusal::Offline); }
     let rt = runtime::of(s.store());
     if let Some(error) = rt.connection_error() {
-        s.notify(error, true);
-        return None;
+        return Err(Refusal::Failed(error));
     }
-    if !rt.can_send() { return None; }
+    if !rt.can_send() { return Err(Refusal::Failed("Telegram is not connected".into())); }
+    let values: Vec<Value> = requests.iter().map(|request| serde_json::from_str(request))
+        .collect::<Result<_, _>>().map_err(|e| Refusal::Failed(e.to_string()))?;
+    let descriptions: Vec<_> = values.iter().map(|v| describe(s.store(), v)).collect();
+    if descriptions.iter().all(Option::is_none) {
+        // Reads and other ordinary requests still bypass the undo tree.
+        return requests.iter().map(|request| panels::queue(s.store(), request)
+            .ok_or_else(|| Refusal::Failed("Telegram is not connected".into()))).collect();
+    }
+    if !s.writable() || !s.store().is_writable() {
+        return Err(Refusal::Failed("another device holds the lease — nothing was sent".into()));
+    }
     pump(s.store());
     let journal = s.store().local::<Journal>();
-    let request_value: Value = serde_json::from_str(request).ok()?;
-    let keys = targets(&request_value, &[]);
+    let keys: Vec<_> = values.iter().flat_map(|v| targets(v, &[])).collect();
     let busy = journal.entries.lock().unwrap().iter().any(|entry| {
         let change = entry.lock().unwrap();
         change.pending() && change.targets(s.store()).iter().any(|key| keys.contains(key))
     });
     if busy {
-        s.notify("wait for the previous Telegram change to finish", true);
-        return None;
+        return Err(Refusal::Failed("wait for the previous Telegram change to finish".into()));
     }
-    let tracked = rt.operations.track(request);
-    let initial: Value = serde_json::from_str(&tracked).ok()?;
-    let id = initial["@extra"]["operation"].as_u64()?;
-    let receipt = rt.operations.watch(id)?;
-    let prepared = !matches!(undo, Undo::Edit | Undo::Reaction | Undo::Chat | Undo::Delete(_));
-    let change = Arc::new(Mutex::new(Change {
-        label: label.clone(), initial, undo, prepared, snapshot: None,
-        desired: true, applied: false, messages: Vec::new(), failed: None,
-        order: journal.next.fetch_add(1, Ordering::Relaxed),
-        flight: Some(Flight { receipt, applied: true, remaining: VecDeque::new() }),
-    }));
-    // Do not coalesce distinct messages or successive edits. Each has its own
-    // server acknowledgement and must reverse in the order the tree walks.
-    if s.act(Action::new(kind, label).claiming(vec![Box::new(Remote(change.clone()))])).is_none() {
-        rt.operations.fail(s.store(), id, "The action could not be recorded; nothing was sent", false);
-        rt.operations.forget_payload(id);
-        return None;
+    let (kind, first_label, _) = descriptions.iter().flatten().next().unwrap();
+    let kind = *kind;
+    let label = label.unwrap_or_else(|| first_label.clone());
+    let mut tracked = Vec::new();
+    let mut changes = Vec::new();
+    for (request, description) in requests.iter().zip(descriptions) {
+        let request = rt.operations.track(request);
+        let initial: Value = serde_json::from_str(&request).unwrap();
+        let id = initial["@extra"]["operation"].as_u64().unwrap();
+        if let Some((_, label, undo)) = description {
+            let receipt = rt.operations.watch(id).unwrap();
+            let prepared = !matches!(undo, Undo::Edit | Undo::Reaction(_) | Undo::Chat | Undo::Delete(_));
+            changes.push(Arc::new(Mutex::new(Change {
+                label, initial, undo, prepared, snapshot: None,
+                desired: true, applied: false, messages: Vec::new(), failed: None,
+                order: journal.next.fetch_add(1, Ordering::Relaxed),
+                flight: Some(Flight { receipt, applied: true, remaining: VecDeque::new() }),
+            })));
+        }
+        tracked.push((id, request));
     }
-    journal.entries.lock().unwrap().push(change);
-    if !rt.send(&tracked) {
-        rt.operations.fail(s.store(), id, "Telegram is disconnected; nothing was sent", false);
-        rt.operations.forget_payload(id);
-        return None;
+    // One gesture is one transaction and one node. Each chat still owns its
+    // snapshot and receipt, so a quick undo waits for every acknowledgement.
+    let intents = changes.iter().map(|change| Box::new(Remote(change.clone())) as Box<dyn Intent>).collect();
+    if s.act(Action::new(kind, label).claiming(intents)).is_none() {
+        for (id, _) in tracked {
+            rt.operations.fail(s.store(), id, "The action could not be recorded; nothing was sent", false);
+            rt.operations.forget_payload(id);
+        }
+        return Err(Refusal::Reported);
     }
-    Some(id)
+    journal.entries.lock().unwrap().extend(changes);
+    let mut disconnected = false;
+    for (id, request) in &tracked {
+        if !rt.send(request) {
+            rt.operations.fail(s.store(), *id, "Telegram is disconnected; the request was not sent", false);
+            rt.operations.forget_payload(*id);
+            disconnected = true;
+        }
+    }
+    if disconnected { return Err(Refusal::Failed("Telegram is disconnected; the request could not be queued".into())); }
+    Ok(tracked.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Take a full TDLib snapshot before edits and reactions. The projection only
@@ -199,11 +255,36 @@ pub(super) fn snapshot(w: &World, reply: &Value) -> Option<Option<String>> {
             drop(change);
             return Some(prepare_delete(w, entry, reply));
         }
+        let initial = change.initial.clone();
+        let inverse = if let Undo::Reaction(snapshot) = &mut change.undo {
+            match snapshot.prepare(store, &initial, reply) {
+                reaction::Preparation::Read(request) => {
+                    let rt = runtime::of(store);
+                    if !rt.operations.pending(id) { return Some(None); }
+                    let tracked = rt.operations.track(&request);
+                    let value: Value = serde_json::from_str(&tracked).unwrap();
+                    let snapshot_id = value["@extra"]["operation"].as_u64().unwrap();
+                    change.snapshot = Some((snapshot_id, rt.operations.watch(snapshot_id).unwrap()));
+                    return Some(Some(tracked));
+                }
+                reaction::Preparation::Ready(inverse) => inverse,
+            }
+        } else { inverse(&change, reply) };
         change.prepared = true;
-        change.undo = inverse(&change, reply).map_or(Undo::Impossible, Undo::Commands);
+        change.undo = inverse.map_or(Undo::Impossible, Undo::Commands);
         return Some(runtime::of(store).operations.pending(id).then(|| change.initial.to_string()));
     }
     Some(None)
+}
+
+/// A confirmation that crosses a metadata update cannot establish absence.
+pub(super) fn reactions_changed(store: &Store, chat: Option<i64>) {
+    let journal = store.local::<Journal>();
+    for entry in journal.entries.lock().unwrap().iter() {
+        let mut change = entry.lock().unwrap();
+        if chat.is_some_and(|chat| change.initial["chat_id"] != chat) { continue; }
+        if let Undo::Reaction(snapshot) = &mut change.undo { snapshot.invalidate(); }
+    }
 }
 
 fn prepare_delete(w: &World, entry: &Arc<Mutex<Change>>, reply: &Value) -> Option<String> {
@@ -312,35 +393,6 @@ fn inverse(change: &Change, message: &Value) -> Option<Vec<Value>> {
             if caption { base["caption"] = text.clone(); }
             else { base["input_message_content"]["text"] = text.clone(); }
             Some(vec![base])
-        }
-        Undo::Reaction => {
-            let info = &message["interaction_info"]["reactions"];
-            let reactions = info.as_array().or_else(|| info["reactions"].as_array())?;
-            let mut chosen = Vec::new();
-            for reaction in reactions {
-                if reaction["is_chosen"].as_bool()? {
-                    let kind = reaction.get("type").cloned().or_else(|| reaction["reaction"].as_str()
-                        .map(|emoji| json!({"@type": "reactionTypeEmoji", "emoji": emoji})))?;
-                    if kind["@type"] != "reactionTypePaid" { chosen.push(kind); }
-                }
-            }
-            // Adding an already chosen emoji is a no-op. In particular undo
-            // must not remove a reaction that predates this history node.
-            if chosen.contains(&request["reaction_type"]) { return Some(Vec::new()); }
-            let mut remove = base.clone();
-            remove["@type"] = json!("removeMessageReaction");
-            remove.as_object_mut()?.remove("is_big");
-            remove.as_object_mut()?.remove("update_recent_reactions");
-            let mut commands = vec![remove];
-            // Adding can evict an earlier selection at the account's limit.
-            // Restore that selection too, preserving custom emoji identities.
-            for kind in chosen {
-                let mut add = base.clone();
-                add["reaction_type"] = kind;
-                add["update_recent_reactions"] = json!(false);
-                commands.push(add);
-            }
-            Some(commands)
         }
         _ => None,
     }
@@ -566,7 +618,7 @@ fn resolve(store: &Store, mut request: Value) -> Value {
         request["reply_to"]["message_id"] = json!(resolve_key(&aliases, (from, id)).1);
     }
     let from = request["from_chat_id"].as_i64().unwrap_or(chat);
-    if let Some(ids) = request["message_ids"].as_array_mut() {
+    if let Some(ids) = request.get_mut("message_ids").and_then(Value::as_array_mut) {
         for id in ids {
             if let Some(value) = id.as_i64() { *id = json!(resolve_key(&aliases, (from, value)).1); }
         }

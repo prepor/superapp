@@ -824,7 +824,9 @@ fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let list = open_root(&mut s, Chats::id());
     with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY].map(|peer| format!("{peer}:0"))));
     let inbox = runtime::of(s.store()).connect();
+    let before = s.history().rows();
     verb(&mut s, list, "telegram.read");
+    assert_eq!(s.history().rows(), before, "read receipts do not enter undo history");
     let requests: Vec<serde_json::Value> = inbox.try_iter()
         .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
     assert_eq!(requests.len(), 2, "one read for each marked group");

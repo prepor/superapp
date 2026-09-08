@@ -258,10 +258,9 @@ impl Panel for Line {
             "telegram.delete" => {
                 let (chat, msg) = (self.chat, self.msg);
                 if super::live(self.world.store()) {
-                    if super::super::history::command(s, &requests::delete_messages(chat, &[msg], true)).is_some() {
-                        self.tell_chat(s, |c| c.lines_gone(&[msg]));
-                    } else {
-                        s.notify("delete could not be queued; the message is kept", true);
+                    match super::super::history::command(s, &requests::delete_messages(chat, &[msg], true)) {
+                        Ok(_) => { self.tell_chat(s, |c| c.lines_gone(&[msg])); }
+                        Err(error) => error.notify(s, "delete"),
                     }
                 } else {
                     self.tell_chat(s, |c| c.lines_gone(&[msg]));

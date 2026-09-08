@@ -442,10 +442,9 @@ impl Chat {
             return;
         }
         if super::live(&self.store) {
-            if super::super::history::command(s, &requests::delete_messages(self.peer, &ids, true)).is_some() {
-                self.lines_gone(&ids);
-            } else {
-                s.notify("delete could not be queued; the messages are kept", true);
+            match super::super::history::command(s, &requests::delete_messages(self.peer, &ids, true)) {
+                Ok(_) => self.lines_gone(&ids),
+                Err(error) => error.notify(s, "delete"),
             }
         } else {
             self.lines_gone(&ids);
@@ -739,9 +738,10 @@ impl Chat {
                 } else {
                     requests::edit_message_text(self.peer, e.msg, &text)
                 };
-                if super::super::history::command(s, &request).is_none() {
+                if let Err(error) = super::super::history::command(s, &request) {
                     if super::live(&self.store) {
                         self.editing = Some(e);
+                        error.notify(s, "edit");
                     } else {
                         verbs::edit_line(s, self.peer, e.msg, &e.original, e.was_edited, &text);
                     }
@@ -811,10 +811,13 @@ impl Chat {
         }
         let text = self.draft.clone();
         let reply = self.reply_to;
-        let operation = super::super::history::command(
+        let operation = match super::super::history::command(
             s,
             &self.request(requests::send_message(self.peer, text.trim(), reply)),
-        );
+        ) {
+            Ok(id) => Some(id),
+            Err(error) => { error.notify(s, "send"); None }
+        };
         if operation.is_some() {
             self.set_draft("");
             self.sent_draft.clear();
@@ -829,10 +832,6 @@ impl Chat {
                     c.forget_sent_draft(&text, reply);
                 }
             }
-        } else {
-            let reason = if runtime::of(&self.store).can_send() { "the change could not be queued" }
-                else { "Telegram is not connected" };
-            s.notify(format!("send failed: {reason}; your draft is kept"), true);
         }
         s.redraw();
         operation
@@ -856,9 +855,10 @@ impl Chat {
                 &file,
                 if i == 0 { &text } else { "" },
             );
-            if super::super::history::command(s, &self.request(request)).is_none() {
+            if let Err(error) = super::super::history::command(s, &self.request(request)) {
                 self.carrying.push(file);
                 self.carrying.extend(files.map(|(_, file)| file));
+                error.notify(s, "send");
                 break;
             }
             if i == 0 {
@@ -870,11 +870,6 @@ impl Chat {
             self.sent_draft.clear();
             self.seen_draft.clear();
             self.reply_to = None;
-        } else {
-            s.notify(
-                "send failed: Telegram is not connected; your draft and files are kept",
-                true,
-            );
         }
         s.redraw();
     }

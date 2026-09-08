@@ -64,6 +64,10 @@ follow its new id. Undoing an edit restores the previous text or caption with
 its original formatting. Reaction undo removes the added emoji and restores
 your previous selection, including one displaced by Telegram's reaction limit.
 Adding an emoji you had already chosen does not remove it on undo.
+When Telegram omits a message's reaction list, the app loads reaction metadata
+and confirms the previous state with a server read before adding the emoji.
+Batch mute, pin, archive and unarchive commands over chats take one undo or
+redo press for the whole selection; each chat waits for its own acknowledgement.
 
 Deleting your own supported messages saves their content before sending the
 deletion to Telegram. **Undo resends copies** as new messages, with new ids and

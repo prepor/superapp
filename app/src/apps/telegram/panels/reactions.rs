@@ -248,20 +248,18 @@ impl Reactions {
                     } else {
                         let runtime = runtime::of(store);
                         let (id, reply) = runtime.await_reaction();
-                        if runtime.connection_error().is_some() || super::super::history::command(
+                        p.seen_reply = None;
+                        if let Err(error) = super::super::history::command(
                             s, &requests::add_message_reaction(p.chat, p.msg, emoji, id),
-                        ).is_none() {
-                            runtime.finish_reaction(
-                                id,
-                                ReactionResult::Error(runtime.connection_error().unwrap_or_else(|| {
-                                    if runtime.can_send() { "wait for the current change, then try again".into() }
-                                    else { "Telegram is disconnected".into() }
-                                })),
-                            );
+                        ) {
+                            let result = ReactionResult::Error(error.reason().into());
+                            if matches!(error, super::super::history::Refusal::Reported) {
+                                p.seen_reply = Some(result.clone());
+                            }
+                            runtime.finish_reaction(id, result);
                         }
                         p.reply = reply;
                         p.adding = true;
-                        p.seen_reply = None;
                     }
                 }
             }

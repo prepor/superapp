@@ -170,11 +170,13 @@ impl<T: Td> Account<T> {
             ">> {} request={} chat={}",
             v["@type"], v["@extra"]["operation"], v["chat_id"]
         ));
+        // Preparing an undo snapshot can also time out. Keep the picker's
+        // waiter bounded from the initial command, then reset it on send.
+        self.track_reactions(w, &v);
         if let Some(snapshot) = super::history::before_send(w.store(), &v) {
             if !snapshot.is_empty() { self.send(w, &snapshot); }
             return;
         }
-        self.track_reactions(w, &v);
         self.td.send(&request);
     }
 
