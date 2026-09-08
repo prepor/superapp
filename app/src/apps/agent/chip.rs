@@ -46,7 +46,8 @@ pub struct PanelChip {
     pub queries: Vec<TraceEntry>,
     /// The panel's own paragraph, in the app's words.
     pub about: String,
-    /// SQL columns rendered as full text; the values are still read at send time.
+    /// SQL columns rendered as full text, kept with the in-memory trace.
+    /// Restored chips obtain both from the live panel; values are read at send time.
     pub text_columns: Vec<String>,
 }
 
@@ -108,9 +109,9 @@ impl Chip {
     /// `Mail` or a `Selection` can join it later without the reader having
     /// to guess which it is reading.
     ///
-    /// The trace is not written down. A chip is a reference, and a trace is
-    /// one draw's provenance: a turn read back a week later re-derives it
-    /// from whatever the panel is showing then, or renders without it.
+    /// The trace and full-text column names are not written down. A chip
+    /// is a reference: a turn read back a week later re-derives them from
+    /// whatever the panel is showing then, or renders without them.
     #[must_use]
     pub fn to_json(&self) -> Value {
         match self {
@@ -121,7 +122,6 @@ impl Chip {
                 "title": p.title,
                 "workspace": p.workspace,
                 "about": p.about,
-                "text_columns": p.text_columns,
             }),
         }
     }
@@ -158,9 +158,7 @@ impl Chip {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    text_columns: v.get("text_columns")
-                        .and_then(|columns| serde_json::from_value(columns.clone()).ok())
-                        .unwrap_or_default(),
+                    text_columns: Vec::new(),
                 }))
             }
             _ => None,

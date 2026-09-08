@@ -353,8 +353,9 @@ A chip reads as the panel's title — `inbox`, `Q3 planning`, `~/Downloads` —
 and knows which slot still shows it, so a click can focus it. `Chip` is an enum
 with one variant, `Panel`, and room for `File`, `Mail` and `Selection`: each
 variant renders itself, which is why nothing else in the app matches on one.
-The chip stores its identity, title, workspace, paragraph and full-text column
-names in the turn; the trace and text values are not part of that reference.
+The chip stores its identity, title, workspace and paragraph in the turn.
+The query trace and full-text column names stay in memory; restored chips
+obtain them from the live panel.
 The rendered context is saved separately on the turn for the agent request.
 
 ## Tools: the agent API on the apps

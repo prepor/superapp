@@ -76,12 +76,9 @@ fn line_chips_reread_full_text_after_edits_and_after_the_panel_closes() {
     let chip = Chip::panel(&s, slot).unwrap();
     let pasted = Chip::from_paste(&s, &context::header_line(&Line::id(VERA, MESSAGE_ID))).unwrap();
     let saved = chip.to_json();
-    assert_eq!(saved["text_columns"], json!(["text", "reply_text"]));
+    assert!(saved.get("text_columns").is_none(), "column selection is derived from the live panel");
     assert!(!saved.to_string().contains("original message"), "the chip stores no text snapshot");
     let restored = Chip::from_json(&saved).unwrap();
-    let mut legacy = saved;
-    legacy.as_object_mut().unwrap().remove("text_columns");
-    let legacy = Chip::from_json(&legacy).unwrap();
 
     let body = format!("{}\n  edited message tail\n", "new body ".repeat(60));
     let reply = format!("{}\n  edited quote tail\n", "new quote ".repeat(60));
@@ -96,7 +93,7 @@ fn line_chips_reread_full_text_after_edits_and_after_the_panel_closes() {
         Ok(())
     }).unwrap();
 
-    for reference in [&chip, &pasted, &restored, &legacy] {
+    for reference in [&chip, &pasted, &restored] {
         let text = reference.render(&s);
         assert!(text.contains(&body), "the complete edited message is read at send time");
         assert!(text.contains(&reply), "the complete edited reply is read at send time");
