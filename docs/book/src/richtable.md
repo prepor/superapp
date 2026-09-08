@@ -101,6 +101,14 @@ took rows from above the cursor as well as under it would carry on from a stale
 index, one row further down for each row that left. A mailbox cursor identifies
 the conversation, not whichever message that conversation currently opens.
 
+If the selected row stops matching the filter, it stays visible and selected
+until another row is selected or the filter changes. Opening a chat or mail
+under `@unread` therefore updates its read status without removing the row or
+moving the highlight. The retained row is read fresh and stays in the source's
+order; arrows and clicks choose among the rows currently shown before the old
+selection leaves. A deleted row or one moved outside the source, such as an
+archived conversation in the inbox, leaves immediately.
+
 ## Marks
 
 Marks select rows for a batch action. They are stored as stable keys, so they
@@ -111,7 +119,8 @@ A source can list all matching keys, test which marked keys still match, and
 read a row by key without applying the current filter. Hidden marks therefore
 remain selected and still take part in actions. A key whose row no longer
 exists is dropped on the next draw. **mark all** means every filtered row,
-including unloaded pages.
+including unloaded pages, plus the retained selected row. A retained row is
+marked in place; it joins the hidden marks only after the cursor leaves it.
 
 Filtering and cursor movement do not change marks; `esc` and **clear** remove
 them. A batch checks each key separately, removes the keys that succeeded, and

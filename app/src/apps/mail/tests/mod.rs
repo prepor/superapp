@@ -416,6 +416,40 @@ fn a_preview_marks_the_thread_read_and_undo_gives_it_back() {
     assert!(s.panel(reader).is_none(), "with the slot it opened");
 }
 
+#[test]
+fn an_unread_thread_stays_selected_after_reading_until_another_thread_is_selected() {
+    let (mut s, _clock) = session();
+    let list = open_root(&mut s, Role::Inbox.id());
+    with_mailbox(&s, list, |m| { m.list_mut().set_filter("@unread"); });
+    let before = with_mailbox(&s, list, |m| m.rows(0, 50));
+    assert_eq!(before.len(), 2);
+    let nav = with_mailbox(&s, list, |m| m.walk(1)).unwrap();
+    go(&mut s, nav);
+
+    with_mailbox(&s, list, |m| {
+        let rows = m.rows(0, 50);
+        assert_eq!(rows.iter().map(|r| r.thread).collect::<Vec<_>>(),
+            before.iter().map(|r| r.thread).collect::<Vec<_>>());
+        assert!(!rows[0].unread, "the retained conversation is read fresh");
+        assert!(rows[1].unread, "only the opened conversation is read");
+        assert_eq!(m.list().cursor_index(s.store()), Some(0));
+        assert_eq!(m.list().cursor_key(), Some(&before[0].thread));
+    });
+
+    let nav = with_mailbox(&s, list, |m| m.walk(1)).unwrap();
+    go(&mut s, nav);
+    with_mailbox(&s, list, |m| {
+        assert_eq!(m.len(), 1, "only the selected read conversation stays");
+        let row = m.rows(0, 50).pop().unwrap();
+        assert_eq!(row.thread, before[1].thread);
+        assert!(!row.unread);
+        assert_eq!(m.list().cursor_index(s.store()), Some(0));
+        assert_eq!(m.list().cursor_key(), Some(&row.thread));
+        m.list_mut().set_filter("@unread @not:html");
+        assert_eq!(m.len(), 0, "a new filter releases the last read conversation");
+    });
+}
+
 /// A walk of previews from one slot is one undo node — the whole walk, not
 /// one node a row.
 #[test]

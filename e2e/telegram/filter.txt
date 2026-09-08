@@ -1,0 +1,64 @@
+# args:
+# env:
+#
+# Reading a chat under @unread keeps its selected row. The next arrow
+# chooses the next visible chat, then releases the previous read row.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+key /
+wait 300
+type "@unread"
+wait 500
+key esc
+wait 300
+key esc
+wait 300
+
+mouse "Elena Petrova"
+wait 800
+visible "Elena Petrova"
+key enter
+wait 800
+visible "Elena Petrova: also bringing a friend, ok?"
+key cmd+left
+wait 500
+key down
+wait 800
+visible "Family"
+key enter
+wait 800
+visible "Irina Rudenko: call me when you're free"
+key cmd+left
+wait 500
+
+# Up now reaches stelaxis: Elena's read row left when Family was selected.
+key up
+wait 800
+key enter
+wait 800
+visible "Ivan Petrov: meeting moved to 15:00"
+key cmd+left
+wait 500
+
+# Enter on the rows establishes selection even without an arrow or click.
+key /
+wait 300
+key cmd+a
+type "@unread @kind:channel"
+wait 500
+key esc
+wait 300
+key esc
+wait 300
+key enter
+wait 800
+key cmd+w
+wait 500
+visible "Rust Weekly"
+quit

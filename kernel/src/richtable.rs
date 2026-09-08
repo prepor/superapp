@@ -245,8 +245,8 @@ impl<D: Datasource> Datasource for &D {
 /// The rows the operator has **marked** for a batch verb: a set of
 /// [`Datasource::Key`]s beside the cursor, and nothing else — no rows, no
 /// store, no widget. A mark is an identity, so it survives the filter, the
-/// paging and a sync landing under the list; sorting the set into what the
-/// filter shows and what it hides is the table's job ([`Table::split`]).
+/// paging and a sync landing under the list. [`ListState::split`] separates
+/// shown and hidden marks, accounting for the list's retained selection.
 ///
 /// Marks are context, not intent: they are held in a panel's memory, never
 /// in the history, and go with the process.
@@ -1219,16 +1219,6 @@ impl<D: Datasource> Table<D> {
         self.ds.by_key(store, key)
     }
 
-    /// The marks the filter shows and the marks it hides, both in the set's
-    /// order. A hidden mark is still a mark: it counts, it is drawn above
-    /// the rows, and a batch verb acts on it.
-    #[must_use]
-    pub fn split(&self, store: &Store, marks: &Marks<D::Key>) -> (Vec<D::Key>, Vec<D::Key>) {
-        let keys = marks.keys();
-        let shown: BTreeSet<D::Key> = self.present(store, &keys).into_iter().collect();
-        keys.into_iter().partition(|k| shown.contains(k))
-    }
-
     /// The end of the list came on screen: a source without a count grows
     /// its window by a page, if the last one was full. A counted source
     /// needs nothing — every row already has a place.
@@ -1331,6 +1321,11 @@ pub enum MarkSlot<R> {
 /// what a batch verb walks on — the rows it took from above the cursor are
 /// rows the rank no longer counts, so the walk lands on the one that took
 /// the cursor's place rather than one row per deletion below it.
+///
+/// A row that still belongs to the source but stops matching the filter
+/// stays in the list while selected. It is read fresh and inserted at its
+/// rank among the matching rows. Moving the cursor or changing the filter
+/// releases it; deleting it or moving it out of the source removes it at once.
 pub struct ListState<D: Datasource> {
     table: Table<D>,
     cursor: Option<Cursor<D>>,
@@ -1401,17 +1396,45 @@ impl<D: Datasource> ListState<D> {
 
     #[must_use]
     pub fn len(&self, store: &Store) -> usize {
-        self.table.len(store)
+        self.table.len(store) + usize::from(self.retained_cursor(store).is_some())
     }
 
     #[must_use]
     pub fn is_empty(&self, store: &Store) -> bool {
-        self.table.is_empty(store)
+        self.len(store) == 0
     }
 
     #[must_use]
     pub fn row(&self, store: &Store, i: usize) -> Option<D::Row> {
+        if let Some((at, row)) = self.retained_cursor(store) {
+            if i == at {
+                return Some(row);
+            }
+            if i > at {
+                return self.table.row(store, i - 1);
+            }
+        }
         self.table.row(store, i)
+    }
+
+    /// Rows `lo..hi`, including the selected row while the filter hides it.
+    #[must_use]
+    pub fn rows(&self, store: &Store, lo: usize, hi: usize) -> Vec<D::Row> {
+        (lo..hi).map_while(|i| self.row(store, i)).collect()
+    }
+
+    /// Only the cursor's row can outlive the filter. The base source still
+    /// has to own it, and a matching row is already in the table's pages.
+    fn retained_cursor(&self, store: &Store) -> Option<(usize, D::Row)> {
+        let c = self.cursor.as_ref()?;
+        self.table.ast()?;
+        if !self.table.present(store, std::slice::from_ref(&c.key)).is_empty() {
+            return None;
+        }
+        let row = self.table.by_key(store, &c.key)?;
+        let at = self.table.source().index_of(store, self.table.ast(), &row)
+            .unwrap_or(c.index).min(self.table.len(store));
+        Some((at, row))
     }
 
     /// The key the cursor is *of*, whatever row it now sits on.
@@ -1425,7 +1448,6 @@ impl<D: Datasource> ListState<D> {
     pub fn cursor_index(&self, store: &Store) -> Option<usize> {
         let c = self.cursor.as_ref()?;
         if self
-            .table
             .row(store, c.index)
             .is_some_and(|r| self.table.key(&r) == c.key)
         {
@@ -1453,22 +1475,32 @@ impl<D: Datasource> ListState<D> {
     /// A key's row, when the source can find one for it.
     #[must_use]
     pub fn index_of_key(&self, store: &Store, key: &D::Key) -> Option<usize> {
+        let retained = self.retained_cursor(store);
+        if let Some((at, row)) = &retained {
+            if &self.table.key(row) == key {
+                return Some(*at);
+            }
+        }
         let row = self.table.by_key(store, key)?;
         let i = self
             .table
             .source()
             .index_of(store, self.table.ast(), &row)?;
-        (self.table.row(store, i).map(|r| self.table.key(&r)) == Some(key.clone())).then_some(i)
+        (self.table.row(store, i).map(|r| self.table.key(&r)) == Some(key.clone()))
+            .then_some(i + usize::from(retained.is_some_and(|(at, _)| at <= i)))
     }
 
     /// Puts the cursor on row `i` and answers what it landed on. Every
     /// cursor move goes through here, so walking and previewing can never
     /// disagree.
     pub fn set_cursor(&mut self, store: &Store, i: usize) -> Option<D::Row> {
-        let row = self.table.row(store, i)?;
+        let row = self.row(store, i)?;
+        // Resolve the press in the list that was drawn, then account for
+        // the old selection leaving it before remembering the new index.
+        let index = i - usize::from(self.retained_cursor(store).is_some_and(|(at, _)| at < i));
         self.cursor = Some(Cursor {
             key: self.table.key(&row),
-            index: i,
+            index,
             row: row.clone(),
         });
         Some(row)
@@ -1477,7 +1509,7 @@ impl<D: Datasource> ListState<D> {
     /// Steps the cursor, clamped to the list. With no cursor it lands on
     /// the top row, which is what an arrow in a fresh panel means.
     pub fn move_cursor(&mut self, store: &Store, d: isize) -> Option<D::Row> {
-        let n = self.table.len(store);
+        let n = self.len(store);
         if n == 0 {
             return None;
         }
@@ -1500,7 +1532,7 @@ impl<D: Datasource> ListState<D> {
     /// there was a row to mark.
     pub fn toggle_mark(&mut self, store: &Store) -> bool {
         let at = self.cursor_index(store).unwrap_or(0);
-        let Some(row) = self.table.row(store, at) else {
+        let Some(row) = self.row(store, at) else {
             return false;
         };
         self.marks.toggle(self.table.key(&row));
@@ -1510,7 +1542,7 @@ impl<D: Datasource> ListState<D> {
     /// One end of a range: the cursor's row, marked rather than toggled.
     pub fn mark_cursor(&mut self, store: &Store) {
         let at = self.cursor_index(store).unwrap_or(0);
-        if let Some(row) = self.table.row(store, at) {
+        if let Some(row) = self.row(store, at) {
             self.marks.add(self.table.key(&row));
         }
     }
@@ -1525,13 +1557,17 @@ impl<D: Datasource> ListState<D> {
         landed
     }
 
-    /// `all`: every key under the filter, the rows off screen included. A
-    /// source that cannot list them leaves the set as it is, and says so.
+    /// `all`: every key under the filter and the retained selection, the
+    /// rows off screen included. A source that cannot list them leaves the
+    /// set as it is, and says so.
     pub fn mark_all(&mut self, store: &Store) -> bool {
         let Some(keys) = self.table.keys(store) else {
             return false;
         };
         self.marks.extend(keys);
+        if let Some((_, row)) = self.retained_cursor(store) {
+            self.marks.add(self.table.key(&row));
+        }
         true
     }
 
@@ -1540,12 +1576,17 @@ impl<D: Datasource> ListState<D> {
         self.hidden.clear();
     }
 
-    /// The marks the filter shows and the marks it hides, both in key
-    /// order. A hidden mark is still a mark: it counts, it is drawn above
-    /// the rows, and a batch verb acts on it.
+    /// The marks the list shows, including its retained selection, and the
+    /// marks it hides, both in key order. A hidden mark is still a mark: it
+    /// counts, it is drawn above the rows, and a batch verb acts on it.
     #[must_use]
     pub fn split(&self, store: &Store) -> (Vec<D::Key>, Vec<D::Key>) {
-        self.table.split(store, &self.marks)
+        let keys = self.marks.keys();
+        let mut shown: BTreeSet<D::Key> = self.table.present(store, &keys).into_iter().collect();
+        if let Some((_, row)) = self.retained_cursor(store) {
+            shown.insert(self.table.key(&row));
+        }
+        keys.into_iter().partition(|k| shown.contains(k))
     }
 
     /// The draw's own step: what the filter shows and what it hides, read
@@ -2301,7 +2342,7 @@ mod tests {
     /// whether or not it matches — so a mark the filter hides is still a
     /// mark, read fresh.
     #[test]
-    fn a_table_sorts_its_marks() {
+    fn a_table_finds_matching_keys_and_hidden_rows() {
         let s = store_with(25);
         let mut t = Table::new(&SOURCE, 10);
 
@@ -2319,12 +2360,9 @@ mod tests {
             t.rows(&s, 0, 12).iter().map(|i| i.id).collect::<Vec<_>>()
         );
 
-        // A mark that left the filter sorts into hidden; the rest is shown.
-        let mut marks = Marks::new();
-        marks.extend([6, 7, 20]); // 7 is odd: not ok, so not shown.
-        assert_eq!(t.present(&s, &marks.keys()), vec![6, 20]);
-        assert_eq!(t.split(&s, &marks), (vec![6, 20], vec![7]));
-        assert_eq!(t.split(&s, &Marks::new()), (vec![], vec![]));
+        // The table answers which marked keys still match.
+        let keys = [6, 7, 20]; // 7 is odd: not ok, so not shown.
+        assert_eq!(t.present(&s, &keys), vec![6, 20]);
 
         // And it still has a row: by_key ignores the filter, keeps the base.
         let hidden = t.by_key(&s, &7).expect("the row behind a hidden mark");
@@ -2334,7 +2372,7 @@ mod tests {
         // Reactive like the page: the keys follow a commit.
         s.write(|c| c.execute("UPDATE item SET ok = 1 WHERE id = 7", []))
             .unwrap();
-        assert_eq!(t.present(&s, &marks.keys()), vec![6, 7, 20]);
+        assert_eq!(t.present(&s, &keys), vec![6, 7, 20]);
         assert_eq!(t.keys(&s).map(|k| k.len()), Some(13));
     }
 
@@ -2343,23 +2381,22 @@ mod tests {
     #[test]
     fn a_grouped_source_marks_by_group() {
         let s = store_with(25);
-        let mut t = Table::new(&GROUP_SOURCE, 10);
-        assert_eq!(t.len(&s), 2, "the ok items and the rest");
+        let mut l = ListState::new(&GROUP_SOURCE, 10);
+        assert_eq!(l.len(&s), 2, "the ok items and the rest");
         assert_eq!(
-            t.keys(&s),
+            l.table().keys(&s),
             Some(vec![0, 1]),
             "latest first: item 25 is not ok"
         );
 
-        t.set_filter("@ok");
-        assert_eq!(t.keys(&s), Some(vec![1]));
-        let mut marks = Marks::new();
-        marks.extend([0, 1]);
-        assert_eq!(t.split(&s, &marks), (vec![1], vec![0]));
+        l.set_filter("@ok");
+        assert_eq!(l.table().keys(&s), Some(vec![1]));
+        l.marks_mut().extend([0, 1]);
+        assert_eq!(l.split(&s), (vec![1], vec![0]));
         // A group whose *members* match a text filter comes back whole.
-        t.set_filter("alpha");
-        assert_eq!(t.keys(&s), Some(vec![0, 1]));
-        assert_eq!(t.by_key(&s, &0).map(|g| g.members), Some(13), "all of it");
+        l.set_filter("alpha");
+        assert_eq!(l.table().keys(&s), Some(vec![0, 1]));
+        assert_eq!(l.table().by_key(&s, &0).map(|g| g.members), Some(13), "all of it");
     }
 
     /// A source that cannot count: the window grows a page at a time as
@@ -2406,7 +2443,6 @@ mod tests {
         // are taken at their word, and nothing is known to be hidden.
         assert_eq!(t.keys(&s), None);
         assert_eq!(t.present(&s, &[3, 99]), vec![3, 99]);
-        assert_eq!(t.split(&s, &Marks::default()), (vec![], vec![]));
         assert_eq!(t.by_key(&s, &3), None);
         t.set_filter("x");
         assert_eq!(t.len(&s), 10, "a new filter resets the window");
@@ -2568,6 +2604,109 @@ mod tests {
         assert!(!l.set_filter("@ok"), "unchanged");
     }
 
+    #[test]
+    fn a_filtered_list_keeps_only_the_selected_row_until_the_cursor_moves() {
+        let s = store_with(25);
+        let mut l = ListState::new(&SOURCE, 3);
+        l.set_filter("@ok");
+        let ids = |l: &ListState<&SqlSource<Item, i64>>| -> Vec<i64> {
+            (0..l.len(&s)).map(|i| l.row(&s, i).unwrap().id).collect()
+        };
+        let before = ids(&l);
+        let held = l.set_cursor(&s, 4).unwrap().id;
+        s.write(move |c| {
+            c.execute("UPDATE item SET ok = 0, name = 'changed' WHERE id = ?1", [held])
+        }).unwrap();
+
+        assert_eq!(ids(&l), before, "the selected row stays between the same neighbors, across pages");
+        assert_eq!(l.cursor_index(&s), Some(4));
+        assert_eq!(l.index_of_key(&s, &held), Some(4));
+        assert_eq!(l.index_of_key(&s, &before[5]), Some(5));
+        let row = l.row(&s, 4).unwrap();
+        assert!(!row.ok, "the retained row is read fresh");
+        assert_eq!(row.name, "changed");
+
+        assert_eq!(l.move_cursor(&s, 1).unwrap().id, before[5], "down takes the next visible row");
+        assert_eq!(l.cursor_index(&s), Some(4), "the previous row has left");
+        assert!(!ids(&l).contains(&held));
+        assert_eq!(l.len(&s), before.len() - 1);
+
+        let held = *l.cursor_key().unwrap();
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+        assert_eq!(l.move_cursor(&s, -1).unwrap().id, before[3], "up takes the previous visible row");
+        assert!(!ids(&l).contains(&held));
+
+        let held = *l.cursor_key().unwrap();
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+        let clicked = l.row(&s, 6).unwrap().id;
+        assert_eq!(l.set_cursor(&s, 6).unwrap().id, clicked);
+        assert_eq!(l.cursor_index(&s), Some(5), "a click resolves before the old row leaves");
+        assert!(!ids(&l).contains(&held));
+    }
+
+    #[test]
+    fn a_retained_row_can_be_the_only_result_and_leaves_with_the_filter_or_source() {
+        let s = store_with(2);
+        let mut l = ListState::new(&SOURCE, 3);
+        l.set_filter("@ok");
+        let held = l.set_cursor(&s, 0).unwrap().id;
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+        assert_eq!(l.len(&s), 1);
+        assert!(!l.is_empty(&s));
+        assert_eq!(l.move_cursor(&s, 1).unwrap().id, held, "down at the end keeps the selection");
+        assert_eq!(l.move_cursor(&s, -1).unwrap().id, held);
+
+        s.write(move |c| c.execute("UPDATE item SET ok = 1 WHERE id = ?1", [held])).unwrap();
+        assert_eq!(l.len(&s), 1, "matching again does not duplicate the row");
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+        assert!(!l.set_filter("@ok"));
+        assert_eq!(l.len(&s), 1, "drawing the same filter keeps the row");
+        l.set_filter("@ok @name:changed");
+        assert!(l.is_empty(&s), "editing the filter drops the selection");
+
+        l.set_filter("@not:ok");
+        l.set_cursor(&s, 0);
+        s.write(move |c| c.execute("UPDATE item SET ok = 1 WHERE id = ?1", [held])).unwrap();
+        l.clear_cursor();
+        assert_eq!(l.len(&s), 1, "clearing the cursor releases its row");
+
+        l.set_filter("@ok");
+        l.set_cursor(&s, 0);
+        s.write(move |c| c.execute("UPDATE item SET id = -id, ok = 0 WHERE id = ?1", [held])).unwrap();
+        assert!(l.is_empty(&s), "a row outside the source's base condition is gone");
+
+        l.set_filter("@not:ok");
+        let held = l.set_cursor(&s, 0).unwrap().id;
+        s.write(move |c| c.execute("DELETE FROM item WHERE id = ?1", [held])).unwrap();
+        assert!(l.is_empty(&s), "a deleted row is gone");
+    }
+
+    #[test]
+    fn a_retained_row_is_marked_in_place_and_hidden_only_after_leaving_it() {
+        let s = store_with(12);
+        let mut l = ListState::new(&SOURCE, 3);
+        l.set_filter("@ok");
+        let held = l.set_cursor(&s, 1).unwrap().id;
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+
+        assert!(l.toggle_mark(&s));
+        assert_eq!(l.marks().keys(), vec![held]);
+        l.sync(&s);
+        assert_eq!(l.split(&s), (vec![held], vec![]));
+        assert!(l.hidden_rows().is_empty(), "the selected row must not also appear above the list");
+
+        l.clear_marks();
+        assert!(l.mark_all(&s));
+        assert_eq!(l.marks().len(), l.len(&s));
+        assert!(l.marks().has(&held), "all includes the selected visible row");
+        l.clear_marks();
+        let next = l.row(&s, 2).unwrap().id;
+        assert_eq!(l.mark_range(&s, 1).unwrap().id, next);
+        assert!(l.marks().has(&held) && l.marks().has(&next));
+        l.sync(&s);
+        assert_eq!(l.hidden_rows().iter().map(|r| r.id).collect::<Vec<_>>(), vec![held]);
+    }
+
     /// The marks a list holds: space toggles the cursor's row, shift+arrow
     /// walks a range, `all` takes the filter's whole set, and a mark the
     /// filter hides rides above the rows.
@@ -2624,6 +2763,7 @@ mod tests {
         // Clearing takes both.
         l.clear_marks();
         assert!(l.marks().is_empty() && l.hidden_rows().is_empty());
+        assert_eq!(l.split(&s), (vec![], vec![]));
     }
 
     /// A source that cannot list its keys does not offer `all`, and its
@@ -2632,6 +2772,7 @@ mod tests {
     fn a_countless_list_offers_no_mark_all() {
         let s = Store::open(None, &[]).unwrap();
         let mut l = ListState::new(Stream((0..23).collect()), 10);
+        assert_eq!(l.split(&s), (vec![], vec![]));
         assert!(!l.mark_all(&s));
         l.marks_mut().extend([3, 99]);
         l.sync(&s);
