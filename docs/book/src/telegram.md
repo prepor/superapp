@@ -42,6 +42,13 @@ Replies can cross the upgrade boundary: `reply_chat` identifies the source chat
 when it differs from the replying message's chat. Replying from the new group's
 composer uses TDLib's `inputMessageReplyToExternalMessage`.
 
+Viewing newer messages in the focused conversation advances its read position,
+including messages loaded or received after the panel opened. Live unread counts
+follow Telegram's acknowledgment; unacknowledged views retry while visible.
+Hidden conversations and background windows send no viewport read receipts.
+Switching conversations waits for the replacement transcript to be drawn before
+acknowledging any of its messages.
+
 With the transcript focused, **Ctrl+E** or **End** jumps to the end of the chat,
 selects its newest message and resumes following new messages; **Home** selects
 the oldest loaded message. In the composer, **Ctrl+E** moves the caret to the

@@ -145,7 +145,7 @@ impl Stage {
             time: t,
         });
         pointer_before(cx, &down);
-        self.forward_to_hosted(cx, sh, &down);
+        self.handle_with(cx, sh, &down);
         for i in 1..=8 {
             let f = f64::from(i) / 8.0;
             let mv = Event::MouseMove(MouseMoveEvent {
@@ -156,7 +156,7 @@ impl Stage {
                 handled: std::cell::Cell::new(Area::Empty),
                 lock_delta: DVec2::default(),
             });
-            self.forward_to_hosted(cx, sh, &mv);
+            self.handle_with(cx, sh, &mv);
         }
         let up = Event::MouseUp(MouseUpEvent {
             abs: to,
@@ -165,7 +165,7 @@ impl Stage {
             modifiers: KeyModifiers::default(),
             time: t + 0.2,
         });
-        self.forward_to_hosted(cx, sh, &up);
+        self.handle_with(cx, sh, &up);
         pointer_after(cx, &up);
     }
 }

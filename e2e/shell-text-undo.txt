@@ -1,0 +1,212 @@
+# args: --demo-disk
+# env:
+# Undo and redo belong to the editable field with the caret, even when its
+# history is empty. Leaving the field gives the workspace its history back.
+# Filters assert the rows their text selects; composers and names assert the
+# text submitted after editing. All accounts and file operations are fakes.
+
+wait 900
+
+# An ordinary single-line field: the menu and keyboard share its history.
+# A redo from the abandoned text branch must do nothing.
+click "filter"
+type "vera"
+wait 500
+key cmd+a
+type "elena"
+wait 500
+visible "Sat hike"
+menu "Undo"
+wait 500
+visible "Q3 infra"
+menu "Redo"
+wait 500
+visible "Sat hike"
+key cmd+z
+wait 500
+key cmd+a
+type "github"
+wait 500
+key cmd+shift+z
+wait 500
+visible "[stelaxis] CI failed on main"
+
+# Exhausting the text history must leave the inbox open. Once the caret
+# leaves the field, closing a reader can still be undone and redone.
+key cmd+z 6
+wait 500
+visible "Q3 infra"
+key esc
+wait 300
+click "Q3 infra"
+wait 700
+key cmd+right
+wait 300
+key cmd+w
+wait 500
+key cmd+z
+wait 700
+click "Vera Kovac · aug 31 09:14"
+key cmd+shift+z
+wait 500
+key cmd+z
+wait 700
+click "Vera Kovac · aug 31 09:14"
+
+# The agent composer keeps only text chords. Paste, typing and deletion
+# each use the field's own history, and an empty stack cannot close it.
+key cmd+2
+wait 400
+key cmd 2
+wait 400
+type "new chat"
+wait 400
+key enter
+wait 700
+menu "Undo"
+wait 300
+click "ask"
+menu "Redo"
+wait 300
+click "ask"
+paste "agent draft"
+wait 300
+type " wrong"
+wait 300
+key cmd+z
+wait 300
+type " restored"
+wait 300
+key cmd+a
+key backspace
+wait 300
+menu "Undo"
+wait 300
+key enter
+wait 900
+click "agent draft restored"
+
+# A read-only text input in the transcript must leave undo with the
+# workspace: undoing the send restores the untitled chat.
+wait 300
+key cmd+z
+wait 700
+click "chat"
+
+# Telegram's composer also declares a restricted policy. Redo a paste,
+# replace its selection, undo that replacement, and append before committing
+# an edit to a fixture message (offline sends do not add transcript rows).
+key cmd+3
+wait 400
+key cmd 2
+wait 400
+type "chats"
+wait 400
+key enter
+wait 700
+click "stelaxis"
+wait 700
+click "me: the muted grey is too light on the fold"
+wait 300
+click "edit"
+wait 400
+click "write a message"
+wait 300
+key cmd+a
+paste "telegram draft"
+wait 300
+key cmd+z
+wait 300
+key cmd+shift+z
+wait 300
+key cmd+a
+type "wrong replacement"
+wait 300
+key cmd+z
+wait 300
+key right
+type " restored"
+wait 300
+key enter
+wait 700
+visible "me: telegram draft restored"
+click "write a message"
+wait 300
+key cmd+z 3
+wait 500
+visible "me: telegram draft restored"
+
+# A transient input in Files: undo the name edit, redo it, and finish the
+# name. An exhausted history above must never have navigated the workspace.
+key cmd+4
+wait 400
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 700
+click "new dir"
+wait 400
+type "undo-name"
+wait 300
+key cmd+z
+wait 300
+key cmd+shift+z
+wait 300
+type "-restored"
+key enter
+wait 700
+visible "undo-name-restored/"
+
+# The same ownership rule applies to RSS's shared table filter.
+key cmd+5
+wait 400
+key cmd 2
+wait 400
+type "rss"
+wait 400
+key enter
+wait 700
+click "filter"
+key cmd+a
+type "Make room"
+wait 500
+key cmd+a
+type "Small tools"
+wait 500
+key cmd+z
+wait 500
+visible "Make room for reading"
+key cmd+shift+z
+wait 500
+visible "Small tools, lasting habits"
+
+# Modal query inputs keep their own undo/redo through both entry points.
+key cmd 2
+wait 400
+type "new mail"
+wait 400
+key cmd+a
+type "new chat"
+wait 400
+menu "Undo"
+wait 400
+click "new mail"
+wait 700
+click "body"
+key cmd 2
+wait 400
+type "new mail"
+wait 400
+key cmd+a
+type "new chat"
+wait 400
+key cmd+z
+wait 400
+menu "Redo"
+wait 400
+key enter
+wait 700
+click "ask"
+quit

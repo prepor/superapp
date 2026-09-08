@@ -53,6 +53,46 @@ fn linking_cached_histories_refreshes_open_transcripts_without_colliding_ids() {
 }
 
 #[test]
+fn visible_reads_across_the_upgrade_use_each_sources_read_position() {
+    for live in [false, true] {
+        let mut s = session();
+        histories(&s, true);
+        let slot = open_root(&mut s, Chat::at(NEW, 42));
+        s.store().write(|c| {
+            c.execute("UPDATE tg_message SET out = 0 WHERE chat IN (?1, ?2)", [OLD, NEW])?;
+            c.execute("UPDATE tg_chat SET unread = 1, last_read = 42 WHERE peer = ?1", [OLD])?;
+            c.execute("UPDATE tg_chat SET unread = 2, last_read = 41 WHERE peer = ?1", [NEW])?;
+            Ok(())
+        }).unwrap();
+        let inbox = live.then(|| runtime::of(s.store()).connect());
+        with_chat(&s, slot, |c| c.view_messages(&[(OLD, 42), (NEW, 42)], s.now()));
+        with_chat(&s, slot, |c| c.view_messages(&[(OLD, 43)], s.now()));
+        if !live {
+            assert_eq!(model::peer(s.store(), OLD).unwrap().last_read, Some(43));
+            assert_eq!(model::peer(s.store(), NEW).unwrap().last_read, Some(42));
+        }
+        with_chat(&s, slot, |c| c.view_messages(&[(NEW, 43)], s.now()));
+        if let Some(inbox) = inbox {
+            let requests: Vec<Value> = std::iter::from_fn(|| inbox.try_recv().ok())
+                .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+            assert_eq!(requests.len(), 3);
+            for (request, (chat, id)) in requests.iter().zip([(NEW, 42), (OLD, 43), (NEW, 43)]) {
+                assert_eq!(request["@type"], "viewMessages");
+                assert_eq!(request["chat_id"], chat);
+                assert_eq!(request["message_ids"], json!([id]));
+            }
+            assert_eq!(model::peer(s.store(), OLD).unwrap().last_read, Some(42));
+            assert_eq!(model::peer(s.store(), NEW).unwrap().last_read, Some(41));
+        } else {
+            for chat in [OLD, NEW] {
+                let card = model::peer(s.store(), chat).unwrap();
+                assert_eq!((card.unread, card.last_read), (0, Some(43)));
+            }
+        }
+    }
+}
+
+#[test]
 fn replies_cards_and_deletion_keep_the_original_message_identity() {
     let mut s = session();
     histories(&s, true);
