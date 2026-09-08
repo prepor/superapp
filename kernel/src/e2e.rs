@@ -22,6 +22,7 @@
 //!                       the launcher trigger
 //! menu "Undo"         — invoke a native menu command (Undo or Redo)
 //! type "hello"        — text into the focused field / panel keys
+//! copy "hello"        — assert the text returned to the system clipboard
 //! paste "a\\nb"        — the same text, but as a paste: the event says so
 //!                       (`was_paste`), and `\\n` is a newline, so a whole
 //!                       document goes in whole. A composer reading a paste
@@ -40,8 +41,10 @@
 //! ```
 //!
 //! Labels match case-insensitively by substring against links, buttons,
-//! fields, rows and panel titles. Steps that mutate the workspace need a
-//! `wait` after them: hits refresh on the next drawn frame.
+//! fields, rows and panel titles. A `text: ` prefix matches the exact text
+//! of a visible native text widget without a panel-defined label.
+//! Steps that mutate the workspace need a `wait` after them: hits refresh
+//! on the next drawn frame.
 
 use std::path::PathBuf;
 
@@ -77,6 +80,8 @@ pub enum Step {
     Menu(String),
     /// Text input into whatever owns the keyboard.
     Type(String),
+    /// Assert what the native clipboard request reads from the selection.
+    Copy(String),
     /// The same, delivered as a **paste**: the text input event carries
     /// `was_paste`, and control characters go through rather than being
     /// refused, because a pasted document keeps its newlines. What a
@@ -241,8 +246,8 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
         }
         "menu" => Step::Menu(quoted()?),
         "type" => Step::Type(quoted()?),
-        // `\n` is a newline here and nowhere else: a paste is the one step
-        // whose argument is a document rather than a word.
+        "copy" => Step::Copy(unescape(&quoted()?)),
+        // A paste and a clipboard assertion can carry whole documents.
         "paste" => Step::Paste(unescape(&quoted()?)),
         "dropfiles" => {
             let values: Vec<String> = serde_json::from_str(rest)

@@ -1,0 +1,87 @@
+# args: --demo-disk
+# env:
+# The same native clipboard request works in every app, for both read-only
+# content and editable fields, without selection handlers on the panels.
+wait 900
+
+# Mail's plain text and HTML readers.
+click "Q3 infra"
+wait 700
+dblclick "mail body"
+wait 300
+copy "Draft"
+key cmd+c
+copy "Draft"
+click "CI failed"
+wait 700
+dblclick "mail html"
+wait 300
+copy "Workflow"
+
+# Editable inputs use the same native clipboard request.
+click "filter"
+wait 300
+key cmd+a
+type "selected input"
+wait 300
+key cmd+a
+wait 300
+copy "selected input"
+key cmd+c
+copy "selected input"
+key esc
+
+# Files has a competing copy-path verb. A text selection takes precedence;
+# collapsing it makes that verb available again.
+key cmd+2
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 700
+click "notes.md"
+wait 700
+drag "~/notes.md" 1200 0
+wait 300
+copy "~/notes.md"
+accel "copy path" -
+key cmd+c
+copy "~/notes.md"
+click "~/notes.md"
+wait 300
+accel "copy path" c
+
+# RSS uses the shared HTML reader.
+key cmd+3
+key cmd 2
+wait 400
+type "rss"
+wait 400
+key enter
+wait 700
+click "Make room for reading"
+wait 700
+dblclick "article body"
+wait 300
+copy "Good"
+key cmd+c
+copy "Good"
+
+# Agent answers render Markdown as selectable HTML.
+key cmd+4
+key cmd 2
+wait 400
+type "new chat"
+wait 400
+key enter
+wait 700
+type "hello"
+key enter
+wait 900
+dblclick "Hello. I am the assistant."
+wait 300
+copy "Hello"
+key cmd+c
+copy "Hello"
+quit

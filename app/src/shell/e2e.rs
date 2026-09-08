@@ -60,6 +60,38 @@ pub struct PendingShot {
 }
 
 impl Stage {
+    /// Native text can be addressed without adding test hits to each panel.
+    /// The pointer still follows the ordinary hit table and widget handlers.
+    fn script_hit(&self, cx: &Cx, sh: &Shell, label: &str) -> Option<Hit> {
+        let Some(expected) = label.strip_prefix("text: ") else {
+            return self.hits.by_label(label);
+        };
+        let mut roots: Vec<_> = self.hosted.iter().collect();
+        roots.sort_by_key(|(slot, _)| (Some(**slot) != sh.session.focus(), **slot));
+        for (slot, root) in roots {
+            let text = super::keyboard::find_text(root, &|widget| {
+                let area = widget.area();
+                let rect = area.clipped_rect(cx);
+                if !area.is_valid(cx) || rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+                    return false;
+                }
+                let text = if widget.borrow::<TextInput>().is_some() {
+                    widget.text()
+                } else {
+                    widget.selection_get_full_text()
+                };
+                text == expected
+            });
+            if let Some(text) = text {
+                let area = text.area();
+                let mut hit = Hit::new(label, area.clipped_rect(cx), MouseCursor::Text, *slot);
+                hit.unclipped = Some(area.rect(cx));
+                return Some(hit);
+            }
+        }
+        None
+    }
+
     /// Executes at most one step per tick; waits pace the script.
     pub(super) fn e2e_tick(&mut self, cx: &mut Cx, sh: &mut Shell, dt_ms: f64) {
         let Some(mut runner) = self.e2e.take() else {
@@ -94,7 +126,7 @@ impl Stage {
             return true;
         }
         match step {
-            Step::Visible(label) => match self.hits.by_label(&label) {
+            Step::Visible(label) => match self.script_hit(cx, sh, &label) {
                 Some(hit) => {
                     if let Err(reason) = check_visible(&hit) {
                         eprintln!("e2e: FAIL visible {label:?}: {reason}");
@@ -103,7 +135,7 @@ impl Stage {
                 }
                 None => self.no_such(r, "visible", &label),
             },
-            Step::Accel { label, letter } => match self.hits.by_label(&label) {
+            Step::Accel { label, letter } => match self.script_hit(cx, sh, &label) {
                 Some(hit) if hit.accel == letter => {}
                 Some(hit) => {
                     eprintln!("e2e: FAIL accel {label:?}: expected {letter:?}, drew {:?}", hit.accel);
@@ -140,7 +172,7 @@ impl Stage {
 
             // Whole-label matches win over substrings, so an exact name is
             // an exact target (see `hits::label_rank`).
-            Step::Click { label, fresh } => match self.hits.by_label(&label) {
+            Step::Click { label, fresh } => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     eprintln!("e2e: click {label:?}{}", if fresh { " (cmd)" } else { "" });
                     self.synth_click(cx, sh, h.rect.pos + h.rect.size / 2.0, fresh);
@@ -150,7 +182,7 @@ impl Stage {
 
             // The same path; kept as its own word because a suite says
             // `mouse` when it means "prove the focus side effects too".
-            Step::Mouse { label } => match self.hits.by_label(&label) {
+            Step::Mouse { label } => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     eprintln!("e2e: mouse {label:?}");
                     self.synth_click(cx, sh, h.rect.pos + h.rect.size / 2.0, false);
@@ -162,7 +194,7 @@ impl Stage {
             // gesture. From the near corner, so the word they take is the
             // run's first — the middle of a long run is as often the space
             // between two words.
-            Step::MultiClick { label, clicks } => match self.hits.by_label(&label) {
+            Step::MultiClick { label, clicks } => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     eprintln!("e2e: click ×{clicks} {label:?}");
                     let p = h.rect.pos + dvec2(4.0, 4.0);
@@ -225,6 +257,17 @@ impl Stage {
                 self.handle_text(cx, sh, &s);
             }
 
+            Step::Copy(expected) => {
+                let response = std::rc::Rc::new(std::cell::RefCell::new(None));
+                self.handle_with(cx, sh, &Event::TextCopy(TextClipboardEvent {
+                    response: response.clone(),
+                }));
+                if response.borrow().as_deref() != Some(expected.as_str()) {
+                    eprintln!("{}e2e: FAIL copy: expected {expected:?}, got {:?}", r.tag, response.borrow());
+                    r.failures += 1;
+                }
+            }
+
             // The same door, told that this came off a clipboard: a
             // composer that reads a paste for what it is cannot be driven
             // by `type`, and a pasted document keeps its newlines.
@@ -233,7 +276,7 @@ impl Stage {
                 self.handle_paste(cx, sh, &s);
             }
 
-            Step::DropFiles { label, paths } => match self.hits.by_label(&label) {
+            Step::DropFiles { label, paths } => match self.script_hit(cx, sh, &label) {
                 Some(hit) => {
                     use std::sync::{Arc, Mutex};
                     let abs = hit.rect.pos + hit.rect.size / 2.0;
@@ -281,7 +324,7 @@ impl Stage {
                 None => self.no_such(r, "dropfiles", &label),
             },
 
-            Step::Drag { label, dx, dy } => match self.hits.by_label(&label) {
+            Step::Drag { label, dx, dy } => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     // From the left edge, so a horizontal drag sweeps the
                     // run rather than starting halfway through it.
@@ -292,7 +335,7 @@ impl Stage {
                 None => self.no_such(r, "drag", &label),
             },
 
-            Step::SelectAll(label) => match self.hits.by_label(&label) {
+            Step::SelectAll(label) => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     eprintln!("e2e: selectall {label:?}");
                     // Just inside the run's top-left corner: the middle of
@@ -331,7 +374,7 @@ impl Stage {
                 dx,
                 dy,
                 hold,
-            } => match self.hits.by_label(&label) {
+            } => match self.script_hit(cx, sh, &label) {
                 Some(h) => {
                     let c = h.rect.pos + h.rect.size / 2.0;
                     eprintln!("e2e: swipe {label:?} by ({dx}, {dy})");

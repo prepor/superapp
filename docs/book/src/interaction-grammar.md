@@ -92,9 +92,11 @@ in step, because the drawing and the routing read the same order.
 
 The shell reads keyboard ownership from the live widget tree, using widget
 identity rather than rectangle overlap or a report cached from an earlier
-frame. Ordinary inputs keep all letter chords; selectable text keeps
-`cmd+x/c/v/a`. A composer can declare a narrower input policy through
-`PanelProps.keyboard.keep`. `bar::Shortcuts` makes the routing decision for
+frame. Ordinary inputs keep all letter chords; read-only selectable text keeps
+`cmd+x/v/a` and keeps `cmd+c` while its selection is nonempty, leaving the
+panel's copy verb available after the selection collapses. A composer can
+declare a narrower input policy through `PanelProps.keyboard.keep`.
+`bar::Shortcuts` makes the routing decision for
 both key presses and bold letters, and focus changes redraw the bars.
 
 Text undo and redo take priority over workspace history while an editable
@@ -105,6 +107,11 @@ The history and workspaces overlays also keep undo and redo on workspace
 history, even if an input underneath retains the caret; the launcher's
 query keeps its own text history. The menu's Undo and Redo follow the same
 rules as their keyboard shortcuts.
+
+The shell gives native text widgets focus when they capture a pointer press
+and preserves it through release, so every app gets the same selection and
+copy behavior. Shared tables retain those widgets when cursor or mark changes
+switch the row's appearance, preserving selection without panel handlers.
 
 Virtual lists reveal a requested row by its measured rectangle. The request
 remains pending until a draw confirms the row is visible, so different row
