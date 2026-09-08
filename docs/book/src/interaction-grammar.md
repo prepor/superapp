@@ -101,6 +101,10 @@ Text undo and redo take priority over workspace history while an editable
 input has the caret, including composers with a narrower letter policy.
 They stay with that input when its undo or redo stack is empty. Read-only
 text and focus outside an editable input leave them with the workspace.
+The history and workspaces overlays also keep undo and redo on workspace
+history, even if an input underneath retains the caret; the launcher's
+query keeps its own text history. The menu's Undo and Redo follow the same
+rules as their keyboard shortcuts.
 
 Virtual lists reveal a requested row by its measured rectangle. The request
 remains pending until a draw confirms the row is visible, so different row

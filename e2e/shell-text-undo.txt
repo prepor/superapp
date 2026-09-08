@@ -7,8 +7,8 @@
 
 wait 900
 
-# An ordinary single-line field: replacement, undo, redo, and a new edit
-# after undo. A redo from the abandoned text branch must do nothing.
+# An ordinary single-line field: the menu and keyboard share its history.
+# A redo from the abandoned text branch must do nothing.
 click "filter"
 type "vera"
 wait 500
@@ -16,10 +16,10 @@ key cmd+a
 type "elena"
 wait 500
 visible "Sat hike"
-key cmd+z
+menu "Undo"
 wait 500
 visible "Q3 infra"
-key cmd+shift+z
+menu "Redo"
 wait 500
 visible "Sat hike"
 key cmd+z
@@ -63,10 +63,10 @@ type "new chat"
 wait 400
 key enter
 wait 700
-key cmd+z
+menu "Undo"
 wait 300
 click "ask"
-key cmd+shift+z
+menu "Redo"
 wait 300
 click "ask"
 paste "agent draft"
@@ -80,7 +80,7 @@ wait 300
 key cmd+a
 key backspace
 wait 300
-key cmd+z
+menu "Undo"
 wait 300
 key enter
 wait 900
@@ -182,7 +182,7 @@ key cmd+shift+z
 wait 500
 visible "Small tools, lasting habits"
 
-# Modal query inputs keep their own undo/redo, too.
+# Modal query inputs keep their own undo/redo through both entry points.
 key cmd 2
 wait 400
 type "new mail"
@@ -190,7 +190,7 @@ wait 400
 key cmd+a
 type "new chat"
 wait 400
-key cmd+z
+menu "Undo"
 wait 400
 click "new mail"
 wait 700
@@ -204,7 +204,7 @@ type "new chat"
 wait 400
 key cmd+z
 wait 400
-key cmd+shift+z
+menu "Redo"
 wait 400
 key enter
 wait 700

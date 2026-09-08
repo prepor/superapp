@@ -205,6 +205,21 @@ impl Stage {
                 }
             },
 
+            Step::Menu(command) => {
+                let id = match command.to_ascii_lowercase().as_str() {
+                    "undo" => Some(super::menu::MENU_UNDO),
+                    "redo" => Some(super::menu::MENU_REDO),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    eprintln!("e2e: menu {command:?}");
+                    self.menu_command(cx, sh, LiveId(id));
+                } else {
+                    eprintln!("e2e: FAIL menu {command:?}: unknown command");
+                    r.failures += 1;
+                }
+            }
+
             Step::Type(s) => {
                 eprintln!("e2e: type {s:?}");
                 self.handle_text(cx, sh, &s);

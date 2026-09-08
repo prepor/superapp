@@ -20,6 +20,7 @@
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
+//! menu "Undo"         — invoke a native menu command (Undo or Redo)
 //! type "hello"        — text into the focused field / panel keys
 //! paste "a\\nb"        — the same text, but as a paste: the event says so
 //!                       (`was_paste`), and `\\n` is a newline, so a whole
@@ -72,6 +73,8 @@ pub enum Step {
     /// A key chord: `cmd+shift+left`, `enter`, `j`, … with a repeat count
     /// (`key j 5`).
     Key { chord: String, times: u32 },
+    /// Invoke a native menu command by name, through its normal handler.
+    Menu(String),
     /// Text input into whatever owns the keyboard.
     Type(String),
     /// The same, delivered as a **paste**: the text input event carries
@@ -236,6 +239,7 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
                 times,
             }
         }
+        "menu" => Step::Menu(quoted()?),
         "type" => Step::Type(quoted()?),
         // `\n` is a newline here and nowhere else: a paste is the one step
         // whose argument is a document rather than a word.
