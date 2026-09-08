@@ -19,9 +19,9 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, ChatRow, PeerId, PAGE};
-use super::super::{draft_toast, requests, runtime};
+use super::super::{requests, runtime};
 use super::Chat;
-use super::{flip, told, wire, Contacts, Messages};
+use super::{flip, told, Contacts, Messages};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
@@ -236,7 +236,7 @@ impl Panel for Chats {
 // -- the batch verbs ---------------------------------------------------------
 
 impl Chats {
-    /// A batch verb over the marks: one request per chat. Acknowledgements
+    /// A batch verb over the marks: one undo node, one request per chat. Acknowledgements
     /// and updates settle each local row, so a failed command keeps its data.
     ///
     /// A set is too many states to toggle one by one, so the bar's word is
@@ -254,6 +254,8 @@ impl Chats {
         let archiving = verb == "telegram.archive";
         let mut queued = Vec::new();
         let mut local = Vec::new();
+        let mut remote = Vec::new();
+        let mut requests = Vec::new();
         for &(peer, topic) in &peers {
             if topic != 0 && matches!(verb, "telegram.pin" | "telegram.archive" | "telegram.unarchive") {
                 local.push((peer, topic));
@@ -273,21 +275,19 @@ impl Chats {
                 _ => requests::add_chat_to_list(peer, archiving),
             };
             let request = if verb == "telegram.read" { requests::in_topic(request, topic) } else { request };
-            if wire(&store, &request) {
-                queued.push((peer, topic));
+            requests.push(request);
+            remote.push((peer, topic));
+        }
+        let word = verb.rsplit('.').next().unwrap_or(verb);
+        let what = if peers.len() == 1 { "chat" } else { "chats" };
+        let label = format!("{word} {} {what}", peers.len());
+        if !requests.is_empty() {
+            match super::super::history::batch(s, &requests, label.clone()) {
+                Ok(_) => queued.extend(remote),
+                Err(error) => { error.notify(s, &label); return; }
             }
         }
-        if queued.is_empty() {
-            let word = verb.rsplit('.').next().unwrap_or(verb);
-            let n = peers.len();
-            let what = if n == 1 { "chat" } else { "chats" };
-            if super::live(&store) {
-                s.notify(format!("{word} failed: Telegram is not connected"), true);
-            } else {
-                s.notify(draft_toast(&format!("{word} {n} {what}")), false);
-            }
-            return;
-        }
+        if queued.is_empty() { return; }
         // Topic pinning and archiving are local preferences. Reads and
         // other server flags settle only when Telegram acknowledges them.
         let topic_column = if verb == "telegram.pin" { "pinned" } else { "archived" };

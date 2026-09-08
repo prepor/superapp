@@ -66,6 +66,7 @@ impl<T: Td> Account<T> {
     }
 
     pub(super) fn counts_metadata_changed(&self, w: &World, chat: Option<PeerId>) {
+        super::super::history::reactions_changed(w.store(), chat);
         let mut state = self.counts.borrow_mut();
         // Metadata updates can follow the null interaction updates they
         // caused. Retire the whole attempt, including its readiness check.

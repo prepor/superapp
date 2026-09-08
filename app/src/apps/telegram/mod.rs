@@ -16,6 +16,7 @@ use kernel::store::Store;
 
 pub mod config;
 mod downloads;
+mod history;
 pub mod model;
 pub mod operations;
 pub mod panels;

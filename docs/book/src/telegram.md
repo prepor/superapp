@@ -52,6 +52,46 @@ literal.
 
 ## User actions
 
+Sends (including attachments and forwards), edits, reactions, chat notification
+changes, pinning and archiving appear in the undo tree. **Cmd+Z** requests their
+reversal on Telegram; redo reapplies them. A pending command settles before its
+reversal runs, and failures appear in the Telegram status strip and Problems.
+The transcript continues to reflect Telegram's updates throughout.
+
+Undoing a send requests **delete for everyone** using the delivered message ids.
+Redo sends a new message; later edits and reactions in the same history branch
+follow its new id. Undoing an edit restores the previous text or caption with
+its original formatting. Reaction undo removes the added emoji and restores
+your previous selection, including one displaced by Telegram's reaction limit.
+Adding an emoji you had already chosen does not remove it on undo.
+When Telegram omits a message's reaction list, the app loads reaction metadata
+and confirms the previous state with a server read before adding the emoji.
+Batch mute, pin, archive and unarchive commands over chats take one undo or
+redo press for the whole selection; each chat waits for its own acknowledgement.
+
+Deleting your own supported messages saves their content before sending the
+deletion to Telegram. **Undo resends copies** as new messages, with new ids and
+timestamps; redo deletes those replacements. Text and caption formatting,
+topics and reply targets are retained, including replies between messages
+restored in the same batch. Existing reactions, replies from other messages,
+forward attribution and album grouping are not restored.
+
+Photos, documents, videos, animations, audio, voice notes, video notes and
+stickers keep independent local copies of their file bytes for undo. Missing
+files are downloaded first; a failed or incomplete backup leaves the originals
+on Telegram. Contacts, static locations and venues can also be resent. Backups
+belong to this session's history and are removed when it releases them.
+
+Messages from other people and unsupported content (such as polls and service
+messages) retain the **cannot undo** label. Undo skips these nodes, since a new
+send cannot reproduce their original sender or behavior. Protected,
+self-destructing, scheduled or still-pending messages cannot be backed up for
+resending; if the snapshot finds one, that deletion is canceled.
+Other actions also become unavailable for undo if their previous server state
+could not be read, or Telegram rejects the reversal. Pending or uncertain sends
+are never automatically resent. History and its reversal data last only for the
+current session. Offline edits, deletes and reactions remain locally undoable.
+
 A conversation's **about** link opens the person's profile. **Block user**
 prevents incoming messages and hides your status and photo; **unblock user**
 reverses it. A blocked conversation keeps its history and draft, shows
@@ -345,6 +385,7 @@ viewer, including when the window is resized.
 | `model`, `search` | Panel queries, value types, formatting and search provider |
 | `runtime`, `trace` | Store-scoped coordination and local diagnostic output |
 | `panels`, `verbs` | Interaction state, live commands and undoable local actions |
+| `history` | User command intents, previous server state and acknowledged undo/redo |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
 
 A row receives its clock explicitly. Transcript rows also receive a
@@ -396,8 +437,10 @@ retry payloads; unconfirmed projected messages remain visible as failed and ask
 for a delivery check. Login secrets are never retained for retry. Recording
 and location sharing report that they are unavailable in live accounts; attach
 an existing recording instead. The location panel still shows its demo map.
-`verbs` implements undo for topic visibility preferences in all accounts, and
-for local fixture edits and deletes.
+`history` connects the main live message and chat actions to the undo tree;
+`verbs` implements topic visibility preferences and offline edits, deletes and
+reactions. Topic mute/pin/archive, read receipts and profile actions still use
+their existing paths and are outside the live command history.
 
 `tg_session` currently persists authorization status in the replicated store;
 it is not excluded from replication. The actual TDLib session files and login

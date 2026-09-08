@@ -67,7 +67,7 @@ pub fn all() -> Vec<Tool> {
              chat, topic, text and reply_to returned by telegram.draft. Asks for approval \
              and refuses if the draft changed or now carries an edit or files. A success \
              means queued, not delivered: check telegram.status with the operation id. \
-             Offline failures keep the draft. Sending cannot be undone.",
+             Offline failures keep the draft. Undo requests deletion for everyone; Telegram must confirm it.",
             send_input,
             true,
             send,

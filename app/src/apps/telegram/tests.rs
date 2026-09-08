@@ -31,6 +31,7 @@ mod topics_tests;
 mod tools;
 mod performance;
 mod downloads_tests;
+mod history;
 mod context_tests;
 
 fn session() -> Session {
@@ -823,7 +824,9 @@ fn batch_reads_ordinary_messages_with_unread_mentions_at_the_end() {
     let list = open_root(&mut s, Chats::id());
     with_chats(&s, list, |c| c.list_mut().marks_mut().extend([STELAXIS, FAMILY].map(|peer| format!("{peer}:0"))));
     let inbox = runtime::of(s.store()).connect();
+    let before = s.history().rows();
     verb(&mut s, list, "telegram.read");
+    assert_eq!(s.history().rows(), before, "read receipts do not enter undo history");
     let requests: Vec<serde_json::Value> = inbox.try_iter()
         .map(|raw| serde_json::from_str(&raw).unwrap()).collect();
     assert_eq!(requests.len(), 2, "one read for each marked group");
@@ -2747,6 +2750,16 @@ fn connected_reaction_account(s: &Session, td: FakeTd) -> sync::Account<FakeTd> 
     acc
 }
 
+
+fn answer_reaction_snapshot(acc: &sync::Account<FakeTd>, s: &Session, td: &FakeTd) {
+    let request = last_reaction_request(td, "getMessage");
+    assert!(request["@extra"]["context"].as_str().unwrap().starts_with("undo_snapshot:"));
+    acc.on_update(s.world(), &serde_json::json!({
+        "@type": "message", "chat_id": request["chat_id"], "id": request["message_id"],
+        "@extra": request["@extra"], "interaction_info": {"reactions": {"reactions": []}},
+    }).to_string());
+}
+
 fn offer_reactions(acc: &sync::Account<FakeTd>, s: &Session, request: &serde_json::Value, emojis: &[&str]) {
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "availableReactions", "@extra": request["@extra"],
@@ -2858,6 +2871,7 @@ fn reaction_request_timeouts_release_the_picker_and_never_resend_an_unconfirmed_
     offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["👍"]);
     verb(&mut s, card, "telegram.reaction_0");
     acc.drain(s.world());
+    answer_reaction_snapshot(&acc, &s, &td);
     let add = last_reaction_request(&td, "addMessageReaction");
     clock.advance(31.0);
     acc.drain(s.world());
@@ -2968,6 +2982,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     verb(&mut s, chat, "telegram.reaction_1");
     assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_1"), "no duplicate send while waiting");
     acc.drain(s.world());
+    answer_reaction_snapshot(&acc, &s, &td);
     let request = last_reaction_request(&td, "addMessageReaction");
     assert_eq!(request["chat_id"], RUST_WEEKLY);
     assert_eq!(request["message_id"], m.id);
@@ -3029,6 +3044,7 @@ fn reaction_paging_reaches_every_choice_in_chat_and_card() {
         verb(&mut s, slot, "telegram.reactions_more");
         verb(&mut s, slot, "telegram.reaction_1");
         acc.drain(s.world());
+        answer_reaction_snapshot(&acc, &s, &td);
         let add = last_reaction_request(&td, "addMessageReaction");
         assert_eq!(add["reaction_type"]["emoji"], "🌚");
         verb(&mut s, slot, "telegram.reactions_cancel");
@@ -3064,6 +3080,7 @@ fn reaction_failures_are_reported_once_and_can_be_inspected_and_retried() {
     offer_reactions(&acc, &s, &query, &["👍"]);
     verb(&mut s, card, "telegram.reaction_0");
     acc.drain(s.world());
+    answer_reaction_snapshot(&acc, &s, &td);
     let request = last_reaction_request(&td, "addMessageReaction");
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "error", "@extra": request["@extra"], "code": 400, "message": "REACTION_INVALID",

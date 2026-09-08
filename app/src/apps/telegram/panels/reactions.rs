@@ -241,34 +241,25 @@ impl Reactions {
                         self.cancel();
                         s.notify("that message is no longer available", true);
                     } else if !p.live {
-                        let runtime = runtime::of(store);
-                        if !runtime.demo_reacted(p.chat, p.msg, emoji) {
-                            let (chat, msg, chosen) = (p.chat, p.msg, emoji.clone());
-                            if let Err(error) =
-                                store.write(move |c| demo_reaction(c, chat, msg, &chosen))
-                            {
-                                s.notify(format!("could not add reaction: {error}"), true);
-                                return true;
-                            }
-                            runtime.remember_demo_reaction(p.chat, p.msg, emoji);
+                        if !super::super::verbs::react_demo(s, p.chat, p.msg, emoji) {
+                            return true;
                         }
                         self.cancel();
                     } else {
                         let runtime = runtime::of(store);
                         let (id, reply) = runtime.await_reaction();
-                        if runtime.connection_error().is_some() || !wire(
-                            store,
-                            &requests::add_message_reaction(p.chat, p.msg, emoji, id),
+                        p.seen_reply = None;
+                        if let Err(error) = super::super::history::command(
+                            s, &requests::add_message_reaction(p.chat, p.msg, emoji, id),
                         ) {
-                            runtime.finish_reaction(
-                                id,
-                                ReactionResult::Error(runtime.connection_error()
-                                    .unwrap_or_else(|| "Telegram is disconnected".into())),
-                            );
+                            let result = ReactionResult::Error(error.reason().into());
+                            if matches!(error, super::super::history::Refusal::Reported) {
+                                p.seen_reply = Some(result.clone());
+                            }
+                            runtime.finish_reaction(id, result);
                         }
                         p.reply = reply;
                         p.adding = true;
-                        p.seen_reply = None;
                     }
                 }
             }
@@ -276,39 +267,4 @@ impl Reactions {
         s.redraw();
         true
     }
-}
-
-/// A fixture updates the same count line the real projection renders.
-/// Only explicitly offline worlds reach this; a missing worker never does.
-fn demo_reaction(
-    c: &rusqlite::Connection,
-    chat: PeerId,
-    msg: MsgId,
-    emoji: &str,
-) -> rusqlite::Result<()> {
-    let before: Option<String> = c.query_row(
-        "SELECT reactions FROM tg_message WHERE chat = ?1 AND id = ?2",
-        [chat, msg],
-        |r| r.get(0),
-    )?;
-    let mut parts: Vec<String> = before
-        .as_deref()
-        .into_iter()
-        .flat_map(|s| s.split(" · "))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if let Some(part) = parts
-        .iter_mut()
-        .find(|p| p.rsplit_once(' ').is_some_and(|(e, _)| e == emoji))
-    {
-        let count = part
-            .rsplit_once(' ')
-            .and_then(|(_, n)| n.parse::<u64>().ok())
-            .unwrap_or(0);
-        *part = format!("{emoji} {}", count.saturating_add(1));
-    } else {
-        parts.push(format!("{emoji} 1"));
-    }
-    super::super::reaction_state::set(c, chat, msg, Some(&parts.join(" · ")))
 }

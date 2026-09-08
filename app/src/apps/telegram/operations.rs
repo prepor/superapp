@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,14 @@ pub struct Outcome {
     pub retryable: bool,
 }
 
+/// A history intent retains this acknowledgement after the feedback expires.
+/// It keeps final message identities, never message content or credentials.
+#[derive(Clone)]
+pub(super) struct Receipt {
+    pub status: Status,
+    pub messages: Vec<(PeerId, i64)>,
+}
+
 #[derive(Clone)]
 pub struct Operation {
     pub id: u64,
@@ -49,12 +57,28 @@ pub struct Operation {
     kind: String,
     messages: Vec<(PeerId, i64)>,
     failed_messages: Vec<(PeerId, i64)>,
+    delivered: BTreeMap<(PeerId, i64), i64>,
+    message_order: Vec<(PeerId, i64)>,
+    receipt: Option<Arc<Mutex<Receipt>>>,
     incomplete_response: bool,
     files: BTreeMap<i64, (u64, u64)>,
     changed: Instant,
 }
 
 impl Operation {
+    fn delivered_messages(&self) -> Vec<(PeerId, i64)> {
+        self.message_order.iter().filter_map(|key| self.delivered.get(key).map(|id| (key.0, *id))).collect()
+    }
+
+    fn changed(&mut self) {
+        self.changed = Instant::now();
+        if let Some(receipt) = &self.receipt {
+            *receipt.lock().unwrap() = Receipt {
+                status: self.status.clone(), messages: self.delivered_messages(),
+            };
+        }
+    }
+
     pub fn line(&self) -> String {
         match &self.status {
             Status::Pending => {
@@ -101,6 +125,7 @@ impl Operation {
                 | "getForumTopic"
                 | "getForumTopics"
                 | "getMessage"
+                | "getChat"
                 | "getMessages"
                 | "getMessageAvailableReactions"
                 | "openChat"
@@ -147,7 +172,7 @@ struct State {
     // Only sends need session-long lookup; background work still expires.
     outcomes: BTreeMap<u64, Outcome>,
     // TDLib may deliver the final update before the sendMessage response.
-    settled: VecDeque<((PeerId, i64), Option<String>)>,
+    settled: VecDeque<((PeerId, i64), Result<i64, String>)>,
 }
 
 impl State {
@@ -230,6 +255,9 @@ impl Tracker {
                 kind,
                 messages: Vec::new(),
                 failed_messages: Vec::new(),
+                delivered: BTreeMap::new(),
+                message_order: Vec::new(),
+                receipt: None,
                 incomplete_response: false,
                 files: BTreeMap::new(),
                 changed: Instant::now(),
@@ -270,8 +298,42 @@ impl Tracker {
         }
     }
 
+    pub(super) fn watch(&self, id: u64) -> Option<Arc<Mutex<Receipt>>> {
+        let mut state = self.state.lock().unwrap();
+        let op = state.operations.get_mut(&id)?;
+        let messages = op.delivered_messages();
+        let receipt = op.receipt.get_or_insert_with(|| Arc::new(Mutex::new(Receipt {
+            status: op.status.clone(), messages,
+        })));
+        Some(receipt.clone())
+    }
+
     pub fn pending(&self, id: u64) -> bool {
         self.state.lock().unwrap().operations.get(&id).is_some_and(|o| o.status == Status::Pending)
+    }
+
+    pub(super) fn preparing_delete(&self, id: u64, waiting: bool) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            if op.status != Status::Pending { return; }
+            let label = if waiting { "saving messages for undo" } else { "deleting messages" };
+            if op.label != label {
+                op.label = label.into();
+                self.changed();
+            }
+            op.changed = Instant::now();
+        }
+    }
+
+    /// A private undo copy completes only its own download. Other downloads
+    /// of this file still need their normal cache completion acknowledgement.
+    pub(super) fn backed_up_file(&self, id: u64) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            if op.status != Status::Pending { return; }
+            op.status = Status::Done;
+            op.request = None;
+            op.changed();
+            self.changed();
+        }
     }
 
     /// A save retains its source request for retry while tracking the file's
@@ -354,10 +416,12 @@ impl Tracker {
         op.request = Some(req.clone());
         op.messages.clear();
         op.failed_messages.clear();
+        op.delivered.clear();
+        op.message_order.clear();
         op.incomplete_response = false;
         op.files.clear();
         op.status = Status::Pending;
-        op.changed = Instant::now();
+        op.changed();
         for key in previous {
             state.settled.retain(|(saved, _)| *saved != key);
         }
@@ -387,7 +451,7 @@ impl Tracker {
                 error: error.to_string(),
                 uncertain,
             };
-            op.changed = Instant::now();
+            op.changed();
             trace::error(
                 dir,
                 &format!("request {id} {} chat={:?}: {error}", op.kind, op.chat),
@@ -420,6 +484,9 @@ impl Tracker {
                 request: None,
                 messages: Vec::new(),
                 failed_messages: Vec::new(),
+                delivered: BTreeMap::new(),
+                message_order: Vec::new(),
+                receipt: None,
                 incomplete_response: false,
                 files: BTreeMap::new(),
                 changed: Instant::now(),
@@ -447,6 +514,7 @@ impl Tracker {
         let mut state = self.state.lock().unwrap();
         let settled = state.settled.clone();
         let op = state.operations.get_mut(&id)?;
+        if op.status == Status::Done { return None; }
         if op.sending() {
             let messages: Vec<&Value> = if v["@type"] == "messages" {
                 v["messages"].as_array()?.iter().collect()
@@ -469,24 +537,30 @@ impl Tracker {
                     failed = Some("Telegram did not confirm every message. Check the chat before sending again.".to_string());
                     continue;
                 };
+                if op.chat != Some(chat) {
+                    op.incomplete_response = true;
+                    failed = Some("Telegram returned a different chat. Check delivery before trying again.".into());
+                    continue;
+                }
+                if !op.message_order.contains(&(chat, mid)) { op.message_order.push((chat, mid)); }
                 match settled
                     .iter()
                     .find(|(key, _)| *key == (chat, mid))
                     .map(|(_, error)| error)
                 {
-                    Some(Some(error)) => {
+                    Some(Err(error)) => {
                         failed = Some(error.clone());
                         op.messages.push((chat, mid));
                         op.failed_messages.push((chat, mid));
                     }
-                    Some(None) => {}
+                    Some(Ok(id)) => { op.delivered.insert((chat, mid), *id); },
                     None if msg["sending_state"]["@type"] == "messageSendingStateFailed" => {
                         failed = Some(error_text(&msg["sending_state"]["error"]));
                         op.messages.push((chat, mid));
                         op.failed_messages.push((chat, mid));
                     }
                     None if !msg["sending_state"].is_null() => op.messages.push((chat, mid)),
-                    None => {}
+                    None => { op.delivered.insert((chat, mid), mid); },
                 }
                 collect_files(&msg["content"], &mut op.files, true);
             }
@@ -497,6 +571,7 @@ impl Tracker {
                 return None;
             }
             if !op.messages.is_empty() {
+                op.changed();
                 return None;
             }
         } else if op.kind == "downloadFile" {
@@ -505,7 +580,7 @@ impl Tracker {
             return None;
         }
         op.status = Status::Done;
-        op.changed = Instant::now();
+        op.changed();
         op.request.take()
     }
 
@@ -521,7 +596,11 @@ impl Tracker {
         let mut state = self.state.lock().unwrap();
         // Refresh duplicates and evict by arrival order, never by chat id.
         state.settled.retain(|(key, _)| *key != (chat, old));
-        state.settled.push_back(((chat, old), error.clone()));
+        let result = error.clone().map_or_else(
+            || msg["id"].as_i64().ok_or_else(|| "Telegram did not return the delivered message id".into()),
+            Err,
+        );
+        state.settled.push_back(((chat, old), result.clone()));
         while state.settled.len() > 256 {
             state.settled.pop_front();
         }
@@ -531,15 +610,16 @@ impl Tracker {
             .values_mut()
             .filter(|o| o.messages.contains(&(chat, old)))
         {
-            if let Some(error) = &error {
+            if let Err(error) = &result {
                 op.failed_messages.push((chat, old));
                 failures.push((op.id, error.clone(), op.incomplete_response));
             } else {
+                op.delivered.insert((chat, old), *result.as_ref().unwrap());
                 op.messages.retain(|m| *m != (chat, old));
                 if op.messages.is_empty() && !op.incomplete_response {
                     op.status = Status::Done;
                     op.request = None;
-                    op.changed = Instant::now();
+                    op.changed();
                 }
             }
         }
@@ -576,7 +656,7 @@ impl Tracker {
                 let value = progress(file, op.sending());
                 op.files.insert(id, value);
                 if previous != Some(value) {
-                    op.changed = Instant::now();
+                    op.changed();
                     self.dirty.store(true, Ordering::Relaxed);
                 }
             }
@@ -598,7 +678,7 @@ impl Tracker {
             } else {
                 op.status = Status::Done;
                 op.request = None;
-                op.changed = Instant::now();
+                op.changed();
             }
         }
         drop(state);
@@ -676,6 +756,7 @@ fn label(v: &Value) -> String {
         "resendMessages" => "resending messages".into(),
         "editMessageText" | "editMessageCaption" => "saving edit".into(),
         "deleteMessages" => "deleting messages".into(),
+        "removeMessageReaction" => "removing reaction".into(),
         "setChatNotificationSettings" => "updating notifications".into(),
         "toggleChatIsPinned" => "updating pin".into(),
         "addChatToList" => "moving chat".into(),
@@ -862,6 +943,9 @@ pub fn run_local(
                 request: None,
                 messages: Vec::new(),
                 failed_messages: Vec::new(),
+                delivered: BTreeMap::new(),
+                message_order: Vec::new(),
+                receipt: None,
                 incomplete_response: false,
                 files: BTreeMap::new(),
                 changed: Instant::now(),
@@ -880,7 +964,7 @@ pub fn run_local(
                     let mut state = worker.operations.state.lock().unwrap();
                     if let Some(op) = state.operations.get_mut(&id) {
                         op.status = Status::Done;
-                        op.changed = Instant::now();
+                        op.changed();
                     }
                 }
                 Err(error) => worker.operations.fail_at(dir.as_deref(), id, &error, false),
