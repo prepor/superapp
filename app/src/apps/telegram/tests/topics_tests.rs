@@ -359,8 +359,11 @@ fn topic_history_read_claim_and_drafts_never_cross_topics() {
     go(&mut s, preview);
     let meetups = s.joined_child(list).unwrap_or(meetups);
     let cycling = open_root(&mut s, Chat::topic(BERLIN, 4));
-    with_chat(&s, meetups, |c| c.set_draft("coffee draft"));
-    with_chat(&s, cycling, |c| c.set_draft("cycling draft"));
+    with_chat(&s, meetups, |c| c.typed("coffee draft"));
+    with_chat(&s, cycling, |c| c.typed("cycling draft"));
+    with_chat(&s, cycling, Chat::save_pending_draft);
+    assert_eq!(topics::get(s.store(), BERLIN, 2).unwrap().draft, None);
+    with_chat(&s, meetups, Chat::save_pending_draft);
     assert_eq!(
         topics::get(s.store(), BERLIN, 2).unwrap().draft.as_deref(),
         Some("coffee draft")

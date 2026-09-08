@@ -1,6 +1,6 @@
 //! The transcript and the composer, drawn.
 //!
-//! The rows are the instance's ([`Chat::rows`]): a day caption, the unread
+//! The rows are the instance's ([`Chat::snapshot`]): a day caption, the unread
 //! line, a service line, or a message — the last with a header where a
 //! writer's run begins and none where it goes on. One row template carries
 //! all four and shows one; the message part hangs its body in the table's
@@ -132,6 +132,8 @@ pub struct ChatPanel {
     /// of this widget's.
     #[rust]
     shown: String,
+    #[rust]
+    draft_timer: Timer,
     /// Whether the panel had focus at the last event: the moment it takes
     /// focus is when the caret goes to the composer, once, so a press on a
     /// line — which hands the keyboard to the lines on purpose — is not
@@ -183,6 +185,14 @@ impl Widget for ChatPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if self.draft_timer.is_event(event).is_some() {
+            self.draft_timer = Timer::default();
+            with_chat(&props, Chat::save_pending_draft);
+            if let Some(s) = scope.data.get_mut::<Session>() { s.redraw(); }
+        }
+        if matches!(event, Event::WindowLostFocus(_) | Event::Background | Event::Shutdown) {
+            with_chat(&props, Chat::flush_draft);
+        }
         if scope.data.get_mut::<Session>().is_some_and(|s| !super::message_panel_visible(s, props.slot)) {
             self.viewed = None;
         }
@@ -573,6 +583,8 @@ impl Widget for ChatPanel {
                 let text = field.text();
                 self.shown = text.clone();
                 with_chat(&props, |c| c.typed(&text));
+                cx.stop_timer(self.draft_timer);
+                self.draft_timer = cx.start_timeout(0.3);
                 if let Some(s) = scope.data.get_mut::<Session>() {
                     s.redraw();
                 }
@@ -602,16 +614,16 @@ impl Widget for ChatPanel {
             .set_visible(cx, self.dragging_files);
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((card, rows, loading, cursor, marks, above, text, carrying, moving)) = ({
+        let Some((card, snapshot, loading, cursor, marks, above, text, carrying, moving)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Chat>().map(|c| {
                 // Capture loading first: the reader may finish between these
                 // calls, but unloaded rows must never look like an empty chat.
                 let loading = c.loading();
-                let rows = c.rows(now);
+                let snapshot = c.snapshot(now);
                 (
                     c.card(),
-                    rows,
+                    snapshot,
                     loading,
                     c.cursor(),
                     c.marks().clone(),
@@ -624,6 +636,7 @@ impl Widget for ChatPanel {
         }) else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        let rows = &snapshot.rows;
 
         // The peer's status line, and *loading…* beside it while the wire
         // is still filling the transcript — a transcript that is short is
@@ -708,9 +721,7 @@ impl Widget for ChatPanel {
             // animating towards a cursor, is left exactly where it got to.
             if let Some((id, first_then)) = anchor {
                 if !list.is_at_end() {
-                    let now_at = rows
-                        .iter()
-                        .position(|r| r.msg().is_some_and(|m| m.id == id));
+                    let now_at = snapshot.row_index(id);
                     if let Some(shift) = now_at.map(|i| i as isize - first_then as isize).filter(|&d| d != 0) {
                         let first = (list.first_id() as isize + shift).max(0) as usize;
                         let scroll = list.first_scroll();
@@ -764,9 +775,7 @@ impl Widget for ChatPanel {
             }
         }
 
-        let target_index = self.reveal.target().and_then(|id| {
-            rows.iter().position(|r| r.msg().is_some_and(|m| m.id == id))
-        });
+        let target_index = self.reveal.target().and_then(|id| snapshot.row_index(id));
         let target_rect = target_index.and_then(|target| {
             drawn.iter().find(|(idx, _, _)| *idx == target).map(|(_, row, _)| row.area().rect(cx))
         });

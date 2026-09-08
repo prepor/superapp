@@ -174,3 +174,112 @@ fn unchanged_transcripts_share_rows_and_refresh_message_edits() {
     let tomorrow = with_chat(&s, slot, |c| c.rows(s.now() + 86400.0));
     assert!(!std::sync::Arc::ptr_eq(&after, &tomorrow), "day captions advance even without a database change");
 }
+
+#[test]
+fn typing_coalesces_draft_writes_without_invalidating_the_transcript() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let before = s.store().revision(&["tg_chat"]);
+    let rows = with_chat(&s, slot, |c| c.rows(s.now()));
+    for text in ["o", "on", "on my", "on my way"] {
+        with_chat(&s, slot, |c| c.typed(text));
+        assert_eq!(field_now(&s, slot), text);
+        assert_eq!(draft_row(&s, VERA), "");
+        assert_eq!(s.store().revision(&["tg_chat"]), before);
+    }
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(draft_row(&s, VERA), "on my way");
+    assert!(std::sync::Arc::ptr_eq(&rows, &with_chat(&s, slot, |c| c.rows(s.now()))));
+    let saved = s.store().revision(&["tg_chat"]);
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(s.store().revision(&["tg_chat"]), saved);
+}
+
+#[test]
+fn pending_drafts_survive_remote_updates_and_failed_saves() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    write_draft(&s, VERA, "a synced draft");
+    assert_eq!(field_now(&s, slot), "a synced draft");
+    with_chat(&s, slot, |c| c.typed(""));
+    write_draft(&s, VERA, "a later remote draft");
+    assert_eq!(field_now(&s, slot), "", "a pending deletion must stay empty");
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(draft_row(&s, VERA), "");
+
+    s.store().db().set_writable(false);
+    with_chat(&s, slot, |c| c.typed("keep these words"));
+    assert!(runtime::of(s.store()).operations.list().is_empty(), "typing must not attempt a write");
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(field_now(&s, slot), "keep these words");
+    s.store().db().set_writable(true);
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(draft_row(&s, VERA), "keep these words");
+}
+
+#[test]
+fn sending_or_staging_before_the_draft_timer_cannot_restore_old_text() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, slot, |c| c.typed("send before the timer"));
+    send(&mut s, slot);
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(draft_row(&s, VERA), "");
+    assert_eq!(field_now(&s, slot), "");
+
+    with_chat(&s, slot, |c| {
+        c.typed("old pending text");
+        c.stage_draft("explicit replacement", None, false).unwrap();
+        c.save_pending_draft();
+    });
+    assert_eq!(draft_row(&s, VERA), "explicit replacement");
+    assert_eq!(field_now(&s, slot), "explicit replacement");
+}
+
+#[test]
+fn leaving_and_dropping_a_chat_save_pending_drafts() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, slot, |c| {
+        c.typed("saved on leaving");
+        c.flush_draft();
+    });
+    assert_eq!(draft_row(&s, VERA), "saved on leaving");
+    with_chat(&s, slot, |c| c.typed("saved on closing"));
+    let world = s.world().clone();
+    drop(s);
+    assert_eq!(model::peer(world.store(), VERA).unwrap().draft.as_deref(), Some("saved on closing"));
+}
+
+#[test]
+#[ignore = "manual comparison of large-chat input work and draft writes"]
+fn chat_interaction_timing() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let mut s = session();
+    large_history(&s);
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let snapshot = with_chat(&s, slot, |c| c.snapshot(s.now()));
+    let visible: Vec<_> = snapshot.history.iter().rev().take(12).map(|m| m.id).collect();
+    let start = Instant::now();
+    for _ in 0..1000 {
+        let history = with_chat(&s, slot, |c| c.history());
+        black_box(history.iter().filter(|m| m.unread_mention && visible.contains(&m.id)).count());
+        black_box(snapshot.rows.iter().position(|r| r.msg().is_some_and(|m| m.id == visible[0])));
+    }
+    eprintln!("10,000 messages: previous history scans per input/frame = {:?}", start.elapsed() / 1000);
+    let start = Instant::now();
+    for _ in 0..1000 {
+        with_chat(&s, slot, |c| c.view_mentions(&visible, s.now()));
+        black_box(snapshot.row_index(visible[0]));
+    }
+    eprintln!("10,000 messages: indexed input/frame lookups = {:?}", start.elapsed() / 1000);
+    let start = Instant::now();
+    for i in 0..100 { with_chat(&s, slot, |c| c.set_draft(&format!("per-key save {i}"))); }
+    eprintln!("100 synchronous draft writes = {:?}", start.elapsed());
+    let start = Instant::now();
+    for i in 0..100 { with_chat(&s, slot, |c| c.typed(&format!("coalesced save {i}"))); }
+    eprintln!("100 in-memory keystrokes = {:?}", start.elapsed());
+    with_chat(&s, slot, Chat::save_pending_draft);
+    assert_eq!(draft_row(&s, VERA), "coalesced save 99");
+}
