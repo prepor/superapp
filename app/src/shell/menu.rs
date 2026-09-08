@@ -30,8 +30,8 @@ const WS_MENU_MOVE: u64 = 0x5753_0200;
 const MENU_LAUNCHER: u64 = 0x5753_0300;
 const MENU_SEARCH: u64 = 0x5753_0301;
 const MENU_ASK: u64 = 0x5753_0302;
-const MENU_UNDO: u64 = 0x5753_0400;
-const MENU_REDO: u64 = 0x5753_0401;
+pub(super) const MENU_UNDO: u64 = 0x5753_0400;
+pub(super) const MENU_REDO: u64 = 0x5753_0401;
 const MENU_HISTORY: u64 = 0x5753_0500;
 const MENU_LIBRARY: u64 = 0x5753_0600;
 /// The problems menu: every item goes to the panel that lists them.
@@ -201,10 +201,16 @@ impl Stage {
             self.go_to(sh, super::search_panel());
         } else if id == MENU_ASK {
             self.ask_about_focused(sh);
-        } else if id == MENU_UNDO {
-            self.do_undo(sh);
-        } else if id == MENU_REDO {
-            self.do_redo(sh);
+        } else if id == MENU_UNDO || id == MENU_REDO {
+            self.handle_key_down(cx, sh, &KeyEvent {
+                key_code: KeyCode::KeyZ,
+                modifiers: KeyModifiers {
+                    logo: true,
+                    shift: id == MENU_REDO,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         } else if id == MENU_HISTORY {
             sh.overlay = Overlay::History;
             sh.session.redraw();

@@ -1,0 +1,88 @@
+# args:
+# env:
+# Both overlays own workspace undo/redo while a filter underneath retains
+# its caret and text history. Undo must restore archived mail; redo must
+# archive it again and return the reader to the next conversation.
+
+wait 900
+click "Q3 infra"
+wait 700
+click "archive"
+wait 700
+key /
+wait 300
+type "vera"
+wait 400
+accel "sync" -
+
+# History: keyboard undo restores the archived mail, not the filter edit.
+key cmd+u
+wait 400
+accel "the beginning" -
+key cmd+z
+wait 500
+key esc
+wait 400
+visible "Q3 infra"
+click "Vera Kovac · aug 31 09:14"
+wait 300
+
+# Leave a text redo pending, then redo the archive through the menu.
+key cmd+left
+wait 300
+key /
+wait 300
+key cmd+a
+type "elena"
+wait 300
+key cmd+z
+wait 300
+accel "sync" -
+key cmd+u
+wait 400
+accel "the beginning" -
+menu "Redo"
+wait 500
+key esc
+wait 400
+click "GitHub · aug 31 08:02"
+wait 300
+
+# Workspaces: menu undo, then keyboard redo, with the same text histories.
+key cmd+left
+wait 300
+key /
+wait 300
+key cmd+a
+type "vera"
+wait 400
+accel "sync" -
+pan2 0 260
+wait 500
+accel "workspace 1" -
+menu "Undo"
+wait 500
+key esc
+wait 400
+visible "Q3 infra"
+click "Vera Kovac · aug 31 09:14"
+wait 300
+key cmd+left
+wait 300
+key /
+wait 300
+key cmd+a
+type "elena"
+wait 300
+key cmd+z
+wait 300
+accel "sync" -
+pan2 0 260
+wait 500
+accel "workspace 1" -
+key cmd+shift+z
+wait 500
+key esc
+wait 400
+click "GitHub · aug 31 08:02"
+quit

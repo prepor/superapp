@@ -15,6 +15,8 @@
 //!    lets a list act on the thing under its cursor without moving focus.
 //!
 //! Nothing in that order names a kind.
+//! Text undo and redo are the exception to the reserved set: an editable
+//! input with key focus keeps them, even when its history is empty.
 //!
 //! A bold letter is a promise that the chord fires that verb *now*, so the
 //! bars draw what this order would reach and nothing else: the set is
@@ -459,7 +461,20 @@ impl Stage {
         }
         match k.key_code {
             KeyCode::KeyZ => {
-                if k.modifiers.shift {
+                // An input's undo stack is independent of workspace
+                // history. Read actual editability, including composers
+                // with a narrow letter policy and carets in a preview.
+                // History/workspaces overlays own workspace history even
+                // if an input underneath still has keyboard focus.
+                let focus = sh.session.focus();
+                let preview = focus.and_then(|slot| sh.session.joined_child(slot));
+                let editor = [focus, preview].into_iter().flatten().find(|slot| {
+                    sh.overlay == Overlay::None
+                        && self.hosted.get(slot).is_some_and(|w| self.keyboard.editing(cx, w))
+                });
+                if let Some(slot) = editor {
+                    self.forward_to_slot(cx, sh, slot, &Event::KeyDown(*k));
+                } else if k.modifiers.shift {
                     self.do_redo(sh);
                 } else {
                     self.do_undo(sh);
