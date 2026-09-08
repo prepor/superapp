@@ -286,11 +286,13 @@ impl Widget for ChatPanel {
                 }
                 return;
             }
-            // Ctrl+E reaches the newest line even from the composer. Home
-            // and End reach either edge with the transcript focused.
+            // Ctrl+E reaches the newest line with the transcript focused.
+            // The composer's caret chords stay with the field.
             let chat_end = k.key_code == KeyCode::KeyE && k.modifiers.control
                 && !(k.modifiers.shift || k.modifiers.alt || k.modifiers.logo);
-            if has_focus && (chat_end || (!focused && matches!(k.key_code, KeyCode::Home | KeyCode::End))) {
+            if has_focus && !focused
+                && (chat_end || matches!(k.key_code, KeyCode::Home | KeyCode::End))
+            {
                 let to_end = chat_end || k.key_code == KeyCode::End;
                 let landed = with_chat(&props, |c| {
                     let hist = c.history();
