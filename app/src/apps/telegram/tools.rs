@@ -309,9 +309,7 @@ fn status(s: &mut Session, input: &Value) -> Result<Value, String> {
     rt.operations.expire(s.store(), std::time::Instant::now());
     let op = rt
         .operations
-        .list()
-        .into_iter()
-        .find(|o| o.id == id)
+        .outcome(id)
         .ok_or("no Telegram operation at that id in this app session")?;
     let (status, error, uncertain) = match &op.status {
         Status::Pending => ("pending", None, false),
@@ -319,5 +317,5 @@ fn status(s: &mut Session, input: &Value) -> Result<Value, String> {
         Status::Failed { error, uncertain } => ("failed", Some(error), *uncertain),
     };
     Ok(json!({"operation": id, "chat": op.chat, "status": status,
-        "error": error, "uncertain": uncertain, "retryable": op.retryable()}))
+        "error": error, "uncertain": uncertain, "retryable": op.retryable}))
 }

@@ -4,6 +4,8 @@
 //! exact payload for an explicit retry, including attachments and replies.
 //! Credentials are never retained or logged. An uncertain send is never retried
 //! automatically: a missing answer does not establish that nothing was sent.
+//! Send outcomes outlive the UI feedback for this session without retaining
+//! completed or dismissed message payloads.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -28,6 +30,13 @@ pub enum Status {
     Pending,
     Done,
     Failed { error: String, uncertain: bool },
+}
+
+#[derive(Clone)]
+pub struct Outcome {
+    pub chat: Option<PeerId>,
+    pub status: Status,
+    pub retryable: bool,
 }
 
 #[derive(Clone)]
@@ -109,6 +118,14 @@ impl Operation {
             "sendMessage" | "forwardMessages" | "resendMessages"
         )
     }
+
+    fn outcome(&self) -> Outcome {
+        Outcome {
+            chat: self.chat,
+            status: self.status.clone(),
+            retryable: self.retryable(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -121,8 +138,28 @@ pub struct Tracker {
 struct State {
     next: u64,
     operations: BTreeMap<u64, Operation>,
+    // Only sends need session-long lookup; background work still expires.
+    outcomes: BTreeMap<u64, Outcome>,
     // TDLib may deliver the final update before the sendMessage response.
     settled: VecDeque<((PeerId, i64), Option<String>)>,
+}
+
+impl State {
+    fn retire(&mut self, id: u64) {
+        if let Some(op) = self.operations.remove(&id) {
+            if op.sending() {
+                self.outcomes.insert(
+                    id,
+                    Outcome {
+                        chat: op.chat,
+                        status: op.status,
+                        // Dismissal discards the payload needed for a retry.
+                        retryable: false,
+                    },
+                );
+            }
+        }
+    }
 }
 
 impl Tracker {
@@ -203,6 +240,16 @@ impl Tracker {
             .collect()
     }
 
+    /// Send status remains queryable after its feedback expires or is dismissed.
+    pub fn outcome(&self, id: u64) -> Option<Outcome> {
+        let state = self.state.lock().unwrap();
+        state
+            .operations
+            .get(&id)
+            .map(Operation::outcome)
+            .or_else(|| state.outcomes.get(&id).cloned())
+    }
+
     /// The latest attempt owns the viewer's status; a late failure from an
     /// older attempt must not hide new progress. Byte counts live in Runtime.
     pub fn media_note(&self, context: &str) -> Option<String> {
@@ -227,7 +274,7 @@ impl Tracker {
             .get(&id)
             .is_some_and(|o| o.status != Status::Pending)
         {
-            state.operations.remove(&id);
+            state.retire(id);
         }
     }
 
@@ -533,14 +580,20 @@ impl Tracker {
                 op.sending(),
             );
         }
-        self.state.lock().unwrap().operations.retain(|_, op| {
-            let keep = op.status != Status::Done
-                || now.saturating_duration_since(op.changed) < Duration::from_secs(5);
-            if !keep {
-                self.dirty.store(true, Ordering::Relaxed);
-            }
-            keep
-        });
+        let mut state = self.state.lock().unwrap();
+        let done: Vec<_> = state
+            .operations
+            .values()
+            .filter(|op| {
+                op.status == Status::Done
+                    && now.saturating_duration_since(op.changed) >= Duration::from_secs(5)
+            })
+            .map(|op| op.id)
+            .collect();
+        for id in done {
+            state.retire(id);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 }
 

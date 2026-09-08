@@ -1,6 +1,7 @@
 use super::*;
 use crate::apps::telegram::{seed::BERLIN, topics};
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 fn call(s: &mut Session, name: &str, input: Value) -> Result<Value, String> {
     let tool = s.apps().tool(name).expect("registered tool").clone();
@@ -100,6 +101,94 @@ fn an_agent_draft_opens_the_correct_composer_and_uses_its_send_path() {
         "the same draft cannot send twice"
     );
     assert!(inbox.try_recv().is_err());
+}
+
+#[test]
+fn delivered_send_status_survives_feedback_expiry_for_the_session() {
+    for confirmed_by_update in [false, true] {
+        let mut s = session();
+        open_root(&mut s, Chats::id());
+        let rt = runtime::of(s.store());
+        let inbox = rt.connect();
+        let d = draft(&mut s, json!({"chat": VERA, "text": "hello"}));
+        let queued = call(&mut s, "telegram.send", d).unwrap();
+        let id = queued["operation"].as_u64().unwrap();
+        let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        rt.operations.reply(
+            s.store(),
+            &json!({
+                "@type": "message", "chat_id": VERA, "id": 100,
+                "@extra": request["@extra"],
+                "sending_state": confirmed_by_update.then(|| json!({
+                    "@type": "messageSendingStatePending"
+                }))
+            }),
+        );
+        if confirmed_by_update {
+            rt.operations.sent(
+                s.store(),
+                &json!({
+                    "@type": "updateMessageSendSucceeded", "old_message_id": 100,
+                    "message": {"chat_id": VERA, "id": 200}
+                }),
+            );
+        }
+
+        for elapsed in [6, 300, 3600] {
+            rt.operations
+                .expire(s.store(), Instant::now() + Duration::from_secs(elapsed));
+            assert!(
+                rt.operations.list().iter().all(|op| op.id != id),
+                "completed feedback still disappears"
+            );
+            assert_eq!(
+                call(&mut s, "telegram.status", json!({"operation": id})).unwrap(),
+                json!({
+                    "operation": id, "chat": VERA, "status": "done",
+                    "error": null, "uncertain": false, "retryable": false
+                })
+            );
+        }
+        assert!(call(&mut s, "telegram.status", json!({"operation": u64::MAX})).is_err());
+        assert!(inbox.try_recv().is_err(), "checking status never resends");
+    }
+}
+
+#[test]
+fn dismissing_send_feedback_keeps_status_but_releases_retry() {
+    for uncertain in [None, Some(false), Some(true)] {
+        let mut s = session();
+        open_root(&mut s, Chats::id());
+        let rt = runtime::of(s.store());
+        let inbox = rt.connect();
+        let d = draft(&mut s, json!({"chat": VERA, "text": "hello"}));
+        let queued = call(&mut s, "telegram.send", d).unwrap();
+        let id = queued["operation"].as_u64().unwrap();
+        let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        if let Some(uncertain) = uncertain {
+            rt.operations.fail(s.store(), id, "send failed", uncertain);
+        } else {
+            rt.operations.reply(
+                s.store(),
+                &json!({
+                    "@type": "message", "chat_id": VERA, "id": 9999,
+                    "@extra": request["@extra"], "sending_state": null
+                }),
+            );
+        }
+        let mut expected = call(&mut s, "telegram.status", json!({"operation": id})).unwrap();
+        assert_eq!(expected["retryable"], uncertain == Some(false));
+        expected["retryable"] = json!(false);
+
+        rt.operations.dismiss(id);
+        assert!(rt.operations.list().iter().all(|op| op.id != id));
+        assert_eq!(
+            call(&mut s, "telegram.status", json!({"operation": id})).unwrap(),
+            expected
+        );
+        assert!(rt.operations.retry(id).is_none());
+        assert!(inbox.try_recv().is_err());
+    }
 }
 
 #[test]

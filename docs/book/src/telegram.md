@@ -135,7 +135,8 @@ attachments and edits remain available in the Telegram panel.
 A successful tool call reports **queued**, with an operation id.
 `telegram.status` reports whether Telegram has confirmed that operation or
 returned an error. Pending or uncertain delivery must not trigger an automatic
-second send. Operation ids last for the current app session.
+second send. Operation ids last for the current app session; completed send
+results remain queryable after their status line disappears.
 
 ## Builds
 
