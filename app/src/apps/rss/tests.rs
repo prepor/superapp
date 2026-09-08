@@ -46,7 +46,13 @@ fn subscriptions_and_seen_state_are_undoable() {
     s.undo();
     assert!(model::FEEDS.by_key(s.store(), &added).is_some());
     let article = id(&s, "notes-1");
-    assert!(model::change(&mut s, model::Flag::Seen, &[article], true));
+    let slot = open(&mut s, panels::Articles::id());
+    s.nav(Nav::Open {
+        from: slot,
+        id: panels::Article::id(article),
+        fresh: false,
+    });
+    s.settle();
     assert!(model::article(s.store(), article).unwrap().seen);
     s.undo();
     assert!(!model::article(s.store(), article).unwrap().seen);
@@ -229,28 +235,32 @@ fn untitled_entries_without_ids_do_not_collapse_into_one_article() {
 }
 
 #[test]
-fn batch_actions_include_hidden_marks_and_undo_restores_them() {
+fn removing_feeds_includes_hidden_marks_and_undo_restores_them() {
     let mut s = session();
-    let slot = open(&mut s, panels::Articles::id());
-    let keys = vec![id(&s, "notes-1"), id(&s, "lab-1")];
+    let slot = open(&mut s, panels::Feeds::id());
+    let keys = model::FEEDS
+        .page(s.store(), None, 0, 50)
+        .iter()
+        .map(|feed| feed.id)
+        .collect::<Vec<_>>();
     let panel = s.panel(slot).unwrap();
     {
         let mut borrow = panel.borrow_mut();
-        let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
+        let p = borrow.as_any().downcast_mut::<panels::Feeds>().unwrap();
         p.list.marks_mut().extend(keys.iter().copied());
-        p.list.set_filter("@feed:Field");
+        p.list.set_filter("Field");
         p.list.sync(s.store());
     }
-    panel.borrow_mut().run("rss.seen", &mut s);
+    panel.borrow_mut().run("rss.remove", &mut s);
     for key in &keys {
-        assert!(model::article(s.store(), *key).unwrap().seen);
+        assert!(model::FEEDS.by_key(s.store(), key).is_none());
     }
     s.undo();
     for key in &keys {
-        assert!(!model::article(s.store(), *key).unwrap().seen);
+        assert!(model::FEEDS.by_key(s.store(), key).is_some());
     }
     let mut borrow = panel.borrow_mut();
-    let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
+    let p = borrow.as_any().downcast_mut::<panels::Feeds>().unwrap();
     for key in keys {
         assert!(p.list.marks().has(&key));
     }

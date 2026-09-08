@@ -115,9 +115,6 @@ impl RowSpec for ArticleRows {
         }
         .into()
     }
-    fn swipe_verbs(_: &Articles) -> [Option<&'static str>; 2] {
-        [Some("rss.seen"), Some("rss.unseen")]
-    }
 }
 
 #[derive(Script, ScriptHook, Widget)]

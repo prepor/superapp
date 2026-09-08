@@ -24,10 +24,9 @@ Feed and author values autocomplete. The subscriptions table offers
 
 Opening or previewing an article marks it seen on the same undoable action
 as the panel opening. A selected article stays under the cursor until the
-cursor moves, even after it no longer matches `@unseen`. The article and
-list bars can mark articles seen or unseen; marked rows take part as a
-batch, including those hidden by the filter. The article filter survives
-session restore.
+cursor moves, even after it no longer matches `@unseen`. Use `@seen` and
+`@unseen` in the filter to choose which articles appear. The article filter
+survives session restore.
 
 The reader uses the same HTML cleanup, proportional typography, heading
 scale, selectable text, code, links and image loader as

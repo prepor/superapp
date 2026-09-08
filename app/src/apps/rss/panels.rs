@@ -55,13 +55,10 @@ struct ConsumedMarks {
 impl ConsumedMarks {
     fn edit(&self, restore: bool) {
         let mut p = self.panel.borrow_mut();
-        let marks = if let Some(p) = p.as_any().downcast_mut::<Feeds>() {
-            p.list.marks_mut()
-        } else if let Some(p) = p.as_any().downcast_mut::<Articles>() {
-            p.list.marks_mut()
-        } else {
+        let Some(p) = p.as_any().downcast_mut::<Feeds>() else {
             return;
         };
+        let marks = p.list.marks_mut();
         if restore {
             marks.extend(self.keys.iter().copied());
         } else {
@@ -212,7 +209,7 @@ impl Panel for Articles {
         PanelId::new(Self::TAG, [self.list.table().filter().to_string()])
     }
     fn verbs(&self) -> Vec<Verb> {
-        let mut verbs = vec![
+        vec![
             Verb::go(
                 "rss.feeds",
                 "feeds",
@@ -224,21 +221,11 @@ impl Panel for Articles {
                 },
             ),
             Verb::run("rss.refresh", "refresh", Some('r')),
-        ];
-        let n = selected(&self.list).len();
-        if n > 0 {
-            verbs.push(Verb::run("rss.seen", format!("seen {n}"), Some('s')));
-            verbs.push(Verb::run("rss.unseen", format!("unseen {n}"), Some('n')));
-        }
-        verbs
+        ]
     }
     fn run(&mut self, verb: &str, s: &mut Session) {
-        match verb {
-            "rss.refresh" => model::refresh(s),
-            "rss.seen" | "rss.unseen" => {
-                change_list(s, self.slot, &mut self.list, Flag::Seen, verb == "rss.seen");
-            }
-            _ => {}
+        if verb == "rss.refresh" {
+            model::refresh(s);
         }
     }
     fn as_any(&mut self) -> &mut dyn Any {
@@ -301,28 +288,16 @@ impl Panel for Article {
         let Some(a) = model::article(&self.store, self.article) else {
             return Vec::new();
         };
-        vec![
-            if a.seen {
-                Verb::run("rss.unseen", "mark unseen", Some('n'))
-            } else {
-                Verb::run("rss.seen", "mark seen", Some('s'))
+        vec![Verb::go(
+            "rss.feed",
+            "feed",
+            Some('f'),
+            Nav::Open {
+                from: self.slot,
+                id: Articles::for_feed(a.feed),
+                fresh: false,
             },
-            Verb::go(
-                "rss.feed",
-                "feed",
-                Some('f'),
-                Nav::Open {
-                    from: self.slot,
-                    id: Articles::for_feed(a.feed),
-                    fresh: false,
-                },
-            ),
-        ]
-    }
-    fn run(&mut self, verb: &str, s: &mut Session) {
-        if matches!(verb, "rss.seen" | "rss.unseen") {
-            model::change(s, Flag::Seen, &[self.article], verb == "rss.seen");
-        }
+        )]
     }
     fn as_any(&mut self) -> &mut dyn Any {
         self
