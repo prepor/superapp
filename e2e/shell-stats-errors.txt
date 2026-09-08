@@ -1,0 +1,20 @@
+# args: --library stats
+# env:
+# The denied library mount shows a selectable diagnostic alongside its values.
+
+wait 3000
+click "superapp stats/unavailable cache"
+wait 900
+mouse "stats errors"
+key cmd+a
+wait 300
+shot stats-error-selected
+
+# The error remains addressable after refresh, alongside the available stats.
+click "refresh"
+wait 600
+mouse "stats errors"
+key cmd+a
+wait 300
+shot stats-error-refreshed
+quit

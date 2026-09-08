@@ -18,6 +18,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
     vec![small_panels(), lists(), search(), stats()]
 }
 
+/// Storage diagnostics with an isolated cache and without a cache capability.
 fn stats() -> Scene<Setup> {
     Scene::new("superapp stats", (480.0, 640.0))
         .note("Local database and file cache usage, with the session's panels, workspaces, workers and jobs. Refresh reads a new storage snapshot.")

@@ -160,6 +160,8 @@ script_mod! {
 
     // ---- local storage and activity ----------------------------------------
 
+    /** One measurement: a muted caption and a selectable value aligned
+        to the right, with room between them for the panel to grow. */
     mod.widgets.SysStatRow = View {
         width: Fill, height: Fit
         flow: Right
@@ -170,6 +172,9 @@ script_mod! {
         value := mod.widgets.SText { width: Fit, is_multiline: false, text: "…" }
     }
 
+    /** Database, file cache and session activity, grouped under rules.
+        Values and errors are selectable; storage and jobs are refreshed
+        through the panel's bar while the body draws the last snapshot. */
     mod.widgets.SysStatsPanel = set_type_default() do #(StatsPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill

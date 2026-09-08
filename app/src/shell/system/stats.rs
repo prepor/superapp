@@ -237,6 +237,7 @@ impl Panel for Stats {
     }
 }
 
+/// The factory: starts the first storage and job snapshot when a panel opens.
 pub struct StatsKind;
 
 impl PanelKind for StatsKind {
@@ -256,6 +257,28 @@ impl PanelKind for StatsKind {
     }
 }
 
+/// Every selectable run and the optional container controlling its visibility.
+/// Registering each one lets the shell preserve its cursor and keyboard focus;
+/// hidden or empty diagnostics must not leave a hit over the panel body.
+const RUNS: [(&str, &[LiveId], &[LiveId]); 14] = [
+    ("stats database", &[], ids!(database.value)),
+    ("stats disk usage", &[], ids!(disk.value)),
+    ("stats write-ahead log", &[], ids!(wal.value)),
+    ("stats reusable space", &[], ids!(reusable.value)),
+    ("stats file cache", &[], ids!(cache.value)),
+    ("stats cache target", &[], ids!(budget.value)),
+    ("stats cached files", &[], ids!(files.value)),
+    ("stats open panels", &[], ids!(panels.value)),
+    ("stats workspaces", &[], ids!(workspaces.value)),
+    ("stats background workers", &[], ids!(workers.value)),
+    ("stats queued jobs", &[], ids!(pending.value)),
+    ("stats running jobs", &[], ids!(running.value)),
+    ("stats failed jobs", &[], ids!(failed.value)),
+    ("stats errors", ids!(errors), ids!(errors.text)),
+];
+
+/// The widget: draws prepared measurements and keeps every value and error
+/// selectable, with each run registered in the shell's hit table.
 #[derive(Script, ScriptHook, Widget)]
 pub struct StatsPanel {
     #[source]
@@ -307,17 +330,13 @@ impl Widget for StatsPanel {
             self.value(cx, ids!(workers), s.workers().names().len().to_string());
         }
         let step = self.view.draw_walk(cx, scope, walk);
-        for (label, path) in [
-            ("stats database", ids!(database.value)),
-            ("stats file cache", ids!(cache.value)),
-            ("stats cached files", ids!(files.value)),
-            ("stats open panels", ids!(panels.value)),
-            ("stats queued jobs", ids!(pending.value)),
-            ("stats failed jobs", ids!(failed.value)),
-        ] {
+        for (label, fold, path) in RUNS {
+            if !fold.is_empty() && !self.view.widget(cx, fold).visible() {
+                continue;
+            }
             let w = self.view.widget(cx, path);
             let rect = w.area().rect(cx);
-            if rect.size.x > 0.0 {
+            if rect.size.x > 0.0 && !w.as_text_input().text().is_empty() {
                 props.hits.add(label, rect, MouseCursor::Text, props.slot);
             }
         }
