@@ -569,6 +569,19 @@ pub trait Disk {
     /// If the write fails.
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String>;
 
+    /// Replace an existing file only while its contents still match the
+    /// editor's original. Real disks stage the new bytes before replacement.
+    fn replace_file(&mut self, path: &Path, original: &[u8], bytes: &[u8]) -> Result<(), String> {
+        let current = self.read_file(path, original.len().max(bytes.len()).saturating_add(1))?;
+        // A crash after replacement but before draft cleanup may retry the
+        // same save. Already-written bytes are a successful no-op.
+        if current == bytes { return Ok(()); }
+        if current != original {
+            return Err("the file changed on disk; your draft is kept".into());
+        }
+        self.write_file(path, bytes)
+    }
+
     /// Hand a path to the OS — whatever opens that kind of file. Nothing is
     /// executed by us.
     ///
@@ -686,6 +699,9 @@ impl Disk for SharedDisk {
     }
     fn write_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), String> {
         self.with(|d| d.write_file(path, bytes))
+    }
+    fn replace_file(&mut self, path: &Path, original: &[u8], bytes: &[u8]) -> Result<(), String> {
+        self.with(|d| d.replace_file(path, original, bytes))
     }
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
         self.with(|d| d.open_path(path))

@@ -40,6 +40,8 @@ const ROWS: (u32, u32) = (3, 6);
 /// has: the entry, and — for a text file or a picture small enough to be
 /// worth it — the preview under the rule.
 pub struct Card {
+    /// Optional editor supplied through the app registry.
+    editor: Option<PanelId>,
     id: PanelId,
     path: String,
     /// The directory the file is in, which is what a watcher can be asked
@@ -348,6 +350,13 @@ impl Panel for Card {
         if FILES.busy(run::whose_world(&self.world)) {
             v.push(Verb::run("files.cancel", "cancel", None));
         }
+        if self.kind() == FileKind::Text && !self.gone() {
+            if let Some(id) = &self.editor {
+                v.push(Verb::go("files.edit", "edit", Some('e'), kernel::nav::Nav::Open {
+                    from: self.slot, id: id.clone(), fresh: false,
+                }));
+            }
+        }
         v.extend([
             Verb::run("files.open", "open", Some('o')),
             Verb::run("files.copy", "copy", Some('p')),
@@ -472,6 +481,7 @@ impl PanelKind for CardKind {
         let dir = parent(&path).unwrap_or(&path).to_string();
         let _watch = Watch::on(&world, &dir);
         let mut card = Card {
+            editor: cx.session().apps().get_as::<crate::apps::notes::Notes>().map(|app| app.editor(&path)),
             id: id.clone(),
             path,
             dir,
@@ -492,4 +502,3 @@ impl PanelKind for CardKind {
         Box::new(card)
     }
 }
-

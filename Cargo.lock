@@ -2488,6 +2488,7 @@ dependencies = [
  "serde_json",
  "simplecss",
  "superapp-kernel",
+ "unicode-segmentation 1.13.3",
  "ureq",
  "url",
  "webpki-roots",

@@ -84,6 +84,11 @@ pub fn windows(windows: &[Window], roots: &[Root], query: &str) -> Vec<Hit> {
         });
     }
 
+    // A named panel leads keyword matches: "notes" opens notes even when
+    // another root also advertises that word (for example saved messages).
+    if !query.trim().is_empty() {
+        hits.sort_by_key(|hit| !hit.label.eq_ignore_ascii_case(query.trim()));
+    }
     hits
 }
 
@@ -244,6 +249,18 @@ mod tests {
             Root::new(id("help"), "help", ""),
             Root::new(id("about"), "about", ""),
         ]
+    }
+
+    #[test]
+    fn an_exact_name_leads_other_roots_keywords() {
+        let roots = vec![
+            Root::new(id("saved"), "saved messages", "notes personal"),
+            Root::new(id("notes"), "notes", "text editor"),
+        ];
+        let hits = windows(&[], &roots, "NOTES");
+        assert_eq!(hits[0].label, "notes");
+        assert_eq!(hits[1].label, "saved messages");
+        assert_eq!(windows(&[], &roots, "")[0].label, "saved messages");
     }
 
     /// An empty query is the switcher: the open panels, then the roots that
