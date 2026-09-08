@@ -79,14 +79,14 @@ impl RunWorker {
     fn ask(&mut self, w: &World) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
         let mine = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? {
+            if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
                 return Ok(false);
             }
             set_run_status_tx(c, run, model::STREAMING, None, now)?;
             Ok(true)
         });
-        // Nothing to ask for: the run went between the pass reading it and
-        // this write, and a request costs money.
+        // The run may have stopped or disappeared since the pass read it,
+        // including after writing tool results. A request costs money.
         if !matches!(mine, Ok(true)) {
             return Wake::OnKick;
         }
@@ -222,7 +222,9 @@ impl RunWorker {
             .map(|c| Turn::new(Message::tool(&c.tool_call_id, c.said())).by(run))
             .collect();
         let wrote = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? {
+            // A blocking read may finish after the person stops the run.
+            // Re-check inside the write so that stop cannot go stale.
+            if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
                 return Ok(false);
             }
             for turn in &results {

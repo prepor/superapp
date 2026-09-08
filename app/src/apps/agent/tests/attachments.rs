@@ -68,6 +68,7 @@ fn a_mail_pdf_reaches_the_models_tool_result_without_a_manual_upload() {
 struct ReadState {
     ready: AtomicBool,
     polls: AtomicUsize,
+    stop: std::sync::Mutex<Option<model::RunId>>,
 }
 
 struct ReadApp;
@@ -98,6 +99,15 @@ impl App for ReadApp {
                         let state = world.store().local::<ReadState>();
                         state.polls.fetch_add(1, Ordering::SeqCst);
                         if state.ready.load(Ordering::SeqCst) {
+                            if let Some(run) = state.stop.lock().unwrap().take() {
+                                // A UI stop commits through another store while
+                                // this single, blocking poll is still running.
+                                let ui = kernel::store::Store::with_db(world.store().db()).unwrap();
+                                ui.write(move |c| {
+                                    model::set_run_status_tx(c, run, model::STOPPED, None, 0.0)
+                                })
+                                .unwrap();
+                            }
                             Poll::Ready(Ok(json!({"text": "file contents"})))
                         } else {
                             Poll::Pending
@@ -196,6 +206,35 @@ fn background_reads_preserve_call_order_and_the_approval_gate() {
         model::DONE
     );
     assert_eq!(model::calls(s.store(), run)[2].status, model::CALL_DONE);
+}
+
+#[test]
+fn a_stop_during_a_blocking_read_prevents_the_next_request() {
+    let mut s = Session::fake(READ_BUILD);
+    let (chat, run) = pending_round(&mut s, &[("read-test.file", json!({"id": 1}))]);
+    let state = s.store().local::<ReadState>();
+    state.ready.store(true, Ordering::SeqCst);
+    *state.stop.lock().unwrap() = Some(run);
+    let requests = fake(&s).requests().len();
+    let turns = model::turns(s.store(), chat).len();
+
+    assert!(matches!(
+        worker::RunWorker::new(run, chat).pass(s.world()),
+        Wake::OnKick
+    ));
+    assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+    assert_eq!(model::calls(s.store(), run)[0].status, model::CALL_DONE);
+    assert_eq!(
+        fake(&s).requests().len(),
+        requests,
+        "a stop during the read must prevent another billed request"
+    );
+    assert_eq!(model::run(s.store(), run).unwrap().status, model::STOPPED);
+    assert_eq!(
+        model::turns(s.store(), chat).len(),
+        turns,
+        "the stopped run must not append tool or assistant turns"
+    );
 }
 
 #[test]
