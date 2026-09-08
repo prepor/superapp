@@ -213,7 +213,7 @@ impl Widget for ChatPanel {
         if let Event::Scroll(e) = event {
             self.reveal.cancel();
             let list = self.view.widget(cx, LIST).as_portal_list();
-            if self.unread_space.is_some() && e.scroll.y > 0.0
+            if self.unread_space.is_some() && e.scroll.y > e.scroll.x.abs()
                 && list.area().clipped_rect(cx).contains(e.abs) && list.is_at_end()
             {
                 self.unread_space = None;

@@ -73,7 +73,7 @@ jobs:
       #
       # `e2e/sync/` is not in it: those walks are two devices over one
       # bucket, so each needs a second process and a `bucketd` beside it.
-      # First check a reveal with no replay timer or forced draw loop;
+      # The reveal test runs without a replay timer or forced draw loop;
       # continuously drawn UI suites can hide a missing redraw request.
       - name: e2e
         env:

@@ -116,6 +116,21 @@ fn unread_openings_preserve_reading_and_allow_following_the_latest_message() {
                         - viewport.pos.y - viewport.size.y).abs() < 1.0,
                         "the latest message must rest at the bottom");
                 }
+                if matches!(frame, 2 | 4) && unread == 1 && !long_previous {
+                    assert!(portal.is_at_end(), "reserved space fills the viewport before a pan");
+                    let space = root.borrow::<ChatPanel>().unwrap().unread_space
+                        .expect("a short unread run reserves space");
+                    let event = Event::Scroll(ScrollEvent {
+                        window_id: CxWindowPool::id_zero(),
+                        scroll: dvec2(if frame == 2 { 30.0 } else { -30.0 }, 0.1),
+                        abs: viewport.pos + viewport.size / 2.0, modifiers: Default::default(),
+                        handled_x: Cell::new(false), handled_y: Cell::new(false),
+                        is_mouse: false, time: now, phase: ScrollPhase::Changed,
+                    });
+                    root.handle_event(&mut cx, &event, &mut Scope::with_data_props(&mut session, &props));
+                    assert_eq!(root.borrow::<ChatPanel>().unwrap().unread_space, Some(space),
+                        "a horizontal pan with vertical drift must preserve the unread space");
+                }
                 if frame == 4 {
                     // Dispatch after the pass has resolved its hit rectangles.
                     let event = if unread == 1 && !long_previous {
