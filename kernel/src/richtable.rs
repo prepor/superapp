@@ -245,8 +245,8 @@ impl<D: Datasource> Datasource for &D {
 /// The rows the operator has **marked** for a batch verb: a set of
 /// [`Datasource::Key`]s beside the cursor, and nothing else — no rows, no
 /// store, no widget. A mark is an identity, so it survives the filter, the
-/// paging and a sync landing under the list; sorting the set into what the
-/// filter shows and what it hides is the table's job ([`Table::split`]).
+/// paging and a sync landing under the list. [`ListState::split`] separates
+/// shown and hidden marks, accounting for the list's retained selection.
 ///
 /// Marks are context, not intent: they are held in a panel's memory, never
 /// in the history, and go with the process.
@@ -1219,16 +1219,6 @@ impl<D: Datasource> Table<D> {
         self.ds.by_key(store, key)
     }
 
-    /// The marks the filter shows and the marks it hides, both in the set's
-    /// order. A hidden mark is still a mark: it counts, it is drawn above
-    /// the rows, and a batch verb acts on it.
-    #[must_use]
-    pub fn split(&self, store: &Store, marks: &Marks<D::Key>) -> (Vec<D::Key>, Vec<D::Key>) {
-        let keys = marks.keys();
-        let shown: BTreeSet<D::Key> = self.present(store, &keys).into_iter().collect();
-        keys.into_iter().partition(|k| shown.contains(k))
-    }
-
     /// The end of the list came on screen: a source without a count grows
     /// its window by a page, if the last one was full. A counted source
     /// needs nothing — every row already has a place.
@@ -1586,9 +1576,9 @@ impl<D: Datasource> ListState<D> {
         self.hidden.clear();
     }
 
-    /// The marks the filter shows and the marks it hides, both in key
-    /// order. A hidden mark is still a mark: it counts, it is drawn above
-    /// the rows, and a batch verb acts on it.
+    /// The marks the list shows, including its retained selection, and the
+    /// marks it hides, both in key order. A hidden mark is still a mark: it
+    /// counts, it is drawn above the rows, and a batch verb acts on it.
     #[must_use]
     pub fn split(&self, store: &Store) -> (Vec<D::Key>, Vec<D::Key>) {
         let keys = self.marks.keys();
@@ -2303,7 +2293,7 @@ mod tests {
     /// whether or not it matches — so a mark the filter hides is still a
     /// mark, read fresh.
     #[test]
-    fn a_table_sorts_its_marks() {
+    fn a_table_finds_matching_keys_and_hidden_rows() {
         let s = store_with(25);
         let mut t = Table::new(&SOURCE, 10);
 
@@ -2321,12 +2311,9 @@ mod tests {
             t.rows(&s, 0, 12).iter().map(|i| i.id).collect::<Vec<_>>()
         );
 
-        // A mark that left the filter sorts into hidden; the rest is shown.
-        let mut marks = Marks::new();
-        marks.extend([6, 7, 20]); // 7 is odd: not ok, so not shown.
-        assert_eq!(t.present(&s, &marks.keys()), vec![6, 20]);
-        assert_eq!(t.split(&s, &marks), (vec![6, 20], vec![7]));
-        assert_eq!(t.split(&s, &Marks::new()), (vec![], vec![]));
+        // The table answers which marked keys still match.
+        let keys = [6, 7, 20]; // 7 is odd: not ok, so not shown.
+        assert_eq!(t.present(&s, &keys), vec![6, 20]);
 
         // And it still has a row: by_key ignores the filter, keeps the base.
         let hidden = t.by_key(&s, &7).expect("the row behind a hidden mark");
@@ -2336,7 +2323,7 @@ mod tests {
         // Reactive like the page: the keys follow a commit.
         s.write(|c| c.execute("UPDATE item SET ok = 1 WHERE id = 7", []))
             .unwrap();
-        assert_eq!(t.present(&s, &marks.keys()), vec![6, 7, 20]);
+        assert_eq!(t.present(&s, &keys), vec![6, 7, 20]);
         assert_eq!(t.keys(&s).map(|k| k.len()), Some(13));
     }
 
@@ -2345,23 +2332,22 @@ mod tests {
     #[test]
     fn a_grouped_source_marks_by_group() {
         let s = store_with(25);
-        let mut t = Table::new(&GROUP_SOURCE, 10);
-        assert_eq!(t.len(&s), 2, "the ok items and the rest");
+        let mut l = ListState::new(&GROUP_SOURCE, 10);
+        assert_eq!(l.len(&s), 2, "the ok items and the rest");
         assert_eq!(
-            t.keys(&s),
+            l.table().keys(&s),
             Some(vec![0, 1]),
             "latest first: item 25 is not ok"
         );
 
-        t.set_filter("@ok");
-        assert_eq!(t.keys(&s), Some(vec![1]));
-        let mut marks = Marks::new();
-        marks.extend([0, 1]);
-        assert_eq!(t.split(&s, &marks), (vec![1], vec![0]));
+        l.set_filter("@ok");
+        assert_eq!(l.table().keys(&s), Some(vec![1]));
+        l.marks_mut().extend([0, 1]);
+        assert_eq!(l.split(&s), (vec![1], vec![0]));
         // A group whose *members* match a text filter comes back whole.
-        t.set_filter("alpha");
-        assert_eq!(t.keys(&s), Some(vec![0, 1]));
-        assert_eq!(t.by_key(&s, &0).map(|g| g.members), Some(13), "all of it");
+        l.set_filter("alpha");
+        assert_eq!(l.table().keys(&s), Some(vec![0, 1]));
+        assert_eq!(l.table().by_key(&s, &0).map(|g| g.members), Some(13), "all of it");
     }
 
     /// A source that cannot count: the window grows a page at a time as
@@ -2408,7 +2394,6 @@ mod tests {
         // are taken at their word, and nothing is known to be hidden.
         assert_eq!(t.keys(&s), None);
         assert_eq!(t.present(&s, &[3, 99]), vec![3, 99]);
-        assert_eq!(t.split(&s, &Marks::default()), (vec![], vec![]));
         assert_eq!(t.by_key(&s, &3), None);
         t.set_filter("x");
         assert_eq!(t.len(&s), 10, "a new filter resets the window");
@@ -2729,6 +2714,7 @@ mod tests {
         // Clearing takes both.
         l.clear_marks();
         assert!(l.marks().is_empty() && l.hidden_rows().is_empty());
+        assert_eq!(l.split(&s), (vec![], vec![]));
     }
 
     /// A source that cannot list its keys does not offer `all`, and its
@@ -2737,6 +2723,7 @@ mod tests {
     fn a_countless_list_offers_no_mark_all() {
         let s = Store::open(None, &[]).unwrap();
         let mut l = ListState::new(Stream((0..23).collect()), 10);
+        assert_eq!(l.split(&s), (vec![], vec![]));
         assert!(!l.mark_all(&s));
         l.marks_mut().extend([3, 99]);
         l.sync(&s);
