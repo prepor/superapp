@@ -114,6 +114,20 @@ pub fn get_message_available_reactions(chat: PeerId, msg: MsgId, request: u64) -
     .to_string()
 }
 
+pub(super) fn refresh_available_reactions(chat: PeerId, msg: MsgId, request: u64, attempt: u64) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&get_message_available_reactions(chat, msg, request)).expect("reaction request");
+    v["@extra"] = json!(format!("reaction_choices:{request}:{attempt}"));
+    v.to_string()
+}
+
+pub(super) fn parse_reaction_choices_extra(extra: &str) -> Option<(u64, u64)> {
+    if let Some(id) = extra.strip_prefix("reactions:") {
+        return Some((id.parse().ok()?, 0));
+    }
+    let (id, attempt) = extra.strip_prefix("reaction_choices:")?.split_once(':')?;
+    Some((id.parse().ok()?, attempt.parse().ok()?))
+}
+
 /// Add one ordinary emoji. The interaction-info update supplies Telegram's
 /// resulting counts.
 #[must_use]
@@ -366,11 +380,22 @@ pub fn chat_open(chat_id: PeerId, open: bool) -> String {
 
 /// Load visible rows into TDLib as well as our durable projection before
 /// asking it to keep their reactions fresh.
-pub fn get_visible_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
+pub fn get_visible_messages(chat_id: PeerId, message_ids: &[MsgId], request: u64) -> String {
     json!({
         "@type": "getMessages", "chat_id": chat_id, "message_ids": message_ids,
-        "@extra": format!("visible:{chat_id}"),
+        "@extra": format!("visible:{chat_id}:{request}"),
     }).to_string()
+}
+
+pub(super) fn parse_visible_extra(extra: &str) -> Option<(PeerId, u64)> {
+    let (chat, request) = extra.strip_prefix("visible:")?.split_once(':')?;
+    Some((chat.parse().ok()?, request.parse().ok()?))
+}
+
+/// TDLib only schedules ongoing reaction polling while this client is online.
+pub(super) fn set_online(online: bool) -> String {
+    json!({"@type": "setOption", "name": "online",
+        "value": {"@type": "optionValueBoolean", "value": online}}).to_string()
 }
 
 /// Subscribe to counts without changing the existing read-cursor behavior.

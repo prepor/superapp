@@ -33,6 +33,7 @@ pub struct Forward {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReactionResult {
     Choices(Vec<String>),
+    Unavailable(String),
     Added,
     Error(String),
 }
@@ -291,9 +292,25 @@ impl Runtime {
     }
 
     pub fn finish_reaction(&self, id: u64, result: ReactionResult) {
-        if let Some(reply) = self.state().reactions.remove(&id).and_then(|r| r.upgrade()) {
+        // Available choices are a subscription: TDLib can change them after
+        // chat metadata or message interactions arrive. The panel owns its
+        // lifetime, including after an empty result.
+        let reply = {
+            let mut state = self.state();
+            if matches!(result, ReactionResult::Choices(_) | ReactionResult::Unavailable(_)) {
+                state.reactions.get(&id).and_then(Weak::upgrade)
+            } else {
+                state.reactions.remove(&id).and_then(|r| r.upgrade())
+            }
+        };
+        if let Some(reply) = reply {
             *reply.lock().expect("reaction reply") = Some(result);
+            self.operations.changed();
         }
+    }
+
+    pub fn reaction_alive(&self, id: u64) -> bool {
+        self.state().reactions.get(&id).is_some_and(|r| r.strong_count() > 0)
     }
 
     pub fn demo_reacted(&self, chat: PeerId, msg: MsgId, emoji: &str) -> bool {

@@ -150,9 +150,17 @@ offer reactions, and marking messages keeps the batch actions on the bar.
 
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
-requests. Visible messages load a fresh snapshot and subscribe to interaction
-updates while their chat or line card remains open; a successful add also
-refreshes that message. Counts wrap at the panel width, including paid stars
+requests. The picker refreshes when Telegram changes the chat's permissions,
+active emoji or message interactions; an initially empty cache is retried
+briefly before showing an empty list with **retry**. Explicit restrictions
+explain why reactions are unavailable, and missing replies time out instead
+of leaving the picker loading indefinitely.
+
+Visible messages load a fresh snapshot and enable TDLib's ongoing reaction
+polling while the panel is visible in the foreground; hidden panels and
+background windows release their subscriptions. Failed or missing snapshots
+retry without scrolling, and older snapshots cannot undo newer interaction
+updates. A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
 and a text fallback for custom emoji. A refused request
 shows **could not load reactions** or **reaction failed**, plus **retry**, and
 automatically reports the reason in a notification; click the status to see it

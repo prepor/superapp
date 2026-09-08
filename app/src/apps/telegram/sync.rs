@@ -34,6 +34,8 @@ use super::transport::Td;
 use super::updates;
 
 mod mentions;
+mod reactions;
+mod views;
 
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
@@ -93,7 +95,8 @@ pub struct Account<T: Td> {
     /// asked for.
     not_before: std::cell::Cell<f64>,
     /// Chats and message rows currently displayed by the account's widgets.
-    viewed: std::cell::RefCell<std::collections::BTreeMap<PeerId, Vec<MsgId>>>,
+    viewed: std::cell::RefCell<views::Views>,
+    reactions: std::cell::RefCell<reactions::Reactions>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -152,6 +155,8 @@ impl<T: Td> Account<T> {
             ">> {} request={} chat={}",
             v["@type"], v["@extra"]["operation"], v["chat_id"]
         ));
+        self.track_reactions(w, &v);
+        self.track_snapshot(w, &v);
         self.td.send(&request);
     }
 
@@ -237,7 +242,8 @@ impl<T: Td> Account<T> {
             mention_generation: std::cell::Cell::new(0),
             mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
-            viewed: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            viewed: std::cell::RefCell::new(views::Views::default()),
+            reactions: std::cell::RefCell::new(reactions::Reactions::default()),
         }
     }
 
@@ -340,49 +346,6 @@ impl<T: Td> Account<T> {
         self.send(w, &get_history_in(page.chat, page.topic, page.from, page.walk));
     }
 
-    fn sync_views(&self, w: &World) {
-        let next = runtime::of(w.store()).visible_messages();
-        let mut before = self.viewed.borrow_mut();
-        for chat in before.keys().filter(|chat| !next.contains_key(chat)) {
-            self.send(w, &chat_open(*chat, false));
-        }
-        for (chat, ids) in &next {
-            if !before.contains_key(chat) {
-                self.send(w, &chat_open(*chat, true));
-            }
-            let fresh: Vec<_> = ids.iter().copied()
-                .filter(|id| before.get(chat).is_none_or(|old| !old.contains(id)))
-                .collect();
-            for batch in fresh.chunks(100) {
-                self.send(w, &get_visible_messages(*chat, batch));
-            }
-        }
-        *before = next;
-    }
-
-    fn on_visible_messages(&self, w: &World, v: &Value, chat: PeerId) {
-        let messages: Vec<_> = v["messages"].as_array().into_iter().flatten()
-            .filter_map(updates::message).filter(|m| m.chat == chat).collect();
-        let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
-        if !messages.is_empty() {
-            self.filed(w, "visible messages", w.store().write(move |c| {
-                ensure_peer(c, chat)?;
-                model::ensure_chat_tx(c, chat)?;
-                for sender in messages.iter().filter_map(|m| m.sender) {
-                    ensure_peer(c, sender)?;
-                }
-                project_messages(c, &messages)?;
-                apply_read_outbox(c, chat)
-            }));
-        }
-        let visible = runtime::of(w.store()).visible_messages();
-        let ids: Vec<_> = ids.into_iter()
-            .filter(|id| visible.get(&chat).is_some_and(|shown| shown.contains(id))).collect();
-        if !ids.is_empty() {
-            self.send(w, &observe_messages(chat, &ids));
-        }
-    }
-
     /// Files a write's outcome. A refused write goes to the trace and, once
     /// per distinct error, to stderr: a store whose table lacks a column
     /// refuses every line the same way, and two thousand copies of one
@@ -444,6 +407,7 @@ impl<T: Td> Account<T> {
             self.retry_parameters.set(None);
             self.parameters(w);
         }
+        self.sync_reactions(w);
         self.pump(w);
         n
     }
@@ -473,6 +437,7 @@ impl<T: Td> Account<T> {
             }
         }
         let tracked = v["@extra"]["operation"].is_u64();
+        self.begin_snapshot(&v);
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
         }
@@ -519,12 +484,7 @@ impl<T: Td> Account<T> {
                 self.on_file_answer(w, &v);
             }
             Some("availableReactions") => {
-                if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
-                    runtime::of(w.store()).finish_reaction(
-                        id,
-                        runtime::ReactionResult::Choices(updates::available_reactions(&v)),
-                    );
-                }
+                self.on_reaction_choices(w, &v, false);
             }
             // A refreshed source message lands like a new line before its
             // viewer starts downloading the file registered by that message.
@@ -545,6 +505,7 @@ impl<T: Td> Account<T> {
                 self.handle_update(w, &v);
             }
         }
+        self.end_snapshot();
     }
 
     /// Appends one line to `tg-debug.log` beside the store — what the worker
@@ -699,7 +660,7 @@ impl<T: Td> Account<T> {
         self.retry_parameters.set(None);
         runtime::of(w.store()).set_connection_note(None);
         // Views may have been drawn while TDLib was still signing in.
-        self.viewed.borrow_mut().clear();
+        self.viewed.borrow_mut().reset();
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -750,6 +711,9 @@ impl<T: Td> Account<T> {
                 .is_some_and(|e| e.starts_with("load_chats:"))
         {
             runtime::of(w.store()).set_list_syncing(false);
+            return;
+        }
+        if failed && (self.on_reaction_choices(w, v, true) || self.on_visible_error(w, v)) {
             return;
         }
         if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
@@ -967,6 +931,16 @@ impl<T: Td> Account<T> {
             Some("updateChatDraftMessage") => self.on_chat_draft(w, update),
             Some("updateChatAction") => self.on_chat_action(w, update),
             Some("updateMessageInteractionInfo") => self.on_interaction(w, update),
+            Some("updateActiveEmojiReactions") => {
+                self.reactions_changed(w, None, None);
+                self.visible_reactions_changed(None);
+            }
+            Some("updateChatAvailableReactions") => {
+                if let Some(chat) = update["chat_id"].as_i64() {
+                    self.reactions_changed(w, Some(chat), None);
+                    self.visible_reactions_changed(Some(chat));
+                }
+            }
             Some("updateMessageSendSucceeded" | "updateMessageSendFailed") => {
                 self.on_sent(w, update);
             }
@@ -1010,10 +984,8 @@ impl<T: Td> Account<T> {
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
             Some("messages") => {
-                if let Some(chat) = update["@extra"].as_str()
-                    .and_then(|s| s.strip_prefix("visible:")).and_then(|s| s.parse().ok())
-                {
-                    self.on_visible_messages(w, update, chat);
+                if let Some((chat, request)) = update["@extra"].as_str().and_then(parse_visible_extra) {
+                    self.on_visible_messages(w, update, chat, request);
                 } else {
                     self.on_history(w, update);
                 }
@@ -1053,7 +1025,7 @@ impl<T: Td> Account<T> {
 
     fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
         let Some(topic) = updates::topic(chat, value) else { return; };
-        let message = updates::message(&value["last_message"])
+        let message = self.message(&value["last_message"])
             .filter(|m| m.chat == chat && m.topic == topic.id);
         self.filed(w, "topic", w.store().write(move |c| {
             ensure_peer(c, chat)?;
@@ -1088,7 +1060,7 @@ impl<T: Td> Account<T> {
     /// trim the chat back to its window. All in one write, so a line and its
     /// trim are one step.
     fn on_new_message(&self, w: &World, message: &Value) {
-        let Some(msg) = updates::message(message) else {
+        let Some(msg) = self.message(message) else {
             return;
         };
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
@@ -1189,6 +1161,8 @@ impl<T: Td> Account<T> {
         let Some(i) = updates::interaction(u) else {
             return;
         };
+        self.remember_interaction(&i);
+        self.reactions_changed(w, Some(i.chat), Some(i.id));
         self.filed(
             w,
             "on_interaction",
@@ -1310,7 +1284,7 @@ impl<T: Td> Account<T> {
     /// still *sending…*, beside the line that had in fact gone.
     fn on_sent(&self, w: &World, u: &Value) {
         runtime::of(w.store()).operations.sent(w.store(), u);
-        let Some(msg) = updates::message(&u["message"]) else {
+        let Some(msg) = self.message(&u["message"]) else {
             return;
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
@@ -1712,7 +1686,7 @@ impl<T: Td> Account<T> {
             return;
         }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
-        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
+        let batch: Vec<IncomingMessage> = raw.iter().filter_map(|v| self.message(v))
             .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {

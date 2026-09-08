@@ -51,6 +51,151 @@ fn account(td: FakeTd, phone: Option<&str>) -> Account<FakeTd> {
     account
 }
 
+fn last_request(td: &FakeTd, kind: &str) -> serde_json::Value {
+    td.sent().iter().rev().map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+        .find(|v| v["@type"] == kind).expect("request was sent")
+}
+
+#[test]
+fn watching_messages_enables_tdlibs_reaction_polling_until_the_last_view_closes() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    runtime::of(w.store()).set_list_syncing(true);
+    acc.drain(&w);
+    let online = last_request(&td, "setOption");
+    assert_eq!(online["name"], "online");
+    assert_eq!(online["value"], json!({"@type": "optionValueBoolean", "value": true}));
+    assert!(td.sent_types().contains(&"getMessages".to_string()), "visible rows must not wait for the entire chat list");
+    drop(view);
+    acc.drain(&w);
+    assert_eq!(last_request(&td, "setOption")["value"]["value"], false);
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "closeChat").count(), 1);
+}
+
+#[test]
+fn failed_visible_fetches_retry_without_scrolling_and_retire_timed_out_answers() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    acc.drain(&w);
+    let first = last_request(&td, "getMessages");
+    acc.on_update(&w, &json!({"@type": "error", "@extra": first["@extra"],
+        "code": 429, "message": "Too Many Requests: retry after 5"}).to_string());
+    acc.drain(&w);
+    assert_eq!(last_request(&td, "getMessages"), first, "honor the server's wait");
+    clock.advance(6.0);
+    acc.drain(&w);
+    let second = last_request(&td, "getMessages");
+    assert_ne!(second["@extra"], first["@extra"], "retry a failed visible fetch");
+    clock.advance(31.0);
+    acc.drain(&w);
+    let third = last_request(&td, "getMessages");
+    assert_ne!(third["@extra"], second["@extra"], "retry a missing reply too");
+    let response = |request: &serde_json::Value, count| json!({
+        "@type": "messages", "@extra": request["@extra"], "messages": [{
+            "chat_id": 7, "id": 42, "content": {"@type": "messageText", "text": {"text": "post"}},
+            "interaction_info": {"reactions": {"reactions": [
+                {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": count},
+            ]}},
+        }],
+    }).to_string();
+    acc.on_update(&w, &response(&third, 9));
+    acc.on_update(&w, &response(&second, 1));
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 1, "retrying must not leak chat subscriptions");
+}
+
+#[test]
+fn reaction_metadata_refreshes_visible_rows_and_snapshots_do_not_undo_live_counts() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    acc.drain(&w);
+    let first = last_request(&td, "getMessages");
+    let message = json!({"chat_id": 7, "id": 42,
+        "content": {"@type": "messageText", "text": {"text": "post"}}});
+    acc.on_update(&w, &json!({"@type": "messages", "@extra": first["@extra"], "messages": [message]}).to_string());
+    acc.on_update(&w, &json!({"@type": "updateChatAvailableReactions", "chat_id": 7,
+        "available_reactions": {"@type": "chatAvailableReactionsAll"}}).to_string());
+    acc.drain(&w);
+    let refreshed = last_request(&td, "getMessages");
+    assert_ne!(refreshed["@extra"], first["@extra"]);
+    acc.on_update(&w, &json!({"@type": "updateMessageInteractionInfo", "chat_id": 7, "message_id": 42,
+        "interaction_info": {"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 8},
+        ]}}}).to_string());
+    acc.on_update(&w, &json!({"@type": "messages", "@extra": refreshed["@extra"], "messages": [message]}).to_string());
+    acc.on_update(&w, &json!({"@type": "updateChatLastMessage", "chat_id": 7, "last_message": message}).to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 8"));
+    // The post-add fetch is newer than the previous push update, and must
+    // be able to advance it even if its own interaction update is delayed.
+    let (id, _reply) = runtime::of(w.store()).await_reaction();
+    acc.send(&w, &super::add_message_reaction(7, 42, "👍", id));
+    let added = last_request(&td, "addMessageReaction");
+    acc.on_update(&w, &json!({"@type": "ok", "@extra": added["@extra"]}).to_string());
+    let fetch = last_request(&td, "getMessage");
+    let mut newer = message.clone();
+    newer["@type"] = json!("message");
+    newer["@extra"] = fetch["@extra"].clone();
+    newer["interaction_info"] = json!({"reactions": {"reactions": [
+        {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 9},
+    ]}});
+    acc.on_update(&w, &newer.to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
+    acc.on_update(&w, &json!({"@type": "updateChatLastMessage", "chat_id": 7, "last_message": message}).to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
+    acc.on_update(&w, &json!({"@type": "updateMessageInteractionInfo", "chat_id": 7, "message_id": 42,
+        "interaction_info": null}).to_string());
+    acc.on_update(&w, &newer.to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions, None, "removing the last reaction must still clear it");
+}
+
+#[test]
+fn missing_visible_messages_retry_and_reopening_reconciles_counts_removed_while_away() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    acc.drain(&w);
+    let first = last_request(&td, "getMessages");
+    acc.on_update(&w, &json!({"@type": "messages", "@extra": first["@extra"], "messages": [null]}).to_string());
+    clock.advance(3.0);
+    acc.drain(&w);
+    let second = last_request(&td, "getMessages");
+    assert_ne!(first["@extra"], second["@extra"]);
+    let message = json!({"chat_id": 7, "id": 42, "content": {"@type": "messageText", "text": {"text": "post"}}});
+    acc.on_update(&w, &json!({"@type": "messages", "@extra": second["@extra"], "messages": [message]}).to_string());
+    acc.on_update(&w, &json!({"@type": "updateMessageInteractionInfo", "chat_id": 7, "message_id": 42,
+        "interaction_info": {"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 8},
+        ]}}}).to_string());
+    acc.send(&w, &super::get_message(7, 42));
+    let old_fetch = last_request(&td, "getMessage");
+    drop(view);
+    acc.drain(&w);
+    let _reopened = runtime::of(w.store()).watch_messages(7, vec![42]);
+    acc.drain(&w);
+    let reopened = last_request(&td, "getMessages");
+    assert_ne!(second["@extra"], reopened["@extra"]);
+    acc.on_update(&w, &json!({"@type": "messages", "@extra": reopened["@extra"], "messages": [message]}).to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions, None);
+    let mut stale = message;
+    stale["@type"] = json!("message");
+    stale["@extra"] = old_fetch["@extra"].clone();
+    stale["interaction_info"] = json!({"reactions": {"reactions": [
+        {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 8},
+    ]}});
+    acc.on_update(&w, &stale.to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions, None,
+        "a request from the previous visit cannot resurrect removed reactions");
+}
+
 #[test]
 fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
     let w = world();
@@ -60,8 +205,8 @@ fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
     let chat = runtime.watch_messages(-1005, vec![4200, 4300]);
     let card = runtime.watch_messages(-1005, vec![4300]);
     acc.drain(&w);
-    assert_eq!(td.sent_types(), vec!["openChat", "getMessages"]);
-    let request: serde_json::Value = serde_json::from_str(&td.sent()[1]).unwrap();
+    assert_eq!(td.sent_types(), vec!["setOption", "openChat", "getMessages"]);
+    let request = last_request(&td, "getMessages");
     assert_eq!(request["message_ids"], json!([4200, 4300]));
     acc.on_update(&w, &json!({
         "@type": "messages", "@extra": request["@extra"], "messages": [null, {
@@ -101,7 +246,8 @@ fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
     assert_eq!(td.sent().len(), n + 1, "the card still owns the open chat");
     drop(card);
     acc.drain(&w);
-    assert_eq!(td.sent_types().last().unwrap(), "closeChat");
+    assert_eq!(last_request(&td, "closeChat")["chat_id"], -1005);
+    assert_eq!(last_request(&td, "setOption")["value"]["value"], false);
     let n = td.sent().len();
     acc.drain(&w);
     assert_eq!(td.sent().len(), n, "close only once");
@@ -121,8 +267,8 @@ fn visible_messages_are_replayed_after_sign_in_and_isolated_between_accounts() {
     acc.drain(&a);
     acc.on_ready(&a);
     acc.drain(&a);
-    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 1,
-        "subscriptions wait until sign-in and the chat-list load finish");
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 2,
+        "visible rows resume as soon as authorization is ready");
     for list in ["main", "archive"] {
         acc.on_update(&a, &json!({"@type": "error", "code": 404,
             "@extra": format!("load_chats:{list}")}).to_string());

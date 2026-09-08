@@ -169,13 +169,29 @@ pub struct ChatPanel {
     dragging_files: bool,
     #[rust]
     viewed: Option<super::super::runtime::MessageView>,
+    #[rust]
+    background: bool,
 }
 
 impl Widget for ChatPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::WindowLostFocus(_) | Event::Background => {
+                self.background = true;
+                self.viewed = None;
+            }
+            Event::WindowGotFocus(_) | Event::Foreground => {
+                self.background = false;
+                self.view.redraw(cx);
+            }
+            _ => {}
+        }
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if scope.data.get_mut::<Session>().is_some_and(|s| !super::message_panel_visible(s, props.slot)) {
+            self.viewed = None;
+        }
 
         if matches!(event, Event::Scroll(_)) {
             self.reveal.cancel();
@@ -761,6 +777,7 @@ impl Widget for ChatPanel {
         }
         if let Some(s) = scope.data.get_mut::<Session>() {
             if let Some(chat) = with_chat(&props, |c| c.peer()) {
+                if self.background || !super::message_panel_visible(s, props.slot) { visible_ids.clear(); }
                 super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, visible_ids);
             }
         }

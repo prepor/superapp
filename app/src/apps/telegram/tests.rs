@@ -2612,6 +2612,154 @@ fn offer_reactions(acc: &sync::Account<FakeTd>, s: &Session, request: &serde_jso
 }
 
 #[test]
+fn a_first_empty_reaction_answer_recovers_when_metadata_arrives_without_reopening() {
+    let mut s = session();
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, card, "telegram.react");
+    acc.drain(s.world());
+    let first = last_reaction_request(&td, "getMessageAvailableReactions");
+    offer_reactions(&acc, &s, &first, &[]);
+    let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, vec!["loading reactions…", "cancel"], "an early empty cache is not a definitive answer");
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateChatAvailableReactions", "chat_id": VERA + 1}).to_string());
+    acc.drain(s.world());
+    assert_eq!(last_reaction_request(&td, "getMessageAvailableReactions"), first, "ignore other chats");
+    for kind in ["updateChatAvailableReactions", "updateActiveEmojiReactions"] {
+        acc.on_update(s.world(), &serde_json::json!({"@type": kind, "chat_id": VERA}).to_string());
+    }
+    acc.drain(s.world());
+    let second = last_reaction_request(&td, "getMessageAvailableReactions");
+    assert_ne!(second["@extra"], first["@extra"]);
+    offer_reactions(&acc, &s, &second, &["👍", "🔥"]);
+    assert!(poll_reactions(&mut s, card));
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_1"));
+    offer_reactions(&acc, &s, &first, &[]);
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_1"), "late answers cannot replace new choices");
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateMessageInteractionInfo",
+        "chat_id": VERA, "message_id": m.id, "interaction_info": null}).to_string());
+    acc.drain(s.world());
+    let third = last_reaction_request(&td, "getMessageAvailableReactions");
+    offer_reactions(&acc, &s, &third, &["❤️"]);
+    assert!(poll_reactions(&mut s, card), "a picker redraws more than its first response");
+    let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels[0], "❤️");
+}
+
+#[test]
+fn empty_reaction_choices_retry_on_the_worker_clock_and_eventually_offer_manual_retry() {
+    use kernel::app::Env;
+    use kernel::caps::{ClockSource, FakeClock};
+    let clock = FakeClock::at(virtual_epoch());
+    let mut s = Session::fake_with(APPS, &Env { clock: ClockSource::Virtual(clock.clone()), ..Env::default() });
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, card, "telegram.react");
+    acc.drain(s.world());
+    let first = last_reaction_request(&td, "getMessageAvailableReactions");
+    offer_reactions(&acc, &s, &first, &[]);
+    clock.advance(1.0);
+    acc.drain(s.world());
+    let retry = last_reaction_request(&td, "getMessageAvailableReactions");
+    assert_ne!(first["@extra"], retry["@extra"], "retry an empty cache even without metadata events");
+    offer_reactions(&acc, &s, &retry, &["👍"]);
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"));
+    verb(&mut s, card, "telegram.reactions_cancel");
+    verb(&mut s, card, "telegram.react");
+    for _ in 0..5 {
+        acc.drain(s.world());
+        offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &[]);
+        clock.advance(4.0);
+    }
+    let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, vec!["no emoji reactions available", "retry", "cancel"]);
+    let count = td.sent().len();
+    clock.advance(60.0);
+    acc.drain(s.world());
+    assert_eq!(td.sent().len(), count, "a confirmed empty result does not poll forever");
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateActiveEmojiReactions"}).to_string());
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["🔥"]);
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"), "late metadata still wakes an empty picker");
+}
+
+#[test]
+fn reaction_request_timeouts_release_the_picker_and_never_resend_an_unconfirmed_add() {
+    use kernel::app::Env;
+    use kernel::caps::{ClockSource, FakeClock};
+    let clock = FakeClock::at(virtual_epoch());
+    let mut s = Session::fake_with(APPS, &Env { clock: ClockSource::Virtual(clock.clone()), ..Env::default() });
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, card, "telegram.react");
+    acc.drain(s.world());
+    let timed_out = last_reaction_request(&td, "getMessageAvailableReactions");
+    clock.advance(31.0);
+    acc.drain(s.world());
+    assert!(poll_reactions(&mut s, card));
+    assert!(s.notes().last().unwrap().msg.contains("could not load reactions"));
+    assert!(!poll_reactions(&mut s, card));
+    verb(&mut s, card, "telegram.reactions_retry");
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &timed_out, &["🔥"]);
+    assert!(!verb_ids(&s, card).contains(&"telegram.reaction_0"));
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["👍"]);
+    verb(&mut s, card, "telegram.reaction_0");
+    acc.drain(s.world());
+    let add = last_reaction_request(&td, "addMessageReaction");
+    clock.advance(31.0);
+    acc.drain(s.world());
+    assert!(poll_reactions(&mut s, card));
+    assert!(s.notes().last().unwrap().msg.contains("could not add reaction"));
+    assert!(!runtime::of(s.store()).operations.pending_context(add["@extra"]["context"].as_str().unwrap()),
+        "shared progress must stop waiting when the picker times out");
+    assert_eq!(td.sent_types().iter().filter(|t| *t == "addMessageReaction").count(), 1);
+    acc.on_update(s.world(), &serde_json::json!({"@type": "ok", "@extra": add["@extra"]}).to_string());
+    assert_eq!(last_reaction_request(&td, "getMessage")["message_id"], m.id, "late success still refreshes the actual message");
+    assert!(verb_ids(&s, card).contains(&"telegram.reactions_retry"), "a retired add cannot finish a newer picker state");
+}
+
+#[test]
+fn reaction_permission_changes_during_loading_are_coalesced_and_explained() {
+    let mut s = session();
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, card, "telegram.react");
+    acc.drain(s.world());
+    let first = last_reaction_request(&td, "getMessageAvailableReactions");
+    for _ in 0..4 {
+        acc.on_update(s.world(), &serde_json::json!({"@type": "updateChatAvailableReactions", "chat_id": VERA}).to_string());
+        acc.drain(s.world());
+    }
+    assert_eq!(last_reaction_request(&td, "getMessageAvailableReactions"), first);
+    offer_reactions(&acc, &s, &first, &["👍"]);
+    acc.drain(s.world());
+    assert_eq!(td.sent_types().iter().filter(|t| *t == "getMessageAvailableReactions").count(), 2);
+    let retry = last_reaction_request(&td, "getMessageAvailableReactions");
+    acc.on_update(s.world(), &serde_json::json!({"@type": "availableReactions", "@extra": retry["@extra"],
+        "unavailability_reason": {"@type": "reactionUnavailabilityReasonGuest"}}).to_string());
+    let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, vec!["join this chat to react", "cancel"]);
+    verb(&mut s, card, "telegram.reactions_cancel");
+    let n = td.sent().len();
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateActiveEmojiReactions"}).to_string());
+    acc.drain(s.world());
+    assert_eq!(td.sent().len(), n, "closing the panel retires its metadata subscription");
+}
+
+#[test]
 fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count() {
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(RUST_WEEKLY));
@@ -2758,7 +2906,7 @@ fn reaction_failures_are_reported_once_and_can_be_inspected_and_retried() {
     let query = last_reaction_request(&td, "getMessageAvailableReactions");
     offer_reactions(&acc, &s, &query, &[]);
     let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
-    assert_eq!(labels, vec!["no emoji reactions available", "cancel"]);
+    assert_eq!(labels, vec!["loading reactions…", "cancel"]);
     verb(&mut s, card, "telegram.reactions_cancel");
     assert!(verb_ids(&s, card).contains(&"telegram.react"));
 
@@ -2767,7 +2915,7 @@ fn reaction_failures_are_reported_once_and_can_be_inspected_and_retried() {
     let query = last_reaction_request(&td, "getMessageAvailableReactions");
     offer_reactions(&acc, &s, &query, &["👍"]);
     drop(acc);
-    verb(&mut s, card, "telegram.reaction_0");
+    assert!(!verb_ids(&s, card).contains(&"telegram.reaction_0"), "disconnect retires the choice subscription");
     verb(&mut s, card, "telegram.reaction_status");
     assert!(s.notes().last().unwrap().msg.contains("disconnected"));
     verb(&mut s, card, "telegram.reactions_retry");
@@ -2797,7 +2945,7 @@ fn a_reaction_reports_its_clients_startup_failure_until_authorization_recovers()
     with_signin(&s, signin, |p| {
         assert_eq!(p.state(), "error");
         assert_eq!(p.line(), reason);
-        assert_eq!(p.note(), None);
+        assert_eq!(p.note().as_deref(), Some("Telegram is open in another app instance · close it to continue"));
         assert_eq!(p.field_kind(), None);
     });
 
@@ -2840,16 +2988,20 @@ fn reaction_pickers_ignore_late_answers_and_keep_panels_and_stores_separate() {
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let chat = open_root(&mut s, Chat::at(VERA, m.id));
     let card = open_root(&mut s, Line::id(VERA, m.id));
-    let inbox = runtime::of(s.store()).connect();
-    let acc = account();
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
     verb(&mut s, chat, "telegram.react");
-    let first: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    acc.drain(s.world());
+    let first = last_reaction_request(&td, "getMessageAvailableReactions");
     verb(&mut s, card, "telegram.react");
-    let second: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    acc.drain(s.world());
+    let second = last_reaction_request(&td, "getMessageAvailableReactions");
     assert_ne!(first["@extra"], second["@extra"]);
     verb(&mut s, chat, "telegram.reactions_cancel");
     verb(&mut s, chat, "telegram.react");
-    let third: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    acc.drain(s.world());
+    let third = last_reaction_request(&td, "getMessageAvailableReactions");
     offer_reactions(&acc, &s, &first, &["🔥"]);
     assert!(!verb_ids(&s, chat).contains(&"telegram.reaction_0"));
     offer_reactions(&acc, &s, &second, &["❤️"]);

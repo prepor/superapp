@@ -29,7 +29,7 @@ struct Picker {
     reply: ReactionReply,
     adding: bool,
     live: bool,
-    seen_reply: bool,
+    seen_reply: Option<ReactionResult>,
 }
 
 impl Picker {
@@ -99,7 +99,7 @@ impl Reactions {
             reply,
             adding: false,
             live: live || was_live || !demo,
-            seen_reply: false,
+            seen_reply: None,
         });
     }
 
@@ -110,11 +110,14 @@ impl Reactions {
         let Some(p) = self.0.as_mut() else {
             return false;
         };
-        if p.seen_reply {
-            return false;
-        }
         if let Some(result) = p.result() {
-            p.seen_reply = true;
+            if p.seen_reply.as_ref() == Some(&result) {
+                return false;
+            }
+            p.seen_reply = Some(result.clone());
+            if let ReactionResult::Choices(emojis) = &result {
+                p.page = p.page.min(emojis.len().saturating_sub(1) / CHOICES.len());
+            }
             if let ReactionResult::Error(error) = result {
                 s.notify(p.error_message(&error), true);
             }
@@ -157,14 +160,13 @@ impl Reactions {
                     verbs.push(Verb::run("telegram.reactions_more", "more", Some('m')).plain());
                 }
             }
-            Some(ReactionResult::Choices(_)) => verbs.push(
-                Verb::run(
-                    "telegram.reaction_status",
-                    "no emoji reactions available",
-                    None,
-                )
-                .plain(),
-            ),
+            Some(ReactionResult::Choices(_)) => {
+                verbs.push(Verb::run("telegram.reaction_status", "no emoji reactions available", None).plain());
+                verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')).plain());
+            }
+            Some(ReactionResult::Unavailable(reason)) => {
+                verbs.push(Verb::run("telegram.reaction_status", &reason, None).plain());
+            }
             Some(ReactionResult::Error(_)) => {
                 verbs.push(
                     Verb::run(
@@ -262,7 +264,7 @@ impl Reactions {
                         }
                         p.reply = reply;
                         p.adding = true;
-                        p.seen_reply = false;
+                        p.seen_reply = None;
                     }
                 }
             }

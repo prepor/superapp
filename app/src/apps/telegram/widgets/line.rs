@@ -31,15 +31,29 @@ pub struct LinePanel {
     picture: Option<Rect>,
     #[rust]
     viewed: Option<super::super::runtime::MessageView>,
+    #[rust]
+    background: bool,
 }
 
 impl Widget for LinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::WindowLostFocus(_) | Event::Background => {
+                self.background = true;
+                self.viewed = None;
+            }
+            Event::WindowGotFocus(_) | Event::Foreground => {
+                self.background = false;
+                self.view.redraw(cx);
+            }
+            _ => {}
+        }
         super::text::handle_event(&mut self.view, cx, event, scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
         if let Some(s) = scope.data.get_mut::<Session>() {
+            if !super::message_panel_visible(s, props.slot) { self.viewed = None; }
             let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
                 .is_some_and(|l| l.poll_reactions(s));
             if changed {
@@ -120,7 +134,8 @@ impl Widget for LinePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         if let Some(s) = scope.data.get_mut::<Session>() {
-            let ids = if m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
+            let ids = if !self.background && super::message_panel_visible(s, props.slot)
+                && m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
                 vec![m.id]
             } else {
                 Vec::new()
