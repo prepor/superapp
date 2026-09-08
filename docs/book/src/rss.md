@@ -48,8 +48,8 @@ have left the publisher's feed and removed subscriptions. Older caches
 without source are cleaned again from their saved HTML, and their feeds
 request a full refresh to recover source where it is still available.
 
-Each subscription has a worker that refreshes every fifteen minutes.
-**refresh** requests an immediate pass. HTTP follows up to five redirects,
+Feeds refresh every fifteen minutes, one request at a time. **refresh**
+queues all subscriptions for refresh. HTTP follows up to five redirects,
 uses conditional requests when validators are available, and bounds each
 request to thirty seconds and eight MiB of feed content. RSS, Atom and JSON
 Feed share one parser. Requests run outside the UI thread and database

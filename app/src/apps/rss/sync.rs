@@ -1,9 +1,8 @@
-//! One background pass per subscribed feed. Network reads are effects;
+//! One background refresher for all subscriptions. Network reads are effects;
 //! transactions begin only once a complete, parsed answer is in hand.
 
 use kernel::app::{Wake, Worker};
 use kernel::effect::{Ctx, Effect, Job, World};
-use kernel::store::Store;
 use rusqlite::{params, OptionalExtension};
 use std::time::Duration;
 use ureq::ResponseExt;
@@ -11,6 +10,7 @@ use ureq::ResponseExt;
 use super::{model, parse, seed};
 
 const INTERVAL: f64 = 15.0 * 60.0;
+const STORE_RETRY: Duration = Duration::from_secs(30);
 pub const MAX_FEED: u64 = 8 << 20;
 
 #[derive(Clone, Debug)]
@@ -126,26 +126,33 @@ impl Effect for Request {
     }
 }
 
-pub struct FeedWorker(pub i64);
+/// One thread, database reader and HTTP connection pool for all feeds.
+/// A worker per subscription exhausts macOS's 256-descriptor launch limit
+/// after an OPML import, leaving other engines unable to open their sockets.
+/// Each pass reads the next feed from the store, so the retained worker also
+/// picks up newly added feeds. Session actions kick the whole worker set.
+pub struct RefreshWorker;
 
-impl Worker for FeedWorker {
+impl Worker for RefreshWorker {
     fn name(&self) -> String {
-        format!("rss-feed-{}", self.0)
-    }
-    fn entity(&self) -> Option<String> {
-        Some(format!("rss-feed:{}", self.0))
+        "rss-refresh".into()
     }
     fn claims(&self, _: &Job) -> bool {
         false
     }
     fn pass(&mut self, w: &World) -> Wake {
-        let id = self.0;
-        let state=w.store().conn().query_row(
-            "SELECT url,etag,modified,checked,requested,completed FROM rss_feed WHERE id=? AND subscribed=1",[id],
-            |r|Ok((Request { id,url:r.get(0)?,etag:r.get(1)?,modified:r.get(2)? },r.get::<_,Option<f64>>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?))
+        let state = w.store().conn().query_row(
+            "SELECT id,url,etag,modified,checked,requested,completed FROM rss_feed
+             WHERE subscribed=1
+             ORDER BY requested != completed DESC, checked, id LIMIT 1",
+            [],
+            |r| Ok((Request { id: r.get(0)?, url: r.get(1)?, etag: r.get(2)?, modified: r.get(3)? },
+                r.get::<_, Option<f64>>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
         ).optional();
-        let Ok(Some((request, checked, requested, completed))) = state else {
-            return Wake::OnKick;
+        let (request, checked, requested, completed) = match state {
+            Ok(Some(state)) => state,
+            Ok(None) => return Wake::OnKick,
+            Err(_) => return Wake::After(STORE_RETRY),
         };
         let now = w.now();
         if requested == completed {
@@ -156,6 +163,7 @@ impl Worker for FeedWorker {
                 }
             }
         }
+        let id = request.id;
         let result = w.run(&request).and_then(|r| match r {
             Response::Unchanged => Ok(None),
             Response::Updated {
@@ -171,7 +179,7 @@ impl Worker for FeedWorker {
             }
         });
         let done = w.now();
-        let _ = w.store().write(move |c| {
+        let saved = w.store().write(move |c| {
             // A removed subscription must not be revived by an in-flight response.
             let active = c
                 .query_row("SELECT subscribed FROM rss_feed WHERE id=?", [id], |r| {
@@ -200,20 +208,9 @@ impl Worker for FeedWorker {
             )?;
             Ok(())
         });
-        Wake::After(Duration::from_secs_f64(INTERVAL))
+        // Hand the thread back between feeds so it can retire promptly.
+        // The next pass either fetches another due feed or sleeps until the
+        // earliest deadline. A failed write must not cause a hot retry loop.
+        Wake::After(if saved.is_ok() { Duration::ZERO } else { STORE_RETRY })
     }
-}
-
-pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
-    store
-        .rows_sql(
-            "rss workers",
-            "subscribed feeds",
-            "SELECT id FROM rss_feed WHERE subscribed=1",
-            &[],
-            |r| r.get::<_, i64>(0),
-        )
-        .iter()
-        .map(|id| Box::new(FeedWorker(*id)) as Box<dyn Worker>)
-        .collect()
 }

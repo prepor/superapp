@@ -49,8 +49,11 @@ impl App for Rss {
             _ => caps.insert::<dyn sync::Fetch>(Box::new(sync::Fake)),
         }
     }
-    fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
-        sync::workers(store)
+    fn workers(&self, _store: &Store) -> Vec<Box<dyn Worker>> {
+        // Keep the same worker while the list is empty: removing the last
+        // feed and adding another must not overlap a retiring HTTP request
+        // with a newly spawned worker. An empty list sleeps until kicked.
+        vec![Box::new(sync::RefreshWorker)]
     }
     fn describe(&self) -> Option<&'static str> {
         Some("rss_feed: subscriptions, URLs, titles and refresh status. subscribed=0 retains a removed feed for undo. \

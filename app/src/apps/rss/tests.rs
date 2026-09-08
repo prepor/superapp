@@ -1,9 +1,11 @@
 use super::{model, opml, panels, parse, seed, sync, RSS};
-use kernel::app::{App, Worker};
+use kernel::app::App;
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
 use kernel::richtable::{Datasource, ListState};
 use kernel::session::{Action, Session};
+
+mod refresh;
 
 static APPS: &[&dyn App] = &[&RSS];
 fn session() -> Session {
@@ -23,6 +25,12 @@ fn id(s: &Session, guid: &str) -> i64 {
             r.get(0)
         })
         .unwrap()
+}
+
+fn refresh_pass(s: &Session) {
+    for mut worker in RSS.workers(s.store()) {
+        worker.pass(s.world());
+    }
 }
 
 #[test]
@@ -157,17 +165,16 @@ fn refresh_updates_readings_without_duplicates_or_losing_read_state_and_order() 
 fn worker_fetches_new_feeds_and_reports_errors_without_losing_cached_articles() {
     let mut s = session();
     let feed = model::add(&mut s, seed::EXTRA).unwrap();
-    let mut worker = sync::FeedWorker(feed);
-    worker.pass(s.world());
+    refresh_pass(&s);
     assert_eq!(
         model::FEEDS.by_key(s.store(), &feed).unwrap().title,
         "A new subscription"
     );
     assert_eq!(model::ARTICLES.count(s.store(), None), Some(5));
-    worker.pass(s.world());
+    refresh_pass(&s);
     assert_eq!(model::ARTICLES.count(s.store(), None), Some(5));
     let bad = model::add(&mut s, "https://example.com/missing.xml").unwrap();
-    sync::FeedWorker(bad).pass(s.world());
+    refresh_pass(&s);
     assert_eq!(
         model::FEEDS.by_key(s.store(), &bad).unwrap().error,
         "demo feed not found"
