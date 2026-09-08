@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 mod measure;
 mod worker;
+pub(crate) mod canvas;
 pub use measure::Measure;
+use canvas::{ViewerImageRef, ViewerImageWidgetRefExt};
+use crate::reader::pdf::{Link, Target};
 use worker::{Ready, Worker};
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +81,10 @@ pub struct FileViewer {
 }
 
 impl FileViewer {
+    fn image(&self, cx: &mut Cx) -> ViewerImageRef {
+        self.view.widget(cx, ids!(image_box.image)).as_viewer_image()
+    }
+
     fn show(&mut self, cx: &mut Cx, preview: Preview) {
         // A new source owns a new receiver: an old render can never land on it.
         self.worker = None;
@@ -87,9 +94,7 @@ impl FileViewer {
         self.text = false;
         self.picture = false;
         self.measure = Measure::Empty;
-        self.view
-            .image(cx, ids!(image_box.image))
-            .set_texture(cx, None);
+        self.image(cx).set(cx, None, DVec2::default(), false, Vec::new());
         self.view
             .text_input(cx, ids!(text_box.text))
             .set_text(cx, "");
@@ -133,13 +138,13 @@ impl FileViewer {
                 pixels,
             }) => {
                 self.measure = Measure::Image(width as u32, height as u32);
-                self.bitmap(cx, width, height, pixels);
+                self.bitmap(cx, width, height, pixels, Vec::new());
             }
             Ok(Ready::Pdf(page)) => {
                 self.measure = Measure::Pdf(page.size.0, page.size.1);
                 self.page = page.number;
                 self.pages = page.count;
-                self.bitmap(cx, page.width, page.height, page.pixels);
+                self.bitmap(cx, page.width, page.height, page.pixels, page.links);
             }
             Err(error) => {
                 self.picture = false;
@@ -150,7 +155,7 @@ impl FileViewer {
         self.view.redraw(cx);
     }
 
-    fn bitmap(&mut self, cx: &mut Cx, width: usize, height: usize, pixels: Vec<u32>) {
+    fn bitmap(&mut self, cx: &mut Cx, width: usize, height: usize, pixels: Vec<u32>, links: Vec<Link>) {
         let texture = Texture::new_with_format(
             cx,
             TextureFormat::VecBGRAu8_32 {
@@ -160,13 +165,15 @@ impl FileViewer {
                 updated: TextureUpdated::Full,
             },
         );
-        self.view
-            .image(cx, ids!(image_box.image))
-            .set_texture(cx, Some(texture));
+        self.image(cx).set(cx, Some(texture), dvec2(width as f64, height as f64), self.pages > 0, links);
         self.picture = true;
     }
 
     fn sync(&mut self, cx: &mut Cx) {
+        let image = self.image(cx);
+        image.enable(self.picture && !self.pending);
+        self.view.view(cx, ids!(zoom)).set_visible(cx, self.picture);
+        self.view.label(cx, ids!(zoom.level)).set_text(cx, &format!("{:.0}%", image.zoom() * 100.0));
         self.view
             .view(cx, ids!(text_box))
             .set_visible(cx, self.text);
@@ -202,6 +209,11 @@ impl FileViewer {
         let Some(page) = page.filter(|p| *p < self.pages) else {
             return;
         };
+        self.go_to(cx, page);
+    }
+
+    fn go_to(&mut self, cx: &mut Cx, page: usize) {
+        if self.pending || page >= self.pages { return; }
         let Some(worker) = self.worker.as_mut() else {
             return;
         };
@@ -221,7 +233,16 @@ impl FileViewer {
 
 impl Widget for FileViewer {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let image = self.image(cx);
+        let zoom = image.zoom();
         self.view.handle_event(cx, event, scope);
+        if image.zoom() != zoom { self.sync(cx); }
+        if let Some(target) = image.clicked() {
+            match target {
+                Target::Url(url) => cx.open_url(&url, OpenUrlInPlace::No),
+                Target::Page(page) => self.go_to(cx, page),
+            }
+        }
         if matches!(event, Event::Signal) && self.pending {
             self.view.redraw(cx);
         }
@@ -234,6 +255,16 @@ impl Widget for FileViewer {
                 || props.hits.at(e.abs).and_then(|hit| hit.slot) != Some(props.slot)
             {
                 return;
+            }
+            if self.picture {
+                for (path, zoom) in [(ids!(zoom.less), image.zoom() / 1.5),
+                    (ids!(zoom.fit), 1.0), (ids!(zoom.more), image.zoom() * 1.5)] {
+                    if self.view.widget(cx, path).area().rect(cx).contains(e.abs) {
+                        image.zoom_to(cx, zoom);
+                        self.sync(cx);
+                        return;
+                    }
+                }
             }
             if self.page > 0
                 && self
@@ -273,16 +304,9 @@ impl Widget for FileViewer {
                     ids!(text_box.text) as &[LiveId],
                     MouseCursor::Text,
                 ),
-                (
-                    self.picture,
-                    if self.pages > 0 {
-                        "pdf page"
-                    } else {
-                        "picture"
-                    },
-                    ids!(image_box.image),
-                    MouseCursor::Default,
-                ),
+                (self.picture, "zoom out", ids!(zoom.less), MouseCursor::Hand),
+                (self.picture, "fit page", ids!(zoom.fit), MouseCursor::Hand),
+                (self.picture, "zoom in", ids!(zoom.more), MouseCursor::Hand),
                 (
                     self.pages > 0,
                     count.as_str(),
@@ -321,6 +345,10 @@ impl Widget for FileViewer {
 }
 
 impl FileViewerRef {
+    pub fn image_label(&self, cx: &mut Cx, label: String) {
+        if let Some(viewer) = self.borrow() { viewer.image(cx).label(label); }
+    }
+
     pub fn show(&self, cx: &mut Cx, preview: Preview) {
         if let Some(mut viewer) = self.borrow_mut() {
             viewer.show(cx, preview);
@@ -350,6 +378,14 @@ script_mod! {
             count := mod.widgets.SLabel { text: "" }
             next := mod.widgets.SBtn { text: "next page" }
         }
+        zoom := View {
+            visible: false, width: Fill, height: Fit
+            flow: Right, spacing: 10, align: Align{y: 0.5}
+            less := mod.widgets.SBtn { text: "−" }
+            level := mod.widgets.SLabel { text: "100%" }
+            more := mod.widgets.SBtn { text: "+" }
+            fit := mod.widgets.SBtn { text: "fit" }
+        }
         text_box := View {
             visible: false, width: Fill, height: Fill
             text := mod.widgets.SText { width: Fill, height: Fill, is_multiline: true }
@@ -357,7 +393,7 @@ script_mod! {
         image_box := View {
             visible: false, width: Fill, height: Fill
             align: Align{x: 0.5, y: 0.5}
-            image := mod.widgets.Image { width: Fill, height: Fill, fit: ImageFit.Smallest }
+            image := mod.widgets.ViewerImage {}
         }
         note := mod.widgets.SLabel { width: Fill, text: "", draw_text +: { color: #909090 } }
     }

@@ -4,6 +4,9 @@ use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::{RenderCache, RenderSettings};
 
+mod links;
+pub use links::{Link, Target};
+
 pub struct Document(Pdf);
 
 pub struct Page {
@@ -13,6 +16,7 @@ pub struct Page {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+    pub links: Vec<Link>,
 }
 
 impl Document {
@@ -42,11 +46,11 @@ impl Document {
         if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
             return Err("This PDF page has invalid dimensions".into());
         }
-        // Enough for a retina reading panel, with a strict pixel budget even
-        // for a poster-sized page. Keep only the current page's render cache.
-        let scale = (2048.0 / w.max(h)).min(2.0);
-        let width = (w * scale).ceil().clamp(1.0, 2048.0) as u16;
-        let height = (h * scale).ceil().clamp(1.0, 2048.0) as u16;
+        // Render enough detail for zooming without re-parsing or rasterizing
+        // during a gesture. Retain only one bitmap, at most 64 MiB.
+        let scale = (4096.0 / w.max(h)).min(4.0);
+        let width = (w * scale).ceil().clamp(1.0, 4096.0) as u16;
+        let height = (h * scale).ceil().clamp(1.0, 4096.0) as u16;
         let pixmap = hayro::render(
             page,
             &RenderCache::new(),
@@ -71,6 +75,7 @@ impl Document {
             width: width as usize,
             height: height as usize,
             pixels,
+            links: links::of(&self.0, page),
         })
     }
 }

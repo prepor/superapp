@@ -22,4 +22,14 @@ shot pdf-telegram
 click "previous page"
 wait 700
 click "page 1 of 2"
+click "zoom in"
+wait 300
+click "fit page"
+wait 300
+click "go to page 2"
+wait 700
+click "page 2 of 2"
+click "go to page 1"
+wait 700
+click "page 1 of 2"
 quit

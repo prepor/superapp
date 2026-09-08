@@ -62,6 +62,7 @@ use makepad_widgets::{ScriptValue, ScriptVm};
 /// components built on them. The binary calls this before any app's.
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     dsl::script_mod(vm);
+    widgets::viewer::canvas::script_mod(vm);
     widgets::viewer::script_mod(vm);
     widgets::dsl::script_mod(vm);
     widgets::media::script_mod(vm);

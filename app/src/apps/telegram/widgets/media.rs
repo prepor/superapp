@@ -350,20 +350,13 @@ impl ViewerPanel {
         let caption = self.view.label(cx, ids!(caption_lbl));
         caption.set_text(cx, &model::one_line(&message.text));
         caption.set_visible(cx, !message.text.trim().is_empty());
+        if let Some(md) = &message.media { viewer.image_label(cx, md.line(super::now(scope))); }
         let step = self.view.draw_walk(cx, scope, walk);
         let measure = viewer.measure();
         let changed = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
             .is_some_and(|panel| panel.measured(measure));
         if changed {
             if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
-        }
-        if let Some(md) = &message.media {
-            if self.view.widget(cx, ids!(file_view.image_box)).visible() {
-                let r = self.view.widget(cx, ids!(file_view.image_box.image)).area().rect(cx);
-                if r.size.x > 0.0 && r.size.y > 0.0 {
-                    props.hits.add(md.line(super::now(scope)), r, MouseCursor::Default, props.slot);
-                }
-            }
         }
         step
     }
