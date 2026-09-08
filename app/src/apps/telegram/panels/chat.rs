@@ -181,10 +181,6 @@ impl Chat {
         runtime::of(&self.store).play_on_open(self.peer, id);
     }
 
-    pub fn want_file(&self, remote_id: &str) {
-        runtime::of(&self.store).want_file(remote_id);
-    }
-
     /// Whether the transcript is still being filled from the wire — the
     /// history walk a chat starts as it opens, until its last page lands.
     #[must_use]
@@ -1374,20 +1370,8 @@ impl PanelKind for ChatKind {
         if let Some(last) = read_target {
             let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));
         }
-        // And fill the transcript's window from the wire: the newest page
-        // first, to close whatever gap an absence left, then — the worker
-        // walking on from each answer — the pages before the oldest line held,
-        // until the window holds its ten thousand. This only starts the walk.
-        // The account holder's own store asks; a fixture's would be putting a
-        // real chat's history on the engine's queue for a scene.
-        #[cfg(feature = "tdlib")]
-        if super::super::Telegram::engine_store(store.dir()) {
-            if topic == 0 {
-                runtime::of(&store).want_history(peer);
-            } else {
-                runtime::of(&store).want_topic_history(peer, topic);
-            }
-        }
+        // The widget requests history only after its viewport settles. Merely
+        // traversing this chat, or restoring a hidden panel, needs no refresh.
         // Opened at a line — from a messages list — the cursor starts on
         // it; from a row of the chat list, nowhere.
         Box::new(Chat {

@@ -25,8 +25,6 @@
 //! the way a finger does. So are the play buttons and the pictures inside
 //! them.
 
-use std::collections::HashSet;
-
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, Tag};
 use kernel::session::Session;
@@ -139,12 +137,6 @@ pub struct ChatPanel {
     /// undone by the focus its own click brought.
     #[rust]
     had_focus: bool,
-    /// The lines whose pictures have been asked for. A photo is fetched as
-    /// its line arrives, but only for the newest forty of a chat as it
-    /// opens, and the cache evicts what it must — so a row drawn without
-    /// its bytes asks for them, once, however often it is drawn.
-    #[rust]
-    wanted: HashSet<MsgId>,
     /// A caret asked for and not yet landed: the field is re-asked every
     /// event and frame until it has the keyboard, since a focus set inside
     /// the press that asked is undone by that press's own default.
@@ -722,7 +714,7 @@ impl Widget for ChatPanel {
                     &render,
                 );
                 if let Some(m) = r.msg() {
-                    self.want_picture(cx, &props, m, &render);
+                    self.want_picture(cx, m, &render);
                 }
                 row.draw_all(cx, scope);
                 drawn.push((idx, row, player));
@@ -776,9 +768,12 @@ impl Widget for ChatPanel {
             }
         }
         if let Some(s) = scope.data.get_mut::<Session>() {
-            if let Some(chat) = with_chat(&props, |c| c.peer()) {
-                if self.background || !super::message_panel_visible(s, props.slot) { visible_ids.clear(); }
-                super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, visible_ids);
+            if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
+                if self.background || !super::message_panel_visible(s, props.slot) {
+                    self.viewed = None;
+                } else {
+                    super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, Some(topic), visible_ids);
+                }
             }
         }
         for (label, path, cursor) in [
@@ -992,12 +987,13 @@ impl ChatPanel {
     /// evicts what it must, so a line further up may have no bytes on this
     /// device at all and no way to draw any. The row keeps the file's
     /// durable remote id for exactly this: the worker turns it into a
-    /// download on its next pass ([`super::super::runtime::Runtime::want_file`]), the bytes land under
+    /// download on its next pass ([`super::super::runtime::want_view_file`]), the bytes land under
     /// the key the row already names, and the next draw finds them. Once per
-    /// line, since a row without its picture is drawn again every frame; and
+    /// viewport, since a row without its picture is drawn again every frame; and
     /// only for what is drawn as a picture — a file's or a sticker's bytes
     /// are the opener's to ask for, not the transcript's.
-    fn want_picture(&mut self, cx: &mut Cx, props: &PanelProps, m: &Msg, render: &RenderContext) {
+    fn want_picture(&self, cx: &mut Cx, m: &Msg, render: &RenderContext) {
+        if !super::super::runtime::view_settled(&self.viewed, render.now) { return; }
         let Some(md) = m.media.as_ref() else { return };
         if !matches!(md.kind.as_str(), "photo" | "video" | "circle") {
             return;
@@ -1005,14 +1001,13 @@ impl ChatPanel {
         let (Some(reference), Some(rid)) = (md.reference.as_deref(), md.rid.as_deref()) else {
             return;
         };
-        if !reference.starts_with("tg:") || self.wanted.contains(&m.id) {
+        if !reference.starts_with("tg:") {
             return;
         }
         // The picture worker reports cache misses; no filesystem stat is
         // needed in this row loop, including while the decode is pending.
         if !super::pictures::missing(cx, md, render.store_dir.as_deref()) { return; }
-        self.wanted.insert(m.id);
-        with_chat(props, |c| c.want_file(rid));
+        super::super::runtime::want_view_file(&self.viewed, rid);
     }
 
     /// The message whose rectangle the shell's hit is, by the rectangles

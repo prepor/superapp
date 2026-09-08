@@ -29,7 +29,7 @@ fn settled_viewports_skip_message_reads_but_an_added_reaction_refreshes_promptly
         message["id"] = json!(id);
         acc.on_update(&w, &message.to_string());
     }
-    let _view = runtime::of(w.store()).watch_messages(7, ids.clone());
+    let _view = watch_messages(&w, 7, ids.clone());
     acc.sync_counts(&w);
     let sent = td.sent().len();
     // Live updates settle every row, including the initial read on the wire.
@@ -181,7 +181,7 @@ fn a_confirmed_removal_survives_stale_snapshots_and_worker_replacement() {
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let view = watch_messages(&w, 7, vec![42]);
     push(&acc, &w, None);
     assert_eq!(counts(&w).as_deref(), Some("👍 8"));
     confirm_empty(&acc, &td, &w, post());
@@ -207,7 +207,7 @@ fn an_initially_empty_metadata_cache_retries_without_hiding_counts() {
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let search = last_request(&td, "searchChatMessages");
     server_reply(&acc, &w, &search, post());
@@ -236,7 +236,7 @@ fn late_empty_confirmations_cannot_erase_a_newer_update() {
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let search = last_request(&td, "searchChatMessages");
     server_reply(&acc, &w, &search, post());
@@ -257,7 +257,7 @@ fn a_quiet_view_repairs_missed_push_updates_without_expiring_its_counts() {
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let first = last_request(&td, "searchChatMessages");
     let message = |count| {
@@ -289,7 +289,7 @@ fn a_metadata_change_invalidates_an_in_flight_removal_check() {
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let old = last_request(&td, "searchChatMessages");
     push(&acc, &w, None);
@@ -309,7 +309,7 @@ fn failed_missing_and_timed_out_reads_preserve_counts_and_ignore_late_replies() 
     let acc = account(td.clone(), None);
     acc.on_update(&w, &post().to_string());
     push(&acc, &w, Some(8));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let first = last_request(&td, "searchChatMessages");
     acc.on_update(&w, &json!({"@type": "error", "@extra": first["@extra"], "code": 429,

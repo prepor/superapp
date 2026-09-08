@@ -6,7 +6,7 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
 use kernel::effect::World;
@@ -41,19 +41,48 @@ pub enum ReactionResult {
 
 pub type ReactionReply = Arc<Mutex<Option<ReactionResult>>>;
 
-/// A widget owns its visible messages; dropping it releases the subscription.
-type ViewedMessages = Mutex<(PeerId, Vec<MsgId>)>;
-pub type MessageView = Arc<ViewedMessages>;
+/// Cached panels draw immediately; automatic network reads wait until a
+/// viewport survives a brief arrow-key preview.
+pub const VIEW_SETTLE: f64 = 0.35;
 
-pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, ids: Vec<MsgId>) {
-    if ids.is_empty() || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
+/// A widget owns its viewport; dropping it cancels work that has not started.
+pub struct Viewport {
+    chat: PeerId,
+    topic: Option<i64>,
+    pub(super) ids: Vec<MsgId>,
+    ready_at: f64,
+    files: HashMap<String, bool>,
+}
+
+pub type MessageView = Arc<Mutex<Viewport>>;
+
+pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, topic: Option<i64>, ids: Vec<MsgId>) {
+    if (ids.is_empty() && topic.is_none()) || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
         *view = None;
         return;
     }
     if let Some(view) = view {
-        *view.lock().expect("visible messages") = (chat, ids);
+        let mut view = view.lock().expect("visible messages");
+        if (view.chat, view.topic) != (chat, topic) {
+            view.ready_at = world.now() + VIEW_SETTLE;
+            view.files.clear();
+        }
+        view.chat = chat;
+        view.topic = topic;
+        view.ids = ids;
     } else {
-        *view = Some(of(world.store()).watch_messages(chat, ids));
+        *view = Some(of(world.store()).watch_messages(chat, topic, ids, world.now()));
+    }
+}
+
+pub fn view_settled(view: &Option<MessageView>, now: f64) -> bool {
+    view.as_ref().is_some_and(|view| now >= view.lock().expect("visible messages").ready_at)
+}
+
+pub fn want_view_file(view: &Option<MessageView>, remote_id: &str) {
+    if let Some(view) = view {
+        let mut view = view.lock().expect("visible messages");
+        if !view.files.contains_key(remote_id) { view.files.insert(remote_id.to_string(), false); }
     }
 }
 
@@ -85,7 +114,7 @@ struct State {
     demo_reactions: HashSet<(PeerId, MsgId, String)>,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
-    views: Vec<Weak<ViewedMessages>>,
+    views: Vec<Weak<Mutex<Viewport>>>,
 }
 
 impl State {
@@ -156,20 +185,22 @@ impl Runtime {
         self.state.lock().expect("Telegram runtime")
     }
 
-    pub fn watch_messages(&self, chat: PeerId, ids: Vec<MsgId>) -> MessageView {
-        let view = Arc::new(Mutex::new((chat, ids)));
-        self.state().views.push(Arc::downgrade(&view));
+    pub fn watch_messages(&self, chat: PeerId, topic: Option<i64>, ids: Vec<MsgId>, now: f64) -> MessageView {
+        let view = Arc::new(Mutex::new(Viewport { chat, topic, ids, ready_at: now + VIEW_SETTLE, files: HashMap::new() }));
+        let mut state = self.state();
+        state.views.retain(|view| view.strong_count() > 0);
+        state.views.push(Arc::downgrade(&view));
         view
     }
 
     /// Combine duplicate panels before the worker subscribes to a chat.
-    pub fn visible_messages(&self) -> BTreeMap<PeerId, Vec<MsgId>> {
+    pub fn visible_messages(&self, now: f64) -> BTreeMap<PeerId, Vec<MsgId>> {
         let mut out: BTreeMap<PeerId, Vec<MsgId>> = BTreeMap::new();
         self.state().views.retain(|view| {
             let Some(view) = view.upgrade() else { return false };
             let view = view.lock().expect("visible messages");
-            if !view.1.is_empty() {
-                out.entry(view.0).or_default().extend(&view.1);
+            if now >= view.ready_at && !view.ids.is_empty() {
+                out.entry(view.chat).or_default().extend(&view.ids);
             }
             true
         });
@@ -177,6 +208,39 @@ impl Runtime {
             ids.sort_unstable();
             ids.dedup();
         }
+        out
+    }
+
+    /// Empty transcripts need history too. Line cards subscribe to messages
+    /// without starting a walk of the whole conversation.
+    pub fn visible_history(&self, now: f64) -> BTreeSet<(PeerId, i64)> {
+        let mut out = BTreeSet::new();
+        self.state().views.retain(|view| {
+            let Some(view) = view.upgrade() else { return false };
+            let view = view.lock().expect("visible messages");
+            if now >= view.ready_at {
+                if let Some(topic) = view.topic { out.insert((view.chat, topic)); }
+            }
+            true
+        });
+        out
+    }
+
+    /// Automatic thumbnails belong to their viewport, unlike an explicit
+    /// download command. Drop pending files when that viewport goes away.
+    pub fn take_view_files(&self, now: f64) -> Vec<String> {
+        let mut out = Vec::new();
+        self.state().views.retain(|view| {
+            let Some(view) = view.upgrade() else { return false };
+            let mut view = view.lock().expect("visible messages");
+            if now >= view.ready_at {
+                for (rid, sent) in &mut view.files {
+                    if !*sent { push_unique(&mut out, rid.clone()); }
+                    *sent = true;
+                }
+            }
+            true
+        });
         out
     }
 
@@ -403,14 +467,14 @@ impl Runtime {
         self.state().downloads.get(reference).copied()
     }
 
-    #[cfg(any(feature = "tdlib", test))]
+    #[cfg(test)]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
         push_unique(&mut state.loading, (chat, 0));
         push_unique(&mut state.wanted.chats, chat);
     }
 
-    #[cfg(any(feature = "tdlib", test))]
+    #[cfg(test)]
     pub fn want_topic_history(&self, chat: PeerId, topic: i64) {
         let mut state = self.state();
         push_unique(&mut state.loading, (chat, topic));

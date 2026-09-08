@@ -137,7 +137,7 @@ impl Widget for LinePanel {
             } else {
                 Vec::new()
             };
-            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, ids);
+            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, None, ids);
         }
         let v = &self.view;
         v.label(cx, ids!(gone_lbl)).set_visible(cx, false);

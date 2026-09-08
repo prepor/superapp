@@ -13,6 +13,13 @@ use std::rc::Rc;
 mod topics_tests;
 mod reaction_state_tests;
 mod startup_tests;
+mod navigation_tests;
+
+/// Protocol tests below start with an already settled viewport. Navigation
+/// tests register at the current clock and exercise the delay itself.
+fn watch_messages(w: &World, chat: i64, ids: Vec<i64>) -> runtime::MessageView {
+    runtime::of(w.store()).watch_messages(chat, None, ids, w.now() - runtime::VIEW_SETTLE)
+}
 
 /// A world over a fresh telegram store — the schema only, no demo seed —
 /// with a fake api_hash planted where the parameters step reads it, so no
@@ -63,7 +70,7 @@ fn watching_messages_enables_tdlibs_reaction_polling_until_the_last_view_closes(
     let w = world();
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let view = watch_messages(&w, 7, vec![42]);
     runtime::of(w.store()).set_list_syncing(true);
     acc.drain(&w);
     let online = last_request(&td, "setOption");
@@ -82,7 +89,7 @@ fn failed_visible_fetches_retry_without_scrolling_and_retire_timed_out_answers()
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let first = last_request(&td, "getMessages");
     acc.on_update(&w, &json!({"@type": "error", "@extra": first["@extra"],
@@ -117,7 +124,7 @@ fn reaction_metadata_refreshes_visible_rows_and_snapshots_do_not_undo_live_count
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let first = last_request(&td, "getMessages");
     let message = json!({"chat_id": 7, "id": 42,
@@ -174,7 +181,7 @@ fn missing_visible_messages_retry_and_reopening_reconciles_counts_removed_while_
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let first = last_request(&td, "getMessages");
     acc.on_update(&w, &json!({"@type": "messages", "@extra": first["@extra"], "messages": [null]}).to_string());
@@ -192,7 +199,7 @@ fn missing_visible_messages_retry_and_reopening_reconciles_counts_removed_while_
     let old_fetch = last_request(&td, "getMessage");
     drop(view);
     acc.drain(&w);
-    let _reopened = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _reopened = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     let reopened = last_request(&td, "getMessages");
     assert_ne!(second["@extra"], reopened["@extra"]);
@@ -216,9 +223,8 @@ fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
     let w = world();
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let runtime = runtime::of(w.store());
-    let chat = runtime.watch_messages(-1005, vec![4200, 4300]);
-    let card = runtime.watch_messages(-1005, vec![4300]);
+    let chat = watch_messages(&w, -1005, vec![4200, 4300]);
+    let card = watch_messages(&w, -1005, vec![4300]);
     acc.drain(&w);
     assert_eq!(td.sent_types(), vec!["setOption", "openChat", "getMessages"]);
     let request = last_request(&td, "getMessages");
@@ -252,7 +258,7 @@ fn visible_messages_refresh_counts_and_share_the_chat_subscription() {
     let n = td.sent().len();
     acc.drain(&w);
     assert_eq!(td.sent().len(), n, "a quiet viewport does not refetch every pass");
-    *chat.lock().unwrap() = (-1005, vec![4300, 4400]);
+    chat.lock().unwrap().ids = vec![4300, 4400];
     acc.drain(&w);
     let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     assert_eq!(request["message_ids"], json!([4400]), "only newly visible rows are fetched");
@@ -274,7 +280,7 @@ fn visible_messages_are_replayed_after_sign_in_and_isolated_between_accounts() {
     let b = world();
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let view = runtime::of(a.store()).watch_messages(7, vec![42]);
+    let view = watch_messages(&a, 7, vec![42]);
     let td_b = FakeTd::new();
     let acc_b = account(td_b.clone(), None);
     acc_b.drain(&b);
@@ -2309,7 +2315,7 @@ fn a_chats_later_updates_land_the_title_the_mention_and_the_counts() {
     );
     assert_eq!(gathered(&w), (None, None, Some("👍 3".into())), "null metadata awaits confirmation");
     assert!(td.sent().is_empty());
-    let _view = runtime::of(w.store()).watch_messages(-1006, vec![4300]);
+    let _view = watch_messages(&w, -1006, vec![4300]);
     reaction_state_tests::confirm_empty(&acc, &td, &w, json!({"chat_id": -1006, "id": 4300}));
     assert_eq!(gathered(&w), (None, None, None), "the confirmed last removal clears it");
 }
