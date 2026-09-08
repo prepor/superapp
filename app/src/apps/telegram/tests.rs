@@ -28,6 +28,7 @@ static APPS: &[&dyn App] = &[&TELEGRAM];
 
 mod filter_tests;
 mod topics_tests;
+mod tools;
 
 fn session() -> Session {
     Session::fake(APPS)

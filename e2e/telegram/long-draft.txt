@@ -1,0 +1,29 @@
+# args: --demo-disk
+# env:
+# A multiline draft must leave the transcript and composer reachable.
+# The same field is populated by typing, SQL and the agent's draft tool.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 700
+key cmd+right
+wait 500
+paste "A long draft\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\nline 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nline 30\nline 31\nline 32\nline 33\nline 34\nline 35\nline 36\nline 37\nline 38\nline 39\nlast line"
+wait 700
+click "Max Ivanov: voice 0:42"
+click "write a message"
+wait 300
+key enter
+wait 500
+click "write a message"
+type "Another message still works"
+wait 300
+key enter
+wait 500
+click "write a message"
+quit

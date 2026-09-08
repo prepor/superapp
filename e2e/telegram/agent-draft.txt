@@ -1,0 +1,46 @@
+# args: --demo-disk
+# env:
+# The fake agent calls telegram.draft with a long message for stelaxis.
+# It must reach an already mounted composer and leave it usable.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 700
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "telegram draft"
+wait 400
+key enter
+wait 900
+click "reply to me: the muted grey is too light on the fold"
+wait 300
+click "Max Ivanov: voice 0:42"
+wait 300
+click "write a message"
+wait 300
+# The field contains the tool's text, so this invokes the demo send.
+key enter
+wait 500
+key up
+wait 300
+click "editing: the muted grey is too light on the fold"
+wait 300
+key esc
+wait 300
+click "write a message"
+wait 300
+type "The composer still works"
+wait 300
+key enter
+wait 500
+click "write a message"
+quit
