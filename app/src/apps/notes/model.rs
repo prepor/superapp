@@ -4,7 +4,7 @@ use kernel::history::Intent;
 use kernel::richtable::{Dir, SqlSource, SqlSpec};
 use kernel::session::{Action, Session};
 use kernel::store::{Store, Val, Q};
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::rc::Rc;
 
 pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -71,11 +71,15 @@ pub fn title(body: &str) -> String {
 }
 
 pub fn create(s: &mut Session) -> Option<i64> {
+    create_with_body(s, String::new())
+}
+
+pub fn create_with_body(s: &mut Session, body: String) -> Option<i64> {
     let now = s.now();
     let id = s.act(Action::writing("notes.new", "new note", move |c| {
         c.execute(
-            "INSERT INTO notes_note(created,modified) VALUES(?1,?1)",
-            [now],
+            "INSERT INTO notes_note(title,body,created,modified) VALUES(?1,?2,?3,?3)",
+            params![title(&body), body, now],
         )?;
         Ok(c.last_insert_rowid())
     }))?;
@@ -89,17 +93,48 @@ pub fn create(s: &mut Session) -> Option<i64> {
 
 pub fn edit(store: &Store, id: i64, body: String, now: f64) -> Result<(), String> {
     store
-        .write(move |c| {
-            let changed = c.execute(
-                "UPDATE notes_note SET title=?1,body=?2,modified=?3 WHERE id=?4 AND deleted=0",
-                params![title(&body), body, now, id],
-            )?;
-            if changed == 0 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-            Ok(())
-        })
+        .write(move |c| put_note(c, id, &NoteText::new(body, now)))
         .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct NoteText {
+    pub title: String,
+    pub body: String,
+    pub modified: f64,
+}
+impl NoteText {
+    pub fn new(body: String, modified: f64) -> Self {
+        Self {
+            title: title(&body),
+            body,
+            modified,
+        }
+    }
+}
+pub fn note_text(c: &Connection, id: i64) -> rusqlite::Result<Option<NoteText>> {
+    c.query_row(
+        "SELECT title,body,modified FROM notes_note WHERE id=? AND deleted=0",
+        [id],
+        |r| {
+            Ok(NoteText {
+                title: r.get(0)?,
+                body: r.get(1)?,
+                modified: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+pub fn put_note(c: &Connection, id: i64, note: &NoteText) -> rusqlite::Result<()> {
+    let changed = c.execute(
+        "UPDATE notes_note SET title=?1,body=?2,modified=?3 WHERE id=?4 AND deleted=0",
+        params![note.title, note.body, note.modified, id],
+    )?;
+    if changed == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
 }
 
 pub fn delete(s: &mut Session, ids: Vec<i64>) -> bool {
@@ -161,7 +196,7 @@ impl Intent for Deleted {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Draft {
     pub original: String,
     pub body: String,
@@ -184,16 +219,53 @@ pub fn draft_source(store: &Store, path: &str) -> Rc<Vec<Draft>> {
 }
 
 pub fn save_draft(store: &Store, path: String, draft: Draft, now: f64) -> Result<(), String> {
-    store.write(move |c| {
-        if draft.body == draft.original {
-            c.execute("DELETE FROM notes_draft WHERE path=?", [path])?;
-        } else {
-            c.execute("INSERT INTO notes_draft(path,original,body,modified) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(path) DO UPDATE SET original=excluded.original,body=excluded.body,modified=excluded.modified",
-                params![path,draft.original,draft.body,now])?;
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())
+    store
+        .write(move |c| {
+            put_draft(
+                c,
+                &path,
+                (draft.body != draft.original).then_some(&draft),
+                now,
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct StoredDraft {
+    pub text: Draft,
+    pub modified: f64,
+}
+pub fn stored_draft(c: &Connection, path: &str) -> rusqlite::Result<Option<StoredDraft>> {
+    c.query_row(
+        "SELECT original,body,modified FROM notes_draft WHERE path=?",
+        [path],
+        |r| {
+            Ok(StoredDraft {
+                text: Draft {
+                    original: r.get(0)?,
+                    body: r.get(1)?,
+                },
+                modified: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+pub fn put_draft(
+    c: &Connection,
+    path: &str,
+    draft: Option<&Draft>,
+    now: f64,
+) -> rusqlite::Result<()> {
+    if let Some(draft) = draft {
+        c.execute("INSERT INTO notes_draft(path,original,body,modified) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(path) DO UPDATE SET original=excluded.original,body=excluded.body,modified=excluded.modified",
+            params![path,draft.original,draft.body,now])?;
+    } else {
+        c.execute("DELETE FROM notes_draft WHERE path=?", [path])?;
+    }
+    Ok(())
 }
 
 /// Bounded, complete UTF-8 reads. A preview must never become a truncated edit.

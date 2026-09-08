@@ -7,9 +7,11 @@ use std::any::Any;
 mod file_text;
 mod markdown;
 mod model;
+mod ops;
 mod panels;
 #[cfg(test)]
 mod tests;
+mod tools;
 mod ui;
 mod widgets;
 
@@ -65,7 +67,10 @@ impl App for Notes {
         )]
     }
     fn describe(&self) -> Option<&'static str> {
-        Some("notes_note: plain Markdown notes, independent of files. The first nonempty line supplies the title. Typing autosaves body and modified; deleted=1 retains a note for undo. notes_draft: unsaved file edits keyed by path, with the original bytes as UTF-8 text for conflict detection. Only the editor's explicit save writes a file. Never update a draft's original to bypass a conflict.")
+        Some("notes_note: plain Markdown notes, independent of files. The first nonempty line supplies the title; deleted=1 retains a note for undo. Discover notes and drafts with sql.query; prefer notes.create/read/update and notes.read_draft/create_draft/update_draft for their contents. Read every body page at the same revision before replacing text. These tools derive titles, retain file originals and support undo. File tool bodies use LF without a BOM; the original BOM and individual line endings are preserved internally. notes_draft contains unsaved file edits keyed by path. Only the editor's explicit Save writes a draft to disk. Never update a draft's original to bypass a conflict.")
+    }
+    fn tools(&self) -> Vec<kernel::tool::Tool> {
+        tools::all()
     }
     fn as_any(&self) -> &dyn Any {
         self
