@@ -186,15 +186,15 @@ stopped`.
 
 ## The gateway
 
-The model is `@cf/zai-org/glm-5.3-flash`, one of the models Cloudflare hosts
-itself, which the gateway reaches as one more provider, `workers-ai`. It is a
-`const` in the app, with the reasoning effort — `medium` — beside it; changing
-either is a commit, not a setting. A chat's row records the model it ran on, so
-a chat that predates a change still says what answered it.
+The chat's **model** button (`cmd+m`) offers **GLM**, **Sol**, and **Astra**.
+GLM (`@cf/zai-org/glm-5.3-flash`) remains the default for new chats. Sol uses
+`gpt-5.6-sol`; Astra uses `gpt-6-astra`. All use `medium` reasoning effort.
+The first send saves a blank chat's choice. Later changes update the chat row
+and can be undone; reopening the chat, retrying, and continuing use the saved
+model. Switching is available between runs so all the requests in a tool
+round use the same model.
 
-Requests speak the **OpenAI-compatible chat-completions API**, the one shape
-Workers AI and every provider behind the gateway share, streamed as
-server-sent events:
+GLM uses Workers AI's **chat-completions API**, streamed as server-sent events:
 
 ```
 POST https://gateway.ai.cloudflare.com/v1/{account}/superapp/workers-ai/v1/chat/completions
@@ -203,13 +203,24 @@ cf-aig-authorization: Bearer {the same token}
 cf-aig-collect-log-payload: false
 ```
 
-One token opens both doors: it is the provider's key and the gateway's at once,
-so there is nothing to store in the gateway and nothing to alias. Where the
-requests go is one `Provider` const — the path, the model, the reasoning
-effort; a second route, or another provider on the same wire, is a second const
-behind the same capability rather than a second module. The gateway itself is
-used for what it is good at — logs, analytics, rate limits, retries — and all
-of that is set up in its dashboard, not here.
+For Workers AI, one Cloudflare token opens both doors. Sol and Astra use the
+same gateway's `/openai/responses` route with only `cf-aig-authorization`.
+AI Gateway supplies the OpenAI key saved under its default provider-key alias;
+the app sends no provider `authorization` header, which would override that
+stored key. See [Cloudflare's BYOK documentation](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/).
+
+OpenAI uses Responses because [Astra's tool calling requires it](https://developers.openai.com/api/docs/guides/latest-model).
+The adapter streams text into the same live tail, translates function calls
+and their results, and keeps usage and failure reasons. Dotted app tool names
+are reversibly escaped for OpenAI's function-name syntax. Each request sets
+`store: false` and replays the local transcript. Completed Responses output is
+kept on the turn, including encrypted reasoning and assistant message phases,
+and replayed intact to the same model. A different model receives the visible
+messages and tool results without the previous model's opaque reasoning.
+
+The gateway's logs, analytics, rate limits, and retries are configured in its
+dashboard. Provider routing is resolved from the chat's saved model for every
+request; older Workers AI model ids continue to use their original route.
 
 `cf-aig-collect-log-payload: false` is the app's own policy: a chat carries the
 person's mail, and the gateway keeps counts and status, not prose.
@@ -217,11 +228,10 @@ person's mail, and the gateway keeps counts and status, not prose.
 setting decide. That is the app's one environment knob, read by itself, because
 argv belongs to the shell.
 
-Not the Anthropic Messages API and none of its extras: the model is not
-Anthropic's, and the chat-completions shape carries what this needs — tools as
+The common transcript still uses the chat-completions vocabulary: tools as
 `function` definitions, `tool_calls` on the agent's message, a `tool` message
-per result, `finish_reason`, `usage` on the last chunk, and the model's
-reasoning as `reasoning_content` where it sends any.
+per result, `finish_reason`, `usage`, and `reasoning_content` where supplied.
+The Responses adapter keeps this vocabulary independent of the provider.
 
 ### One Cloudflare token, shared with R2
 
@@ -557,7 +567,9 @@ written in. Then **allow** (no letter) and **refuse** (`cmd+f`) while a call is
 [waiting for a word](#the-gate-what-asks-first) — the same two the card wears,
 because the bar is where a panel's verbs live and a card is not always in
 view. Then **add panel** (`cmd+p`), which is always there because it is the
-phone's way into context and harmless where the chord exists. Nothing on
+phone's way into context and harmless where the chord exists. When no round
+is running, **model: GLM/Sol/Astra** (`cmd+m`) opens the model choices in the
+bar; a choice or **cancel** returns to the usual actions. Nothing on
 the bar leaves the conversation: a fresh chat and the list of them belong to
 the agents list, which the launcher opens.
 

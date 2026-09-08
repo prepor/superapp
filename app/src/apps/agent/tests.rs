@@ -14,7 +14,9 @@ use super::wire::{
     Assembler, ChatRequest, Chunk, Completion, Finish, FunctionCall, Message, Role, ToolCall,
     ToolDef, Usage,
 };
-use super::{FakeGateway, Gateway, AGENT, GATEWAY, MODEL, PROVIDER, REASONING_EFFORT};
+use super::{
+    FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER, REASONING_EFFORT,
+};
 
 static APPS: &[&dyn App] = &[&AGENT];
 
@@ -298,7 +300,7 @@ fn stop_cuts_the_stream_at_its_next_chunk() {
 
 fn parts(log_payload: bool) -> Parts {
     let mut req = ChatRequest::new(MODEL, vec![Message::user("what is in my inbox?")]);
-    req.reasoning_effort = Some(PROVIDER.reasoning_effort.to_string());
+    req.reasoning_effort = Some(REASONING_EFFORT.to_string());
     req.tools = vec![ToolDef::from(&look())];
     request_parts_with(&PROVIDER, "acc0unt", GATEWAY, "t0ken", &req, log_payload)
 }
@@ -325,12 +327,53 @@ fn one_token_opens_the_provider_and_the_gateway_at_once() {
     );
 }
 
+#[test]
+fn openai_models_use_the_stored_gateway_key_and_responses_route() {
+    for model in &MODELS[1..] {
+        let provider = Provider::for_model(model.id).expect("a supported model");
+        let mut req = ChatRequest::new(model.id, vec![Message::user("hello")]);
+        req.reasoning_effort = Some(REASONING_EFFORT.to_string());
+        req.tools = vec![ToolDef::from(&look())];
+        let parts = request_parts_with(&provider, "account", GATEWAY, "cf-token", &req, false);
+        assert_eq!(
+            parts.url,
+            "https://gateway.ai.cloudflare.com/v1/account/superapp/openai/responses"
+        );
+        assert!(parts
+            .headers
+            .contains(&("cf-aig-authorization", "Bearer cf-token".into())));
+        assert!(parts
+            .headers
+            .contains(&("cf-aig-collect-log-payload", "false".into())));
+        assert!(
+            !parts
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "authorization"),
+            "a provider header would override the OpenAI key saved in AI Gateway"
+        );
+        let body: Value = serde_json::from_slice(&parts.body).expect("JSON");
+        assert_eq!(body["model"], model.id);
+        assert_eq!(body["reasoning"]["effort"], REASONING_EFFORT);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["tools"][0]["name"], "test_2elook");
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert!(body.get("messages").is_none());
+    }
+    assert_eq!(Provider::for_model(MODEL).unwrap(), Provider::WorkersAi);
+    assert_eq!(
+        Provider::for_model("@cf/older/model").unwrap(),
+        Provider::WorkersAi
+    );
+    assert!(Provider::for_model("unrecognized-model").is_err());
+}
+
 /// The knob is the one thing about a request the environment gets a say
 /// in, so what it says is what the two spellings must agree on.
 #[test]
 fn the_policy_is_the_apps_and_the_environment_only_turns_it_off() {
     let mut req = ChatRequest::new(MODEL, vec![Message::user("what is in my inbox?")]);
-    req.reasoning_effort = Some(PROVIDER.reasoning_effort.to_string());
+    req.reasoning_effort = Some(REASONING_EFFORT.to_string());
     let knob = std::env::var("SUPERAPP_AGENT_LOG_PAYLOAD").is_ok_and(|v| v.trim() == "1");
     assert_eq!(
         request_parts(&PROVIDER, "acc0unt", GATEWAY, "t0ken", &req),
@@ -786,6 +829,115 @@ fn send_new(s: &mut Session, text: &str) -> ChatId {
     chat
 }
 
+#[test]
+fn the_switcher_keeps_the_draft_and_saves_the_model_for_later_rounds() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::new_id());
+    with_chat(&s, slot, |c| c.set_draft("hello"));
+    verb(&mut s, slot, "agent.model");
+    assert_eq!(
+        verb_ids(&s, slot),
+        vec![
+            "agent.model.glm",
+            "agent.model.sol",
+            "agent.model.astra",
+            "agent.model.cancel",
+        ]
+    );
+    verb(&mut s, slot, "agent.model.sol");
+    assert_eq!(with_chat(&s, slot, |c| c.draft().to_string()), "hello");
+    assert_eq!(
+        with_chat(&s, slot, |c| c.chat()),
+        None,
+        "a choice alone makes no row"
+    );
+    verb(&mut s, slot, "agent.send");
+    let chat = with_chat(&s, slot, |c| c.chat().unwrap());
+    assert_eq!(model::chat(s.store(), chat).unwrap().model, "gpt-5.6-sol");
+    assert_eq!(fake(&s).requests().last().unwrap().model, "gpt-5.6-sol");
+
+    // Another panel reads the choice from the row, including changes made
+    // elsewhere and by history walks.
+    let reopened = open_root(&mut s, Chat::id(chat));
+    assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-5.6-sol");
+    let before = transcript(&s, chat);
+    verb(&mut s, reopened, "agent.model");
+    verb(&mut s, reopened, "agent.model.astra");
+    assert_eq!(transcript(&s, chat), before);
+    assert!(s.undo());
+    assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-5.6-sol");
+    assert!(s.redo());
+    assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-6-astra");
+    with_chat(&s, reopened, |c| c.set_draft("again"));
+    verb(&mut s, reopened, "agent.send");
+    let req = fake(&s).requests().last().unwrap().clone();
+    assert_eq!(req.model, "gpt-6-astra");
+    assert!(req.messages.iter().any(|m| m.text() == "hello"));
+
+    verb(&mut s, reopened, "agent.model");
+    verb(&mut s, reopened, "agent.model.cancel");
+    assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-6-astra");
+    verb(&mut s, reopened, "agent.model");
+    verb(&mut s, reopened, "agent.model.glm");
+    with_chat(&s, reopened, |c| c.set_draft("back to GLM"));
+    verb(&mut s, reopened, "agent.send");
+    assert_eq!(fake(&s).requests().last().unwrap().model, MODEL);
+}
+
+#[test]
+fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    assert!(!model::set_model(&mut s, chat, "unknown"));
+    let run = model::latest_run(s.store(), chat).unwrap().id;
+    let slot = open_root(&mut s, Chat::id(chat));
+    for status in model::LIVE {
+        s.store()
+            .write(move |db| {
+                db.execute(
+                    "UPDATE agent_run SET status = ?2 WHERE id = ?1",
+                    rusqlite::params![run, status],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        assert!(!model::set_model(&mut s, chat, "gpt-5.6-sol"), "{status}");
+        assert!(!verb_ids(&s, slot).contains(&"agent.model"));
+        assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
+    }
+    s.store()
+        .write(move |db| {
+            db.execute("UPDATE agent_run SET status = 'done' WHERE id = ?1", [run])
+                .map(|_| ())
+        })
+        .unwrap();
+    s.store().set_writable(false);
+    assert!(!model::set_model(&mut s, chat, "gpt-6-astra"));
+    assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
+}
+
+#[test]
+fn retry_and_continue_use_the_chats_selected_model() {
+    let mut s = session();
+    plant(
+        &s,
+        vec![Reply::always(Answer::Fail("try another model".into()))],
+    );
+    let chat = send_new(&mut s, "hello");
+    assert!(model::set_model(&mut s, chat, "gpt-5.6-sol"));
+    plant(
+        &s,
+        vec![Reply::always(Answer::Cut("half an answer".into()))],
+    );
+    model::retry(&mut s, chat).unwrap();
+    s.settle();
+    assert_eq!(fake(&s).requests().last().unwrap().model, "gpt-5.6-sol");
+    assert!(model::set_model(&mut s, chat, "gpt-6-astra"));
+    let slot = open_root(&mut s, Chat::id(chat));
+    verb(&mut s, slot, "agent.continue");
+    assert_eq!(fake(&s).requests().last().unwrap().model, "gpt-6-astra");
+}
+
 /// The call standing at its card waiting for the person, if this chat's
 /// newest round has one.
 fn asked_call(s: &Session, chat: ChatId) -> Option<model::Call> {
@@ -1182,14 +1334,14 @@ fn the_chat_panel_names_its_conversation_and_wears_its_bar() {
     );
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.add_panel"],
+        vec!["agent.add_panel", "agent.model"],
         "nothing to send and nothing going; a panel is always there to add"
     );
 
     with_chat(&s, blank, |c| c.set_draft("hello"));
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.send", "agent.add_panel"]
+        vec!["agent.send", "agent.add_panel", "agent.model"]
     );
 
     verb(&mut s, blank, "agent.send");
@@ -1276,7 +1428,7 @@ fn stop_ends_the_run_and_the_bar_offers_retry() {
     let slot = open_root(&mut s, Chat::id(chat));
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.retry", "agent.add_panel"],
+        vec!["agent.retry", "agent.add_panel", "agent.model"],
         "a round that was stopped is one to ask again"
     );
 }
@@ -1629,6 +1781,59 @@ fn the_real_gateway_answers_a_real_request() {
     assert_eq!(input["name"], json!("readme-old.txt"));
 }
 
+/// Opt-in smoke check against the keys already configured in AI Gateway.
+/// The tool is an echo; this never reads or changes workspace data.
+#[test]
+#[ignore]
+fn the_openai_models_use_tools_through_the_real_gateway() {
+    use kernel::caps::SecretsFactory;
+    let env = kernel::app::Env {
+        scripted: false,
+        secrets_backend: Some(SecretsFactory::new(|| {
+            Box::new(crate::platform::secret::Keychain::new(None))
+        })),
+        ..kernel::app::Env::default()
+    };
+    let mut gateway = real::RealGateway::new(&env);
+    let echo = Tool::new(
+        "test.echo",
+        "Return the supplied text unchanged.",
+        json!({
+            "type": "object", "properties": {"text": {"type": "string"}},
+            "required": ["text"], "additionalProperties": false,
+        }),
+        false,
+        |_, input| Ok(input.clone()),
+    );
+    for model in &MODELS[1..] {
+        let mut req = ChatRequest::new(model.id, vec![
+            Message::user("Call the echo tool exactly once with text 'ping'. After it returns, reply only with 'pong'."),
+        ]);
+        req.tools = vec![ToolDef::from(&echo)];
+        req.reasoning_effort = Some(REASONING_EFFORT.to_string());
+        let answer = gateway
+            .complete(&req, &mut |_| Flow::Go)
+            .unwrap_or_else(|e| panic!("{}: {e}", model.label));
+        assert_eq!(answer.finish, Finish::ToolCalls, "{}", model.label);
+        assert_eq!(answer.message.tool_calls.len(), 1);
+        let call = answer.message.tool_calls[0].clone();
+        assert_eq!(call.function.name, "test.echo");
+        assert_eq!(call.input().unwrap()["text"], "ping");
+        req.messages.push(answer.message);
+        req.messages.push(Message::tool(call.id, "ping"));
+        let answer = gateway
+            .complete(&req, &mut |_| Flow::Go)
+            .unwrap_or_else(|e| panic!("{} tool continuation: {e}", model.label));
+        assert_eq!(answer.finish, Finish::Stop);
+        assert!(answer.message.text().to_lowercase().contains("pong"));
+        assert!(answer.usage.is_some());
+        eprintln!(
+            "{}: streamed tool call and continuation passed",
+            model.label
+        );
+    }
+}
+
 #[test]
 fn an_answer_that_ran_out_of_room_wears_continue_and_asking_is_a_turn() {
     let mut s = session();
@@ -1961,7 +2166,7 @@ fn allow_runs_the_call_and_the_round_goes_on() {
     );
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.add_panel"],
+        vec!["agent.add_panel", "agent.model"],
         "and the bar is a bar again"
     );
 }
@@ -2090,7 +2295,10 @@ fn a_round_the_person_stopped_offers_no_word_on_what_it_was_holding() {
         with_chat(&s, slot, |c| c.asked_call()).is_none(),
         "the round is over: a word on what it was holding would do nothing"
     );
-    assert_eq!(verb_ids(&s, slot), vec!["agent.retry", "agent.add_panel"]);
+    assert_eq!(
+        verb_ids(&s, slot),
+        vec!["agent.retry", "agent.add_panel", "agent.model"]
+    );
 }
 
 #[test]

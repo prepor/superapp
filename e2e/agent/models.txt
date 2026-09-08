@@ -1,0 +1,54 @@
+# args: --grid 4x3 --window 380x780
+# env:
+# Pick before sending, switch an existing chat, undo and redo the choice,
+# and return to GLM. Every request goes through the scripted gateway.
+
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "hello"
+wait 400
+click "model: GLM"
+wait 400
+click "Sol"
+wait 400
+click "send"
+wait 900
+click "Hello. I am the assistant."
+wait 400
+click "model: Sol"
+wait 400
+shot model-choices
+click "Astra"
+wait 400
+key cmd+z
+wait 400
+# Undo brings back the Sol label. Redo brings back Astra.
+key cmd+shift+z
+wait 400
+click "model: Astra"
+wait 400
+click "cancel"
+wait 400
+click "ask"
+wait 400
+type "again"
+wait 400
+click "send"
+wait 900
+click "again"
+wait 400
+click "model: Astra"
+wait 400
+click "GLM"
+wait 400
+click "model: GLM"
+wait 400
+click "cancel"
+wait 400
+shot models
+quit

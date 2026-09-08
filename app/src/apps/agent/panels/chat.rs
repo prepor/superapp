@@ -24,6 +24,7 @@ use kernel::store::Store;
 use super::super::calls;
 use super::super::chip::Chip;
 use super::super::model::{self, Call, Carried, ChatId, Run, Turn};
+use super::super::{model_label, MODEL, MODELS};
 
 /// The argument a chat panel carries when there is no row behind it yet.
 const NEW: &str = "new";
@@ -46,6 +47,9 @@ pub struct Chat {
     /// edit, as the compose sheet does with a draft — but nothing is
     /// written down: an unsent message is not a row.
     draft: String,
+    /// A blank chat's choice, until the first send saves it on the row.
+    model: String,
+    choosing_model: bool,
     /// What the composer is carrying beside its words. They go with the
     /// next send and leave the composer with it; like the draft, they are
     /// not a row until then.
@@ -85,6 +89,29 @@ impl Chat {
     #[must_use]
     pub fn chat(&self) -> Option<ChatId> {
         self.chat
+    }
+
+    /// The saved choice, or the composer's choice before its first send.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.chat
+            .and_then(|id| model::chat(&self.store, id))
+            .map_or_else(|| self.model.clone(), |c| c.model)
+    }
+
+    /// Pick a model for the next round without touching the draft or turns.
+    pub fn select_model(&mut self, s: &mut Session, selected: &str) {
+        if !MODELS.iter().any(|m| m.id == selected) || self.latest_run().is_some_and(|r| r.live()) {
+            return;
+        }
+        if let Some(chat) = self.chat {
+            if self.model() != selected && !model::set_model(s, chat, selected) {
+                return;
+            }
+        } else {
+            self.model = selected.to_string();
+        }
+        self.choosing_model = false;
     }
 
     /// What the composer holds.
@@ -284,13 +311,15 @@ impl Chat {
                     .join("\n")
             }),
         };
-        let Some((chat, _)) = model::send(s, self.chat, &said, carried) else {
+        let Some((chat, _)) = model::send_with_model(s, self.chat, &said, carried, &self.model())
+        else {
             self.draft = said;
             self.chips = chips;
             return;
         };
         let was_blank = self.chat.is_none();
         self.chat = Some(chat);
+        self.choosing_model = false;
         if was_blank {
             // Folded into the send's own node: opening the conversation one
             // has just started is the send arriving at its consequence, not
@@ -320,10 +349,7 @@ impl Panel for Chat {
 
     fn about(&self) -> String {
         let n = self.turns().len();
-        let model_name = self
-            .chat
-            .and_then(|c| model::chat(&self.store, c))
-            .map_or_else(|| super::super::MODEL.to_string(), |c| c.model);
+        let model_name = self.model();
         // A call standing at its card is the one thing about this panel a
         // reader has to act on, so it is said and named.
         let asked = self.asked_call().map_or_else(String::new, |c| {
@@ -358,12 +384,20 @@ impl Panel for Chat {
     /// *send* while there is something to send and nothing going, *stop*
     /// while something is, *retry* on a round that came to nothing,
     /// *continue* on an answer that ran out of room, *allow* and *refuse*
-    /// while a call is waiting to be one or the other — then *add panel*,
-    /// the one that is always there. A fresh chat and the list of them are
+    /// while a call is waiting to be one or the other — then *add panel*
+    /// and the idle chat's model switcher. A fresh chat and the list of them are
     /// the agents panel's business, not a conversation's.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
         let going = run.as_ref().is_some_and(Run::live);
+        if self.choosing_model && !going {
+            let mut choices: Vec<Verb> = MODELS
+                .iter()
+                .map(|m| Verb::run(m.verb, m.label, None))
+                .collect();
+            choices.push(Verb::run("agent.model.cancel", "cancel", None));
+            return choices;
+        }
         let mut v = Vec::new();
         if !going && (!self.draft.trim().is_empty() || !self.chips.is_empty()) {
             v.push(Verb::run("agent.send", "send", Some('s')));
@@ -401,10 +435,21 @@ impl Panel for Chat {
         // harmless where the chord is there: a field over the panels that
         // are open, one pick apiece.
         v.push(Verb::run("agent.add_panel", "add panel", Some('p')));
+        if !going {
+            v.push(Verb::run(
+                "agent.model",
+                format!("model: {}", model_label(&self.model())),
+                Some('m'),
+            ));
+        }
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if let Some(m) = MODELS.iter().find(|m| m.verb == verb) {
+            self.select_model(s, m.id);
+            return;
+        }
         match verb {
             "agent.send" => self.send(s),
             "agent.stop" => {
@@ -419,6 +464,8 @@ impl Panel for Chat {
             }
             "agent.continue" => self.carry_on(s),
             "agent.add_panel" => self.picking = Some(String::new()),
+            "agent.model" => self.choosing_model = !self.latest_run().is_some_and(|r| r.live()),
+            "agent.model.cancel" => self.choosing_model = false,
             _ => {}
         }
     }
@@ -443,6 +490,8 @@ impl PanelKind for ChatKind {
             store: cx.session().store().clone(),
             slot: 0,
             draft: String::new(),
+            model: MODEL.to_string(),
+            choosing_model: false,
             // What `cmd+shift+a` left for it: the panel it was opened
             // about, offered on the app's own static because a navigation
             // carries an identity and nothing else.

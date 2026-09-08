@@ -11,9 +11,9 @@
 //! them. [`request_parts`] makes the URL, the headers and the body a
 //! request goes out as, so what this app sends is testable without sending
 //! it; [`stream_completion`] is the loop over already-framed events, so the
-//! reading of a stream is testable without one. What is left for the real
-//! gateway — a follow-up to this phase, over `kernel::http` and
-//! `kernel::sse` — is the connection between them.
+//! reading of a stream is testable without one. [`super::responses`] does
+//! the same for OpenAI's wire; the real gateway connects them to
+//! `kernel::http` and `kernel::sse`.
 
 use std::fmt;
 
@@ -63,7 +63,7 @@ impl fmt::Display for Failure {
 /// The model behind a chat. One implementation per world: the real gateway
 /// on a window's run, the scripted fake everywhere else.
 pub trait Gateway {
-    /// One chat-completions request, streamed. `on` is called per chunk as
+    /// One model request, streamed. `on` is called per chunk as
     /// it arrives and answers whether to go on, which is how *stop* cuts a
     /// stream at its next chunk; the answer is the assembled message —
     /// text, `tool_calls`, `finish_reason`, `usage` — or the failure in
@@ -81,17 +81,33 @@ pub trait Gateway {
     ) -> Result<Completion, Failure>;
 }
 
-/// Where requests go and what answers them. One const in the app; a second
-/// provider — Cloudflare's REST route, or another model on the same wire —
-/// is a second const behind the same capability, not a second module.
+/// The two routes behind the same gateway capability. OpenAI uses Responses
+/// because Astra's function calling requires it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Provider {
-    /// What the gateway calls it in its own logs and in its URL.
-    pub name: &'static str,
-    /// The path under the gateway's URL, leading slash and all.
-    pub path: &'static str,
-    pub model: &'static str,
-    pub reasoning_effort: &'static str,
+pub enum Provider {
+    WorkersAi,
+    OpenAi,
+}
+
+impl Provider {
+    /// Resolve every request from its saved model, including older Workers
+    /// AI chats. Unknown models fail before credentials or a socket are used.
+    pub fn for_model(model: &str) -> Result<Provider, Failure> {
+        if let Some(m) = super::MODELS.iter().find(|m| m.id == model) {
+            return Ok(m.provider);
+        }
+        if model.starts_with("@cf/") {
+            return Ok(Provider::WorkersAi);
+        }
+        Err(Failure::new(format!("unsupported agent model: {model}")))
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::WorkersAi => "/workers-ai/v1/chat/completions",
+            Self::OpenAi => "/openai/responses",
+        }
+    }
 }
 
 /// One request, made ready to send: everything the transport needs and
@@ -121,9 +137,9 @@ pub fn request_parts(
 
 /// The same, with the policy said — which is what a test says.
 ///
-/// One Cloudflare token opens both doors: it is the provider's key
-/// (`authorization`) and the gateway's (`cf-aig-authorization`) at once, so
-/// there is nothing to store in the gateway and nothing to alias.
+/// Workers AI uses the Cloudflare token for both authorization headers.
+/// OpenAI uses only `cf-aig-authorization`: AI Gateway supplies the provider
+/// key stored in its dashboard. Sending a provider header would override it.
 ///
 /// `cf-aig-collect-log-payload: false` is the app's own policy: a chat
 /// carries the person's mail, and the gateway keeps counts and status, not
@@ -139,24 +155,37 @@ pub fn request_parts_with(
     log_payload: bool,
 ) -> Parts {
     let bearer = format!("Bearer {token}");
-    let mut headers = vec![
-        ("authorization", bearer.clone()),
+    let mut headers = Vec::new();
+    if *p == Provider::WorkersAi {
+        headers.push(("authorization", bearer.clone()));
+    }
+    headers.extend([
         ("cf-aig-authorization", bearer),
         ("content-type", "application/json".to_string()),
         ("accept", "text/event-stream".to_string()),
-    ];
+    ]);
     if !log_payload {
         headers.push(("cf-aig-collect-log-payload", "false".to_string()));
     }
     Parts {
         url: format!(
             "https://gateway.ai.cloudflare.com/v1/{account}/{gateway}{}",
-            p.path
+            p.path()
         ),
         headers,
         // The request is strings and schemas: there is nothing in it
         // serde can refuse.
-        body: serde_json::to_vec(req).unwrap_or_default(),
+        body: match p {
+            Provider::OpenAi => serde_json::to_vec(&super::responses::request_body(req)),
+            Provider::WorkersAi => {
+                let mut req = req.clone();
+                for message in &mut req.messages {
+                    message.response = None;
+                }
+                serde_json::to_vec(&req)
+            }
+        }
+        .unwrap_or_default(),
     }
 }
 

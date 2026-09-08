@@ -44,6 +44,7 @@ pub mod panels;
 pub mod problems;
 pub mod prompt;
 pub mod real;
+mod responses;
 pub mod run;
 pub mod scenes;
 pub mod schema;
@@ -64,17 +65,10 @@ pub use panels::{Agents, Chat};
 pub use real::RealGateway;
 pub use ui::UI;
 
-/// The model behind every chat here: one of the models Cloudflare hosts
-/// itself, which the gateway reaches as the `workers-ai` provider. A
-/// million tokens of context, function calling, streaming and a reasoning
-/// mode, priced so that a day of chatting over one's own mail costs cents.
-/// Changing it is a commit, not a setting; a chat's row records the model
-/// it ran on, so a chat that predates the change still says what answered
-/// it.
+/// The default for a new chat. Existing chats keep their selected model.
 pub const MODEL: &str = "@cf/zai-org/glm-5.3-flash";
 
-/// How hard the model thinks before it answers. Beside the model, and a
-/// commit for the same reason.
+/// How hard the model thinks before it answers, shared by all three models.
 pub const REASONING_EFFORT: &str = "medium";
 
 /// The gateway's name, made once in the Cloudflare dashboard. Where it is —
@@ -82,15 +76,43 @@ pub const REASONING_EFFORT: &str = "medium";
 /// has a gateway and one that does not has neither.
 pub const GATEWAY: &str = "superapp";
 
-/// Where requests go. A second provider — Cloudflare's REST route, or
-/// another model on the same wire — is a second const behind the same
-/// capability, not a second module.
-pub static PROVIDER: Provider = Provider {
-    name: "workers-ai",
-    path: "/workers-ai/v1/chat/completions",
-    model: MODEL,
-    reasoning_effort: REASONING_EFFORT,
-};
+/// The provider of the default model.
+pub const PROVIDER: Provider = Provider::WorkersAi;
+
+/// One choice on the chat's model switcher.
+pub struct Model {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub verb: &'static str,
+    pub provider: Provider,
+}
+
+pub const MODELS: &[Model] = &[
+    Model {
+        id: MODEL,
+        label: "GLM",
+        verb: "agent.model.glm",
+        provider: PROVIDER,
+    },
+    Model {
+        id: "gpt-5.6-sol",
+        label: "Sol",
+        verb: "agent.model.sol",
+        provider: Provider::OpenAi,
+    },
+    Model {
+        id: "gpt-6-astra",
+        label: "Astra",
+        verb: "agent.model.astra",
+        provider: Provider::OpenAi,
+    },
+];
+
+/// A short name for the switcher; older models still show their saved id.
+#[must_use]
+pub fn model_label(id: &str) -> &str {
+    MODELS.iter().find(|m| m.id == id).map_or(id, |m| m.label)
+}
 
 /// The app, and the little it keeps in memory.
 ///

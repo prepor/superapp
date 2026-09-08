@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::wire::{Message, Role, ToolCall, Usage};
-use super::MODEL;
+use super::{MODEL, MODELS};
 
 /// A conversation's row id — the one argument a `chat` panel carries.
 pub type ChatId = i64;
@@ -947,6 +947,21 @@ pub fn send(
     text: &str,
     carried: Carried,
 ) -> Option<(ChatId, RunId)> {
+    send_with_model(s, chat, text, carried, MODEL)
+}
+
+/// Send using the selected model when creating a chat. An existing chat
+/// always uses its saved choice.
+pub fn send_with_model(
+    s: &mut Session,
+    chat: Option<ChatId>,
+    text: &str,
+    carried: Carried,
+    selected: &str,
+) -> Option<(ChatId, RunId)> {
+    if chat.is_none() && !MODELS.iter().any(|m| m.id == selected) {
+        return None;
+    }
     let said = text.trim().to_string();
     if said.is_empty() && carried.chips.is_empty() {
         return None;
@@ -954,7 +969,7 @@ pub fn send(
     let now = s.now();
     let title = title_of(&said);
     let label = format!("send “{title}”");
-    let (model, body) = (MODEL.to_string(), said.clone());
+    let (model, body) = (selected.to_string(), said.clone());
     let held = carried.clone();
     let mut act = Action::writing("agent.send", label, move |tx| {
         let chat = match chat {
@@ -984,6 +999,49 @@ pub fn send(
         run: Cell::new(run),
     }));
     Some((chat, run))
+}
+
+/// Change what answers the next round. A live round keeps its model for
+/// all its tool requests. The write and its undo obey the same rule.
+pub fn set_model(s: &mut Session, chat_id: ChatId, selected: &str) -> bool {
+    if !MODELS.iter().any(|m| m.id == selected) {
+        return false;
+    }
+    let Some(before) = chat(s.store(), chat_id) else {
+        return false;
+    };
+    if before.model == selected || latest_run(s.store(), chat_id).is_some_and(|r| r.live()) {
+        return false;
+    }
+    let after = selected.to_string();
+    let (name, now) = (after.clone(), s.now());
+    let changed = s.act(
+        Action::writing(
+            "agent.model",
+            format!("use {}", super::model_label(selected)),
+            move |tx| set_model_tx(tx, chat_id, &name, now),
+        )
+        .about(chat_entity(chat_id)),
+    );
+    if changed != Some(true) {
+        return false;
+    }
+    s.claim(Box::new(ChangedModel {
+        chat: chat_id,
+        before: before.model,
+        after,
+    }));
+    true
+}
+
+fn set_model_tx(c: &Connection, chat: ChatId, name: &str, now: f64) -> rusqlite::Result<bool> {
+    c.execute(
+        "UPDATE agent_chat SET model = ?2, updated = ?3 WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM agent_run WHERE chat = ?1
+                           AND status IN ('pending', 'streaming', 'waiting'))",
+        rusqlite::params![chat, name, now],
+    )
+    .map(|n| n > 0)
 }
 
 /// *stop*: the run's status, which the worker reads between chunks and the
@@ -1084,6 +1142,51 @@ fn delete_chat_tx(c: &Connection, chat: ChatId) -> rusqlite::Result<()> {
 }
 
 // -- what an action claimed of the world ---------------------------------------
+
+struct ChangedModel {
+    chat: ChatId,
+    before: String,
+    after: String,
+}
+
+impl ChangedModel {
+    fn write(&self, w: &World, name: &str) -> Result<(), String> {
+        let (chat, name, now) = (self.chat, name.to_string(), w.now());
+        let changed = w
+            .store()
+            .write(move |c| set_model_tx(c, chat, &name, now))
+            .map_err(|e| e.to_string())?;
+        if changed {
+            Ok(())
+        } else {
+            Err("the chat is gone or a round is still running".into())
+        }
+    }
+}
+
+impl Intent for ChangedModel {
+    fn describe(&self) -> String {
+        format!(
+            "chat:{} uses {}",
+            self.chat,
+            super::model_label(&self.after)
+        )
+    }
+
+    fn blocked(&self, w: &World) -> Option<String> {
+        latest_run(w.store(), self.chat)
+            .filter(Run::live)
+            .map(|_| "a running round keeps its model".to_string())
+    }
+
+    fn reverse(&self, w: &World) -> Result<(), String> {
+        self.write(w, &self.before)
+    }
+
+    fn reapply(&self, w: &World) -> Result<(), String> {
+        self.write(w, &self.after)
+    }
+}
 
 /// A send: the person's turn, and the run it started.
 ///

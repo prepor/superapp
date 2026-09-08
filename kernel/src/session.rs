@@ -839,7 +839,11 @@ impl Session {
         let Some(step) = step else {
             return false;
         };
+        // The grid belongs to the current screen, not to history. Restore
+        // supplies a default grid because snapshots deliberately omit it.
+        let grid = self.wm.grid;
         self.wm = Wm::restore(step.snap);
+        self.wm.set_grid(grid);
         // A walk is nobody's `&mut self`: it comes from a chord or the
         // history overlay, so the instances settle within the call.
         self.unsettle();
@@ -1361,6 +1365,23 @@ mod tests {
             fresh.panel(slot).unwrap().borrow().title(),
             format!("Some({slot})")
         );
+    }
+
+    #[test]
+    fn undo_and_redo_keep_the_current_screens_grid() {
+        let mut s = Session::fake(APPS);
+        open(&mut s, note("first"));
+        open(&mut s, note("second"));
+        // A phone or a folded screen can have a different grid from the
+        // one on which the history nodes were recorded.
+        let grid = Grid { w: 4, h: 3 };
+        s.set_grid(grid);
+        assert!(s.undo());
+        assert_eq!(s.ws().grid, grid);
+        assert!(s.showing(&note("second")).is_empty());
+        assert!(s.redo());
+        assert_eq!(s.ws().grid, grid);
+        assert_eq!(s.showing(&note("second")).len(), 1);
     }
 
     /// The three knobs the shell turns that are not actions: the grid, the
