@@ -19,6 +19,7 @@ pub mod messages;
 pub mod peer;
 pub mod people;
 pub mod place;
+mod pictures;
 mod text;
 pub mod topics;
 

@@ -302,10 +302,12 @@ impl Node {
             if let Some(body) = bodies.get(&self.section) {
                 raw.extend_from_slice(body);
             } else {
-                // A nonempty placeholder keeps header-only binary messages
-                // classified as files by the MIME parser. It is stripped
-                // when Content::from_raw builds the stored reading.
-                raw.extend_from_slice(b"AA==");
+                // Keep header-only files nonempty without introducing an
+                // encoding error into a reading. This is valid base64 AND
+                // quoted-printable; padding such as `AA==` makes the parser
+                // classify quoted-printable readings as attachments.
+                // Content::from_raw strips the placeholder from file parts.
+                raw.extend_from_slice(b"AAAA");
             }
         } else {
             for child in &self.children {
@@ -467,6 +469,57 @@ mod tests {
             .finish(&HashMap::from([("1".into(), b"caf\xe9".to_vec())]))
             .unwrap();
         assert_eq!(super::super::sync::parse_mail(&stored).unwrap().body, "café");
+    }
+
+    #[test]
+    fn encoded_readings_are_fetched_for_single_and_multipart_messages() {
+        for subtype in ["PLAIN", "HTML"] {
+            for (encoding, bytes) in [
+                ("7BIT", b"hello".as_slice()),
+                ("8BIT", b"hello".as_slice()),
+                ("BINARY", b"hello".as_slice()),
+                ("BASE64", b"aGVsbG8=".as_slice()),
+                ("QUOTED-PRINTABLE", b"he=6Clo".as_slice()),
+            ] {
+                let body = format!(
+                    "(\"TEXT\" \"{subtype}\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1)",
+                    bytes.len()
+                );
+                for structure in [body.clone(), format!("({body} \"MIXED\")")] {
+                    let p = plan(&structure);
+                    assert_eq!(p.readings, ["1"], "{structure}");
+                    let stored = p
+                        .finish(&HashMap::from([("1".into(), bytes.to_vec())]))
+                        .unwrap();
+                    let parsed = super::super::sync::parse_mail(&stored).unwrap();
+                    assert_eq!(parsed.body, "hello", "{structure}");
+                    assert_eq!(parsed.html.is_some(), subtype == "HTML", "{structure}");
+                    assert!(parsed.attachments.is_empty(), "{structure}");
+                    assert!(Content::read(&stored).unwrap().parts.is_empty(), "{structure}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_text_attachments_stay_remote() {
+        for subtype in ["PLAIN", "HTML"] {
+            for encoding in ["BASE64", "QUOTED-PRINTABLE"] {
+                let file = format!(
+                    "(\"TEXT\" \"{subtype}\" NIL NIL NIL \"{encoding}\" 120 1 NIL (\"ATTACHMENT\" NIL))"
+                );
+                let p = plan(&file);
+                assert!(p.readings.is_empty(), "{file}");
+                let stored = p.finish(&HashMap::new()).unwrap();
+                let content = Content::read(&stored).unwrap();
+                assert_eq!(content.parts.len(), 1, "{file}");
+                assert_eq!(content.parts[0].section, "1", "{file}");
+                let parsed = super::super::sync::parse_mail(&stored).unwrap();
+                assert!(parsed.body.is_empty(), "{file}");
+                assert!(parsed.html.is_none(), "{file}");
+                assert_eq!(parsed.attachments.len(), 1, "{file}");
+            }
+        }
     }
 
     #[test]

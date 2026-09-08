@@ -9,6 +9,26 @@ even when the native client is linked.
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
 
+Chat previews prepare their cached transcript on a background reader. Draws
+reuse those rows and prepare players only for visible messages. Rapid cursor
+walks prioritize the latest chat and discard obsolete queued reads; the eight
+most recent transcripts remain cached. Updates keep the current transcript
+visible while its replacement loads. Photo reads, decoding and map rendering
+also run on workers, with a bounded texture cache shared across chats. Opening
+an unread chat still records its read claim and preserves its unread divider.
+
+Automatic history, message and reaction refreshes wait until a chat has stayed
+visible for 350 ms. Arrow-key previews show cached data immediately; traversed
+chats leave no refresh queue behind. Visible copies of the same chat share one
+history walk, including empty chats waiting for their first messages. Leaving a
+chat cancels its queued pages and thumbnail requests; late history replies cannot
+restart an abandoned walk. Telegram's page pacing and retry waits still apply.
+
+With the transcript focused, **Ctrl+E** or **End** jumps to the end of the chat,
+selects its newest message and resumes following new messages; **Home** selects
+the oldest loaded message. In the composer, **Ctrl+E** moves the caret to the
+end of the current line, and **Shift+Ctrl+E** extends the selection to that point.
+
 Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
 answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
 Following several originals keeps each return point, so repeated `back`

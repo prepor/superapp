@@ -41,7 +41,7 @@ pub fn has_video(m: &Msg) -> bool {
 
 /// Reserve the final video dimensions before downloading or preparing it.
 /// Thumbnail dimensions must never determine a video's transcript height.
-pub fn fill_poster(cx: &mut Cx, slot: &WidgetRef, m: &Msg, bytes: Option<&[u8]>, decode: bool) -> bool {
+pub fn fill_poster(cx: &mut Cx, slot: &WidgetRef, m: &Msg, dir: Option<&std::path::Path>) -> bool {
     if let Some(mut slot) = slot.borrow_mut::<InlineVideoSlot>() {
         slot.view.visible = has_video(m);
         let fallback = if m.media.as_ref().is_some_and(|md| md.kind == "circle") { 1.0 } else { 16.0 / 9.0 };
@@ -50,7 +50,7 @@ pub fn fill_poster(cx: &mut Cx, slot: &WidgetRef, m: &Msg, bytes: Option<&[u8]>,
             .map_or(fallback, |(w, h)| w as f64 / h as f64);
     }
     let poster = slot.child(live_id!(poster));
-    media::fill_picture(cx, &poster, bytes, decode)
+    super::pictures::photo(cx, &poster, m.media.as_ref().filter(|_| has_video(m)), dir)
 }
 
 pub fn fill_slot(cx: &mut Cx, slot: &WidgetRef, video: &WidgetRef, shown: bool, note: Option<&str>) {
@@ -174,7 +174,7 @@ mod tests {
         let session = Session::fake(APPS);
         let mut msg = model::history(session.store(), STELAXIS).iter()
             .find(|m| has_video(m)).unwrap().clone();
-        let poster = msg.media.as_ref().unwrap().picture_bytes(None).unwrap();
+        let reference = msg.media.as_ref().unwrap().reference.clone();
         let finished = Rc::new(Cell::new(false));
         let seen = finished.clone();
         let mut root = WidgetRef::empty();
@@ -223,9 +223,9 @@ mod tests {
                 md.w = Some(w);
                 md.h = Some(h);
                 md.kind = kind.into();
+                md.reference = if phase > 0 { reference.clone() } else { None };
                 let surface = root.child(live_id!(surface));
-                let bytes = (phase > 0).then_some(poster.as_slice());
-                assert_eq!(fill_poster(cx, &surface, &msg, bytes, phase == 1), phase > 0);
+                assert_eq!(fill_poster(cx, &surface, &msg, None), phase > 0);
                 let playing = matches!(phase, 4 | 5);
                 video.set_visible(cx, playing);
                 fill_slot(cx, &surface, &video, playing, (phase == 2).then_some("downloading 25%"));

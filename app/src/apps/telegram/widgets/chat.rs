@@ -25,8 +25,6 @@
 //! the way a finger does. So are the play buttons and the pictures inside
 //! them.
 
-use std::collections::{HashMap, HashSet};
-
 use kernel::nav::Nav;
 use kernel::panel::{PanelId, Tag};
 use kernel::session::Session;
@@ -36,7 +34,6 @@ use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
 use crate::shell::hits::visible;
 use crate::shell::keys::Letters;
-use crate::shell::widgets::map::{self, FakeTiles};
 use crate::shell::widgets::media::{self, PlayerState};
 use crate::shell::widgets::table;
 use crate::shell::widgets::reveal::Reveal;
@@ -128,6 +125,8 @@ pub struct ChatPanel {
     /// the field took the keyboard.
     #[rust]
     mounted: bool,
+    #[rust]
+    positioned: bool,
     /// The draft as this widget last wrote it into the field, so the field
     /// is only rewritten when the instance's text moved without a keystroke
     /// of this widget's.
@@ -139,19 +138,6 @@ pub struct ChatPanel {
     /// undone by the focus its own click brought.
     #[rust]
     had_focus: bool,
-    /// Which message each picture box and map last decoded, by the box's
-    /// own widget uid — one per twin of a row item, since the cursor's wash
-    /// swaps the twin drawn. Items are reused as the list scrolls, so a
-    /// picture is decoded when a box's message changes and not once a
-    /// frame.
-    #[rust]
-    pictured: HashMap<u64, (MsgId, String)>,
-    /// The lines whose pictures have been asked for. A photo is fetched as
-    /// its line arrives, but only for the newest forty of a chat as it
-    /// opens, and the cache evicts what it must — so a row drawn without
-    /// its bytes asks for them, once, however often it is drawn.
-    #[rust]
-    wanted: HashSet<MsgId>,
     /// A caret asked for and not yet landed: the field is re-asked every
     /// event and frame until it has the keyboard, since a focus set inside
     /// the press that asked is undone by that press's own default.
@@ -182,6 +168,7 @@ impl Widget for ChatPanel {
         // under a visible row by Makepad's single-parent widget search tree.
         let clip_box = self.view.child(live_id!(video_source)).child(live_id!(clip_box));
         let video_before = media::video_word(cx, &clip_box);
+        if super::pictures::changed(cx, event) { self.view.redraw(cx); }
         match event {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
@@ -306,6 +293,41 @@ impl Widget for ChatPanel {
                 }
                 return;
             }
+            // Ctrl+E reaches the newest line with the transcript focused.
+            // The composer's caret chords stay with the field.
+            let chat_end = k.key_code == KeyCode::KeyE && k.modifiers.control
+                && !(k.modifiers.shift || k.modifiers.alt || k.modifiers.logo);
+            if has_focus && !focused
+                && (chat_end || matches!(k.key_code, KeyCode::Home | KeyCode::End))
+            {
+                let to_end = chat_end || k.key_code == KeyCode::End;
+                let landed = with_chat(&props, |c| {
+                    let hist = c.history();
+                    let pick = if to_end {
+                        hist.iter().rev().find(|m| !m.service)
+                    } else {
+                        hist.iter().find(|m| !m.service)
+                    };
+                    let id = pick.map(|m| m.id)?;
+                    c.set_cursor(id);
+                    Some(id)
+                })
+                .flatten();
+                if to_end {
+                    self.reveal.cancel();
+                    let list = self.view.widget(cx, LIST).as_portal_list();
+                    list.scroll_to_end(cx);
+                    list.set_tail_range(true);
+                    self.anchor = None;
+                } else if let Some(id) = landed {
+                    self.follow(cx, id);
+                }
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
             if focused {
                 match k.key_code {
                     // Enter sends; shift+enter is the field's newline, and
@@ -394,39 +416,6 @@ impl Widget for ChatPanel {
                         self.view.redraw(cx);
                         // The cursor and the marks feed the bar, which the
                         // stage draws.
-                        if let Some(s) = scope.data.get_mut::<Session>() {
-                            s.redraw();
-                        }
-                    }
-                    // Home and End: the oldest line held and the newest, the
-                    // cursor going with the view.
-                    KeyCode::Home | KeyCode::End => {
-                        let to_end = k.key_code == KeyCode::End;
-                        let landed = with_chat(&props, |c| {
-                            let hist = c.history();
-                            let pick = if to_end {
-                                hist.iter().rev().find(|m| !m.service)
-                            } else {
-                                hist.iter().find(|m| !m.service)
-                            };
-                            let id = pick.map(|m| m.id)?;
-                            c.set_cursor(id);
-                            Some(id)
-                        })
-                        .flatten();
-                        if let Some(id) = landed {
-                            if to_end {
-                                self.reveal.cancel();
-                                self.view
-                                    .widget(cx, LIST)
-                                    .as_portal_list()
-                                    .set_tail_range(true);
-                                self.anchor = None;
-                            } else {
-                                self.follow(cx, id);
-                            }
-                        }
-                        self.view.redraw(cx);
                         if let Some(s) = scope.data.get_mut::<Session>() {
                             s.redraw();
                         }
@@ -603,7 +592,7 @@ impl Widget for ChatPanel {
         // A bar action runs after this widget handles its input event.
         // Take its navigation request on the first draw it invalidated,
         // without waiting for another key, pointer event or timer tick.
-        if self.mounted {
+        if self.mounted && with_chat(&props, |c| c.transcript_ready()).unwrap_or(false) {
             if let Some(id) = with_chat(&props, Chat::take_follow_wish).flatten() {
                 self.reveal.request(id);
             }
@@ -613,26 +602,22 @@ impl Widget for ChatPanel {
             .set_visible(cx, self.dragging_files);
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((card, rows, cursor, marks, above, text, carrying, mut players, moving)) = ({
+        let Some((card, rows, loading, cursor, marks, above, text, carrying, moving)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Chat>().map(|c| {
+                // Capture loading first: the reader may finish between these
+                // calls, but unloaded rows must never look like an empty chat.
+                let loading = c.loading();
                 let rows = c.rows(now);
-                let players: Vec<Option<PlayerState>> = rows
-                    .iter()
-                    .map(|r| match r {
-                        Row::Message { msg, .. } => c.player_state(msg, now),
-                        _ => None,
-                    })
-                    .collect();
                 (
                     c.card(),
                     rows,
+                    loading,
                     c.cursor(),
                     c.marks().clone(),
                     c.above_line(now),
                     c.field_text().to_string(),
                     c.carrying().iter().map(|f| (f.label(), f.path.clone())).collect::<Vec<_>>(),
-                    players,
                     c.playing(now),
                 )
             })
@@ -644,14 +629,14 @@ impl Widget for ChatPanel {
         // is still filling the transcript — a transcript that is short is
         // seen to be short for now.
         let mut status = card.as_ref().map(model::PeerCard::status_line).unwrap_or_default();
-        if with_chat(&props, |c| c.loading()).unwrap_or(false) {
+        if loading {
             if !status.is_empty() {
                 status.push_str(" · ");
             }
             status.push_str("loading…");
         }
         self.view.label(cx, STATUS).set_text(cx, &status);
-        self.view.label(cx, EMPTY).set_visible(cx, rows.is_empty());
+        self.view.label(cx, EMPTY).set_visible(cx, !loading && rows.is_empty());
 
         // The composer, or the line that stands where it cannot.
         let can_post = card.as_ref().is_none_or(model::PeerCard::can_post);
@@ -695,7 +680,20 @@ impl Widget for ChatPanel {
         let active = with_chat(&props, |c| c.active_media()).flatten();
         let mut video_drawn = false;
         let mut video_redraw = false;
-        let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();
+        if !self.positioned && n > 0 {
+            let list = self.view.widget(cx, LIST).as_portal_list();
+            match rows.iter().position(|r| matches!(r, Row::Unread)) {
+                Some(idx) => {
+                    list.set_tail_range(false);
+                    if let Some(mut list) = list.borrow_mut() {
+                        list.set_first_id_and_scroll(idx.saturating_sub(1), 0.0);
+                    }
+                }
+                None => list.set_tail_range(true),
+            }
+            self.positioned = true;
+        }
+        let mut drawn: Vec<(usize, WidgetRef, Option<PlayerState>)> = Vec::new();
         let anchor = self.anchor.take();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
@@ -733,17 +731,17 @@ impl Widget for ChatPanel {
                 let id = r.msg().map(|m| m.id);
                 let selected = id.is_some() && id == cursor;
                 let marked = id.is_some_and(|i| marks.contains(&i));
+                let mut player = r.msg().and_then(|m| with_chat(&props, |c| c.player_state(m, now)).flatten());
                 populate(
                     cx,
                     &row,
                     r,
                     (selected, marked),
-                    Some(&mut self.pictured),
-                    players.get(idx).copied().flatten(),
+                    player,
                     &render,
                 );
                 if let Some(m) = r.msg() {
-                    self.want_picture(&props, m, &render);
+                    self.want_picture(cx, m, &render);
                     let message = row.view(cx, ids!(msg));
                     let line = table::line(cx, &message, selected, marked);
                     let slot = line.widget(cx, ids!(body.clip_box));
@@ -756,13 +754,13 @@ impl Widget for ChatPanel {
                     if let Some(result) = result {
                         video_drawn = true;
                         video_redraw |= result.redraw;
-                        players[idx] = result.player;
+                        player = result.player;
                         let player = line.widget(cx, ids!(body.player));
                         media::fill_player(cx, &player, result.player.as_ref());
                     }
                 }
                 row.draw_all(cx, scope);
-                drawn.push((idx, row));
+                drawn.push((idx, row, player));
             }
         }
 
@@ -770,7 +768,7 @@ impl Widget for ChatPanel {
             rows.iter().position(|r| r.msg().is_some_and(|m| m.id == id))
         });
         let target_rect = target_index.and_then(|target| {
-            drawn.iter().find(|(idx, _)| *idx == target).map(|(_, row)| row.area().rect(cx))
+            drawn.iter().find(|(idx, _, _)| *idx == target).map(|(_, row, _)| row.area().rect(cx))
         });
         let portal = self.view.widget(cx, LIST).as_portal_list();
         if self.reveal.apply(cx, &portal, target_index, target_rect) {
@@ -786,7 +784,7 @@ impl Widget for ChatPanel {
         let clip = self.view.widget(cx, LIST).area().rect(cx);
         let mut active_visible = false;
         let mut visible_ids = Vec::new();
-        for (idx, row) in drawn {
+        for (idx, row, player) in drawn {
             let Some(r) = rows.get(idx) else { continue };
             let full = row.area().rect(cx);
             if full.size.x <= 0.0 || full.size.y <= 0.0 {
@@ -805,7 +803,7 @@ impl Widget for ChatPanel {
                     active_visible |= Some(msg.id) == active;
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
-                    self.inner_hits(cx, &props, &row, msg, twin, players.get(idx).copied().flatten(), &render);
+                    self.inner_hits(cx, &props, &row, msg, twin, player, &render);
                 }
                 Row::Service(_) | Row::Day(_) | Row::Unread => {
                     props.hits.add_clipped(
@@ -820,9 +818,12 @@ impl Widget for ChatPanel {
             video_redraw = false;
         }
         if let Some(s) = scope.data.get_mut::<Session>() {
-            if let Some(chat) = with_chat(&props, |c| c.peer()) {
-                if self.background || !super::message_panel_visible(s, props.slot) { visible_ids.clear(); }
-                super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, visible_ids);
+            if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
+                if self.background || !super::message_panel_visible(s, props.slot) {
+                    self.viewed = None;
+                } else {
+                    super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, Some(topic), visible_ids);
+                }
             }
         }
         for (label, path, cursor) in [
@@ -871,24 +872,6 @@ impl ChatPanel {
         .unwrap_or_default();
         field.set_text(cx, &text);
         self.shown = text;
-        // The transcript opens at the first unread line, its divider just
-        // above, as the client does — and at the end when nothing is unread.
-        let list = self.view.widget(cx, LIST).as_portal_list();
-        let unread_at = with_chat(props, |c| {
-            c.rows(super::now(scope))
-                .iter()
-                .position(|r| matches!(r, Row::Unread))
-        })
-        .flatten();
-        match unread_at {
-            Some(idx) => {
-                list.set_tail_range(false);
-                if let Some(mut l) = list.borrow_mut() {
-                    l.set_first_id_and_scroll(idx.saturating_sub(1), 0.0);
-                }
-            }
-            None => list.set_tail_range(true),
-        }
         let focused = scope
             .data
             .get_mut::<Session>()
@@ -1027,13 +1010,8 @@ impl ChatPanel {
             }
         }
         let video = line.widget(cx, ids!(body.clip_box));
-        let pictured = md.picture_bytes(render.store_dir.as_deref()).is_some();
-        if video.visible() || pictured || matches!(md.kind.as_str(), "video" | "circle" | "animation") {
-            let img = if video.visible() { video } else if pictured {
-                line.widget(cx, ids!(body.img_box))
-            } else {
-                line.widget(cx, ids!(body.media_lbl))
-            };
+        let img = if video.visible() { video } else { line.widget(cx, ids!(body.img_box)) };
+        if img.visible() {
             if let Some(r) = rect_of(cx, &img).and_then(|r| visible(r, clip)) {
                 props.hits.add(md.word(), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
@@ -1068,12 +1046,13 @@ impl ChatPanel {
     /// evicts what it must, so a line further up may have no bytes on this
     /// device at all and no way to draw any. The row keeps the file's
     /// durable remote id for exactly this: the worker turns it into a
-    /// download on its next pass ([`super::super::runtime::Runtime::want_file`]), the bytes land under
+    /// download on its next pass ([`super::super::runtime::want_view_file`]), the bytes land under
     /// the key the row already names, and the next draw finds them. Once per
-    /// line, since a row without its picture is drawn again every frame; and
+    /// viewport, since a row without its picture is drawn again every frame; and
     /// only for what is drawn as a picture — a file's or a sticker's bytes
     /// are the opener's to ask for, not the transcript's.
-    fn want_picture(&mut self, props: &PanelProps, m: &Msg, render: &RenderContext) {
+    fn want_picture(&self, cx: &mut Cx, m: &Msg, render: &RenderContext) {
+        if !super::super::runtime::view_settled(&self.viewed, render.now) { return; }
         let Some(md) = m.media.as_ref() else { return };
         if !matches!(md.kind.as_str(), "photo" | "video" | "circle") {
             return;
@@ -1081,16 +1060,13 @@ impl ChatPanel {
         let (Some(reference), Some(rid)) = (md.reference.as_deref(), md.rid.as_deref()) else {
             return;
         };
-        if !reference.starts_with("tg:") || self.wanted.contains(&m.id) {
+        if !reference.starts_with("tg:") {
             return;
         }
-        // The cheap look: whether the cache has a file under that name, not
-        // its bytes — the row's own draw reads those.
-        if model::media_path(render.store_dir.as_deref(), reference).is_some() {
-            return;
-        }
-        self.wanted.insert(m.id);
-        with_chat(props, |c| c.want_file(rid));
+        // The picture worker reports cache misses; no filesystem stat is
+        // needed in this row loop, including while the decode is pending.
+        if !super::pictures::missing(cx, md, render.store_dir.as_deref()) { return; }
+        super::super::runtime::want_view_file(&self.viewed, rid);
     }
 
     /// The message whose rectangle the shell's hit is, by the rectangles
@@ -1130,10 +1106,7 @@ pub fn row_label(r: &Row, now: f64) -> String {
 
 /// Fills one row: shows the one part it is and stands the others down.
 ///
-/// `pictured` remembers which message each picture box and map last
-/// decoded, by the box's widget uid, so a box that already shows the
-/// picture is not asked to decode it again; a caller with no memory — the
-/// library, for a fixture — decodes every time. `player` is where the
+/// Pictures share a bounded cache across row twins and chats. `player` is where the
 /// line's recording stands, for a line that has one. Public because the
 /// library draws a fixture through the very same function.
 pub fn populate(
@@ -1141,7 +1114,6 @@ pub fn populate(
     row: &WidgetRef,
     r: &Row,
     selection: (bool, bool),
-    mut pictured: Option<&mut HashMap<u64, (MsgId, String)>>,
     player: Option<PlayerState>,
     render: &RenderContext,
 ) {
@@ -1224,61 +1196,15 @@ pub fn populate(
                 m.entities.as_deref(),
             );
 
-            // The media, through the kit: a picture — a photo, or a video's
-            // poster — decoded when this box's message changed, which the
-            // cursor's wash counts as, since each twin has a box of its
-            // own; a map for a place, the same way; the player over a
-            // recording, drawn every frame since it moves; a sticker as its
-            // emoji drawn large; and every kind but a drawn photo on a line
-            // of its own as well.
-            // Remembered by the line *and* the file it shows, so a photo
-            // swapped under the same line is decoded again (review,
-            // 2026-09-07).
-            let shows = (
-                m.id,
-                m.media
-                    .as_ref()
-                    .and_then(|md| md.reference.clone())
-                    .unwrap_or_default(),
-            );
-            let mut fresh = |w: &WidgetRef| match pictured.as_deref_mut() {
-                Some(memory) => {
-                    let uid = w.widget_uid().0;
-                    let fresh = memory.get(&uid) != Some(&shows);
-                    if fresh {
-                        memory.insert(uid, shows.clone());
-                    }
-                    fresh
-                }
-                None => true,
-            };
-            let bytes = m
-                .media
-                .as_ref()
-                .and_then(|md| md.picture_bytes(render.store_dir.as_deref()));
+            // Disk reads, decoding and map construction belong to the picture
+            // workers. A source-keyed texture is shared across recycled twins.
             let img_box = line.widget(cx, ids!(body.img_box));
             let slot = line.widget(cx, ids!(body.clip_box));
             let video = inline_video::has_video(m);
-            let decode = bytes.is_some() && fresh(if video { &slot } else { &img_box });
-            inline_video::fill_poster(cx, &slot, m, bytes.as_deref().filter(|_| video), decode);
-            let shown = media::fill_picture(cx, &img_box, bytes.as_deref().filter(|_| !video), decode);
-            let place = m
-                .media
-                .as_ref()
-                .filter(|md| matches!(md.kind.as_str(), "location" | "live"))
-                .and_then(|md| Some((md.lat?, md.lon?)));
+            inline_video::fill_poster(cx, &slot, m, render.store_dir.as_deref());
+            let shown = super::pictures::photo(cx, &img_box, m.media.as_ref().filter(|_| !video), render.store_dir.as_deref());
             let map_box = line.widget(cx, ids!(body.map));
-            match place {
-                Some((lat, lon)) => {
-                    if fresh(&map_box) {
-                        let snap = map::snapshot(&mut FakeTiles, lat, lon, map::ZOOM, 320, 160);
-                        media::fill_map(cx, &map_box, Some(&snap));
-                    } else {
-                        map_box.set_visible(cx, true);
-                    }
-                }
-                None => map_box.set_visible(cx, false),
-            }
+            super::pictures::place(cx, &map_box, m.media.as_ref(), render.store_dir.is_none());
             let player_w = line.widget(cx, ids!(body.player));
             media::fill_player(cx, &player_w, player.as_ref());
             let sticker = m.media.as_ref().filter(|md| md.is_sticker());

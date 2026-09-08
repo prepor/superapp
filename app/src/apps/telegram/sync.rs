@@ -37,6 +37,7 @@ mod mentions;
 mod counts;
 mod reactions;
 mod views;
+mod history;
 
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
@@ -90,6 +91,7 @@ pub struct Account<T: Td> {
     pages: std::cell::RefCell<std::collections::VecDeque<Page>>,
     /// When the page on the wire went, or `None` when none is.
     in_flight: std::cell::Cell<Option<(Page, f64)>>,
+    history_views: std::cell::RefCell<history::HistoryViews>,
     mention_generation: std::cell::Cell<u64>,
     mention_scans: std::cell::RefCell<std::collections::HashMap<PeerId, mentions::Scan>>,
     /// The earliest the next page may go: the pace, or the wait Telegram
@@ -108,6 +110,8 @@ struct Page {
     topic: i64,
     from: MsgId,
     walk: Walk,
+    /// A viewport's history walk. None for explicitly requested background work.
+    view: Option<u64>,
 }
 
 /// Seconds between history pages. Telegram throttles `messages.getHistory`
@@ -246,6 +250,7 @@ impl<T: Td> Account<T> {
             typing: std::cell::RefCell::new(std::collections::HashMap::new()),
             pages: std::cell::RefCell::new(std::collections::VecDeque::new()),
             in_flight: std::cell::Cell::new(None),
+            history_views: std::cell::RefCell::new(history::HistoryViews::default()),
             mention_generation: std::cell::Cell::new(0),
             mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
@@ -269,6 +274,7 @@ impl<T: Td> Account<T> {
             topic,
             from: 0,
             walk: Walk::Fill,
+            view: None,
         };
         if !pages.contains(&page) {
             pages.push_front(page);
@@ -281,6 +287,7 @@ impl<T: Td> Account<T> {
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
         let rt = runtime::of(w.store());
+        self.sync_history_views(w);
         // Retire canceled/expired reads even while authorization is pending.
         // Reaction reply timeouts start in send(), only after the chat is ready.
         let pending = std::mem::take(&mut *self.deferred_reads.borrow_mut());
@@ -310,7 +317,7 @@ impl<T: Td> Account<T> {
         }
         // Files a drawing found missing go before background history pages.
         let wanted = runtime::of(w.store()).take_wanted();
-        for rid in wanted.files {
+        for rid in wanted.files.into_iter().chain(rt.take_view_files(w.now())) {
             self.send(w, &request_file(&rid));
         }
         for chat in wanted.chats {
@@ -345,7 +352,7 @@ impl<T: Td> Account<T> {
             self.finish_page(w, page, true);
             runtime::of(w.store()).operations.fail_context(
                 w.store(),
-                &history_extra_in(page.chat, page.topic, page.from, page.walk),
+                &page.extra(),
                 "Telegram did not return the history page. Try again.",
             );
         }
@@ -359,7 +366,7 @@ impl<T: Td> Account<T> {
         };
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
-        self.send(w, &get_history_in(page.chat, page.topic, page.from, page.walk));
+        self.send(w, &page.request());
     }
 
     /// Files a write's outcome. A refused write goes to the trace and, once
@@ -555,6 +562,7 @@ impl<T: Td> Account<T> {
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
         self.auth_ready.set(false);
+        self.sync_history_views(w);
         runtime::of(w.store()).set_connection_error(None);
         let now = w.now();
         self.retry_parameters.set(None);
@@ -797,10 +805,16 @@ impl<T: Td> Account<T> {
             // whole queue waits that long. Anything else — a chat gone
             // private, not found — ends that chat's walk.
             (Some(extra), true) if parse_history_in(extra).is_some() => {
-                let Some((chat, topic, walk, from)) = parse_history_in(extra) else {
+                let Some(page) = Page::parse(extra) else {
                     return;
                 };
-                let page = Page { chat, topic, walk, from };
+                let wait = (v["code"].as_i64() == Some(429))
+                    .then(|| retry_after(v["message"].as_str().unwrap_or("")))
+                    .flatten();
+                // A canceled request can still carry a server-wide flood wait.
+                if let Some(secs) = wait {
+                    self.not_before.set(self.not_before.get().max(w.now() + secs + 1.0));
+                }
                 if self
                     .in_flight
                     .get()
@@ -811,13 +825,10 @@ impl<T: Td> Account<T> {
                 if !self.accept_page(page) {
                     return;
                 }
-                let wait = (v["code"].as_i64() == Some(429))
-                    .then(|| retry_after(v["message"].as_str().unwrap_or("")))
-                    .flatten();
+                if !self.history_wanted(w, page) { return; }
                 match wait {
-                    Some(secs) => {
-                        self.not_before.set(w.now() + secs + 1.0);
-                        self.pages.borrow_mut().push_front(Page { chat, topic, from, walk });
+                    Some(_) => {
+                        self.pages.borrow_mut().push_front(page);
                     }
                     None => self.finish_page(w, page, true),
                 }
@@ -1703,14 +1714,15 @@ impl<T: Td> Account<T> {
     /// from, ends the walk. Media is fetched for the first page only — what
     /// the transcript shows as it opens — never for the thousands beneath.
     fn on_history(&self, w: &World, v: &Value) {
-        let Some((chat, topic, walk, from)) = v["@extra"].as_str().and_then(parse_history_in) else {
+        let Some(page) = v["@extra"].as_str().and_then(Page::parse) else {
             return;
         };
-        let page = Page { chat, topic, walk, from };
+        let Page { chat, topic, walk, from, .. } = page;
         let stale = self.in_flight.get().is_some_and(|(current, _)| current != page);
         if !self.accept_page(page) {
             return;
         }
+        if !self.history_wanted(w, page) { return; }
         if matches!(walk, Walk::Mentions(_)) {
             self.on_mentions(w, v, page);
             return;
@@ -1789,7 +1801,7 @@ impl<T: Td> Account<T> {
         };
         runtime::of(w.store()).set_loading_in(chat, topic, next.is_some());
         if let Some((from, walk)) = next {
-            self.pages.borrow_mut().push_back(Page { chat, topic, from, walk });
+            self.pages.borrow_mut().push_back(Page { from, walk, ..page });
         }
     }
 
