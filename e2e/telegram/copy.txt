@@ -11,6 +11,7 @@ wait 900
 click "stelaxis"
 wait 900
 
+visible "text: meeting moved to 15:00"
 dblclick "text: meeting moved to 15:00"
 wait 400
 copy "meeting"

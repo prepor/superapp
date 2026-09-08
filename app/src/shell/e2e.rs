@@ -83,7 +83,10 @@ impl Stage {
                 text == expected
             });
             if let Some(text) = text {
-                return Some(Hit::new(label, text.area().clipped_rect(cx), MouseCursor::Text, *slot));
+                let area = text.area();
+                let mut hit = Hit::new(label, area.clipped_rect(cx), MouseCursor::Text, *slot);
+                hit.unclipped = Some(area.rect(cx));
+                return Some(hit);
             }
         }
         None
