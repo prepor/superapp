@@ -135,6 +135,14 @@ and selections.
 
 ## Agent drafts and sends
 
+The `line` panel's agent context describes one message, identifies its chat
+and message arguments, and explains its reply and editing actions. The full
+cached text or caption and quoted reply are rendered as text blocks with
+their whitespace preserved, alongside the SQL and row metadata.
+They are re-read when the chip is sent or `panels.context` is called, so
+edits made after attaching a panel reach the agent. Table previews retain
+their 200-character cell limit; the full text uses the panel's 32 KiB budget.
+
 Agents find recipients and read cached history with `sql.query`. Telegram's
 data dictionary explains chat and topic ids, the cache's limits, and why raw
 SQL writes cannot send messages or manage the live composer.

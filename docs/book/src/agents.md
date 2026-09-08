@@ -270,14 +270,18 @@ network.
 
 ### What a panel says about itself
 
-Two additions to the [contract](./apps.md#what-an-app-registers), both with
-defaults, so no existing panel had to change:
+The [contract](./apps.md#what-an-app-registers) provides three hooks with
+defaults:
 
 - `Panel::about` is what this panel is about, for an agent: one paragraph in
   the app's words — what the rows are, what the arguments mean, what a person
   does here. The default is the title and the identity. Every panel kind in
   this build answers it, `Missing` included, which says that no app here owns
   the tag and that its arguments mean whatever the build that has it means.
+- `Panel::context_text_columns` names SQL result columns to include in full
+  as text blocks before their table previews. It defaults to none. Telegram's
+  `line` panel names `text` and `reply_text`, preserving the complete message
+  and quoted reply, including line breaks and code fences.
 - `App::describe` is the app's data in its own words: each table, what a row
   is, the columns that matter, the values a column takes, and what must never
   be written directly. Mail's is the data half of the [mail chapter](./mail.md)
@@ -317,8 +321,11 @@ move uid 91 from INBOX to Archive — done, aug 30 14:22
 ````
 
 The rows are re-read at render time off the store's own reader, bound with the
-values the draw bound: at most 50 a query, 200 characters a cell, 32 KiB a
-chip, with a line saying what was cut. The recent effects are the [effect
+values the draw bound: at most 50 a query, 200 characters a table cell, 32 KiB
+a chip, with a line saying what was cut. Columns selected for full text are
+also rendered outside the table without the cell limit; the whole-chip cap
+still applies. These text blocks are re-read with the rows, including after
+the panel closes. The recent effects are the [effect
 log](./data-substrate.md#effects-and-job-panels)'s newest ten for this panel's
 arguments, and only what **wrote** — the same narrowing the log panel opens
 on, because a chip full of *connect*, *select*, *fetch* tells a model nothing
@@ -346,8 +353,10 @@ A chip reads as the panel's title — `inbox`, `Q3 planning`, `~/Downloads` —
 and knows which slot still shows it, so a click can focus it. `Chip` is an enum
 with one variant, `Panel`, and room for `File`, `Mail` and `Selection`: each
 variant renders itself, which is why nothing else in the app matches on one.
-Only the identity, the title, the workspace and the paragraph are written into
-a turn; the trace is not, because a chip points at a panel and not at a moment.
+The chip stores its identity, title, workspace and paragraph in the turn.
+The query trace and full-text column names stay in memory; restored chips
+obtain them from the live panel.
+The rendered context is saved separately on the turn for the agent request.
 
 ## Tools: the agent API on the apps
 

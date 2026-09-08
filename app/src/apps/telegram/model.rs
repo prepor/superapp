@@ -1265,7 +1265,7 @@ static Q_HISTORY: Q = Q {
     // nothing outside it, and joining on the id alone quoted whichever chat's
     // line happened to wear that number (V8).
     sql: "SELECT m.id, m.chat, m.sender, COALESCE(s.name, ''), m.date, m.text, m.out, m.state,
-                 m.edited, m.reply_to, COALESCE(rs.name, ''), COALESCE(r.text, ''),
+                 m.edited, m.reply_to, COALESCE(rs.name, ''), COALESCE(r.text, '') AS reply_text,
                  m.fwd_from, m.views, m.comments,
                  CASE WHEN rx.known THEN rx.counts ELSE m.reactions END, m.service,
                  COALESCE(r.out, 0), r.media,

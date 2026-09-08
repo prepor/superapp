@@ -46,6 +46,9 @@ pub struct PanelChip {
     pub queries: Vec<TraceEntry>,
     /// The panel's own paragraph, in the app's words.
     pub about: String,
+    /// SQL columns rendered as full text, kept with the in-memory trace.
+    /// Restored chips obtain both from the live panel; values are read at send time.
+    pub text_columns: Vec<String>,
 }
 
 /// What a chip of a panel that nobody has open says instead of its
@@ -106,9 +109,9 @@ impl Chip {
     /// `Mail` or a `Selection` can join it later without the reader having
     /// to guess which it is reading.
     ///
-    /// The trace is not written down. A chip is a reference, and a trace is
-    /// one draw's provenance: a turn read back a week later re-derives it
-    /// from whatever the panel is showing then, or renders without it.
+    /// The trace and full-text column names are not written down. A chip
+    /// is a reference: a turn read back a week later re-derives them from
+    /// whatever the panel is showing then, or renders without them.
     #[must_use]
     pub fn to_json(&self) -> Value {
         match self {
@@ -155,6 +158,7 @@ impl Chip {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    text_columns: Vec::new(),
                 }))
             }
             _ => None,
@@ -183,6 +187,7 @@ impl Chip {
             workspace: 0,
             queries: Vec::new(),
             about: NOT_OPEN.to_string(),
+            text_columns: Vec::new(),
         }))
     }
 }
@@ -196,6 +201,7 @@ impl PanelChip {
             workspace: cx.workspace,
             queries: cx.queries,
             about: cx.about,
+            text_columns: cx.text_columns,
         }
     }
 
@@ -209,6 +215,7 @@ impl PanelChip {
             title: self.title.clone(),
             workspace: self.workspace,
             about: self.about.clone(),
+            text_columns: self.text_columns.clone(),
             queries: self.queries.clone(),
         };
         if cx.queries.is_empty() {
