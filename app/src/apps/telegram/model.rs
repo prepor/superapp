@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use kernel::filter::Op;
 use kernel::panel::{PanelId, Tag};
-use kernel::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, Values};
+use kernel::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, TextIndex, Values};
 use kernel::store::{Q, Store, Val};
 use kernel::time::civil_from_days;
 
@@ -1019,11 +1019,12 @@ static MESSAGES_SPEC: SqlSpec = SqlSpec {
              m.media_clip, m.media_clip_rid, m.topic",
     from: "tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
     base: "m.service = 0",
-    text: &["m.text"],
-    index: None,
+    text: &[],
+    index: Some(TextIndex { build: super::search_index::predicate }),
     tags: &[
         ("from", TagSql::Col("COALESCE(s.name, '')")),
-        ("chat", TagSql::Col("p.name")),
+        ("chat", TagSql::TextMatch("m.chat IN (SELECT id FROM tg_peer
+            WHERE casefold(name) LIKE casefold(?) ESCAPE '\\')")),
         ("date", TagSql::Col("m.date")),
         ("media", TagSql::Where("m.media IS NOT NULL")),
     ],
@@ -1067,7 +1068,7 @@ fn suggest_messages(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
 
 /// The datasource a messages panel pages through, everywhere or in one
 /// chat — the same source, narrowed by the panel's seeded `@chat:`.
-pub static MESSAGES: SqlSource<MsgHit, i64> = SqlSource {
+static MESSAGES_SQL: SqlSource<MsgHit, i64> = SqlSource {
     spec: &MESSAGES_SPEC,
     tags: MESSAGES_TAGS,
     map: msg_hit_row,
@@ -1086,9 +1087,17 @@ static REPLIES_SPEC: SqlSpec = SqlSpec {
     ..MESSAGES_SPEC
 };
 
-pub static REPLIES: SqlSource<MsgHit, i64> = SqlSource {
+static REPLIES_SQL: SqlSource<MsgHit, i64> = SqlSource {
     spec: &REPLIES_SPEC,
-    ..MESSAGES
+    ..MESSAGES_SQL
+};
+
+pub static MESSAGES: super::search_index::MessageSource = super::search_index::MessageSource {
+    sql: &MESSAGES_SQL, all: true,
+};
+
+pub static REPLIES: super::search_index::MessageSource = super::search_index::MessageSource {
+    sql: &REPLIES_SQL, all: false,
 };
 
 static Q_REPLY_CHATS: Q = Q {

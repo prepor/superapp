@@ -481,6 +481,9 @@ fn open_writer(target: &Target) -> rusqlite::Result<Connection> {
         .or_else(|_| conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // REPLACE deletes conflicting rows. SQLite only runs their DELETE
+    // triggers with this enabled, so derived indexes otherwise retain them.
+    conn.pragma_update(None, "recursive_triggers", "ON")?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     register_text_functions(&conn)?;
     Ok(conn)

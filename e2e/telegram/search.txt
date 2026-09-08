@@ -1,0 +1,29 @@
+# args: --library messages
+# env:
+#
+# Literal infixes in the production messages table, including a short query
+# and a chat filter. Clicks assert that the filtered rows can be opened.
+wait 8000
+click "messages/everywhere"
+wait 700
+key /
+wait 300
+type "rm"
+wait 500
+click "and the thermos"
+wait 500
+key /
+wait 300
+type "hermos"
+wait 500
+click "and the thermos"
+wait 500
+key /
+wait 300
+type "@chat:Hiking thermos"
+wait 500
+key esc
+wait 300
+click "and the thermos"
+wait 300
+quit

@@ -2,19 +2,20 @@
 //! list, seeded with the chat it is about.
 
 use kernel::panel::PanelId;
-use kernel::richtable::{ListState, SqlSource};
+use kernel::richtable::ListState;
 use makepad_widgets::*;
 
 use crate::shell::widgets::table::{self, RowSpec, TableView};
 
 use super::super::model::{self, MsgHit};
 use super::super::panels::{Chat, Messages};
+use super::super::search_index::MessageSource;
 
 /// What the table needs to know about a messages list's rows.
 pub struct MessagesRows;
 
 impl RowSpec for MessagesRows {
-    type Src = &'static SqlSource<MsgHit, i64>;
+    type Src = &'static MessageSource;
     type Panel = Messages;
 
     fn list(panel: &mut Messages) -> &mut ListState<Self::Src> {

@@ -1959,6 +1959,7 @@ name = "superapp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "caseless",
  "html5ever",
  "imap",
  "imap-proto",

@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod scenes;
 pub mod schema;
 pub mod search;
+mod search_index;
 pub mod seed;
 /// The authorization state machine and the per-account worker loop.
 pub mod sync;

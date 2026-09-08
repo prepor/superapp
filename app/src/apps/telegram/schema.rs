@@ -33,8 +33,54 @@ pub static SCHEMA: Schema = Schema {
         Step::Always(v12_mentions),
         Step::Always(v13_topic_schema),
         Step::Always(v14_reaction_state),
+        Step::Always(v15_message_search),
+        Step::Derived {
+            key: "telegram:message-substr",
+            version: 1,
+            rebuild: rebuild_message_substr,
+        },
     ],
 };
+
+fn v15_message_search(c: &Connection) -> rusqlite::Result<()> {
+    super::search_index::register(c)?;
+    let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master
+        WHERE name = 'tg_message_substr')", [], |r| r.get(0))?;
+    if exists { return Ok(()); }
+    let tx = c.unchecked_transaction()?;
+    tx.execute_batch("
+        CREATE VIRTUAL TABLE tg_message_substr USING fts5(
+            grams, content='', detail=none, columnsize=0, tokenize='ascii');
+        CREATE TRIGGER tg_message_substr_ai AFTER INSERT ON tg_message WHEN new.service = 0 BEGIN
+            INSERT INTO tg_message_substr(rowid, grams) VALUES(new.seq, tg_search_grams(new.text));
+        END;
+        CREATE TRIGGER tg_message_substr_ad AFTER DELETE ON tg_message WHEN old.service = 0 BEGIN
+            INSERT INTO tg_message_substr(tg_message_substr, rowid, grams)
+                VALUES('delete', old.seq, tg_search_grams(old.text));
+        END;
+        CREATE TRIGGER tg_message_substr_au AFTER UPDATE OF seq, text, service ON tg_message
+        WHEN old.seq != new.seq OR old.text != new.text OR old.service != new.service BEGIN
+            INSERT INTO tg_message_substr(tg_message_substr, rowid, grams)
+                SELECT 'delete', old.seq, tg_search_grams(old.text) WHERE old.service = 0;
+            INSERT INTO tg_message_substr(rowid, grams)
+                SELECT new.seq, tg_search_grams(new.text) WHERE new.service = 0;
+        END;
+        CREATE INDEX tg_message_date ON tg_message(date DESC, seq DESC) WHERE service = 0;
+        CREATE INDEX tg_message_search_meta ON tg_message(seq, chat, sender, date, media) WHERE service = 0;
+        CREATE INDEX tg_message_search_chat ON tg_message(chat, date, seq, sender, media) WHERE service = 0;
+    ")?;
+    tx.commit()
+}
+
+fn rebuild_message_substr(c: &Connection) -> rusqlite::Result<()> {
+    // Older writers omitted recursive_triggers, leaving stale grams when
+    // undo used REPLACE. Rebuild those stores once, and backfill new indexes.
+    let tx = c.unchecked_transaction()?;
+    tx.execute_batch("INSERT INTO tg_message_substr(tg_message_substr) VALUES('delete-all');
+        INSERT INTO tg_message_substr(rowid, grams)
+            SELECT seq, tg_search_grams(text) FROM tg_message WHERE service = 0;")?;
+    tx.commit()
+}
 
 fn v14_reaction_state(c: &Connection) -> rusqlite::Result<()> {
     if !columns(c, "tg_message")?.contains("content_type") {
@@ -695,6 +741,7 @@ mod tests {
     use rusqlite::Connection;
 
     mod topics;
+    mod search;
 
     #[test]
     fn reaction_upgrade_preserves_counts_and_does_not_reseed_confirmed_removals() {
