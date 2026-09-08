@@ -33,6 +33,7 @@ mod performance;
 mod downloads_tests;
 mod history;
 mod context_tests;
+mod reading;
 
 fn session() -> Session {
     Session::fake(APPS)
@@ -708,15 +709,15 @@ fn unread_replies_open_at_the_message_and_only_visible_items_are_read() {
     with_chat(&s, reader, |c| {
         assert_eq!(c.cursor(), Some(reply.id));
         assert_eq!(c.take_follow_wish(), Some(reply.id), "the transcript scrolls to the reply");
-        c.view_mentions(&[], s.now());
+        c.view_messages(&[], s.now());
     });
     assert_eq!(model::reply_count(s.store()), 2, "opening alone reads no notification");
     assert_eq!(unread(&s, STELAXIS).0, 8, "a targeted opening does not read the whole chat");
-    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now()));
+    with_chat(&s, reader, |c| c.view_messages(&[reply.id], s.now()));
     assert_eq!(model::reply_count(s.store()), 1);
     assert!(!model::line(s.store(), reply.chat, reply.id).unwrap().unread_mention);
     assert!(model::line(s.store(), rows[1].chat, rows[1].id).unwrap().unread_mention);
-    with_chat(&s, reader, |c| c.view_mentions(&[reply.id], s.now() + 10.0));
+    with_chat(&s, reader, |c| c.view_messages(&[reply.id], s.now() + 10.0));
     assert_eq!(model::reply_count(s.store()), 1, "repeat views cannot decrement twice");
 }
 
@@ -751,14 +752,14 @@ fn live_reply_views_wait_for_acknowledgment_and_can_retry() {
         .filter(|m| m.unread_mention).map(|m| m.id).collect();
     let reader = open_root(&mut s, Chat::at(STELAXIS, unread_ids[0]));
     let inbox = runtime::of(s.store()).connect();
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now()));
+    with_chat(&s, reader, |c| c.view_messages(&unread_ids[..1], s.now()));
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@type"], "viewMessages");
     assert_eq!(request["message_ids"], serde_json::json!([unread_ids[0]]));
     assert_eq!(model::reply_count(s.store()), 2, "enqueue is not acknowledgment");
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 1.0));
+    with_chat(&s, reader, |c| c.view_messages(&unread_ids[..1], s.now() + 1.0));
     assert!(inbox.try_recv().is_err(), "views are deduplicated while pending");
-    with_chat(&s, reader, |c| c.view_mentions(&unread_ids[..1], s.now() + 6.0));
+    with_chat(&s, reader, |c| c.view_messages(&unread_ids[..1], s.now() + 6.0));
     assert!(inbox.try_recv().is_ok(), "an unacknowledged view can retry");
 }
 

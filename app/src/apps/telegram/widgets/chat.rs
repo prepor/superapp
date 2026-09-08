@@ -72,7 +72,7 @@ const FILE_TAG: Tag = Tag("file");
 struct RowHit {
     id: MsgId,
     rect: Rect,
-    /// Mention acknowledgement measures how much of the full message was seen.
+    /// Read acknowledgment measures how much of the full message was seen.
     unclipped: Rect,
 }
 
@@ -81,7 +81,7 @@ impl RowHit {
         let full = self.unclipped;
         let height = (full.pos.y + full.size.y).min(viewport.pos.y + viewport.size.y)
             - full.pos.y.max(viewport.pos.y);
-        // A long reply can be taller than the viewport; showing a
+        // A long message can be taller than the viewport; showing a
         // substantial part of it must still let the reader dismiss it.
         viewport.size.y > 0.0 && height + 1.0 >= full.size.y.min(viewport.size.y * 0.5)
             && full.pos.x >= viewport.pos.x - 1.0
@@ -198,7 +198,9 @@ impl Widget for ChatPanel {
         if matches!(event, Event::WindowLostFocus(_) | Event::Background | Event::Shutdown) {
             with_chat(&props, Chat::flush_draft);
         }
-        if scope.data.get_mut::<Session>().is_some_and(|s| !super::message_panel_visible(s, props.slot)) {
+        let panel_visible = scope.data.get_mut::<Session>()
+            .is_some_and(|s| super::message_panel_visible(s, props.slot));
+        if !panel_visible {
             self.viewed = None;
         }
 
@@ -271,11 +273,11 @@ impl Widget for ChatPanel {
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
-        if has_focus && self.mounted {
+        if has_focus && self.mounted && panel_visible && !self.background {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
             let visible: Vec<MsgId> = self.rows.iter().filter(|r| r.viewed_in(viewport))
                 .map(|r| r.id).collect();
-            with_chat(&props, |c| c.view_mentions(&visible, super::now(scope)));
+            with_chat(&props, |c| c.view_messages(&visible, super::now(scope)));
         }
         // A reply or an edit asked for the caret — the bar's verb over the
         // cursor, or the line's card through the join — since both are
@@ -1326,7 +1328,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipped_hits_only_acknowledge_mentions_after_enough_of_the_message_is_shown() {
+    fn clipped_hits_only_acknowledge_reads_after_enough_of_the_message_is_shown() {
         let rect = |y, h| Rect { pos: dvec2(0.0, y), size: dvec2(300.0, h) };
         let viewport = rect(100.0, 200.0);
         for (full, viewed) in [

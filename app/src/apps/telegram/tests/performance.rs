@@ -270,7 +270,7 @@ fn chat_interaction_timing() {
     eprintln!("10,000 messages: previous history scans per input/frame = {:?}", start.elapsed() / 1000);
     let start = Instant::now();
     for _ in 0..1000 {
-        with_chat(&s, slot, |c| c.view_mentions(&visible, s.now()));
+        with_chat(&s, slot, |c| c.view_messages(&visible, s.now()));
         black_box(snapshot.row_index(visible[0]));
     }
     eprintln!("10,000 messages: indexed input/frame lookups = {:?}", start.elapsed() / 1000);

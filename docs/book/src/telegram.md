@@ -29,6 +29,11 @@ history walk, including empty chats waiting for their first messages. Leaving a
 chat cancels its queued pages and thumbnail requests; late history replies cannot
 restart an abandoned walk. Telegram's page pacing and retry waits still apply.
 
+Viewing newer messages in the focused conversation advances its read position,
+including messages loaded or received after the panel opened. Live unread counts
+follow Telegram's acknowledgment; unacknowledged views retry while visible.
+Hidden conversations and background windows send no viewport read receipts.
+
 With the transcript focused, **Ctrl+E** or **End** jumps to the end of the chat,
 selects its newest message and resumes following new messages; **Home** selects
 the oldest loaded message. In the composer, **Ctrl+E** moves the caret to the
