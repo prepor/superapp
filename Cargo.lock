@@ -1969,6 +1969,7 @@ dependencies = [
  "makepad-objc-sys",
  "makepad-widgets",
  "markup5ever_rcdom",
+ "pulldown-cmark",
  "regex",
  "ring",
  "rusqlite",

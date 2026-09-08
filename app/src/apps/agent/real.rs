@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use super::gateway::{request_parts, stream_completion, Failure, Flow, Gateway};
 use super::wire::{ChatRequest, Chunk, Completion};
-use super::{GATEWAY, PROVIDER};
+use super::{Provider, GATEWAY};
 
 /// How much of a refusal's body is worth reading. An endpoint that answers
 /// a gigabyte to a bad account is not owed the memory.
@@ -168,6 +168,7 @@ impl Gateway for RealGateway {
         req: &ChatRequest,
         on: &mut dyn FnMut(&Chunk) -> Flow,
     ) -> Result<Completion, Failure> {
+        let provider = Provider::for_model(&req.model)?;
         let mut secrets = self.secrets();
         // The token out of the keychain, the account off the bucket's host or
         // out of Cloudflare's own answer: device sync's credentials, borne
@@ -179,7 +180,7 @@ impl Gateway for RealGateway {
         let account = self
             .account(&token)
             .map_err(|e| Failure::new(format!("gateway: {e}")))?;
-        let parts = request_parts(&PROVIDER, &account, GATEWAY, &token, req);
+        let parts = request_parts(&provider, &account, GATEWAY, &token, req);
         let resp = http::send(&Request {
             method: "POST",
             url: &parts.url,
@@ -195,7 +196,11 @@ impl Gateway for RealGateway {
             return Err(refused(status, body));
         }
         let mut events = SseReader::new(resp.body);
-        stream_completion(std::iter::from_fn(|| events.next_event().transpose()), on)
+        let events = std::iter::from_fn(|| events.next_event().transpose());
+        match provider {
+            Provider::WorkersAi => stream_completion(events, on),
+            Provider::OpenAi => super::responses::stream(events, &req.model, on),
+        }
     }
 }
 

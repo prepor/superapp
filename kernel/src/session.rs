@@ -730,8 +730,10 @@ impl Session {
             }
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
-                // too: half an action is not an action.
+                // too, keeping the screen's unsnapshotted grid.
+                let grid = self.wm.grid;
                 self.wm = Wm::restore(before);
+                self.wm.set_grid(grid);
                 self.unsettle();
                 self.notify(format!("the store refused: {e}"), true);
                 return None;
@@ -839,7 +841,11 @@ impl Session {
         let Some(step) = step else {
             return false;
         };
+        // The grid belongs to the current screen, not to history. Restore
+        // supplies a default grid because snapshots deliberately omit it.
+        let grid = self.wm.grid;
         self.wm = Wm::restore(step.snap);
+        self.wm.set_grid(grid);
         // A walk is nobody's `&mut self`: it comes from a chord or the
         // history overlay, so the instances settle within the call.
         self.unsettle();
@@ -1219,6 +1225,8 @@ mod tests {
     #[test]
     fn a_refused_write_puts_the_layout_back() {
         let mut s = Session::fake(APPS);
+        let grid = Grid { w: 4, h: 3 };
+        s.set_grid(grid);
         let first = open(&mut s, note("one"));
         s.take_notes();
         let out: Option<()> = s.act(
@@ -1231,6 +1239,10 @@ mod tests {
         );
         assert!(out.is_none());
         s.settle();
+        assert!(
+            s.ws().wss.iter().all(|ws| ws.grid == grid),
+            "rollback keeps the current screen's grid on every workspace"
+        );
         assert_eq!(s.panels().len(), 1, "the layout went back");
         assert_eq!(s.focus(), Some(first));
         assert!(s.take_notes()[0].msg.starts_with("the store refused"));
@@ -1361,6 +1373,23 @@ mod tests {
             fresh.panel(slot).unwrap().borrow().title(),
             format!("Some({slot})")
         );
+    }
+
+    #[test]
+    fn undo_and_redo_keep_the_current_screens_grid() {
+        let mut s = Session::fake(APPS);
+        open(&mut s, note("first"));
+        open(&mut s, note("second"));
+        // A phone or a folded screen can have a different grid from the
+        // one on which the history nodes were recorded.
+        let grid = Grid { w: 4, h: 3 };
+        s.set_grid(grid);
+        assert!(s.undo());
+        assert_eq!(s.ws().grid, grid);
+        assert!(s.showing(&note("second")).is_empty());
+        assert!(s.redo());
+        assert_eq!(s.ws().grid, grid);
+        assert_eq!(s.showing(&note("second")).len(), 1);
     }
 
     /// The three knobs the shell turns that are not actions: the grid, the

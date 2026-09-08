@@ -38,7 +38,7 @@ use super::super::model::{self, Call, CallId, Run, Turn, TurnId};
 use super::super::panels::Chat;
 use super::super::run::Tail;
 use super::super::wire::Role;
-use super::super::{calls, AGENT};
+use super::super::{calls, text, AGENT};
 
 /// How many chips one row shows by name. Past this it says how many more
 /// there are: a composer is a composer, and thirty panels must not push the
@@ -281,7 +281,21 @@ impl Widget for AgentChatPanel {
             }
         }
 
-        self.view.handle_event(cx, event, scope);
+        // Capture only this panel's links: action broadcasts reach every
+        // open chat, but one click must open the source just once.
+        let mut actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
+        actions.retain(|action| {
+            if let Some(action) = action.as_widget_action() {
+                if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
+                    if text::web_url(&url) {
+                        cx.open_url(&url, OpenUrlInPlace::No);
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+        cx.extend_actions(actions);
         self.mount(cx, &props, scope);
         self.follow_focus(cx, &props, scope, event);
         if matches!(event, Event::MouseUp(_)) && std::mem::take(&mut self.caret) {
@@ -497,8 +511,8 @@ impl AgentChatPanel {
             .set_visible(cx, has && open);
         row.text_input(cx, ids!(theirs.reason_wrap.reason_txt))
             .set_text(cx, if has && open { reasoning.trim() } else { "" });
-        row.text_input(cx, ids!(theirs.theirs_txt))
-            .set_text(cx, &text);
+        row.widget(cx, ids!(theirs.theirs_txt))
+            .set_text(cx, &text::html(&text));
         let foot = match item {
             Item::Theirs(i) => shown.foots.get(i).cloned().unwrap_or_default(),
             _ => String::new(),
@@ -691,6 +705,18 @@ impl AgentChatPanel {
                         props.hits.add(line, r, MouseCursor::Text, props.slot);
                     }
                 }
+            }
+            if matches!(item, Item::Theirs(_) | Item::Tail) {
+                let body = row.html(cx, ids!(theirs.theirs_txt));
+                if let Some(body) = body.borrow() {
+                    for area in &body.text_flow.areas_tracker.areas {
+                        if area.is_valid(cx) {
+                            if let Some(rect) = visible(area.rect(cx), clip_rect) {
+                                props.hits.add("source link", rect, MouseCursor::Hand, props.slot);
+                            }
+                        }
+                    }
+                };
             }
         }
         // The composer, last: its chips take a press over anything the list

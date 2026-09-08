@@ -1,10 +1,9 @@
 //! The chat-completions wire, as Workers AI documents it.
 //!
-//! One shape is spoken to the gateway: the OpenAI-compatible
-//! chat-completions API, which Workers AI serves under the AI Gateway route
-//! `/workers-ai/v1/chat/completions` and which every provider behind the
-//! gateway shares — so a later model, or a later provider, is this wire
-//! under another name.
+//! This is also the agent's common transcript and streaming vocabulary.
+//! Workers AI speaks it directly; [`super::responses`] translates OpenAI's
+//! Responses API and keeps its original output beside the common message
+//! for subsequent tool rounds.
 //!
 //! Two rules hold over every type here. **Extra fields are ignored**: the
 //! providers add their own, and a chat must not fail because one of them
@@ -122,6 +121,16 @@ pub struct Message {
     /// muted, and sent back as it came.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Responses output, kept intact for tool continuations and assistant
+    /// phases. Only replayed to the same model; never sent to Workers AI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseOutput {
+    pub model: String,
+    pub items: Vec<Value>,
 }
 
 impl Message {
@@ -134,6 +143,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_content: None,
+            response: None,
         }
     }
 
@@ -541,6 +551,7 @@ impl Assembler {
             tool_calls,
             tool_call_id: None,
             reasoning_content: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),
+            response: None,
         };
         Ok(Completion {
             message,

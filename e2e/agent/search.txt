@@ -1,0 +1,30 @@
+# args: --grid 4x3 --window 380x780
+# env:
+# The scripted search answer carries the same inline Markdown links as
+# OpenAI. Headless mode ignores opening the browser after a source click.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+click "model: GLM"
+wait 400
+click "Sol"
+wait 400
+type "web search"
+wait 400
+click "send"
+wait 900
+click "source link"
+wait 400
+shot web-search
+click "ask"
+wait 400
+type "hello"
+wait 400
+click "send"
+wait 900
+click "Hello. I am the assistant."
+quit

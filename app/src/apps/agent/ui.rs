@@ -170,6 +170,26 @@ script_mod! {
         }
     }
 
+    /** The answer's Markdown, including inline web source links. */
+    mod.widgets.AgentAnswer = Html {
+        width: Fill, height: Fit
+        padding: 0, margin: 0
+        selectable: true
+        font_size: 10.5
+        font_color: #141414
+        draw_text +: { color: #141414 }
+        text_style_normal: mod.widgets.SMonoStyle{}
+        text_style_fixed: mod.widgets.SMonoStyle{}
+        a := mod.widgets.HtmlLink {
+            color: #141414
+            pressed_color: #141414
+        }
+        draw_selection +: {
+            draw_call_group: @selection
+            color: #00000020
+        }
+    }
+
     // ---- one line of the transcript ------------------------------------------
 
     /** One item: a person's turn, the agent's, a tool call's card, or the
@@ -218,7 +238,7 @@ script_mod! {
                 width: Fill, height: Fit
                 reason_txt := mod.widgets.AgentMuted {}
             }
-            theirs_txt := mod.widgets.SText { is_multiline: true }
+            theirs_txt := mod.widgets.AgentAnswer {}
             foot_lbl := mod.widgets.SLabel {
                 visible: false
                 text: ""
