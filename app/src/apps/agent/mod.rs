@@ -48,6 +48,7 @@ mod responses;
 pub mod run;
 pub mod scenes;
 pub mod schema;
+mod text;
 pub mod ui;
 pub mod widgets;
 pub mod wire;

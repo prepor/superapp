@@ -66,23 +66,24 @@ pub(super) fn request_body(req: &ChatRequest) -> Value {
     if let Some(effort) = &req.reasoning_effort {
         body["reasoning"] = json!({"effort": effort, "summary": "auto"});
     }
-    if !req.tools.is_empty() {
-        body["tools"] = req
-            .tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "name": wire_name(&t.function.name),
-                    "description": t.function.description,
-                    "parameters": t.function.parameters,
-                    // The apps' schemas have optional fields. Keep their meaning
-                    // rather than letting Responses make every property required.
-                    "strict": false,
-                })
+    let mut tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "name": wire_name(&t.function.name),
+                "description": t.function.description,
+                "parameters": t.function.parameters,
+                // The apps' schemas have optional fields. Keep their meaning
+                // rather than letting Responses make every property required.
+                "strict": false,
             })
-            .collect();
-    }
+        })
+        .collect();
+    // Hosted tools run within the response alongside the app's functions.
+    tools.push(json!({"type": "web_search"}));
+    body["tools"] = json!(tools);
     body
 }
 
@@ -405,6 +406,43 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["name"],
             "files.read_text"
         );
+    }
+
+    #[test]
+    fn hosted_search_keeps_its_citations_when_saved_and_replayed() {
+        let text = "Read [the Rust book](https://doc.rust-lang.org/book/).";
+        let output = json!([
+            {"type": "web_search_call", "id": "ws_1", "status": "completed",
+             "action": {"type": "search", "queries": ["Rust book"]}},
+            {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": text, "annotations": [
+                {"type": "url_citation", "start_index": 5, "end_index": text.len() - 1,
+                 "url": "https://doc.rust-lang.org/book/", "title": "The Rust Programming Language"}
+             ]}]}
+        ]);
+        let answer = read(vec![
+            json!({"type": "response.web_search_call.in_progress"}),
+            json!({"type": "response.web_search_call.searching"}),
+            json!({"type": "response.web_search_call.completed"}),
+            done(output.clone()),
+        ]).unwrap();
+        assert_eq!(answer.finish, Finish::Stop);
+        assert!(answer.message.tool_calls.is_empty(), "hosted search never enters the app's tool gate");
+        let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
+        assert_eq!(turn.message.text(), text);
+        assert_eq!(turn.message.response.as_ref().unwrap().items, output.as_array().unwrap().clone());
+        let mut req = ChatRequest::new("gpt-6-astra", vec![turn.message, Message::user("more")]);
+        let input = request_body(&req)["input"].as_array().unwrap().clone();
+        assert_eq!(&input[..2], output.as_array().unwrap());
+
+        req.model = "gpt-5.6-sol".into();
+        assert_eq!(request_body(&req)["input"][0]["content"], text, "switching models keeps source URLs");
+        req.model = super::super::MODEL.into();
+        let parts = request_parts_with(&Provider::WorkersAi, "a", "g", "token", &req, false);
+        let body: Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["messages"][0]["content"], text);
+        assert!(body["messages"][0].get("response").is_none());
+        assert!(body.get("tools").is_none(), "Workers AI does not receive the hosted tool");
     }
 
     #[test]

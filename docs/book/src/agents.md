@@ -221,6 +221,14 @@ kept on the turn, including encrypted reasoning and assistant message phases,
 and replayed intact to the same model. A different model receives the visible
 messages and tool results without the previous model's opaque reasoning.
 
+Sol and Astra also have OpenAI's built-in
+[`web_search` tool](https://developers.openai.com/api/docs/guides/tools-web-search)
+alongside the app's functions. The model decides when to search; OpenAI runs
+the search inside the response through the same gateway and stored key.
+Answers render Markdown with underlined, clickable source links. Search
+output and citation annotations stay on the saved Responses turn for later
+requests, and the visible source URLs remain when switching models.
+
 The gateway's logs, analytics, rate limits, and retries are configured in its
 dashboard. Provider routing is resolved from the chat's saved model for every
 request; older Workers AI model ids continue to use their original route.

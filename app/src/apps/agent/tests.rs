@@ -359,7 +359,12 @@ fn openai_models_use_the_stored_gateway_key_and_responses_route() {
         assert_eq!(body["store"], false);
         assert_eq!(body["tools"][0]["name"], "test_2elook");
         assert_eq!(body["tools"][0]["strict"], false);
+        assert_eq!(body["tools"].as_array().unwrap().last(), Some(&json!({"type": "web_search"})));
         assert!(body.get("messages").is_none());
+        req.tools.clear();
+        let parts = request_parts_with(&provider, "account", GATEWAY, "cf-token", &req, false);
+        let body: Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["tools"], json!([{"type": "web_search"}]));
     }
     assert_eq!(Provider::for_model(MODEL).unwrap(), Provider::WorkersAi);
     assert_eq!(
@@ -1882,6 +1887,43 @@ fn the_openai_models_use_tools_through_the_real_gateway() {
             "{}: streamed tool call and continuation passed",
             model.label
         );
+    }
+}
+
+/// Opt-in search and continuation using only the public Rust book.
+#[test]
+#[ignore]
+fn the_openai_models_search_the_web_through_the_real_gateway() {
+    use kernel::caps::SecretsFactory;
+    let env = kernel::app::Env {
+        scripted: false,
+        secrets_backend: Some(SecretsFactory::new(|| {
+            Box::new(crate::platform::secret::Keychain::new(None))
+        })),
+        ..kernel::app::Env::default()
+    };
+    let mut gateway = real::RealGateway::new(&env);
+    for model in &MODELS[1..] {
+        let mut req = ChatRequest::new(model.id, vec![Message::user(
+            "Search the web for Rust's official book at doc.rust-lang.org/book. Reply in one sentence with a source citation.",
+        )]);
+        req.reasoning_effort = Some(REASONING_EFFORT.to_string());
+        let answer = gateway.complete(&req, &mut |_| Flow::Go)
+            .unwrap_or_else(|e| panic!("{}: {e}", model.label));
+        assert_eq!(answer.finish, Finish::Stop);
+        assert!(answer.message.tool_calls.is_empty(), "hosted search is not an app function");
+        let items = &answer.message.response.as_ref().unwrap().items;
+        assert!(items.iter().any(|item| item["type"] == "web_search_call"), "{} searched", model.label);
+        let annotations: Vec<_> = items.iter().filter_map(|item| item["content"].as_array())
+            .flatten().filter_map(|part| part["annotations"].as_array()).flatten().collect();
+        assert!(annotations.iter().any(|annotation| annotation["type"] == "url_citation"));
+        req.messages.push(answer.message);
+        req.messages.push(Message::user("What was the URL you just cited? Reply only with that URL; do not search again."));
+        let answer = gateway.complete(&req, &mut |_| Flow::Go)
+            .unwrap_or_else(|e| panic!("{} search continuation: {e}", model.label));
+        assert_eq!(answer.finish, Finish::Stop);
+        assert!(answer.message.text().contains("doc.rust-lang.org/book"));
+        eprintln!("{}: hosted web search, citations, and continuation passed", model.label);
     }
 }
 
