@@ -17,6 +17,11 @@ visible while its replacement loads. Photo reads, decoding and map rendering
 also run on workers, with a bounded texture cache shared across chats. Opening
 an unread chat still records its read claim and preserves its unread divider.
 
+Scrolling and mention checks look up messages in the prepared transcript, and
+unchanged message text reuses its formatted links. Typing updates the composer
+immediately; local drafts save after a 300 ms pause or when leaving the chat.
+Sending and explicit draft replacements cancel the pending save.
+
 Automatic history, message and reaction refreshes wait until a chat has stayed
 visible for 350 ms. Arrow-key previews show cached data immediately; traversed
 chats leave no refresh queue behind. Visible copies of the same chat share one

@@ -229,6 +229,8 @@ fn drafts_keep_existing_work_unless_replacement_is_explicit() {
     let input = json!({"chat": VERA, "text": "agent words"});
     assert!(call(&mut s, "telegram.draft", input.clone()).is_err());
     assert_eq!(field_now(&s, chat), "my unsent words");
+    // Refusing replacement must also preserve a keystroke's pending save.
+    with_chat(&s, chat, Chat::save_pending_draft);
     assert_eq!(draft_row(&s, VERA), "my unsent words");
 
     // A remote row cannot conceal a different local draft from the tool.

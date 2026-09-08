@@ -95,6 +95,8 @@ pub struct Chat {
     /// what tells the composer's own words from a change made *under* it, by
     /// another device or by a send the engine refused.
     seen_draft: String,
+    /// Keystrokes stay in memory until a brief pause or the chat is left.
+    draft_pending: bool,
     /// An edit under way: the field shows its text instead of the draft,
     /// which waits.
     editing: Option<Editing>,
@@ -219,11 +221,12 @@ impl Chat {
             return;
         }
         // Untouched means the server already has what the composer holds —
-        // nothing typed since the last flush — or nothing at all. Typing
-        // writes the row too, so the row saying what the composer says is
-        // no sign nobody typed (review, 2026-09-07: a phone's draft
-        // overwrote unsent words).
-        let untouched = self.draft.is_empty() || self.draft == self.sent_draft;
+        // nothing typed since the last flush — or nothing at all. A pending
+        // save also protects a newly emptied field. Saving our own text to
+        // the row does not make it a remote draft (review, 2026-09-07: a
+        // phone's draft overwrote unsent words).
+        let untouched = !self.draft_pending
+            && (self.draft.is_empty() || self.draft == self.sent_draft);
         self.seen_draft.clone_from(&row);
         if untouched {
             self.sent_draft.clone_from(&row);
@@ -239,10 +242,12 @@ impl Chat {
 
     /// The widget supplies only messages visible in the focused transcript.
     pub fn view_mentions(&mut self, visible: &[MsgId], now: f64) {
-        let ids: Vec<MsgId> = self.history().iter()
-            .filter(|m| m.unread_mention && visible.contains(&m.id))
+        if visible.is_empty() { return; }
+        let snapshot = self.transcript.get(&self.store);
+        let ids: Vec<MsgId> = visible.iter().filter_map(|&id| snapshot.message(id))
+            .filter(|m| m.unread_mention)
             .filter(|m| self.viewed_mentions.get(&m.id).is_none_or(|at| now - at >= 5.0))
-            .map(|m| m.id).collect();
+            .map(|m| m.id).collect::<BTreeSet<_>>().into_iter().collect();
         if ids.is_empty() {
             return;
         }
@@ -267,10 +272,17 @@ impl Chat {
 
     /// The transcript: the lines with the day captions, the unread line and
     /// the runs worked out. `now` is what the captions are spelled against.
+    #[cfg(test)]
     #[must_use]
     pub fn rows(&self, now: f64) -> std::sync::Arc<Vec<Row>> {
+        self.snapshot(now).rows.clone()
+    }
+
+    /// The draw and its message lookups must use the same immutable reading,
+    /// even when a background refresh finishes during the draw.
+    pub fn snapshot(&self, now: f64) -> std::sync::Arc<super::super::transcript::Snapshot> {
         self.transcript.at(now);
-        self.transcript.get(&self.store).rows.clone()
+        self.transcript.get(&self.store)
     }
 
     // -- the cursor and the marks -----------------------------------------------
@@ -410,12 +422,22 @@ impl Chat {
         }
     }
 
-    /// The field changed: an edit keeps its text on the instance, a draft
-    /// goes to the chat's row.
+    /// The field changes immediately. Persist after a pause, so a keystroke
+    /// never waits behind the database writer or invalidates the chat list.
     pub fn typed(&mut self, text: &str) {
         match &mut self.editing {
             Some(e) => e.text = text.to_string(),
-            None => self.set_draft(text),
+            None if self.draft != text => {
+                self.draft = text.to_string();
+                self.draft_pending = true;
+            }
+            None => {}
+        }
+    }
+
+    pub fn save_pending_draft(&mut self) {
+        if self.draft_pending {
+            self.set_draft(&self.draft.clone());
         }
     }
 
@@ -547,8 +569,8 @@ impl Chat {
     #[must_use]
     pub fn reply_line(&self, now: f64) -> Option<String> {
         let id = self.reply_to?;
-        let hist = self.history();
-        let m = hist.iter().find(|m| m.id == id)?;
+        let snapshot = self.transcript.get(&self.store);
+        let m = snapshot.message(id)?;
         Some(format!(
             "reply to {}: {}",
             m.writer(),
@@ -573,6 +595,7 @@ impl Chat {
         if let Err(e) = self.save_draft(text) {
             // A failed persistence write must not erase what was typed.
             self.draft = text.to_string();
+            self.draft_pending = true;
             runtime::of(&self.store)
                 .operations
                 .report(&self.store, "saving draft", &e);
@@ -580,7 +603,7 @@ impl Chat {
     }
 
     fn save_draft(&mut self, text: &str) -> Result<(), String> {
-        if self.draft == text && self.seen_draft == text {
+        if !self.draft_pending && self.draft == text && self.seen_draft == text {
             return Ok(());
         }
         let (peer, topic, d) = (self.peer, self.topic, text.to_string());
@@ -588,6 +611,7 @@ impl Chat {
             .map_err(|e| e.to_string())?;
         self.draft = text.to_string();
         self.seen_draft.clone_from(&self.draft);
+        self.draft_pending = false;
         Ok(())
     }
 
@@ -611,6 +635,7 @@ impl Chat {
             self.draft.clear();
             self.sent_draft.clear();
             self.seen_draft.clear();
+            self.draft_pending = false;
             self.reply_to = None;
         }
     }
@@ -902,6 +927,7 @@ impl Chat {
     /// Off the wire there is nothing to tell, and the retry costs a comparison
     /// the next time the chat is left.
     pub fn flush_draft(&mut self) {
+        self.save_pending_draft();
         if self.draft == self.sent_draft {
             return;
         }
@@ -1063,8 +1089,8 @@ impl Panel for Chat {
         }
         let n = self.marks.len();
         let k = self.carrying.len();
-        let hist = self.history();
-        let under = self.cursor.and_then(|c| hist.iter().find(|m| m.id == c && !m.service));
+        let snapshot = self.transcript.get(&self.store);
+        let under = self.cursor.and_then(|id| snapshot.message(id)).filter(|m| !m.service);
         let mut v = Vec::new();
         if !self.reply_back.is_empty() {
             v.push(Verb::run("telegram.back", "back", Some('b')));
@@ -1156,7 +1182,7 @@ impl Panel for Chat {
             let all_mine = self
                 .marks
                 .iter()
-                .all(|id| hist.iter().any(|m| m.id == *id && m.out));
+                .all(|id| snapshot.message(*id).is_some_and(|m| m.out));
             if all_mine {
                 v.push(Verb::run("telegram.delete", format!("delete {n}"), Some('d')));
             }
@@ -1389,6 +1415,7 @@ impl PanelKind for ChatKind {
             reply_to: None,
             sent_draft: draft.clone(),
             seen_draft: draft.clone(),
+            draft_pending: false,
             draft,
             editing: None,
             #[cfg(test)]

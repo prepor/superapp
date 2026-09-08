@@ -3,7 +3,7 @@
 //! first, and an evicted request cannot delay the next chat in a cursor walk.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, OnceLock};
 
 use kernel::store::Store;
@@ -19,12 +19,25 @@ pub struct Snapshot {
     pub ready: bool,
     pub history: Arc<Vec<Msg>>,
     pub rows: Arc<Vec<Row>>,
+    messages: HashMap<MsgId, usize>,
+    row_indices: HashMap<MsgId, usize>,
 }
 
 impl Snapshot {
     fn new(history: Vec<Msg>, first_unread: Option<MsgId>, now: f64) -> Self {
         let rows = Arc::new(rows_of(&history, first_unread, now));
-        Self { ready: true, history: Arc::new(history), rows }
+        let messages = history.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+        let row_indices = rows.iter().enumerate()
+            .filter_map(|(i, r)| r.msg().map(|m| (m.id, i))).collect();
+        Self { ready: true, history: Arc::new(history), rows, messages, row_indices }
+    }
+
+    pub fn message(&self, id: MsgId) -> Option<&Msg> {
+        self.messages.get(&id).and_then(|&i| self.history.get(i))
+    }
+
+    pub fn row_index(&self, id: MsgId) -> Option<usize> {
+        self.row_indices.get(&id).copied()
     }
 }
 
@@ -214,6 +227,33 @@ mod tests {
     }
 
     fn key(peer: PeerId) -> Key { Key { peer, topic: 0, first_unread: None, day: 0 } }
+
+    #[test]
+    fn message_lookups_follow_backfills_deletions_and_dividers() {
+        let store = store();
+        let mut history = model::history(&store, seed::VERA).as_ref().clone();
+        let id = history.last().unwrap().id;
+        let before = Snapshot::new(history.clone(), Some(id), 0.0);
+        let mut older = history[0].clone();
+        older.id = -1;
+        older.date -= 86400.0;
+        older.text = "backfilled".into();
+        history.insert(0, older);
+        history.retain(|m| m.id != id);
+        let after = Snapshot::new(history, None, 0.0);
+        assert!(before.message(id).is_some());
+        assert!(after.message(id).is_none());
+        assert!(after.row_index(id).is_none());
+        assert_eq!(after.message(-1).unwrap().text, "backfilled");
+        for snapshot in [&before, &after] {
+            for (i, row) in snapshot.rows.iter().enumerate() {
+                if let Some(msg) = row.msg() {
+                    assert_eq!(snapshot.row_index(msg.id), Some(i));
+                    assert_eq!(snapshot.message(msg.id), Some(msg));
+                }
+            }
+        }
+    }
 
     fn loaded(loader: &Arc<Loader>, store: &Store, key: Key) -> Arc<Snapshot> {
         let deadline = Instant::now() + Duration::from_secs(5);
