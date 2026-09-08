@@ -146,6 +146,7 @@ fn agents_send_photos_and_documents_with_a_caption_and_individual_delivery_statu
     assert_eq!(with_chat(&s, slot(&d), |c| c.carrying().len()), 2);
     assert!(inbox.try_iter().all(|r| serde_json::from_str::<Value>(&r).unwrap()["@type"] != "sendMessage"));
 
+    let before_send = s.history().head();
     let result = call(&mut s, "telegram.send", d.clone()).unwrap();
     assert_eq!(result["status"], "queued");
     let operations = result["operations"].as_array().unwrap();
@@ -183,6 +184,15 @@ fn agents_send_photos_and_documents_with_a_caption_and_individual_delivery_statu
     assert!(with_chat(&s, slot(&d), |c| c.carrying().is_empty()));
     assert!(call(&mut s, "telegram.send", d).is_err());
     assert!(inbox.try_recv().is_err(), "delivery checks never repeat a send");
+
+    assert!(s.undo());
+    assert_eq!(s.history().head(), before_send, "a rejected attachment must not skip the send's undo node");
+    let deletes: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0]["@type"], "deleteMessages");
+    assert_eq!(deletes[0]["chat_id"], BERLIN);
+    assert_eq!(deletes[0]["message_ids"], json!([9999]));
+    assert_eq!(deletes[0]["revoke"], true);
 }
 
 #[test]

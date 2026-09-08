@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod deletion;
 mod review;
+mod sends;
 
 fn receive(inbox: &runtime::Inbox) -> Value {
     serde_json::from_str(&inbox.try_recv().expect("queued command")).unwrap()

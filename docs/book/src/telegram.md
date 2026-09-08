@@ -261,6 +261,10 @@ queuing anything. Offline failures keep the draft. Queued text and attachments
 clear from every matching open copy of the composer. A multi-file send records
 one history action, labelled with the attachment count; one Undo requests
 deletion of every sent attachment, waiting for each delivery acknowledgement.
+Rejected or uncertain files do not block deletion of delivered attachments.
+Their receipts remain watched, so a late confirmation also follows the Undo.
+Redo restores deleted attachments without retrying rejected or uncertain sends;
+a known deletion failure blocks Redo for the whole send.
 
 A successful tool call reports **queued**, with an `operations` list containing
 one id per message; `operation` is the first id for compatibility with text sends.
