@@ -4,6 +4,109 @@ use makepad_widgets::script_eval;
 use std::cell::{Cell, RefCell};
 
 #[test]
+fn focused_source_input_draws_a_visible_caret() {
+    let done = Rc::new(Cell::new(false));
+    let seen = done.clone();
+    let mut root = WidgetRef::empty();
+    let mut pass = None;
+    let mut draw_list: Option<DrawList> = None;
+    let mut frame = 0;
+    let cx = Rc::new(RefCell::new(Cx::new(Box::new(
+        move |cx, event| match event {
+            Event::Startup => {
+                root = cx.with_vm(|vm| {
+                    makepad_widgets::script_mod(vm);
+                    crate::shell::script_mod(vm);
+                    let value = script_eval!(vm, { mod.widgets.SourceInput{} });
+                    WidgetRef::script_from_value(vm, value)
+                });
+                makepad_widgets::widget_tree::set_ui_root(cx, &root);
+                let p = DrawPass::new(cx);
+                p.set_size(cx, dvec2(260.0, 220.0));
+                pass = Some(p);
+                draw_list = Some(DrawList::new(cx));
+                cx.redraw_all();
+            }
+            Event::Draw(event) => {
+                frame += 1;
+                let mut draw = CxDraw::new(cx, event);
+                let pass = pass.as_ref().unwrap();
+                draw.begin_pass(pass, Some(1.0));
+                let list = draw_list.as_mut().unwrap();
+                list.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(260.0, 220.0), Layout::default());
+                root.draw_all(&mut cx, &mut Scope::empty());
+                cx.end_turtle();
+                if frame > 1 {
+                    let input = root.borrow::<SourceInput>().unwrap();
+                    assert!(root.key_focus(&cx));
+                    let mut focus = [f32::NAN];
+                    let mut blink = [f32::NAN];
+                    assert!(input.draw_cursor.get_instance_on_area(
+                        &cx,
+                        live_id!(focus),
+                        &mut focus
+                    ));
+                    assert!(input.draw_cursor.get_instance_on_area(
+                        &cx,
+                        live_id!(blink),
+                        &mut blink
+                    ));
+                    let expected = if frame == 4 { 0.0 } else { 1.0 };
+                    assert!(
+                        ((1.0 - blink[0]) * focus[0] - expected).abs() < 0.01,
+                        "caret opacity must be {expected}: focus={focus:?}, blink={blink:?}"
+                    );
+                    let caret = input.draw_cursor.area().rect(&cx);
+                    assert!(
+                        caret.size.x >= 1.0 && caret.size.y > 8.0,
+                        "caret: {caret:?}"
+                    );
+                    assert!(input
+                        .area()
+                        .rect(&cx)
+                        .contains(caret.pos + caret.size * 0.5));
+                    if frame > 2 {
+                        assert_eq!(
+                            input.text, "A **bold** thought",
+                            "animation must retain the source"
+                        );
+                    }
+                    if frame == 5 {
+                        seen.set(true);
+                    }
+                }
+                if frame == 1 {
+                    root.borrow_mut::<SourceInput>()
+                        .unwrap()
+                        .take_key_focus(&mut cx);
+                } else if frame == 2 {
+                    root.set_text(&mut cx, "A **bold** thought");
+                } else if frame == 3 {
+                    root.borrow_mut::<SourceInput>()
+                        .unwrap()
+                        .animator_cut(&mut cx, ids!(blink.on));
+                } else if frame == 4 {
+                    // Focusing an already focused input must reset its blink.
+                    root.borrow_mut::<SourceInput>()
+                        .unwrap()
+                        .take_key_focus(&mut cx);
+                }
+                if frame < 5 {
+                    cx.redraw_all();
+                }
+                list.end(&mut draw);
+                draw.end_pass(pass);
+            }
+            _ => root.handle_event(cx, event, &mut Scope::empty()),
+        },
+    ))));
+    Cx::headless_event_loop_for_draw_cycles(cx, 5);
+    assert!(done.get());
+}
+
+#[test]
 fn source_styles_preserve_wrapping_caret_geometry_and_cached_layout() {
     let done = Rc::new(Cell::new(false));
     let seen = done.clone();

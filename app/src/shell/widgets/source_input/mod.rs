@@ -28,6 +28,8 @@ script_mod! {
     use mod.widgets.*
     mod.widgets.SourceInput = set_type_default() do #(SourceInput::register_widget(vm)) {
         ..mod.widgets.SField
+        // The spread copies SField's own properties; its animator is inherited.
+        animator: mod.widgets.SField.animator
         width: Fill, height: Fill
         padding: 12, margin: 0
         flow: Right {wrap: true}
