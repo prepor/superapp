@@ -18,6 +18,47 @@ fn counts(w: &World) -> Option<String> {
 }
 
 #[test]
+fn settled_viewports_skip_message_reads_but_an_added_reaction_refreshes_promptly() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let ids: Vec<_> = (42..82).collect();
+    for id in &ids {
+        let mut message = post();
+        message["id"] = json!(id);
+        acc.on_update(&w, &message.to_string());
+    }
+    let _view = runtime::of(w.store()).watch_messages(7, ids.clone());
+    acc.sync_counts(&w);
+    let sent = td.sent().len();
+    // Live updates settle every row, including the initial read on the wire.
+    for id in &ids {
+        acc.on_update(&w, &json!({"@type": "updateMessageInteractionInfo", "chat_id": 7,
+            "message_id": id, "interaction_info": {"reactions": {"reactions": [
+                {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 8},
+            ]}}}).to_string());
+    }
+    clock.advance(2.0);
+    w.store().trace_begin(1);
+    for _ in 0..10 {
+        acc.sync_counts(&w);
+        clock.advance(0.3);
+    }
+    w.store().trace_end();
+    assert!(w.store().trace_of(1).is_empty(), "settled rows must not load message bodies or history");
+    assert_eq!(td.sent().len(), sent, "settled rows require no server requests");
+
+    acc.counts_after_add(&w, 7, 81);
+    w.store().trace_begin(2);
+    acc.sync_counts(&w);
+    w.store().trace_end();
+    assert_eq!(w.store().trace_of(2).len(), 1, "only the dirty message needs its body");
+    assert_eq!(last_request(&td, "searchChatMessages")["from_message_id"], 81,
+        "an add must not wait for the periodic sweep");
+}
+
+#[test]
 fn reconciliation_searches_text_senders_topics_and_captionless_media_on_the_server() {
     let w = world();
     let td = FakeTd::new();
@@ -228,6 +269,10 @@ fn a_quiet_view_repairs_missed_push_updates_without_expiring_its_counts() {
     };
     server_reply(&acc, &w, &first, message(8));
     clock.advance(61.0);
+    acc.drain(&w);
+    assert_eq!(last_request(&td, "searchChatMessages"), first,
+        "the fallback must not search a settled viewport every minute");
+    clock.advance(240.0);
     acc.drain(&w);
     let next = last_request(&td, "searchChatMessages");
     assert_ne!(first["@extra"], next["@extra"]);

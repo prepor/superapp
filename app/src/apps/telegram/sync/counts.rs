@@ -15,7 +15,9 @@ use super::super::reaction_state;
 type Key = (PeerId, MsgId);
 const PATIENCE: f64 = 30.0;
 const GAP: f64 = 1.0;
-const RECHECK: f64 = 60.0;
+// A fallback for missed pushes, separate from initial loads and post-add
+// checks. Sweeping every minute keeps searching even a settled viewport.
+const RECHECK: f64 = 5.0 * 60.0;
 
 #[derive(Default)]
 pub(super) struct Counts {
@@ -128,9 +130,10 @@ impl<T: Td> Account<T> {
         let next = state.urgent.iter().chain(order).copied().find_map(|key| {
             if !self.chat_ready(key.0) { return None; }
             if state.retries.get(&key).is_some_and(|(due, _)| w.now() < *due) { return None; }
-            let message = model::line(w.store(), key.0, key.1).filter(|m| !m.service)?;
             let row = reaction_state::state(w.store().conn(), key.0, key.1).ok()?;
-            row.refresh.then_some((key, row.revision, message))
+            if !row.refresh { return None; }
+            let message = model::line(w.store(), key.0, key.1).filter(|m| !m.service)?;
+            Some((key, row.revision, message))
         });
         let Some((key, revision, message)) = next else { return; };
         state.next += 1;
