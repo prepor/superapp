@@ -28,18 +28,27 @@ shot t2-group
 click "Ivan Petrov: meeting moved to 15:00"
 wait 400
 
+# Opening starts at the unread run. Walk back to the earlier demo video.
+click "me: the muted grey is too light on the fold"
+key up
+wait 300
+
 # What a line carries is in its label: a video is its caption and the word,
 # a sticker its emoji, a voice note its length. A line the list has drawn
-# resolves; one scrolled out of the viewport does not, which is why these
-# three are near the foot. The first press took the keyboard to the lines
-# — a press on a line is the way to the transcript's cursor, and the caret
-# a chat taking focus parks in the composer stays out of the way.
+# resolves; one scrolled out of the viewport does not. After the video we
+# jump to the end for the sticker and voice note. The first press took the
+# keyboard to the lines — a press on a line is the way to the transcript's
+# cursor, and the caret a chat taking focus parks in the composer stays out
+# of the way.
 click "video"
 wait 600
 # Press the visible poster itself: clipping can leave the row's centre on
 # its caption. The picture opens the viewer joined, closed again here.
 key cmd+w
 wait 500
+key esc
+key end
+wait 300
 click "Olga Novak: sticker 🙈"
 wait 300
 click "Max Ivanov: voice 0:42"

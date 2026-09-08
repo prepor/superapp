@@ -8,6 +8,10 @@ key enter
 wait 900
 click "stelaxis"
 wait 900
+# The demo video precedes the unread run the chat opens on.
+click "me: the muted grey is too light on the fold"
+key up
+wait 300
 
 # A click before the first play creates a paused player in the transcript.
 mouse "seek video"
