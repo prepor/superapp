@@ -81,9 +81,10 @@ impl Operation {
                 ..
             }
         ) && self.request.is_some()
-            // Profile actions must start a fresh guarded attempt from their
-            // panel; replaying the old correlation would bypass that flow.
-            && !self.context().is_some_and(|c| c.starts_with("peer_action:"))
+            // These requests own their attempt guards and retry paths;
+            // replaying an old correlation cannot complete a new attempt.
+            && !self.context().is_some_and(|c| ["peer_action:", "reactions:", "reaction_choices:", "reaction_count:", "reaction:", "visible:"]
+                .iter().any(|prefix| c.starts_with(prefix)))
             && self
                 .messages
                 .iter()
@@ -100,6 +101,11 @@ impl Operation {
                 | "getForumTopic"
                 | "getForumTopics"
                 | "getMessage"
+                | "getMessages"
+                | "getMessageAvailableReactions"
+                | "openChat"
+                | "closeChat"
+                | "setOption"
                 | "getRemoteFile"
                 | "downloadFile"
                 | "deleteFile"
@@ -286,6 +292,13 @@ impl Tracker {
         {
             self.fail(store, op.id, error, false);
         }
+    }
+
+    /// A worker replaced a read request with a fresh correlated attempt.
+    /// Its retired operation must not time out later or offer a stale retry.
+    pub(super) fn retire_context(&self, context: &str) {
+        self.state.lock().unwrap().operations.retain(|_, op| op.context() != Some(context));
+        self.changed();
     }
 
     /// Reuse the operation id on retry so disconnection cannot lose the
@@ -861,6 +874,23 @@ mod tests {
     }
     fn refusal(v: &Value) -> Value {
         json!({"@type": "error", "code": 400, "message": "InputFile is not specified", "@extra": v["@extra"]})
+    }
+
+    #[test]
+    fn reaction_and_visible_request_retries_keep_their_own_attempt_guards() {
+        let store = store();
+        let tracker = Tracker::default();
+        for request in [
+            requests::get_message_available_reactions(7, 42, 1),
+            requests::refresh_available_reactions(7, 42, 1, 2),
+            requests::add_message_reaction(7, 42, "👍", 1),
+            requests::get_visible_messages(7, &[42], 1),
+        ] {
+            let request = tracked(&tracker, request);
+            tracker.reply(&store, &refusal(&request));
+            assert!(tracker.retry(request["@extra"]["operation"].as_u64().unwrap()).is_none(),
+                "the picker/worker must create a new attempt, not replay retired correlation");
+        }
     }
 
     #[test]

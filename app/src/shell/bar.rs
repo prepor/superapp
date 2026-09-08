@@ -14,7 +14,7 @@
 //! panel gets a taller bar rather than fewer verbs. [`height`] is what the
 //! wrap costs, and the body is drawn in what is left.
 
-use kernel::panel::Verb;
+use kernel::panel::{Verb, VerbStyle};
 use kernel::theme;
 use makepad_widgets::*;
 
@@ -25,6 +25,9 @@ use super::keys::Letters;
 pub const BAR_H: f64 = 26.0;
 /// A bar entry's height.
 pub const ENTRY_H: f64 = 18.0;
+/// A glyph has equal room on each side, regardless of its Unicode length.
+pub const GLYPH_SIZE: f64 = 32.0;
+pub const GLYPH_FONT_SIZE: f64 = 18.0;
 /// The inset at either end of the strip.
 pub const PAD_X: f64 = 8.0;
 /// Above the first row of entries, and below the last.
@@ -77,11 +80,12 @@ pub fn height(verbs: &[Verb], cell: &CellFont, panel: Rect) -> f64 {
     }
     let width = (panel.size.x - 2.0).max(0.0);
     let room = panel.size.y - theme::HEAD_H - MIN_BODY - BORDER;
-    let max = rows_in(room).clamp(1, MAX_ROWS);
+    let row_h = row_height(verbs);
+    let max = rows_in(room, row_h).clamp(1, MAX_ROWS);
     let rows = flow(verbs, cell, width, max)
         .last()
         .map_or(1, |p| p.row + 1);
-    rows_h(rows)
+    rows_h(rows, row_h)
 }
 
 /// Lays the verbs out left to right in the strip, wrapping to a further
@@ -89,16 +93,17 @@ pub fn height(verbs: &[Verb], cell: &CellFont, panel: Rect) -> f64 {
 /// dropped, and so is anything after a label too long for a row of its own.
 #[must_use]
 pub fn entries(verbs: &[Verb], cell: &CellFont, strip: Rect) -> Vec<Entry> {
-    flow(verbs, cell, strip.size.x, rows_in(strip.size.y))
+    let row_h = row_height(verbs);
+    flow(verbs, cell, strip.size.x, rows_in(strip.size.y, row_h))
         .into_iter()
         .map(|p| Entry {
             at: p.at,
             rect: Rect {
                 pos: dvec2(
                     strip.pos.x + p.x,
-                    strip.pos.y + PAD_Y + p.row as f64 * (ENTRY_H + ROW_GAP),
+                    strip.pos.y + PAD_Y + p.row as f64 * (row_h + ROW_GAP),
                 ),
-                size: dvec2(p.w, ENTRY_H),
+                size: dvec2(p.w, row_h),
             },
             button: verbs[p.at].act.button(),
         })
@@ -120,7 +125,12 @@ fn flow(verbs: &[Verb], cell: &CellFont, width: f64, rows: usize) -> Vec<Placed>
     let right = width - PAD_X;
     let (mut x, mut row) = (PAD_X, 0);
     for (at, v) in verbs.iter().enumerate() {
-        let w = cell.label_w(v.label.chars().count()) + if v.act.button() { BTN_PAD } else { 0.0 };
+        let w = match v.style {
+            VerbStyle::Glyph => GLYPH_SIZE,
+            VerbStyle::Plain => cell.label_w(v.label.chars().count()) + BTN_PAD,
+            VerbStyle::Standard => cell.label_w(v.label.chars().count())
+                + if v.act.button() { BTN_PAD } else { 0.0 },
+        };
         if x + w > right {
             // The row is full: the next one, if this bar has one to give
             // and the label fits a row at all.
@@ -137,16 +147,20 @@ fn flow(verbs: &[Verb], cell: &CellFont, width: f64, rows: usize) -> Vec<Placed>
 }
 
 /// What `rows` rows of entries stand in, padding and rule included.
-fn rows_h(rows: usize) -> f64 {
-    PAD_Y * 2.0 + rows as f64 * ENTRY_H + (rows.saturating_sub(1)) as f64 * ROW_GAP
+fn row_height(verbs: &[Verb]) -> f64 {
+    if verbs.iter().any(|v| v.style == VerbStyle::Glyph) { GLYPH_SIZE } else { ENTRY_H }
+}
+
+fn rows_h(rows: usize, row_h: f64) -> f64 {
+    PAD_Y * 2.0 + rows as f64 * row_h + (rows.saturating_sub(1)) as f64 * ROW_GAP
 }
 
 /// The other way about: how many rows a strip that tall holds.
-fn rows_in(h: f64) -> usize {
-    if h < BAR_H {
+fn rows_in(h: f64, row_h: f64) -> usize {
+    if h < rows_h(1, row_h) {
         return 0;
     }
-    ((h - PAD_Y * 2.0 + ROW_GAP) / (ENTRY_H + ROW_GAP)) as usize
+    ((h - PAD_Y * 2.0 + ROW_GAP) / (row_h + ROW_GAP)) as usize
 }
 
 /// The verb a letter fires on this bar, by id. The bar's own half of the
@@ -338,12 +352,31 @@ mod tests {
     fn a_full_row_wraps_to_the_next() {
         let cell = CellFont::default();
         let verbs = same("copy", 3);
-        let sr = strip(narrow(&cell), rows_h(2));
+        let sr = strip(narrow(&cell), rows_h(2, ENTRY_H));
         let out = entries(&verbs, &cell, sr);
         assert_eq!(out.len(), 3, "nothing is dropped: the third wrapped");
         assert_eq!(out[0].rect.pos.y, out[1].rect.pos.y, "two to a row");
         assert_eq!(out[2].rect.pos.x, sr.pos.x + PAD_X);
         assert_eq!(out[2].rect.pos.y, out[0].rect.pos.y + ENTRY_H + ROW_GAP);
+    }
+
+    #[test]
+    fn emoji_sequences_have_equal_hit_areas_and_wrap_without_clipping() {
+        let cell = CellFont::default();
+        let verbs: Vec<_> = ["👍", "❤️", "👨‍👩‍👧‍👦"].into_iter()
+            .map(|emoji| Verb::glyph("emoji", emoji)).collect();
+        let panel = rect(0.0, 0.0, 2.0 + PAD_X * 2.0 + GLYPH_SIZE * 2.0 + GAP, 300.0);
+        let h = height(&verbs, &cell, panel);
+        let sr = strip(panel, h);
+        let out = entries(&verbs, &cell, sr);
+        assert_eq!(out.len(), 3);
+        for entry in &out {
+            assert_eq!(entry.rect.size, dvec2(GLYPH_SIZE, GLYPH_SIZE));
+            assert!(entry.rect.pos.y + entry.rect.size.y <= sr.pos.y + sr.size.y - PAD_Y);
+        }
+        assert_eq!(out[0].rect.pos.y, out[1].rect.pos.y);
+        assert_eq!(out[2].rect.pos.y, out[0].rect.pos.y + GLYPH_SIZE + ROW_GAP);
+        assert_eq!(out[2].rect.pos.x, sr.pos.x + PAD_X);
     }
 
     /// And the panel pays for the row: a bar is as tall as what it draws,
@@ -354,7 +387,7 @@ mod tests {
         let verbs = same("copy", 3);
         let wide = rect(0.0, 0.0, 600.0, 400.0);
         assert_eq!(height(&verbs, &cell, wide), BAR_H, "one row, as ever");
-        assert_eq!(height(&verbs, &cell, narrow(&cell)), rows_h(2));
+        assert_eq!(height(&verbs, &cell, narrow(&cell)), rows_h(2, ENTRY_H));
         assert_eq!(height(&[], &cell, wide), 0.0, "no verbs, no bar");
     }
 
@@ -367,7 +400,7 @@ mod tests {
         let verbs = same("copy", 9);
         let panel = narrow(&cell);
         let h = height(&verbs, &cell, panel);
-        assert_eq!(h, rows_h(MAX_ROWS), "three rows and no more");
+        assert_eq!(h, rows_h(MAX_ROWS, ENTRY_H), "three rows and no more");
         let out = entries(&verbs, &cell, strip(panel, h));
         assert_eq!(out.len(), MAX_ROWS * 2, "two to a row, and the rest gone");
 
@@ -412,7 +445,7 @@ mod tests {
             Verb::run("v", "copy", None),
         ];
         let panel = narrow(&cell);
-        let out = entries(&verbs, &cell, strip(panel, rows_h(MAX_ROWS)));
+        let out = entries(&verbs, &cell, strip(panel, rows_h(MAX_ROWS, ENTRY_H)));
         assert_eq!(out.len(), 1);
     }
 

@@ -6,18 +6,55 @@
 //! worker's inbox. Closing the session or dropping that inbox disconnects
 //! the send side and releases actions whose replies can no longer arrive.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 
+use kernel::effect::World;
 use kernel::store::Store;
 
 use super::model::{DownloadProgress, MsgId, PeerId};
 use super::requests::PeerAction;
 
+/// Chosen when the world is created, independently of worker availability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Live,
+    Demo,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
     pub from: PeerId,
     pub ids: Vec<MsgId>,
+}
+
+/// A reaction picker waits in memory for either the available emoji or the
+/// acknowledgement of its choice. Closing the picker drops the reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionResult {
+    Waiting,
+    Choices(Vec<String>),
+    Unavailable(String),
+    Added,
+    Error(String),
+}
+
+pub type ReactionReply = Arc<Mutex<Option<ReactionResult>>>;
+
+/// A widget owns its visible messages; dropping it releases the subscription.
+type ViewedMessages = Mutex<(PeerId, Vec<MsgId>)>;
+pub type MessageView = Arc<ViewedMessages>;
+
+pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, ids: Vec<MsgId>) {
+    if ids.is_empty() || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
+        *view = None;
+        return;
+    }
+    if let Some(view) = view {
+        *view.lock().expect("visible messages") = (chat, ids);
+    } else {
+        *view = Some(of(world.store()).watch_messages(chat, ids));
+    }
 }
 
 #[derive(Default)]
@@ -43,13 +80,22 @@ struct State {
     downloads: HashMap<String, DownloadProgress>,
     connection_status: Option<String>,
     wanted: Wanted,
+    next_reaction: u64,
+    reactions: HashMap<u64, Weak<Mutex<Option<ReactionResult>>>>,
+    demo_reactions: HashSet<(PeerId, MsgId, String)>,
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
+    views: Vec<Weak<ViewedMessages>>,
 }
 
 impl State {
     fn disconnect(&mut self) {
         self.sender = None;
+        for (_, reply) in self.reactions.drain() {
+            if let Some(reply) = reply.upgrade() {
+                *reply.lock().expect("reaction reply") = Some(ReactionResult::Error("Telegram is disconnected".into()));
+            }
+        }
         if !self.peer_actions.is_empty() {
             self.peer_actions.clear();
             self.notices.push(("Telegram disconnected before confirming pending user actions".to_string(), true));
@@ -108,6 +154,30 @@ pub fn of(store: &Store) -> Arc<Runtime> {
 impl Runtime {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("Telegram runtime")
+    }
+
+    pub fn watch_messages(&self, chat: PeerId, ids: Vec<MsgId>) -> MessageView {
+        let view = Arc::new(Mutex::new((chat, ids)));
+        self.state().views.push(Arc::downgrade(&view));
+        view
+    }
+
+    /// Combine duplicate panels before the worker subscribes to a chat.
+    pub fn visible_messages(&self) -> BTreeMap<PeerId, Vec<MsgId>> {
+        let mut out: BTreeMap<PeerId, Vec<MsgId>> = BTreeMap::new();
+        self.state().views.retain(|view| {
+            let Some(view) = view.upgrade() else { return false };
+            let view = view.lock().expect("visible messages");
+            if !view.1.is_empty() {
+                out.entry(view.0).or_default().extend(&view.1);
+            }
+            true
+        });
+        for ids in out.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        out
     }
 
     /// Called by the worker on its first pass, never by a panel.
@@ -208,6 +278,48 @@ impl Runtime {
 
     pub fn take_notices(&self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.state().notices)
+    }
+
+    /// Each request has its own reply, even when two panels show the same
+    /// message. Late answers cannot change a newer picker or another store.
+    pub fn await_reaction(&self) -> (u64, ReactionReply) {
+        let reply = Arc::new(Mutex::new(None));
+        let mut state = self.state();
+        state.reactions.retain(|_, reply| reply.strong_count() > 0);
+        state.next_reaction += 1;
+        let id = state.next_reaction;
+        state.reactions.insert(id, Arc::downgrade(&reply));
+        (id, reply)
+    }
+
+    pub fn finish_reaction(&self, id: u64, result: ReactionResult) {
+        // Available choices are a subscription: TDLib can change them after
+        // chat metadata or message interactions arrive. The panel owns its
+        // lifetime, including after an empty result.
+        let reply = {
+            let mut state = self.state();
+            if matches!(result, ReactionResult::Waiting | ReactionResult::Choices(_) | ReactionResult::Unavailable(_)) {
+                state.reactions.get(&id).and_then(Weak::upgrade)
+            } else {
+                state.reactions.remove(&id).and_then(|r| r.upgrade())
+            }
+        };
+        if let Some(reply) = reply {
+            *reply.lock().expect("reaction reply") = Some(result);
+            self.operations.changed();
+        }
+    }
+
+    pub fn reaction_alive(&self, id: u64) -> bool {
+        self.state().reactions.get(&id).is_some_and(|r| r.strong_count() > 0)
+    }
+
+    pub fn demo_reacted(&self, chat: PeerId, msg: MsgId, emoji: &str) -> bool {
+        self.state().demo_reactions.contains(&(chat, msg, emoji.to_string()))
+    }
+
+    pub fn remember_demo_reaction(&self, chat: PeerId, msg: MsgId, emoji: &str) {
+        self.state().demo_reactions.insert((chat, msg, emoji.to_string()));
     }
 
     pub fn carry_forward(&self, from: PeerId, ids: Vec<MsgId>) {

@@ -98,6 +98,65 @@ pub(super) fn load_chats(list: ChatList) -> String {
     .to_string()
 }
 
+// -- reactions ----------------------------------------------------------------
+
+/// Available reactions for this particular message, in Telegram's preferred
+/// order. The correlation id belongs to the panel's in-memory picker.
+#[must_use]
+pub fn get_message_available_reactions(chat: PeerId, msg: MsgId, request: u64) -> String {
+    json!({
+        "@type": "getMessageAvailableReactions",
+        "chat_id": chat,
+        "message_id": msg,
+        "row_size": 6,
+        "@extra": format!("reactions:{request}"),
+    })
+    .to_string()
+}
+
+pub(super) fn refresh_available_reactions(chat: PeerId, msg: MsgId, request: u64, attempt: u64) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&get_message_available_reactions(chat, msg, request)).expect("reaction request");
+    v["@extra"] = json!(format!("reaction_choices:{request}:{attempt}"));
+    v.to_string()
+}
+
+pub(super) fn parse_reaction_choices_extra(extra: &str) -> Option<(u64, u64)> {
+    if let Some(id) = extra.strip_prefix("reactions:") {
+        return Some((id.parse().ok()?, 0));
+    }
+    let (id, attempt) = extra.strip_prefix("reaction_choices:")?.split_once(':')?;
+    Some((id.parse().ok()?, attempt.parse().ok()?))
+}
+
+/// Add one ordinary emoji. The interaction-info update supplies Telegram's
+/// resulting counts.
+#[must_use]
+pub fn add_message_reaction(chat: PeerId, msg: MsgId, emoji: &str, request: u64) -> String {
+    json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat,
+        "message_id": msg,
+        "reaction_type": {"@type": "reactionTypeEmoji", "emoji": emoji},
+        "is_big": false,
+        "update_recent_reactions": true,
+        "@extra": format!("reaction:{request}:{chat}:{msg}"),
+    })
+    .to_string()
+}
+
+pub(super) fn parse_reaction_extra(extra: &str) -> Option<u64> {
+    extra
+        .strip_prefix("reactions:")
+        .and_then(|id| id.parse().ok())
+        .or_else(|| parse_added_reaction_extra(extra).map(|(id, _, _)| id))
+}
+
+pub(super) fn parse_added_reaction_extra(extra: &str) -> Option<(u64, PeerId, MsgId)> {
+    let mut parts = extra.strip_prefix("reaction:")?.split(':');
+    let result = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    parts.next().is_none().then_some(result)
+}
+
 // -- the content verbs, live ---------------------------------------------------
 //
 // The phase-4 requests: the composer's send, reply and edit, and a line's
@@ -311,6 +370,40 @@ pub fn view_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
         "force_read": true,
     })
     .to_string()
+}
+
+/// An open chat receives live interaction updates. Balanced by closeChat
+/// when its last message widget goes away.
+pub fn chat_open(chat_id: PeerId, open: bool) -> String {
+    json!({"@type": if open { "openChat" } else { "closeChat" }, "chat_id": chat_id}).to_string()
+}
+
+/// Load visible rows into TDLib as well as our durable projection before
+/// asking it to keep their reactions fresh.
+pub fn get_visible_messages(chat_id: PeerId, message_ids: &[MsgId], request: u64) -> String {
+    json!({
+        "@type": "getMessages", "chat_id": chat_id, "message_ids": message_ids,
+        "@extra": format!("visible:{chat_id}:{request}"),
+    }).to_string()
+}
+
+pub(super) fn parse_visible_extra(extra: &str) -> Option<(PeerId, u64)> {
+    let (chat, request) = extra.strip_prefix("visible:")?.split_once(':')?;
+    Some((chat.parse().ok()?, request.parse().ok()?))
+}
+
+/// TDLib only schedules ongoing reaction polling while this client is online.
+pub(super) fn set_online(online: bool) -> String {
+    json!({"@type": "setOption", "name": "online",
+        "value": {"@type": "optionValueBoolean", "value": online}}).to_string()
+}
+
+/// Subscribe to counts without changing the existing read-cursor behavior.
+pub fn observe_messages(chat_id: PeerId, message_ids: &[MsgId]) -> String {
+    json!({
+        "@type": "viewMessages", "chat_id": chat_id, "message_ids": message_ids,
+        "source": {"@type": "messageSourceOther"}, "force_read": false,
+    }).to_string()
 }
 
 // -- the verbs about a chat ----------------------------------------------------
@@ -691,6 +784,43 @@ pub fn get_message(chat: PeerId, id: MsgId) -> String {
         "@extra": format!("line:{chat}:{id}"),
     })
     .to_string()
+}
+
+/// A server search starting at this message, with a criterion that includes
+/// it. An empty query without any criterion can silently return no results.
+/// Our TDLib message database is disabled in set_tdlib_parameters, so even
+/// media searches bypass its database cache. This sends no read receipt.
+pub(super) fn reaction_count_snapshot(m: &model::Msg, context: &str) -> String {
+    let filter = m.content_type.as_deref().filter(|_| m.sender.is_none() && m.topic == 0).and_then(|kind| match kind {
+        "messagePhoto" => Some("searchMessagesFilterPhoto"),
+        "messageAnimation" => Some("searchMessagesFilterAnimation"),
+        "messageVideo" => Some("searchMessagesFilterVideo"),
+        "messageVoiceNote" => Some("searchMessagesFilterVoiceNote"),
+        "messageVideoNote" => Some("searchMessagesFilterVideoNote"),
+        "messageAudio" => Some("searchMessagesFilterAudio"),
+        "messageDocument" => Some("searchMessagesFilterDocument"),
+        "messagePoll" => Some("searchMessagesFilterPoll"),
+        _ => None,
+    }).map(|kind| json!({"@type": kind}));
+    let sender = m.sender.unwrap_or(m.chat);
+    let sender = if sender > 0 { json!({"@type": "messageSenderUser", "user_id": sender}) }
+        else { json!({"@type": "messageSenderChat", "chat_id": sender}) };
+    let topic = (m.topic != 0).then(|| json!({"@type": "messageTopicForum", "forum_topic_id": m.topic}));
+    // A senderless channel post needs text or a content filter: TDLib
+    // removes a redundant sender filter for the channel's own identity.
+    let query = if filter.is_none() && topic.is_none() && m.sender.is_none() {
+        m.text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty())
+            .max_by_key(|word| word.chars().count()).or_else(|| m.text.split_whitespace().next())
+            .unwrap_or("").chars().take(64).collect::<String>()
+    } else { String::new() };
+    json!({"@type": "searchChatMessages", "chat_id": m.chat, "from_message_id": m.id,
+        "query": query, "sender_id": sender, "topic_id": topic,
+        "offset": 0, "limit": 1, "filter": filter, "@extra": context}).to_string()
+}
+
+pub(super) fn reaction_count_metadata(chat: PeerId, id: MsgId, context: &str) -> String {
+    json!({"@type": "getMessageAvailableReactions", "chat_id": chat, "message_id": id,
+        "row_size": 8, "@extra": context}).to_string()
 }
 
 /// Restore the message's file source in this TDLib session before downloading.

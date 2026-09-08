@@ -25,6 +25,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
     let (text, media) = content(&m["content"], date);
     let info = &m["interaction_info"];
     Some(IncomingMessage {
+        content_type: m["content"]["@type"].as_str().map(str::to_string),
         id,
         chat,
         topic: message_topic(m),
@@ -146,12 +147,34 @@ fn reactions_line(info: &Value) -> Option<String> {
             // later layer wrapped it in a `type` object. Read either.
             let emoji = r["reaction"]
                 .as_str()
-                .or_else(|| r["type"]["emoji"].as_str())?;
+                .or_else(|| r["type"]["emoji"].as_str())
+                .or_else(|| match r["type"]["@type"].as_str() {
+                    Some("reactionTypePaid") => Some("⭐"),
+                    // Custom artwork has no Unicode representation. Keep
+                    // its count visible until a sticker renderer is used.
+                    Some("reactionTypeCustomEmoji") => Some("custom emoji"),
+                    _ => None,
+                })?;
             let n = r["total_count"].as_i64().unwrap_or(0);
             Some(format!("{emoji} {n}"))
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Missing interaction metadata is unknown. An actual list (even an empty
+/// one) is evidence; unsupported or malformed entries must not become zero.
+pub(super) fn reaction_counts(info: &Value) -> Option<Option<String>> {
+    let list = info["reactions"].as_array().or_else(|| info["reactions"]["reactions"].as_array())?;
+    if list.iter().any(|r| {
+        let named = r["reaction"].as_str().is_some_and(|s| !s.is_empty()) || match r["type"]["@type"].as_str() {
+            Some("reactionTypeEmoji") => r["type"]["emoji"].as_str().is_some_and(|s| !s.is_empty()),
+            Some("reactionTypeCustomEmoji" | "reactionTypePaid") => true,
+            _ => false,
+        };
+        !named || r["total_count"].as_i64().is_none_or(|n| n < 0)
+    }) { return None; }
+    Some(reactions_line(info))
 }
 
 /// What a line has gathered since it was posted: the views, the comments
@@ -165,12 +188,35 @@ pub struct Interaction {
     pub reactions: Option<String>,
 }
 
+/// Ordinary emoji available to this user, preserving Telegram's ordering.
+/// Custom emoji need their own renderer; paid reactions use a separate API.
+#[must_use]
+pub fn available_reactions(v: &Value) -> Vec<String> {
+    if !v["unavailability_reason"].is_null() {
+        return Vec::new();
+    }
+    let mut emojis = Vec::new();
+    for key in ["top_reactions", "recent_reactions", "popular_reactions"] {
+        for reaction in v[key].as_array().into_iter().flatten() {
+            if reaction["needs_premium"].as_bool() == Some(true)
+                || reaction["type"]["@type"].as_str() != Some("reactionTypeEmoji")
+            {
+                continue;
+            }
+            if let Some(emoji) = reaction["type"]["emoji"].as_str().filter(|e| !e.is_empty()) {
+                if !emojis.iter().any(|e| e == emoji) {
+                    emojis.push(emoji.to_string());
+                }
+            }
+        }
+    }
+    emojis
+}
+
 /// `updateMessageInteractionInfo`: a channel post counted again, a reaction
-/// added or taken back. Unlike a peer's counts this is the whole picture —
-/// TDLib sends the `interaction_info` entire, and `null` where a line has
-/// none left — so an absence here is a genuine nought and the projection
-/// writes it through rather than keeping what it had. `None` only when the
-/// update names no chat or no message.
+/// added or taken back. TDLib also emits null while reaction metadata is
+/// invalidated; the worker reconciles that ambiguity before clearing counts.
+/// `None` only when the update names no chat or no message.
 #[must_use]
 pub fn interaction(u: &Value) -> Option<Interaction> {
     let info = &u["interaction_info"];
@@ -1524,11 +1570,18 @@ mod tests {
         assert!(chat_draft(&json!({"@type": "updateChatDraftMessage"})).is_none());
     }
 
-    /// The interaction info is the whole picture of what a line has
-    /// gathered, so a count that has gone reads as an absence and the
-    /// projection writes it through.
+    /// Decode counts without confusing nullable metadata with an empty list.
     #[test]
-    fn the_interaction_info_is_the_whole_of_what_a_line_gathered() {
+    fn interaction_counts_distinguish_unknown_metadata_from_empty_lists() {
+        assert_eq!(reaction_counts(&json!(null)), None);
+        assert_eq!(reaction_counts(&json!({"reactions": null})), None);
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": []}})), Some(None));
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeFuture"}, "total_count": 4},
+        ]}})), None);
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji"}, "total_count": 4},
+        ]}})), None);
         let i = interaction(&json!({
             "@type": "updateMessageInteractionInfo", "chat_id": -1005, "message_id": 4200,
             "interaction_info": {
@@ -1552,5 +1605,15 @@ mod tests {
         .expect("the info");
         assert_eq!((none.views, none.comments, none.reactions), (None, None, None));
         assert!(interaction(&json!({"@type": "updateMessageInteractionInfo", "chat_id": -1005})).is_none());
+    }
+
+    #[test]
+    fn reaction_counts_include_paid_and_custom_emoji_instead_of_dropping_them() {
+        let info = json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 12},
+            {"type": {"@type": "reactionTypePaid"}, "total_count": 30},
+            {"type": {"@type": "reactionTypeCustomEmoji", "custom_emoji_id": "123"}, "total_count": 4},
+        ]}});
+        assert_eq!(reactions_line(&info).as_deref(), Some("👍 12 · ⭐ 30 · custom emoji 4"));
     }
 }

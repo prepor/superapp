@@ -400,7 +400,31 @@ impl Stage {
                 .filter(|c| bold.has(*c))
                 .and_then(|c| accel_idx(&label, c));
             let act = Act::Verb(slot, id);
-            if e.button {
+            if v.style != kernel::panel::VerbStyle::Standard {
+                if hover == Some(&act) {
+                    self.draw_flat.color = rgba_a(theme::HOVER, alpha);
+                    self.draw_flat.draw_abs(cx, e.rect);
+                }
+                if v.style == kernel::panel::VerbStyle::Glyph {
+                    // Shape the entire emoji, including variation selectors
+                    // and joined sequences, instead of tracking code points.
+                    self.draw_mono.text_style.font_size = bar::GLYPH_FONT_SIZE as f32;
+                    self.draw_mono.color = rgba_a(theme::INK, alpha);
+                    if let Some(run) = self.draw_mono.prepare_single_line_run(cx, &label) {
+                        let w = f64::from(run.width_in_lpxs);
+                        let h = f64::from(run.ascender_in_lpxs - run.descender_in_lpxs);
+                        self.draw_mono.draw_abs(cx, dvec2(
+                            e.rect.pos.x + (e.rect.size.x - w) / 2.0,
+                            e.rect.pos.y + (e.rect.size.y - h) / 2.0,
+                        ), &label);
+                    }
+                } else {
+                    let x = e.rect.pos.x + (e.rect.size.x - self.cell.label_w(label.chars().count())) / 2.0;
+                    let y = e.rect.pos.y + (e.rect.size.y - self.cell.label_line()) / 2.0;
+                    self.draw_label_accel(cx, x, y, &label, theme::INK, alpha, accel);
+                }
+                self.hits.push(Hit::act(label, e.rect, MouseCursor::Hand, act));
+            } else if e.button {
                 self.draw_box_btn(cx, e.rect, &label, &label, false, alpha, act, hover, accel);
             } else {
                 // A link, not a button: the three signals of the

@@ -293,6 +293,17 @@ pub struct Verb {
     /// app tests its own bars.
     pub accel: Option<char>,
     pub act: VerbAct,
+    pub style: VerbStyle,
+}
+
+/// Presentation is independent of whether a verb runs an action or navigates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbStyle {
+    Standard,
+    /// Text with a padded hit area and no outline.
+    Plain,
+    /// One complete glyph, such as an emoji sequence, in a square hit area.
+    Glyph,
 }
 
 impl Verb {
@@ -305,7 +316,20 @@ impl Verb {
             label: label.into(),
             accel,
             act: VerbAct::Run,
+            style: VerbStyle::Standard,
         }
+    }
+
+    /// A borderless action represented by one glyph or emoji sequence.
+    #[must_use]
+    pub fn glyph(id: &'static str, label: impl Into<String>) -> Verb {
+        Verb { style: VerbStyle::Glyph, ..Self::run(id, label, None) }
+    }
+
+    #[must_use]
+    pub fn plain(mut self) -> Self {
+        self.style = VerbStyle::Plain;
+        self
     }
 
     /// A link.
@@ -316,6 +340,7 @@ impl Verb {
             label: label.into(),
             accel,
             act: VerbAct::Go(nav),
+            style: VerbStyle::Standard,
         }
     }
 
@@ -336,6 +361,7 @@ impl Verb {
             label: label.into(),
             accel,
             act: VerbAct::Call(Rc::new(f)),
+            style: VerbStyle::Standard,
         }
     }
 }
@@ -346,6 +372,7 @@ impl fmt::Debug for Verb {
             .field("id", &self.id)
             .field("label", &self.label)
             .field("accel", &self.accel)
+            .field("style", &self.style)
             .finish_non_exhaustive()
     }
 }

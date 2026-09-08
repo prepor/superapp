@@ -62,7 +62,7 @@ fn another_builds_migration_counter_cannot_hide_existing_chats() {
             assert_eq!(entities, "[]", "the other build's column survives");
             assert_eq!(
                 schema::SCHEMA.progress(store.conn()).unwrap(),
-                progress.max(13)
+                progress.max(schema::SCHEMA.steps.len() as i64)
             );
         }
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -88,7 +88,7 @@ fn early_topic_builds_upgrade_with_link_metadata_and_block_state() {
         .unwrap();
 
         schema::SCHEMA.apply(&c).unwrap();
-        assert_eq!(schema::SCHEMA.progress(&c).unwrap(), 13);
+        assert_eq!(schema::SCHEMA.progress(&c).unwrap(), schema::SCHEMA.steps.len() as i64);
         let mentions: (bool, bool) = c.query_row(
             "SELECT unread_mention, mention_read FROM tg_message WHERE chat = 42 AND id = 1",
             [], |r| Ok((r.get(0)?, r.get(1)?)),

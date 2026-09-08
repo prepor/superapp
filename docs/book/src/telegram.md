@@ -138,6 +138,61 @@ returned an error. Pending or uncertain delivery must not trigger an automatic
 second send. Operation ids last for the current app session; completed send
 results remain queryable after their status line disappears.
 
+## Reactions
+
+Select a message and press **Cmd+J**, or choose **react(j)** in the chat's
+bar or its line card. The shortcut also works while the composer has focus.
+The bar shows the ordinary emoji Telegram allows for that message in evenly
+spaced, borderless choices, six at a time; **more** and **back** move through
+them. Choose an emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
+cursor also closes it. Service messages and pending or failed sends do not
+offer reactions, and marking messages keeps the batch actions on the bar.
+
+The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
+and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
+requests. The picker refreshes when Telegram changes the chat's permissions,
+active emoji or message interactions; an initially empty cache keeps retrying
+with a capped delay, showing **waiting for reactions…** and **retry** if it
+takes longer. A temporary empty cache keeps already loaded choices. Explicit restrictions
+explain why reactions are unavailable, and missing replies time out instead
+of leaving the picker loading indefinitely.
+
+Visible messages load their bodies and enable TDLib's ongoing reaction
+polling while the panel is visible in the foreground; hidden panels and
+background windows release their subscriptions. Failed or missing snapshots
+retry without scrolling. On startup, saved messages and counts stay visible
+while Telegram restores the chat. Message loads, reaction checks and the
+picker wait for that chat's announcement, independently of the rest of the
+chat list; signing in alone does not make a saved chat ready to open.
+Reaction counts have their own durable projection;
+history, media loads and viewport changes cannot overwrite them. A null
+interaction update means the counts need checking, so the last known counts
+stay visible until a server read confirms a change. Checks retry failures,
+respect rate limits and reject replies that predate newer counts or metadata.
+A fallback sweep every five minutes checks visible messages for missed push
+updates. Initial loads, changed metadata and successful adds request checks
+without waiting for that sweep; reconciliation is paced per account and
+honors Telegram's retry delays.
+Confirmed empty counts survive restarts and stale message loads.
+A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
+and a text fallback for custom emoji. A refused request
+shows **could not load reactions** or **reaction failed**, plus **retry**, and
+automatically reports the reason in a notification; click the status to see it
+again. Startup failures also appear in the sign-in panel. If another app
+instance has locked Telegram's database, close it and restart this instance.
+Offline demos offer a small fixture list and update the message's displayed counts
+locally when an emoji is chosen. A live account with no connected worker reports
+a connection error; it never falls back to demo reactions.
+Custom emoji and paid reactions are not offered.
+
+Count reconciliation uses `searchChatMessages` at the exact message id,
+with its sender, topic, text or media type as the search criterion. Our TDLib
+message database is disabled, so its [search path](https://github.com/tdlib/td/blob/master/td/telegram/MessagesManager.cpp)
+goes to the server; `getMessage` and `getMessages` can still return cached
+data. An absent or unsearchable result keeps the last known counts and retries;
+it never proves a removal. Null counts require loaded reaction metadata and a
+second matching server result within the same metadata generation.
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.

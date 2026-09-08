@@ -282,6 +282,17 @@ mod tests {
         assert_eq!(snapshot(&tracker, None), completed);
         tracked(&tracker, requests::get_forum_topic(7, 2));
         assert_eq!(snapshot(&tracker, None), completed);
+        for request in [
+            requests::set_online(true), requests::chat_open(7, true),
+            requests::get_visible_messages(7, &[42], 1),
+            requests::get_message_available_reactions(7, 42, 1),
+            requests::chat_open(7, false), requests::set_online(false),
+        ] {
+            let request = tracked(&tracker, request);
+            assert_eq!(snapshot(&tracker, None), completed, "reaction synchronization stays out of command progress");
+            tracker.reply(&store, &json!({"@type": "ok", "@extra": request["@extra"]}));
+            assert_eq!(snapshot(&tracker, None), completed);
+        }
     }
 
     #[test]

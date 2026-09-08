@@ -29,14 +29,51 @@ pub struct LinePanel {
     play: Option<Rect>,
     #[rust]
     picture: Option<Rect>,
+    #[rust]
+    viewed: Option<super::super::runtime::MessageView>,
+    #[rust]
+    background: bool,
 }
 
 impl Widget for LinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::WindowLostFocus(_) | Event::Background => {
+                self.background = true;
+                self.viewed = None;
+            }
+            Event::WindowGotFocus(_) | Event::Foreground => {
+                self.background = false;
+                self.view.redraw(cx);
+            }
+            _ => {}
+        }
         super::text::handle_event(&mut self.view, cx, event, scope);
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if !super::message_panel_visible(s, props.slot) { self.viewed = None; }
+            let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+                .is_some_and(|l| l.poll_reactions(s));
+            if changed {
+                self.view.redraw(cx);
+                s.redraw();
+            }
+        }
+        if matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape)
+            && scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot))
+        {
+            let cancelled = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+                .is_some_and(Line::cancel_reactions);
+            if cancelled {
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
+        }
         let Event::MouseDown(e) = event else { return };
         if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
             return;
@@ -92,9 +129,19 @@ impl Widget for LinePanel {
                 Some((m, st, l.playing(now)))
             })
         }) else {
+            self.viewed = None;
             self.view.label(cx, ids!(gone_lbl)).set_visible(cx, true);
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            let ids = if !self.background && super::message_panel_visible(s, props.slot)
+                && m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
+                vec![m.id]
+            } else {
+                Vec::new()
+            };
+            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, ids);
+        }
         let v = &self.view;
         v.label(cx, ids!(gone_lbl)).set_visible(cx, false);
 

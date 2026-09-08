@@ -32,8 +32,25 @@ pub static SCHEMA: Schema = Schema {
         Step::Always(v11_block_state),
         Step::Always(v12_mentions),
         Step::Always(v13_topic_schema),
+        Step::Always(v14_reaction_state),
     ],
 };
+
+fn v14_reaction_state(c: &Connection) -> rusqlite::Result<()> {
+    if !columns(c, "tg_message")?.contains("content_type") {
+        c.execute_batch("ALTER TABLE tg_message ADD COLUMN content_type TEXT")?;
+    }
+    if !columns(c, "tg_message_reaction")?.is_empty() { return Ok(()); }
+    c.execute_batch("CREATE TABLE tg_message_reaction(
+        chat INTEGER NOT NULL, message INTEGER NOT NULL, counts TEXT,
+        known INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+        refresh INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(chat, message));
+        INSERT INTO tg_message_reaction(chat, message, counts, known, revision)
+            SELECT chat, id, reactions, 1, 1 FROM tg_message WHERE reactions IS NOT NULL;
+        CREATE TRIGGER tg_message_reaction_delete AFTER DELETE ON tg_message BEGIN
+            DELETE FROM tg_message_reaction WHERE chat = old.chat AND message = old.id;
+        END;")
+}
 
 // Existing cached text remains readable and can detect bare URLs locally.
 // New updates retain their entities, including destinations behind labels.
@@ -678,6 +695,34 @@ mod tests {
     use rusqlite::Connection;
 
     mod topics;
+
+    #[test]
+    fn reaction_upgrade_preserves_counts_and_does_not_reseed_confirmed_removals() {
+        let old = kernel::app::Schema { app: "telegram", steps: &super::SCHEMA.steps[..13] };
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        old.apply(&c).unwrap();
+        c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'Reactions');
+            INSERT INTO tg_chat(peer) VALUES(10);
+            INSERT INTO tg_message(id, chat, date, text, reactions) VALUES(1, 10, 1, 'post', '👍 8');
+            INSERT INTO tg_message(id, chat, date, text) VALUES(2, 10, 2, 'unknown');").unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        let seeded: (String, bool, bool) = c.query_row(
+            "SELECT counts, known, refresh FROM tg_message_reaction WHERE chat = 10 AND message = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(seeded, ("👍 8".into(), true, true));
+        assert!(super::super::reaction_state::state(&c, 10, 2).unwrap().refresh);
+        super::super::reaction_state::set(&c, 10, 1, None).unwrap();
+        c.execute("UPDATE tg_message SET reactions = '👍 8' WHERE id = 1", []).unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        let removed: (Option<String>, bool) = c.query_row(
+            "SELECT counts, known FROM tg_message_reaction WHERE chat = 10 AND message = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(removed, (None, true));
+        c.execute("DELETE FROM tg_message WHERE chat = 10 AND id = 1", []).unwrap();
+        let left: i64 = c.query_row("SELECT count(*) FROM tg_message_reaction", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "message retention also retires its reaction state");
+    }
 
     #[test]
     fn v9_keeps_cached_messages_and_their_search_index() {

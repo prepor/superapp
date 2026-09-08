@@ -34,6 +34,9 @@ use super::transport::Td;
 use super::updates;
 
 mod mentions;
+mod counts;
+mod reactions;
+mod views;
 
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
@@ -60,8 +63,8 @@ pub struct Account<T: Td> {
     /// A failed initialization needs another request: TDLib does not emit
     /// WaitTdlibParameters again when a competing instance releases its lock.
     retry_parameters: std::cell::Cell<Option<f64>>,
-    /// A restored viewer can open before loadChats has restored its chat.
-    media_requests: std::cell::RefCell<Vec<String>>,
+    /// Viewers and reaction pickers can open before TDLib restores their chat.
+    deferred_reads: std::cell::RefCell<Vec<String>>,
     known_chats: std::cell::RefCell<std::collections::HashSet<PeerId>>,
     loading_chats: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
@@ -92,6 +95,10 @@ pub struct Account<T: Td> {
     /// The earliest the next page may go: the pace, or the wait Telegram
     /// asked for.
     not_before: std::cell::Cell<f64>,
+    /// Chats and message rows currently displayed by the account's widgets.
+    viewed: std::cell::RefCell<views::Views>,
+    reactions: std::cell::RefCell<reactions::Reactions>,
+    counts: std::cell::RefCell<counts::Counts>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -120,6 +127,14 @@ const FETCH_ON_OPEN: usize = 40;
 const PARAMETERS_RETRY: f64 = 5.0;
 
 impl<T: Td> Account<T> {
+    /// Our persisted chat is not evidence that this TDLib client knows it.
+    /// Authorization starts restoration; updateNewChat makes each chat usable.
+    /// Once both lists finish, let TDLib report genuinely unavailable chats.
+    fn chat_ready(&self, chat: PeerId) -> bool {
+        self.auth_ready.get()
+            && (!self.loading_chats.get() || self.known_chats.borrow().contains(&chat))
+    }
+
     /// The single outbound boundary for commands and background requests.
     fn send(&self, w: &World, request: &str) {
         let rt = runtime::of(w.store());
@@ -129,12 +144,10 @@ impl<T: Td> Account<T> {
                 .report(w.store(), "sending request", "Invalid request JSON");
             return;
         };
-        if v["@type"] == "getMessage"
-            && v["@extra"]["context"].as_str().and_then(parse_media_extra).is_some()
-            && (!self.auth_ready.get() || (self.loading_chats.get()
-                && !v["chat_id"].as_i64().is_some_and(|chat| self.known_chats.borrow().contains(&chat))))
+        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessageAvailableReactions"))
+            && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
-            let mut pending = self.media_requests.borrow_mut();
+            let mut pending = self.deferred_reads.borrow_mut();
             if !pending.contains(&request) {
                 pending.push(request);
             }
@@ -150,6 +163,7 @@ impl<T: Td> Account<T> {
             ">> {} request={} chat={}",
             v["@type"], v["@extra"]["operation"], v["chat_id"]
         ));
+        self.track_reactions(w, &v);
         self.td.send(&request);
     }
 
@@ -223,7 +237,7 @@ impl<T: Td> Account<T> {
             auth_ready: std::cell::Cell::new(false),
             waiting_for_parameters: std::cell::Cell::new(false),
             retry_parameters: std::cell::Cell::new(None),
-            media_requests: std::cell::RefCell::new(Vec::new()),
+            deferred_reads: std::cell::RefCell::new(Vec::new()),
             known_chats: std::cell::RefCell::new(std::collections::HashSet::new()),
             loading_chats: std::cell::Cell::new(false),
             api_id,
@@ -235,6 +249,9 @@ impl<T: Td> Account<T> {
             mention_generation: std::cell::Cell::new(0),
             mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
+            viewed: std::cell::RefCell::new(views::Views::default()),
+            counts: std::cell::RefCell::new(counts::Counts::default()),
+            reactions: std::cell::RefCell::new(reactions::Reactions::default()),
         }
     }
 
@@ -264,17 +281,28 @@ impl<T: Td> Account<T> {
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
         let rt = runtime::of(w.store());
+        // Retire canceled/expired reads even while authorization is pending.
+        // Reaction reply timeouts start in send(), only after the chat is ready.
+        let pending = std::mem::take(&mut *self.deferred_reads.borrow_mut());
+        for request in pending {
+            let Ok(v) = serde_json::from_str::<Value>(&request) else { continue; };
+            let context = v["@extra"]["context"].as_str();
+            let picker = context.and_then(parse_reaction_choices_extra).map(|(id, _)| id);
+            if picker.is_some_and(|id| !rt.reaction_alive(id)) {
+                if let Some(context) = context { rt.operations.retire_context(context); }
+                continue;
+            }
+            if v["@extra"]["operation"].as_u64().is_some_and(|id| rt.operations.pending(id)) {
+                self.send(w, &request);
+            } else if let Some(id) = picker {
+                rt.finish_reaction(id, runtime::ReactionResult::Error(
+                    "Telegram did not restore this chat. Try again.".into()));
+            }
+        }
         if !self.auth_ready.get() || rt.connection_error().is_some() {
             return;
         }
-        let pending = std::mem::take(&mut *self.media_requests.borrow_mut());
-        for request in pending {
-            let id = serde_json::from_str::<Value>(&request).ok()
-                .and_then(|v| v["@extra"]["operation"].as_u64());
-            if id.is_some_and(|id| runtime::of(w.store()).operations.pending(id)) {
-                self.send(w, &request);
-            }
-        }
+        self.sync_views(w);
         // A viewer can fetch its media once that chat is known. Background
         // history and topic work wait until the chat lists finish loading.
         if rt.list_syncing() {
@@ -326,9 +354,7 @@ impl<T: Td> Account<T> {
         }
         let page = {
             let mut pages = self.pages.borrow_mut();
-            let Some(index) = pages.iter().position(|page| {
-                !self.loading_chats.get() || self.known_chats.borrow().contains(&page.chat)
-            }) else { return };
+            let Some(index) = pages.iter().position(|page| self.chat_ready(page.chat)) else { return };
             pages.remove(index).unwrap()
         };
         self.in_flight.set(Some((page, now)));
@@ -397,7 +423,9 @@ impl<T: Td> Account<T> {
             self.retry_parameters.set(None);
             self.parameters(w);
         }
+        self.sync_reactions(w);
         self.pump(w);
+        self.sync_counts(w);
         n
     }
 
@@ -432,6 +460,7 @@ impl<T: Td> Account<T> {
         if tracked {
             v["@extra"] = v["@extra"]["context"].clone();
         }
+        if self.on_count_reply(w, &v) { return; }
         match v["@type"].as_str() {
             Some("updateConnectionState") => {
                 rt.set_connection(v["state"]["@type"].as_str().unwrap_or(""));
@@ -470,6 +499,9 @@ impl<T: Td> Account<T> {
                 self.log("<< file");
                 self.on_file(w, &v);
                 self.on_file_answer(w, &v);
+            }
+            Some("availableReactions") => {
+                self.on_reaction_choices(w, &v, false);
             }
             // A refreshed source message lands like a new line before its
             // viewer starts downloading the file registered by that message.
@@ -530,6 +562,8 @@ impl<T: Td> Account<T> {
             st["@type"].as_str() == Some("authorizationStateWaitTdlibParameters"),
         );
         if st["@type"].as_str() != Some("authorizationStateReady") {
+            self.known_chats.borrow_mut().clear();
+            self.counts.borrow_mut().reset(w);
             let note = match st["@type"].as_str() {
                 Some("authorizationStateWaitTdlibParameters") => "connecting to Telegram…",
                 Some("authorizationStateClosing" | "authorizationStateClosed") => "Telegram is disconnected",
@@ -643,6 +677,9 @@ impl<T: Td> Account<T> {
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
         runtime::of(w.store()).set_connection_note(None);
+        // Views may have been drawn while TDLib was still signing in.
+        self.viewed.borrow_mut().reset();
+        self.counts.borrow_mut().reset(w);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -654,8 +691,9 @@ impl<T: Td> Account<T> {
     }
 
     /// A plain reply — `ok` or an error — to one of this account's own
-    /// requests, told apart by the `@extra` it wore: the chat-list load, a
-    /// history page. Send outcomes are handled by the operation tracker.
+    /// requests, told apart by the `@extra` it wore: initialization,
+    /// reactions, the chat-list load, and history pages. Send outcomes are
+    /// handled by the operation tracker.
     ///
     /// The list load: `ok` says a page landed and there may be another, an
     /// error (TDLib's 404) that the list is complete — after the main list
@@ -692,6 +730,28 @@ impl<T: Td> Account<T> {
                 .is_some_and(|e| e.starts_with("load_chats:"))
         {
             runtime::of(w.store()).set_list_syncing(false);
+            return;
+        }
+        if failed && (self.on_reaction_choices(w, v, true) || self.on_visible_error(w, v)) {
+            return;
+        }
+        if let Some(id) = v["@extra"].as_str().and_then(parse_reaction_extra) {
+            let result = if failed {
+                runtime::ReactionResult::Error(
+                    runtime::of(w.store()).connection_error().unwrap_or_else(|| {
+                        v["message"].as_str().unwrap_or("reaction request failed").to_string()
+                    }),
+                )
+            } else {
+                if let Some((_, chat, msg)) = v["@extra"].as_str().and_then(parse_added_reaction_extra) {
+                    // Restore the body if needed, and reconcile its counts
+                    // through the server path even if the picker was closed.
+                    self.send(w, &get_message(chat, msg));
+                    self.counts_after_add(w, chat, msg);
+                }
+                runtime::ReactionResult::Added
+            };
+            runtime::of(w.store()).finish_reaction(id, result);
             return;
         }
         match (v["@extra"].as_str(), failed) {
@@ -890,6 +950,18 @@ impl<T: Td> Account<T> {
             Some("updateChatDraftMessage") => self.on_chat_draft(w, update),
             Some("updateChatAction") => self.on_chat_action(w, update),
             Some("updateMessageInteractionInfo") => self.on_interaction(w, update),
+            Some("updateActiveEmojiReactions") => {
+                self.reactions_changed(w, None, None);
+                self.visible_reactions_changed(None);
+                self.counts_metadata_changed(w, None);
+            }
+            Some("updateChatAvailableReactions") => {
+                if let Some(chat) = update["chat_id"].as_i64() {
+                    self.reactions_changed(w, Some(chat), None);
+                    self.visible_reactions_changed(Some(chat));
+                    self.counts_metadata_changed(w, Some(chat));
+                }
+            }
             Some("updateMessageSendSucceeded" | "updateMessageSendFailed") => {
                 self.on_sent(w, update);
             }
@@ -932,7 +1004,14 @@ impl<T: Td> Account<T> {
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
-            Some("messages" | "foundChatMessages") => self.on_history(w, update),
+            Some("messages") => {
+                if let Some((chat, request)) = update["@extra"].as_str().and_then(parse_visible_extra) {
+                    self.on_visible_messages(w, update, chat, request);
+                } else {
+                    self.on_history(w, update);
+                }
+            }
+            Some("foundChatMessages") => self.on_history(w, update),
             Some("forumTopics") => self.on_topics(w, update),
             Some("forumTopic") => {
                 if let Some(chat) = update["info"]["chat_id"].as_i64()
@@ -1063,11 +1142,17 @@ impl<T: Td> Account<T> {
         };
         let (text, media) = updates::content(&u["new_content"], 0.0);
         let entities = updates::content_entities(&u["new_content"]);
+        let content_type = u["new_content"]["@type"].as_str().map(str::to_string);
         self.filed(
             w,
             "on_message_content",
             w.store()
-                .write(move |c| set_content(c, chat, id, &text, media.as_ref(), &entities)),
+                .write(move |c| {
+                    set_content(c, chat, id, &text, media.as_ref(), &entities)?;
+                    c.execute("UPDATE tg_message SET content_type = COALESCE(?3, content_type)
+                        WHERE chat = ?1 AND id = ?2", (chat, id, content_type))?;
+                    Ok::<_, rusqlite::Error>(())
+                }),
         );
         // A swapped-in photo or file is fetched the same way a new line's is.
         self.fetch(w, &u["new_content"]);
@@ -1095,24 +1180,28 @@ impl<T: Td> Account<T> {
 
     /// What a line has gathered since it was posted: the views a channel
     /// post counts, the comments under it, the reactions as the one line the
-    /// transcript draws. Written straight, not coalesced — the update carries
-    /// the interaction info whole, so a reaction taken back is an absence
-    /// that must reach the row, else the last emoji a post ever wore would
-    /// stay on it forever.
+    /// transcript draws. Null reactions can also mean invalidated metadata;
+    /// retain the durable counts until reconciliation confirms their removal.
     fn on_interaction(&self, w: &World, u: &Value) {
         let Some(i) = updates::interaction(u) else {
             return;
         };
+        let counts = updates::reaction_counts(&u["interaction_info"]);
+        self.reactions_changed(w, Some(i.chat), Some(i.id));
         self.filed(
             w,
             "on_interaction",
             w.store().write(move |c| {
                 c.execute(
-                    "UPDATE tg_message SET views = ?3, comments = ?4, reactions = ?5
+                    "UPDATE tg_message SET views = ?3, comments = ?4
                      WHERE chat = ?1 AND id = ?2",
-                    rusqlite::params![i.chat, i.id, i.views, i.comments, i.reactions],
-                )
-                .map(|_| ())
+                    rusqlite::params![i.chat, i.id, i.views, i.comments],
+                )?;
+                if let Some(counts) = counts {
+                    super::reaction_state::set(c, i.chat, i.id, counts.as_deref())
+                } else {
+                    super::reaction_state::refresh(c, i.chat, i.id)
+                }
             }),
         );
     }
@@ -1149,6 +1238,7 @@ impl<T: Td> Account<T> {
     fn on_new_chat(&self, w: &World, chat: &Value) {
         if let Some(id) = chat["id"].as_i64() {
             self.known_chats.borrow_mut().insert(id);
+            self.log(&format!("<< chat ready chat={id}"));
         }
         let Some(ch) = updates::chat(chat) else {
             return;

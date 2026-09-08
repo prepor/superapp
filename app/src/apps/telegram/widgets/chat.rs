@@ -167,13 +167,31 @@ pub struct ChatPanel {
     reveal: Reveal<MsgId>,
     #[rust]
     dragging_files: bool,
+    #[rust]
+    viewed: Option<super::super::runtime::MessageView>,
+    #[rust]
+    background: bool,
 }
 
 impl Widget for ChatPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        match event {
+            Event::WindowLostFocus(_) | Event::Background => {
+                self.background = true;
+                self.viewed = None;
+            }
+            Event::WindowGotFocus(_) | Event::Foreground => {
+                self.background = false;
+                self.view.redraw(cx);
+            }
+            _ => {}
+        }
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if scope.data.get_mut::<Session>().is_some_and(|s| !super::message_panel_visible(s, props.slot)) {
+            self.viewed = None;
+        }
 
         if matches!(event, Event::Scroll(_)) {
             self.reveal.cancel();
@@ -214,6 +232,13 @@ impl Widget for ChatPanel {
                 _ => self.dragging_files = false,
             }
             self.view.redraw(cx);
+        }
+
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if with_chat(&props, |c| c.poll_reactions(s)).unwrap_or(false) {
+                self.view.redraw(cx);
+                s.redraw();
+            }
         }
 
         let field = self.view.text_input(cx, INPUT);
@@ -265,6 +290,15 @@ impl Widget for ChatPanel {
 
         let focused = field.key_focus(cx);
         if let Event::KeyDown(k) = event {
+            if has_focus && k.key_code == KeyCode::Escape
+                && with_chat(&props, Chat::cancel_reactions).unwrap_or(false)
+            {
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
             if focused {
                 match k.key_code {
                     // Enter sends; shift+enter is the field's newline, and
@@ -713,6 +747,7 @@ impl Widget for ChatPanel {
         self.rows.clear();
         self.inner.clear();
         let clip = self.view.widget(cx, LIST).area().rect(cx);
+        let mut visible_ids = Vec::new();
         for (idx, row) in drawn {
             let Some(r) = rows.get(idx) else { continue };
             let full = row.area().rect(cx);
@@ -724,6 +759,10 @@ impl Widget for ChatPanel {
                     let Some(rect) = props.hits.add_row_clipped(
                         row_label(r, now), full, clip, MouseCursor::Hand, props.slot,
                     ) else { continue };
+                    if msg.id > 0 && !msg.service && !matches!(msg.state.as_deref(), Some("sending" | "failed"))
+                    {
+                        visible_ids.push(msg.id);
+                    }
                     self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
@@ -734,6 +773,12 @@ impl Widget for ChatPanel {
                         row_label(r, now), full, clip, MouseCursor::Default, props.slot,
                     );
                 }
+            }
+        }
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if let Some(chat) = with_chat(&props, |c| c.peer()) {
+                if self.background || !super::message_panel_visible(s, props.slot) { visible_ids.clear(); }
+                super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, visible_ids);
             }
         }
         for (label, path, cursor) in [

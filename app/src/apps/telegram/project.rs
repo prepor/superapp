@@ -124,6 +124,9 @@ pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> 
 /// a channel post's counts, and whether it is a service line nobody wrote.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IncomingMessage {
+    /// Retain the wire type: videos and animations share a renderer but use
+    /// different Telegram search filters when reconciling their reactions.
+    pub content_type: Option<String>,
     pub id: MsgId,
     pub chat: PeerId,
     pub topic: i64,
@@ -271,12 +274,13 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service, entities, entities_known, topic, unread_mention)
+  views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
        ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1,
-       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29)
+       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
+  content_type = COALESCE(excluded.content_type, tg_message.content_type),
   text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
   edited = excluded.edited, reply_to = excluded.reply_to,
@@ -288,7 +292,7 @@ ON CONFLICT(chat, id) DO UPDATE SET
   media_lon = excluded.media_lon, media_until = excluded.media_until,
   media_clip = excluded.media_clip, media_clip_rid = excluded.media_clip_rid,
   views = excluded.views, comments = excluded.comments,
-  reactions = excluded.reactions, service = excluded.service,
+  service = excluded.service,
   unread_mention = excluded.unread_mention AND NOT tg_message.mention_read,
   mention_read = tg_message.mention_read OR
                  (tg_message.unread_mention AND NOT excluded.unread_mention)";
@@ -335,7 +339,9 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             serde_json::to_string(&m.entities).expect("text entities serialize"),
             m.topic,
             m.unread_mention,
+            m.content_type,
         ])?;
+        super::reaction_state::seed(c, m.chat, m.id, m.reactions.as_deref())?;
     }
     Ok(())
 }
@@ -538,6 +544,7 @@ mod tests {
     /// no sender peer is needed).
     fn msg(id: MsgId, chat: PeerId, at: f64, text: &str) -> IncomingMessage {
         IncomingMessage {
+            content_type: Some("messageText".into()),
             topic: 0,
             id,
             chat,

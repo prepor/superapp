@@ -23,6 +23,7 @@ pub mod messages;
 pub mod peer;
 pub mod people;
 pub mod place;
+mod reactions;
 pub mod signin;
 pub mod topics;
 

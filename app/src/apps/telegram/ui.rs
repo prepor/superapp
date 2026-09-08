@@ -348,11 +348,12 @@ script_mod! {
         foot := View {
             visible: false
             width: Fill, height: Fit
-            flow: Right
-            spacing: 12
+            flow: Down
+            spacing: 4
             reactions_lbl := mod.widgets.SLabel {
                 visible: false
-                width: Fit, text: "", draw_text +: { color: #5a5a5a }
+                width: Fill
+                text: "", draw_text +: { color: #5a5a5a }
             }
             comments_lbl := mod.widgets.SLabel {
                 visible: false
@@ -708,11 +709,12 @@ script_mod! {
         foot := View {
             visible: false
             width: Fill, height: Fit
-            flow: Right
-            spacing: 12
+            flow: Down
+            spacing: 4
             reactions_lbl := mod.widgets.SLabel {
                 visible: false
-                width: Fit, text: "", draw_text +: { color: #5a5a5a }
+                width: Fill
+                text: "", draw_text +: { color: #5a5a5a }
             }
             comments_lbl := mod.widgets.SLabel {
                 visible: false

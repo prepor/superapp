@@ -1,5 +1,5 @@
 //! One line of a chat, as a card: the whole of it, its media at the card's
-//! width, and the verbs that act on one line — reply, forward, copy, pin,
+//! width, and the verbs that act on one line — reply, forward, copy, react, pin,
 //! and on a line of mine edit and delete, which are real on the store.
 //!
 //! Reached from the chat's bar by `line`, over the line under the cursor,
@@ -23,6 +23,7 @@ use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId, Player};
 use super::super::{requests, runtime, verbs};
 use super::chat::copy_line;
+use super::reactions::{self, Reactions};
 use super::{wire, Chat, Chats, Viewer};
 
 /// A line's card.
@@ -34,6 +35,7 @@ pub struct Line {
     slot: SlotId,
     /// The card's own player, where the line has a recording.
     player: Option<Player>,
+    reactions: Reactions,
 }
 
 impl Line {
@@ -63,6 +65,14 @@ impl Line {
 
     fn blocked(&self) -> bool {
         model::peer(self.world.store(), self.chat).is_some_and(|c| c.blocked)
+    }
+
+    pub fn cancel_reactions(&mut self) -> bool {
+        self.reactions.cancel()
+    }
+
+    pub fn poll_reactions(&mut self, s: &mut Session) -> bool {
+        self.reactions.poll(s)
     }
 
     /// Where the player stands, for a line with a recording.
@@ -138,6 +148,9 @@ impl Panel for Line {
     /// carries a picture, a video or a sound; and a place's two ways out —
     /// Apple Maps, and the map in a browser.
     fn verbs(&self) -> Vec<Verb> {
+        if let Some(verbs) = self.reactions.verbs() {
+            return verbs;
+        }
         let m = self.msg();
         let mine = m.as_ref().is_some_and(|m| m.out);
         let mut v = Vec::new();
@@ -149,6 +162,9 @@ impl Panel for Line {
         }
         v.push(Verb::run("telegram.forward", "forward", Some('f')));
         v.push(Verb::run("telegram.copy", "copy", Some('c')));
+        if m.as_ref().is_some_and(reactions::can_react) {
+            v.push(Verb::run("telegram.react", "react(j)", Some('j')));
+        }
         if mine {
             v.push(Verb::run("telegram.delete", "delete", Some('d')));
         }
@@ -189,8 +205,17 @@ impl Panel for Line {
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.reactions.run(self.world.store(), verb, s) {
+            return;
+        }
         let now = s.now();
         match verb {
+            "telegram.react" => {
+                if let Some(m) = self.msg() {
+                    self.reactions.open(s, &m);
+                    s.redraw();
+                }
+            }
             // The chat this card hangs under takes the reply or the edit,
             // and the keyboard with it: the composer is there, and both are
             // written.
@@ -305,6 +330,7 @@ impl PanelKind for LineKind {
             world: cx.session().world().clone(),
             slot: 0,
             player: None,
+            reactions: Reactions::default(),
         })
     }
 }
