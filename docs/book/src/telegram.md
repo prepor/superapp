@@ -24,6 +24,11 @@ history walk, including empty chats waiting for their first messages. Leaving a
 chat cancels its queued pages and thumbnail requests; late history replies cannot
 restart an abandoned walk. Telegram's page pacing and retry waits still apply.
 
+Press **Ctrl+E** to jump to the end of the chat and select its newest message,
+including while the composer has focus. The draft and caret stay in place,
+and new messages follow as they arrive. With the transcript focused, **Home**
+and **End** select the oldest and newest loaded messages.
+
 Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
 answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
 Following several originals keeps each return point, so repeated `back`
