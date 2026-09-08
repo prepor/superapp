@@ -138,6 +138,11 @@ impl FakeGateway {
         FakeGateway::new(vec![
             Reply::when("fail", Answer::Fail("the gateway is down".into())),
             Reply::when("cut", Answer::Cut("This answer is long and it".into())),
+            Reply::when("read attachment", Answer::Call {
+                name: "mail.attachment".into(),
+                arguments: serde_json::json!({"mail": 1, "part": 2}),
+                then: "The attachment is available.".into(),
+            }),
             Reply::when("web search", Answer::Text(
                 "I found [the Rust book](https://doc.rust-lang.org/book/).".into(),
             )),

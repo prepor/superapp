@@ -374,6 +374,9 @@ pub fn registry_for(list: &'static [&'static dyn App]) -> Registry {
 pub fn capabilities_for(list: &'static [&'static dyn App], mode: Mode, env: &Env) -> Capabilities {
     let mut caps = Capabilities::default();
     crate::caps::install(mode, env, &mut caps);
+    caps.insert::<crate::tool::Readers>(Box::new(crate::tool::Readers(
+        list.iter().flat_map(|app| app.tools()).filter(|tool| tool.reader.is_some()).collect(),
+    )));
     for a in list {
         a.outside(mode, env, &mut caps);
     }

@@ -1,5 +1,5 @@
 //! The pass that drives one run: ask, write what came back, and — where
-//! the model asked for tools — sleep until the chat has run them.
+//! the model asked for tools — run background reads or wait for session calls.
 //!
 //! One worker per run that is still going — `pending`, `streaming` or
 //! `waiting` — derived from the store, so a run starts the moment its row
@@ -12,6 +12,8 @@
 use kernel::app::{Wake, Worker};
 use kernel::effect::{Job, World};
 use kernel::store::Store;
+use std::task::Poll;
+use std::time::Duration;
 
 use super::model::{
     self, add_call_tx, add_turn_tx, set_run_status_tx, set_run_usage_tx, ChatId, Cost, RunId, Turn,
@@ -24,12 +26,13 @@ use super::AGENT;
 pub struct RunWorker {
     run: RunId,
     chat: ChatId,
+    reading: Option<(model::CallId, kernel::tool::Read)>,
 }
 
 impl RunWorker {
     #[must_use]
     pub fn new(run: RunId, chat: ChatId) -> RunWorker {
-        RunWorker { run, chat }
+        RunWorker { run, chat, reading: None }
     }
 }
 
@@ -127,7 +130,7 @@ impl RunWorker {
                 }
                 Ok(())
             });
-            return Wake::OnKick;
+            return Wake::After(Duration::ZERO);
         }
         let turn = Turn::new(done.message.clone())
             .by(run)
@@ -199,6 +202,9 @@ impl RunWorker {
     /// once still has the earlier rounds' rows, and those were answered
     /// when they were the latest.
     fn answered(&mut self, w: &World) -> Wake {
+        if let Some(wake) = self.read_calls(w) {
+            return wake;
+        }
         let calls = model::round_calls_conn(w.store().conn(), self.run);
         // Answered is *not* run: a call the person refused never ran, and
         // the refusal is its answer. What the round is still owed is a call
@@ -228,6 +234,53 @@ impl RunWorker {
             return Wake::OnKick;
         }
         self.ask(w)
+    }
+
+    /// Read tools run in the same order as session tools, stopping at either
+    /// a pending download or a call that belongs to the UI/approval gate.
+    fn read_calls(&mut self, w: &World) -> Option<Wake> {
+        let tools = w.with_cap::<kernel::tool::Readers, _>(|readers| readers.0.clone()).unwrap_or_default();
+        for call in model::round_calls_conn(w.store().conn(), self.run) {
+            if call.status == model::CALL_ASKED {
+                return Some(Wake::OnKick);
+            }
+            if call.status != model::CALL_PENDING {
+                continue;
+            }
+            let tool = tools.iter().find(|t| t.name == call.tool)?;
+            let reader = tool.reader.filter(|_| !tool.asks && !tool.writes)?;
+            if model::is_stopped(w.store().conn(), self.run) {
+                self.reading = None;
+                return Some(Wake::OnKick);
+            }
+            let input = call.input();
+            let result = match tool.check(&input) {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    if self.reading.as_ref().is_none_or(|(id, _)| *id != call.id) {
+                        self.reading = Some((call.id, reader(&input)));
+                    }
+                    w.store().poll_external();
+                    match (self.reading.as_mut().unwrap().1)(w) {
+                        Poll::Pending => return Some(Wake::After(Duration::from_millis(100))),
+                        Poll::Ready(result) => result,
+                    }
+                }
+            };
+            self.reading = None;
+            let (status, output) = match result {
+                Ok(value) => (model::CALL_DONE, value.to_string()),
+                Err(error) => (model::CALL_FAILED, error),
+            };
+            let (id, run, chat, now) = (call.id, self.run, self.chat, w.now());
+            let _ = w.store().write(move |c| {
+                if model::run_alive_tx(c, run, chat)? {
+                    model::set_call_tx(c, id, status, &output, None, now)?;
+                }
+                Ok(())
+            });
+        }
+        None
     }
 }
 

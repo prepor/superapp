@@ -3,6 +3,7 @@
 use makepad_widgets::*;
 
 pub mod html;
+pub mod document;
 pub mod pictures;
 pub mod ui;
 

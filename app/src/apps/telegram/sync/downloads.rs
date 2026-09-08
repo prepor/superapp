@@ -1,4 +1,5 @@
-//! A save is one acknowledged operation from source refresh through disk copy.
+//! A download is one acknowledged operation from source refresh through cache
+//! arrival, and through disk copy when the person explicitly saves it.
 //! Its retry always starts at the source; no session-local file id is replayed.
 
 use kernel::caps::Blobs;
@@ -12,6 +13,12 @@ pub(super) struct Download {
     file: i64,
     reference: String,
     name: String,
+    cache_only: bool,
+}
+
+fn source(context: &str) -> Option<(i64, i64, bool)> {
+    requests::parse_save_extra(context).map(|(chat, msg)| (chat, msg, false))
+        .or_else(|| requests::parse_cache_extra(context).map(|(chat, msg)| (chat, msg, true)))
 }
 
 impl<T: Td> Account<T> {
@@ -21,9 +28,9 @@ impl<T: Td> Account<T> {
         if request["@type"] != "getMessage" {
             return false;
         }
-        let Some((chat, msg)) = request["@extra"]["context"]
+        let Some((chat, msg, cache_only)) = request["@extra"]["context"]
             .as_str()
-            .and_then(requests::parse_save_extra)
+            .and_then(source)
         else {
             return false;
         };
@@ -42,16 +49,16 @@ impl<T: Td> Account<T> {
         };
         // Only documents retain their original filename in the projection.
         // Other media refreshes its metadata before saving, even when cached.
-        if m.media.as_ref().is_none_or(|md| md.kind != "file") {
+        if !cache_only && m.media.as_ref().is_none_or(|md| md.kind != "file") {
             return false;
         }
         let Some(reference) = downloads::reference(&m) else {
             return false;
         };
-        self.save_cached(w, id, reference, &downloads::name(&m))
+        self.save_cached(w, id, reference, &downloads::name(&m), cache_only)
     }
 
-    fn save_cached(&self, w: &World, id: u64, reference: &str, name: &str) -> bool {
+    fn save_cached(&self, w: &World, id: u64, reference: &str, name: &str, cache_only: bool) -> bool {
         let rt = runtime::of(w.store());
         let path = match w.with_cap::<dyn Blobs, _>(|b| b.get(reference)) {
             Ok(Some(path)) => path,
@@ -61,6 +68,10 @@ impl<T: Td> Account<T> {
                 return true;
             }
         };
+        if cache_only {
+            rt.operations.cached(id);
+            return true;
+        }
         match downloads::save(w, &path, name) {
             Ok(path) => rt.operations.saved(id, &path),
             Err(error) => rt.operations.fail(w.store(), id, &error, false),
@@ -72,7 +83,7 @@ impl<T: Td> Account<T> {
         let Some(context) = v["@extra"]["context"].as_str() else {
             return false;
         };
-        let Some((chat, msg)) = requests::parse_save_extra(context) else {
+        let Some((chat, msg, cache_only)) = source(context) else {
             return false;
         };
         let Some(id) = v["@extra"]["operation"].as_u64() else {
@@ -119,12 +130,20 @@ impl<T: Td> Account<T> {
                     );
                     return true;
                 };
+                if cache_only {
+                    let size = file["size"].as_u64().unwrap_or(0)
+                        .max(file["expected_size"].as_u64().unwrap_or(0));
+                    if let Err(error) = crate::reader::document::check_size(size) {
+                        rt.operations.fail(w.store(), id, &error, false);
+                        return true;
+                    }
+                }
                 let name = updates::attachment_name(&v["content"])
                     .map(downloads::safe_name)
                     .or_else(|| model::line(w.store(), chat, msg).map(|m| downloads::name(&m)))
                     .unwrap_or_else(|| "telegram-file".into());
                 self.on_file(w, file);
-                if self.save_cached(w, id, &reference, &name) {
+                if self.save_cached(w, id, &reference, &name, cache_only) {
                     return true;
                 }
                 let file_id = file["id"].as_i64().unwrap();
@@ -135,6 +154,7 @@ impl<T: Td> Account<T> {
                         file: file_id,
                         reference,
                         name,
+                        cache_only,
                     },
                 );
                 let mut request: Value =
@@ -157,7 +177,7 @@ impl<T: Td> Account<T> {
                 }
                 let download = pending.remove(&id).unwrap();
                 drop(pending);
-                if !self.save_cached(w, id, &download.reference, &download.name) {
+                if !self.save_cached(w, id, &download.reference, &download.name, download.cache_only) {
                     rt.operations.fail(
                         w.store(),
                         id,

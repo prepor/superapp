@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::model::{self, MsgId, PeerCard, PeerId};
 use super::operations::Status;
 use super::panels::Chat;
-use super::{runtime, topics};
+use super::{downloads, requests, runtime, topics};
 
 pub const DESCRIBE: &str = "\
 Telegram is a local cache of one account's TDLib updates. `tg_peer` names \
@@ -23,6 +23,11 @@ keyed by (`chat`, `id`): `topic` (0 outside a forum topic), `sender`, \
 `date`, `text`, `out`, `reply_to`, and media metadata. Message ids are \
 only unique within a chat. Use sql.query to find a recipient by name or \
 username and read their cached messages; the cache may be incomplete.
+
+Media columns are metadata, not file contents. Use telegram.file with the \
+chat and message id to read an attached PDF or text file, downloading it \
+on demand. This works even without an open Telegram panel. Follow its \
+next_offset for longer documents instead of asking the person to re-upload.
 
 Use telegram.draft to put text in the correct chat's composer for review, \
 then telegram.send with the returned slot and exact chat, topic, text and \
@@ -51,6 +56,26 @@ pub fn all() -> Vec<Tool> {
     });
     send_input["required"] = json!(["slot", "chat", "text"]);
     vec![
+        Tool::reading(
+            "telegram.file",
+            "Read the file attached to a Telegram message, using its chat and message \
+             ids from a panel or sql.query on tg_message. Downloads the full attachment \
+             on demand into the local cache, including documents whose previews show \
+             only a filename. Use for translation or summarization of PDF text layers \
+             and UTF-8/UTF-16 text files up to 32 MiB. Scanned PDFs need OCR. Returns \
+             up to 64 KiB of text; repeat with next_offset until truncated is false. \
+             Does not mark messages read or save a copy to Downloads.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "integer", "description": "tg_message.chat (Telegram chat id)"},
+                    "message": {"type": "integer", "description": "tg_message.id within that chat"},
+                    "offset": {"type": "integer", "description": "omit for the start; use next_offset from a previous read"}
+                },
+                "required": ["chat", "message"], "additionalProperties": false
+            }),
+            file,
+        ),
         Tool::new(
             "telegram.draft",
             "Write a text draft and open its Telegram chat for review. Find the chat id \
@@ -87,6 +112,76 @@ pub fn all() -> Vec<Tool> {
             status,
         ),
     ]
+}
+
+fn file(input: &Value) -> kernel::tool::Read {
+    let input = input.clone();
+    let mut operation = None;
+    let started = std::time::Instant::now();
+    Box::new(move |world| match read_file(world, &input, &mut operation, started) {
+        Ok(Some(value)) => std::task::Poll::Ready(Ok(value)),
+        Ok(None) => std::task::Poll::Pending,
+        Err(error) => std::task::Poll::Ready(Err(error)),
+    })
+}
+
+fn read_file(
+    world: &kernel::effect::World,
+    input: &Value,
+    operation: &mut Option<u64>,
+    started: std::time::Instant,
+) -> Result<Option<Value>, String> {
+    use crate::reader::document;
+    use kernel::caps::Blobs;
+    use std::io::Read as _;
+
+    let chat = input["chat"].as_i64().ok_or("`chat` must be a 64-bit integer")?;
+    let message = input["message"].as_i64().ok_or("`message` must be a 64-bit integer")?;
+    let offset = document::offset(input)?;
+    let m = model::line(world.store(), chat, message)
+        .ok_or_else(|| format!("no cached Telegram message at {chat}, {message}"))?;
+    let reference = downloads::reference(&m).ok_or("This message has no downloadable attachment")?;
+    if let Some(path) = world.with_cap::<dyn Blobs, _>(|b| b.get(reference))? {
+        let source = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+        document::check_size(source.metadata().map_err(|error| error.to_string())?.len())?;
+        let mut bytes = Vec::new();
+        source.take(document::MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+        let name = downloads::name(&m);
+        let mut out = document::read(&bytes, &name, "", offset)?;
+        out["chat"] = json!(chat);
+        out["message"] = json!(message);
+        out["name"] = json!(name);
+        out["size"] = json!(bytes.len());
+        return Ok(Some(out));
+    }
+    let rt = runtime::of(world.store());
+    if !rt.can_send() {
+        return Err("Telegram is not connected and this file is not cached; reconnect and try again".into());
+    }
+    if let Some(id) = *operation {
+        match rt.operations.outcome(id).map(|o| o.status) {
+            Some(Status::Failed { error, .. }) => return Err(error),
+            Some(Status::Done) => return Err("Downloaded file is no longer in the cache; try again".into()),
+            None => return Err("Telegram download is no longer available; try again".into()),
+            Some(Status::Pending) => {}
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(120) {
+            let error = "Telegram did not finish downloading this file within two minutes; try again";
+            rt.operations.fail(world.store(), id, error, false);
+            return Err(error.into());
+        }
+    } else {
+        let request = rt.operations.track(&requests::cache_file(chat, message));
+        let request_value: Value = serde_json::from_str(&request).map_err(|e| e.to_string())?;
+        let id = request_value["@extra"]["operation"].as_u64().ok_or("download was not tracked")?;
+        if !rt.send(&request) {
+            let error = "Telegram disconnected before the download could start";
+            rt.operations.fail(world.store(), id, error, false);
+            return Err(error.into());
+        }
+        *operation = Some(id);
+    }
+    Ok(None)
 }
 
 fn message_input() -> Value {

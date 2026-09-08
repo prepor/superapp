@@ -41,7 +41,7 @@ const MAX_HITS: i64 = 100;
 /// The default when a search says nothing about how many it wants.
 const HITS: i64 = 20;
 
-/// Mail's tools, in the order a request lists them: the two that read, then
+/// Mail's tools, in the order a request lists them: the three that read, then
 /// the five that file, then the two that mark, then writing a letter.
 #[must_use]
 pub fn all() -> Vec<Tool> {
@@ -78,6 +78,26 @@ pub fn all() -> Vec<Tool> {
             }),
             false,
             thread,
+        ),
+        Tool::reading(
+            "mail.attachment",
+            "Read a mail attachment's contents, downloading it on demand and reusing \
+             the local cache. Use this to translate or summarize an attached PDF or \
+             text file; an attachment preview contains metadata, not its contents. \
+             Find mail and part in mail.thread, the attachment panel, or the attachment \
+             table. Supports PDF text layers and UTF-8/UTF-16 text up to 32 MiB; \
+             scanned PDFs need OCR. Returns at most 64 KiB of text; continue with \
+             next_offset until truncated is false. Does not mark mail read.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "mail": {"type": "integer", "description": "message.id of the letter carrying the file"},
+                    "part": {"type": "integer", "description": "attachment.part (not attachment.id)"},
+                    "offset": {"type": "integer", "description": "omit for the start; use next_offset from a previous read"}
+                },
+                "required": ["mail", "part"], "additionalProperties": false
+            }),
+            attachment,
         ),
         Tool::new(
             "mail.archive",
@@ -257,6 +277,9 @@ fn thread(s: &mut Session, input: &Value) -> Result<Value, String> {
             "mailbox": m.role,
             "unread": m.mail.head.unread,
             "text": text,
+            "attachments": super::parts::attachments(store, m.mail.head.id).iter().map(|a| json!({
+                "mail": a.message, "part": a.at, "name": a.name, "mime": a.mime, "size": a.size,
+            })).collect::<Vec<_>>(),
         }));
     }
     Ok(json!({
@@ -265,6 +288,27 @@ fn thread(s: &mut Session, input: &Value) -> Result<Value, String> {
         "letters": letters,
         "truncated": truncated,
     }))
+}
+
+fn attachment(input: &Value) -> kernel::tool::Read {
+    let input = input.clone();
+    Box::new(move |world| std::task::Poll::Ready((|| {
+        let mail = int(&input, "mail")?.ok_or("`mail` must be an integer")?;
+        let part = int(&input, "part")?.and_then(|n| u32::try_from(n).ok())
+            .ok_or("`part` must be a nonnegative 32-bit integer")?;
+        let offset = crate::reader::document::offset(&input)?;
+        let a = super::parts::attachment(world.store(), mail, part)
+            .ok_or_else(|| format!("no attachment at mail {mail}, part {part}"))?;
+        crate::reader::document::check_size(a.size)?;
+        let bytes = super::parts::part(world, &a)?;
+        let mut out = crate::reader::document::read(&bytes, &a.name, &a.mime, offset)?;
+        out["mail"] = json!(mail);
+        out["part"] = json!(part);
+        out["name"] = json!(a.name);
+        out["mime"] = json!(a.mime);
+        out["size"] = json!(bytes.len());
+        Ok(out)
+    })()))
 }
 
 // -- filing --------------------------------------------------------------------------

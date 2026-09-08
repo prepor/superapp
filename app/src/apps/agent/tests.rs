@@ -20,6 +20,8 @@ use super::{
 
 static APPS: &[&dyn App] = &[&AGENT];
 
+mod attachments;
+
 /// What a chunk stream comes to, with nothing watching it.
 fn read(raw: &str) -> Result<Completion, Failure> {
     stream_completion(events(raw).into_iter(), &mut |_| Flow::Go)

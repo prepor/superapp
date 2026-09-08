@@ -31,6 +31,42 @@ fn clear_cache(s: &Session) {
         .caps(|c| c.insert::<dyn Blobs>(Box::new(Env::default().blobs)));
 }
 
+fn agent_read(s: &Session, mail: MailId, part: u32) -> Result<serde_json::Value, String> {
+    let tool = s.apps().tool("mail.attachment").unwrap();
+    assert!(!tool.writes && !tool.asks);
+    let input = serde_json::json!({"mail": mail, "part": part});
+    tool.check(&input)?;
+    let std::task::Poll::Ready(result) = (tool.reader.unwrap())(&input)(s.world()) else {
+        panic!("the IMAP read completes on its own worker");
+    };
+    result
+}
+
+#[test]
+fn an_agent_discovers_and_reads_pdf_attachments_with_no_panel_or_manual_export() {
+    let (mut s, _) = session();
+    let bytes = crate::reader::document::test_pdf("Bonjour depuis le PDF.");
+    let mail = deliver(&s, "agent-pdf", &bytes);
+    let tool = s.apps().tool("mail.thread").unwrap().clone();
+    let thread = (tool.run)(&mut s, &serde_json::json!({"thread": mail})).unwrap();
+    let part = &thread["letters"][0]["attachments"][0];
+    assert_eq!(part["mail"], mail);
+    assert_eq!(part["name"], "download.bin");
+    let at = part["part"].as_u64().unwrap() as u32;
+    assert_eq!(servers(&s).with(seed::ACCOUNT, |srv| srv.part_fetches.len()), Some(0));
+    let result = agent_read(&s, mail, at).unwrap();
+    assert!(result["text"].as_str().unwrap().contains("Bonjour depuis le PDF."));
+    assert_eq!(result["format"], "pdf");
+    assert_eq!(result["size"], bytes.len());
+    servers(&s).set_down(Some("offline"));
+    assert_eq!(agent_read(&s, mail, at).unwrap(), result);
+    assert_eq!(servers(&s).with(seed::ACCOUNT, |srv| srv.part_fetches.len()), Some(1));
+    assert!(model::mail(s.store(), mail).unwrap().head.unread);
+    clear_cache(&s);
+    assert!(agent_read(&s, mail, at).unwrap_err().contains("offline"));
+    assert!(agent_read(&s, mail, u32::MAX).unwrap_err().contains("no attachment"));
+}
+
 #[test]
 fn attachments_download_only_on_demand_and_cache_hits_work_offline() {
     let (s, _) = session();

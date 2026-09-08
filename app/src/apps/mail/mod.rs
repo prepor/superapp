@@ -208,7 +208,9 @@ Threading is three lookups over this table and no subject guessing.
 `attachment` — saved with the message: a part's \
 `name`, `mime`, `size`, `cid`, and the `part` index its bytes are read back \
 by. Bytes download on demand via IMAP into the device-local file cache \
-shared with Telegram.
+shared with Telegram. Use mail.attachment with mail = attachment.message \
+and part = attachment.part to read a PDF or text file; mail.thread lists \
+these ids with each letter. A preview or raw snapshot is not the file.
 
 `draft` and `draft_attachment` — a compose panel's unsent text and the \
 paths it will carry, both keyed by that panel's slot (`panel`), which is why \

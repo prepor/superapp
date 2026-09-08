@@ -1,0 +1,20 @@
+# args: --demo-disk
+# env:
+# The fake asks for the seeded budget attachment. The shell must advance
+# the background read and resume the agent. Only a successful read with a
+# nonempty result wears the folded card marker; errors cannot satisfy it.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "read attachment"
+wait 400
+key enter
+wait 900
+click "› mail.attachment 1 2"
+wait 400
+click "The attachment is available."
+quit
