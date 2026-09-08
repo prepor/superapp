@@ -13,7 +13,8 @@ pub fn events(now: f64) -> Vec<Value> {
     };
     let mut design = timed("design", "Design review", 0, "14:00", 45);
     design["recurrence"] = json!(["RRULE:FREQ=WEEKLY;COUNT=8"]);
-    design["description"] = json!("Review the calendar timeline and upcoming work.");
+    design["description"] = json!("<p>Review the calendar timeline and upcoming work.</p><p><a href=\"https://example.com/agenda\">Review agenda</a><br>Project notes: https://example.com/notes</p>");
+    design["location"] = json!("https://example.com/meeting-room");
     design["attendees"] = json!([{"email":"nora@studio.example","displayName":"Nora","responseStatus":"accepted"},{"email":"leo@studio.example","displayName":"Leo","responseStatus":"tentative"}]);
     design["conferenceData"] = json!({"entryPoints":[{"entryPointType":"video","uri":"https://meet.google.com/demo-review"}]});
     let mut invitation = timed("research", "Research catch-up", 0, "15:30", 30);

@@ -938,12 +938,14 @@ fn collapse(t: &str) -> (String, bool, bool) {
 struct Ctx {
     fmt: Fmt,
     ws: Ws,
+    in_link: bool,
 }
 
 struct Walk<'a> {
     doc: &'a Doc,
     sheet: StyleSheet<'a>,
     out: Out,
+    detect_links: bool,
 }
 
 /// Where a declaration stands in the cascade — `(important, inline,
@@ -980,6 +982,27 @@ impl Walk<'_> {
     }
 
     fn text(&mut self, t: &str, ctx: &Ctx) {
+        if self.detect_links && !ctx.in_link && !ctx.fmt.mono && !matches!(ctx.ws, Ws::Pre) {
+            let finder = linkify::LinkFinder::new();
+            let mut end = 0;
+            for link in finder.links(t) {
+                self.text_run(&t[end..link.start()], ctx);
+                let target = match link.kind() {
+                    linkify::LinkKind::Email => format!("mailto:{}", link.as_str()),
+                    _ => link.as_str().to_string(),
+                };
+                let mut linked = ctx.clone();
+                linked.fmt.link = link_target(&target);
+                self.text_run(link.as_str(), &linked);
+                end = link.end();
+            }
+            self.text_run(&t[end..], ctx);
+        } else {
+            self.text_run(t, ctx);
+        }
+    }
+
+    fn text_run(&mut self, t: &str, ctx: &Ctx) {
         match ctx.ws {
             Ws::Pre => self.out.run(t, &ctx.fmt, true),
             Ws::PreLines => {
@@ -1078,6 +1101,7 @@ impl Walk<'_> {
             "hr" => self.out.void("hr"),
             "img" => self.img(attrs, &css, &ctx),
             "a" => {
+                ctx.in_link = true;
                 if let Some(h) = href(attrs) {
                     ctx.fmt.link = Some(h);
                 }
@@ -1411,6 +1435,37 @@ pub fn sanitize(src: &str) -> String {
 
 /// Narrow a document and resolve relative links and images against its source.
 pub fn sanitize_with_base(src: &str, base: Option<&str>) -> String {
+    reading(src, base, false)
+}
+
+/// Read a description containing HTML or plain text, preserving its line
+/// breaks and detecting bare web addresses and emails outside existing links
+/// and code. Existing Mail/RSS readings keep their normal HTML whitespace.
+pub fn linked(src: &str) -> String {
+    reading(src, None, true)
+}
+
+/// The same reading for literal fields such as an event location.
+pub fn linked_text(src: &str) -> String {
+    let mut escaped = String::new();
+    esc(&mut escaped, src);
+    linked(&escaped)
+}
+
+/// Only destinations the shared reader is allowed to open.
+pub fn link_target(src: &str) -> Option<String> {
+    if src.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let parsed = url::Url::parse(src).ok()?;
+    match parsed.scheme() {
+        "http" | "https" if parsed.host_str().is_some() => Some(src.to_string()),
+        "mailto" if !parsed.path().is_empty() => Some(src.to_string()),
+        _ => None,
+    }
+}
+
+fn reading(src: &str, base: Option<&str>, detect_links: bool) -> String {
     let mut src = src;
     if src.len() > MAX_IN {
         let mut end = MAX_IN;
@@ -1443,8 +1498,13 @@ pub fn sanitize_with_base(src: &str, base: Option<&str>) -> String {
         doc: &doc,
         sheet,
         out: Out::default(),
+        detect_links,
     };
-    walk.node(0, &Ctx::default());
+    let mut ctx = Ctx::default();
+    if detect_links {
+        ctx.ws = Ws::PreLines;
+    }
+    walk.node(0, &ctx);
     walk.out.finish()
 }
 

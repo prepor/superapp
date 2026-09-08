@@ -202,6 +202,45 @@ fn a_styled_link_keeps_its_text() {
     );
 }
 
+#[test]
+fn linked_descriptions_detect_urls_and_email_and_preserve_line_breaks() {
+    let text = "Meet at https://meet.google.com/abc-defg-hij.\nEmail me@example.com\nA < B & C";
+    let html = linked_text(text);
+    assert!(html.contains(r#"<a href="https://meet.google.com/abc-defg-hij">https://meet.google.com/abc-defg-hij</a>."#), "{html}");
+    assert!(html.contains(r#"<a href="mailto:me@example.com">me@example.com</a>"#), "{html}");
+    assert_eq!(html.matches("<br>").count(), 2, "{html}");
+    assert!(html.contains("A &lt; B &amp; C"), "{html}");
+    assert!(!linked_text("main.rs and Dr.Smith").contains("<a "));
+}
+
+#[test]
+fn linked_descriptions_keep_html_labels_and_autolink_only_outside_anchors() {
+    let html = linked(r#"<p><b><a href="https://example.com/agenda?a=1&amp;b=2">Review agenda</a></b></p><p>Notes: https://example.com/notes</p><a href="https://example.com/target">https://example.com/label</a>"#);
+    assert!(html.contains(r#"<b><a href="https://example.com/agenda?a=1&amp;b=2">Review agenda</a></b>"#), "{html}");
+    assert!(html.contains(r#"<a href="https://example.com/notes">https://example.com/notes</a>"#), "{html}");
+    assert!(html.contains(r#"<a href="https://example.com/target">https://example.com/label</a>"#), "{html}");
+    assert_eq!(html.matches("<a ").count(), 3, "{html}");
+}
+
+#[test]
+fn linked_descriptions_leave_unsafe_links_and_code_inert() {
+    let html = linked(r#"<a href="javascript:alert(1)">https://example.com/label</a><code>https://example.com/code</code><pre>https://example.com/pre</pre><script>https://example.com/script</script><span hidden>https://example.com/hidden</span>"#);
+    assert!(!html.contains("<a "), "{html}");
+    assert!(!html.contains("javascript:") && !html.contains("/script") && !html.contains("/hidden"), "{html}");
+    assert!(html.contains("/code") && html.contains("/pre"), "{html}");
+    assert_eq!(linked_text("<b>literal</b>"), "&lt;b&gt;literal&lt;/b&gt;");
+}
+
+#[test]
+fn reader_link_targets_only_allow_web_and_email_destinations() {
+    for target in ["https://example.com/a?x=1&y=2", "http://example.com/", "mailto:me@example.com"] {
+        assert_eq!(link_target(target).as_deref(), Some(target));
+    }
+    for target in ["javascript:alert(1)", "file:///tmp/file", "data:text/html,hello", "https://", "mailto:", "https://example.com/\nnext"] {
+        assert_eq!(link_target(target), None, "{target}");
+    }
+}
+
 /// A link is one item to the widget: it cannot span lines, so a link
 /// around block content (a newsletter's button) is re-opened on each
 /// line, and one with no text at all vanishes.

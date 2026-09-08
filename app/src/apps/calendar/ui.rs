@@ -85,9 +85,9 @@ script_mod! {
             when_lbl := mod.widgets.SLabel { width: Fill }
             source_lbl := mod.widgets.SLabel { width: Fill, draw_text +: { color: #909090 } }
             mod.widgets.SRule {}
-            details_lbl := mod.widgets.SText { width: Fill, is_multiline: true }
+            details_html := mod.widgets.ReaderHtml {}
             people_lbl := mod.widgets.SText { width: Fill, is_multiline: true }
-            notes_lbl := mod.widgets.SText { width: Fill, is_multiline: true, draw_text +: { text_style: mod.widgets.SProseStyle{} } }
+            notes_html := mod.widgets.ReaderHtml {}
             state_lbl := mod.widgets.SLabel { width: Fill, draw_text +: { color: #5a5a5a } }
             delete_view := View { width: Fill, height: Fit, flow: Down, spacing: 8
                 delete_lbl := mod.widgets.SLabel { width: Fill }

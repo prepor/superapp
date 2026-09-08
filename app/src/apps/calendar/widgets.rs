@@ -1,4 +1,5 @@
 use super::{availability, dates, edit, model, panels, scoped};
+use crate::reader::{self, pictures};
 use crate::shell::{
     hosted::PanelProps,
     widgets::{
@@ -338,6 +339,27 @@ impl Widget for CalendarMonthPanel {
     }
 }
 
+/// Avoid parsing unchanged descriptions during redraws, and preserve the
+/// reader's text selection when only surrounding event state changes.
+#[derive(Default)]
+struct EventText {
+    source: String,
+    html: String,
+}
+impl EventText {
+    fn get(&mut self, source: &str, literal: bool) -> &str {
+        if self.source != source {
+            self.html = if literal {
+                reader::html::linked_text(source)
+            } else {
+                reader::html::linked(source)
+            };
+            self.source = source.into();
+        }
+        &self.html
+    }
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct CalendarEventPanel {
     #[source]
@@ -346,10 +368,19 @@ pub struct CalendarEventPanel {
     view: View,
     #[rust]
     content: WidgetRef,
+    #[rust]
+    details: EventText,
+    #[rust]
+    notes: EventText,
 }
 impl Widget for CalendarEventPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
+        reader::handle_links(&mut self.view, cx, event, scope);
+        match event {
+            Event::Actions(a) if pictures::landed(cx, a) => self.view.redraw(cx),
+            Event::NetworkResponses(r) if pictures::arrived(cx, r) => self.view.redraw(cx),
+            _ => {}
+        }
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
@@ -435,7 +466,8 @@ impl Widget for CalendarEventPanel {
                             _ => "",
                         }
                     );
-                    text_field(cx, &w, ids!(details_lbl), &details);
+                    let details_view = w.html(cx, ids!(details_html));
+                    reader::set_html(cx, details_view, self.details.get(details.trim(), true));
                     let people = raw["attendees"]
                         .as_array()
                         .map(|a| {
@@ -466,7 +498,11 @@ impl Widget for CalendarEventPanel {
                             people
                         ),
                     );
-                    text_field(cx, &w, ids!(notes_lbl), model::text(raw, "description"));
+                    let notes = model::text(raw, "description");
+                    let notes_view = w.html(cx, ids!(notes_html));
+                    reader::set_html(cx, notes_view, self.notes.get(notes, false));
+                    w.widget(cx, ids!(notes_html))
+                        .set_visible(cx, !notes.trim().is_empty());
                     w.view(cx, ids!(delete_view)).set_visible(cx, deleting);
                     w.label(cx,ids!(delete_lbl)).set_text(cx,"Delete this event from Google Calendar? Guest notifications follow the setting below.");
                     w.button(cx, ids!(scope_btn))
@@ -487,6 +523,11 @@ impl Widget for CalendarEventPanel {
                     w.label(cx, ids!(when_lbl))
                         .set_text(cx, "deleted or calendar disconnected");
                     w.view(cx, ids!(delete_view)).set_visible(cx, false);
+                    let details_view = w.html(cx, ids!(details_html));
+                    reader::set_html(cx, details_view, "");
+                    let notes_view = w.html(cx, ids!(notes_html));
+                    reader::set_html(cx, notes_view, "");
+                    text_field(cx, &w, ids!(people_lbl), "");
                 }
                 w.label(cx, ids!(state_lbl)).set_text(
                     cx,
@@ -499,8 +540,31 @@ impl Widget for CalendarEventPanel {
                 drawn = Some(w);
             }
         }
+        let pics = pictures::link_rects(cx);
         if let Some(w) = drawn {
             let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+            for (path, label, link_label) in [
+                (ids!(details_html), "event details", "event details link"),
+                (
+                    ids!(notes_html),
+                    "event description",
+                    "event description link",
+                ),
+            ] {
+                let widget = w.widget(cx, path);
+                if !widget.visible() || !widget.area().is_valid(cx) {
+                    continue;
+                }
+                let area = widget.area().rect(cx);
+                props
+                    .hits
+                    .add_clipped(label, area, clip, MouseCursor::Text, props.slot);
+                for rect in reader::link_runs(cx, &w, path, area, &pics) {
+                    props
+                        .hits
+                        .add_clipped(link_label, rect, clip, MouseCursor::Hand, props.slot);
+                }
+            }
             for path in [
                 ids!(title_lbl),
                 ids!(when_lbl),

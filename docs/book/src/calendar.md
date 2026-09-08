@@ -11,6 +11,11 @@ next, and today move through months. Selecting a date opens that day's agenda;
 selecting an agenda row previews its event in a joined panel. Both views keep
 the filter when switching. Multi-day events occupy every overlapping date.
 
+Event details use the shared rich-text reader: links in descriptions, locations,
+and Meet URLs are clickable. Descriptions retain HTML formatting and labelled
+links; plain web addresses and email addresses are detected automatically.
+Text remains selectable, and a link opens once even with several events visible.
+
 ## Sources and accounts
 
 The **calendars** panel lists each source's account, Google calendar ID,
