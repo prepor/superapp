@@ -46,6 +46,8 @@ pub struct PanelChip {
     pub queries: Vec<TraceEntry>,
     /// The panel's own paragraph, in the app's words.
     pub about: String,
+    /// SQL columns rendered as full text; the values are still read at send time.
+    pub text_columns: Vec<String>,
 }
 
 /// What a chip of a panel that nobody has open says instead of its
@@ -119,6 +121,7 @@ impl Chip {
                 "title": p.title,
                 "workspace": p.workspace,
                 "about": p.about,
+                "text_columns": p.text_columns,
             }),
         }
     }
@@ -155,6 +158,9 @@ impl Chip {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    text_columns: v.get("text_columns")
+                        .and_then(|columns| serde_json::from_value(columns.clone()).ok())
+                        .unwrap_or_default(),
                 }))
             }
             _ => None,
@@ -183,6 +189,7 @@ impl Chip {
             workspace: 0,
             queries: Vec::new(),
             about: NOT_OPEN.to_string(),
+            text_columns: Vec::new(),
         }))
     }
 }
@@ -196,6 +203,7 @@ impl PanelChip {
             workspace: cx.workspace,
             queries: cx.queries,
             about: cx.about,
+            text_columns: cx.text_columns,
         }
     }
 
@@ -209,6 +217,7 @@ impl PanelChip {
             title: self.title.clone(),
             workspace: self.workspace,
             about: self.about.clone(),
+            text_columns: self.text_columns.clone(),
             queries: self.queries.clone(),
         };
         if cx.queries.is_empty() {

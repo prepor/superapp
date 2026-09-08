@@ -59,6 +59,8 @@ pub struct PanelContext {
     /// layout no longer places.
     pub workspace: usize,
     pub about: String,
+    /// Columns the panel asks to include as full text, before table previews.
+    pub text_columns: Vec<String>,
     /// The trace of the panel's last draw — its provenance, and what the
     /// rows below are re-read from.
     pub queries: Vec<TraceEntry>,
@@ -69,15 +71,19 @@ pub struct PanelContext {
 #[must_use]
 pub fn of(s: &Session, slot: SlotId) -> Option<PanelContext> {
     let inst = s.panel(slot)?;
-    let (id, title, about) = {
+    let (id, title, about, text_columns) = {
         let p = inst.borrow();
-        (p.id().clone(), p.title(), p.about())
+        (
+            p.id().clone(), p.title(), p.about(),
+            p.context_text_columns().iter().map(|name| (*name).to_string()).collect(),
+        )
     };
     Some(PanelContext {
         id,
         title,
         workspace: s.ws().ws_of(slot).map_or(0, |k| k + 1),
         about,
+        text_columns,
         queries: s.store().trace_of(slot),
     })
 }
@@ -89,8 +95,9 @@ pub fn of(s: &Session, slot: SlotId) -> Option<PanelContext> {
 /// traced query its purpose, its parameters, its SQL, and a markdown table of
 /// the rows **as they read now** — the SQL is prepared again on the store's
 /// reader (query-only by construction) and bound with the values the draw
-/// bound; then `## recent effects`, at most [`EFFECTS`] lines, absent when
-/// there are none.
+/// bound. Columns named by the panel's `context_text_columns` also appear
+/// in full as text blocks before their table. Then `## recent effects`, at
+/// most [`EFFECTS`] lines, absent when there are none.
 ///
 /// Nothing here asks the session for anything, so a panel that has since
 /// closed renders exactly as it did while it was open.
@@ -110,7 +117,7 @@ pub fn render(store: &Store, cx: &PanelContext, effects: &[Job]) -> String {
             out.push_str(&format!("params: {}\n", e.params));
         }
         out.push_str(&format!("```sql\n{}\n```\n", collapse(&e.sql)));
-        out.push_str(&rows_now(store, e));
+        out.push_str(&rows_now(store, e, &cx.text_columns));
     }
     let recent: Vec<&Job> = effects.iter().take(EFFECTS).collect();
     if !recent.is_empty() {
@@ -210,8 +217,8 @@ pub fn recent_effects(store: &Store, id: &PanelId, n: usize) -> Vec<Job> {
 /// and the line that says how many of how many. A query that will not run
 /// again — a table dropped, a text no longer valid — says so on one line
 /// instead, because the point of the SQL above it is that it can be checked.
-fn rows_now(store: &Store, e: &TraceEntry) -> String {
-    match read(store, e) {
+fn rows_now(store: &Store, e: &TraceEntry, text_columns: &[String]) -> String {
+    match read(store, e, text_columns) {
         Ok((table, k)) => format!("{table}rows ({k} of {}, the panel's own page)\n", e.rows),
         Err(err) => format!(
             "could not re-read this query: {}\n",
@@ -220,28 +227,47 @@ fn rows_now(store: &Store, e: &TraceEntry) -> String {
     }
 }
 
-/// The markdown table, and how many rows went into it.
-fn read(store: &Store, e: &TraceEntry) -> rusqlite::Result<(String, usize)> {
+/// Full text fields followed by the markdown table, and its row count.
+fn read(store: &Store, e: &TraceEntry, text_columns: &[String]) -> rusqlite::Result<(String, usize)> {
     let mut stmt = store.conn().prepare(&e.sql)?;
     let names: Vec<String> = stmt
         .column_names()
         .into_iter()
         .map(ToString::to_string)
         .collect();
-    let mut out = md_row(names.iter().map(String::as_str));
-    out.push_str(&md_rule(names.len()));
+    let mut out = String::new();
+    let mut table = md_row(names.iter().map(String::as_str));
+    table.push_str(&md_rule(names.len()));
     let mut rows = stmt.query(rusqlite::params_from_iter(e.values.iter()))?;
     let mut k = 0;
     while k < ROWS {
         let Some(r) = rows.next()? else { break };
         let mut cells: Vec<String> = Vec::with_capacity(names.len());
-        for i in 0..names.len() {
-            cells.push(cell(&r.get_ref(i)?));
+        for (i, name) in names.iter().enumerate() {
+            let value = r.get_ref(i)?;
+            if text_columns.contains(name) {
+                if let rusqlite::types::ValueRef::Text(text) = value {
+                    if !text.is_empty() {
+                        out.push_str(&text_field(name, k + 1, &String::from_utf8_lossy(text)));
+                    }
+                }
+            }
+            cells.push(cell(&value));
         }
-        out.push_str(&md_row(cells.iter().map(String::as_str)));
+        table.push_str(&md_row(cells.iter().map(String::as_str)));
         k += 1;
     }
+    out.push_str(&table);
     Ok((out, k))
+}
+
+/// Preserve the text verbatim inside a fence longer than any backtick run
+/// it contains, so code in a message cannot close its own text block.
+fn text_field(name: &str, row: usize, text: &str) -> String {
+    let ticks = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((ticks + 1).max(3));
+    let newline = if text.ends_with('\n') { "" } else { "\n" };
+    format!("\n#### {name} (row {row})\n{fence}text\n{text}{newline}{fence}\n\n")
 }
 
 /// One value as text. Numbers as they were written, text on one line and cut
@@ -702,6 +728,7 @@ mod tests {
             title: "he said \"hi\" <loudly>".into(),
             workspace: 2,
             about: "a note".into(),
+            text_columns: Vec::new(),
             queries: Vec::new(),
         };
         let s = Session::fake(APPS);

@@ -134,6 +134,26 @@ impl Panel for Line {
         self.head()
     }
 
+    fn about(&self) -> String {
+        format!(
+            "One Telegram message as a card: its complete text or caption, author, \
+             time, quoted reply, forwarding information, reactions and media metadata. \
+             Its arguments are the chat id ({}, `tg_peer.id`) and message id \
+             ({}, `tg_message.id`); together they identify one row of `tg_message`. \
+             Message ids are only unique within a chat. The row's `topic` is the \
+             forum topic id, or 0 outside a topic. The `text` and `reply_text` \
+             sections contain the full cached message and quoted text with their \
+             line breaks. A person reads, copies, replies, forwards or reacts here, \
+             and can edit or delete their own message. Reply and edit use the \
+             Telegram conversation's composer.",
+            self.chat, self.msg
+        )
+    }
+
+    fn context_text_columns(&self) -> &'static [&'static str] {
+        &["text", "reply_text"]
+    }
+
     /// A card: four wide, four tall — room for a picture at its width.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (4, 4)

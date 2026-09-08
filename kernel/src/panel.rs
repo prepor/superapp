@@ -232,6 +232,14 @@ pub trait Panel: Any {
         format!("{} — {}", self.title(), self.id())
     }
 
+    /// Query columns whose text belongs in full in the agent's context.
+    /// They are rendered as separate text blocks, preserving whitespace,
+    /// before the table's clipped previews. The panel-wide context cap still
+    /// applies. Names are the SQL result's column names, including aliases.
+    fn context_text_columns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The size the panel asks for, width and height in grid units, given
     /// the column's width in characters. Constant for most kinds; a letter
     /// or a file card asks for the rows its content needs. The layout

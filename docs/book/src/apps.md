@@ -79,10 +79,10 @@ no claims.
 
 `Panel` is the live instance in a slot. It owns its own state between draws:
 its table, its cursor and marks, which messages are open, what it measured, the
-text of its fields. It answers `id`, `title`, `about`, `wish`, `verbs`,
-`persist`, and `run`, is told `placed(slot)` once the layout has run, and lends
-itself through `as_any` so its own app can downcast it. The widget that draws
-it borrows it from the scope and calls its methods on input.
+text of its fields. It answers `id`, `title`, `about`, `context_text_columns`,
+`wish`, `verbs`, `persist`, and `run`, is told `placed(slot)` once the layout
+has run, and lends itself through `as_any` so its own app can downcast it.
+The widget that draws it borrows it from the scope and calls its methods on input.
 
 `about` is the one paragraph the panel would say about itself to an
 [agent](./agents.md#what-a-panel-says-about-itself) — what the rows are, what
