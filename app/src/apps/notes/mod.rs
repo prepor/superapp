@@ -4,6 +4,7 @@ use kernel::app::{App, Root, Schema, Step};
 use kernel::panel::{PanelId, PanelKind};
 use std::any::Any;
 
+mod file_text;
 mod markdown;
 mod model;
 mod panels;

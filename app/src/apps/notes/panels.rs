@@ -1,4 +1,4 @@
-use super::model;
+use super::{file_text, file_text::editable, model};
 use kernel::caps::{basename, display_path, real_path};
 use kernel::effect::World;
 use kernel::layout::SlotId;
@@ -139,14 +139,7 @@ impl Editor {
         if !self.is_file() {
             return self.text.clone();
         }
-        let mut text = self.text.clone();
-        if self.original.contains("\r\n") {
-            text = text.replace('\n', "\r\n");
-        }
-        if self.original.starts_with('\u{feff}') {
-            text.insert(0, '\u{feff}');
-        }
-        text
+        file_text::encode(&self.original, &self.text)
     }
     pub fn dirty(&self) -> bool {
         self.dirty
@@ -169,17 +162,18 @@ impl Editor {
             return;
         }
         self.text = text;
-        self.dirty = self.is_file() && self.bytes_text() != self.original;
+        let body = self.bytes_text();
+        self.dirty = self.is_file() && body != self.original;
         let result = match &self.source {
             Source::Note(id) => {
-                model::edit(self.world.store(), *id, self.text.clone(), self.world.now())
+                model::edit(self.world.store(), *id, body, self.world.now())
             }
             Source::File(path) => model::save_draft(
                 self.world.store(),
                 path.clone(),
                 model::Draft {
                     original: self.original.clone(),
-                    body: self.bytes_text(),
+                    body,
                 },
                 self.world.now(),
             ),
@@ -296,11 +290,6 @@ impl Editor {
         }
         s.redraw();
     }
-}
-fn editable(text: &str) -> String {
-    text.strip_prefix('\u{feff}')
-        .unwrap_or(text)
-        .replace("\r\n", "\n")
 }
 impl Panel for Editor {
     fn id(&self) -> &PanelId {

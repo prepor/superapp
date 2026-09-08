@@ -69,7 +69,6 @@ pub struct Ui;
 pub static UI: Ui = Ui;
 impl AppUi for Ui {
     fn script_mod(&self, vm: &mut ScriptVm) -> ScriptValue {
-        crate::shell::widgets::source_input::script_mod(vm);
         self::script_mod(vm)
     }
     fn template(&self, tag: Tag) -> Option<LiveId> {

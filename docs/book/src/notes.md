@@ -26,7 +26,8 @@ change; source positions and line geometry stay the same. Parsing happens
 on text changes; styled layout is reused until the text or width changes.
 Tabs draw at four-column stops while remaining literal tabs in the source.
 The small styling hook currently requires a local copy of Makepad's input,
-with its license beside it, until that hook is available upstream.
+with its license beside it, until that hook is available upstream. The shell
+registers the shared input's template before any app UI is loaded.
 
 ## Editing files
 
@@ -42,8 +43,11 @@ conflict or failure keeps the draft and reports the error. On a real disk,
 new bytes are staged beside the target, flushed, and renamed into place;
 permissions and symbolic links are preserved. External writers are not
 locked, so the last comparison and replacement are not a filesystem
-compare-and-swap. UTF-8 BOMs and CRLF line endings are retained. Files over
-2 MiB, invalid UTF-8 and binary data are refused rather than truncated.
+compare-and-swap. UTF-8 BOMs and individual LF/CRLF endings are retained,
+including in mixed-ending files: line alignment keeps unchanged lines'
+endings when lines are inserted or deleted, and replacement lines reuse
+their prior endings. Additional new lines follow the surrounding style.
+Files over 2 MiB, invalid UTF-8 and binary data are refused rather than truncated.
 
 | Tag | Arguments | Meaning |
 |---|---|---|

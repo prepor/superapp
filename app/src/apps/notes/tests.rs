@@ -210,6 +210,77 @@ fn file_read_is_complete_utf8_or_refused_and_line_endings_are_preserved() {
 }
 
 #[test]
+fn mixed_line_endings_survive_edits_draft_recovery_and_save() {
+    let original = "\u{feff}# Café\r\nfirst\nsecond\r\nthird\nlast";
+    for (edited, expected) in [
+        (
+            "# Café!\nfirst\nsecond\nthird\nlast",
+            "\u{feff}# Café!\r\nfirst\nsecond\r\nthird\nlast",
+        ),
+        (
+            "# Café\nfirst!\nsecond\nthird!\nlast",
+            "\u{feff}# Café\r\nfirst!\nsecond\r\nthird!\nlast",
+        ),
+        (
+            "intro\n# Café\nfirst\nsecond\nthird\nlast",
+            "\u{feff}intro\r\n# Café\r\nfirst\nsecond\r\nthird\nlast",
+        ),
+        (
+            "first\nsecond\nthird\nlast",
+            "\u{feff}first\nsecond\r\nthird\nlast",
+        ),
+        (
+            "# Café\nfirst\nsecond\ninserted\nthird\nlast",
+            "\u{feff}# Café\r\nfirst\nsecond\r\ninserted\nthird\nlast",
+        ),
+        (
+            "# Café\nfirst\nsecond\nthird\nlast\n",
+            "\u{feff}# Café\r\nfirst\nsecond\r\nthird\nlast\n",
+        ),
+    ] {
+        let mut s = Session::fake(APPS);
+        let path = "~/notes.md";
+        disk_write(&s, path, original.as_bytes());
+        let slot = open(&mut s, Editor::file(path));
+        editor(&mut s, slot, |p, _| {
+            assert_eq!(p.text, "# Café\nfirst\nsecond\nthird\nlast");
+            assert!(!p.dirty());
+            p.edited(edited.into());
+            assert!(p.dirty());
+        });
+        assert_eq!(disk_read(&s, path), original.as_bytes());
+        assert_eq!(model::draft(s.store(), path).unwrap().body, expected);
+        s.nav(Nav::Close { slot, label: None });
+        s.settle();
+        let slot = open(&mut s, Editor::file(path));
+        editor(&mut s, slot, |p, s| {
+            assert_eq!(p.text, edited);
+            assert!(p.dirty());
+            // Undoing to the original source also restores its exact endings.
+            p.edited("# Café\nfirst\nsecond\nthird\nlast".into());
+            assert!(!p.dirty());
+            assert!(model::draft(s.store(), path).is_none());
+            p.edited(edited.into());
+            p.run("notes.save", s);
+            assert!(p.error.is_empty(), "{}", p.error);
+            assert!(!p.dirty());
+        });
+        assert_eq!(disk_read(&s, path), expected.as_bytes());
+        assert!(model::draft(s.store(), path).is_none());
+        // A subsequent edit uses the saved file's endings as its baseline.
+        editor(&mut s, slot, |p, s| {
+            p.edited(format!("!{}", p.text));
+            p.run("notes.save", s);
+            assert!(p.error.is_empty(), "{}", p.error);
+        });
+        assert_eq!(
+            disk_read(&s, path),
+            format!("\u{feff}!{}", expected.trim_start_matches('\u{feff}')).as_bytes()
+        );
+    }
+}
+
+#[test]
 fn notes_and_drafts_survive_a_database_restart() {
     let path = std::env::temp_dir().join(format!("superapp-notes-{}.db", std::process::id()));
     {

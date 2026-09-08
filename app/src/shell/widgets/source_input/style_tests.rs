@@ -20,8 +20,8 @@ fn source_styles_preserve_wrapping_caret_geometry_and_cached_layout() {
             Event::Startup => {
                 root = cx.with_vm(|vm| {
                     makepad_widgets::script_mod(vm);
+                    // Shared inputs must exist before any app UI is registered.
                     crate::shell::script_mod(vm);
-                    super::super::script_mod(vm);
                     let value = script_eval!(vm, { mod.widgets.SourceInput{} });
                     WidgetRef::script_from_value(vm, value)
                 });
