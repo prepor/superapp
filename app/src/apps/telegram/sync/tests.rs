@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 mod topics_tests;
 mod reaction_state_tests;
+mod startup_tests;
 
 /// A world over a fresh telegram store — the schema only, no demo seed —
 /// with a fake api_hash planted where the parameters step reads it, so no
@@ -279,10 +280,15 @@ fn visible_messages_are_replayed_after_sign_in_and_isolated_between_accounts() {
     acc_b.drain(&b);
     assert!(td_b.sent().is_empty(), "a fixture cannot subscribe another store's worker");
     acc.drain(&a);
-    acc.on_ready(&a);
+    acc.on_update(&a, &auth("authorizationStateWaitTdlibParameters"));
+    acc.on_update(&a, &auth("authorizationStateReady"));
+    acc.drain(&a);
+    assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 1,
+        "reauthorization must wait for this client's chat announcement too");
+    acc.on_update(&a, &chat_object(7, "restored chat", json!([])));
     acc.drain(&a);
     assert_eq!(td.sent_types().iter().filter(|s| *s == "openChat").count(), 2,
-        "visible rows resume as soon as authorization is ready");
+        "visible rows resume as soon as their chat is ready");
     for list in ["main", "archive"] {
         acc.on_update(&a, &json!({"@type": "error", "code": 404,
             "@extra": format!("load_chats:{list}")}).to_string());

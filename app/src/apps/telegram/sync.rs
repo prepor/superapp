@@ -63,8 +63,8 @@ pub struct Account<T: Td> {
     /// A failed initialization needs another request: TDLib does not emit
     /// WaitTdlibParameters again when a competing instance releases its lock.
     retry_parameters: std::cell::Cell<Option<f64>>,
-    /// A restored viewer can open before loadChats has restored its chat.
-    media_requests: std::cell::RefCell<Vec<String>>,
+    /// Viewers and reaction pickers can open before TDLib restores their chat.
+    deferred_reads: std::cell::RefCell<Vec<String>>,
     known_chats: std::cell::RefCell<std::collections::HashSet<PeerId>>,
     loading_chats: std::cell::Cell<bool>,
     /// The application id — a small positive int Telegram assigns, not a
@@ -127,6 +127,14 @@ const FETCH_ON_OPEN: usize = 40;
 const PARAMETERS_RETRY: f64 = 5.0;
 
 impl<T: Td> Account<T> {
+    /// Our persisted chat is not evidence that this TDLib client knows it.
+    /// Authorization starts restoration; updateNewChat makes each chat usable.
+    /// Once both lists finish, let TDLib report genuinely unavailable chats.
+    fn chat_ready(&self, chat: PeerId) -> bool {
+        self.auth_ready.get()
+            && (!self.loading_chats.get() || self.known_chats.borrow().contains(&chat))
+    }
+
     /// The single outbound boundary for commands and background requests.
     fn send(&self, w: &World, request: &str) {
         let rt = runtime::of(w.store());
@@ -136,12 +144,10 @@ impl<T: Td> Account<T> {
                 .report(w.store(), "sending request", "Invalid request JSON");
             return;
         };
-        if v["@type"] == "getMessage"
-            && v["@extra"]["context"].as_str().and_then(parse_media_extra).is_some()
-            && (!self.auth_ready.get() || (self.loading_chats.get()
-                && !v["chat_id"].as_i64().is_some_and(|chat| self.known_chats.borrow().contains(&chat))))
+        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessageAvailableReactions"))
+            && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
-            let mut pending = self.media_requests.borrow_mut();
+            let mut pending = self.deferred_reads.borrow_mut();
             if !pending.contains(&request) {
                 pending.push(request);
             }
@@ -231,7 +237,7 @@ impl<T: Td> Account<T> {
             auth_ready: std::cell::Cell::new(false),
             waiting_for_parameters: std::cell::Cell::new(false),
             retry_parameters: std::cell::Cell::new(None),
-            media_requests: std::cell::RefCell::new(Vec::new()),
+            deferred_reads: std::cell::RefCell::new(Vec::new()),
             known_chats: std::cell::RefCell::new(std::collections::HashSet::new()),
             loading_chats: std::cell::Cell::new(false),
             api_id,
@@ -275,16 +281,26 @@ impl<T: Td> Account<T> {
     /// front first. One page per pass at most.
     fn pump(&self, w: &World) {
         let rt = runtime::of(w.store());
+        // Retire canceled/expired reads even while authorization is pending.
+        // Reaction reply timeouts start in send(), only after the chat is ready.
+        let pending = std::mem::take(&mut *self.deferred_reads.borrow_mut());
+        for request in pending {
+            let Ok(v) = serde_json::from_str::<Value>(&request) else { continue; };
+            let context = v["@extra"]["context"].as_str();
+            let picker = context.and_then(parse_reaction_choices_extra).map(|(id, _)| id);
+            if picker.is_some_and(|id| !rt.reaction_alive(id)) {
+                if let Some(context) = context { rt.operations.retire_context(context); }
+                continue;
+            }
+            if v["@extra"]["operation"].as_u64().is_some_and(|id| rt.operations.pending(id)) {
+                self.send(w, &request);
+            } else if let Some(id) = picker {
+                rt.finish_reaction(id, runtime::ReactionResult::Error(
+                    "Telegram did not restore this chat. Try again.".into()));
+            }
+        }
         if !self.auth_ready.get() || rt.connection_error().is_some() {
             return;
-        }
-        let pending = std::mem::take(&mut *self.media_requests.borrow_mut());
-        for request in pending {
-            let id = serde_json::from_str::<Value>(&request).ok()
-                .and_then(|v| v["@extra"]["operation"].as_u64());
-            if id.is_some_and(|id| runtime::of(w.store()).operations.pending(id)) {
-                self.send(w, &request);
-            }
         }
         self.sync_views(w);
         // A viewer can fetch its media once that chat is known. Background
@@ -338,9 +354,7 @@ impl<T: Td> Account<T> {
         }
         let page = {
             let mut pages = self.pages.borrow_mut();
-            let Some(index) = pages.iter().position(|page| {
-                !self.loading_chats.get() || self.known_chats.borrow().contains(&page.chat)
-            }) else { return };
+            let Some(index) = pages.iter().position(|page| self.chat_ready(page.chat)) else { return };
             pages.remove(index).unwrap()
         };
         self.in_flight.set(Some((page, now)));
@@ -548,6 +562,7 @@ impl<T: Td> Account<T> {
             st["@type"].as_str() == Some("authorizationStateWaitTdlibParameters"),
         );
         if st["@type"].as_str() != Some("authorizationStateReady") {
+            self.known_chats.borrow_mut().clear();
             self.counts.borrow_mut().reset(w);
             let note = match st["@type"].as_str() {
                 Some("authorizationStateWaitTdlibParameters") => "connecting to Telegram…",
@@ -1223,6 +1238,7 @@ impl<T: Td> Account<T> {
     fn on_new_chat(&self, w: &World, chat: &Value) {
         if let Some(id) = chat["id"].as_i64() {
             self.known_chats.borrow_mut().insert(id);
+            self.log(&format!("<< chat ready chat={id}"));
         }
         let Some(ch) = updates::chat(chat) else {
             return;

@@ -160,7 +160,11 @@ of leaving the picker loading indefinitely.
 Visible messages load their bodies and enable TDLib's ongoing reaction
 polling while the panel is visible in the foreground; hidden panels and
 background windows release their subscriptions. Failed or missing snapshots
-retry without scrolling. Reaction counts have their own durable projection;
+retry without scrolling. On startup, saved messages and counts stay visible
+while Telegram restores the chat. Message loads, reaction checks and the
+picker wait for that chat's announcement, independently of the rest of the
+chat list; signing in alone does not make a saved chat ready to open.
+Reaction counts have their own durable projection;
 history, media loads and viewport changes cannot overwrite them. A null
 interaction update means the counts need checking, so the last known counts
 stay visible until a server read confirms a change. Checks retry failures,

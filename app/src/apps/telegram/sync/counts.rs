@@ -126,6 +126,7 @@ impl<T: Td> Account<T> {
         let order = wanted.iter().filter(|key| cursor.is_none_or(|cursor| **key > cursor))
             .chain(wanted.iter().filter(|key| cursor.is_some_and(|cursor| **key <= cursor)));
         let next = state.urgent.iter().chain(order).copied().find_map(|key| {
+            if !self.chat_ready(key.0) { return None; }
             if state.retries.get(&key).is_some_and(|(due, _)| w.now() < *due) { return None; }
             let message = model::line(w.store(), key.0, key.1).filter(|m| !m.service)?;
             let row = reaction_state::state(w.store().conn(), key.0, key.1).ok()?;

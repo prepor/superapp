@@ -67,6 +67,7 @@ impl<T: Td> Account<T> {
                 rt.operations.retire_context(&load.context(*id));
                 return false;
             }
+            if !self.chat_ready(load.chat) { return true; }
             if now < load.due { return true; }
             if load.pending {
                 let error = "Telegram did not return the available reactions. Try again.";

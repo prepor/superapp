@@ -2602,6 +2602,18 @@ fn last_reaction_request(td: &FakeTd, kind: &str) -> serde_json::Value {
         .expect("the worker sent the reaction request")
 }
 
+/// Picker behavior tests begin after the fake client has restored its lists.
+/// Startup ordering is exercised separately by the worker's protocol tests.
+fn connected_reaction_account(s: &Session, td: FakeTd) -> sync::Account<FakeTd> {
+    let acc = sync::Account::new(td, 17844, std::env::temp_dir(), None);
+    acc.on_ready(s.world());
+    for list in ["main", "archive"] {
+        acc.on_update(s.world(), &serde_json::json!({"@type": "error", "code": 404,
+            "@extra": format!("load_chats:{list}")}).to_string());
+    }
+    acc
+}
+
 fn offer_reactions(acc: &sync::Account<FakeTd>, s: &Session, request: &serde_json::Value, emojis: &[&str]) {
     acc.on_update(s.world(), &serde_json::json!({
         "@type": "availableReactions", "@extra": request["@extra"],
@@ -2617,7 +2629,7 @@ fn a_first_empty_reaction_answer_recovers_when_metadata_arrives_without_reopenin
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2658,7 +2670,7 @@ fn empty_reaction_choices_keep_retrying_on_the_worker_clock() {
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2696,7 +2708,7 @@ fn reaction_request_timeouts_release_the_picker_and_never_resend_an_unconfirmed_
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2732,7 +2744,7 @@ fn reaction_permission_changes_during_loading_are_coalesced_and_explained() {
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2766,7 +2778,7 @@ fn an_empty_picker_cache_keeps_retrying_and_cannot_erase_loaded_choices() {
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2793,7 +2805,7 @@ fn a_reaction_uses_the_messages_available_emoji_and_the_server_updates_its_count
     let m = model::history(s.store(), RUST_WEEKLY).iter().find(|m| !m.service).unwrap().clone();
     with_chat(&s, chat, |c| c.set_cursor(m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
 
     // Channels may accept reactions even when the composer is read-only.
@@ -2864,7 +2876,7 @@ fn reaction_paging_reaches_every_choice_in_chat_and_card() {
     with_chat(&s, chat, |c| c.set_cursor(m.id));
     let card = open_root(&mut s, Line::id(m.chat, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     let choices = ["👍", "❤️", "🔥", "😂", "😮", "🙏", "🎉", "👏", "🤔", "🤯", "😢", "💯", "🦄", "🌚"];
     for slot in [chat, card] {
@@ -2899,7 +2911,7 @@ fn reaction_failures_are_reported_once_and_can_be_inspected_and_retried() {
     let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, card, "telegram.react");
     acc.drain(s.world());
@@ -2993,6 +3005,10 @@ fn a_reaction_reports_its_clients_startup_failure_until_authorization_recovers()
         "@type": "updateAuthorizationState",
         "authorization_state": {"@type": "authorizationStateReady"},
     }).to_string());
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateNewChat", "chat": {
+        "@type": "chat", "id": VERA, "title": "Vera",
+        "type": {"@type": "chatTypePrivate", "user_id": VERA},
+    }}).to_string());
     verb(&mut s, chat, "telegram.reactions_retry");
     acc.drain(s.world());
     let query = last_reaction_request(&td, "getMessageAvailableReactions");
@@ -3016,7 +3032,7 @@ fn reaction_pickers_ignore_late_answers_and_keep_panels_and_stores_separate() {
     let chat = open_root(&mut s, Chat::at(VERA, m.id));
     let card = open_root(&mut s, Line::id(VERA, m.id));
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, chat, "telegram.react");
     acc.drain(s.world());
@@ -3058,7 +3074,7 @@ fn a_live_reaction_picker_never_falls_back_to_demo_when_the_worker_is_missing() 
 
     // A worker that starts later makes retry useful, without reopening the panel.
     let td = FakeTd::new();
-    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    let acc = connected_reaction_account(&s, td.clone());
     acc.drain(s.world());
     verb(&mut s, chat, "telegram.reactions_retry");
     acc.drain(s.world());
