@@ -98,7 +98,7 @@ fn unread_openings_preserve_reading_and_allow_following_the_latest_message() {
                 let viewport = portal.area().rect(&cx);
                 if matches!(frame, 2..=4) && unread > 0 {
                     let panel = root.borrow::<ChatPanel>().unwrap();
-                    let first = panel.rows.iter().find(|row| row.id == 31)
+                    let first = panel.rows.iter().find(|row| row.id == (ELENA, 31))
                         .expect("the first unread message must be visible");
                     let y = first.unclipped.pos.y - viewport.pos.y;
                     assert!(y >= 0.0 && y < viewport.size.y * 0.3,
@@ -111,7 +111,7 @@ fn unread_openings_preserve_reading_and_allow_following_the_latest_message() {
                     let panel = root.borrow::<ChatPanel>().unwrap();
                     assert!(panel.unread_space.is_none(), "the latest view has no reserved space");
                     let last_id = 30 + unread + i64::from(unread > 0) + i64::from(frame >= 7);
-                    let last = panel.rows.iter().find(|row| row.id == last_id).unwrap();
+                    let last = panel.rows.iter().find(|row| row.id == (ELENA, last_id)).unwrap();
                     assert!((last.unclipped.pos.y + last.unclipped.size.y
                         - viewport.pos.y - viewport.size.y).abs() < 1.0,
                         "the latest message must rest at the bottom");
