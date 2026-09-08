@@ -26,7 +26,7 @@ fn file_download_is_available_in_the_chat_card_and_viewer_and_survives_closing_t
         "documents are never downloaded on arrival"
     );
     let chat = open_root(&mut s, Chat::id(ANNA));
-    with_chat(&s, chat, |c| c.set_cursor(4242));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), 4242)));
     let card = open_root(&mut s, Line::id(ANNA, 4242));
     let viewer = open_root(&mut s, Viewer::id(ANNA, 4242));
     for slot in [chat, card, viewer] {

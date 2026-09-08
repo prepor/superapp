@@ -140,6 +140,7 @@ pub struct IncomingMessage {
     pub state: Option<String>,
     pub edited: bool,
     pub reply_to: Option<MsgId>,
+    pub reply_chat: Option<PeerId>,
     pub unread_mention: bool,
     pub fwd_from: Option<String>,
     /// The reference in `media.reference` is what the blob cache is keyed by
@@ -274,16 +275,16 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid,
-  views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type)
+  views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type, reply_chat)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
        ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1,
-       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30)
+       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30, ?31)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
   content_type = COALESCE(excluded.content_type, tg_message.content_type),
   text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
-  edited = excluded.edited, reply_to = excluded.reply_to,
+  edited = excluded.edited, reply_to = excluded.reply_to, reply_chat = excluded.reply_chat,
   fwd_from = excluded.fwd_from, media = excluded.media,
   media_label = excluded.media_label, media_ref = excluded.media_ref,
   media_rid = excluded.media_rid,
@@ -340,6 +341,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.topic,
             m.unread_mention,
             m.content_type,
+            m.reply_chat,
         ])?;
         super::reaction_state::seed(c, m.chat, m.id, m.reactions.as_deref())?;
     }
@@ -556,6 +558,7 @@ mod tests {
             state: None,
             edited: false,
             reply_to: None,
+            reply_chat: None,
             unread_mention: false,
             fwd_from: None,
             media: None,

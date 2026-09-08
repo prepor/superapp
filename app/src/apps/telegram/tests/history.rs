@@ -210,7 +210,7 @@ fn incoming_deletes_are_recorded_and_skipped_without_recreating_local_messages()
     let m = model::history(s.store(), VERA).iter().find(|m| !m.out && !m.service).unwrap().clone();
     let rt = runtime::of(s.store());
     let inbox = rt.connect();
-    with_chat(&s, chat, |c| c.set_cursor(m.id));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), m.id)));
     history::command(&mut s, &requests::delete_messages(VERA, &[m.id], true)).unwrap();
     assert_eq!(receive(&inbox)["@type"], "deleteMessages");
     let row = s.history().rows().0.last().unwrap().clone();

@@ -114,7 +114,7 @@ fn refused_sends_edits_and_both_delete_paths_keep_input_and_report_once() {
         let chat = open_root(&mut s, Chat::id(VERA));
         let m = model::history(s.store(), VERA).iter().find(|m| m.out && !m.service).unwrap().clone();
         with_chat(&s, chat, |c| {
-            c.set_cursor(m.id);
+            c.set_cursor((c.peer(), m.id));
             c.set_draft("keep these words");
             if action == "files" { c.carry(&["/tmp/attachment.png".into()]); }
         });

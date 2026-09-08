@@ -45,6 +45,7 @@ pub mod ui;
 /// Pure maps from a TDLib update's JSON to the projection's `Incoming*`
 /// structs — the wire's shapes in one greppable place.
 pub mod updates;
+mod upgrades;
 pub mod verbs;
 pub mod widgets;
 

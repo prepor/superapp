@@ -265,7 +265,7 @@ fn drafting_never_discards_an_edit_or_attachments() {
         .id;
     let input = json!({"chat": VERA, "text": "new text", "replace": true});
     with_chat(&s, chat, |c| {
-        assert!(c.edit(own));
+        assert!(c.edit((c.peer(), own)));
         c.typed("edited text");
     });
     assert!(call(&mut s, "telegram.draft", input.clone()).is_err());
@@ -353,13 +353,13 @@ fn a_send_rechecks_contents_recipient_topic_reply_and_composer_mode() {
             "chat" => d["chat"] = json!(ELENA),
             "topic" => d["topic"] = json!(99999),
             "reply" => with_chat(&s, chat, |c| {
-                c.reply(message);
+                c.reply((c.peer(), message));
             }),
             "files" => with_chat(&s, chat, |c| {
                 c.carry(&["/tmp/keep.pdf".into()]);
             }),
             "edit" => with_chat(&s, chat, |c| {
-                c.edit(message);
+                c.edit((c.peer(), message));
             }),
             "closed" => go(
                 &mut s,

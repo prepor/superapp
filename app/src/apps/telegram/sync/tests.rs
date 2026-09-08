@@ -15,6 +15,7 @@ mod reaction_state_tests;
 mod startup_tests;
 mod navigation_tests;
 mod downloads_tests;
+mod upgrades_tests;
 
 /// Protocol tests below start with an already settled viewport. Navigation
 /// tests register at the current clock and exercise the delay itself.

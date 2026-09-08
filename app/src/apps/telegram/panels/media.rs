@@ -286,7 +286,7 @@ impl PanelKind for ViewerKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
-            playback: Playback::new(cx.session().store().clone(), msg),
+            playback: Playback::new(cx.session().store().clone(), (chat, msg)),
         })
     }
 }

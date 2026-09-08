@@ -422,7 +422,7 @@ fn composer_files_drafts_and_forwards_target_the_selected_topic() {
     with_chat(&s, chat, |c| {
         c.set_draft("coffee: Saturday");
         c.flush_draft();
-        c.reply(2000);
+        c.reply((c.peer(), 2000));
     });
     send(&mut s, chat);
     with_chat(&s, chat, |c| {

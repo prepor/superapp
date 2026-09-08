@@ -34,6 +34,19 @@ history walk, including empty chats waiting for their first messages. Leaving a
 chat cancels its queued pages and thumbnail requests; late history replies cannot
 restart an abandoned walk. Telegram's page pacing and retry waits still apply.
 
+Groups upgraded to supergroups show their original history in the new
+conversation. Telegram's upgrade metadata links the two source chats;
+`tg_chat_upgrade` stores that link across restarts. Cached older messages appear
+as soon as the link is known, and the original group's history loads through the
+same paced, cancellable queue. Each source retains the existing 10,000-message
+cache limit. Forum-topic transcripts remain scoped to their own topic.
+
+Messages retain both their source chat and message id, including cursor and
+scroll anchors, selection, playback, reactions, edits, deletion and forwarding.
+Replies can cross the upgrade boundary: `reply_chat` identifies the source chat
+when it differs from the replying message's chat. Replying from the new group's
+composer uses TDLib's `inputMessageReplyToExternalMessage`.
+
 Viewing newer messages in the focused conversation advances its read position,
 including messages loaded or received after the panel opened. Live unread counts
 follow Telegram's acknowledgment; unacknowledged views retry while visible.

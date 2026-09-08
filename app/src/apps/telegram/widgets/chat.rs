@@ -41,7 +41,7 @@ use crate::shell::widgets::media::{self, PlayerState, SeekBar};
 use crate::shell::widgets::table;
 use crate::shell::widgets::reveal::Reveal;
 
-use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgId};
+use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgKey};
 use super::super::panels::{Chat, Line, Row, Viewer};
 use super::RenderContext;
 use super::inline_video::{self, InlineVideo};
@@ -75,9 +75,11 @@ const CARRY_LBLS: [LiveId; CARRY_SLOTS] = [
 /// The card over a path on this machine. Named by tag rather than by app.
 const FILE_TAG: Tag = Tag("file");
 
+type InheritedViews = std::collections::BTreeMap<i64, super::super::runtime::MessageView>;
+
 /// Where one message of the last draw landed.
 struct RowHit {
-    id: MsgId,
+    id: MsgKey,
     rect: Rect,
     /// Read acknowledgment measures how much of the full message was seen.
     unclipped: Rect,
@@ -110,12 +112,12 @@ enum Inner {
     /// Seek this line using the full bar, even when its hit is clipped.
     Seek(Box<Msg>, SeekBar),
     /// Open the line's media in the viewer.
-    View(MsgId),
+    View(MsgKey),
     /// Open the line's card — a place's ways out are on it.
-    Card(MsgId),
+    Card(MsgKey),
     /// Jump to the line this one answers — a press on the quoted reply, as
     /// on the client.
-    Original(MsgId),
+    Original(MsgKey),
 }
 
 /// The widget.
@@ -168,15 +170,17 @@ pub struct ChatPanel {
     /// and an index would then name a different line; the next draw sees
     /// by how much this line moved and moves the list with it.
     #[rust]
-    anchor: Option<(MsgId, usize)>,
+    anchor: Option<(MsgKey, usize)>,
     #[rust]
-    reveal: Reveal<MsgId>,
+    reveal: Reveal<MsgKey>,
     #[rust]
     dragging_files: bool,
     #[rust]
     viewed: Option<super::super::runtime::MessageView>,
     #[rust]
     background: bool,
+    #[rust]
+    inherited_viewed: InheritedViews,
     #[rust]
     video: InlineVideo,
     #[rust]
@@ -194,6 +198,7 @@ impl Widget for ChatPanel {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
                 self.viewed = None;
+                self.inherited_viewed.clear();
                 self.scrubbing = None;
             }
             Event::WindowGotFocus(_) | Event::Foreground => {
@@ -209,6 +214,7 @@ impl Widget for ChatPanel {
         // when another chat or target reuses this slot and its message ids.
         if !self.drawn_for.ptr_eq(&Rc::downgrade(&props.panel)) {
             self.viewed = None;
+            self.inherited_viewed.clear();
             return;
         }
         if self.draft_timer.is_event(event).is_some() {
@@ -223,6 +229,7 @@ impl Widget for ChatPanel {
             .is_some_and(|s| super::message_panel_visible(s, props.slot));
         if !panel_visible {
             self.viewed = None;
+            self.inherited_viewed.clear();
         }
 
         if let Event::Scroll(e) = event {
@@ -305,7 +312,7 @@ impl Widget for ChatPanel {
         self.had_focus = has_focus;
         if has_focus && self.mounted && panel_visible && !self.background {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
-            let visible: Vec<MsgId> = self.rows.iter().filter(|r| r.viewed_in(viewport))
+            let visible: Vec<MsgKey> = self.rows.iter().filter(|r| r.viewed_in(viewport))
                 .map(|r| r.id).collect();
             with_chat(&props, |c| c.view_messages(&visible, super::now(scope)));
         }
@@ -355,7 +362,7 @@ impl Widget for ChatPanel {
                     } else {
                         hist.iter().find(|m| !m.service)
                     };
-                    let id = pick.map(|m| m.id)?;
+                    let id = pick.map(|m| m.key())?;
                     c.set_cursor(id);
                     Some(id)
                 })
@@ -393,7 +400,7 @@ impl Widget for ChatPanel {
                             && !with_chat(&props, |c| c.editing().is_some()).unwrap_or(true) =>
                     {
                         let last = with_chat(&props, |c| {
-                            c.history().iter().rev().find(|m| m.out && !m.service).map(|m| m.id)
+                            c.history().iter().rev().find(|m| m.out && !m.service).map(|m| m.key())
                         })
                         .flatten();
                         if let Some(id) = last {
@@ -538,7 +545,7 @@ impl Widget for ChatPanel {
         };
         if let Some((m, position)) = seek {
             let now = super::now(scope);
-            with_chat(&props, |c| self.video.seek(cx, c.select_playback(m.id), &m, position, now));
+            with_chat(&props, |c| self.video.seek(cx, c.select_playback(m.key()), &m, position, now));
             self.view.redraw(cx);
             if let Some(s) = scope.data.get_mut::<Session>() { s.redraw(); }
             return;
@@ -592,7 +599,7 @@ impl Widget for ChatPanel {
                         }
                         Inner::Seek(m, bar) => {
                             with_chat(&props, |c| self.video.seek(
-                                cx, c.select_playback(m.id), &m, bar.position(e.abs.x), now,
+                                cx, c.select_playback(m.key()), &m, bar.position(e.abs.x), now,
                             ));
                             self.scrubbing = Some((m, bar));
                         }
@@ -611,9 +618,9 @@ impl Widget for ChatPanel {
                                 Inner::View(_) => {
                                     c.pause(now);
                                     media::pause_video(cx, &clip_box);
-                                    Viewer::id(c.peer(), id)
+                                    Viewer::id(id.0, id.1)
                                 }
-                                _ => Line::id(c.peer(), id),
+                                _ => Line::id(id.0, id.1),
                             });
                             if let (Some(id), Some(s)) = (target, scope.data.get_mut::<Session>()) {
                                 s.nav(Nav::Open {
@@ -808,7 +815,7 @@ impl Widget for ChatPanel {
                 .iter()
                 .enumerate()
                 .skip(first)
-                .find_map(|(i, r)| r.msg().map(|m| (m.id, i)));
+                .find_map(|(i, r)| r.msg().map(|m| (m.key(), i)));
             while let Some(idx) = list.next_visible_item(cx) {
                 if idx == n {
                     if let Some(height) = self.unread_space {
@@ -822,7 +829,7 @@ impl Widget for ChatPanel {
                 }
                 let Some(r) = rows.get(idx) else { continue };
                 let row = list.item(cx, idx, live_id!(row));
-                let id = r.msg().map(|m| m.id);
+                let id = r.msg().map(|m| m.key());
                 let selected = id.is_some() && id == cursor;
                 let marked = id.is_some_and(|i| marks.contains(&i));
                 let mut player = r.msg().and_then(|m| with_chat(&props, |c| c.player_state(m, now)).flatten());
@@ -840,7 +847,7 @@ impl Widget for ChatPanel {
                     let line = table::line(cx, &message, selected, marked);
                     let slot = line.widget(cx, ids!(body.clip_box));
                     let result = with_chat(&props, |c| {
-                        c.playback(m.id).map(|p| self.video.drive(cx, &video, p, m, now))
+                        c.playback(m.key()).map(|p| self.video.drive(cx, &video, p, m, now))
                     }).flatten();
                     let shown = result.as_ref().is_some_and(|d| d.shown);
                     let note = result.as_ref().and_then(|d| d.note.as_deref());
@@ -907,11 +914,11 @@ impl Widget for ChatPanel {
                     ) else { continue };
                     if msg.id > 0 && !msg.service && !matches!(msg.state.as_deref(), Some("sending" | "failed"))
                     {
-                        visible_ids.push(msg.id);
+                        visible_ids.push(msg.key());
                     }
-                    self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
-                    active_visible |= Some(msg.id) == active;
-                    let id = msg.id;
+                    self.rows.push(RowHit { id: msg.key(), rect, unclipped: full });
+                    active_visible |= Some(msg.key()) == active;
+                    let id = msg.key();
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
                     self.inner_hits(cx, &props, &row, msg, twin, player, &render);
                 }
@@ -932,8 +939,9 @@ impl Widget for ChatPanel {
             if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
                 if self.background || !super::message_panel_visible(s, props.slot) {
                     self.viewed = None;
+                    self.inherited_viewed.clear();
                 } else {
-                    super::super::runtime::show_messages(&mut self.viewed, s.world(), chat, Some(topic), visible_ids);
+                    super::super::runtime::show_history_messages(&mut self.viewed, &mut self.inherited_viewed, s.world(), chat, topic, visible_ids);
                 }
             }
         }
@@ -1093,7 +1101,7 @@ impl ChatPanel {
                     .add("the line it answers", r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
-                    act: Inner::Original(m.id),
+                    act: Inner::Original(m.key()),
                 });
             }
         }
@@ -1134,7 +1142,7 @@ impl ChatPanel {
                 props.hits.add(md.word(), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
-                    act: Inner::View(m.id),
+                    act: Inner::View(m.key()),
                 });
             }
         }
@@ -1144,7 +1152,7 @@ impl ChatPanel {
                 props.hits.add(md.line(now), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
-                    act: Inner::Card(m.id),
+                    act: Inner::Card(m.key()),
                 });
             }
         }
@@ -1152,7 +1160,7 @@ impl ChatPanel {
 
     /// The draw resolves the message's current index and measured rectangle,
     /// including rows inserted by a backfill between the request and the draw.
-    fn follow(&mut self, cx: &mut Cx, id: MsgId) {
+    fn follow(&mut self, cx: &mut Cx, id: MsgKey) {
         self.reveal.request(id);
         self.view.redraw(cx);
     }
@@ -1189,7 +1197,7 @@ impl ChatPanel {
 
     /// The message whose rectangle the shell's hit is, by the rectangles
     /// of the last draw.
-    fn row_at(&self, hit: Rect) -> Option<MsgId> {
+    fn row_at(&self, hit: Rect) -> Option<MsgKey> {
         self.rows
             .iter()
             .rev()
@@ -1411,7 +1419,7 @@ mod tests {
             (rect(180.0, 400.0), true),
             (rect(280.0, 400.0), false),
         ] {
-            let row = RowHit { id: 1, rect: visible(full, viewport).unwrap(), unclipped: full };
+            let row = RowHit { id: (0, 1), rect: visible(full, viewport).unwrap(), unclipped: full };
             assert_eq!(row.viewed_in(viewport), viewed, "full: {full:?}, hit: {:?}", row.rect);
         }
     }

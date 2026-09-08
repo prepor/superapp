@@ -114,6 +114,8 @@ struct Page {
     walk: Walk,
     /// A viewport's history walk. None for explicitly requested background work.
     view: Option<u64>,
+    /// The upgraded transcript that owns a walk through its original group.
+    parent: Option<PeerId>,
 }
 
 /// Seconds between history pages. Telegram throttles `messages.getHistory`
@@ -138,6 +140,7 @@ impl<T: Td> Account<T> {
     /// Once both lists finish, let TDLib report genuinely unavailable chats.
     fn chat_ready(&self, chat: PeerId) -> bool {
         self.auth_ready.get()
+            && !self.history_views.borrow().opening.contains(&chat)
             && (!self.loading_chats.get() || self.known_chats.borrow().contains(&chat))
     }
 
@@ -287,6 +290,13 @@ impl<T: Td> Account<T> {
     }
 
     fn want_in(&self, w: &World, chat: PeerId, topic: i64) {
+        self.history_views.borrow_mut().originals.remove(&(chat, None));
+        if topic == 0 {
+            self.history_views.borrow_mut().explicit.insert(chat);
+            self.history_views.borrow_mut().metadata.remove(&chat);
+            self.request_upgrade_info(w, chat);
+        }
+        self.want_original_history(w, chat, topic, None);
         runtime::of(w.store()).set_loading_in(chat, topic, true);
         let mut pages = self.pages.borrow_mut();
         let page = Page {
@@ -295,6 +305,7 @@ impl<T: Td> Account<T> {
             from: 0,
             walk: Walk::Fill,
             view: None,
+            parent: None,
         };
         if !pages.contains(&page) {
             pages.push_front(page);
@@ -384,6 +395,7 @@ impl<T: Td> Account<T> {
             let Some(index) = pages.iter().position(|page| self.chat_ready(page.chat)) else { return };
             pages.remove(index).unwrap()
         };
+        if page.parent.is_some() { runtime::of(w.store()).set_loading_in(page.chat, page.topic, true); }
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
         self.send(w, &page.request());
@@ -970,12 +982,17 @@ impl<T: Td> Account<T> {
     /// and projected through [`project`](super::project); an update this phase
     /// does not know is dropped in silence, the framing being TDLib's to keep.
     pub fn handle_update(&self, w: &World, update: &Value) {
+        for (old, new) in super::upgrades::decode(update) {
+            self.history_views.borrow_mut().known_originals.insert(old);
+            self.filed(w, "group upgrade", w.store().write(move |c| super::upgrades::record(c, old, new)));
+        }
         match update["@type"].as_str() {
             Some("updateNewMessage") => self.on_new_message(w, &update["message"]),
             Some("updateMessageContent") => self.on_message_content(w, update),
             Some("updateMessageEdited") => self.on_message_edited(w, update),
             Some("updateDeleteMessages") => self.on_delete_messages(w, update),
             Some("updateNewChat") => self.on_new_chat(w, &update["chat"]),
+            Some("chat") => self.on_new_chat(w, update),
             Some("updateChatLastMessage") => self.on_new_message(w, &update["last_message"]),
             Some("updateChatPosition") => self.on_chat_position(w, update),
             Some("updateChatAddedToList") => self.on_chat_listing(w, update, true),
@@ -1122,6 +1139,10 @@ impl<T: Td> Account<T> {
     /// trim the chat back to its window. All in one write, so a line and its
     /// trim are one step.
     fn on_new_message(&self, w: &World, message: &Value) {
+        for (old, new) in super::upgrades::decode(message) {
+            self.history_views.borrow_mut().known_originals.insert(old);
+            self.filed(w, "group upgrade", w.store().write(move |c| super::upgrades::record(c, old, new)));
+        }
         let Some(msg) = updates::message(message) else {
             return;
         };
@@ -1281,6 +1302,7 @@ impl<T: Td> Account<T> {
     fn on_new_chat(&self, w: &World, chat: &Value) {
         if let Some(id) = chat["id"].as_i64() {
             self.known_chats.borrow_mut().insert(id);
+            self.history_views.borrow_mut().opening.remove(&id);
             self.log(&format!("<< chat ready chat={id}"));
         }
         let Some(ch) = updates::chat(chat) else {
@@ -1759,6 +1781,7 @@ impl<T: Td> Account<T> {
             self.on_mentions(w, v, page);
             return;
         }
+        if page.parent.is_none() { self.want_original_history(w, chat, topic, page.view); }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
         let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
             .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();

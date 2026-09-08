@@ -5,7 +5,7 @@ use makepad_widgets::*;
 use makepad_widgets::widget_tree::CxWidgetExt;
 
 use crate::shell::widgets::media::{self, PlayerState, VideoPlayback};
-use super::super::model::{Msg, MsgId};
+use super::super::model::{Msg, MsgKey};
 use super::super::panels::playback::Playback;
 
 /// One media surface for the poster, shared video and download feedback.
@@ -74,7 +74,7 @@ pub fn fill_slot(cx: &mut Cx, slot: &WidgetRef, video: &WidgetRef, shown: bool, 
 #[derive(Default)]
 pub struct InlineVideo {
     playback: VideoPlayback,
-    source: Option<(MsgId, Option<String>)>,
+    source: Option<(MsgKey, Option<String>)>,
     last_word: String,
     frame_ready: bool,
 }
@@ -94,7 +94,7 @@ impl InlineVideo {
     }
 
     fn set_source(&mut self, cx: &mut Cx, m: &Msg) {
-        let source = (m.id, m.media.as_ref().and_then(|md| md.clip.clone()));
+        let source = (m.key(), m.media.as_ref().and_then(|md| md.clip.clone()));
         if self.source.as_ref() != Some(&source) {
             self.playback.reset(cx);
             self.source = Some(source);
@@ -178,6 +178,21 @@ mod tests {
         VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoTextureUpdatedEvent,
     };
     use crate::apps::telegram::{model, seed::STELAXIS, TELEGRAM};
+
+    #[test]
+    fn equal_message_ids_from_different_chats_do_not_share_inline_playback() {
+        static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+        let session = Session::fake(APPS);
+        let mut msg = model::history(session.store(), STELAXIS).iter()
+            .find(|m| has_video(m)).unwrap().clone();
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let mut owner = InlineVideo::default();
+        owner.set_source(cx, &msg);
+        owner.frame_ready = true;
+        msg.chat -= 1;
+        owner.set_source(cx, &msg);
+        assert!(!owner.frame_ready, "the old row's frame cannot stand in for the new source");
+    }
 
     /// Draw the actual surface template across the poster/loading/video
     /// handoff. Its height is also the following message's scroll position.
@@ -302,7 +317,7 @@ mod tests {
         std::fs::write(dir.join("blobs").join(kernel::caps::file_name("tg:native-handoff")),
             b"\x00\x00\x00\x18ftypisom").unwrap();
         let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
-        let mut players = [Playback::new(store.clone(), msg.id), Playback::new(store, msg.id)];
+        let mut players = [Playback::new(store.clone(), msg.key()), Playback::new(store, msg.key())];
         let mut owners = [InlineVideo::default(), InlineVideo::default()];
         let cx = &mut Cx::new(Box::new(|_, _| {}));
         let (root, videos) = cx.with_vm(|vm| {
@@ -354,7 +369,7 @@ mod tests {
         std::fs::write(dir.join("blobs").join(kernel::caps::file_name("tg:inline-native")),
             b"\x00\x00\x00\x18ftypisom").unwrap();
         let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
-        let mut player = Playback::new(store.clone(), msg.id);
+        let mut player = Playback::new(store.clone(), msg.key());
 
         let cx = &mut Cx::new(Box::new(|_, _| {}));
         let (root, video, first, second) = cx.with_vm(|vm| {
@@ -423,7 +438,7 @@ mod tests {
         assert!(clip.is_paused());
         let mut next = msg.clone();
         next.id += 1;
-        let mut next_player = Playback::new(store, next.id);
+        let mut next_player = Playback::new(store, next.key());
         next_player.toggle_play(&next, 5.0);
         assert!(!owner.drive(cx, &video, &mut next_player, &next, 5.0).shown);
         assert!(clip.is_cleaning_up(), "a new message must release the old native source first");
@@ -455,7 +470,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
         let inbox = super::super::super::runtime::of(&store).connect();
-        let mut player = Playback::new(store.clone(), msg.id);
+        let mut player = Playback::new(store.clone(), msg.key());
         let cx = &mut Cx::new(Box::new(|_, _| {}));
         let video = cx.with_vm(|vm| {
             let mut view = View::script_new(vm);
@@ -517,7 +532,7 @@ mod tests {
         // this transcript's native player.
         owner.seek(cx, &mut player, &msg, 6.0, 7.0);
         msg.id += 1;
-        let mut next = Playback::new(store, msg.id);
+        let mut next = Playback::new(store, msg.key());
         let drawn = owner.drive(cx, &video, &mut next, &msg, 7.0);
         assert!(!drawn.shown);
         assert!(!owner.playback.awaiting_seek());

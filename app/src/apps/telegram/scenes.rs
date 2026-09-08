@@ -129,6 +129,7 @@ fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
         state: None,
         edited: false,
         reply_to: None,
+        reply_chat: None,
         unread_mention: false,
         reply_name: String::new(),
         reply_text: String::new(),
