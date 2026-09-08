@@ -20,10 +20,11 @@ use crate::shell::widgets::map;
 use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
-use super::super::model::{self, Msg, MsgId, PeerId, Player};
+use super::super::model::{self, Msg, MsgId, PeerId};
 use super::super::{downloads, requests, runtime, verbs};
 use super::chat::copy_line;
 use super::reactions::{self, Reactions};
+use super::playback::Playback;
 use super::{wire, Chat, Chats, Viewer};
 
 /// A line's card.
@@ -34,7 +35,7 @@ pub struct Line {
     world: Rc<World>,
     slot: SlotId,
     /// The card's own player, where the line has a recording.
-    player: Option<Player>,
+    pub playback: Playback,
     reactions: Reactions,
 }
 
@@ -78,31 +79,12 @@ impl Line {
     /// Where the player stands, for a line with a recording.
     #[must_use]
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
-        let secs = m.media.as_ref()?.secs?;
-        Some(match self.player {
-            Some(p) => p.state(now),
-            None => PlayerState {
-                playing: false,
-                position: 0.0,
-                length: secs as f64,
-            },
-        })
+        self.playback.player_state(m, now)
     }
 
-    /// Play or pause.
+    /// Play or pause in the card.
     pub fn toggle_play(&mut self, m: &Msg, now: f64) {
-        let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else {
-            return;
-        };
-        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
-        p.toggle(now);
-        self.player = Some(p);
-    }
-
-    /// Whether the player runs — what asks for the next frame.
-    #[must_use]
-    pub fn playing(&self, now: f64) -> bool {
-        self.player.is_some_and(|p| p.state(now).playing)
+        self.playback.toggle_play(m, now);
     }
 
     /// The card's title: the writer and the time.
@@ -177,7 +159,7 @@ impl Panel for Line {
                     v.push(Verb::run("telegram.browser", "browser", Some('b')));
                 }
                 _ => {
-                    if md.secs.is_some() {
+                    if m.as_ref().is_some_and(|m| self.player_state(m, self.world.now()).is_some()) {
                         let playing = m.as_ref().is_some_and(|m| {
                             self.player_state(m, self.world.now()).is_some_and(|s| s.playing)
                         });
@@ -335,7 +317,7 @@ impl PanelKind for LineKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
-            player: None,
+            playback: Playback::new(cx.session().store().clone(), msg),
             reactions: Reactions::default(),
         })
     }

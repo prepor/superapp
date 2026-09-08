@@ -41,6 +41,7 @@ use crate::shell::widgets::reveal::Reveal;
 use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgId};
 use super::super::panels::{Chat, Line, Row, Viewer};
 use super::RenderContext;
+use super::inline_video::{self, InlineVideo};
 
 /// The children the transcript expects in its template.
 const STATUS: &[LiveId] = ids!(status_lbl);
@@ -97,7 +98,7 @@ struct InnerHit {
 /// What a press inside a row does.
 #[derive(Clone)]
 enum Inner {
-    /// Play or pause the line's recording.
+    /// Play or pause in the line.
     Play(Box<Msg>),
     /// Open the line's media in the viewer.
     View(MsgId),
@@ -157,10 +158,16 @@ pub struct ChatPanel {
     viewed: Option<super::super::runtime::MessageView>,
     #[rust]
     background: bool,
+    #[rust]
+    video: InlineVideo,
 }
 
 impl Widget for ChatPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Direct children keep this stable when the same video is indexed
+        // under a visible row by Makepad's single-parent widget search tree.
+        let clip_box = self.view.child(live_id!(video_source)).child(live_id!(clip_box));
+        let video_before = media::video_word(cx, &clip_box);
         if super::pictures::changed(cx, event) { self.view.redraw(cx); }
         match event {
             Event::WindowLostFocus(_) | Event::Background => {
@@ -441,7 +448,30 @@ impl Widget for ChatPanel {
             }
         }
 
-        super::text::handle_event(&mut self.view, cx, event, scope);
+        let actions = cx.capture_actions(|cx| super::text::handle_event(&mut self.view, cx, event, scope));
+        if self.video.handle_actions(cx, &clip_box, &actions) {
+            self.view.redraw(cx);
+        }
+        cx.extend_actions(actions);
+        let video_after = media::video_word(cx, &clip_box);
+        if video_before != video_after {
+            self.view.redraw(cx);
+            if let Event::VideoDecodingError(error) = event {
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    with_chat(&props, |c| c.pause(s.now()));
+                    super::super::runtime::of(s.store()).operations.report(
+                        s.store(), "playing video", &error.error,
+                    );
+                    s.redraw();
+                }
+            }
+        }
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if self.background || !super::message_panel_visible(s, props.slot) {
+                with_chat(&props, |c| c.pause(s.now()));
+                media::pause_video(cx, &clip_box);
+            }
+        }
         self.mount(cx, &props, scope);
 
         // A press on the composer's field takes the keyboard, the way a
@@ -484,26 +514,9 @@ impl Widget for ChatPanel {
                 .map(|h| h.rect);
             if let Some(rect) = hit {
                 if let Some(act) = self.inner_at(rect) {
+                    if e.button != MouseButton::PRIMARY { return; }
                     let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
                     match act {
-                        // A real clip cannot play in its row — the row is a
-                        // reused list item and the platform's player is the
-                        // viewer's — so its play button opens the viewer on
-                        // the line, playing. A demo line or a recording
-                        // keeps the row's own timeline.
-                        Inner::Play(m) if wire_clip(&m) => {
-                            let target = with_chat(&props, |c| {
-                                c.play_on_open(m.id);
-                                Viewer::id(c.peer(), m.id)
-                            });
-                            if let (Some(id), Some(s)) = (target, scope.data.get_mut::<Session>()) {
-                                s.nav(Nav::Open {
-                                    from: props.slot,
-                                    id,
-                                    fresh: e.modifiers.logo,
-                                });
-                            }
-                        }
                         Inner::Play(m) => {
                             with_chat(&props, |c| c.toggle_play(&m, now));
                         }
@@ -519,7 +532,11 @@ impl Widget for ChatPanel {
                         }
                         Inner::View(id) | Inner::Card(id) => {
                             let target = with_chat(&props, |c| match act {
-                                Inner::View(_) => Viewer::id(c.peer(), id),
+                                Inner::View(_) => {
+                                    c.pause(now);
+                                    media::pause_video(cx, &clip_box);
+                                    Viewer::id(c.peer(), id)
+                                }
                                 _ => Line::id(c.peer(), id),
                             });
                             if let (Some(id), Some(s)) = (target, scope.data.get_mut::<Session>()) {
@@ -659,6 +676,10 @@ impl Widget for ChatPanel {
         self.carries(cx, if can_post { &carrying } else { &[] }, props.slot);
 
         let n = rows.len();
+        let video = self.view.child(live_id!(video_source)).child(live_id!(clip_box));
+        let active = with_chat(&props, |c| c.active_media()).flatten();
+        let mut video_drawn = false;
+        let mut video_redraw = false;
         if !self.positioned && n > 0 {
             let list = self.view.widget(cx, LIST).as_portal_list();
             match rows.iter().position(|r| matches!(r, Row::Unread)) {
@@ -710,7 +731,7 @@ impl Widget for ChatPanel {
                 let id = r.msg().map(|m| m.id);
                 let selected = id.is_some() && id == cursor;
                 let marked = id.is_some_and(|i| marks.contains(&i));
-                let player = r.msg().and_then(|m| with_chat(&props, |c| c.player_state(m, now)).flatten());
+                let mut player = r.msg().and_then(|m| with_chat(&props, |c| c.player_state(m, now)).flatten());
                 populate(
                     cx,
                     &row,
@@ -721,6 +742,22 @@ impl Widget for ChatPanel {
                 );
                 if let Some(m) = r.msg() {
                     self.want_picture(cx, m, &render);
+                    let message = row.view(cx, ids!(msg));
+                    let line = table::line(cx, &message, selected, marked);
+                    let slot = line.widget(cx, ids!(body.clip_box));
+                    let result = with_chat(&props, |c| {
+                        c.playback(m.id).map(|p| self.video.drive(cx, &video, p, m, now))
+                    }).flatten();
+                    let shown = result.as_ref().is_some_and(|d| d.shown);
+                    let note = result.as_ref().and_then(|d| d.note.as_deref());
+                    inline_video::fill_slot(cx, &slot, &video, shown, note);
+                    if let Some(result) = result {
+                        video_drawn = true;
+                        video_redraw |= result.redraw;
+                        player = result.player;
+                        let player = line.widget(cx, ids!(body.player));
+                        media::fill_player(cx, &player, result.player.as_ref());
+                    }
                 }
                 row.draw_all(cx, scope);
                 drawn.push((idx, row, player));
@@ -745,6 +782,7 @@ impl Widget for ChatPanel {
         self.rows.clear();
         self.inner.clear();
         let clip = self.view.widget(cx, LIST).area().rect(cx);
+        let mut active_visible = false;
         let mut visible_ids = Vec::new();
         for (idx, row, player) in drawn {
             let Some(r) = rows.get(idx) else { continue };
@@ -762,6 +800,7 @@ impl Widget for ChatPanel {
                         visible_ids.push(msg.id);
                     }
                     self.rows.push(RowHit { id: msg.id, rect, unclipped: full });
+                    active_visible |= Some(msg.id) == active;
                     let id = msg.id;
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
                     self.inner_hits(cx, &props, &row, msg, twin, player, &render);
@@ -772,6 +811,11 @@ impl Widget for ChatPanel {
                     );
                 }
             }
+        }
+        if !video_drawn || !active_visible {
+            with_chat(&props, |c| c.pause(now));
+            media::pause_video(cx, &video);
+            video_redraw = false;
         }
         if let Some(s) = scope.data.get_mut::<Session>() {
             if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
@@ -797,7 +841,7 @@ impl Widget for ChatPanel {
         }
         // A player's progress moves — and a caret still landing asks to be
         // re-asked — so the next frame draws it further along.
-        if moving || self.refocus {
+        if (moving && active_visible) || video_redraw || self.refocus {
             self.view.redraw(cx);
         }
         DrawStep::done()
@@ -951,15 +995,24 @@ impl ChatPanel {
                     MouseCursor::Hand,
                     props.slot,
                 );
+                props.hits.add(
+                    format!("{} {}", if st.playing { "pause" } else { "play" }, md.word()),
+                    r, MouseCursor::Hand, props.slot,
+                );
                 self.inner.push(InnerHit {
                     rect: r,
                     act: Inner::Play(Box::new(m.clone())),
                 });
+                props.hits.add_clipped(
+                    st.time_line(), player_w.label(cx, ids!(time_lbl)).area().rect(cx),
+                    clip, MouseCursor::Default, props.slot,
+                );
             }
         }
-        if md.has_picture() {
-            let img = line.widget(cx, ids!(body.img_box));
-            if let Some(r) = img.visible().then(|| rect_of(cx, &img)).flatten().and_then(|r| visible(r, clip)) {
+        let video = line.widget(cx, ids!(body.clip_box));
+        let img = if video.visible() { video } else { line.widget(cx, ids!(body.img_box)) };
+        if img.visible() {
+            if let Some(r) = rect_of(cx, &img).and_then(|r| visible(r, clip)) {
                 props.hits.add(md.word(), r, MouseCursor::Hand, props.slot);
                 self.inner.push(InnerHit {
                     rect: r,
@@ -1146,7 +1199,10 @@ pub fn populate(
             // Disk reads, decoding and map construction belong to the picture
             // workers. A source-keyed texture is shared across recycled twins.
             let img_box = line.widget(cx, ids!(body.img_box));
-            let shown = super::pictures::photo(cx, &img_box, m.media.as_ref(), render.store_dir.as_deref());
+            let slot = line.widget(cx, ids!(body.clip_box));
+            let video = inline_video::has_video(m);
+            inline_video::fill_poster(cx, &slot, m, render.store_dir.as_deref());
+            let shown = super::pictures::photo(cx, &img_box, m.media.as_ref().filter(|_| !video), render.store_dir.as_deref());
             let map_box = line.widget(cx, ids!(body.map));
             super::pictures::place(cx, &map_box, m.media.as_ref(), render.store_dir.is_none());
             let player_w = line.widget(cx, ids!(body.player));
@@ -1214,15 +1270,6 @@ fn with_chat<R>(props: &PanelProps, f: impl FnOnce(&mut Chat) -> R) -> Option<R>
 /// view, never `Area::Empty`.
 fn leave_field(cx: &mut Cx, view: &View) {
     cx.set_key_focus(view.area());
-}
-
-/// Whether a line is a moving picture of the wire's — a video, a circle or
-/// an animation whose poster is a `tg:` reference — as against the demo's.
-fn wire_clip(m: &Msg) -> bool {
-    m.media.as_ref().is_some_and(|md| {
-        matches!(md.kind.as_str(), "video" | "circle" | "animation")
-            && md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
-    })
 }
 
 #[cfg(test)]

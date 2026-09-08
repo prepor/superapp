@@ -33,9 +33,9 @@ use kernel::session::Session;
 use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
-use super::super::model::{self, Msg, MsgId, PeerId, Player};
-use super::super::{downloads, requests, runtime};
-use super::wire;
+use super::super::model::{self, Msg, MsgId, PeerId};
+use super::super::downloads;
+use super::playback::Playback;
 
 /// The viewer.
 pub struct Viewer {
@@ -44,22 +44,7 @@ pub struct Viewer {
     msg: MsgId,
     world: Rc<World>,
     slot: SlotId,
-    /// The fake timeline, for what this build cannot really play: a voice
-    /// note, a track, and every clip in a build with no engine behind it.
-    player: Option<Player>,
-    /// Whether the clip should be running. A verb has no `Cx` to speak to a
-    /// player through, so the wish is kept here and the draw carries it out;
-    /// the draw hands back what it stands at, which is how a clip that has
-    /// run to its end puts the button back to *play*.
-    running: bool,
-    /// Whether the clip has been asked for. Once per open: the answer lands
-    /// in the blob cache under the row's own key, and every draw looks there
-    /// again until it does.
-    asked: bool,
-    /// Whether the picture itself has been asked for — the photo, or the
-    /// poster a moving picture is opened on. Once per open, for the same
-    /// reason.
-    wanted_pic: bool,
+    playback: Playback,
 }
 
 impl Viewer {
@@ -101,178 +86,56 @@ impl Viewer {
         )
     }
 
-    /// Where the player stands, for a line with something to play.
-    ///
-    /// A clip's real position and length are the platform player's, and the
-    /// draw reads them off it; this is what stands in until there is a
-    /// player to read — the wish, over the length the row itself knows. A
-    /// sound has no player at all yet, so its timeline is the fake one,
-    /// ticked against the clock.
-    #[must_use]
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
-        let md = m.media.as_ref()?;
-        if self.plays_clip(m) {
-            return Some(PlayerState {
-                playing: self.running,
-                position: 0.0,
-                length: md.secs.unwrap_or(0) as f64,
-            });
-        }
-        let secs = md.secs?;
-        Some(match self.player {
-            Some(p) => p.state(now),
-            None => PlayerState {
-                playing: false,
-                position: 0.0,
-                length: secs as f64,
-            },
-        })
+        self.playback.player_state(m, now)
     }
 
-    /// The clip's file on this device: where the download landed in the blob
-    /// cache, or `None` while it has not. Every draw asks again, which is how
-    /// the poster gives way to the player the moment the bytes are here.
-    #[must_use]
     pub fn clip_file(&self, m: &Msg) -> Option<PathBuf> {
-        model::playable_path(self.world.store().dir(), m.media.as_ref()?.clip.as_deref()?)
+        self.playback.clip_file(m)
     }
 
-    /// The file on this device to hand the system — the clip where it has
-    /// landed, else the picture — or `None` with nothing here yet.
-    #[must_use]
     pub fn file_to_open(&self, m: &Msg) -> Option<PathBuf> {
-        self.clip_file(m).or_else(|| {
-            model::media_path(self.world.store().dir(), m.media.as_ref()?.reference.as_deref()?)
-        })
+        self.playback.file_to_open(m)
     }
 
-    /// Whether the clip is this panel's to play: the line is a moving
-    /// picture of the wire's — never the demo's — and either its file is
-    /// already here, or its source message and clip have been asked for.
-    /// A demo line and a build with no
-    /// engine keep the poster and the fake timeline the panels library
-    /// draws; a real video never runs the fake timeline, which would only
-    /// count seconds over a still (Andrey, 2026-09-07: "the seconds update
-    /// but nothing plays").
-    #[must_use]
     pub fn plays_clip(&self, m: &Msg) -> bool {
-        moving_picture_of_the_wire(m)
-            && (self.asked || self.clip_file(m).is_some())
+        self.playback.plays_clip(m)
     }
 
-    /// Downloaded and total bytes for the clip or picture this viewer is
-    /// waiting on. A clip takes precedence over its poster; once the clip
-    /// is here, the player says the rest.
-    #[must_use]
     pub fn download_note(&self, m: &Msg) -> Option<String> {
-        let md = m.media.as_ref()?;
-        let reference = if self.plays_clip(m) {
-            if self.clip_file(m).is_some() {
-                return None;
-            }
-            md.clip.as_deref()
-        } else if self.awaiting_picture(m) {
-            md.reference.as_deref()
-        } else {
-            return None;
-        };
-        let state = runtime::of(self.world.store());
-        if let Some(note) = state.connection_note() {
-            return Some(note);
-        }
-        let context = requests::media_context(m.chat, m.id, self.plays_clip(m));
-        if let Some(note) = state.operations.media_note(&context) {
-            return Some(note);
-        }
-        Some(
-            reference
-                .and_then(|key| state.download(key))
-                .map_or_else(|| "downloading…".to_string(), |progress| progress.note()),
-        )
+        self.playback.download_note(m)
     }
 
-    /// Fetch the source message in this session before asking for its clip.
-    /// Remote file ids survive restarts, but their expiring file references
-    /// need a source TDLib can refresh. The cache still answers immediately.
     pub fn ask_for_clip(&mut self, m: &Msg) {
-        if self.asked || !moving_picture_of_the_wire(m) || self.clip_file(m).is_some() {
-            return;
-        }
-        self.asked = wire(self.world.store(), &requests::request_media(m.chat, m.id, true));
+        self.playback.ask_for_clip(m)
     }
 
-    /// Restore a missing photo through its source message too. A clip request
-    /// already fetches its poster, so it needs no second message request.
     pub fn ask_for_picture(&mut self, m: &Msg) {
-        if self.wanted_pic || self.asked {
-            return;
-        }
-        let Some(md) = m.media.as_ref() else { return };
-        if !md.has_picture() || md.picture_bytes(self.world.store().dir()).is_some()
-            || !md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
-        {
-            return;
-        }
-        self.wanted_pic = wire(self.world.store(), &requests::request_media(m.chat, m.id, false));
+        self.playback.ask_for_picture(m)
     }
 
-    /// Whether a picture was asked for and has not landed — what keeps the
-    /// viewer drawing until it does, a file appearing under the cache's name
-    /// announcing itself to nobody.
-    #[must_use]
     pub fn awaiting_picture(&self, m: &Msg) -> bool {
-        self.wanted_pic
-            && m.media
-                .as_ref()
-                .is_some_and(|md| md.picture_bytes(self.world.store().dir()).is_none())
+        self.playback.awaiting_picture(m)
     }
 
-    /// Play or pause. Pressing play on a clip is also the asking, since a
-    /// clip nobody has opened was never downloaded; the wish is all a verb
-    /// can set — a player is only reachable where there is a `Cx`, which is
-    /// the draw. Everything else toggles the fake timeline against the clock.
     pub fn toggle_play(&mut self, m: &Msg, now: f64) {
-        self.ask_for_clip(m);
-        if self.plays_clip(m) {
-            self.running = !self.running;
-            return;
-        }
-        let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else {
-            return;
-        };
-        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
-        p.toggle(now);
-        self.player = Some(p);
+        self.playback.toggle_play(m, now)
     }
 
-    /// Seek the demo or audio timeline; a real clip is sought by the widget's
-    /// native player, which needs a `Cx`.
     pub fn seek(&mut self, m: &Msg, position: f64, now: f64) {
-        if self.plays_clip(m) {
-            return;
-        }
-        let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else { return };
-        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
-        p.seek(position, now);
-        self.player = Some(p);
+        self.playback.seek(m, position, now)
     }
 
-    /// The wish the draw carries out over the clip's player.
-    #[must_use]
     pub fn running(&self) -> bool {
-        self.running
+        self.playback.running()
     }
 
-    /// What the draw found the player at afterwards — `false` where the clip
-    /// has run to its end, which is what puts the button back to *play*.
     pub fn set_running(&mut self, running: bool) {
-        self.running = running;
+        self.playback.set_running(running)
     }
 
-    /// Whether anything runs — what asks for the next frame.
-    #[must_use]
     pub fn playing(&self, now: f64) -> bool {
-        self.running || self.player.is_some_and(|p| p.state(now).playing)
+        self.playback.playing(now)
     }
 }
 
@@ -400,19 +263,6 @@ impl Panel for Viewer {
     }
 }
 
-/// Whether a line is a moving picture that came over the wire — a video, a
-/// circle or an animation whose clip or poster is a `tg:` reference — as against
-/// the demo world's, which are bundled stills with a fake timeline.
-fn moving_picture_of_the_wire(m: &Msg) -> bool {
-    m.media.as_ref().is_some_and(|md| {
-        matches!(md.kind.as_str(), "video" | "circle" | "animation")
-            && [md.clip.as_deref(), md.reference.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|r| r.starts_with("tg:"))
-    })
-}
-
 /// Its factory.
 pub struct ViewerKind;
 
@@ -429,11 +279,7 @@ impl PanelKind for ViewerKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
-            player: None,
-            // Opened from a line's own play button, it plays as it opens.
-            running: runtime::of(cx.session().store()).take_play_on_open(chat, msg),
-            asked: false,
-            wanted_pic: false,
+            playback: Playback::new(cx.session().store().clone(), msg),
         })
     }
 }

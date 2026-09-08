@@ -309,8 +309,19 @@ fresh file at priority 32 with a completion response, while `updateFile` keeps
 the byte counts current. Source errors, download failures and timeouts appear
 in the viewer; the shared feedback controls offer an explicit retry.
 
-Playing videos fit inside the viewer at their original aspect ratio, including
-when the window is resized, with empty space around the frame where needed.
+The play button plays videos inline in the transcript or message card. It
+downloads an uncached clip on demand. The preview and decoded frames share
+one surface, fitted to the column within 320×480 using the message's video
+dimensions. The preview remains until the first decoded frame arrives;
+download feedback overlays the surface so starting playback does not move
+the transcript. Clicking the video itself opens the dedicated viewer. Playback
+pauses when its message leaves the viewport or the viewer opens. Starting
+playback in another Telegram panel pauses the previous player, including when
+a transcript and its message card remain visible together. Selecting or marking
+a message keeps the same native player.
+
+Playing videos retain their original aspect ratio, both inline and inside the
+viewer, including when the window is resized.
 
 ## Modules
 

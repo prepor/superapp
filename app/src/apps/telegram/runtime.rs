@@ -98,7 +98,6 @@ struct State {
     connection: u64,
     next_action: u64,
     forward: Option<Forward>,
-    play_next: Option<(PeerId, MsgId)>,
     loading: Vec<(PeerId, i64)>,
     topic_lists: std::collections::HashMap<PeerId, Result<bool, String>>,
     mentions_loading: Vec<PeerId>,
@@ -398,19 +397,6 @@ impl Runtime {
         self.state().forward.take()
     }
 
-    pub fn play_on_open(&self, chat: PeerId, id: MsgId) {
-        self.state().play_next = Some((chat, id));
-    }
-
-    pub fn take_play_on_open(&self, chat: PeerId, id: MsgId) -> bool {
-        let mut state = self.state();
-        if state.play_next != Some((chat, id)) {
-            return false;
-        }
-        state.play_next = None;
-        true
-    }
-
     #[cfg(test)]
     pub fn loading(&self, chat: PeerId) -> bool {
         self.loading_in(chat, 0)
@@ -574,7 +560,6 @@ mod tests {
         let store = Store::open(None, &[]).unwrap();
         let state = of(&store);
         state.carry_forward(7, vec![42]);
-        state.play_on_open(7, 42);
         state.set_list_syncing(true);
         state.set_connection_note(Some("connecting to Telegram…"));
         let progress = DownloadProgress {
@@ -618,14 +603,11 @@ mod tests {
         let fixture = Store::open(None, &[]).unwrap();
         let other = of(&fixture);
         assert!(other.take_forward().is_none());
-        assert!(!other.take_play_on_open(7, 42));
         assert!(!other.loading(7));
         assert_eq!(other.connection_note(), None);
         assert_eq!(other.download("tg:photo"), None);
         assert_eq!(state.download("tg:photo"), Some(progress));
         assert!(other.take_wanted().files.is_empty());
-        assert!(state.take_play_on_open(7, 42));
-        assert!(!state.take_play_on_open(7, 42));
 
         let weak = Arc::downgrade(&state);
         drop(state);

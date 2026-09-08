@@ -294,6 +294,7 @@ pub struct VideoDrawn {
 pub struct VideoPlayback {
     lease: Option<VideoLease>,
     seek: Option<VideoSeek>,
+    releasing: bool,
 }
 
 struct VideoSeek {
@@ -351,6 +352,15 @@ pub fn cleanup_videos(cx: &mut Cx, event: Option<&Event>) {
 }
 
 impl VideoPlayback {
+    /// Reuse a panel's player for another source after native cleanup.
+    pub fn reset(&mut self, cx: &mut Cx) {
+        self.seek = None;
+        if let Some(lease) = &self.lease {
+            self.releasing = !lease.clip.as_video().is_unprepared();
+            lease.clip.as_video().stop_and_cleanup_resources(cx);
+        }
+    }
+
     fn own(&mut self, cx: &mut Cx, clip: WidgetRef) {
         if clip.is_empty() || self.lease.as_ref().is_some_and(|lease| lease.clip == clip) {
             return;
@@ -447,6 +457,16 @@ impl VideoPlayback {
         let widget = video.widget(cx, ids!(clip));
         self.own(cx, widget.clone());
         let clip = widget.as_video();
+        if self.releasing {
+            if clip.is_unprepared() {
+                self.releasing = false;
+            } else {
+                // A late Prepared can arrive after cleanup was requested.
+                // Keep the old source hidden until its release is acknowledged.
+                video.set_visible(cx, false);
+                return VideoDrawn { shown: false, playing };
+            }
+        }
         let mut playing = playing;
         match path {
             Some(path) => {
@@ -512,6 +532,15 @@ pub fn video_word(cx: &Cx, video: &WidgetRef) -> &'static str {
         "unprepared"
     } else {
         "releasing"
+    }
+}
+
+/// Pause a live clip when its inline surface leaves the viewport. Makepad's
+/// pause call also marks an unprepared player paused, preventing its first load.
+pub fn pause_video(cx: &mut Cx, video: &WidgetRef) {
+    let clip = video.widget(cx, ids!(clip)).as_video();
+    if clip.is_playing() {
+        clip.pause_playback(cx);
     }
 }
 
