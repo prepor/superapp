@@ -786,6 +786,43 @@ pub fn get_message(chat: PeerId, id: MsgId) -> String {
     .to_string()
 }
 
+/// A server search starting at this message, with a criterion that includes
+/// it. An empty query without any criterion can silently return no results.
+/// Our TDLib message database is disabled in set_tdlib_parameters, so even
+/// media searches bypass its database cache. This sends no read receipt.
+pub(super) fn reaction_count_snapshot(m: &model::Msg, context: &str) -> String {
+    let filter = m.content_type.as_deref().filter(|_| m.sender.is_none() && m.topic == 0).and_then(|kind| match kind {
+        "messagePhoto" => Some("searchMessagesFilterPhoto"),
+        "messageAnimation" => Some("searchMessagesFilterAnimation"),
+        "messageVideo" => Some("searchMessagesFilterVideo"),
+        "messageVoiceNote" => Some("searchMessagesFilterVoiceNote"),
+        "messageVideoNote" => Some("searchMessagesFilterVideoNote"),
+        "messageAudio" => Some("searchMessagesFilterAudio"),
+        "messageDocument" => Some("searchMessagesFilterDocument"),
+        "messagePoll" => Some("searchMessagesFilterPoll"),
+        _ => None,
+    }).map(|kind| json!({"@type": kind}));
+    let sender = m.sender.unwrap_or(m.chat);
+    let sender = if sender > 0 { json!({"@type": "messageSenderUser", "user_id": sender}) }
+        else { json!({"@type": "messageSenderChat", "chat_id": sender}) };
+    let topic = (m.topic != 0).then(|| json!({"@type": "messageTopicForum", "forum_topic_id": m.topic}));
+    // A senderless channel post needs text or a content filter: TDLib
+    // removes a redundant sender filter for the channel's own identity.
+    let query = if filter.is_none() && topic.is_none() && m.sender.is_none() {
+        m.text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty())
+            .max_by_key(|word| word.chars().count()).or_else(|| m.text.split_whitespace().next())
+            .unwrap_or("").chars().take(64).collect::<String>()
+    } else { String::new() };
+    json!({"@type": "searchChatMessages", "chat_id": m.chat, "from_message_id": m.id,
+        "query": query, "sender_id": sender, "topic_id": topic,
+        "offset": 0, "limit": 1, "filter": filter, "@extra": context}).to_string()
+}
+
+pub(super) fn reaction_count_metadata(chat: PeerId, id: MsgId, context: &str) -> String {
+    json!({"@type": "getMessageAvailableReactions", "chat_id": chat, "message_id": id,
+        "row_size": 8, "@extra": context}).to_string()
+}
+
 /// Restore the message's file source in this TDLib session before downloading.
 /// A persistent remote file id alone cannot repair an expired file reference.
 pub fn request_media(chat: PeerId, id: MsgId, clip: bool) -> String {

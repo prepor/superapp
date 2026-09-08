@@ -2650,7 +2650,7 @@ fn a_first_empty_reaction_answer_recovers_when_metadata_arrives_without_reopenin
 }
 
 #[test]
-fn empty_reaction_choices_retry_on_the_worker_clock_and_eventually_offer_manual_retry() {
+fn empty_reaction_choices_keep_retrying_on_the_worker_clock() {
     use kernel::app::Env;
     use kernel::caps::{ClockSource, FakeClock};
     let clock = FakeClock::at(virtual_epoch());
@@ -2678,15 +2678,13 @@ fn empty_reaction_choices_retry_on_the_worker_clock_and_eventually_offer_manual_
         clock.advance(4.0);
     }
     let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
-    assert_eq!(labels, vec!["no emoji reactions available", "retry", "cancel"]);
+    assert_eq!(labels, vec!["waiting for reactions…", "retry", "cancel"]);
     let count = td.sent().len();
     clock.advance(60.0);
     acc.drain(s.world());
-    assert_eq!(td.sent().len(), count, "a confirmed empty result does not poll forever");
-    acc.on_update(s.world(), &serde_json::json!({"@type": "updateActiveEmojiReactions"}).to_string());
-    acc.drain(s.world());
+    assert_eq!(td.sent().len(), count + 1, "an empty cache keeps retrying with a capped delay");
     offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["🔥"]);
-    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"), "late metadata still wakes an empty picker");
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"), "late metadata recovers without a new update or reopening");
 }
 
 #[test]
@@ -2757,6 +2755,35 @@ fn reaction_permission_changes_during_loading_are_coalesced_and_explained() {
     acc.on_update(s.world(), &serde_json::json!({"@type": "updateActiveEmojiReactions"}).to_string());
     acc.drain(s.world());
     assert_eq!(td.sent().len(), n, "closing the panel retires its metadata subscription");
+}
+
+#[test]
+fn an_empty_picker_cache_keeps_retrying_and_cannot_erase_loaded_choices() {
+    use kernel::app::Env;
+    use kernel::caps::{ClockSource, FakeClock};
+    let clock = FakeClock::at(virtual_epoch());
+    let mut s = Session::fake_with(APPS, &Env { clock: ClockSource::Virtual(clock.clone()), ..Env::default() });
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
+    let card = open_root(&mut s, Line::id(VERA, m.id));
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir(), None);
+    acc.drain(s.world());
+    verb(&mut s, card, "telegram.react");
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &[]);
+    clock.advance(11.0);
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &[]);
+    let labels: Vec<_> = s.panel(card).unwrap().borrow().verbs().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, ["waiting for reactions…", "retry", "cancel"]);
+    clock.advance(3.0);
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["👍"]);
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"), "recover without reopening the picker");
+    acc.on_update(s.world(), &serde_json::json!({"@type": "updateActiveEmojiReactions"}).to_string());
+    acc.drain(s.world());
+    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &[]);
+    assert!(verb_ids(&s, card).contains(&"telegram.reaction_0"), "metadata invalidation must not flash away known choices");
 }
 
 #[test]

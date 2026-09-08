@@ -488,6 +488,8 @@ pub fn first_name(name: &str) -> &str {
 /// One message as the transcript draws it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Msg {
+    pub content_type: Option<String>,
+    pub topic: i64,
     pub id: MsgId,
     pub chat: PeerId,
     pub sender: Option<PeerId>,
@@ -1264,12 +1266,14 @@ static Q_HISTORY: Q = Q {
     // line happened to wear that number (V8).
     sql: "SELECT m.id, m.chat, m.sender, COALESCE(s.name, ''), m.date, m.text, m.out, m.state,
                  m.edited, m.reply_to, COALESCE(rs.name, ''), COALESCE(r.text, ''),
-                 m.fwd_from, m.views, m.comments, m.reactions, m.service,
+                 m.fwd_from, m.views, m.comments,
+                 CASE WHEN rx.known THEN rx.counts ELSE m.reactions END, m.service,
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention
+                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic
           FROM tg_message m
+          LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = m.chat AND r.id = m.reply_to
           LEFT JOIN tg_peer rs ON rs.id = r.sender
@@ -1290,6 +1294,8 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
     let reply_media = r.get::<_, Option<String>>(18)?.map(|k| Media::of(&k));
     let reply_text = media_or_text(reply_media.as_ref(), &r.get::<_, String>(11)?, 0.0);
     Ok(Msg {
+        content_type: r.get(34)?,
+        topic: r.get(35)?,
         id: r.get(0)?,
         chat: r.get(1)?,
         sender: r.get(2)?,

@@ -24,6 +24,7 @@ struct Load {
     dirty: bool,
     due: f64,
     started: f64,
+    has_choices: bool,
 }
 
 impl Load {
@@ -41,6 +42,7 @@ impl<T: Td> Account<T> {
             self.reactions.borrow_mut().loads.insert(id, Load {
                 chat, msg, attempt: 0, pending: true, dirty: false,
                 due: w.now() + PATIENCE, started: w.now(),
+                has_choices: false,
             });
         } else if let Some((id, _, _)) = parse_added_reaction_extra(extra) {
             self.reactions.borrow_mut().adds.insert(id, (extra.to_string(), w.now() + PATIENCE));
@@ -127,14 +129,20 @@ impl<T: Td> Account<T> {
         self.log(&format!("<< available reactions request={id} attempt={attempt} choices={} restricted={}", emojis.len(), unavailable.is_some()));
         if let Some(reason) = unavailable {
             load.due = f64::INFINITY;
+            load.has_choices = false;
             rt.finish_reaction(id, ReactionResult::Unavailable(reason.into()));
-        } else if emojis.is_empty() && w.now() - load.started < EMPTY_PATIENCE {
+        } else if emojis.is_empty() && ["top_reactions", "recent_reactions", "popular_reactions"].iter()
+            .all(|key| v[key].as_array().is_none_or(|a| a.is_empty())) {
             // getMessageAvailableReactions reads a cache while TDLib loads
             // the active emoji and chat permissions. An initial empty list
             // is provisional; retry even if that metadata emits no update.
-            load.due = w.now() + 2_f64.powi(load.attempt.min(2) as i32);
+            load.due = w.now() + 2_f64.powi(load.attempt.min(5) as i32).min(30.0);
+            if !load.has_choices && w.now() - load.started >= EMPTY_PATIENCE {
+                rt.finish_reaction(id, ReactionResult::Waiting);
+            }
         } else {
             load.due = f64::INFINITY;
+            load.has_choices = !emojis.is_empty();
             rt.finish_reaction(id, ReactionResult::Choices(emojis));
         }
         true

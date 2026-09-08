@@ -25,6 +25,7 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
     let (text, media) = content(&m["content"], date);
     let info = &m["interaction_info"];
     Some(IncomingMessage {
+        content_type: m["content"]["@type"].as_str().map(str::to_string),
         id,
         chat,
         topic: message_topic(m),
@@ -161,6 +162,21 @@ fn reactions_line(info: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// Missing interaction metadata is unknown. An actual list (even an empty
+/// one) is evidence; unsupported or malformed entries must not become zero.
+pub(super) fn reaction_counts(info: &Value) -> Option<Option<String>> {
+    let list = info["reactions"].as_array().or_else(|| info["reactions"]["reactions"].as_array())?;
+    if list.iter().any(|r| {
+        let named = r["reaction"].as_str().is_some_and(|s| !s.is_empty()) || match r["type"]["@type"].as_str() {
+            Some("reactionTypeEmoji") => r["type"]["emoji"].as_str().is_some_and(|s| !s.is_empty()),
+            Some("reactionTypeCustomEmoji" | "reactionTypePaid") => true,
+            _ => false,
+        };
+        !named || r["total_count"].as_i64().is_none_or(|n| n < 0)
+    }) { return None; }
+    Some(reactions_line(info))
+}
+
 /// What a line has gathered since it was posted: the views, the comments
 /// under it, and its reactions as the one line a post draws.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -198,11 +214,9 @@ pub fn available_reactions(v: &Value) -> Vec<String> {
 }
 
 /// `updateMessageInteractionInfo`: a channel post counted again, a reaction
-/// added or taken back. Unlike a peer's counts this is the whole picture —
-/// TDLib sends the `interaction_info` entire, and `null` where a line has
-/// none left — so an absence here is a genuine nought and the projection
-/// writes it through rather than keeping what it had. `None` only when the
-/// update names no chat or no message.
+/// added or taken back. TDLib also emits null while reaction metadata is
+/// invalidated; the worker reconciles that ambiguity before clearing counts.
+/// `None` only when the update names no chat or no message.
 #[must_use]
 pub fn interaction(u: &Value) -> Option<Interaction> {
     let info = &u["interaction_info"];
@@ -1556,11 +1570,18 @@ mod tests {
         assert!(chat_draft(&json!({"@type": "updateChatDraftMessage"})).is_none());
     }
 
-    /// The interaction info is the whole picture of what a line has
-    /// gathered, so a count that has gone reads as an absence and the
-    /// projection writes it through.
+    /// Decode counts without confusing nullable metadata with an empty list.
     #[test]
-    fn the_interaction_info_is_the_whole_of_what_a_line_gathered() {
+    fn interaction_counts_distinguish_unknown_metadata_from_empty_lists() {
+        assert_eq!(reaction_counts(&json!(null)), None);
+        assert_eq!(reaction_counts(&json!({"reactions": null})), None);
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": []}})), Some(None));
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeFuture"}, "total_count": 4},
+        ]}})), None);
+        assert_eq!(reaction_counts(&json!({"reactions": {"reactions": [
+            {"type": {"@type": "reactionTypeEmoji"}, "total_count": 4},
+        ]}})), None);
         let i = interaction(&json!({
             "@type": "updateMessageInteractionInfo", "chat_id": -1005, "message_id": 4200,
             "interaction_info": {

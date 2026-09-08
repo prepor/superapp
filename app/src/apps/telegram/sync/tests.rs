@@ -11,6 +11,7 @@ use serde_json::json;
 use std::rc::Rc;
 
 mod topics_tests;
+mod reaction_state_tests;
 
 /// A world over a fresh telegram store — the schema only, no demo seed —
 /// with a fake api_hash planted where the parameters step reads it, so no
@@ -111,7 +112,8 @@ fn failed_visible_fetches_retry_without_scrolling_and_retire_timed_out_answers()
 
 #[test]
 fn reaction_metadata_refreshes_visible_rows_and_snapshots_do_not_undo_live_counts() {
-    let w = world();
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
@@ -132,8 +134,8 @@ fn reaction_metadata_refreshes_visible_rows_and_snapshots_do_not_undo_live_count
     acc.on_update(&w, &json!({"@type": "messages", "@extra": refreshed["@extra"], "messages": [message]}).to_string());
     acc.on_update(&w, &json!({"@type": "updateChatLastMessage", "chat_id": 7, "last_message": message}).to_string());
     assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 8"));
-    // The post-add fetch is newer than the previous push update, and must
-    // be able to advance it even if its own interaction update is delayed.
+    // Post-add reconciliation advances the counts from the server even
+    // when the corresponding interaction update is delayed.
     let (id, _reply) = runtime::of(w.store()).await_reaction();
     acc.send(&w, &super::add_message_reaction(7, 42, "👍", id));
     let added = last_request(&td, "addMessageReaction");
@@ -146,12 +148,22 @@ fn reaction_metadata_refreshes_visible_rows_and_snapshots_do_not_undo_live_count
         {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 9},
     ]}});
     acc.on_update(&w, &newer.to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 8"),
+        "a cached getMessage must not replace the reaction owner");
+    clock.advance(2.0);
+    acc.drain(&w);
+    let search = last_request(&td, "searchChatMessages");
+    acc.on_update(&w, &json!({"@type": "foundChatMessages", "@extra": search["@extra"],
+        "messages": [newer]}).to_string());
     assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
     acc.on_update(&w, &json!({"@type": "updateChatLastMessage", "chat_id": 7, "last_message": message}).to_string());
     assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
     acc.on_update(&w, &json!({"@type": "updateMessageInteractionInfo", "chat_id": 7, "message_id": 42,
         "interaction_info": null}).to_string());
     acc.on_update(&w, &newer.to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 9"));
+    clock.advance(2.0);
+    reaction_state_tests::confirm_empty(&acc, &td, &w, message);
     assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions, None, "removing the last reaction must still clear it");
 }
 
@@ -184,6 +196,8 @@ fn missing_visible_messages_retry_and_reopening_reconciles_counts_removed_while_
     let reopened = last_request(&td, "getMessages");
     assert_ne!(second["@extra"], reopened["@extra"]);
     acc.on_update(&w, &json!({"@type": "messages", "@extra": reopened["@extra"], "messages": [message]}).to_string());
+    assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions.as_deref(), Some("👍 8"));
+    reaction_state_tests::confirm_empty(&acc, &td, &w, message.clone());
     assert_eq!(super::model::line(w.store(), 7, 42).unwrap().reactions, None);
     let mut stale = message;
     stale["@type"] = json!("message");
@@ -2287,8 +2301,11 @@ fn a_chats_later_updates_land_the_title_the_mention_and_the_counts() {
                 "message_id": 4300, "interaction_info": null})
         .to_string(),
     );
-    assert_eq!(gathered(&w), (None, None, None), "the last reaction, taken back");
+    assert_eq!(gathered(&w), (None, None, Some("👍 3".into())), "null metadata awaits confirmation");
     assert!(td.sent().is_empty());
+    let _view = runtime::of(w.store()).watch_messages(-1006, vec![4300]);
+    reaction_state_tests::confirm_empty(&acc, &td, &w, json!({"chat_id": -1006, "id": 4300}));
+    assert_eq!(gathered(&w), (None, None, None), "the confirmed last removal clears it");
 }
 
 /// A draft typed on the phone shows here, and a draft cleared there

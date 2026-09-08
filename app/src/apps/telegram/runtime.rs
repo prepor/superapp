@@ -32,6 +32,7 @@ pub struct Forward {
 /// acknowledgement of its choice. Closing the picker drops the reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReactionResult {
+    Waiting,
     Choices(Vec<String>),
     Unavailable(String),
     Added,
@@ -297,7 +298,7 @@ impl Runtime {
         // lifetime, including after an empty result.
         let reply = {
             let mut state = self.state();
-            if matches!(result, ReactionResult::Choices(_) | ReactionResult::Unavailable(_)) {
+            if matches!(result, ReactionResult::Waiting | ReactionResult::Choices(_) | ReactionResult::Unavailable(_)) {
                 state.reactions.get(&id).and_then(Weak::upgrade)
             } else {
                 state.reactions.remove(&id).and_then(|r| r.upgrade())

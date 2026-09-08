@@ -116,6 +116,8 @@ fn vera() -> ChatRow {
 
 fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
     Msg {
+        content_type: None,
+        topic: 0,
         id: 1,
         chat: 2,
         sender: Some(2),

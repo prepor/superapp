@@ -164,6 +164,10 @@ impl Reactions {
                 verbs.push(Verb::run("telegram.reaction_status", "no emoji reactions available", None).plain());
                 verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')).plain());
             }
+            Some(ReactionResult::Waiting) => {
+                verbs.push(Verb::run("telegram.reaction_status", "waiting for reactions…", None).plain());
+                verbs.push(Verb::run("telegram.reactions_retry", "retry", Some('r')).plain());
+            }
             Some(ReactionResult::Unavailable(reason)) => {
                 verbs.push(Verb::run("telegram.reaction_status", &reason, None).plain());
             }
@@ -306,9 +310,5 @@ fn demo_reaction(
     } else {
         parts.push(format!("{emoji} 1"));
     }
-    c.execute(
-        "UPDATE tg_message SET reactions = ?3 WHERE chat = ?1 AND id = ?2",
-        rusqlite::params![chat, msg, parts.join(" · ")],
-    )?;
-    Ok(())
+    super::super::reaction_state::set(c, chat, msg, Some(&parts.join(" · ")))
 }

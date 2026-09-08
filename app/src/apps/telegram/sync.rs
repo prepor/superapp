@@ -34,6 +34,7 @@ use super::transport::Td;
 use super::updates;
 
 mod mentions;
+mod counts;
 mod reactions;
 mod views;
 
@@ -97,6 +98,7 @@ pub struct Account<T: Td> {
     /// Chats and message rows currently displayed by the account's widgets.
     viewed: std::cell::RefCell<views::Views>,
     reactions: std::cell::RefCell<reactions::Reactions>,
+    counts: std::cell::RefCell<counts::Counts>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -156,7 +158,6 @@ impl<T: Td> Account<T> {
             v["@type"], v["@extra"]["operation"], v["chat_id"]
         ));
         self.track_reactions(w, &v);
-        self.track_snapshot(w, &v);
         self.td.send(&request);
     }
 
@@ -243,6 +244,7 @@ impl<T: Td> Account<T> {
             mention_scans: std::cell::RefCell::new(std::collections::HashMap::new()),
             not_before: std::cell::Cell::new(0.0),
             viewed: std::cell::RefCell::new(views::Views::default()),
+            counts: std::cell::RefCell::new(counts::Counts::default()),
             reactions: std::cell::RefCell::new(reactions::Reactions::default()),
         }
     }
@@ -409,6 +411,7 @@ impl<T: Td> Account<T> {
         }
         self.sync_reactions(w);
         self.pump(w);
+        self.sync_counts(w);
         n
     }
 
@@ -437,13 +440,13 @@ impl<T: Td> Account<T> {
             }
         }
         let tracked = v["@extra"]["operation"].is_u64();
-        self.begin_snapshot(&v);
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
         }
         if tracked {
             v["@extra"] = v["@extra"]["context"].clone();
         }
+        if self.on_count_reply(w, &v) { return; }
         match v["@type"].as_str() {
             Some("updateConnectionState") => {
                 rt.set_connection(v["state"]["@type"].as_str().unwrap_or(""));
@@ -505,7 +508,6 @@ impl<T: Td> Account<T> {
                 self.handle_update(w, &v);
             }
         }
-        self.end_snapshot();
     }
 
     /// Appends one line to `tg-debug.log` beside the store — what the worker
@@ -546,6 +548,7 @@ impl<T: Td> Account<T> {
             st["@type"].as_str() == Some("authorizationStateWaitTdlibParameters"),
         );
         if st["@type"].as_str() != Some("authorizationStateReady") {
+            self.counts.borrow_mut().reset(w);
             let note = match st["@type"].as_str() {
                 Some("authorizationStateWaitTdlibParameters") => "connecting to Telegram…",
                 Some("authorizationStateClosing" | "authorizationStateClosed") => "Telegram is disconnected",
@@ -661,6 +664,7 @@ impl<T: Td> Account<T> {
         runtime::of(w.store()).set_connection_note(None);
         // Views may have been drawn while TDLib was still signing in.
         self.viewed.borrow_mut().reset();
+        self.counts.borrow_mut().reset(w);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -725,10 +729,10 @@ impl<T: Td> Account<T> {
                 )
             } else {
                 if let Some((_, chat, msg)) = v["@extra"].as_str().and_then(parse_added_reaction_extra) {
-                    // A message restored from SQLite may not have emitted a
-                    // TDLib update yet. Always read the confirmed result too,
-                    // even if its picker was closed while the add was pending.
+                    // Restore the body if needed, and reconcile its counts
+                    // through the server path even if the picker was closed.
                     self.send(w, &get_message(chat, msg));
+                    self.counts_after_add(w, chat, msg);
                 }
                 runtime::ReactionResult::Added
             };
@@ -934,11 +938,13 @@ impl<T: Td> Account<T> {
             Some("updateActiveEmojiReactions") => {
                 self.reactions_changed(w, None, None);
                 self.visible_reactions_changed(None);
+                self.counts_metadata_changed(w, None);
             }
             Some("updateChatAvailableReactions") => {
                 if let Some(chat) = update["chat_id"].as_i64() {
                     self.reactions_changed(w, Some(chat), None);
                     self.visible_reactions_changed(Some(chat));
+                    self.counts_metadata_changed(w, Some(chat));
                 }
             }
             Some("updateMessageSendSucceeded" | "updateMessageSendFailed") => {
@@ -1025,7 +1031,7 @@ impl<T: Td> Account<T> {
 
     fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
         let Some(topic) = updates::topic(chat, value) else { return; };
-        let message = self.message(&value["last_message"])
+        let message = updates::message(&value["last_message"])
             .filter(|m| m.chat == chat && m.topic == topic.id);
         self.filed(w, "topic", w.store().write(move |c| {
             ensure_peer(c, chat)?;
@@ -1060,7 +1066,7 @@ impl<T: Td> Account<T> {
     /// trim the chat back to its window. All in one write, so a line and its
     /// trim are one step.
     fn on_new_message(&self, w: &World, message: &Value) {
-        let Some(msg) = self.message(message) else {
+        let Some(msg) = updates::message(message) else {
             return;
         };
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
@@ -1121,11 +1127,17 @@ impl<T: Td> Account<T> {
         };
         let (text, media) = updates::content(&u["new_content"], 0.0);
         let entities = updates::content_entities(&u["new_content"]);
+        let content_type = u["new_content"]["@type"].as_str().map(str::to_string);
         self.filed(
             w,
             "on_message_content",
             w.store()
-                .write(move |c| set_content(c, chat, id, &text, media.as_ref(), &entities)),
+                .write(move |c| {
+                    set_content(c, chat, id, &text, media.as_ref(), &entities)?;
+                    c.execute("UPDATE tg_message SET content_type = COALESCE(?3, content_type)
+                        WHERE chat = ?1 AND id = ?2", (chat, id, content_type))?;
+                    Ok::<_, rusqlite::Error>(())
+                }),
         );
         // A swapped-in photo or file is fetched the same way a new line's is.
         self.fetch(w, &u["new_content"]);
@@ -1153,26 +1165,28 @@ impl<T: Td> Account<T> {
 
     /// What a line has gathered since it was posted: the views a channel
     /// post counts, the comments under it, the reactions as the one line the
-    /// transcript draws. Written straight, not coalesced — the update carries
-    /// the interaction info whole, so a reaction taken back is an absence
-    /// that must reach the row, else the last emoji a post ever wore would
-    /// stay on it forever.
+    /// transcript draws. Null reactions can also mean invalidated metadata;
+    /// retain the durable counts until reconciliation confirms their removal.
     fn on_interaction(&self, w: &World, u: &Value) {
         let Some(i) = updates::interaction(u) else {
             return;
         };
-        self.remember_interaction(&i);
+        let counts = updates::reaction_counts(&u["interaction_info"]);
         self.reactions_changed(w, Some(i.chat), Some(i.id));
         self.filed(
             w,
             "on_interaction",
             w.store().write(move |c| {
                 c.execute(
-                    "UPDATE tg_message SET views = ?3, comments = ?4, reactions = ?5
+                    "UPDATE tg_message SET views = ?3, comments = ?4
                      WHERE chat = ?1 AND id = ?2",
-                    rusqlite::params![i.chat, i.id, i.views, i.comments, i.reactions],
-                )
-                .map(|_| ())
+                    rusqlite::params![i.chat, i.id, i.views, i.comments],
+                )?;
+                if let Some(counts) = counts {
+                    super::reaction_state::set(c, i.chat, i.id, counts.as_deref())
+                } else {
+                    super::reaction_state::refresh(c, i.chat, i.id)
+                }
             }),
         );
     }
@@ -1284,7 +1298,7 @@ impl<T: Td> Account<T> {
     /// still *sending…*, beside the line that had in fact gone.
     fn on_sent(&self, w: &World, u: &Value) {
         runtime::of(w.store()).operations.sent(w.store(), u);
-        let Some(msg) = self.message(&u["message"]) else {
+        let Some(msg) = updates::message(&u["message"]) else {
             return;
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
@@ -1686,7 +1700,7 @@ impl<T: Td> Account<T> {
             return;
         }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
-        let batch: Vec<IncomingMessage> = raw.iter().filter_map(|v| self.message(v))
+        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
             .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {

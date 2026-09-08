@@ -151,16 +151,23 @@ offer reactions, and marking messages keeps the batch actions on the bar.
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
 requests. The picker refreshes when Telegram changes the chat's permissions,
-active emoji or message interactions; an initially empty cache is retried
-briefly before showing an empty list with **retry**. Explicit restrictions
+active emoji or message interactions; an initially empty cache keeps retrying
+with a capped delay, showing **waiting for reactions…** and **retry** if it
+takes longer. A temporary empty cache keeps already loaded choices. Explicit restrictions
 explain why reactions are unavailable, and missing replies time out instead
 of leaving the picker loading indefinitely.
 
-Visible messages load a fresh snapshot and enable TDLib's ongoing reaction
+Visible messages load their bodies and enable TDLib's ongoing reaction
 polling while the panel is visible in the foreground; hidden panels and
 background windows release their subscriptions. Failed or missing snapshots
-retry without scrolling, and older snapshots cannot undo newer interaction
-updates. A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
+retry without scrolling. Reaction counts have their own durable projection;
+history, media loads and viewport changes cannot overwrite them. A null
+interaction update means the counts need checking, so the last known counts
+stay visible until a server read confirms a change. Checks retry failures,
+respect rate limits and reject replies that predate newer counts or metadata.
+Periodic checks of visible messages also repair missed push updates.
+Confirmed empty counts survive restarts and stale message loads.
+A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
 and a text fallback for custom emoji. A refused request
 shows **could not load reactions** or **reaction failed**, plus **retry**, and
 automatically reports the reason in a notification; click the status to see it
@@ -170,6 +177,14 @@ Offline demos offer a small fixture list and update the message's displayed coun
 locally when an emoji is chosen. A live account with no connected worker reports
 a connection error; it never falls back to demo reactions.
 Custom emoji and paid reactions are not offered.
+
+Count reconciliation uses `searchChatMessages` at the exact message id,
+with its sender, topic, text or media type as the search criterion. Our TDLib
+message database is disabled, so its [search path](https://github.com/tdlib/td/blob/master/td/telegram/MessagesManager.cpp)
+goes to the server; `getMessage` and `getMessages` can still return cached
+data. An absent or unsearchable result keeps the last known counts and retries;
+it never proves a removal. Null counts require loaded reaction metadata and a
+second matching server result within the same metadata generation.
 
 ## Builds
 
