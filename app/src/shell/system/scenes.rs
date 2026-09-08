@@ -8,14 +8,23 @@
 use kernel::scene::Scene;
 
 use crate::shell::app_ui::Setup;
-use crate::shell::catalog::panel;
+use crate::shell::catalog::{panel, panel_fake};
 
-use super::{About, Effects, Help, Problems, Search};
+use super::{About, Effects, Help, Problems, Search, Stats};
 
 /// The system app's scenes, in canvas order.
 #[must_use]
 pub fn scenes() -> Vec<Scene<Setup>> {
-    vec![small_panels(), lists(), search()]
+    vec![small_panels(), lists(), search(), stats()]
+}
+
+fn stats() -> Scene<Setup> {
+    Scene::new("superapp stats", (480.0, 640.0))
+        .note("Local database and file cache usage, with the session's panels, workspaces, workers and jobs. Refresh reads a new storage snapshot.")
+        .node("stats", panel_fake(|_| Stats::id(), ""))
+        .about("an in-memory store and an empty, isolated file cache")
+        .node("unavailable cache", panel(|_| Stats::id(), ""))
+        .about("a world without a file cache shows an explanation alongside the database and activity")
 }
 
 /// The manual and the colophon: the two panels a build always has.
