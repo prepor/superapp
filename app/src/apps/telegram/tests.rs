@@ -1658,6 +1658,78 @@ fn inline_video_play_downloads_on_demand_and_stays_in_the_chat() {
     });
 }
 
+/// A card opened through the bar must hand playback off even while its chat
+/// remains visible. Starting again in the chat or viewer transfers it back.
+#[test]
+fn telegram_panels_transfer_playback_without_overlapping() {
+    use crate::shell::widgets::media::PlayerState;
+
+    for native in [false, true] {
+        let mut s = session();
+        let mut video = model::history(s.store(), STELAXIS).iter()
+            .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "video")).unwrap().clone();
+        if native {
+            let id = video.id;
+            s.store().write(move |c| c.execute(
+                "UPDATE tg_message SET media_clip = 'tg:handoff' WHERE id = ?1", [id],
+            )).unwrap();
+            video = model::line(s.store(), STELAXIS, id).unwrap();
+        }
+        let chat = open_root(&mut s, Chat::id(STELAXIS));
+        let _inbox = native.then(|| runtime::of(s.store()).connect());
+        let now = s.now();
+        with_chat(&s, chat, |c| {
+            c.set_cursor(video.id);
+            c.toggle_play(&video, now);
+            if native {
+                c.playback(video.id).unwrap().set_native_state(PlayerState {
+                    playing: true, position: 3.5, length: 14.0,
+                });
+            }
+        });
+        verb(&mut s, chat, "telegram.line");
+        let card = s.focus().unwrap();
+        assert_eq!(s.panel(card).unwrap().borrow().id(), &Line::id(STELAXIS, video.id));
+        verb(&mut s, card, "telegram.play");
+        with_chat(&s, chat, |c| {
+            assert!(!c.player_state(&video, now).unwrap().playing);
+            if native {
+                let p = c.playback(video.id).unwrap();
+                // A late native update cannot reclaim another panel's turn.
+                p.set_native_state(PlayerState { playing: true, position: 3.5, length: 14.0 });
+                assert!(!p.running());
+                assert_eq!(p.player_state(&video, now).unwrap().position, 3.5);
+            }
+        });
+        let card_panel = s.panel(card).unwrap();
+        {
+            let mut b = card_panel.borrow_mut();
+            let l = b.as_any().downcast_mut::<Line>().unwrap();
+            assert!(l.player_state(&video, now).unwrap().playing);
+        }
+        with_chat(&s, chat, |c| c.toggle_play(&video, now));
+        {
+            let mut b = card_panel.borrow_mut();
+            let l = b.as_any().downcast_mut::<Line>().unwrap();
+            assert!(!l.player_state(&video, now).unwrap().playing,
+                "returning to the transcript must also pause the card");
+        }
+        verb(&mut s, card, "telegram.open");
+        let viewer = s.focus().unwrap();
+        verb(&mut s, viewer, "telegram.play");
+        with_chat(&s, chat, |c| assert!(!c.player_state(&video, now).unwrap().playing));
+        let viewer_panel = s.panel(viewer).unwrap();
+        let mut b = viewer_panel.borrow_mut();
+        assert!(b.as_any().downcast_mut::<Viewer>().unwrap().player_state(&video, now).unwrap().playing);
+
+        // An isolated fixture/session with the same message id owns its own audio.
+        let other = session();
+        let mut other_player = super::panels::playback::Playback::new(other.store().clone(), video.id);
+        other_player.toggle_play(&video, now);
+        assert!(b.as_any().downcast_mut::<Viewer>().unwrap().player_state(&video, now).unwrap().playing);
+    }
+}
+
 /// The viewer reads live byte counts for its own file, including before the
 /// first bytes arrive and when Telegram only knows an approximate size.
 #[test]

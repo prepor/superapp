@@ -278,6 +278,10 @@ impl Widget for LinePanel {
                 MouseCursor::Hand,
                 props.slot,
             );
+            props.hits.add(
+                if st.playing { "pause in card" } else { "play in card" },
+                r, MouseCursor::Hand, props.slot,
+            );
             props.hits.add(st.time_line(), player_w.label(cx, ids!(time_lbl)).area().rect(cx),
                 MouseCursor::Default, props.slot);
         }

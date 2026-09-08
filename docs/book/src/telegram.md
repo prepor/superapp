@@ -297,9 +297,11 @@ downloads an uncached clip on demand. The preview and decoded frames share
 one surface, fitted to the column within 320×480 using the message's video
 dimensions. The preview remains until the first decoded frame arrives;
 download feedback overlays the surface so starting playback does not move
-the transcript. Clicking the video itself opens the dedicated viewer. Playback pauses
-when its message leaves the viewport or the viewer opens; a chat plays one
-message at a time. Selecting or marking a message keeps the same native player.
+the transcript. Clicking the video itself opens the dedicated viewer. Playback
+pauses when its message leaves the viewport or the viewer opens. Starting
+playback in another Telegram panel pauses the previous player, including when
+a transcript and its message card remain visible together. Selecting or marking
+a message keeps the same native player.
 
 Playing videos retain their original aspect ratio, both inline and inside the
 viewer, including when the window is resized.

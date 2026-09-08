@@ -33,14 +33,21 @@ wait 300
 click "pause video"
 click "write a message"
 
-# Message cards use the same inline playback controls.
+# Opening a card while the transcript plays must still allow playback
+# handoffs in both directions, with only one panel playing at a time.
 click "Elena Petrova: the fold in motion"
+wait 300
+click "play video"
 wait 300
 click "line"
 wait 900
-click "play"
+click "play in card"
+wait 300
+click "play video"
+wait 300
+click "play in card"
 wait 1200
-click "pause"
+click "pause in card"
 wait 300
 click "0:01 / 0:14"
 click "video"

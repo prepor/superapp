@@ -275,6 +275,58 @@ mod tests {
     }
 
     #[test]
+    fn native_players_pause_when_another_panel_takes_playback() {
+        static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+        let session = Session::fake(APPS);
+        let mut msg = model::history(session.store(), STELAXIS).iter()
+            .find(|m| has_video(m)).unwrap().clone();
+        msg.media.as_mut().unwrap().clip = Some("tg:native-handoff".into());
+        let dir = std::env::temp_dir().join(format!("superapp-native-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(dir.join("blobs").join(kernel::caps::file_name("tg:native-handoff")),
+            b"\x00\x00\x00\x18ftypisom").unwrap();
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
+        let mut players = [Playback::new(store.clone(), msg.id), Playback::new(store, msg.id)];
+        let mut owners = [InlineVideo::default(), InlineVideo::default()];
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let (root, videos) = cx.with_vm(|vm| {
+            let mut root = View::script_new(vm);
+            let videos = [0, 1].map(|i| {
+                let mut view = View::script_new(vm);
+                let clip = WidgetRef::new_with_inner(Box::new(Video::script_new(vm)));
+                view.children.push((live_id!(clip), clip));
+                let video = WidgetRef::new_with_inner(Box::new(view));
+                root.children.push((LiveId(i), video.clone()));
+                video
+            });
+            (WidgetRef::new_with_inner(Box::new(root)), videos)
+        });
+        makepad_widgets::widget_tree::set_ui_root(cx, &root);
+        for (turn, current) in [0, 1, 0].into_iter().enumerate() {
+            let now = turn as f64;
+            players[current].toggle_play(&msg, now);
+            // Exercise both draw orders as ownership moves between panels.
+            for i in 0..2 {
+                owners[i].drive(cx, &videos[i], &mut players[i], &msg, now);
+                let clip = videos[i].widget(cx, ids!(clip)).as_video();
+                if clip.is_preparing() {
+                    videos[i].handle_event(cx, &Event::VideoPlaybackPrepared(VideoPlaybackPreparedEvent {
+                        video_id: LiveId(0), video_width: 480, video_height: 300, duration: 14_000,
+                        is_seekable: true, video_tracks: Vec::new(), audio_tracks: Vec::new(),
+                    }), &mut Scope::empty());
+                    owners[i].drive(cx, &videos[i], &mut players[i], &msg, now);
+                }
+            }
+            assert!(videos[current].widget(cx, ids!(clip)).as_video().is_playing());
+            assert!(!videos[1 - current].widget(cx, ids!(clip)).as_video().is_playing(),
+                "the other panel's native player must pause, not just its control label");
+        }
+        drop(owners);
+        media_cleanup(cx, &root);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn native_video_survives_row_replacement_and_releases_before_another_clip() {
         static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
         let session = Session::fake(APPS);

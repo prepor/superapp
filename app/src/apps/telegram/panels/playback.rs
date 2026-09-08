@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, Weak};
 
 use kernel::store::Store;
 
@@ -12,11 +13,31 @@ use super::super::model::{self, Msg, MsgId, Player};
 use super::super::{requests, runtime};
 use super::wire;
 
+/// Panels over the same store share playback ownership, including separate
+/// cards of the same message. A weak reference never keeps a closed panel alive.
+#[derive(Default)]
+struct ActivePlayback(Mutex<Weak<Mutex<Transport>>>);
+
+#[derive(Default)]
+struct Transport {
+    player: Option<Player>,
+    running: bool,
+}
+
+impl Transport {
+    fn pause(&mut self, now: f64) {
+        self.running = false;
+        if let Some(p) = self.player.as_mut().filter(|p| p.state(now).playing) {
+            p.toggle(now);
+        }
+    }
+}
+
 pub struct Playback {
     store: Rc<Store>,
     pub msg: MsgId,
-    player: Option<Player>,
-    running: bool,
+    transport: Arc<Mutex<Transport>>,
+    active: Arc<ActivePlayback>,
     native: PlayerState,
     asked: bool,
     wanted_pic: bool,
@@ -24,7 +45,8 @@ pub struct Playback {
 
 impl Playback {
     pub fn new(store: Rc<Store>, msg: MsgId) -> Self {
-        Self { store, msg, player: None, running: false, native: PlayerState::default(),
+        let active = store.local();
+        Self { store, msg, transport: Arc::default(), active, native: PlayerState::default(),
             asked: false, wanted_pic: false }
     }
 
@@ -38,15 +60,16 @@ impl Playback {
     #[must_use]
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
         let md = m.media.as_ref()?;
+        let transport = self.transport.lock().expect("playback transport");
         if self.plays_clip(m) {
             return Some(PlayerState {
-                playing: self.running,
+                playing: transport.running,
                 position: self.native.position,
                 length: if self.native.length > 0.0 { self.native.length } else { md.secs.unwrap_or(0) as f64 },
             });
         }
         let secs = md.secs.or_else(|| moving_picture_of_the_wire(m).then_some(0))?;
-        Some(match self.player {
+        Some(match transport.player {
             Some(p) => p.state(now),
             None => PlayerState {
                 playing: false,
@@ -160,16 +183,25 @@ impl Playback {
     /// the draw. Everything else toggles the fake timeline against the clock.
     pub fn toggle_play(&mut self, m: &Msg, now: f64) {
         self.ask_for_clip(m);
-        if self.plays_clip(m) {
-            self.running = !self.running;
+        if self.playing(now) {
+            self.pause(now);
             return;
         }
-        let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else {
-            return;
-        };
-        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
-        p.toggle(now);
-        self.player = Some(p);
+        let native = self.plays_clip(m);
+        let secs = m.media.as_ref().and_then(|md| md.secs);
+        if !native && secs.is_none() { return; }
+        let mut active = self.active.0.lock().expect("active playback");
+        if let Some(previous) = active.upgrade().filter(|p| !Arc::ptr_eq(p, &self.transport)) {
+            previous.lock().expect("playback transport").pause(now);
+        }
+        let mut transport = self.transport.lock().expect("playback transport");
+        if native {
+            transport.running = true;
+        } else {
+            let p = transport.player.get_or_insert_with(|| Player::over(m.id, secs.unwrap() as f64));
+            p.toggle(now);
+        }
+        *active = Arc::downgrade(&self.transport);
     }
 
     /// Seek the demo or audio timeline; a real clip is sought by the widget's
@@ -179,40 +211,40 @@ impl Playback {
             return;
         }
         let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else { return };
-        let mut p = self.player.unwrap_or_else(|| Player::over(m.id, secs as f64));
+        let mut transport = self.transport.lock().expect("playback transport");
+        let p = transport.player.get_or_insert_with(|| Player::over(m.id, secs as f64));
         p.seek(position, now);
-        self.player = Some(p);
     }
 
     /// The wish the draw carries out over the clip's player.
     #[must_use]
     pub fn running(&self) -> bool {
-        self.running
+        self.transport.lock().expect("playback transport").running
     }
 
     /// What the draw found the player at afterwards — `false` where the clip
     /// has run to its end, which is what puts the button back to *play*.
     pub fn set_running(&mut self, running: bool) {
-        self.running = running;
+        let owns_playback = self.active.0.lock().expect("active playback")
+            .upgrade().is_some_and(|active| Arc::ptr_eq(&active, &self.transport));
+        self.transport.lock().expect("playback transport").running = running && owns_playback;
     }
 
     /// Keep the native position for controls and verbs between draws.
     pub fn set_native_state(&mut self, state: PlayerState) {
         self.native = state;
-        self.running = state.playing;
+        self.set_running(state.playing);
     }
 
     pub fn pause(&mut self, now: f64) {
-        self.running = false;
-        if let Some(p) = self.player.as_mut().filter(|p| p.state(now).playing) {
-            p.toggle(now);
-        }
+        self.transport.lock().expect("playback transport").pause(now);
     }
 
     /// Whether anything runs — what asks for the next frame.
     #[must_use]
     pub fn playing(&self, now: f64) -> bool {
-        self.running || self.player.is_some_and(|p| p.state(now).playing)
+        let transport = self.transport.lock().expect("playback transport");
+        transport.running || transport.player.is_some_and(|p| p.state(now).playing)
     }
 }
 
