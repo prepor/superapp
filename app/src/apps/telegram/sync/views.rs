@@ -56,7 +56,7 @@ impl Views {
 
 impl<T: Td> Account<T> {
     pub(super) fn sync_views(&self, w: &World) {
-        let mut next = runtime::of(w.store()).visible_messages();
+        let mut next = runtime::of(w.store()).visible_messages(w.now());
         // Register a subscription only when TDLib can open it. In particular,
         // auth ready precedes updateNewChat when restoring a saved viewport.
         next.retain(|chat, _| self.chat_ready(*chat));
@@ -152,7 +152,7 @@ impl<T: Td> Account<T> {
             .filter(|(_, row)| row.pending == Some(request)).map(|(id, _)| *id).collect();
         state.finish(request, w.now() + RETRY_GAP);
         drop(state);
-        let visible = runtime::of(w.store()).visible_messages();
+        let visible = runtime::of(w.store()).visible_messages(w.now());
         let messages: Vec<_> = v["messages"].as_array().into_iter().flatten()
             .filter(|v| v["chat_id"] == chat && v["id"].as_i64().is_some_and(|id| eligible.contains(&id)
                 && visible.get(&chat).is_some_and(|ids| ids.contains(&id))))

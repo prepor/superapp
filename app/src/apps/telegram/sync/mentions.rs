@@ -44,6 +44,7 @@ impl<T: Td> Account<T> {
                 topic: 0,
                 from: 0,
                 walk: Walk::Mentions(generation),
+                view: None,
             });
         }
     }

@@ -33,6 +33,7 @@ pub mod text;
 #[cfg(feature = "tdlib")]
 pub mod tdjson;
 pub mod trace;
+mod transcript;
 pub mod topics;
 pub mod tools;
 /// The engine seam the loop drives: the real transport, and a fake for tests.
@@ -114,6 +115,7 @@ impl App for Telegram {
     }
 
     fn poll(&self, s: &mut kernel::session::Session) {
+        if transcript::take_changed(s.store()) { s.redraw(); }
         let rt = runtime::of(s.store());
         rt.operations.expire(s.store(), std::time::Instant::now());
         if rt.operations.take_changed() {

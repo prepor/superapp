@@ -365,7 +365,7 @@ fn message_row() -> Scene<Setup> {
     let row = |r: Row, selected: bool, marked: bool| {
         widget(live_id!(telegram_msg_row_tpl), move |cx, w| {
             super::widgets::chat::populate(
-                cx, w, &r, (selected, marked), None, None,
+                cx, w, &r, (selected, marked), None,
                 &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
             );
         })
@@ -518,7 +518,7 @@ fn media() -> Scene<Setup> {
                 _ => None,
             };
             super::widgets::chat::populate(
-                cx, w, &r, (false, false), None, player,
+                cx, w, &r, (false, false), player,
                 &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
             );
         })
@@ -534,7 +534,7 @@ fn media() -> Scene<Setup> {
                 _ => None,
             };
             super::widgets::chat::populate(
-                cx, w, &r, (false, false), None, player,
+                cx, w, &r, (false, false), player,
                 &super::widgets::RenderContext { now: virtual_epoch(), store_dir: None },
             );
         })

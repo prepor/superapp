@@ -77,7 +77,7 @@ impl<T: Td> Account<T> {
             }
         }
         drop(state);
-        for (c, ids) in runtime::of(w.store()).visible_messages() {
+        for (c, ids) in runtime::of(w.store()).visible_messages(w.now()) {
             if chat.is_none_or(|chat| chat == c) { self.refresh_counts(w, c, &ids); }
         }
     }
@@ -97,7 +97,7 @@ impl<T: Td> Account<T> {
     pub(super) fn sync_counts(&self, w: &World) {
         if !self.auth_ready.get() { return; }
         let mut state = self.counts.borrow_mut();
-        let visible = runtime::of(w.store()).visible_messages();
+        let visible = runtime::of(w.store()).visible_messages(w.now());
         // Push updates provide the fast path. Periodic reconciliation also
         // repairs missed updates and TDLib's limited set of polled messages.
         // Counts stay displayed throughout; this expires freshness, not data.

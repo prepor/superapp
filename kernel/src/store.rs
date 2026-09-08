@@ -106,6 +106,8 @@ pub struct Store {
     redraw: Cell<bool>,
     /// Last seen `PRAGMA data_version` (foreign-commit detector).
     data_version: Cell<i64>,
+    seen_commit: Cell<u64>,
+    external_generation: Cell<u64>,
     /// Last seen [`crate::effect::MemLog`] version — the same detector for
     /// the one "table" no commit hook can report, because it is not in the
     /// database at all.
@@ -300,6 +302,30 @@ pub struct Db {
     /// Transient app state shared by this database's readers and workers.
     /// The database owns these values; they never enter a snapshot.
     local: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+    commits: Arc<Mutex<Commits>>,
+}
+
+/// Published after commit, before replying to its caller. Readers can validate
+/// derived data without running SQL, including data prepared off the UI thread.
+#[derive(Default)]
+struct Commits {
+    serial: u64,
+    reset: u64,
+    tables: HashMap<String, u64>,
+}
+
+impl Commits {
+    fn record(&mut self, tables: Option<&HashSet<String>>) {
+        self.serial += 1;
+        if let Some(tables) = tables {
+            for table in tables {
+                *self.tables.entry(table.clone()).or_default() += 1;
+            }
+        } else {
+            // Replication can replace the database, beyond ordinary row hooks.
+            self.reset += 1;
+        }
+    }
 }
 
 impl Db {
@@ -345,9 +371,11 @@ impl Db {
             d.lock().expect("dirty set").insert(table.to_string());
         }))?;
         let (jobs, rx) = mpsc::channel::<Job>();
+        let commits = Arc::new(Mutex::new(Commits::default()));
+        let clock = commits.clone();
         std::thread::Builder::new()
             .name("store-writer".into())
-            .spawn(move || writer_loop(&conn, &dirty, &replicated, &rx))
+            .spawn(move || writer_loop(&conn, &dirty, &replicated, &rx, &clock))
             .expect("spawn the store writer");
         Ok(Arc::new(Db {
             jobs,
@@ -356,6 +384,7 @@ impl Db {
             writable: Arc::new(AtomicBool::new(true)),
             mem: Arc::new(crate::effect::MemLog::new()),
             local: Mutex::default(),
+            commits,
         }))
     }
 
@@ -569,18 +598,31 @@ fn writer_loop(
     dirty: &Arc<Mutex<HashSet<String>>>,
     replicated: &[String],
     rx: &mpsc::Receiver<Job>,
+    commits: &Mutex<Commits>,
 ) {
     while let Ok(job) = rx.recv() {
         match job {
             Job::Write { run, reply } => {
-                let _ = reply.send(do_write(conn, dirty, replicated, run));
+                let result = do_write(conn, dirty, replicated, run);
+                if let Ok(wrote) = &result {
+                    commits.lock().expect("commit clock").record(Some(&wrote.touched));
+                }
+                let _ = reply.send(result);
             }
             Job::Apply { changeset, reply } => {
-                let _ = reply.send(repl::do_apply(conn, &changeset));
+                let result = repl::do_apply(conn, &changeset);
+                commits.lock().expect("commit clock").record(None);
+                let _ = reply.send(result);
             }
             Job::Raw { run, reply } => {
                 dirty.lock().expect("dirty set").clear();
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(conn)));
+                let touched = dirty.lock().expect("dirty set");
+                if !touched.is_empty() {
+                    let bookkeeping = touched.iter().all(|t| matches!(t.as_str(), "repl" | "repl_log"));
+                    commits.lock().expect("commit clock").record(bookkeeping.then_some(&touched));
+                }
+                drop(touched);
                 let _ = reply.send(match ran {
                     Ok(r) => r,
                     Err(_) => Err(store_err("a raw closure panicked")),
@@ -622,9 +664,6 @@ fn do_write(
             return Err(store_err("a write closure panicked"));
         }
     };
-    // The tables the closure touched — snapshotted before the `repl_log`
-    // insert adds its own, which no query depends on.
-    let touched: HashSet<String> = dirty.lock().expect("dirty set").clone();
     let mut cs: Vec<u8> = Vec::new();
     sess.changeset_strm(&mut cs)?;
     drop(sess);
@@ -637,6 +676,9 @@ fn do_write(
         tx.execute("UPDATE repl SET next_local_seq = next_local_seq + 1", [])?;
     }
     tx.commit()?;
+    // Include the automatically recorded replication rows too: readers of
+    // their status must observe worker commits just like readers of app data.
+    let touched: HashSet<String> = dirty.lock().expect("dirty set").clone();
     Ok(Wrote { value, touched, cs })
 }
 
@@ -679,6 +721,8 @@ impl Store {
             cache: RefCell::default(),
             redraw: Cell::new(false),
             data_version: Cell::new(-1),
+            seen_commit: Cell::new(0),
+            external_generation: Cell::new(0),
             mem_version: Cell::new(0),
             traces: RefCell::default(),
             active_trace: Cell::new(None),
@@ -788,18 +832,10 @@ impl Store {
         Ok((out, cs))
     }
 
-    /// Bumps the generation of every table a commit touched, so cached
-    /// queries that read them go stale, then refreshes this reader's
-    /// `data_version` baseline: the write landed on the *writer's*
-    /// connection, foreign to this one, and we have already accounted for it
-    /// — `poll_external` must not re-run every query again for the same
-    /// commit.
+    /// The writer has published the affected table generations. Refresh this
+    /// reader's foreign-commit baseline so its own write is not reported twice.
     fn bump(&self, dirty: &HashSet<String>) {
         if !dirty.is_empty() {
-            let mut gens = self.generations.borrow_mut();
-            for t in dirty {
-                *gens.entry(t.clone()).or_insert(0) += 1;
-            }
             self.redraw.set(true);
         }
         let v: i64 = self
@@ -807,6 +843,7 @@ impl Store {
             .query_row("PRAGMA data_version", [], |r| r.get(0))
             .unwrap_or(0);
         self.data_version.set(v);
+        self.seen_commit.set(self.db.commits.lock().expect("commit clock").serial);
     }
 
     /// Whether any commit landed since the last take — the shell's cue to
@@ -816,29 +853,26 @@ impl Store {
     }
 
     /// Detects commits from *other* connections (the workers):
-    /// `data_version` moves only for foreign commits. Coarse on purpose —
-    /// every table's generation bumps, every cached query re-runs; at this
-    /// scale that costs microseconds. Returns whether anything changed.
+    /// Known writer commits invalidate only their tables. An untracked commit
+    /// still invalidates everything, as do replication's raw replacements.
     pub fn poll_external(&self) -> bool {
         // The ring moves under its own version, and a worker's effects are
         // exactly the kind that arrive without a commit to notice.
         let mem = self.poll_mem();
+        let serial = self.db.commits.lock().expect("commit clock").serial;
+        let known = serial != self.seen_commit.replace(serial);
         let v: i64 = self
             .conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))
             .unwrap_or(0);
         if v == self.data_version.replace(v) {
-            return mem;
+            if known { self.redraw.set(true); }
+            return mem || known;
         }
-        let mut gens = self.generations.borrow_mut();
-        for g in gens.values_mut() {
-            *g += 1;
+        if !known {
+            self.external_generation.set(self.external_generation.get() + 1);
+            self.cache.borrow_mut().clear();
         }
-        // Tables no query has touched yet have no entry — a fresh read
-        // records the current (bumped) state, so nothing is missed.
-        drop(gens);
-        // Invalidate even never-bumped deps: wipe the cache wholesale.
-        self.cache.borrow_mut().clear();
         self.redraw.set(true);
         true
     }
@@ -881,7 +915,16 @@ impl Store {
     }
 
     fn gen_of(&self, table: &str) -> u64 {
-        self.generations.borrow().get(table).copied().unwrap_or(0)
+        let commits = self.db.commits.lock().expect("commit clock");
+        commits.reset + commits.tables.get(table).copied().unwrap_or(0)
+            + self.external_generation.get()
+            + self.generations.borrow().get(table).copied().unwrap_or(0)
+    }
+
+    /// An in-memory validity stamp for a derived view's declared dependencies.
+    /// No connection, query preparation or disk access is needed to check it.
+    pub fn revision(&self, tables: &[&str]) -> Vec<u64> {
+        tables.iter().map(|table| self.gen_of(table)).collect()
     }
 
     /// Runs a registered query through the cache: a hit whose dependency
@@ -945,6 +988,9 @@ impl Store {
             }
         });
         let rows = cached.unwrap_or_else(|| {
+            // Stamp before reading: a commit during the query must leave the
+            // result stale, never label an older SQLite snapshot as current.
+            let gens = deps.iter().map(|t| self.gen_of(t)).collect();
             let run = || -> rusqlite::Result<Vec<T>> {
                 let mut stmt = self.conn.prepare_cached(sql)?;
                 let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
@@ -954,7 +1000,6 @@ impl Store {
                 eprintln!("store: query {id} failed: {e}");
                 Vec::new()
             }));
-            let gens = deps.iter().map(|t| self.gen_of(t)).collect();
             self.cache.borrow_mut().insert(
                 key,
                 Cached {
@@ -965,7 +1010,19 @@ impl Store {
             );
             rows
         });
+        self.trace_rows_sql(id, describe, sql, params, rows.len());
+        rows
+    }
+
+    /// Record a background-prepared query in the drawing panel's provenance,
+    /// without executing it again on the drawing thread.
+    pub fn trace_rows(&self, q: &'static Q, params: &[Val], rows: usize) {
+        self.trace_rows_sql(q.id, q.describe, q.sql, params, rows);
+    }
+
+    fn trace_rows_sql(&self, id: &'static str, describe: &'static str, sql: &str, params: &[Val], rows: usize) {
         if let Some(k) = self.active_trace.get() {
+            let pkey = fmt_params(params);
             let mut traces = self.traces.borrow_mut();
             if let Some(v) = traces.get_mut(&k) {
                 if !v
@@ -978,12 +1035,11 @@ impl Store {
                         describe,
                         params: pkey,
                         values: params.to_vec(),
-                        rows: rows.len(),
+                        rows,
                     });
                 }
             }
         }
-        rows
     }
 
     /// Opens a trace: reads until [`Store::trace_end`] are recorded as this
@@ -1322,6 +1378,33 @@ mod tests {
             Err(rusqlite::Error::QueryReturnedNoRows)
         });
         assert_eq!(*s.rows(&Q_META, &[], probe), vec![7], "rollback kept 7");
+    }
+
+    #[test]
+    fn worker_commits_preserve_unrelated_cached_queries() {
+        let ui = store();
+        ui.write(|c| c.execute("INSERT INTO meta(key,value) VALUES('probe',7)", []).map(|_| ())).unwrap();
+        let before = ui.rows(&Q_META, &[], probe);
+        let revision = ui.revision(&["meta"]);
+        let worker = Store::with_db(ui.db()).unwrap();
+        worker.write(|c| c.execute("INSERT INTO wm(id,active) VALUES(1,3)", []).map(|_| ())).unwrap();
+        assert!(ui.poll_external());
+        assert!(Rc::ptr_eq(&before, &ui.rows(&Q_META, &[], probe)));
+        assert_eq!(revision, ui.revision(&["meta"]));
+
+        worker.write(|c| c.execute("UPDATE meta SET value=8 WHERE key='probe'", []).map(|_| ())).unwrap();
+        assert_ne!(revision, ui.revision(&["meta"]), "background views detect a commit without SQL or polling");
+        assert!(ui.poll_external());
+        assert_eq!(*ui.rows(&Q_META, &[], probe), [8]);
+        assert!(!Rc::ptr_eq(&before, &ui.rows(&Q_META, &[], probe)));
+
+        let before = ui.rows(&Q_META, &[], probe);
+        let _ = worker.write(|c| -> rusqlite::Result<()> {
+            c.execute("UPDATE meta SET value=9 WHERE key='probe'", [])?;
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        });
+        assert!(!ui.poll_external());
+        assert!(Rc::ptr_eq(&before, &ui.rows(&Q_META, &[], probe)));
     }
 
     /// Wm state survives the store: save → load → restore is the same

@@ -7,7 +7,6 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::map::{self, FakeTiles};
 use crate::shell::widgets::media;
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark};
@@ -20,9 +19,6 @@ pub struct LinePanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
-    /// Which line the picture box and the map last decoded for.
-    #[rust]
-    shown: Option<String>,
     /// The play button's rectangle of the last draw, and what a press on
     /// the picture opens.
     #[rust]
@@ -37,6 +33,7 @@ pub struct LinePanel {
 
 impl Widget for LinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if super::pictures::changed(cx, event) { self.view.redraw(cx); }
         match event {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
@@ -140,7 +137,7 @@ impl Widget for LinePanel {
             } else {
                 Vec::new()
             };
-            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, ids);
+            super::super::runtime::show_messages(&mut self.viewed, s.world(), m.chat, None, ids);
         }
         let v = &self.view;
         v.label(cx, ids!(gone_lbl)).set_visible(cx, false);
@@ -177,38 +174,10 @@ impl Widget for LinePanel {
         );
         reply.set_visible(cx, m.reply_to.is_some());
 
-        // The media, decoded when the line changed: a picture at the card's
-        // width, a map for a place, and the player over a recording drawn
-        // every frame, since it moves.
-        // What is on the picture box, by the line and the file it shows —
-        // recorded only once the bytes decoded, so a photo that arrives
-        // after the panel opened is decoded then, and a line whose media
-        // changed is decoded again (review, 2026-09-07).
-        let key = format!(
-            "{}:{}",
-            m.id,
-            m.media.as_ref().and_then(|md| md.reference.as_deref()).unwrap_or("")
-        );
-        let fresh = self.shown.as_deref() != Some(key.as_str());
-        let bytes = m
-            .media
-            .as_ref()
-            .and_then(|md| md.picture_bytes(store_dir.as_deref()));
         let img_box = v.widget(cx, ids!(img_box));
-        let decoded = media::fill_picture(cx, &img_box, bytes.as_deref(), fresh);
-        self.shown = decoded.then_some(key);
-        let place = m
-            .media
-            .as_ref()
-            .filter(|md| matches!(md.kind.as_str(), "location" | "live"))
-            .and_then(|md| Some((md.lat?, md.lon?)));
-        if fresh || place.is_none() {
-            let snap = place.map(|(lat, lon)| {
-                map::snapshot(&mut FakeTiles, lat, lon, map::ZOOM, 320, 160)
-            });
-            let map_w = v.widget(cx, ids!(map));
-            media::fill_map(cx, &map_w, snap.as_ref());
-        }
+        let decoded = super::pictures::photo(cx, &img_box, m.media.as_ref(), store_dir.as_deref());
+        let map_box = v.widget(cx, ids!(map));
+        super::pictures::place(cx, &map_box, m.media.as_ref(), store_dir.is_none());
         let player_w = v.widget(cx, ids!(player));
         media::fill_player(cx, &player_w, player.as_ref());
         let sticker = m.media.as_ref().filter(|md| md.is_sticker());
@@ -216,7 +185,7 @@ impl Widget for LinePanel {
         sticker_lbl.set_text(cx, sticker.and_then(|s| s.label.as_deref()).unwrap_or(""));
         sticker_lbl.set_visible(cx, sticker.is_some_and(|s| s.label.is_some()));
         let media_line = m.media.as_ref().and_then(|md| {
-            let pictured = bytes.is_some() && md.kind == "photo";
+            let pictured = decoded && md.kind == "photo";
             let is_sticker = md.is_sticker() && md.label.is_some();
             (!pictured && !is_sticker).then(|| md.line(now))
         });
@@ -271,7 +240,7 @@ impl Widget for LinePanel {
             );
         }
         let img_w = self.view.widget(cx, ids!(img_box));
-        self.picture = bytes.and(rect_of(cx, &img_w));
+        self.picture = decoded.then(|| rect_of(cx, &img_w)).flatten();
         if let Some(r) = self.picture {
             let word = m.media.as_ref().map_or("picture", |md| md.word());
             props.hits.add(word, r, MouseCursor::Hand, props.slot);

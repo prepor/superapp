@@ -20,7 +20,7 @@ fn cached_chat_waits_for_its_announcement_before_opening_or_loading_reactions() 
     let td = FakeTd::new();
     let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
     let rt = runtime::of(w.store());
-    let view = rt.watch_messages(7, vec![42]);
+    let view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     assert!(td.sent().is_empty(), "a persisted session is not authorization for this client");
     acc.on_update(&w, &auth("authorizationStateReady"));
@@ -57,9 +57,8 @@ fn closing_a_view_while_its_chat_restores_does_not_leave_a_subscription() {
     for chat in [7, 8] { cached_message(&w, chat); }
     let td = FakeTd::new();
     let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
-    let rt = runtime::of(w.store());
-    let abandoned = rt.watch_messages(7, vec![42]);
-    let _visible = rt.watch_messages(8, vec![42]);
+    let abandoned = watch_messages(&w, 7, vec![42]);
+    let _visible = watch_messages(&w, 8, vec![42]);
     acc.on_ready(&w);
     acc.drain(&w);
     drop(abandoned);
@@ -132,7 +131,7 @@ fn a_waiting_urgent_count_check_does_not_block_a_restored_visible_chat() {
     for chat in [7, 8] { cached_message(&w, chat); }
     let td = FakeTd::new();
     let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
-    let _view = runtime::of(w.store()).watch_messages(8, vec![42]);
+    let _view = watch_messages(&w, 8, vec![42]);
     acc.on_ready(&w);
     acc.counts_after_add(&w, 7, 42);
     acc.drain(&w);
@@ -180,7 +179,7 @@ fn losing_authorization_forgets_the_clients_chat_readiness() {
     acc.on_update(&w, &chat_object(7, "old client", json!([])));
     acc.on_update(&w, &auth("authorizationStateWaitTdlibParameters"));
     acc.on_update(&w, &auth("authorizationStateReady"));
-    let _view = runtime::of(w.store()).watch_messages(7, vec![42]);
+    let _view = watch_messages(&w, 7, vec![42]);
     acc.drain(&w);
     assert!(!td.sent_types().iter().any(|t| t == "openChat"));
     td.push(chat_object(7, "new client", json!([])));
