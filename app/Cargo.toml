@@ -52,6 +52,9 @@ simplecss = "0.2"
 linkify = "0.11"
 url = "2"
 
+# Unicode control and format categories in downloaded filenames.
+regex = { version = "1", default-features = false, features = ["std", "unicode-gencat"] }
+
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
 # POST the token endpoint takes.
 serde_json = "1"

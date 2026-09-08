@@ -15,6 +15,7 @@ use kernel::search::Provider;
 use kernel::store::Store;
 
 pub mod config;
+mod downloads;
 pub mod model;
 pub mod operations;
 pub mod panels;
