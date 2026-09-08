@@ -1,0 +1,24 @@
+# args: --demo-disk
+# env:
+# An attachment renders through the same viewer as disk files.
+wait 900
+key /
+type "invoice"
+wait 600
+key esc
+click "invoice 2026-08"
+wait 700
+click "invoice-2026-08.pdf"
+wait 700
+click "application/pdf"
+click "page 1 of 2"
+click "pdf page"
+click "next page"
+wait 700
+click "page 2 of 2"
+click "pdf page"
+shot pdf-attachment
+click "previous page"
+wait 700
+click "page 1 of 2"
+quit

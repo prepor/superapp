@@ -1,10 +1,11 @@
 //! The shared widgets a panel is built from.
 //!
-//! Two components live here, and both are helpers a panel's widget embeds
+//! The table and card are helpers a panel's widget embeds
 //! rather than widgets of their own: the [`table`] over a
 //! [`ListState`](kernel::richtable::ListState) the panel instance owns, and
 //! the file [`card`] over a [`CardData`](card::CardData) the panel fills.
-//! Neither holds state that belongs to a panel — the table borrows its list
+//! The shared [`viewer`] adds text, image and PDF rendering and measurement.
+//! Neither helper holds state that belongs to a panel — the table borrows its list
 //! from the instance through `as_any` on every draw and event, and the card
 //! is handed its data.
 //!
@@ -15,6 +16,7 @@
 //! a row opens are the app's.
 
 pub mod card;
+pub mod viewer;
 pub mod dsl;
 pub mod map;
 pub mod media;

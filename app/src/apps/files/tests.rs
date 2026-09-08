@@ -13,8 +13,8 @@ use kernel::session::{Action, Instance, Session};
 use kernel::store::Store;
 
 use super::model::{
-    crumbs, fmt_size, image_lines, image_size, normalize, preview_of, read_in, real_path, stat_in,
-    text_lines, watched_at, Entry, FileKind, Preview, HOME,
+    crumbs, fmt_size, image_size, normalize, preview_of, read_in, real_path, stat_in,
+    watched_at, Entry, FileKind, Preview, HOME,
 };
 // The kernel's, beside `FileKind`: what a name claims and how much of it a
 // card reads are questions mail asks of a part of a letter too, so the app
@@ -2184,8 +2184,6 @@ fn a_typed_path_is_read_the_way_a_shell_reads_one() {
     assert_eq!(fmt_size(640), "640 B");
     assert_eq!(fmt_size(84 * 1024), "84 KB");
     assert_eq!(fmt_size(1024 * 1024 + 200 * 1024), "1.2 MB");
-    assert_eq!(text_lines("a\nb\nc", 40), 3);
-    assert_eq!(text_lines(&"x".repeat(100), 40), 3, "a long line wraps");
 
     // The one clash a copy is allowed to make, under a name that is free.
     assert_eq!(copy_name("notes.txt", 1), "notes copy.txt");
@@ -2243,7 +2241,8 @@ fn values(offer: &[kernel::richtable::Suggestion]) -> Vec<String> {
 fn a_card_reads_what_its_kind_is_worth_and_no_more() {
     let _alone = alone();
     let never = |_: usize| -> Option<Vec<u8>> { panic!("read for a kind with no preview") };
-    assert_eq!(preview_of(FileKind::Pdf, "a.pdf", 96, never), Preview::None);
+    assert!(matches!(preview_of(FileKind::Pdf, "a.pdf", 96,
+        |_| Some(kernel::caps::demo::PDF.to_vec())), Preview::Pdf(_)));
     assert_eq!(
         preview_of(FileKind::Archive, "a.zip", 400, never),
         Preview::None
@@ -2302,15 +2301,12 @@ fn a_picture_is_measured_by_its_header() {
 
     // Drawn at the text's width, a square picture is that width tall: at 60
     // characters, 60 · 0.8 / 2.0 = 24 lines. Half as tall, half as many.
-    assert_eq!(image_lines(60, 32, 32), 24.0);
-    assert_eq!(image_lines(60, 64, 32), 12.0);
-    assert_eq!(image_lines(60, 32, 64), 48.0);
 }
 
 /// The card over each of the three previews, on the demo tree: what it
 /// says, what it holds, and the rows it asks for.
 #[test]
-fn a_card_previews_a_text_file_a_picture_or_neither() {
+fn a_card_previews_text_images_and_pdfs() {
     let _alone = alone();
     let (mut s, slot) = home();
 
@@ -2353,10 +2349,10 @@ fn a_card_previews_a_text_file_a_picture_or_neither() {
         assert!(c.image().is_some_and(|b| b.starts_with(b"\x89PNG\r\n\x1a\n")));
     });
 
-    // Neither: the card's lines, and the *open* that shows it.
+    // PDF bytes go to the renderer; its measurement arrives after rendering.
     let c = card(&mut s, "~/Downloads/report-q3.pdf");
     with_card(&s, c, |c| {
-        assert_eq!(c.preview(), &Preview::None);
+        assert!(matches!(c.preview(), Preview::Pdf(bytes) if bytes.starts_with(b"%PDF-")));
         assert_eq!(c.kind_line(), "pdf · 1.2 MB");
     });
     assert_eq!(inst(&s, c).borrow().wish(60), (4, 3));

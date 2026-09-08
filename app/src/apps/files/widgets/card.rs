@@ -21,7 +21,7 @@ use makepad_widgets::*;
 use crate::shell::hosted::PanelProps;
 use crate::shell::widgets::card::{self, CardData, Preview};
 
-use super::super::model::{fmt_size, FileKind, Preview as Read};
+use super::super::model::{fmt_size, FileKind};
 use super::super::panels::Card;
 use super::field::Raised;
 
@@ -38,11 +38,6 @@ const RENAME: &[LiveId] = ids!(rename_row.rename_input);
 /// is. Both are addressed by a script — the path by its own text, which is
 /// the one thing two cards can never both be right about.
 const DETAIL: &[LiveId] = ids!(detail_txt);
-const PREVIEW: &[LiveId] = ids!(text_box.text_prev);
-/// The picture, when there is one: addressed by one word, since a card
-/// draws at most one and its bytes are nothing a script can name.
-const PICTURE: &[LiveId] = ids!(img_box.img_prev);
-
 /// Which reading of which file is on the card. A picture is decoded once
 /// per reading, so a second draw of the same one writes nothing.
 #[derive(Clone, PartialEq, Eq)]
@@ -153,6 +148,12 @@ impl Widget for CardPanel {
             .set_visible(cx, !self.rename_field.up());
 
         let step = self.view.draw_walk(cx, scope, walk);
+        let measure = card::measure(cx, &self.view);
+        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Card>()
+            .is_some_and(|card| card.measured(measure));
+        if changed {
+            if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
+        }
 
         // The field, addressable by name — that is all a script needs to put
         // a caret in one. Only while its row is up: a hidden widget keeps
@@ -166,15 +167,9 @@ impl Widget for CardPanel {
 
         // The path line carries its own text as its label, the way a row
         // does, so a script can say which file this card is on.
-        for (label, path, cursor) in [
-            (data.detail.as_str(), DETAIL, MouseCursor::Text),
-            ("preview", PREVIEW, MouseCursor::Text),
-            ("picture", PICTURE, MouseCursor::Default),
-        ] {
-            let r = self.view.widget(cx, path).area().rect(cx);
-            if r.size.x > 0.0 && r.size.y > 0.0 && !label.is_empty() {
-                props.hits.add(label, r, cursor, props.slot);
-            }
+        let r = self.view.widget(cx, DETAIL).area().rect(cx);
+        if r.size.x > 0.0 && r.size.y > 0.0 && !data.detail.is_empty() {
+            props.hits.add(data.detail.as_str(), r, MouseCursor::Text, props.slot);
         }
         step
     }
@@ -278,11 +273,7 @@ fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Chrome)> {
             // The instance's reading, in the card's own words. The two
             // enums are the same three cases on either side of the seam:
             // the app decides what is worth reading, the card decodes.
-            preview: match (preview, c.preview()) {
-                (true, Read::Text(t)) => Preview::Text(t.clone()),
-                (true, Read::Image(b)) => Preview::Image(b.clone()),
-                _ => Preview::None,
-            },
+            preview: if preview { c.viewer_preview() } else { Preview::None },
         },
         Chrome {
             status: c.note(),

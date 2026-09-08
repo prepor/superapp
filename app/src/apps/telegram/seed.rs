@@ -388,7 +388,8 @@ fn chats() -> Vec<SeedChat> {
                 },
                 Line {
                     media: Some("file"),
-                    media_label: Some("report-q3.pdf · 2.1 MB"),
+                    media_label: Some("report-q3.pdf"),
+                    media_ref: Some("demo:document"),
                     ..from(MAX, t(8, 31, 9, 3), "the numbers")
                 },
                 Line {
@@ -642,6 +643,7 @@ fn chats() -> Vec<SeedChat> {
 #[must_use]
 pub fn demo_bytes(media_ref: &str) -> Option<&'static [u8]> {
     match media_ref {
+        "demo:document" => Some(kernel::caps::demo::PDF),
         "demo:palette" => Some(include_bytes!("../../../resources/telegram/palette.png")),
         "demo:garden" => Some(include_bytes!("../../../resources/telegram/garden.png")),
         _ => None,

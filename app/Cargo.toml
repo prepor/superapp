@@ -2,7 +2,7 @@
 name = "superapp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.92"
 description = "My personal app for everyday work in one scrolling panel workspace."
 publish = false
 # Make `cargo run` start the app rather than asking which binary to use.
@@ -51,6 +51,8 @@ simplecss = "0.2"
 
 # Agent reads of PDF attachments, independent of the selected model provider.
 pdf-extract = "0.12"
+# Shared file viewer: rasterize PDF pages on a worker, on every platform.
+hayro = "0.7.1"
 
 # Recognize links in cached Telegram text and validate their destinations.
 linkify = "0.11"

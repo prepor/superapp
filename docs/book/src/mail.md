@@ -176,7 +176,7 @@ in the body is not listed under a picture of itself.
 An attachment is `("attachment", ["42", "3"])`: the letter and the part's place
 in it, because a derived row's own id is local to a device. It opens in the
 same card widget a disk file uses, and shows the name, the media type, the
-size, the letter it came with, and a preview of text or a PNG or JPEG. A part
+size, the letter it came with, and the shared [viewer](./viewers.md) for text, PNG/JPEG images, or PDF pages. A part
 has no disk path, so its one verb is `open` (`cmd+o`), which writes the part to
 a per-part directory under the system temporary directory, keeping the sender's
 filename, and asks the operating system to open it.

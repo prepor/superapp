@@ -11,34 +11,20 @@ use kernel::session::Session;
 use kernel::time::fmt_date;
 
 use super::super::model::{
-    basename, image_lines, image_size, parent, preview_of, read_in, stat_in, text_lines, Entry,
+    basename, image_size, parent, preview_of, read_in, stat_in, Entry,
     FileKind, Preview, Watch,
 };
 use super::super::ops;
 use super::super::run;
 use super::super::{Op, Seen, FILES};
 use super::dir;
-
-/// What the card spends on everything that is not the preview: the name,
-/// the kind line, the date, the path, the rule and the padding around
-/// them, in lines.
-const CHROME_LINES: usize = 7;
-
-/// How many lines of text one grid row holds, near enough for a wish. The
-/// panel cannot measure the viewport — [`Panel::wish`] is given the column's
-/// width in characters and nothing else — and the layout clamps whatever
-/// this asks for to the grid it actually has.
-const ROW_LINES: usize = 6;
-
-/// The rows a card asks for at its shortest, and the most it will ask for.
-const ROWS: (u32, u32) = (3, 6);
+use crate::shell::widgets::viewer::{Measure, Preview as ViewPreview};
 
 /// One file, shown.
 ///
-/// Everything the card draws is read when the panel opens and again
-/// whenever a verb writes the disk or the watcher says another program
-/// has: the entry, and — for a text file or a picture small enough to be
-/// worth it — the preview under the rule.
+/// File metadata is refreshed on opening and when the disk changes. The
+/// shared viewer reads and renders the contents on a worker; demo worlds
+/// retain an inline reading for deterministic tests.
 pub struct Card {
     id: PanelId,
     path: String,
@@ -50,9 +36,10 @@ pub struct Card {
     /// What the disk had when it was last asked; `None` once the path
     /// names nothing.
     entry: Option<Entry>,
-    /// What there is to show of the contents: a text file's reading, a
-    /// picture's bytes, or nothing at all.
+    /// The inline reading for demo worlds. A native reader uses `viewer_disk`.
     preview: Preview,
+    measure: Measure,
+    viewer_disk: Option<kernel::caps::DiskFactory>,
     /// A picture's `(width, height)`, off the header of the bytes above.
     /// Kept because [`Panel::wish`] is asked on every relayout, and reading
     /// a header on each of them would be a read a frame.
@@ -146,11 +133,27 @@ impl Card {
         }
     }
 
-    /// The preview: the first 64 KiB of a text file, a picture's bytes, or
-    /// nothing at all — what the card draws under the rule.
+    /// The demo reading before it is handed to the shared viewer.
     #[must_use]
+    #[cfg(test)]
     pub fn preview(&self) -> &Preview {
         &self.preview
+    }
+
+    pub fn viewer_preview(&self) -> ViewPreview {
+        if matches!(self.kind(), FileKind::Text | FileKind::Image | FileKind::Pdf) {
+            if let Some(factory) = &self.viewer_disk {
+                return ViewPreview::Disk { factory: factory.clone(), path: kernel::caps::real_path(&self.path),
+                    name: self.name(), kind: self.kind(), size: self.size() };
+            }
+        }
+        self.preview.clone().into()
+    }
+
+    pub fn measured(&mut self, measure: Measure) -> bool {
+        if self.measure == measure { return false; }
+        self.measure = measure;
+        true
     }
 
     /// The reading, where the preview is a text file's.
@@ -239,7 +242,7 @@ impl Card {
 
     // -- keeping up ------------------------------------------------------------
 
-    /// Reads the file again: what it is, and what it shows.
+    /// Refresh metadata and invalidate the viewer only when this file changed.
     ///
     /// The kind decides whether anything is read at all, so a card over a
     /// 38 MB disk image costs one `stat`; a picture's size is taken off the
@@ -264,12 +267,14 @@ impl Card {
         self.read += 1;
         let (world, path) = (self.world.clone(), self.path.clone());
         self.preview = match &self.entry {
+            Some(_) if self.viewer_disk.is_some() => Preview::None,
             Some(e) => preview_of(e.kind(), &e.name, e.size, |max| {
                 read_in(&world, &path, max).ok()
             }),
             None => Preview::None,
         };
         self.pixels = self.image().and_then(image_size);
+        self.measure = Measure::of(&self.preview);
     }
 
     /// Called on every draw and every event, as a list's is: the card asks
@@ -295,8 +300,7 @@ impl Panel for Card {
     fn about(&self) -> String {
         format!(
             "One file as a card: {} — its name, its kind, its size, its date, \
-             its path, and a preview when it is text or a picture small enough \
-             to be worth reading. Its argument is that path; nothing is stored \
+             its path, and a shared viewer for text, images, and PDF pages. Its argument is that path; nothing is stored \
              about it, so every fact here comes off the disk when the panel \
              opens and again whenever a verb writes. The verbs are the file's \
              own: open it with the operating system, hold it for a copy or a \
@@ -310,15 +314,7 @@ impl Panel for Card {
     /// whole — up to what a grid is likely to hold. The layout clamps it to
     /// the grid there actually is.
     fn wish(&self, cols: usize) -> (u32, u32) {
-        let lines = match (&self.preview, self.pixels) {
-            (Preview::Text(t), _) => text_lines(t, cols),
-            // The picture is drawn at the text's width, so what it costs in
-            // lines is its aspect at that width.
-            (Preview::Image(_), Some((w, h))) => image_lines(cols, w, h).ceil() as usize,
-            _ => 0,
-        };
-        let rows = (CHROME_LINES + lines).div_ceil(ROW_LINES) as u32;
-        (4, rows.clamp(ROWS.0, ROWS.1))
+        self.measure.wish(cols, 7)
     }
 
     fn placed(&mut self, slot: SlotId) {
@@ -479,6 +475,8 @@ impl PanelKind for CardKind {
             world,
             entry: None,
             preview: Preview::None,
+            measure: Measure::Empty,
+            viewer_disk: cx.session().world().with_cap::<super::super::ViewerDisk, _>(|r| r.0.clone()).ok(),
             pixels: None,
             renaming: None,
             status: None,

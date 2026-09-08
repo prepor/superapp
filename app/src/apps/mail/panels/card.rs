@@ -1,7 +1,7 @@
 //! The `attachment` panel: one part of a letter, on the shared file card.
 //!
 //! The same card the files app draws a path with, filled from a row instead
-//! of a `stat`. That is the whole of the sharing: what a file *is* — its kind
+//! of a `stat`. The shared viewer renders and measures its content; the kind
 //! word, its size, whether a preview is worth attempting — is the kernel's
 //! (`caps::preview`), so a part and a file on a disk cannot drift apart.
 //!
@@ -20,21 +20,11 @@ use kernel::layout::SlotId;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
+use crate::shell::widgets::viewer::Measure;
 use kernel::time::fmt_date;
 
 use super::super::model::{self, MailId};
 use super::super::parts::{self, scratch, Attachment};
-
-/// What the card spends on everything that is not the preview: the name, the
-/// kind line, the date, the media type, the rule and the padding around them,
-/// in lines.
-const CHROME_LINES: usize = 7;
-
-/// How many lines of text one grid row holds, near enough for a wish.
-const ROW_LINES: usize = 6;
-
-/// The rows a card asks for at its shortest, and the most it will ask for.
-const ROWS: (u32, u32) = (3, 6);
 
 /// One part of a letter, shown.
 pub struct Card {
@@ -50,6 +40,7 @@ pub struct Card {
     with: String,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
+    measure: Measure,
     pending: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
 }
 
@@ -129,6 +120,12 @@ impl Card {
     #[must_use]
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub fn measured(&mut self, measure: Measure) -> bool {
+        if self.measure == measure { return false; }
+        self.measure = measure;
+        true
     }
 
     /// Reads the row again — the description is a row, so it is there at
@@ -241,7 +238,7 @@ impl Panel for Card {
         format!(
             "One part of a letter, on the same card the files app draws a path \
              with: the name, the media type, the size, the letter it came \
-             with, and a preview when it is text or a picture. Its arguments \
+             with, and a viewer for text, images, and PDF pages. Its arguments \
              are the letter's `message.id`, {}, and the part's place in it, \
              {} — a part's own row in `attachment` is derived from the \
              content snapshot and local to a device, so the identity is the \
@@ -254,17 +251,10 @@ impl Panel for Card {
         )
     }
 
-    /// Three rows as the floor, more when the preview needs them. The bytes
-    /// are not here to measure — they come off a thread — so a text part is
-    /// wished at its size and a picture at the box a card gives one.
-    fn wish(&self, _cols: usize) -> (u32, u32) {
-        let lines = match self.kind() {
-            FileKind::Text => (self.size() as usize / 60).min(120),
-            FileKind::Image => 12,
-            _ => 0,
-        };
-        let rows = (CHROME_LINES + lines).div_ceil(ROW_LINES) as u32;
-        (4, rows.clamp(ROWS.0, ROWS.1))
+    /// The shared viewer reports the loaded content's measurement once,
+    /// including a PDF page's dimensions whenever the page changes.
+    fn wish(&self, cols: usize) -> (u32, u32) {
+        self.measure.wish(cols, 7)
     }
 
     fn placed(&mut self, slot: SlotId) {
@@ -307,6 +297,7 @@ impl PanelKind for CardKind {
             row: None,
             with: String::new(),
             status: None,
+            measure: Measure::Empty,
             pending: None,
         };
         card.reread();

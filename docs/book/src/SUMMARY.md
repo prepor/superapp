@@ -13,6 +13,7 @@
 - [Data and Effects](./data-substrate.md)
 - [Device Sync](./device-sync.md)
 - [The Rich Table](./richtable.md)
+- [File Viewers](./viewers.md)
 - [Apps](./apps.md)
 
 # Apps

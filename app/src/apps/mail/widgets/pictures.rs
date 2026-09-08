@@ -56,17 +56,20 @@ fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
 fn letter_part(world: Option<&World>, mail: MailId, at: u32, k: String) -> Ready {
     let bytes = world
         .and_then(|w| parts::attachment(w.store(), mail, at).map(|a| (w, a)))
-        .and_then(|(w, a)| parts::part(w, &a).ok());
+        .and_then(|(w, a)| {
+            let limit = if a.kind() == kernel::caps::FileKind::Pdf {
+                kernel::caps::PDF_PREVIEW_MAX + 1
+            } else { kernel::caps::IMAGE_PREVIEW_MAX };
+            parts::part(w, &a).ok().map(|b| (b, limit))
+        });
     match bytes {
-        // Cut to the preview's own ceiling before it is *kept*: this cache
-        // outlives the card, and a card only ever draws the first
-        // `IMAGE_PREVIEW_MAX` of a part anyway. What `open` hands to the OS
-        // does not come through here — it reads the whole part and writes it
-        // out (see `Card::write_out`).
-        Some(b) => Ready {
+        // Keep only the preview budget, including the extra byte that detects
+        // an oversized PDF. PDF data leaves this transient cache after handoff;
+        // the durable blob cache remains the source for a later opening.
+        Some((b, limit)) => Ready {
             items: vec![(
                 k,
-                Arc::from(&b[..b.len().min(kernel::caps::IMAGE_PREVIEW_MAX)]),
+                Arc::from(&b[..b.len().min(limit)]),
             )],
             failed: Vec::new(),
             retry: Vec::new(),
@@ -87,6 +90,15 @@ pub enum PartBytes {
     /// It cannot be had: the letter no longer yields that part. Said once, so
     /// the card can stop waiting and say so.
     Gone,
+}
+
+/// The PDF worker owns its document after handoff. Keep the durable blob
+/// cache as the source instead of retaining another whole PDF on `Cx`.
+pub fn release_part(cx: &mut Cx, scope: &str, at: u32) {
+    let key = part_key(scope, at);
+    let pictures = cx.global::<Pictures>();
+    pictures.bytes.remove(&key);
+    pictures.asked.remove(&key);
 }
 
 /// Asks for one part's bytes, once, and answers with them when they are here.

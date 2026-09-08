@@ -63,12 +63,11 @@ A card shows the name, the kind and size on one line, the modification date,
 the path as a selectable run, and a preview under a rule. A file that has gone
 reads *not there any more*.
 
-The preview limits are the kernel's, in `kernel/src/caps/preview.rs`: a text
-file's first 64 KiB, or a picture up to 20 MiB. A picture is decoded by what
-its bytes say it is, never by its name, so a PNG saved as `.jpg` still draws;
-only `png`, `jpg`, and `jpeg` are attempted at all. The card asks for the rows
-its content needs, and the picture's size comes off its header alone so the
-wish costs no read per frame.
+The shared [file viewer](./viewers.md) shows text, PNG/JPEG images, and PDF
+pages inside the card. File reads and decoding run on a worker; the panel's
+width and height follow the loaded content. A PNG saved as `.jpg` still draws
+because decoding follows its bytes. PDFs have previous/next page controls and
+a page count, including documents with pages of different sizes or rotation.
 
 `open` (`cmd+o`) hands the path to the operating system. Superapp does not
 execute the file.

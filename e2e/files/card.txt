@@ -3,7 +3,7 @@
 #
 # What a card shows under the rule: the first 64 KiB of a text file, a
 # picture decoded from its own bytes, or neither — and the rows each of them
-# asks for, which is why a picture opens a taller panel than a pdf.
+# asks for, which is why the file itself determines the panel size.
 #
 # Run with `--demo-disk`, so the tree is the fixture rather than whatever
 # this machine's ~ holds. The fixture's pictures are one real PNG, whatever
@@ -84,12 +84,10 @@ click "picture"
 wait 500
 shot c3-sniffed
 
-# -- neither ------------------------------------------------------------------------
+# -- PDF pages ----------------------------------------------------------------------
 
-# A pdf is never read: pulling 1.2 MB into a panel to be told it is a pdf is
-# a pause for nothing. The card is its four lines, and it says that `open`
-# shows the rest — so the panel stands at its floor of three rows, where the
-# picture above stood taller.
+# A real PDF renders in the card. Paging preserves the source; the rotated
+# second page asks for a wider panel, and previous returns to the portrait.
 click "go to"
 wait 500
 type "~/Downloads/"
@@ -100,7 +98,17 @@ click "report-q3.pdf"
 wait 900
 click "~/Downloads/report-q3.pdf"
 wait 400
-shot c4-no-preview
+click "pdf page"
+click "page 1 of 2"
+click "next page"
+wait 700
+click "page 2 of 2"
+click "pdf page"
+shot c4-landscape
+click "previous page"
+wait 700
+click "page 1 of 2"
+shot c4-pdf
 
 # -- open ---------------------------------------------------------------------------
 
