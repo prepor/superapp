@@ -240,6 +240,39 @@ fn a_preview_marks_the_chat_read_and_undo_gives_it_back() {
     assert!(s.joined_child(list).is_none(), "the preview went with it");
 }
 
+#[test]
+fn an_unread_chat_stays_selected_after_reading_until_another_chat_is_selected() {
+    let mut s = session();
+    let list = open_root(&mut s, Chats::id());
+    with_chats(&s, list, |c| { c.list_mut().set_filter("@unread"); });
+    let before = titles(&s, list);
+    let nav = with_chats(&s, list, |c| c.go(1)).unwrap();
+    go(&mut s, nav);
+
+    assert_eq!(unread(&s, ELENA), (0, false));
+    assert_eq!(titles(&s, list), before, "reading keeps the selected chat in place");
+    with_chats(&s, list, |c| {
+        let l = c.list_mut();
+        assert_eq!(l.cursor_index(s.store()), Some(1));
+        let row = l.row(s.store(), 1).unwrap();
+        assert_eq!(row.peer, ELENA);
+        assert_eq!(row.unread, 0, "the retained row shows its current read status");
+    });
+
+    let row = with_chats(&s, list, |c| c.list_mut().move_cursor(s.store(), 1)).unwrap();
+    assert_eq!(row.peer, FAMILY, "down takes the next chat without skipping it");
+    go(&mut s, Nav::Preview { from: list, id: Chats::target(&row) });
+    assert_eq!(unread(&s, FAMILY), (0, false));
+    assert_eq!(titles(&s, list), vec!["stelaxis", "Family", "Rust Weekly"]);
+    with_chats(&s, list, |c| {
+        assert_eq!(c.list_mut().cursor_index(s.store()), Some(1));
+    });
+
+    let nav = with_chats(&s, list, |c| c.go(0)).unwrap();
+    go(&mut s, nav);
+    assert_eq!(titles(&s, list), vec!["stelaxis", "Rust Weekly"]);
+}
+
 /// The transcript's rows: a day where the day changes, the unread line
 /// above the first unread line, a run where one writer goes on.
 #[test]

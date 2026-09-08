@@ -94,7 +94,7 @@ impl Chats {
     #[cfg(test)]
     #[must_use]
     pub fn rows(&self, lo: usize, hi: usize) -> Vec<ChatRow> {
-        self.list.table().rows(&self.store, lo, hi)
+        self.list.rows(&self.store, lo, hi)
     }
 
     /// Puts the cursor on row `i` — a click — and answers the preview.
@@ -210,9 +210,7 @@ impl Panel for Chats {
         let store = self.store.clone();
         match verb {
             "telegram.all" => {
-                if let Some(keys) = self.list.table().keys(&store) {
-                    self.list.marks_mut().extend(keys);
-                }
+                self.list.mark_all(&store);
                 s.redraw();
             }
             // The way out of both states this bar can be in: the marked set,

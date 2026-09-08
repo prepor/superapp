@@ -30,11 +30,16 @@ shot g2-narrowed
 
 # Two conversations have something unread in them; the seven that are read
 # are gone from the list, and a click that would have found one fails the
-# run. Previewing this one reads it — so it leaves the list it was found
-# in, which is what a filter over a flag means.
+# run. Previewing this one reads it; the selected row stays in the list
+# until the cursor moves. Enter must still open that conversation.
 click "[stelaxis]"
 wait 800
+visible "[stelaxis]"
+key enter
+wait 800
 click "GitHub · aug 31 08:02"
+wait 500
+key cmd+left
 wait 500
 shot g3-kept
 

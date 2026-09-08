@@ -332,7 +332,7 @@ impl<S: RowSpec> TableView<S> {
             KeyCode::ReturnKey => {
                 let target = with_list::<S, _>(props, |l| {
                     let i = l.cursor_index(store).unwrap_or(0);
-                    l.row(store, i).map(|r| S::target(&r))
+                    l.set_cursor(store, i).map(|r| S::target(&r))
                 })
                 .flatten();
                 if let Some(id) = target {

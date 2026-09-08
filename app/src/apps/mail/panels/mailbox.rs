@@ -71,7 +71,7 @@ impl Mailbox {
     #[cfg(test)]
     #[must_use]
     pub fn rows(&self, lo: usize, hi: usize) -> Vec<ThreadHead> {
-        self.list.table().rows(&self.store, lo, hi)
+        self.list.rows(&self.store, lo, hi)
     }
 
     /// Space: the mark on the cursor's row, toggled.
