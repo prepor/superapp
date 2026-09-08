@@ -286,6 +286,41 @@ impl Widget for ChatPanel {
                 }
                 return;
             }
+            // Ctrl+E reaches the newest line with the transcript focused.
+            // The composer's caret chords stay with the field.
+            let chat_end = k.key_code == KeyCode::KeyE && k.modifiers.control
+                && !(k.modifiers.shift || k.modifiers.alt || k.modifiers.logo);
+            if has_focus && !focused
+                && (chat_end || matches!(k.key_code, KeyCode::Home | KeyCode::End))
+            {
+                let to_end = chat_end || k.key_code == KeyCode::End;
+                let landed = with_chat(&props, |c| {
+                    let hist = c.history();
+                    let pick = if to_end {
+                        hist.iter().rev().find(|m| !m.service)
+                    } else {
+                        hist.iter().find(|m| !m.service)
+                    };
+                    let id = pick.map(|m| m.id)?;
+                    c.set_cursor(id);
+                    Some(id)
+                })
+                .flatten();
+                if to_end {
+                    self.reveal.cancel();
+                    let list = self.view.widget(cx, LIST).as_portal_list();
+                    list.scroll_to_end(cx);
+                    list.set_tail_range(true);
+                    self.anchor = None;
+                } else if let Some(id) = landed {
+                    self.follow(cx, id);
+                }
+                self.view.redraw(cx);
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    s.redraw();
+                }
+                return;
+            }
             if focused {
                 match k.key_code {
                     // Enter sends; shift+enter is the field's newline, and
@@ -374,39 +409,6 @@ impl Widget for ChatPanel {
                         self.view.redraw(cx);
                         // The cursor and the marks feed the bar, which the
                         // stage draws.
-                        if let Some(s) = scope.data.get_mut::<Session>() {
-                            s.redraw();
-                        }
-                    }
-                    // Home and End: the oldest line held and the newest, the
-                    // cursor going with the view.
-                    KeyCode::Home | KeyCode::End => {
-                        let to_end = k.key_code == KeyCode::End;
-                        let landed = with_chat(&props, |c| {
-                            let hist = c.history();
-                            let pick = if to_end {
-                                hist.iter().rev().find(|m| !m.service)
-                            } else {
-                                hist.iter().find(|m| !m.service)
-                            };
-                            let id = pick.map(|m| m.id)?;
-                            c.set_cursor(id);
-                            Some(id)
-                        })
-                        .flatten();
-                        if let Some(id) = landed {
-                            if to_end {
-                                self.reveal.cancel();
-                                self.view
-                                    .widget(cx, LIST)
-                                    .as_portal_list()
-                                    .set_tail_range(true);
-                                self.anchor = None;
-                            } else {
-                                self.follow(cx, id);
-                            }
-                        }
-                        self.view.redraw(cx);
                         if let Some(s) = scope.data.get_mut::<Session>() {
                             s.redraw();
                         }
