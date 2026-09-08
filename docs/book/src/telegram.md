@@ -227,23 +227,45 @@ supported. Results contain at most 64 KiB of text; pass `next_offset` as
 PDFs needing OCR are reported to the agent.
 
 `telegram.draft` opens or reuses the destination's composer with the requested
-text and optional reply. Forum topics keep their own destination. Existing
-draft text requires explicit `replace: true`; edits and attachments are kept
-and must be finished in the panel. All open copies of the composer receive
-the staged draft, and long drafts scroll inside a bounded field. Draft text
-persists like typing; the reply selection belongs to the open composer.
+text, optional reply and `files`, an ordered list of local paths. Paths must
+be absolute or start with `~/`; `files.list` can find them. PNG and JPEG images
+send as photos, GIFs as animations, video and audio as their media types, and
+other files as documents, using the same rules as the attachment panel. Each
+file becomes its own message; text and the reply belong to the first. Use
+`text: ""` to attach files without a caption. Files must be readable, nonempty
+regular files and stay available until delivery.
 
-`telegram.send` takes the returned slot, chat, topic, text and reply target.
+Forum topics keep their own destination. Existing draft text requires explicit
+`replace: true`; edits must be finished in the panel. Existing attachments
+must remain at the start of `files` in their current order, even with replace;
+new files can be appended. All open copies of the composer receive the staged
+draft, and long drafts scroll inside a bounded field. Draft text persists like
+typing; reply selections and attachment paths belong to the open composer.
+
+For example, `telegram.draft` accepts:
+
+```json
+{"chat": 123456789, "text": "The screenshot and report", "files": ["~/Pictures/screenshot.png", "~/Documents/report.pdf"]}
+```
+
+Use the recipient's actual chat id from `sql.query` and pass the returned
+arguments to `telegram.send`.
+
+`telegram.send` takes the returned slot, chat, topic, text, reply target and files.
 It uses the same send path as Enter, after the agent's ordinary approval card.
-If the contents or destination changed while approval was pending, it refuses
-the send. Offline failures keep the draft. These tools compose text messages;
-attachments and edits remain available in the Telegram panel.
+If the text, destination, reply or attachment paths or order changed while
+approval was pending, it refuses the send. It rechecks file availability before
+queuing anything. Offline failures keep the draft. Queued text and attachments
+clear from every matching open copy of the composer.
 
-A successful tool call reports **queued**, with an operation id.
-`telegram.status` reports whether Telegram has confirmed that operation or
-returned an error. Pending or uncertain delivery must not trigger an automatic
-second send. Operation ids last for the current app session; completed send
-results remain queryable after their status line disappears.
+A successful tool call reports **queued**, with an `operations` list containing
+one id per message; `operation` is the first id for compatibility with text sends.
+Check each id with `telegram.status` to learn whether Telegram confirmed it or
+returned an error. If queuing stops partway through, **partially_queued** reports
+the queued operations and `remaining_files`; unsent files stay in the composer.
+Pending, partial or uncertain delivery must not trigger an automatic repeat of
+the original send. Operation ids last for the current app session; completed
+send results remain queryable after their status line disappears.
 
 ## Reactions
 

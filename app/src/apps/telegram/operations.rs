@@ -821,15 +821,22 @@ pub fn validate_files(v: &Value) -> Result<(), String> {
     let mut paths = Vec::new();
     local_paths(v, &mut paths);
     for path in paths {
-        let metadata = std::fs::metadata(path).map_err(|e| format!("Cannot open {path}: {e}"))?;
-        if !metadata.is_file() {
-            return Err(format!("{path} is not a regular file"));
-        }
-        if metadata.len() == 0 {
-            return Err(format!("{path} is empty"));
-        }
-        std::fs::File::open(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        validate_local_file(Path::new(path))?;
     }
+    Ok(())
+}
+
+/// Shared by agent drafts and the worker's final check before uploading.
+pub(super) fn validate_local_file(path: &Path) -> Result<(), String> {
+    let name = path.display();
+    let metadata = std::fs::metadata(path).map_err(|e| format!("Cannot open {name}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{name} is not a regular file"));
+    }
+    if metadata.len() == 0 {
+        return Err(format!("{name} is empty"));
+    }
+    std::fs::File::open(path).map_err(|e| format!("Cannot read {name}: {e}"))?;
     Ok(())
 }
 

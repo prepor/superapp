@@ -8,7 +8,7 @@ use kernel::session::Session;
 use kernel::tool::Tool;
 use serde_json::{json, Value};
 
-use super::model::{self, MsgId, PeerCard, PeerId};
+use super::model::{self, Carried, MsgId, PeerCard, PeerId};
 use super::operations::Status;
 use super::panels::Chat;
 use super::{downloads, requests, runtime, topics};
@@ -31,12 +31,16 @@ chat and message id to read an attached PDF or text file, downloading it \
 on demand. This works even without an open Telegram panel. Follow its \
 next_offset for longer documents instead of asking the person to re-upload.
 
-Use telegram.draft to put text in the correct chat's composer for review, \
-then telegram.send with the returned slot and exact chat, topic, text and \
-reply_to. Sending asks for approval. Existing unsent text is preserved \
-unless draft's replace is explicitly set. Drafts persist like typed text; \
-reply selections belong to the open composer. Use telegram.status to check \
-the returned operation: queued does not mean delivered. Never repeat a send \
+Use telegram.draft to put text and local files in the correct chat's composer \
+for review, then telegram.send with the returned slot and exact chat, topic, \
+text, reply_to and files. Find local paths with files.list. Images send as \
+photos; other files use the composer's media type. Text captions the first \
+attachment; use empty text to send files without a caption. Sending asks for \
+approval. Existing unsent text is preserved unless draft's replace is \
+explicitly set. Keep existing attachments at the start of files when adding \
+more. Draft text persists like typed text; reply selections and attachments \
+belong to the open composer. Use telegram.status to check every returned \
+operation in operations: queued does not mean delivered. Never repeat a send \
 just because its acknowledgement is pending or uncertain.
 
 Do not INSERT messages or UPDATE drafts/flags with sql.write: these tables \
@@ -80,20 +84,25 @@ pub fn all() -> Vec<Tool> {
         ),
         Tool::new(
             "telegram.draft",
-            "Write a text draft and open its Telegram chat for review. Find the chat id \
+            "Write a draft with optional local files and open its Telegram chat for review. Find the chat id \
              with sql.query first. Supports forum topics and replies to cached messages. \
              Updates every open copy of this composer. Refuses existing unsent work \
-             unless replace is true. Returns the exact arguments telegram.send takes.",
+             unless replace is true; never discards an edit or existing attachments. \
+             To add files, include existing attachments first, in their current order. \
+             Returns the exact arguments telegram.send takes.",
             draft_input,
             true,
             draft,
         ),
         Tool::new(
             "telegram.send",
-            "Send the text draft already open in a Telegram composer, using the slot, \
-             chat, topic, text and reply_to returned by telegram.draft. Asks for approval \
-             and refuses if the draft changed or now carries an edit or files. A success \
-             means queued, not delivered: check telegram.status with the operation id. \
+            "Send the draft already open in a Telegram composer, using the slot, \
+             chat, topic, text, reply_to and files returned by telegram.draft. Asks for approval \
+             and refuses if the draft or attachment order changed or an edit is open. \
+             Files send as separate messages, with text and reply on the first. Check \
+             telegram.status for every id in operations; operation is the first id. \
+             Queued does not mean delivered. Partially queued sends report the queued \
+             operations and remaining_files; never repeat the original send automatically. \
              Offline failures keep the draft. Undo requests deletion for everyone; Telegram must confirm it.",
             send_input,
             true,
@@ -192,8 +201,12 @@ fn message_input() -> Value {
         "properties": {
             "chat": {"type": "integer", "description": "the recipient's tg_peer.id, not an AI chat id"},
             "topic": {"type": "integer", "description": "tg_topic.id within this chat; omit or use 0 outside a forum topic"},
-            "text": {"type": "string", "description": "the whole plain-text message"},
-            "reply_to": {"type": ["integer", "null"], "description": "a cached tg_message.id in this chat and topic; omit for no reply"}
+            "text": {"type": "string", "description": "the whole plain-text message, or the first file's caption; may be empty when files are attached"},
+            "reply_to": {"type": ["integer", "null"], "description": "a cached tg_message.id in this chat and topic; omit for no reply"},
+            "files": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Ordered local file paths, absolute or starting with ~/. Omit for no attachments. PNG/JPEG send as photos; GIF, video and audio use their media types; other files send as documents. Keep the files available until delivery."
+            }
         },
         "required": ["chat", "text"], "additionalProperties": false
     })
@@ -204,6 +217,7 @@ struct Message<'a> {
     topic: i64,
     text: &'a str,
     reply_to: Option<MsgId>,
+    files: Vec<Carried>,
 }
 
 impl<'a> Message<'a> {
@@ -217,7 +231,21 @@ impl<'a> Message<'a> {
                 .ok_or("`topic` must be a nonnegative integer")?,
         };
         let text = input["text"].as_str().ok_or("`text` must be a string")?;
-        if text.trim().is_empty() {
+        let mut files = Vec::new();
+        if let Some(value) = input.get("files") {
+            for value in value.as_array().ok_or("`files` must be an array of paths")? {
+                let path = value.as_str().ok_or("each file path must be a string")?;
+                if !std::path::Path::new(path).is_absolute() && !path.starts_with("~/") {
+                    return Err("file paths must be absolute or start with ~/".into());
+                }
+                let file = Carried { path: path.to_string() };
+                if files.contains(&file) {
+                    return Err(format!("file is listed more than once: {path}"));
+                }
+                files.push(file);
+            }
+        }
+        if text.trim().is_empty() && files.is_empty() {
             return Err("the message is empty".into());
         }
         let reply_to = match input.get("reply_to") {
@@ -233,6 +261,7 @@ impl<'a> Message<'a> {
             topic,
             text,
             reply_to,
+            files,
         })
     }
 
@@ -271,9 +300,17 @@ impl<'a> Message<'a> {
         c.peer() == self.chat && c.topic_id() == self.topic
     }
 
+    fn validate_files(&self) -> Result<(), String> {
+        for file in &self.files {
+            super::operations::validate_local_file(&kernel::caps::real_path(&file.path))?;
+        }
+        Ok(())
+    }
+
     fn result(&self, slot: SlotId) -> Value {
         json!({"slot": slot, "chat": self.chat, "topic": self.topic,
-            "text": self.text, "reply_to": self.reply_to})
+            "text": self.text, "reply_to": self.reply_to,
+            "files": self.files.iter().map(|f| &f.path).collect::<Vec<_>>()})
     }
 }
 
@@ -285,9 +322,9 @@ fn ready(s: &Session) -> Result<(), String> {
     }
 }
 
-fn text_composer(c: &Chat) -> Result<(), String> {
-    if c.editing().is_some() || !c.carrying().is_empty() {
-        Err("this composer has an edit or attachments; finish those in Telegram first".into())
+fn new_message_composer(c: &Chat) -> Result<(), String> {
+    if c.editing().is_some() {
+        Err("this composer has an edit; finish it in Telegram first".into())
     } else {
         Ok(())
     }
@@ -297,6 +334,7 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
     ready(s)?;
     let msg = Message::read(input)?;
     let card = msg.destination(s)?;
+    msg.validate_files()?;
     let replace = input["replace"].as_bool().unwrap_or(false);
     if !replace
         && card
@@ -315,7 +353,10 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
             continue;
         };
         let _ = c.card();
-        text_composer(c)?;
+        new_message_composer(c)?;
+        if !msg.files.starts_with(c.carrying()) {
+            return Err("this composer has attachments; keep them at the start of files in their current order, or finish them in Telegram first".into());
+        }
         if !replace
             && ((!c.field_text().is_empty() && c.field_text() != msg.text)
                 || (c.reply_to().is_some() && c.reply_key() != msg.reply_to.map(|id| (msg.chat, id))))
@@ -362,7 +403,7 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
             .as_any()
             .downcast_mut::<Chat>()
             .ok_or("that slot is not a Telegram composer")?;
-        c.stage_draft(msg.text, msg.reply_to, open == slot)?;
+        c.stage_draft(msg.text, msg.reply_to, &msg.files, open == slot)?;
     }
     s.redraw();
     Ok(msg.result(slot))
@@ -384,17 +425,21 @@ fn send(s: &mut Session, input: &Value) -> Result<Value, String> {
         .downcast_mut::<Chat>()
         .ok_or("that slot is not a Telegram composer")?;
     let _ = c.card();
-    text_composer(c)?;
-    if !msg.matches(c) || c.field_text() != msg.text || c.reply_key() != msg.reply_to.map(|id| (msg.chat, id)) {
+    new_message_composer(c)?;
+    if !msg.matches(c) || c.field_text() != msg.text || c.reply_key() != msg.reply_to.map(|id| (msg.chat, id))
+        || c.carrying() != msg.files
+    {
         return Err("the Telegram draft changed; review it and request a new send with its current contents".into());
     }
     if !super::panels::live(s.store()) {
         return Err("Telegram is not connected; the draft is kept and nothing was sent".into());
     }
-    let operation = c
-        .send_text_draft(s)
-        .ok_or("Telegram could not queue the message; the draft is kept")?;
-    Ok(json!({"status": "queued", "operation": operation,
+    msg.validate_files()?;
+    let operations = c.send_draft(s);
+    let operation = operations.first().ok_or("Telegram could not queue the message; the draft is kept")?;
+    let remaining: Vec<_> = c.carrying().iter().map(|f| &f.path).collect();
+    Ok(json!({"status": if remaining.is_empty() { "queued" } else { "partially_queued" },
+        "operation": operation, "operations": operations, "remaining_files": remaining,
         "chat": msg.chat, "topic": msg.topic}))
 }
 

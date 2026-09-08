@@ -631,18 +631,19 @@ impl Chat {
     /// An agent's explicit draft replacement uses the composer's own write.
     /// Unlike a remote update, it replaces local text after the tool checks
     /// for unsent work. Each open copy is updated, so none can restore stale
-    /// words on its next focus or send.
-    pub fn stage_draft(&mut self, text: &str, reply_to: Option<MsgId>, focus: bool) -> Result<(), String> {
+    /// words or attachments on its next focus or send.
+    pub fn stage_draft(&mut self, text: &str, reply_to: Option<MsgId>, files: &[Carried], focus: bool) -> Result<(), String> {
         self.save_draft(text)?;
         self.reply_to = reply_to.map(|id| (self.peer, id));
+        self.carrying = files.to_vec();
         self.wants_field = focus;
         Ok(())
     }
 
     /// Another open copy sent this exact draft. Its send already cleared
     /// the row; forget our copy without a second write or a focus change.
-    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgKey>) {
-        if self.editing.is_none() && self.carrying.is_empty()
+    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgKey>, files: &[Carried], sent_files: usize) {
+        if self.editing.is_none() && self.carrying == files
             && self.draft == text && self.reply_to == reply_to
         {
             self.draft.clear();
@@ -650,6 +651,7 @@ impl Chat {
             self.seen_draft.clear();
             self.draft_pending = false;
             self.reply_to = None;
+            self.carrying.drain(..sent_files);
         }
     }
 
@@ -792,7 +794,7 @@ impl Chat {
             return;
         }
         if super::live(&self.store) {
-            self.send_live(s);
+            self.send_draft(s);
             return;
         }
         // Over the wire where the build is signed in; the sent line rides its
@@ -867,7 +869,7 @@ impl Chat {
                 if let Some(c) = p.as_any().downcast_mut::<Chat>()
                     .filter(|c| c.peer == self.peer && c.topic == self.topic)
                 {
-                    c.forget_sent_draft(&text, reply);
+                    c.forget_sent_draft(&text, reply, &[], 0);
                 }
             }
         }
@@ -877,13 +879,23 @@ impl Chat {
 
     /// Only queued files leave the composer. Each queued request owns its
     /// caption, reply and source path until Telegram confirms delivery.
-    fn send_live(&mut self, s: &mut Session) {
-        if self.carrying.is_empty() {
-            self.send_text_draft(s);
-            return;
+    /// Enter and an approved agent send use this same boundary; partial
+    /// sends return every queued operation and retain the unsent files.
+    pub fn send_draft(&mut self, s: &mut Session) -> Vec<u64> {
+        // As with text sends, never reconcile remote draft text after an
+        // agent has checked the composer's exact contents for approval.
+        if super::super::topics::card(&self.store, self.peer, self.topic)
+            .is_some_and(|c| !c.can_post()) || self.editing.is_some()
+        {
+            return Vec::new();
         }
-        let text = self.draft.trim().to_string();
-        let mut sent_first = false;
+        if self.carrying.is_empty() {
+            return self.send_text_draft(s).into_iter().collect();
+        }
+        let text = self.draft.clone();
+        let reply = self.reply_to;
+        let carried = self.carrying.clone();
+        let mut operations = Vec::new();
         let files = std::mem::take(&mut self.carrying);
         let mut files = files.into_iter().enumerate();
         while let Some((i, file)) = files.next() {
@@ -891,25 +903,35 @@ impl Chat {
                 self.peer,
                 if i == 0 { self.reply_to() } else { None },
                 &file,
-                if i == 0 { &text } else { "" },
+                if i == 0 { text.trim() } else { "" },
             );
-            if let Err(error) = super::super::history::command(s, &self.request(request)) {
-                self.carrying.push(file);
-                self.carrying.extend(files.map(|(_, file)| file));
-                error.notify(s, "send");
-                break;
-            }
-            if i == 0 {
-                sent_first = true;
+            match super::super::history::command(s, &self.request(request)) {
+                Ok(operation) => operations.push(operation),
+                Err(error) => {
+                    self.carrying.push(file);
+                    self.carrying.extend(files.map(|(_, file)| file));
+                    error.notify(s, "send");
+                    break;
+                }
             }
         }
-        if sent_first {
+        if !operations.is_empty() {
             self.set_draft("");
             self.sent_draft.clear();
             self.seen_draft.clear();
             self.reply_to = None;
+            for (slot, panel) in s.panels() {
+                if slot == self.slot { continue; }
+                let mut p = panel.borrow_mut();
+                if let Some(c) = p.as_any().downcast_mut::<Chat>()
+                    .filter(|c| c.peer == self.peer && c.topic == self.topic)
+                {
+                    c.forget_sent_draft(&text, reply, &carried, operations.len());
+                }
+            }
         }
         s.redraw();
+        operations
     }
 
     /// The carried files, each as its own message: the composer's words ride
