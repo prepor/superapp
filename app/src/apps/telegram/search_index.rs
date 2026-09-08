@@ -51,6 +51,23 @@ fn read_count(store: &Store, q: &Sql) -> usize {
         &["tg_message"], |r| r.get::<_, i64>(0)).first().copied().unwrap_or(0).max(0) as usize
 }
 
+/// A required text clause with few candidates should drive the message
+/// lookup, even inside a large chat. Stop counting at the broad threshold;
+/// common terms must not enumerate their entire posting list just to plan.
+fn selective(store: &Store, ast: Option<&Ast>) -> bool {
+    match ast {
+        Some(Ast::Text(text)) => predicate(text).is_some_and(|q| {
+            read_count(store, &Sql {
+                sql: "SELECT COUNT(*) FROM (SELECT rowid FROM tg_message_substr
+                    WHERE tg_message_substr MATCH ? LIMIT ?)".into(),
+                params: vec![q.params[0].clone(), Val::I(BROAD as i64)],
+            }) < BROAD
+        }),
+        Some(Ast::And(parts)) => parts.iter().any(|a| selective(store, Some(a))),
+        _ => false,
+    }
+}
+
 /// SQL table behavior with cheap counts and an ordered scan for broad filters.
 pub struct MessageSource {
     pub sql: &'static SqlSource<MsgHit, i64>,
@@ -78,14 +95,16 @@ impl Datasource for MessageSource {
             _ => {}
         }
         let mut spec = *self.sql.spec;
-        spec.from = if scoped(ast) { CHAT_FROM } else { COUNT_FROM };
+        spec.from = if scoped(ast) && !selective(store, ast) { CHAT_FROM } else { COUNT_FROM };
         Some(read_count(store, &spec.count(self.sql.tags, ast)))
     }
 
     fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<MsgHit>> {
         let mut spec = *self.sql.spec;
         if self.all {
-            if scoped(ast) { spec.from = CHAT_FROM; }
+            if scoped(ast) {
+                if !selective(store, ast) { spec.from = CHAT_FROM; }
+            }
             else if self.count(store, ast).is_some_and(|n| n >= BROAD) { spec.from = RECENT_FROM; }
         }
         let q = spec.page(self.sql.tags, ast, offset, limit);

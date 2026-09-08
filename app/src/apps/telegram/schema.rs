@@ -34,6 +34,11 @@ pub static SCHEMA: Schema = Schema {
         Step::Always(v13_topic_schema),
         Step::Always(v14_reaction_state),
         Step::Always(v15_message_search),
+        Step::Derived {
+            key: "telegram:message-substr",
+            version: 1,
+            rebuild: rebuild_message_substr,
+        },
     ],
 };
 
@@ -60,12 +65,20 @@ fn v15_message_search(c: &Connection) -> rusqlite::Result<()> {
             INSERT INTO tg_message_substr(rowid, grams)
                 SELECT new.seq, tg_search_grams(new.text) WHERE new.service = 0;
         END;
-        INSERT INTO tg_message_substr(rowid, grams)
-            SELECT seq, tg_search_grams(text) FROM tg_message WHERE service = 0;
         CREATE INDEX tg_message_date ON tg_message(date DESC, seq DESC) WHERE service = 0;
         CREATE INDEX tg_message_search_meta ON tg_message(seq, chat, sender, date, media) WHERE service = 0;
         CREATE INDEX tg_message_search_chat ON tg_message(chat, date, seq, sender, media) WHERE service = 0;
     ")?;
+    tx.commit()
+}
+
+fn rebuild_message_substr(c: &Connection) -> rusqlite::Result<()> {
+    // Older writers omitted recursive_triggers, leaving stale grams when
+    // undo used REPLACE. Rebuild those stores once, and backfill new indexes.
+    let tx = c.unchecked_transaction()?;
+    tx.execute_batch("INSERT INTO tg_message_substr(tg_message_substr) VALUES('delete-all');
+        INSERT INTO tg_message_substr(rowid, grams)
+            SELECT seq, tg_search_grams(text) FROM tg_message WHERE service = 0;")?;
     tx.commit()
 }
 

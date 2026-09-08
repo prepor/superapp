@@ -369,10 +369,13 @@ a contentless FTS5 index, so even the first character can use a posting list.
 Longer queries intersect their trigrams and verify the literal substring only
 in those candidates; punctuation and word order remain significant. Inserts,
 text edits, service-line changes and deletions maintain the index transactionally.
-Short queries count posting lists directly. Broad searches page in date order,
-and a chat filter resolves names once and reads that chat's index; counting and
-sorting no longer require loading every matching message body.
-Existing stores build it once on their next open. The projection's separate
+Writers enable recursive triggers so replacement deletes also remove old grams;
+stores built before that setting rebuild the substring index once.
+Short queries count posting lists directly. Broad searches page in date order.
+A chat filter resolves names once, then uses the posting list for selective
+text or the chat index for broad matches; a bounded candidate count chooses
+between them without scanning the entire chat for a rare term.
+Existing stores build the index on their next open. The projection's separate
 word-prefix FTS query remains available, and there is no server search fallback.
 A short local history does not establish that the server has no older messages.
 

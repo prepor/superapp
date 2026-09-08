@@ -5,7 +5,6 @@ use rusqlite::Connection;
 #[test]
 fn substring_index_upgrades_cached_history_and_tracks_message_identity() {
     let c = Connection::open_in_memory().unwrap();
-    c.pragma_update(None, "recursive_triggers", true).unwrap();
     c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
     Schema { app: "telegram", steps: &SCHEMA.steps[..14] }.apply(&c).unwrap();
     c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'One'), (20, 'group', 'Two');
@@ -39,8 +38,33 @@ fn substring_index_upgrades_cached_history_and_tracks_message_identity() {
     c.execute_batch("UPDATE tg_message SET service = 1 WHERE chat = 10 AND id = 2;
         DELETE FROM tg_message WHERE chat = 10 AND id = 1;").unwrap();
     assert!(chats("rm").is_empty());
-    c.execute_batch("INSERT OR REPLACE INTO tg_message(seq, id, chat, date, text)
-        SELECT seq, id, chat, date, 'coffee' FROM tg_message WHERE chat = 20;").unwrap();
-    assert!(chats("pot").is_empty());
-    assert_eq!(chats("fee"), [20]);
+}
+
+#[test]
+fn substring_index_repairs_stale_grams_from_older_writers_once() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+    SCHEMA.apply(&c).unwrap();
+    // Reproduce a store made by the old writer, including an orphan posting
+    // and a replaced row whose key was reused. No repair marker existed yet.
+    c.pragma_update(None, "recursive_triggers", false).unwrap();
+    c.execute_batch("DELETE FROM meta WHERE key = 'telegram:message-substr';
+        INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'One');
+        INSERT INTO tg_chat(peer) VALUES(10);
+        INSERT INTO tg_message(seq, id, chat, date, text)
+            VALUES(1, 1, 10, 1, 'teapot'), (2, 2, 10, 2, 'teapot');
+        INSERT OR REPLACE INTO tg_message(seq, id, chat, date, text)
+            VALUES(1, 1, 10, 1, 'coffee'), (3, 2, 10, 2, 'coffee');").unwrap();
+    let count = |text: &str| -> i64 {
+        let q = search_index::predicate(text).unwrap();
+        c.query_row("SELECT COUNT(*) FROM tg_message_substr WHERE tg_message_substr MATCH ?",
+            rusqlite::params_from_iter(&q.params), |r| r.get(0)).unwrap()
+    };
+    assert_eq!(count("pot"), 2, "old REPLACE retained both posting lists");
+    SCHEMA.apply(&c).unwrap();
+    assert_eq!(count("pot"), 0);
+    assert_eq!(count("fee"), 2);
+    let changed = c.total_changes();
+    SCHEMA.apply(&c).unwrap();
+    assert_eq!(c.total_changes(), changed, "repair only runs once");
 }
