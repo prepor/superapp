@@ -12,7 +12,7 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::media::{self, VideoPlayback};
+use crate::shell::widgets::media::{self, SeekBar, VideoPlayback};
 
 use super::super::model::{self};
 use super::super::panels::Viewer;
@@ -39,20 +39,6 @@ pub struct ViewerPanel {
     scrubbing: Option<SeekBar>,
     #[rust]
     playback: VideoPlayback,
-}
-
-/// Keep the geometry and duration from the press for the whole drag, even
-/// outside the bar or while the time label changes width.
-#[derive(Clone, Copy)]
-struct SeekBar {
-    rect: Rect,
-    length: f64,
-}
-
-impl SeekBar {
-    fn position(self, x: f64) -> f64 {
-        ((x - self.rect.pos.x) / self.rect.size.x).clamp(0.0, 1.0) * self.length
-    }
 }
 
 impl Widget for ViewerPanel {
@@ -271,12 +257,7 @@ impl Widget for ViewerPanel {
                 props.slot,
             );
         }
-        self.seek_bar = player
-            .filter(|st| st.length.is_finite() && st.length > 0.0)
-            .and_then(|st| media::seek_rect(cx, &player_w).map(|rect| SeekBar {
-                rect,
-                length: st.length,
-            }));
+        self.seek_bar = player.and_then(|st| SeekBar::from_player(cx, &player_w, st));
         if let Some(bar) = self.seek_bar {
             props.hits.add("seek", bar.rect, MouseCursor::Hand, props.slot);
         } else {

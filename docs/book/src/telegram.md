@@ -373,6 +373,10 @@ playback in another Telegram panel pauses the previous player, including when
 a transcript and its message card remain visible together. Selecting or marking
 a message keeps the same native player.
 
+Click or drag the progress bar to seek in the transcript, message card or
+viewer. Seeking preserves play/pause state, clamps at either end, and waits
+for an uncached clip to download and prepare before applying the position.
+
 Playing videos retain their original aspect ratio, both inline and inside the
 viewer, including when the window is resized.
 
