@@ -459,7 +459,11 @@ impl Widget for ChatPanel {
             }
         }
 
-        super::text::handle_event(&mut self.view, cx, event, scope);
+        let actions = cx.capture_actions(|cx| super::text::handle_event(&mut self.view, cx, event, scope));
+        if self.video.handle_actions(cx, &clip_box, &actions) {
+            self.view.redraw(cx);
+        }
+        cx.extend_actions(actions);
         let video_after = media::video_word(cx, &clip_box);
         if video_before != video_after {
             self.view.redraw(cx);
@@ -747,19 +751,14 @@ impl Widget for ChatPanel {
                         c.playback(m.id).map(|p| self.video.drive(cx, &video, p, m, now))
                     }).flatten();
                     let shown = result.as_ref().is_some_and(|d| d.shown);
-                    inline_video::fill_slot(cx, &slot, &video, m, shown);
-                    if shown {
-                        line.widget(cx, ids!(body.img_box)).set_visible(cx, false);
-                    }
+                    let note = result.as_ref().and_then(|d| d.note.as_deref());
+                    inline_video::fill_slot(cx, &slot, &video, shown, note);
                     if let Some(result) = result {
                         video_drawn = true;
                         video_redraw |= result.redraw;
                         players[idx] = result.player;
                         let player = line.widget(cx, ids!(body.player));
                         media::fill_player(cx, &player, result.player.as_ref());
-                        let note = line.label(cx, ids!(body.download_lbl));
-                        note.set_text(cx, result.note.as_deref().unwrap_or(""));
-                        note.set_visible(cx, result.note.is_some());
                     }
                 }
                 row.draw_all(cx, scope);
@@ -1258,10 +1257,11 @@ pub fn populate(
                 .as_ref()
                 .and_then(|md| md.picture_bytes(render.store_dir.as_deref()));
             let img_box = line.widget(cx, ids!(body.img_box));
-            let decode = bytes.is_some() && fresh(&img_box);
-            let shown = media::fill_picture(cx, &img_box, bytes.as_deref(), decode);
-            line.widget(cx, ids!(body.clip_box)).set_visible(cx, false);
-            line.label(cx, ids!(body.download_lbl)).set_visible(cx, false);
+            let slot = line.widget(cx, ids!(body.clip_box));
+            let video = inline_video::has_video(m);
+            let decode = bytes.is_some() && fresh(if video { &slot } else { &img_box });
+            inline_video::fill_poster(cx, &slot, m, bytes.as_deref().filter(|_| video), decode);
+            let shown = media::fill_picture(cx, &img_box, bytes.as_deref().filter(|_| !video), decode);
             let place = m
                 .media
                 .as_ref()

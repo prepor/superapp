@@ -2,44 +2,73 @@
 //! so replacing a virtual row or its selection twin never replaces the player.
 
 use makepad_widgets::*;
+use makepad_widgets::widget_tree::CxWidgetExt;
 
 use crate::shell::widgets::media::{self, PlayerState, VideoPlayback};
 use super::super::model::{Msg, MsgId};
 use super::super::panels::playback::Playback;
 
-/// Draw a shared video without forwarding events a second time. The hidden
-/// source view in the chat owns event delivery, even while a row is recycled.
+/// One media surface for the poster, shared video and download feedback.
+/// The panel's hidden source owns event delivery, even as rows are recycled.
 #[derive(Script, ScriptHook, Widget)]
 pub struct InlineVideoSlot {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[rust]
+    aspect: f64,
 }
 
 impl Widget for InlineVideoSlot {
     fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
+        // Both the poster and the decoded frames fill this one rectangle.
+        // Fit the whole surface, including portrait clips, into the column.
+        let available = cx.peek_walk_turtle(Walk { width: Size::fill(), ..walk }).size.x;
+        let aspect = if self.aspect > 0.0 { self.aspect } else { 16.0 / 9.0 };
+        let width = available.clamp(0.0, 320.0).min(480.0 * aspect);
+        walk.width = Size::Fixed(width);
+        walk.height = Size::Fixed(width / aspect);
         self.view.draw_walk(cx, scope, walk)
     }
 }
 
-pub fn fill_slot(_cx: &mut Cx, slot: &WidgetRef, video: &WidgetRef, m: &Msg, shown: bool) {
-    if let Some(mut slot) = slot.borrow_mut::<InlineVideoSlot>() {
-        slot.view.visible = shown;
-        slot.view.children.clear();
-        if shown {
-            slot.view.children.push((live_id!(video), video.clone()));
-            slot.view.walk.height = Size::Fixed(height(m));
-        }
-    }
+pub fn has_video(m: &Msg) -> bool {
+    m.media.as_ref().is_some_and(|md| matches!(md.kind.as_str(), "video" | "circle" | "animation"))
 }
 
-pub fn height(m: &Msg) -> f64 {
-    m.media.as_ref().and_then(|md| Some((md.w?, md.h?)))
-        .filter(|(w, h)| *w > 0 && *h > 0)
-        .map_or(180.0, |(w, h)| (320.0 * h as f64 / w as f64).clamp(80.0, 480.0))
+/// Reserve the final video dimensions before downloading or preparing it.
+/// Thumbnail dimensions must never determine a video's transcript height.
+pub fn fill_poster(cx: &mut Cx, slot: &WidgetRef, m: &Msg, bytes: Option<&[u8]>, decode: bool) -> bool {
+    if let Some(mut slot) = slot.borrow_mut::<InlineVideoSlot>() {
+        slot.view.visible = has_video(m);
+        let fallback = if m.media.as_ref().is_some_and(|md| md.kind == "circle") { 1.0 } else { 16.0 / 9.0 };
+        slot.aspect = m.media.as_ref().and_then(|md| Some((md.w?, md.h?)))
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .map_or(fallback, |(w, h)| w as f64 / h as f64);
+    }
+    let poster = slot.child(live_id!(poster));
+    media::fill_picture(cx, &poster, bytes, decode)
+}
+
+pub fn fill_slot(cx: &mut Cx, slot: &WidgetRef, video: &WidgetRef, shown: bool, note: Option<&str>) {
+    if let Some(mut holder) = slot.child(live_id!(playback)).borrow_mut::<View>() {
+        if holder.children.first().map(|(_, widget)| widget) != shown.then_some(video) {
+            holder.children.clear();
+            if shown {
+                holder.children.push((live_id!(video), video.clone()));
+            }
+            cx.widget_tree_mark_dirty(holder.widget_uid());
+        }
+    }
+    if shown {
+        slot.child(live_id!(poster)).set_visible(cx, false);
+    }
+    let status = slot.child(live_id!(status));
+    status.set_visible(cx, note.is_some());
+    status.label(cx, ids!(download_lbl)).set_text(cx, note.unwrap_or(""));
 }
 
 #[derive(Default)]
@@ -47,6 +76,7 @@ pub struct InlineVideo {
     playback: VideoPlayback,
     source: Option<(MsgId, Option<String>)>,
     last_word: String,
+    frame_ready: bool,
 }
 
 pub struct InlineDrawn {
@@ -60,6 +90,24 @@ impl InlineVideo {
     pub fn reset(&mut self, cx: &mut Cx) {
         self.playback.reset(cx);
         self.source = None;
+        self.frame_ready = false;
+    }
+
+    /// Prepared/playing only says the decoder has started. Keep the poster
+    /// until this particular player has delivered its first texture, even
+    /// when that frame's timestamp is zero.
+    pub fn handle_actions(&mut self, cx: &mut Cx, video: &WidgetRef, actions: &Actions) -> bool {
+        let clip = video.widget(cx, ids!(clip));
+        for action in actions.filter_widget_actions(clip.widget_uid()) {
+            if let VideoAction::TextureUpdated = action.cast() {
+                if clip.as_video().is_playing() || clip.as_video().is_paused() {
+                    self.frame_ready = true;
+                    clip.as_video().should_dispatch_texture_updates(false);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn drive(
@@ -69,10 +117,17 @@ impl InlineVideo {
         if self.source.as_ref() != Some(&source) {
             self.playback.reset(cx);
             self.source = Some(source);
+            self.frame_ready = false;
         }
         let native = player.plays_clip(m);
         let file = native.then(|| player.clip_file(m)).flatten();
         let drawn = self.playback.drive(cx, video, file.as_deref(), player.running());
+        if !drawn.shown {
+            self.frame_ready = false;
+        }
+        video.widget(cx, ids!(clip)).as_video().should_dispatch_texture_updates(!self.frame_ready);
+        let shown = drawn.shown && self.frame_ready;
+        video.set_visible(cx, shown);
         if crate::shell::boot::frame_log() {
             let word = media::video_word(cx, video);
             if self.last_word != word {
@@ -90,7 +145,7 @@ impl InlineVideo {
         }
         let note = player.download_note(m);
         InlineDrawn {
-            shown: drawn.shown,
+            shown,
             player: player.player_state(m, now),
             redraw: player.playing(now) || note.is_some(),
             note,
@@ -107,6 +162,117 @@ mod tests {
         VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoTextureUpdatedEvent,
     };
     use crate::apps::telegram::{model, seed::STELAXIS, TELEGRAM};
+
+    /// Draw the actual surface template across the poster/loading/video
+    /// handoff. Its height is also the following message's scroll position.
+    #[cfg(headless)]
+    #[test]
+    fn inline_media_keeps_its_rectangle_through_playback() {
+        use std::cell::{Cell, RefCell};
+
+        static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+        let session = Session::fake(APPS);
+        let mut msg = model::history(session.store(), STELAXIS).iter()
+            .find(|m| has_video(m)).unwrap().clone();
+        let poster = msg.media.as_ref().unwrap().picture_bytes(None).unwrap();
+        let finished = Rc::new(Cell::new(false));
+        let seen = finished.clone();
+        let mut root = WidgetRef::empty();
+        let mut video = WidgetRef::empty();
+        let mut pass = None;
+        let mut draw_list: Option<DrawList> = None;
+        let mut frame = 0;
+        let mut baseline = None;
+        let formats = [
+            (1920, 1080, "video"), (1080, 1920, "video"), (1080, 1080, "video"),
+            (1920, 240, "video"), (0, 0, "video"), (0, 0, "circle"),
+        ];
+        let widths = [200.0, 640.0];
+        let count = formats.len() * widths.len() * 7;
+        let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
+            Event::Startup => {
+                (root, video) = cx.with_vm(|vm| {
+                    makepad_widgets::script_mod(vm);
+                    crate::shell::script_mod(vm);
+                    crate::apps::telegram::ui::script_mod(vm);
+                    let value = script_eval!(vm, {
+                        use mod.prelude.widgets.*
+                        mod.widgets.View {
+                            width: Fill, height: Fit, flow: Down, spacing: 2
+                            surface := mod.widgets.TelegramInlineVideo {}
+                            following := mod.widgets.View { width: Fill, height: 30 }
+                        }
+                    });
+                    let root = WidgetRef::script_from_value(vm, value);
+                    let value = script_eval!(vm, { mod.widgets.MediaVideo {} });
+                    (root, WidgetRef::script_from_value(vm, value))
+                });
+                makepad_widgets::widget_tree::set_ui_root(cx, &root);
+                let p = DrawPass::new(cx);
+                p.set_size(cx, dvec2(640.0, 800.0));
+                pass = Some(p);
+                draw_list = Some(DrawList::new(cx));
+                cx.redraw_all();
+            }
+            Event::Draw(event) if frame < count => {
+                let phase = frame % 7;
+                let scenario = frame / 7;
+                let width = widths[scenario / formats.len()];
+                let (w, h, kind) = formats[scenario % formats.len()];
+                let md = msg.media.as_mut().unwrap();
+                md.w = Some(w);
+                md.h = Some(h);
+                md.kind = kind.into();
+                let surface = root.child(live_id!(surface));
+                let bytes = (phase > 0).then_some(poster.as_slice());
+                assert_eq!(fill_poster(cx, &surface, &msg, bytes, phase == 1), phase > 0);
+                let playing = matches!(phase, 4 | 5);
+                video.set_visible(cx, playing);
+                fill_slot(cx, &surface, &video, playing, (phase == 2).then_some("downloading 25%"));
+                assert_eq!(surface.child(live_id!(poster)).visible(), phase > 0 && !playing);
+                let mut draw = CxDraw::new(cx, event);
+                let pass = pass.as_ref().unwrap();
+                draw.begin_pass(pass, Some(1.0));
+                let list = draw_list.as_mut().unwrap();
+                list.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(width, 800.0), Layout::default());
+                root.draw_all(&mut cx, &mut Scope::empty());
+                cx.end_turtle();
+                let rect = surface.area().rect(&cx);
+                let following = root.child(live_id!(following)).area().rect(&cx);
+                assert!(rect.size.x > 0.0 && rect.size.y > 0.0);
+                assert!(rect.size.x <= width && rect.size.x <= 320.0 && rect.size.y <= 480.0);
+                let aspect = if w > 0 && h > 0 { w as f64 / h as f64 }
+                    else if kind == "circle" { 1.0 } else { 16.0 / 9.0 };
+                assert!((rect.size.x / rect.size.y - aspect).abs() < 0.001);
+                if phase == 0 {
+                    baseline = Some((rect, following));
+                } else {
+                    assert_eq!((rect, following), baseline.unwrap(),
+                        "phase {phase} moved the media or following row for {w}x{h} in a {width}px column");
+                    let content = if playing {
+                        video.widget(&cx, ids!(clip))
+                    } else {
+                        surface.widget(&cx, ids!(poster.img))
+                    };
+                    assert_eq!(content.area().rect(&cx), rect,
+                        "poster and video must occupy the same rectangle, even with a mismatched thumbnail");
+                }
+                frame += 1;
+                if frame < count {
+                    cx.redraw_area_in_draw(root.area());
+                } else {
+                    seen.set(true);
+                }
+                list.end(&mut draw);
+                draw.end_pass(pass);
+            }
+            _ => {}
+        }))));
+        Cx::headless_event_loop_for_draw_cycles(cx, count);
+        assert!(finished.get(), "all media shapes and playback phases must draw");
+    }
 
     #[test]
     fn native_video_survives_row_replacement_and_releases_before_another_clip() {
@@ -131,8 +297,13 @@ mod tests {
             let mut source = View::script_new(vm);
             source.visible = false;
             source.children.push((live_id!(clip_box), video.clone()));
-            let first = WidgetRef::new_with_inner(Box::new(InlineVideoSlot::script_new(vm)));
-            let second = WidgetRef::new_with_inner(Box::new(InlineVideoSlot::script_new(vm)));
+            let slot = |vm: &mut ScriptVm| {
+                let mut slot = InlineVideoSlot::script_new(vm);
+                slot.view.children.push((live_id!(playback), WidgetRef::new_with_inner(Box::new(View::script_new(vm)))));
+                WidgetRef::new_with_inner(Box::new(slot))
+            };
+            let first = slot(vm);
+            let second = slot(vm);
             let mut root = View::script_new(vm);
             root.children.push((live_id!(source), WidgetRef::new_with_inner(Box::new(source))));
             root.children.push((live_id!(first), first.clone()));
@@ -151,24 +322,36 @@ mod tests {
             video_id: LiveId(0), video_width: 480, video_height: 300, duration: 14_000,
             is_seekable: true, video_tracks: Vec::new(), audio_tracks: Vec::new(),
         }), &mut Scope::empty());
+        assert!(!owner.drive(cx, &video, &mut player, &msg, 1.0).shown,
+            "preparation alone must not replace the poster with an empty video");
+        let frame = |id| Event::VideoTextureUpdated(VideoTextureUpdatedEvent {
+            video_id: LiveId(id), current_position_ms: 0, yuv: Default::default(), rgba_gl_2d: false,
+        });
+        let actions = cx.capture_actions(|cx| root.handle_event(cx, &frame(123), &mut Scope::empty()));
+        assert!(!owner.handle_actions(cx, &video, &actions));
+        assert!(!owner.drive(cx, &video, &mut player, &msg, 1.0).shown,
+            "another panel's first frame must not remove this poster");
+        let actions = cx.capture_actions(|cx| root.handle_event(cx, &frame(0), &mut Scope::empty()));
+        assert!(owner.handle_actions(cx, &video, &actions));
         assert!(owner.drive(cx, &video, &mut player, &msg, 1.0).shown,
-            "preparation must reach the hidden source before a row can show its video");
-        fill_slot(cx, &first, &video, &msg, true);
+            "the first decoded frame must reveal the video even at timestamp zero");
+        fill_slot(cx, &first, &video, true, None);
         root.handle_event(cx, &Event::VideoTextureUpdated(VideoTextureUpdatedEvent {
             video_id: LiveId(0), current_position_ms: 2500, yuv: Default::default(), rgba_gl_2d: false,
         }), &mut Scope::empty());
-        fill_slot(cx, &first, &video, &msg, false);
-        fill_slot(cx, &second, &video, &msg, true);
+        fill_slot(cx, &first, &video, false, None);
+        fill_slot(cx, &second, &video, true, None);
         let state = owner.drive(cx, &video, &mut player, &msg, 3.0).player.unwrap();
         assert_eq!(state, PlayerState { playing: true, position: 2.5, length: 14.0 });
-        assert!(first.borrow_mut::<InlineVideoSlot>().unwrap().view.children.is_empty());
-        assert_eq!(second.widget(cx, ids!(video.clip)), video.widget(cx, ids!(clip)),
+        assert!(first.child(live_id!(playback)).borrow_mut::<View>().unwrap().children.is_empty());
+        assert_eq!(second.widget(cx, ids!(playback.video.clip)), video.widget(cx, ids!(clip)),
             "a different row or selection twin must draw the same native player");
         assert_eq!(root.child(live_id!(source)).child(live_id!(clip_box)), video,
             "the owner must keep finding its player after a row indexes it as a child");
 
         player.pause(4.0);
-        owner.drive(cx, &video, &mut player, &msg, 4.0);
+        assert!(owner.drive(cx, &video, &mut player, &msg, 4.0).shown,
+            "pausing must retain the decoded picture");
         assert!(clip.is_paused());
         let mut next = msg.clone();
         next.id += 1;
