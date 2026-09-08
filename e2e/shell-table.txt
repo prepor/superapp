@@ -126,8 +126,9 @@ shot c5-copied
 
 # -- esc lets the set go ------------------------------------------------------
 
-# The copy took the marks with it, so there is a set to make again.
-click "filter"
+# The copy took the marks with it, so there is a set to make again. Re-enter
+# the current list's filter with its keyboard shortcut.
+key /
 wait 300
 key cmd+a
 type "@memory"

@@ -122,14 +122,12 @@ impl Stage {
         cmd: bool,
         n: u32,
     ) {
-        if n > 1 {
-            hand_the_pointer_back(cx);
-        }
         let t = next_gesture_time();
         for i in 0..n.max(1) {
             for ev in press_release_at(p, cmd, t + f64::from(i) * CLICK_GAP) {
                 pointer_before(cx, &ev);
                 self.handle_with(cx, sh, &ev);
+                pointer_after(cx, &ev);
                 self.settle(cx, sh);
             }
         }
@@ -146,7 +144,7 @@ impl Stage {
             handled: std::cell::Cell::new(Area::Empty),
             time: t,
         });
-        cx.fingers.process_tap_count(from, t);
+        pointer_before(cx, &down);
         self.forward_to_hosted(cx, sh, &down);
         for i in 1..=8 {
             let f = f64::from(i) / 8.0;
@@ -168,6 +166,7 @@ impl Stage {
             time: t + 0.2,
         });
         self.forward_to_hosted(cx, sh, &up);
+        pointer_after(cx, &up);
     }
 }
 
@@ -186,30 +185,22 @@ fn next_gesture_time() -> f64 {
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64
 }
 
-/// The press bookkeeping the platform's own event loop does and a
-/// synthesized press skips: how many presses deep this one is. Without it
-/// every press a script makes is a first click, and no widget it drives is
-/// ever handed a double one.
+/// The press bookkeeping the platform's own event loop does: which button
+/// owns the capture and how many presses deep this gesture is.
 pub(super) fn pointer_before(cx: &mut Cx, ev: &Event) {
     if let Event::MouseDown(e) = ev {
+        cx.fingers.mouse_down(e.button, e.window_id);
         cx.fingers.process_tap_count(e.abs, e.time);
     }
 }
 
-/// The other half of that loop, which a scripted run also skips: the pointer
-/// handed back on a release. A widget a script pressed keeps the capture and
-/// is dealt every later press wherever it lands — which is invisible while a
-/// press only moves a caret, and is a whole word washed in a letter nobody
-/// clicked once a press selects. A gesture that means to select hands the
-/// pointer back before it starts.
-///
-/// Only there. Handing it back after every scripted release would be truer
-/// to the platform, but it is not what the suites were written against: a
-/// press whose fresh hit test fails still reaches the widget holding the
-/// capture, and steps in `shell-table` lean on that.
-fn hand_the_pointer_back(cx: &mut Cx) {
-    cx.fingers.mouse_down(MouseButton::PRIMARY, CxWindowPool::id_zero());
-    cx.fingers.mouse_up(MouseButton::PRIMARY);
+/// Release after the widget sees the up event, as the platform does. A
+/// stale capture would let an earlier widget answer the next press outside
+/// its bounds and overwrite the clicked field's keyboard focus.
+pub(super) fn pointer_after(cx: &mut Cx, ev: &Event) {
+    if let Event::MouseUp(e) = ev {
+        cx.fingers.mouse_up(e.button);
+    }
 }
 
 /// The gap between the presses of one multi-click gesture, seconds. Well
@@ -253,4 +244,48 @@ fn press_release_at(p: DVec2, cmd: bool, t: f64) -> [Event; 2] {
             time: t + 0.1,
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use makepad_widgets::makepad_platform::CxRectArea;
+
+    #[test]
+    fn released_click_does_not_reach_previous_widget() {
+        // Hosted widgets can be visited in either order. Once the first
+        // click is released, only the next click's target may answer it.
+        for order in [[0, 1], [1, 0]] {
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let draw_list = DrawList::new(&mut cx);
+            let id = draw_list.id();
+            let areas = [0, 1].map(|i| {
+                let rect = Rect {
+                    pos: dvec2(i as f64 * 100.0, 0.0), size: dvec2(80.0, 40.0),
+                };
+                cx.draw_lists[id].rect_areas.push(CxRectArea {
+                    rect,
+                    draw_clip: (rect.pos, rect.pos + rect.size),
+                });
+                Area::Rect(RectArea {
+                    draw_list_id: id, rect_id: i, redraw_id: cx.draw_lists[id].redraw_id,
+                })
+            });
+            for target in [0, 1, 0] {
+                let at = areas[target].rect(&cx).pos + dvec2(10.0, 10.0);
+                let mut pressed = Vec::new();
+                for event in press_release(at, false) {
+                    pointer_before(&mut cx, &event);
+                    for i in order {
+                        if matches!(event.hits(&mut cx, areas[i]), Hit::FingerDown(_)) {
+                            pressed.push(i);
+                        }
+                    }
+                    pointer_after(&mut cx, &event);
+                }
+                assert_eq!(pressed, vec![target],
+                    "a released widget must not receive a later click outside it");
+            }
+        }
+    }
 }
