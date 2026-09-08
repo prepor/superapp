@@ -25,8 +25,11 @@
 //! the way a finger does. So are the play buttons and the pictures inside
 //! them.
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use kernel::nav::Nav;
-use kernel::panel::{PanelId, Tag};
+use kernel::panel::{Panel, PanelId, Tag};
 use kernel::session::Session;
 use makepad_widgets::*;
 
@@ -120,6 +123,10 @@ pub struct ChatPanel {
     view: View,
     #[rust]
     rows: Vec<RowHit>,
+    /// The instance that produced the drawn rows. A slot can be replaced
+    /// before the shell rebuilds its retained widget on the next draw.
+    #[rust]
+    drawn_for: Weak<RefCell<Box<dyn Panel>>>,
     #[rust]
     inner: Vec<InnerHit>,
     /// The first look at a live panel has happened: the field took the
@@ -190,6 +197,12 @@ impl Widget for ChatPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        // Row geometry and input belong to the instance last drawn, even
+        // when another chat or target reuses this slot and its message ids.
+        if !self.drawn_for.ptr_eq(&Rc::downgrade(&props.panel)) {
+            self.viewed = None;
+            return;
+        }
         if self.draft_timer.is_event(event).is_some() {
             self.draft_timer = Timer::default();
             with_chat(&props, Chat::save_pending_draft);
@@ -889,6 +902,7 @@ impl Widget for ChatPanel {
         if (moving && active_visible) || video_redraw || self.refocus {
             self.view.redraw(cx);
         }
+        self.drawn_for = Rc::downgrade(&props.panel);
         DrawStep::done()
     }
 }
@@ -1322,6 +1336,9 @@ fn with_chat<R>(props: &PanelProps, f: impl FnOnce(&mut Chat) -> R) -> Option<R>
 fn leave_field(cx: &mut Cx, view: &View) {
     cx.set_key_focus(view.area());
 }
+
+#[cfg(all(test, headless))]
+mod reading_tests;
 
 #[cfg(test)]
 mod tests {
