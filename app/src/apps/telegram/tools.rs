@@ -101,8 +101,8 @@ pub fn all() -> Vec<Tool> {
              and refuses if the draft or attachment order changed or an edit is open. \
              Files send as separate messages, with text and reply on the first. Check \
              telegram.status for every id in operations; operation is the first id. \
-             Queued does not mean delivered. Partially queued sends report the queued \
-             operations and remaining_files; never repeat the original send automatically. \
+             Queued does not mean delivered. All files queue as one action; one undo \
+             covers every attachment. Never repeat a pending or uncertain send automatically. \
              Offline failures keep the draft. Undo requests deletion for everyone; Telegram must confirm it.",
             send_input,
             true,
@@ -355,7 +355,8 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
         let _ = c.card();
         new_message_composer(c)?;
         if !msg.files.starts_with(c.carrying()) {
-            return Err("this composer has attachments; keep them at the start of files in their current order, or finish them in Telegram first".into());
+            let files = json!(c.carrying().iter().map(|f| &f.path).collect::<Vec<_>>());
+            return Err(format!("this composer has attachments; keep these paths at the start of files in this order: {files}"));
         }
         if !replace
             && ((!c.field_text().is_empty() && c.field_text() != msg.text)
@@ -437,9 +438,7 @@ fn send(s: &mut Session, input: &Value) -> Result<Value, String> {
     msg.validate_files()?;
     let operations = c.send_draft(s);
     let operation = operations.first().ok_or("Telegram could not queue the message; the draft is kept")?;
-    let remaining: Vec<_> = c.carrying().iter().map(|f| &f.path).collect();
-    Ok(json!({"status": if remaining.is_empty() { "queued" } else { "partially_queued" },
-        "operation": operation, "operations": operations, "remaining_files": remaining,
+    Ok(json!({"status": "queued", "operation": operation, "operations": operations,
         "chat": msg.chat, "topic": msg.topic}))
 }
 

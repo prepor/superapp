@@ -148,7 +148,6 @@ fn agents_send_photos_and_documents_with_a_caption_and_individual_delivery_statu
 
     let result = call(&mut s, "telegram.send", d.clone()).unwrap();
     assert_eq!(result["status"], "queued");
-    assert_eq!(result["remaining_files"], json!([]));
     let operations = result["operations"].as_array().unwrap();
     assert_eq!(operations.len(), 2);
     assert_eq!(result["operation"], operations[0]);
@@ -187,7 +186,7 @@ fn agents_send_photos_and_documents_with_a_caption_and_individual_delivery_statu
 }
 
 #[test]
-fn partial_sends_report_queued_operations_and_keep_unsent_files_in_every_copy() {
+fn a_disconnected_batch_keeps_all_files_in_every_copy() {
     let attachments = Attachments::new();
     let document = attachments.file("report.txt", b"the report");
     let mut s = session();
@@ -199,8 +198,8 @@ fn partial_sends_report_queued_operations_and_keep_unsent_files_in_every_copy() 
     let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
     assert!(rt.operations.list().is_empty());
 
-    // Lose the connection after recording the second send, before it can
-    // enter the worker's inbox. The first file has already been queued.
+    // Lose the connection after recording the batch, before any file can
+    // enter the worker's inbox. Both operations belong to the same action.
     let worker = rt.clone();
     s.store().write(move |c| {
         c.commit_hook(Some(move || {
@@ -211,27 +210,66 @@ fn partial_sends_report_queued_operations_and_keep_unsent_files_in_every_copy() 
         }))?;
         Ok(())
     }).unwrap();
-    let result = call(&mut s, "telegram.send", d.clone()).unwrap();
+    assert!(call(&mut s, "telegram.send", d.clone()).is_err());
     s.store().write(|c| c.commit_hook(None::<fn() -> bool>)).unwrap();
-    assert_eq!(result["status"], "partially_queued");
-    assert_eq!(result["operations"], json!([result["operation"]]));
-    assert_eq!(result["remaining_files"], json!([document]));
-    let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
-    assert_eq!(request["@extra"]["operation"], result["operation"]);
-    assert_eq!(request["input_message_content"]["caption"]["text"], "caption");
-    assert!(inbox.try_recv().is_err());
+    assert!(inbox.try_recv().is_err(), "none of the batch was queued");
     for open in [first, second] {
-        assert_eq!(field_now(&s, open), "");
-        assert_eq!(with_chat(&s, open, |c| c.carrying().to_vec()), vec![model::Carried { path: document.clone() }]);
+        assert_eq!(field_now(&s, open), "caption");
+        assert_eq!(with_chat(&s, open, |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), vec![PHOTO.to_string(), document.clone()]);
     }
     rt.set_connection_error(None);
-    assert!(call(&mut s, "telegram.send", d).is_err(), "the original send cannot be repeated");
-    let remaining = draft(&mut s, json!({"chat": VERA, "text": "", "files": [document]}));
-    assert_eq!(call(&mut s, "telegram.send", remaining).unwrap()["status"], "queued");
-    let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
-    assert_eq!(request["input_message_content"]["document"]["document"]["path"], document);
-    assert_eq!(request["input_message_content"]["caption"]["text"], "");
-    assert!(inbox.try_recv().is_err());
+    assert_eq!(call(&mut s, "telegram.send", d).unwrap()["status"], "queued");
+    let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["input_message_content"]["caption"]["text"], "caption");
+    assert_eq!(requests[1]["input_message_content"]["document"]["document"]["path"], document);
+    assert_eq!(requests[1]["input_message_content"]["caption"]["text"], "");
+}
+
+#[test]
+fn one_undo_reverses_every_attachment_in_a_send() {
+    use crate::apps::telegram::history as telegram_history;
+    for (from_panel, undo_before_delivery) in [(false, false), (false, true), (true, false), (true, true)] {
+        let attachments = Attachments::new();
+        let document = attachments.file("report.txt", b"the report");
+        let mut s = session();
+        open_root(&mut s, Chats::id());
+        let rt = runtime::of(s.store());
+        let inbox = rt.connect();
+        let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
+        let (before, head) = s.history().rows();
+        if from_panel { send(&mut s, slot(&d)); }
+        else { call(&mut s, "telegram.send", d).unwrap(); }
+        let (after, _) = s.history().rows();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(after.last().unwrap().label, "send 2 attachments · Vera Kovac");
+        let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+        assert_eq!(requests.len(), 2);
+        if undo_before_delivery {
+            assert!(s.undo());
+            assert!(inbox.try_recv().is_err(), "undo waits for Telegram's message ids");
+        }
+        for (i, request) in requests.iter().enumerate() {
+            rt.operations.reply(s.store(), &json!({
+                "@type": "message", "chat_id": VERA, "id": 9000 + i,
+                "@extra": request["@extra"], "sending_state": null
+            }));
+        }
+        if !undo_before_delivery { assert!(s.undo()); }
+        telegram_history::pump(s.store());
+        assert_eq!(s.history().head(), head, "one undo returns past the entire send");
+        let deletes: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+        assert_eq!(deletes.len(), 2);
+        let mut ids = Vec::new();
+        for delete in &deletes {
+            assert_eq!(delete["@type"], "deleteMessages");
+            assert_eq!(delete["chat_id"], VERA);
+            assert_eq!(delete["revoke"], true);
+            ids.extend(delete["message_ids"].as_array().unwrap().iter().map(|id| id.as_i64().unwrap()));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![9000, 9001], "the captioned first attachment is undone too");
+    }
 }
 
 #[test]
@@ -271,21 +309,25 @@ fn captionless_attachments_update_and_clear_every_matching_open_composer() {
 fn agents_can_append_attachments_but_cannot_discard_existing_files() {
     let attachments = Attachments::new();
     let document = attachments.file("report.txt", b"the report");
+    let notes = attachments.file("notes \"draft\".txt", b"notes");
     let mut s = session();
     let first = open_root(&mut s, Chat::id(VERA));
     let message = model::history(s.store(), VERA).last().unwrap().id;
     let second = open_root(&mut s, Chat::at(VERA, message));
-    with_chat(&s, second, |c| { c.carry(&[PHOTO.into()]); });
-    assert!(call(&mut s, "telegram.draft", json!({
+    with_chat(&s, second, |c| { c.carry(&[PHOTO.into(), notes.clone()]); });
+    let error = call(&mut s, "telegram.draft", json!({
         "chat": VERA, "text": "caption", "replace": true, "files": [document]
-    })).is_err());
+    })).unwrap_err();
+    let mut files: Vec<String> = serde_json::from_str(error.split_once("in this order: ").unwrap().1).unwrap();
+    assert_eq!(files, vec![PHOTO.to_string(), notes]);
     assert_eq!(field_now(&s, first), "", "all composers are checked before any is changed");
     assert!(with_chat(&s, first, |c| c.carrying().is_empty()));
-    let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
+    files.push(document);
+    let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": files}));
     for open in [first, second] {
-        assert_eq!(with_chat(&s, open, |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), vec![PHOTO.to_string(), document.clone()]);
+        assert_eq!(with_chat(&s, open, |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), files);
     }
-    assert_eq!(d["files"], json!([PHOTO, document]));
+    assert_eq!(d["files"], json!(files));
 }
 
 #[test]
@@ -675,7 +717,8 @@ fn a_remote_draft_cannot_replace_the_reviewed_text_at_the_queue_boundary() {
         .as_any()
         .downcast_mut::<Chat>()
         .unwrap()
-        .send_text_draft(&mut s)
+        .send_draft(&mut s)
+        .into_iter().next()
         .unwrap();
     let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@extra"]["operation"], operation);

@@ -2262,6 +2262,7 @@ fn telegram_attachments_wait_for_approval_and_reject_changes_to_the_file_order()
             .find(|c| c.id == waiting.id).unwrap().clone();
         if decision == "allow" {
             assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
+            assert_eq!(answered.label.as_deref(), Some("send 2 attachments · Vera Kovac"));
             let result: Value = serde_json::from_str(answered.output.as_deref().unwrap()).unwrap();
             let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
             assert_eq!(requests.len(), 2);

@@ -642,7 +642,7 @@ impl Chat {
 
     /// Another open copy sent this exact draft. Its send already cleared
     /// the row; forget our copy without a second write or a focus change.
-    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgKey>, files: &[Carried], sent_files: usize) {
+    fn forget_sent_draft(&mut self, text: &str, reply_to: Option<MsgKey>, files: &[Carried]) {
         if self.editing.is_none() && self.carrying == files
             && self.draft == text && self.reply_to == reply_to
         {
@@ -651,7 +651,7 @@ impl Chat {
             self.seen_draft.clear();
             self.draft_pending = false;
             self.reply_to = None;
-            self.carrying.drain(..sent_files);
+            self.carrying.clear();
         }
     }
 
@@ -836,97 +836,56 @@ impl Chat {
         s.redraw();
     }
 
-    /// A live text send, shared by Enter and the agent's approved send.
-    /// Its operation id is captured at the queue boundary, not guessed from
-    /// later tracker state. A failure leaves the composer intact.
-    pub fn send_text_draft(&mut self, s: &mut Session) -> Option<u64> {
+    /// A live send, shared by Enter and the agent's approved send. Every
+    /// attachment belongs to one history action; delivery is still tracked
+    /// per message. A queue failure leaves the whole composer intact.
+    pub fn send_draft(&mut self, s: &mut Session) -> Vec<u64> {
         // Read permission without reconciling a newer remote draft: the
         // caller has already read the composer, and the tool approved that
         // exact text. Nothing may substitute other words at this boundary.
-        if super::super::topics::card(&self.store, self.peer, self.topic)
-            .is_some_and(|c| !c.can_post()) || self.editing.is_some()
-            || !self.carrying.is_empty() || self.draft.trim().is_empty()
-        {
-            return None;
-        }
-        let text = self.draft.clone();
-        let reply = self.reply_to;
-        let operation = match super::super::history::command(
-            s,
-            &self.request(requests::send_message(self.peer, text.trim(), reply.map(|(_, id)| id))),
-        ) {
-            Ok(id) => Some(id),
-            Err(error) => { error.notify(s, "send"); None }
-        };
-        if operation.is_some() {
-            self.set_draft("");
-            self.sent_draft.clear();
-            self.seen_draft.clear();
-            self.reply_to = None;
-            for (slot, panel) in s.panels() {
-                if slot == self.slot { continue; }
-                let mut p = panel.borrow_mut();
-                if let Some(c) = p.as_any().downcast_mut::<Chat>()
-                    .filter(|c| c.peer == self.peer && c.topic == self.topic)
-                {
-                    c.forget_sent_draft(&text, reply, &[], 0);
-                }
-            }
-        }
-        s.redraw();
-        operation
-    }
-
-    /// Only queued files leave the composer. Each queued request owns its
-    /// caption, reply and source path until Telegram confirms delivery.
-    /// Enter and an approved agent send use this same boundary; partial
-    /// sends return every queued operation and retain the unsent files.
-    pub fn send_draft(&mut self, s: &mut Session) -> Vec<u64> {
-        // As with text sends, never reconcile remote draft text after an
-        // agent has checked the composer's exact contents for approval.
-        if super::super::topics::card(&self.store, self.peer, self.topic)
-            .is_some_and(|c| !c.can_post()) || self.editing.is_some()
+        let card = super::super::topics::card(&self.store, self.peer, self.topic);
+        if card.as_ref().is_some_and(|c| !c.can_post()) || self.editing.is_some()
+            || (self.carrying.is_empty() && self.draft.trim().is_empty())
         {
             return Vec::new();
-        }
-        if self.carrying.is_empty() {
-            return self.send_text_draft(s).into_iter().collect();
         }
         let text = self.draft.clone();
         let reply = self.reply_to;
         let carried = self.carrying.clone();
-        let mut operations = Vec::new();
-        let files = std::mem::take(&mut self.carrying);
-        let mut files = files.into_iter().enumerate();
-        while let Some((i, file)) = files.next() {
-            let request = requests::send_file(
+        let requests: Vec<_> = if carried.is_empty() {
+            vec![self.request(requests::send_message(self.peer, text.trim(), self.reply_to()))]
+        } else {
+            carried.iter().enumerate().map(|(i, file)| self.request(requests::send_file(
                 self.peer,
                 if i == 0 { self.reply_to() } else { None },
-                &file,
+                file,
                 if i == 0 { text.trim() } else { "" },
-            );
-            match super::super::history::command(s, &self.request(request)) {
-                Ok(operation) => operations.push(operation),
-                Err(error) => {
-                    self.carrying.push(file);
-                    self.carrying.extend(files.map(|(_, file)| file));
-                    error.notify(s, "send");
-                    break;
-                }
-            }
-        }
+            ))).collect()
+        };
+        let queued = if requests.len() == 1 {
+            super::super::history::command(s, &requests[0]).map(|id| vec![id])
+        } else {
+            let label = format!("send {} attachments", carried.len());
+            let label = card.map_or(label.clone(), |c| format!("{label} · {}", c.name));
+            super::super::history::batch(s, &requests, label)
+        };
+        let operations = match queued {
+            Ok(ids) => ids,
+            Err(error) => { error.notify(s, "send"); Vec::new() }
+        };
         if !operations.is_empty() {
             self.set_draft("");
             self.sent_draft.clear();
             self.seen_draft.clear();
             self.reply_to = None;
+            self.carrying.clear();
             for (slot, panel) in s.panels() {
                 if slot == self.slot { continue; }
                 let mut p = panel.borrow_mut();
                 if let Some(c) = p.as_any().downcast_mut::<Chat>()
                     .filter(|c| c.peer == self.peer && c.topic == self.topic)
                 {
-                    c.forget_sent_draft(&text, reply, &carried, operations.len());
+                    c.forget_sent_draft(&text, reply, &carried);
                 }
             }
         }

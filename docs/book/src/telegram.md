@@ -238,9 +238,11 @@ regular files and stay available until delivery.
 Forum topics keep their own destination. Existing draft text requires explicit
 `replace: true`; edits must be finished in the panel. Existing attachments
 must remain at the start of `files` in their current order, even with replace;
-new files can be appended. All open copies of the composer receive the staged
-draft, and long drafts scroll inside a bounded field. Draft text persists like
-typing; reply selections and attachment paths belong to the open composer.
+new files can be appended. If the list doesn't match, the error includes the
+existing paths as a JSON array in their current order. All open copies of the
+composer receive the staged draft, and long drafts scroll inside a bounded
+field. Draft text persists like typing; reply selections and attachment paths
+belong to the open composer.
 
 For example, `telegram.draft` accepts:
 
@@ -256,16 +258,18 @@ It uses the same send path as Enter, after the agent's ordinary approval card.
 If the text, destination, reply or attachment paths or order changed while
 approval was pending, it refuses the send. It rechecks file availability before
 queuing anything. Offline failures keep the draft. Queued text and attachments
-clear from every matching open copy of the composer.
+clear from every matching open copy of the composer. A multi-file send records
+one history action, labelled with the attachment count; one Undo requests
+deletion of every sent attachment, waiting for each delivery acknowledgement.
 
 A successful tool call reports **queued**, with an `operations` list containing
 one id per message; `operation` is the first id for compatibility with text sends.
 Check each id with `telegram.status` to learn whether Telegram confirmed it or
-returned an error. If queuing stops partway through, **partially_queued** reports
-the queued operations and `remaining_files`; unsent files stay in the composer.
-Pending, partial or uncertain delivery must not trigger an automatic repeat of
-the original send. Operation ids last for the current app session; completed
-send results remain queryable after their status line disappears.
+returned an error. All files queue together on one worker connection; a queue
+failure keeps the whole draft. Telegram still confirms or rejects each message
+individually. Pending or uncertain delivery must not trigger an automatic
+repeat of the original send. Operation ids last for the current app session;
+completed send results remain queryable after their status line disappears.
 
 ## Reactions
 

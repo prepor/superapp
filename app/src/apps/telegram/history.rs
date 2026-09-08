@@ -180,15 +180,13 @@ fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result
         return Err(Refusal::Reported);
     }
     journal.entries.lock().unwrap().extend(changes);
-    let mut disconnected = false;
-    for (id, request) in &tracked {
-        if !rt.send(request) {
+    if !rt.send_batch(tracked.iter().map(|(_, request)| request.as_str())) {
+        for (id, _) in &tracked {
             rt.operations.fail(s.store(), *id, "Telegram is disconnected; the request was not sent", false);
             rt.operations.forget_payload(*id);
-            disconnected = true;
         }
+        return Err(Refusal::Failed("Telegram is disconnected; the request could not be queued".into()));
     }
-    if disconnected { return Err(Refusal::Failed("Telegram is disconnected; the request could not be queued".into())); }
     Ok(tracked.into_iter().map(|(id, _)| id).collect())
 }
 
