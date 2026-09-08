@@ -225,6 +225,17 @@ impl Stage {
                 self.handle_text(cx, sh, &s);
             }
 
+            Step::Copy(expected) => {
+                let response = std::rc::Rc::new(std::cell::RefCell::new(None));
+                self.handle_with(cx, sh, &Event::TextCopy(TextClipboardEvent {
+                    response: response.clone(),
+                }));
+                if response.borrow().as_deref() != Some(expected.as_str()) {
+                    eprintln!("{}e2e: FAIL copy: expected {expected:?}, got {:?}", r.tag, response.borrow());
+                    r.failures += 1;
+                }
+            }
+
             // The same door, told that this came off a clipboard: a
             // composer that reads a paste for what it is cannot be driven
             // by `type`, and a pasted document keeps its newlines.

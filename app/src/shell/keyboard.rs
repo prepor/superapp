@@ -58,11 +58,15 @@ impl Keyboard {
                     editable,
                 });
             }
-            if widget.borrow::<TextFlow>().is_some()
-                || widget.borrow::<Html>().is_some()
-                || widget.borrow::<Markdown>().is_some()
-            {
-                return Some(Owner { letters: Letters::TEXT, editable: false });
+            let selection = widget.borrow::<TextFlow>().map(|text| text.has_selection())
+                .or_else(|| widget.borrow::<Html>().map(|text| text.has_selection()))
+                .or_else(|| widget.borrow::<Markdown>().map(|text| text.has_selection()));
+            if let Some(selected) = selection {
+                // A collapsed selection leaves copy available to the panel.
+                return Some(Owner {
+                    letters: if selected { Letters::TEXT } else { Letters::TEXT.minus(Letters::of(&['c'])) },
+                    editable: false,
+                });
             }
         }
         let mut found = None;

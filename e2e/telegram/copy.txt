@@ -1,0 +1,56 @@
+# args:
+# env:
+# Selected text owns copy, even when selecting it also moves the message cursor.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+
+dblclick "message text: meeting moved to 15:00"
+wait 400
+copy "meeting"
+accel "copy" -
+key cmd+c
+wait 300
+copy "meeting"
+
+# Marking a message changes its background without replacing selected text.
+key space
+wait 300
+copy "meeting"
+key space
+wait 300
+copy "meeting"
+
+# A single click collapses the selection, so the panel can copy the message.
+click "message text: meeting moved to 15:00"
+wait 400
+accel "copy" c
+key cmd+c
+wait 300
+
+# Select-all in the message and normal selection in the composer still work.
+key cmd+a
+wait 300
+copy "meeting moved to 15:00"
+accel "copy" -
+
+# Dragging across a different message also moves the cursor and keeps selection.
+drag "message text: the muted grey is too light on the fold" 1200 0
+wait 300
+copy "the muted grey is too light on the fold"
+accel "copy" -
+
+click "write a message"
+wait 300
+type "draft words"
+key cmd+a
+wait 300
+copy "draft words"
+accel "copy" -
+quit
