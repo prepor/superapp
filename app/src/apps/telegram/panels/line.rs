@@ -127,8 +127,10 @@ impl Panel for Line {
              sections contain the full cached message and quoted text with their \
              line breaks. A person reads, copies, replies, forwards or reacts here, \
              and can edit or delete their own message. Reply and edit use the \
-             Telegram conversation's composer.",
-            self.chat, self.msg
+             Telegram conversation's composer. Use telegram.file with chat = {} \
+             and message = {} to read an attached file; media metadata and a \
+             caption are not the attachment's contents.",
+            self.chat, self.msg, self.chat, self.msg
         )
     }
 

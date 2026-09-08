@@ -847,6 +847,18 @@ pub fn save_context(chat: PeerId, id: MsgId) -> String {
     format!("save:{chat}:{id}")
 }
 
+/// An agent read refreshes the same source, but only fills the media cache.
+pub fn cache_file(chat: PeerId, id: MsgId) -> String {
+    let mut request: Value = serde_json::from_str(&get_message(chat, id)).unwrap();
+    request["@extra"] = json!(format!("cache:{chat}:{id}"));
+    request.to_string()
+}
+
+pub(super) fn parse_cache_extra(extra: &str) -> Option<(PeerId, MsgId)> {
+    let (chat, id) = extra.strip_prefix("cache:")?.split_once(':')?;
+    Some((chat.parse().ok()?, id.parse().ok()?))
+}
+
 pub(super) fn parse_save_extra(extra: &str) -> Option<(PeerId, MsgId)> {
     let (chat, id) = extra.strip_prefix("save:")?.split_once(':')?;
     Some((chat.parse().ok()?, id.parse().ok()?))

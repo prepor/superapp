@@ -1,10 +1,12 @@
-//! Running the calls a run is waiting on, on the UI thread.
+//! Running session calls a run is waiting on, on the UI thread.
 //!
 //! A tool is the whole behaviour of a verb over ids instead of over a
 //! cursor, and it runs with the session — so it runs *here*, where the
 //! session is, and not on the worker's thread. The chat panel calls this on
 //! every event while its run is waiting; a run whose chat is shown nowhere
-//! pauses at its next call and picks up when the chat is opened again.
+//! pauses at its next session call and picks up when the chat is opened again.
+//! Background reads belong to the run's worker; this walk stops at them so
+//! later session calls cannot overtake a download.
 //!
 //! Nearly every call runs as soon as it arrives: undo is the net, and it is
 //! one chord away — each tool files its own action, so what `cmd+z` takes
@@ -83,6 +85,11 @@ pub fn refuse(s: &mut Session, chat: ChatId, call: CallId) -> bool {
 fn walk(s: &mut Session, run: RunId) -> usize {
     let mut moved = 0;
     for call in model::pending_calls(s.store(), run) {
+        // A worker read owns this place in the round. Later session actions
+        // must wait for it, including the next call's approval card.
+        if s.apps().tool(&call.tool).is_some_and(|t| t.reader.is_some() && !t.asks) {
+            break;
+        }
         moved += 1;
         if s.apps().tool(&call.tool).is_some_and(|t| t.asks) {
             let id = call.id;

@@ -231,7 +231,8 @@ impl Tracker {
             }
         }
         let saving = v["@extra"].as_str().and_then(super::requests::parse_save_extra).is_some();
-        let kind = if saving { "saveFile" } else { v["@type"].as_str().unwrap_or("request") }.to_string();
+        let caching = v["@extra"].as_str().and_then(super::requests::parse_cache_extra).is_some();
+        let kind = if saving { "saveFile" } else if caching { "cacheFile" } else { v["@type"].as_str().unwrap_or("request") }.to_string();
         let mut state = self.state.lock().unwrap();
         state.next += 1;
         let id = state.next;
@@ -249,7 +250,7 @@ impl Tracker {
             Operation {
                 id,
                 chat: v["chat_id"].as_i64(),
-                label: if saving { "downloading to ~/Downloads".into() } else { label(&v) },
+                label: if saving { "downloading to ~/Downloads".into() } else if caching { "reading attachment".into() } else { label(&v) },
                 status: Status::Pending,
                 request: (!secret).then(|| v.clone()),
                 kind,
@@ -363,6 +364,16 @@ impl Tracker {
         self.changed();
     }
 
+    pub(super) fn cached(&self, id: u64) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            op.status = Status::Done;
+            op.label = "attachment ready".into();
+            op.request = None;
+            op.changed();
+        }
+        self.changed();
+    }
+
     pub fn dismiss(&self, id: u64) {
         self.dirty.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
@@ -407,11 +418,16 @@ impl Tracker {
                 "message_ids": previous.iter().map(|(_, id)| id).collect::<Vec<_>>(),
                 "@extra": {"operation": id, "context": null}});
         }
-        if req["@extra"]["context"].as_str().and_then(super::requests::parse_save_extra).is_some() {
+        let context = req["@extra"]["context"].as_str().unwrap_or_default();
+        let saving = super::requests::parse_save_extra(context).is_some();
+        let caching = super::requests::parse_cache_extra(context).is_some();
+        if saving || caching {
             req["@extra"]["attempt"] = json!(req["@extra"]["attempt"].as_u64().unwrap_or(0) + 1);
         }
-        op.kind = if req["@extra"]["context"].as_str().and_then(super::requests::parse_save_extra).is_some() {
+        op.kind = if saving {
             "saveFile"
+        } else if caching {
+            "cacheFile"
         } else { req["@type"].as_str()? }.to_string();
         op.request = Some(req.clone());
         op.messages.clear();

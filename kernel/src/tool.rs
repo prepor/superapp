@@ -6,6 +6,9 @@
 //! tool, so `cmd+z` takes it back like any other action. The kernel names the
 //! type and collects the list ([`Apps::tools`](crate::app::Apps::tools)); the
 //! apps fill it and the chat runs a call by name.
+//! Read-only tools can use [`Tool::reading`] for network and document work on
+//! the agent worker. Their callback returns [`Poll::Pending`] while another
+//! worker downloads the file; no session action runs until the read answers.
 //!
 //! Undo is the net for nearly all of them, which is why nothing asks the
 //! person first. [`Tool::asks`] is the exception: a call of a tool that
@@ -18,8 +21,18 @@
 //! model can act on — the key that is missing, or the type that was wanted.
 
 use serde_json::Value;
+use std::task::Poll;
 
+use crate::effect::World;
 use crate::session::Session;
+
+/// One read on the agent worker. Pending downloads retain their state here;
+/// polling never waits for another worker or performs I/O on the UI thread.
+pub type Read = Box<dyn FnMut(&World) -> Poll<Result<Value, String>> + Send>;
+
+/// The background reads available in one world's app list. A worker must
+/// never dispatch through another session's process-global catalogue.
+pub struct Readers(pub Vec<Tool>);
 
 /// One thing an app lets an agent do, by name.
 #[derive(Clone)]
@@ -45,6 +58,9 @@ pub struct Tool {
     /// The whole behaviour, on the UI thread, with the session: one `act`
     /// per call, labelled by the tool, so it is one undo.
     pub run: fn(&mut Session, &Value) -> Result<Value, String>,
+    /// A read that needs network or document processing, driven by the agent
+    /// worker instead of `run`. Each invocation gets its own pending state.
+    pub reader: Option<fn(&Value) -> Read>,
 }
 
 impl Tool {
@@ -65,7 +81,24 @@ impl Tool {
             writes,
             asks: false,
             run,
+            reader: None,
         }
+    }
+
+    /// A read-only tool whose work stays on the agent worker. Its callback
+    /// is made only after the input schema has been checked.
+    #[must_use]
+    pub fn reading(
+        name: &'static str,
+        description: &'static str,
+        input: Value,
+        reader: fn(&Value) -> Read,
+    ) -> Tool {
+        let mut tool = Self::new(name, description, input, false, |_, _| {
+            Err("this read must run on the agent worker".into())
+        });
+        tool.reader = Some(reader);
+        tool
     }
 
     /// The same tool, asking first: a call of it waits on the person's

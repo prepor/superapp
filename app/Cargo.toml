@@ -49,6 +49,9 @@ html5ever = "0.39"
 markup5ever_rcdom = "0.39.0"
 simplecss = "0.2"
 
+# Agent reads of PDF attachments, independent of the selected model provider.
+pdf-extract = "0.12"
+
 # Recognize links in cached Telegram text and validate their destinations.
 linkify = "0.11"
 url = "2"

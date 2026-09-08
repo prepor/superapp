@@ -204,6 +204,15 @@ Agents find recipients and read cached history with `sql.query`. Telegram's
 data dictionary explains chat and topic ids, the cache's limits, and why raw
 SQL writes cannot send messages or manage the live composer.
 
+`telegram.file` reads an attached file by `chat` and `message` id. It refreshes
+the source message before downloading the full attachment, then reads from
+the local media cache; cached files work offline. It works without a
+Telegram panel open, leaves read receipts alone, and creates no copy in
+Downloads. PDF text layers and UTF-8/UTF-16 text files up to 32 MiB are
+supported. Results contain at most 64 KiB of text; pass `next_offset` as
+`offset` to continue. Download failures, unsupported binary formats and
+PDFs needing OCR are reported to the agent.
+
 `telegram.draft` opens or reuses the destination's composer with the requested
 text and optional reply. Forum topics keep their own destination. Existing
 draft text requires explicit `replace: true`; edits and attachments are kept

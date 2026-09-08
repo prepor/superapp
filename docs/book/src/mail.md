@@ -196,6 +196,14 @@ UID, and section; a stale UID generation is refused. The cache's SQLite index
 holds filenames and sizes only; file bytes stay on disk. File sizes shown from
 the server's MIME structure are estimates.
 
+Agents use `mail.attachment` with the letter's `mail` id and MIME `part`
+index to read the file directly. `mail.thread` includes each attachment's
+name, media type, size and those ids. The read runs on the agent worker and
+uses the same IMAP/cache path as a preview. PDFs with text layers and
+UTF-8/UTF-16 text files up to 32 MiB are supported; longer text is read in
+64 KiB chunks using `next_offset`. Scanned PDFs need OCR. No panel, manual
+export, or mark-as-read action is needed.
+
 ## Carrying a file
 
 A draft carries **paths**, not bytes. Attaching costs one `stat`; the file

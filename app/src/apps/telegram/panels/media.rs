@@ -157,6 +157,13 @@ impl Panel for Viewer {
         }
     }
 
+    fn about(&self) -> String {
+        format!("A Telegram media attachment. Its arguments are chat id {} and message id {}. \
+            Use telegram.file with chat = {} and message = {} to read the full attachment; \
+            the displayed preview and caption are not its file contents.",
+            self.chat, self.msg, self.chat, self.msg)
+    }
+
     /// The whole grid: full screen, in a workspace of columns.
     fn wish(&self, _cols: usize) -> (u32, u32) {
         (12, 6)

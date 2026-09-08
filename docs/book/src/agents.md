@@ -58,14 +58,18 @@ and its sync pass already do.
    the reply into the live tail, and writes the agent's turn as a row when the
    answer is whole.
 3. **The model asks for a tool.** The worker writes one `call` row per entry of
-   `tool_calls`, sets the run to *waiting*, and sleeps on a kick.
-4. **The tools run on the UI thread.** The chat panel runs every pending call
+   `tool_calls`, sets the run to *waiting*, and checks for background reads.
+4. **The tools run in order.** The chat panel runs session calls
    through the session — one history node per call, wearing the tool's own
-   label — writes each result to its row, and kicks the worker.
+   label — writes each result to its row, and kicks the worker. Attachment
+   reads run on the agent worker, which polls pending downloads without
+   blocking the UI. Later calls wait for the read, and an approval card
+   holds later reads as well as session calls.
 5. **Back to 2**, until the model stops, the run fails, or the person stops it.
 
 The chat panel is the run's hands: a run whose chat is shown nowhere pauses at
-its next call and picks up when the chat is opened again, and the agents list
+its next session call and picks up when the chat is opened again. Background
+attachment reads can finish while the chat is closed. The agents list
 is what says which runs are waiting. Nothing in the kernel schedules anything
 for this app.
 
@@ -390,6 +394,12 @@ whose call [waits for the person](#the-gate-what-asks-first), and the
 behaviour itself: a function of the session, run on the UI thread, filing one
 action labelled by the tool so that it is one undo.
 
+`Tool::reading` registers a read that needs network I/O or document parsing.
+Its callback is created after schema validation and polled on the agent
+worker with that worker's world. Each call keeps its own pending state; a
+stopped run never resumes it. The world's `Readers` capability is built from
+its own app list, so another session cannot change which implementation runs.
+
 `Apps::tools()` is the list a request carries and the registry a call is run by
 name from: the kernel's own first, then each app's in app-list order. Two apps
 offering one name stop the process at boot, naming both. A call for a tool no
@@ -463,9 +473,25 @@ action.
 
 | App | Reads | Writes |
 |---|---|---|
-| mail | `mail.search`, `mail.thread` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.put_back`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
+| mail | `mail.search`, `mail.thread`, `mail.attachment` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.put_back`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
+| telegram | `telegram.file`, `telegram.status` | `telegram.draft`, `telegram.send` |
 | files | `files.list`, `files.read` | `files.rename`, `files.move`, `files.copy`, `files.trash`, `files.mkdir`, `files.write` |
 | system | `problems.list`, `effects.recent` | — |
+
+`mail.attachment` takes a letter's `mail` id and MIME `part` index;
+`mail.thread` lists those references with each letter. `telegram.file` takes
+the Telegram `chat` and `message` ids. Both download on demand into the
+existing local cache and return the file's text, without marking messages
+read or exporting a copy to Downloads. Cached files work offline.
+
+The shared document reader supports PDF text layers and UTF-8/UTF-16 text
+files up to 32 MiB. Each result contains at most 64 KiB of UTF-8 text; when
+`truncated` is true, pass the returned `next_offset` as `offset` to read the
+next chunk without losing characters. Invalid or binary files fail with an
+explanation; scanned PDFs without a text layer report that OCR is needed.
+Images, audio, video and other binary formats are not interpreted by these
+text tools. The system prompt tells agents to try these tools before asking
+the person to save or upload an attachment again.
 
 A conversation is named by any of its letters, because every query in mail
 resolves the thread from the id it is handed, and `mail.search` answers the

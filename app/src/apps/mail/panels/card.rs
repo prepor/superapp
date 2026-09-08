@@ -248,8 +248,9 @@ impl Panel for Card {
              pair rather than that row's id. Bytes download on demand over \
              IMAP and stay in the device-local file cache. The *open* verb \
              saves a copy with the sender's filename and hands it to the \
-             operating system.",
-            self.mail, self.at
+             operating system. Use mail.attachment with mail = {} and part = {} \
+             to read the file's contents for translation or analysis.",
+            self.mail, self.at, self.mail, self.at
         )
     }
 
