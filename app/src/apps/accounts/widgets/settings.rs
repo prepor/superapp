@@ -25,7 +25,7 @@ pub struct SettingsPanel {
     view: View,
     /// Which remove button is where, as the last draw left it.
     #[rust]
-    removes: Vec<(i64, Rect)>,
+    removes: Vec<(i64, u8, Rect)>,
 }
 
 impl Widget for SettingsPanel {
@@ -40,16 +40,27 @@ impl Widget for SettingsPanel {
         if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
             return;
         }
-        let Some((id, _)) = self.removes.iter().rev().find(|(_, r)| r.contains(e.abs)) else {
+        let Some((id, action, _)) = self
+            .removes
+            .iter()
+            .rev()
+            .find(|(_, _, r)| r.contains(e.abs))
+        else {
             return;
         };
         let id = *id;
+        let action = *action;
         let Some(session) = scope.data.get_mut::<Session>() else {
             return;
         };
         let mut borrow = props.panel.borrow_mut();
         if let Some(s) = borrow.as_any().downcast_mut::<Settings>() {
-            s.remove(session, id);
+            match action {
+                0 => s.ask_remove(session, id),
+                1 => s.service(session, id, false),
+                2 => s.service(session, id, true),
+                _ => s.reconnect(session, id),
+            }
         }
     }
 
@@ -79,7 +90,46 @@ impl Widget for SettingsPanel {
             while let Some(idx) = list.next_visible_item(cx) {
                 let Some(a) = accounts.get(idx) else { continue };
                 let row = list.item(cx, idx, live_id!(account_row));
-                let (status, err) = a.status_line();
+                let confirming = props
+                    .panel
+                    .borrow_mut()
+                    .as_any()
+                    .downcast_mut::<Settings>()
+                    .is_some_and(|p| p.confirming == Some(a.id));
+                let (status, err) = if confirming {
+                    ("Remove this account, its cached Mail and Calendar data, and unsent drafts? Google events remain in Google. Press confirm remove to continue.".into(),false)
+                } else {
+                    a.status_line()
+                };
+                row.button(cx, ids!(remove_btn)).set_text(
+                    cx,
+                    if confirming {
+                        "confirm remove"
+                    } else {
+                        "remove"
+                    },
+                );
+                let services = scope
+                    .data
+                    .get::<Session>()
+                    .map(|s| crate::identity::services(s.store().conn(), a.id))
+                    .unwrap_or_default();
+                row.button(cx, ids!(mail_btn))
+                    .set_text(cx, if services.0 { "Mail: on" } else { "Mail: off" });
+                row.button(cx, ids!(calendar_btn)).set_text(
+                    cx,
+                    if services.1 {
+                        "Calendar: on"
+                    } else {
+                        "Calendar: off"
+                    },
+                );
+                row.button(cx, ids!(calendar_btn)).set_visible(
+                    cx,
+                    a.oauth() || services.1 || services.2.contains("calendar"),
+                );
+                row.button(cx, ids!(reconnect_btn))
+                    .set_visible(cx, a.oauth());
                 row.text_input(cx, ids!(email_lbl)).set_text(cx, &a.email);
                 row.text_input(cx, ids!(host_lbl))
                     .set_text(cx, &a.host_line());
@@ -96,22 +146,55 @@ impl Widget for SettingsPanel {
         // and the status line so a script can click into them, and the
         // button, which this widget answers itself.
         for (id, row) in drawn {
-            for path in [ids!(email_lbl), ids!(host_lbl), ids!(status_lbl), ids!(status_err_lbl)] {
+            for path in [
+                ids!(email_lbl),
+                ids!(host_lbl),
+                ids!(status_lbl),
+                ids!(status_err_lbl),
+            ] {
                 let w = row.text_input(cx, path);
                 if !w.visible() {
                     continue;
                 }
                 let r = w.area().rect(cx);
                 if r.size.x > 0.0 {
-                    props
-                        .hits
-                        .add(w.text(), r, MouseCursor::Text, props.slot);
+                    props.hits.add_clipped(
+                        w.text(),
+                        r,
+                        self.view.area().rect(cx),
+                        MouseCursor::Text,
+                        props.slot,
+                    );
+                }
+            }
+            for (action, name, path) in [
+                (1, "toggle Mail", ids!(mail_btn)),
+                (2, "toggle Calendar", ids!(calendar_btn)),
+                (3, "reconnect Google", ids!(reconnect_btn)),
+            ] {
+                let w = row.widget(cx, path);
+                if w.visible() {
+                    let r = w.area().rect(cx);
+                    props.hits.add_clipped(
+                        name,
+                        r,
+                        self.view.area().rect(cx),
+                        MouseCursor::Hand,
+                        props.slot,
+                    );
+                    self.removes.push((id, action, r));
                 }
             }
             let r = row.button(cx, ids!(remove_btn)).area().rect(cx);
             if r.size.x > 0.0 {
-                props.hits.add("remove", r, MouseCursor::Hand, props.slot);
-                self.removes.push((id, r));
+                props.hits.add_clipped(
+                    row.button(cx, ids!(remove_btn)).text(),
+                    r,
+                    self.view.area().rect(cx),
+                    MouseCursor::Hand,
+                    props.slot,
+                );
+                self.removes.push((id, 0, r));
             }
         }
         DrawStep::done()

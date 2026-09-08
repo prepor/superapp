@@ -1,7 +1,7 @@
 # args:
 # env:
 #
-# The settings walk: reach mail's accounts panel through the launcher, open
+# The settings walk: reach the shared accounts panel through the launcher, open
 # the add-account form from the bar's link (solid: it joins to the right) — by
 # mouse, then again by the chord the link wears — fill the form with the
 # tab/enter walk (an .invalid host, so the worker fails fast and locally),
@@ -12,7 +12,7 @@
 # really open, so the chord is proven without reading a screenshot.
 #
 # Settings are not a shell panel: what a person configures belongs to the app
-# it configures, and these are mail's.
+# it configures. Accounts owns this form for Mail and Calendar.
 
 wait 700
 key cmd 2
@@ -65,6 +65,8 @@ shot s5-error-selected
 # The row's own button takes the account away, with everything it brought.
 # Later hits win, so this is the second row's — the one just added.
 click "remove"
+wait 200
+click "confirm remove"
 wait 900
 shot s6-removed
 

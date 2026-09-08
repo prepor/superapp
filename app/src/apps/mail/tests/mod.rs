@@ -32,7 +32,7 @@ mod context;
 mod downloads;
 mod tools;
 
-static APPS: &[&dyn App] = &[&MAIL];
+static APPS: &[&dyn App] = &[&MAIL, &crate::apps::accounts::ACCOUNTS];
 
 /// A session and the clock it runs on — the send window is the one thing a
 /// test has to move time for.
@@ -1477,6 +1477,7 @@ fn the_app_registers_its_tags_workers_and_roots() {
     assert_eq!(
         tags,
         vec![
+            "accounts",
             "add_account",
             "archive",
             "attachment",
@@ -1495,7 +1496,7 @@ fn the_app_registers_its_tags_workers_and_roots() {
     assert_eq!(
         roots,
         vec![
-            "inbox", "archive", "sent", "spam", "trash", "new mail", "settings"
+            "inbox", "archive", "sent", "spam", "trash", "new mail", "accounts"
         ]
     );
 

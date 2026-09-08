@@ -48,11 +48,12 @@ pub static SCHEMA: Schema = Schema {
             rebuild: rebuild_recipients,
         },
         Step::Sql(V5),
+        Step::Run(crate::identity::upgrade),
     ],
 };
 
 const V1: &str = "
-CREATE TABLE account(
+CREATE TABLE IF NOT EXISTS account(
   id        INTEGER PRIMARY KEY,
   label     TEXT NOT NULL,
   email     TEXT NOT NULL,

@@ -58,6 +58,10 @@ script_mod! {
     mod.widgets.TblRow = View {
         width: Fill, height: Fit
         flow: Down
+        section_lbl := mod.widgets.SSection {
+            visible: false, width: Fill
+            margin: Inset{top: 14, bottom: 7}
+        }
     }
 
     /** A row's line, plain. The row's inset is the one source of spacing:

@@ -18,6 +18,8 @@
 # Apps
 
 - [Mail](./mail.md)
+- [Calendar](./calendar.md)
+- [Accounts](./accounts.md)
 - [RSS](./rss.md)
 - [Telegram](./telegram.md)
 - [Files](./files.md)

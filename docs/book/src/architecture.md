@@ -199,3 +199,17 @@ remembers it on the instance, because the wish is asked for on every relayout.
 Some Makepad work, such as turning SVG into drawing commands, must stay on the
 UI thread. Such input is limited instead: inline SVG is capped at 64 KiB, and
 larger images use their alternative text.
+
+## Shared identities and forms
+
+`app/src/identity/` owns the identity table migration, account queries and
+history, Google OAuth, and refresh-token lookup used by Mail and Calendar.
+The Accounts app owns the native settings UI and agent description. Existing
+account IDs and keychain keys survive the extraction; historical Mail settings
+tags resolve through Accounts. Calendar remains a registered app with its own
+schema, worker, native panels, problems and tools.
+
+The shared UI kit supplies aligned form rows and Tab/Shift-Tab field traversal
+with scroll reveal. Rich-table row specifications can supply optional section
+headings, which Calendar uses for dates. Existing apps inherit the same base
+controls without acquiring Calendar-specific code in the shell.

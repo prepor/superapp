@@ -19,10 +19,12 @@ pub mod mailbox;
 pub mod message;
 pub mod settings;
 
-pub use add_account::{AddAccount, AddAccountKind, Form};
+pub use add_account::AddAccount;
+#[cfg(test)]
+pub use add_account::Form;
 pub use card::{Card, CardKind};
 pub use compose::{Compose, ComposeKind};
 pub use contact::{Contact, ContactKind};
 pub use mailbox::{Mailbox, MailboxKind};
 pub use message::{Message, MessageKind};
-pub use settings::{Settings, SettingsKind};
+pub use settings::Settings;

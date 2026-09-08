@@ -1,7 +1,7 @@
 # Mail
 
 The mail app is five mailboxes over one list, conversations, drafts, contacts,
-and accounts, with real IMAP and SMTP behind them. It registers eleven panel
+with real IMAP and SMTP behind them. It registers nine panel
 kinds, its own schema ladder, a demo seed, four deferred effects, three
 capabilities of its own, a search source, two problem sources, and one worker
 per account plus the sender.
@@ -25,11 +25,11 @@ so no pass fails on every panel of the canvas.
 | `compose` | none, or `reply`/`forward`/`reopen` and a mail id | one draft |
 | `contact` | an address | one correspondent |
 | `attachment` | a mail id and a part index | one part of a letter, as a card |
-| `settings` | none | the accounts |
-| `add_account` | none | the add-account form |
 
 The roots the launcher offers, in this order: **inbox**, **archive**, **sent**,
-**spam**, **trash**, **new mail**, **settings**. Mail is listed first among the
+**spam**, **trash**, **new mail**. Shared account settings now belong to
+[Accounts](./accounts.md), which also preserves the historical `settings` and
+`add_account` tags. Mail is listed first among the
 apps, so a store nobody has booted comes up on the inbox.
 
 ## Five mailboxes, one list
@@ -244,26 +244,12 @@ filters like any other mailbox, which is where to go looking through it.
 
 ## Accounts
 
-Settings is mail's own panel, not the shell's: what a person configures belongs
-to the app it configures. It lists one row per account with the address, the
-host, and the last pass's status, all three selectable so a sync error can be
-carried somewhere else, plus a *remove* button per row. Its one bar verb is
-*add account* (`cmd+d`, because `a` is archive and `s` is sync everywhere
-else).
-
-What an account stores is a label, an address, an IMAP host, an SMTP host, and
-one word saying how it authenticates, plus the status and time the sync pass
-writes. The secret is never in the store: an app password lives in the keychain
-under the address and a Google refresh token under a key of its own, while an
-access token is never written down at all.
-
-Removing an account cannot be undone, and history says so rather than
-half-restoring it: putting the panel back cannot put its mail back.
-
-The add-account form has four fields, with the two host fields prefilled,
-because a form with two empty host fields is a quiz. It refuses a blank address
-and an address already present, files the password to the keychain, and adds
-the row.
+[Accounts](./accounts.md) owns the shared account list and sign-in form. Mail
+uses its existing account IDs, hosts, keychain entries and Google grants;
+Google Calendar uses the same identities with separate service permissions.
+A disabled Mail service keeps cached messages but stops its workers. The
+shared list shows the address, hosts, status, service switches and removal
+confirmation. Password/IMAP accounts continue to work as before.
 
 ## Gmail sign-in
 
@@ -279,8 +265,8 @@ flow in one line, and a second press while one is waiting is refused too.
 | Refresh token | until revoked | platform secret store |
 | Access token | about one hour | process memory |
 
-The app checks that the granted scopes include full mail access before creating
-the account, and reads Google's XOAUTH2 error response so it can tell a missing
+When Mail is selected, the app checks that the granted scopes include full
+mail access before enabling the service, and reads Google's XOAUTH2 error response so it can tell a missing
 scope from disabled IMAP. Signing in again as an existing Google account
 renews the grant rather than adding a duplicate; an address already present as
 a password account is refused, because its hosts are another provider's.

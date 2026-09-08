@@ -90,7 +90,7 @@ pub fn connect(w: &World, account: i64) -> Result<(), String> {
         .conn()
         .query_row(
             "SELECT email, COALESCE(imap_host, ''), COALESCE(auth, '') = ?2
-             FROM account WHERE id = ?1",
+             FROM account WHERE id = ?1 AND mail_enabled=1",
             rusqlite::params![account, super::oauth::GOOGLE.name],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -1262,7 +1262,7 @@ pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
     let mut v: Vec<Box<dyn Worker>> = vec![Box::new(SenderPass)];
     let Ok(mut stmt) = store
         .conn()
-        .prepare("SELECT id FROM account WHERE COALESCE(imap_host, '') != '' ORDER BY id")
+        .prepare("SELECT id FROM account WHERE mail_enabled=1 AND COALESCE(imap_host, '') != '' ORDER BY id")
     else {
         return v;
     };

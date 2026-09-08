@@ -18,12 +18,13 @@
 mod apps;
 pub mod platform;
 mod reader;
+mod identity;
 pub mod root;
 pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{agent, files, mail, rss, telegram};
+use crate::apps::{accounts, agent, calendar, files, mail, rss, telegram};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
@@ -32,6 +33,8 @@ use crate::shell::system;
 /// Mail leads, so a store nobody has booted comes up on the inbox.
 static APPS: &[&dyn App] = &[
     &mail::MAIL,
+    &calendar::CALENDAR,
+    &accounts::ACCOUNTS,
     &telegram::TELEGRAM,
     &rss::RSS,
     &files::FILES,
@@ -42,6 +45,8 @@ static APPS: &[&dyn App] = &[
 /// Their Makepad halves, in the same order.
 static UIS: &[&dyn AppUi] = &[
     &mail::UI,
+    &calendar::UI,
+    &accounts::UI,
     &telegram::UI,
     &rss::UI,
     &files::UI,
@@ -119,6 +124,9 @@ mod tests {
             "mail.archive",
             "mail.draft",
             "mail.send",
+            "accounts.list",
+            "calendar.events",
+            "calendar.commit",
             "files.list",
             "files.rename",
             "files.write",
@@ -161,6 +169,10 @@ mod tests {
                 "sql.write",
                 "mail.delete",
                 "mail.send",
+                "calendar.commit",
+                "calendar.delete",
+                "calendar.respond",
+                "calendar.retry",
                 "telegram.send",
                 "files.trash",
                 "files.write"

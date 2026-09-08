@@ -157,6 +157,13 @@ script_mod! {
         draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
     }
 
+    /** A consistently aligned form row, shared by app editors. */
+    mod.widgets.SFormRow = View {
+        width: Fill, height: Fit, flow: Right, spacing: 8
+        align: Align{y: 0.5}
+    }
+    mod.widgets.SFormLabel = mod.widgets.SSection { width: 92 }
+
     /** Plain text field. Its border darkens on focus. */
     mod.widgets.SField = TextInputFlat {
         width: Fill, height: Fit

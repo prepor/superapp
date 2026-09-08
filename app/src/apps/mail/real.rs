@@ -12,11 +12,11 @@
 //! rule, the message a draft goes out as.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use kernel::app::{Capabilities, Env};
-use kernel::caps::{ClockSource, MemSecrets, Secrets, SecretsFactory};
+#[cfg(test)]
+use kernel::caps::{MemSecrets, SecretsFactory};
 
 #[cfg(test)]
 use super::caps::Part;
@@ -25,10 +25,6 @@ use super::caps::{
     UidSet, Watched,
 };
 use super::oauth;
-
-/// How early a cached access token is treated as spent, so a long sync
-/// started with 3 seconds left does not die halfway through.
-const TOKEN_MARGIN: f64 = 120.0;
 
 /// Mail's real capabilities for one world. One IMAP session per account and
 /// one submission transport per send; both live on the thread that built the
@@ -249,75 +245,9 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
 
 // -- the grant -------------------------------------------------------------
 
-/// The Google grant, with the cache that keeps a refresh from happening per
-/// connect. Per-process and never written down: a token is worth an hour.
-pub struct RealOAuth {
-    /// Where the store lives: the client registration sits beside it (see
-    /// [`oauth::Client::load`]). `None` for an in-memory run, which then has
-    /// no Gmail either.
-    dir: Option<PathBuf>,
-    /// The machine's own secret store, when the shell installed one. It has
-    /// to be *this* store and not the shared map: the sign-in form files the
-    /// refresh token through the [`Secrets`] capability, which in a real run
-    /// is the keychain — so a grant looked up in the map would be missing
-    /// from the one place it was never written.
-    backend: Option<SecretsFactory>,
-    /// The shared map otherwise — a scripted run, and a build with no
-    /// platform store.
-    memory: MemSecrets,
-    clock: ClockSource,
-    /// Access tokens by address, with the unix second each expires at.
-    tokens: HashMap<String, (String, f64)>,
-}
-
-impl RealOAuth {
-    /// One for this world, out of what the shell put on the environment.
-    #[must_use]
-    pub fn new(env: &Env) -> RealOAuth {
-        RealOAuth {
-            dir: env.db_dir.clone(),
-            backend: env.secrets_backend.clone(),
-            memory: env.secrets.clone(),
-            clock: env.clock.clone(),
-            tokens: HashMap::new(),
-        }
-    }
-
-    /// A secret store for one lookup, the way every other world gets one.
-    fn secrets(&self) -> Box<dyn Secrets> {
-        match &self.backend {
-            Some(f) => f.make(),
-            None => Box::new(self.memory.clone()),
-        }
-    }
-
-    /// The refresh token this address signed in with, from wherever the
-    /// sign-in's write went.
-    fn grant(&self, email: &str) -> Option<String> {
-        self.secrets().get(&oauth::refresh_key(email))
-    }
-}
-
+pub use crate::identity::Tokens as RealOAuth;
 impl OAuth for RealOAuth {
-    fn access_token(&mut self, email: &str) -> Result<String, String> {
-        let now = self.clock.read();
-        if let Some((tok, until)) = self.tokens.get(email) {
-            if now + TOKEN_MARGIN < *until {
-                return Ok(tok.clone());
-            }
-        }
-        let dir = self
-            .dir
-            .clone()
-            .ok_or("this run has no store directory, so no google client")?;
-        let client = oauth::Client::load(&dir)?;
-        let refresh = self
-            .grant(email)
-            .ok_or_else(|| format!("{email} has no google grant — sign in again"))?;
-        let (tok, until) = oauth::refresh(&client, oauth::GOOGLE, &refresh, now)?;
-        self.tokens.insert(email.to_string(), (tok.clone(), until));
-        Ok(tok)
-    }
+    fn access_token(&mut self,email:&str)->Result<String,String>{self.access(email)}
 }
 
 // -- the roles a server advertises -----------------------------------------
