@@ -41,6 +41,10 @@ matches, while the displayed totals still cover the whole conversation.
 | `@a @b` | `@unread vera` | Both expressions |
 | `text` | `budget draft` | Substring in searchable columns, and a word in an indexed one |
 
+SQL text columns and text tag values match substrings using Unicode case
+folding: `привет` finds `ПРИВЕТ`, and `STRASSE` finds `Straße`. Literal `%`,
+`_`, and `\` in the filter keep their literal meaning.
+
 A source may also declare an index for free text — text too wide to read a
 row at a time, such as a mail body. The index is asked first and the columns
 after, in one `OR`, so a row the index answers for is never scanned. The two

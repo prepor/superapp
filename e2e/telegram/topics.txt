@@ -10,6 +10,11 @@ key enter
 wait 900
 click "topics"
 wait 700
+# The forum filter finds Cyrillic titles regardless of the typed case.
+key /
+wait 300
+type "вАСТРИК.бЕРЛИН"
+wait 500
 click "Вастрик.Берлин"
 wait 700
 click "0 of 4 topics shown as chats"

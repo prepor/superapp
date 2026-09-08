@@ -15,6 +15,9 @@ path = "src/lib.rs"
 # queries; sessions record changes for device sync.
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "session"] }
 
+# Unicode case folding for text filters, including scripts outside ASCII.
+caseless = "0.2.2"
+
 # Deferred effects use JSON payloads in the `effect` table.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

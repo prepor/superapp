@@ -23,8 +23,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::session::Session as Capture;
+use rusqlite::types::ToSqlOutput;
 use rusqlite::{Connection, OpenFlags, Transaction};
 
 use crate::app::Schema;
@@ -451,6 +453,7 @@ fn open_writer(target: &Target) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    register_text_functions(&conn)?;
     Ok(conn)
 }
 
@@ -473,7 +476,32 @@ fn open_reader(target: &Target) -> rusqlite::Result<Connection> {
             c
         }
     };
+    register_text_functions(&conn)?;
     Ok(conn)
+}
+
+/// SQLite's built-in LIKE only folds ASCII. Fold both operands explicitly
+/// for Unicode text filters, retaining NULL for missing text. Determinism
+/// lets SQLite fold a bound search pattern once per query. ASCII stays as
+/// supplied: LIKE already handles its case, so those values can pass through
+/// without allocating a Rust string or walking the Unicode case tables.
+fn register_text_functions(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "casefold",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = ctx.get_raw(0).as_str_or_null()?;
+            Ok(match text {
+                Some(text) if !text.is_ascii() => {
+                    ToSqlOutput::from(caseless::default_case_fold_str(text))
+                }
+                _ => ToSqlOutput::Arg(0),
+            })
+        },
+    )
 }
 
 /// The kernel's ladder, then each app's, run once on the writable connection
@@ -1221,6 +1249,42 @@ mod tests {
 
     fn probe(r: &rusqlite::Row) -> rusqlite::Result<i64> {
         r.get(0)
+    }
+
+    #[test]
+    fn unicode_casefold_is_available_on_writer_and_readers() {
+        fn folded(conn: &Connection) -> rusqlite::Result<(String, Option<String>)> {
+            conn.query_row("SELECT casefold('ЁЖИК Straße ΟΔΟΣ'), casefold(NULL)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+        }
+        let s = store();
+        let expected = ("ёжик strasse οδοσ".to_string(), None);
+        assert_eq!(s.write(|c| folded(c)).unwrap(), expected);
+        assert_eq!(folded(s.conn()).unwrap(), expected);
+        let worker = Store::with_db(s.db()).unwrap();
+        assert_eq!(folded(worker.conn()).unwrap(), expected);
+    }
+
+    #[test]
+    fn casefold_like_matches_across_ascii_and_unicode() {
+        let s = store();
+        for (text, pattern, expected) in [
+            ("ASCII TEXT", "%ascii text%", true),
+            ("STRASSE", "%straße%", true),
+            ("Straße", "%STRASSE%", true),
+            ("KELVIN", "%Kelvin%", true),
+            ("Kelvin", "%KELVIN%", true),
+            ("Привет", "%пРиВеТ%", true),
+            ("Straße", "%STRESS%", false),
+        ] {
+            let found: bool = s.conn().query_row(
+                "SELECT casefold(?1) LIKE casefold(?2)",
+                [text, pattern],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(found, expected, "{text:?} LIKE {pattern:?}");
+        }
     }
 
     /// The reactive contract: cached until a commit touches a dependency,

@@ -395,7 +395,7 @@ pub struct SqlSpec {
     pub from: &'static str,
     /// A `WHERE` fragment every query carries, or `""`.
     pub base: &'static str,
-    /// Columns free text searches, each a substring.
+    /// Columns free text searches, each a Unicode case-insensitive substring.
     pub text: &'static [&'static str],
     /// An index free text asks as well, for text too wide to scan.
     pub index: Option<TextIndex>,
@@ -526,7 +526,7 @@ impl SqlSpec {
                 let pat = format!("%{}%", escape_like(t));
                 for c in self.text {
                     params.push(Val::S(pat.clone()));
-                    parts.push(format!("{c} LIKE ? ESCAPE '\\'"));
+                    parts.push(format!("casefold({c}) LIKE casefold(?) ESCAPE '\\'"));
                 }
                 if parts.is_empty() {
                     return None;
@@ -547,7 +547,7 @@ impl SqlSpec {
                     TagType::Text => match op {
                         Op::Eq => {
                             params.push(Val::S(format!("%{}%", escape_like(value))));
-                            format!("{col} LIKE ? ESCAPE '\\'")
+                            format!("casefold({col}) LIKE casefold(?) ESCAPE '\\'")
                         }
                         _ => {
                             params.push(Val::S(value.clone()));
@@ -1877,7 +1877,7 @@ mod tests {
         let q = SPEC.count(TAGS, a("john").as_ref());
         assert_eq!(
             q.sql,
-            "SELECT COUNT(*) FROM item WHERE id > 0 AND (name LIKE ? ESCAPE '\\')"
+            "SELECT COUNT(*) FROM item WHERE id > 0 AND (casefold(name) LIKE casefold(?) ESCAPE '\\')"
         );
         assert_eq!(q.params, vec![Val::S("%john%".into())]);
 
@@ -1978,7 +1978,7 @@ mod tests {
             (
                 concat!(
                     " WHERE id > 0 AND ((id IN (SELECT rowid FROM item_fts",
-                    " WHERE item_fts MATCH ?)) OR name LIKE ? ESCAPE '\\')"
+                    " WHERE item_fts MATCH ?)) OR casefold(name) LIKE casefold(?) ESCAPE '\\')"
                 )
                 .into(),
                 vec![Val::S("\"alpha\"*".into()), Val::S("%alpha%".into())]
@@ -1988,7 +1988,7 @@ mod tests {
         assert_eq!(
             w("@name:Al"),
             (
-                " WHERE id > 0 AND name LIKE ? ESCAPE '\\'".into(),
+                " WHERE id > 0 AND casefold(name) LIKE casefold(?) ESCAPE '\\'".into(),
                 vec![Val::S("%Al%".into())]
             )
         );
@@ -2020,14 +2020,14 @@ mod tests {
         assert_eq!(
             w("@name:Al"),
             (
-                " WHERE id > 0 AND name LIKE ? ESCAPE '\\'".into(),
+                " WHERE id > 0 AND casefold(name) LIKE casefold(?) ESCAPE '\\'".into(),
                 vec![Val::S("%Al%".into())]
             )
         );
         assert_eq!(
             w("@not:name:al"),
             (
-                " WHERE id > 0 AND NOT COALESCE((name LIKE ? ESCAPE '\\'), 0)".into(),
+                " WHERE id > 0 AND NOT COALESCE((casefold(name) LIKE casefold(?) ESCAPE '\\'), 0)".into(),
                 vec![Val::S("%al%".into())]
             )
         );
@@ -2047,7 +2047,7 @@ mod tests {
         assert_eq!(
             w("@ok @n>1 alpha"),
             (
-                " WHERE id > 0 AND ((ok = 1) AND n > ? AND (name LIKE ? ESCAPE '\\'))".into(),
+                " WHERE id > 0 AND ((ok = 1) AND n > ? AND (casefold(name) LIKE casefold(?) ESCAPE '\\'))".into(),
                 vec![Val::F(1.0), Val::S("%alpha%".into())]
             )
         );
@@ -2061,7 +2061,7 @@ mod tests {
         assert_eq!(
             w("@ok @or beta"),
             (
-                " WHERE id > 0 AND ((ok = 1) OR (name LIKE ? ESCAPE '\\'))".into(),
+                " WHERE id > 0 AND ((ok = 1) OR (casefold(name) LIKE casefold(?) ESCAPE '\\'))".into(),
                 vec![Val::S("%beta%".into())]
             )
         );
@@ -2119,6 +2119,55 @@ mod tests {
         assert_eq!(date_span("01.13.2026"), None);
         assert_eq!(date_span("30.08.2026 25:00"), None);
         assert_eq!(date_span("30/08/2026"), None);
+    }
+
+    #[test]
+    fn text_filters_ignore_unicode_case_and_keep_literal_substrings() {
+        let s = store_with(0);
+        s.write(|c| {
+            for name in [
+                "Привет ЁЖИК",
+                "École Ångström",
+                "ΟΔΟΣ",
+                "Straße",
+                "ABC",
+                r"Скидка 100%_Путь\Файл",
+                r"Скидка 100XАПуть\Файл",
+                "你好",
+            ] {
+                c.execute(
+                    "INSERT INTO item(name, n, ok, at) VALUES(?1, 0, 1, 0)",
+                    [name],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut table = Table::new(&SOURCE, 1);
+        for (query, id) in [
+            ("прИвЕт ёж", 1),
+            ("éCOLE åNG", 2),
+            ("οδος", 3),
+            ("οΔοΣ", 3),
+            ("STRASSE", 4),
+            ("aBc", 5),
+            (r"100%_путь\файл", 6),
+            ("你好", 8),
+        ] {
+            for filter in [query.to_string(), format!("@name:{}", filter::quote(query))] {
+                table.set_filter(&filter);
+                assert_eq!(table.len(&s), 1, "{filter}");
+                let row = table.row(&s, 0).expect("matching row");
+                assert_eq!(row.id, id, "{filter}");
+                assert!(table.row(&s, 1).is_none(), "{filter}");
+                assert_eq!(table.keys(&s), Some(vec![id]), "{filter}");
+                assert_eq!(table.index_of(&s, &row), Some(0), "{filter}");
+                assert_eq!(SOURCE.present(&s, a(&filter).as_ref(), &[id, 99]), vec![id]);
+            }
+        }
+        table.set_filter("@not:name:STRASSE");
+        assert_eq!(table.len(&s), 7);
+        assert!(!table.keys(&s).unwrap().contains(&4));
     }
 
     #[test]

@@ -56,7 +56,7 @@ const MESSAGES_SQL: &str = "
     SELECT m.id, m.chat, COALESCE(t.name || ' · ', '') || p.name, COALESCE(s.name, ''), m.out, m.text, m.topic
     FROM tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender
     LEFT JOIN tg_topic t ON t.chat = m.chat AND t.id = m.topic
-    WHERE m.service = 0 AND m.text LIKE ?1 ESCAPE '\\'
+    WHERE m.service = 0 AND casefold(m.text) LIKE casefold(?1) ESCAPE '\\'
     ORDER BY m.date DESC, m.id DESC
     LIMIT ?2";
 
@@ -117,8 +117,8 @@ fn matching_names(store: &Store, terms: &[String]) -> Vec<Hit> {
         .collect()
 }
 
-/// The messages whose text carries the query as typed, latest first. Each
-/// opens its chat at that line.
+/// The messages whose text carries the query regardless of Unicode case,
+/// latest first. Each opens its chat at that line.
 fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
     let q = query.trim();
     if q.is_empty() {

@@ -26,6 +26,7 @@ use super::{runtime, schema, requests, sync, Telegram, TELEGRAM};
 
 static APPS: &[&dyn App] = &[&TELEGRAM];
 
+mod filter_tests;
 mod topics_tests;
 
 fn session() -> Session {
