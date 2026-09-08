@@ -583,13 +583,17 @@ impl Widget for ChatPanel {
             .set_visible(cx, self.dragging_files);
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((card, rows, cursor, marks, above, text, carrying, moving)) = ({
+        let Some((card, rows, loading, cursor, marks, above, text, carrying, moving)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Chat>().map(|c| {
+                // Capture loading first: the reader may finish between these
+                // calls, but unloaded rows must never look like an empty chat.
+                let loading = c.loading();
                 let rows = c.rows(now);
                 (
                     c.card(),
                     rows,
+                    loading,
                     c.cursor(),
                     c.marks().clone(),
                     c.above_line(now),
@@ -606,14 +610,14 @@ impl Widget for ChatPanel {
         // is still filling the transcript — a transcript that is short is
         // seen to be short for now.
         let mut status = card.as_ref().map(model::PeerCard::status_line).unwrap_or_default();
-        if with_chat(&props, |c| c.loading()).unwrap_or(false) {
+        if loading {
             if !status.is_empty() {
                 status.push_str(" · ");
             }
             status.push_str("loading…");
         }
         self.view.label(cx, STATUS).set_text(cx, &status);
-        self.view.label(cx, EMPTY).set_visible(cx, rows.is_empty());
+        self.view.label(cx, EMPTY).set_visible(cx, !loading && rows.is_empty());
 
         // The composer, or the line that stands where it cannot.
         let can_post = card.as_ref().is_none_or(model::PeerCard::can_post);

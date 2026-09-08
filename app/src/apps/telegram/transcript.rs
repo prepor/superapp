@@ -72,14 +72,17 @@ impl Loader {
     fn request(self: &Arc<Self>, store: &Store, key: Key, now: f64) -> Arc<Snapshot> {
         let revision = store.revision(DEPENDENCIES);
         let mut state = self.state.lock().expect("transcript queue");
-        let previous = state.entries.iter().position(|e| e.key == key)
+        let previous = state.entries.iter().position(|e| {
+            e.key.peer == key.peer && e.key.topic == key.topic && e.key.first_unread == key.first_unread
+        })
             .and_then(|i| state.entries.remove(i));
         let entry = match previous {
-            Some(entry) if entry.revision == revision
+            Some(entry) if entry.key == key && entry.revision == revision
                 && entry.load.failed_at.lock().expect("transcript retry")
                     .is_none_or(|at| at.elapsed().as_secs_f64() < 1.0) => entry,
             previous => {
-                // Keep the current reading visible while a live update loads.
+                // A day change invalidates captions, not the current reading.
+                // Keep it visible while either new captions or messages load.
                 let snapshot = previous.map(|e| e.load.snapshot.lock().unwrap().clone())
                     .unwrap_or_default();
                 let load = Arc::new(Load { snapshot: Mutex::new(snapshot), failed_at: Mutex::new(None) });
@@ -215,7 +218,7 @@ mod tests {
     fn loaded(loader: &Arc<Loader>, store: &Store, key: Key) -> Arc<Snapshot> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snapshot = loader.request(store, key, 0.0);
+            let snapshot = loader.request(store, key, key.day as f64 * 86400.0);
             if snapshot.ready { return snapshot; }
             assert!(Instant::now() < deadline, "the background transcript did not finish");
             std::thread::sleep(Duration::from_millis(1));
@@ -270,5 +273,57 @@ mod tests {
         assert_eq!(state.jobs.len(), CAPACITY);
         assert_eq!(state.jobs.pop().unwrap().key.peer, 100);
         assert!(state.jobs.iter().all(|j| j.key.peer > 100 - CAPACITY as i64));
+    }
+
+    #[test]
+    fn day_rollover_keeps_the_reading_until_background_captions_arrive() {
+        let store = store();
+        store.write(|c| c.execute("UPDATE tg_message SET date = 90000 WHERE chat = ?1", [seed::VERA]).map(|_| ())).unwrap();
+        let loader = store.local::<Loader>();
+        let first_unread = model::history(&store, seed::VERA).first().map(|m| m.id);
+        let today = Key { day: 1, first_unread, ..key(seed::VERA) };
+        let before = loaded(&loader, &store, today);
+        assert!(matches!(before.rows.first(), Some(Row::Day(day)) if day == "TODAY"));
+        let unread = before.rows.iter().position(|row| matches!(row, Row::Unread));
+        assert!(unread.is_some());
+
+        // Request the new day through the real background loader, even in
+        // headless tests whose usual Transcript path prepares rows inline.
+        let tomorrow = Key { day: 2, ..today };
+        let pending = loader.request(&store, tomorrow, 172800.0);
+        assert!(Arc::ptr_eq(&before, &pending), "midnight must preserve the current reading while loading");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let after = loader.request(&store, tomorrow, 172800.0);
+            assert!(after.ready);
+            assert_eq!(*after.history, *before.history, "verbs must retain access to the messages");
+            assert_eq!(after.rows.iter().position(|row| matches!(row, Row::Unread)), unread);
+            if matches!(after.rows.first(), Some(Row::Day(day)) if day == "YESTERDAY") {
+                assert!(!Arc::ptr_eq(&before, &after));
+                break;
+            }
+            assert!(Instant::now() < deadline, "the background day captions did not refresh");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(before.rows.first(), Some(Row::Day(day)) if day == "TODAY"),
+            "published snapshots stay immutable");
+    }
+
+    #[test]
+    fn a_fallback_reading_cannot_come_from_another_chat_topic_or_unread_boundary() {
+        let store = store();
+        let loader = store.local::<Loader>();
+        let today = Key { day: 1, ..key(seed::VERA) };
+        assert!(!loaded(&loader, &store, today).history.is_empty());
+        for different in [
+            Key { peer: seed::STELAXIS, day: 2, ..today },
+            Key { topic: 42, day: 2, ..today },
+            Key { first_unread: Some(42), day: 2, ..today },
+        ] {
+            let pending = loader.request(&store, different, 172800.0);
+            assert!(!pending.ready);
+            assert!(pending.rows.is_empty());
+            assert!(pending.history.is_empty());
+        }
     }
 }
