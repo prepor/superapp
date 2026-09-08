@@ -95,6 +95,7 @@ pub(super) fn stream(
     model: &str,
     on: &mut dyn FnMut(&Chunk) -> Flow,
 ) -> Result<Completion, Failure> {
+    let mut summary_started = false;
     for event in events {
         let event = event.map_err(|e| Failure::new(format!("the stream broke: {e}")))?;
         let data = event.trim();
@@ -112,6 +113,14 @@ pub(super) fn stream(
         match kind {
             "response.output_text.delta" | "response.refusal.delta" => {
                 delta.content = Some(string(&event, "delta")?.to_string());
+            }
+            "response.reasoning_summary_part.added" => {
+                // Match completion's join, even across reasoning items or
+                // empty parts. Deltas within a part need no separator.
+                if summary_started {
+                    delta.reasoning_content = Some("\n".to_string());
+                }
+                summary_started = true;
             }
             "response.reasoning_summary_text.delta" => {
                 delta.reasoning_content = Some(string(&event, "delta")?.to_string());
@@ -313,6 +322,9 @@ mod tests {
         }));
         let events = vec![
             json!({"type": "response.created", "response": {"status": "in_progress"}}),
+            json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1",
+                   "output_index": 0, "summary_index": 0,
+                   "part": {"type": "summary_text", "text": ""}}),
             json!({"type": "response.reasoning_summary_text.delta", "delta": "Checking "}),
             json!({"type": "response.reasoning_summary_text.delta", "delta": "the request."}),
             json!({"type": "response.output_text.delta", "delta": "Hel"}),
@@ -348,6 +360,57 @@ mod tests {
             (usage.prompt_tokens, usage.completion_tokens, usage.cached()),
             (25, 8, 20)
         );
+    }
+
+    #[test]
+    fn reasoning_summary_boundaries_match_in_the_live_and_saved_turn() {
+        for (summaries, expected) in [
+            (vec![vec!["First part.", "Second part."]], "First part.\nSecond part."),
+            (vec![vec!["First part."], vec!["Second part."]], "First part.\nSecond part."),
+            (vec![vec!["", "Second part.", ""]], "\nSecond part.\n"),
+        ] {
+            let mut events = Vec::new();
+            let mut output = Vec::new();
+            for (output_index, summaries) in summaries.iter().enumerate() {
+                let item_id = format!("rs_{output_index}");
+                let mut parts = Vec::new();
+                for (summary_index, text) in summaries.iter().enumerate() {
+                    events.push(json!({"type": "response.reasoning_summary_part.added",
+                        "item_id": item_id, "output_index": output_index, "summary_index": summary_index,
+                        "part": {"type": "summary_text", "text": ""}}));
+                    for delta in text.split_inclusive(' ') {
+                        events.push(json!({"type": "response.reasoning_summary_text.delta",
+                            "item_id": item_id, "output_index": output_index,
+                            "summary_index": summary_index, "delta": delta}));
+                    }
+                    let part = json!({"type": "summary_text", "text": text});
+                    events.push(json!({"type": "response.reasoning_summary_text.done",
+                        "item_id": item_id, "output_index": output_index,
+                        "summary_index": summary_index, "text": text}));
+                    events.push(json!({"type": "response.reasoning_summary_part.done",
+                        "item_id": item_id, "output_index": output_index,
+                        "summary_index": summary_index, "part": part}));
+                    parts.push(part);
+                }
+                output.push(json!({"type": "reasoning", "id": item_id, "summary": parts}));
+            }
+            events.push(done(json!(output)));
+            let mut reasoning = String::new();
+            let answer = stream(
+                events.into_iter().map(|e| Ok(e.to_string())),
+                "gpt-6-astra",
+                &mut |c| {
+                    for choice in &c.choices {
+                        reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+                    }
+                    Flow::Go
+                },
+            ).unwrap();
+            assert_eq!(reasoning, expected, "live summary parts: {summaries:?}");
+            assert_eq!(answer.message.reasoning_content.as_deref(), Some(expected));
+            let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
+            assert_eq!(turn.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+        }
     }
 
     #[test]
