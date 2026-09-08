@@ -106,7 +106,7 @@ pub struct Chat {
     first_unread: Option<MsgId>,
     /// Retry unacknowledged views after a short delay; a queued command is
     /// not enough to dismiss a server notification.
-    viewed_mentions: std::collections::BTreeMap<MsgId, f64>,
+    viewed_messages: std::collections::BTreeMap<MsgId, f64>,
     /// What the composer will send with the text, in the order it will go.
     /// Edited from the attach panel, through the join.
     carrying: Vec<Carried>,
@@ -240,26 +240,33 @@ impl Chat {
         self.transcript.get(&self.store).history.clone()
     }
 
-    /// The widget supplies only messages visible in the focused transcript.
-    pub fn view_mentions(&mut self, visible: &[MsgId], now: f64) {
+    /// The widget supplies messages seen in the focused foreground transcript.
+    /// Opening only read the cached history; newer visible lines need receipts
+    /// too. Mentions keep their own acknowledgment behind the inbox cursor.
+    pub fn view_messages(&mut self, visible: &[MsgId], now: f64) {
         if visible.is_empty() { return; }
+        let last_read = super::super::topics::card(&self.store, self.peer, self.topic)
+            .and_then(|card| card.last_read).unwrap_or(0);
         let snapshot = self.transcript.get(&self.store);
         let ids: Vec<MsgId> = visible.iter().filter_map(|&id| snapshot.message(id))
-            .filter(|m| m.unread_mention)
-            .filter(|m| self.viewed_mentions.get(&m.id).is_none_or(|at| now - at >= 5.0))
+            .filter(|m| m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")))
+            .filter(|m| m.unread_mention || m.id > last_read)
+            .filter(|m| self.viewed_messages.get(&m.id).is_none_or(|at| now - at >= 5.0))
             .map(|m| m.id).collect::<BTreeSet<_>>().into_iter().collect();
-        if ids.is_empty() {
-            return;
-        }
+        let Some(through) = ids.iter().copied().max() else { return; };
         if wire(&self.store, &requests::in_topic(requests::view_messages(self.peer, &ids), self.topic)) {
             for id in ids {
-                self.viewed_mentions.insert(id, now);
+                self.viewed_messages.insert(id, now);
             }
         } else if !super::super::Telegram::engine_store(self.store.dir())
             && super::super::schema::session(self.store.conn()).state == "closed"
         {
             let peer = self.peer;
-            super::flip(&self.store, move |c| super::super::project::read_mentions(c, peer, &ids));
+            let topic = self.topic;
+            super::flip(&self.store, move |c| {
+                super::super::topics::read_tx(c, peer, topic, through)?;
+                super::super::project::read_mentions(c, peer, &ids)
+            });
         }
     }
 
@@ -1425,7 +1432,7 @@ impl PanelKind for ChatKind {
             editing: None,
             #[cfg(test)]
             first_unread,
-            viewed_mentions: std::collections::BTreeMap::new(),
+            viewed_messages: std::collections::BTreeMap::new(),
             carrying: Vec::new(),
             wants_field: false,
             player: None,

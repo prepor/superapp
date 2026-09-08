@@ -25,8 +25,11 @@
 //! the way a finger does. So are the play buttons and the pictures inside
 //! them.
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use kernel::nav::Nav;
-use kernel::panel::{PanelId, Tag};
+use kernel::panel::{Panel, PanelId, Tag};
 use kernel::session::Session;
 use makepad_widgets::*;
 
@@ -72,7 +75,7 @@ const FILE_TAG: Tag = Tag("file");
 struct RowHit {
     id: MsgId,
     rect: Rect,
-    /// Mention acknowledgement measures how much of the full message was seen.
+    /// Read acknowledgment measures how much of the full message was seen.
     unclipped: Rect,
 }
 
@@ -81,7 +84,7 @@ impl RowHit {
         let full = self.unclipped;
         let height = (full.pos.y + full.size.y).min(viewport.pos.y + viewport.size.y)
             - full.pos.y.max(viewport.pos.y);
-        // A long reply can be taller than the viewport; showing a
+        // A long message can be taller than the viewport; showing a
         // substantial part of it must still let the reader dismiss it.
         viewport.size.y > 0.0 && height + 1.0 >= full.size.y.min(viewport.size.y * 0.5)
             && full.pos.x >= viewport.pos.x - 1.0
@@ -120,6 +123,10 @@ pub struct ChatPanel {
     view: View,
     #[rust]
     rows: Vec<RowHit>,
+    /// The instance that produced the drawn rows. A slot can be replaced
+    /// before the shell rebuilds its retained widget on the next draw.
+    #[rust]
+    drawn_for: Weak<RefCell<Box<dyn Panel>>>,
     #[rust]
     inner: Vec<InnerHit>,
     /// The first look at a live panel has happened: the field took the
@@ -190,6 +197,12 @@ impl Widget for ChatPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        // Row geometry and input belong to the instance last drawn, even
+        // when another chat or target reuses this slot and its message ids.
+        if !self.drawn_for.ptr_eq(&Rc::downgrade(&props.panel)) {
+            self.viewed = None;
+            return;
+        }
         if self.draft_timer.is_event(event).is_some() {
             self.draft_timer = Timer::default();
             with_chat(&props, Chat::save_pending_draft);
@@ -198,7 +211,9 @@ impl Widget for ChatPanel {
         if matches!(event, Event::WindowLostFocus(_) | Event::Background | Event::Shutdown) {
             with_chat(&props, Chat::flush_draft);
         }
-        if scope.data.get_mut::<Session>().is_some_and(|s| !super::message_panel_visible(s, props.slot)) {
+        let panel_visible = scope.data.get_mut::<Session>()
+            .is_some_and(|s| super::message_panel_visible(s, props.slot));
+        if !panel_visible {
             self.viewed = None;
         }
 
@@ -271,11 +286,11 @@ impl Widget for ChatPanel {
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
-        if has_focus && self.mounted {
+        if has_focus && self.mounted && panel_visible && !self.background {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
             let visible: Vec<MsgId> = self.rows.iter().filter(|r| r.viewed_in(viewport))
                 .map(|r| r.id).collect();
-            with_chat(&props, |c| c.view_mentions(&visible, super::now(scope)));
+            with_chat(&props, |c| c.view_messages(&visible, super::now(scope)));
         }
         // A reply or an edit asked for the caret — the bar's verb over the
         // cursor, or the line's card through the join — since both are
@@ -887,6 +902,7 @@ impl Widget for ChatPanel {
         if (moving && active_visible) || video_redraw || self.refocus {
             self.view.redraw(cx);
         }
+        self.drawn_for = Rc::downgrade(&props.panel);
         DrawStep::done()
     }
 }
@@ -1321,12 +1337,15 @@ fn leave_field(cx: &mut Cx, view: &View) {
     cx.set_key_focus(view.area());
 }
 
+#[cfg(all(test, headless))]
+mod reading_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn clipped_hits_only_acknowledge_mentions_after_enough_of_the_message_is_shown() {
+    fn clipped_hits_only_acknowledge_reads_after_enough_of_the_message_is_shown() {
         let rect = |y, h| Rect { pos: dvec2(0.0, y), size: dvec2(300.0, h) };
         let viewport = rect(100.0, 200.0);
         for (full, viewed) in [
