@@ -151,7 +151,7 @@ impl<T: Td> Account<T> {
             return;
         };
         if self.cached_download(w, &v) { return; }
-        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessageAvailableReactions"))
+        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessages" | "getMessageAvailableReactions"))
             && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
             let mut pending = self.deferred_reads.borrow_mut();
@@ -435,9 +435,12 @@ impl<T: Td> Account<T> {
             self.send(w, &request);
         }
         drop(commands);
+        super::history::preparing(w.store());
         runtime::of(w.store())
             .operations
             .expire(w.store(), std::time::Instant::now());
+        // Propagate a backup timeout before accepting any late replies below.
+        super::history::preparing(w.store());
         self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
         let mut n = 0;
@@ -485,7 +488,7 @@ impl<T: Td> Account<T> {
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
         }
-        if let Some(request) = super::history::snapshot(w.store(), &v) {
+        if let Some(request) = super::history::snapshot(w, &v) {
             if let Some(request) = request { self.send(w, &request); }
             return;
         }

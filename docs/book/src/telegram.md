@@ -65,8 +65,24 @@ its original formatting. Reaction undo removes the added emoji and restores
 your previous selection, including one displaced by Telegram's reaction limit.
 Adding an emoji you had already chosen does not remove it on undo.
 
-Message deletions are recorded as **cannot undo**: Telegram provides deletion,
-but no operation that restores the original message. Undo skips these nodes.
+Deleting your own supported messages saves their content before sending the
+deletion to Telegram. **Undo resends copies** as new messages, with new ids and
+timestamps; redo deletes those replacements. Text and caption formatting,
+topics and reply targets are retained, including replies between messages
+restored in the same batch. Existing reactions, replies from other messages,
+forward attribution and album grouping are not restored.
+
+Photos, documents, videos, animations, audio, voice notes, video notes and
+stickers keep independent local copies of their file bytes for undo. Missing
+files are downloaded first; a failed or incomplete backup leaves the originals
+on Telegram. Contacts, static locations and venues can also be resent. Backups
+belong to this session's history and are removed when it releases them.
+
+Messages from other people and unsupported content (such as polls and service
+messages) retain the **cannot undo** label. Undo skips these nodes, since a new
+send cannot reproduce their original sender or behavior. Protected,
+self-destructing, scheduled or still-pending messages cannot be backed up for
+resending; if the snapshot finds one, that deletion is canceled.
 Other actions also become unavailable for undo if their previous server state
 could not be read, or Telegram rejects the reversal. Pending or uncertain sends
 are never automatically resent. History and its reversal data last only for the

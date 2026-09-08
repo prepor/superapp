@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use super::operations::{Receipt, Status};
 use super::{model, panels, requests, runtime};
 
+mod deletion;
+
 pub(super) fn command(s: &mut Session, request: &str) -> Option<u64> {
     let v: Value = serde_json::from_str(request).ok()?;
     let (kind, label, undo) = match v["@type"].as_str()? {
@@ -25,6 +27,8 @@ pub(super) fn command(s: &mut Session, request: &str) -> Option<u64> {
         }
         "forwardMessages" => ("forward", "forward messages".into(), Undo::Send),
         "editMessageText" | "editMessageCaption" => ("edit", "edit message".into(), Undo::Edit),
+        "deleteMessages" if deletion::eligible(s.store(), &v) =>
+            ("delete", "delete messages (undo resends copies)".into(), Undo::Delete(None)),
         "deleteMessages" => ("delete", "delete messages (cannot undo)".into(), Undo::Impossible),
         "addMessageReaction" => ("react", format!("react {}", v["reaction_type"]["emoji"].as_str().unwrap_or("")), Undo::Reaction),
         "setChatNotificationSettings" => ("mute", "change chat notifications".into(), Undo::Chat),
@@ -37,11 +41,12 @@ pub(super) fn command(s: &mut Session, request: &str) -> Option<u64> {
     submit(s, request, kind, label, undo)
 }
 
-pub(super) enum Undo {
+enum Undo {
     Send,
     Edit,
     Reaction,
     Chat,
+    Delete(Option<deletion::Saved>),
     Commands(Vec<Value>),
     Impossible,
 }
@@ -78,7 +83,7 @@ struct Change {
 
 /// Only deliberate user commands enter here. Reads, typing and projection
 /// updates keep using the ordinary queue and create no history nodes.
-pub(super) fn submit(
+fn submit(
     s: &mut Session, request: &str, kind: &'static str, label: String, undo: Undo,
 ) -> Option<u64> {
     if !panels::live(s.store()) { return None; }
@@ -108,7 +113,7 @@ pub(super) fn submit(
     let initial: Value = serde_json::from_str(&tracked).ok()?;
     let id = initial["@extra"]["operation"].as_u64()?;
     let receipt = rt.operations.watch(id)?;
-    let prepared = !matches!(undo, Undo::Edit | Undo::Reaction | Undo::Chat);
+    let prepared = !matches!(undo, Undo::Edit | Undo::Reaction | Undo::Chat | Undo::Delete(_));
     let change = Arc::new(Mutex::new(Change {
         label: label.clone(), initial, undo, prepared, snapshot: None,
         desired: true, applied: false, messages: Vec::new(), failed: None,
@@ -150,6 +155,14 @@ pub(super) fn before_send(store: &Store, request: &Value) -> Option<String> {
             snapshot["@type"] = json!("getChat");
             snapshot.as_object_mut().unwrap().remove("message_id");
         }
+        if matches!(change.undo, Undo::Delete(_)) {
+            snapshot["@type"] = json!("getMessages");
+            snapshot.as_object_mut().unwrap().remove("message_id");
+            snapshot["message_ids"] = request["message_ids"].clone();
+            // A failed preparation needs a fresh delete gesture and snapshot,
+            // never a retry of a deletion whose backup is incomplete.
+            runtime::of(store).operations.forget_payload(id);
+        }
         let rt = runtime::of(store);
         let tracked = rt.operations.track(&snapshot.to_string());
         let tracked_value: Value = serde_json::from_str(&tracked).unwrap();
@@ -161,23 +174,106 @@ pub(super) fn before_send(store: &Store, request: &Value) -> Option<String> {
 }
 
 /// A snapshot is private to the command: it must not re-project stale message
-/// bodies. A missing snapshot leaves the action recorded as irreversible.
-pub(super) fn snapshot(store: &Store, reply: &Value) -> Option<Option<String>> {
+/// bodies. Deletion needs a complete backup; a failed backup cancels deletion.
+/// Other missing snapshots leave their actions recorded as irreversible.
+pub(super) fn snapshot(w: &World, reply: &Value) -> Option<Option<String>> {
+    let store = w.store();
     let context = reply["@extra"]["context"].as_str().or_else(|| reply["@extra"].as_str())?;
     let id: u64 = context.strip_prefix("undo_snapshot:")?.parse().ok()?;
     let journal = store.local::<Journal>();
-    let entries = journal.entries.lock().unwrap();
+    let entries = journal.entries.lock().unwrap().clone();
     for entry in entries.iter() {
         let mut change = entry.lock().unwrap();
         if change.initial["@extra"]["operation"] != id || change.prepared { continue; }
         if change.snapshot.as_ref().is_none_or(|(id, _)| reply["@extra"]["operation"] != *id) {
             return Some(None);
         }
+        if matches!(change.undo, Undo::Delete(_)) {
+            let status = change.snapshot.as_ref().unwrap().1.lock().unwrap().status.clone();
+            if let Status::Failed { error, .. } = status {
+                let rt = runtime::of(store);
+                rt.operations.fail(store, id, &format!("{error}; nothing was deleted"), false);
+                rt.operations.forget_payload(id);
+                return Some(None);
+            }
+            drop(change);
+            return Some(prepare_delete(w, entry, reply));
+        }
         change.prepared = true;
         change.undo = inverse(&change, reply).map_or(Undo::Impossible, Undo::Commands);
         return Some(runtime::of(store).operations.pending(id).then(|| change.initial.to_string()));
     }
     Some(None)
+}
+
+fn prepare_delete(w: &World, entry: &Arc<Mutex<Change>>, reply: &Value) -> Option<String> {
+    let store = w.store();
+    let rt = runtime::of(store);
+    let mut change = entry.lock().unwrap();
+    let id = change.initial["@extra"]["operation"].as_u64().unwrap();
+    if !rt.operations.pending(id) { return None; }
+    let initial = change.initial.clone();
+    let Undo::Delete(mut saved) = std::mem::replace(&mut change.undo, Undo::Delete(None)) else { unreachable!() };
+    // Copying large attachments must not hold a lock the UI's undo path needs.
+    drop(change);
+    let result = (|| {
+        if !store.is_writable() { return Err("another device holds the lease".into()); }
+        if let Some(saved) = &mut saved { saved.downloaded(w, reply)?; }
+        else { saved = Some(deletion::Saved::capture(&initial, reply)?); }
+        saved.as_mut().unwrap().next_file(w)
+    })();
+    let mut change = entry.lock().unwrap();
+    change.undo = Undo::Delete(saved);
+    match result {
+        Ok(file) if store.is_writable() && rt.operations.pending(id) => {
+            if reply["@type"] == "file" {
+                rt.operations.backed_up_file(reply["@extra"]["operation"].as_u64().unwrap());
+            }
+            if let Some(file) = file {
+                let request = rt.operations.track(&requests::download_media(file, &format!("undo_snapshot:{id}")));
+                let value: Value = serde_json::from_str(&request).unwrap();
+                let snapshot_id = value["@extra"]["operation"].as_u64().unwrap();
+                change.snapshot = Some((snapshot_id, rt.operations.watch(snapshot_id).unwrap()));
+                return Some(request);
+            }
+            change.prepared = true;
+            rt.operations.preparing_delete(id, false);
+            Some(change.initial.to_string())
+        }
+        result => {
+            let reason = result.err().unwrap_or_else(|| "The deletion is no longer available".into());
+            let error = format!("{reason}; nothing was deleted");
+            rt.operations.fail(store, id, &error, false);
+            rt.operations.forget_payload(id);
+            if reply["@type"] == "file" {
+                rt.operations.fail(store, reply["@extra"]["operation"].as_u64().unwrap(), &error, false);
+            }
+            None
+        }
+    }
+}
+
+/// An attachment download has its own progress/timeout. Keep the deletion
+/// pending while that backup runs; a failed backup must never delete anything.
+pub(super) fn preparing(store: &Store) {
+    let journal = store.local::<Journal>();
+    let rt = runtime::of(store);
+    for entry in journal.entries.lock().unwrap().iter() {
+        let change = entry.lock().unwrap();
+        if change.prepared || !matches!(change.undo, Undo::Delete(_)) { continue; }
+        let id = change.initial["@extra"]["operation"].as_u64().unwrap();
+        if let Some((_, snapshot)) = &change.snapshot {
+            let status = snapshot.lock().unwrap().status.clone();
+            match status {
+                Status::Pending => rt.operations.preparing_delete(id, true),
+                Status::Failed { error, .. } => {
+                    rt.operations.fail(store, id, &format!("{error}; nothing was deleted"), false);
+                    rt.operations.forget_payload(id);
+                }
+                Status::Done => {}
+            }
+        }
+    }
 }
 
 fn inverse(change: &Change, message: &Value) -> Option<Vec<Value>> {
@@ -254,11 +350,16 @@ impl Change {
     fn targets(&self, store: &Store) -> Vec<(i64, i64)> {
         let mut sent = self.messages.clone();
         if let Some(flight) = &self.flight {
-            if flight.applied { sent.extend(&flight.receipt.lock().unwrap().messages); }
+            sent.extend(&flight.receipt.lock().unwrap().messages);
+        }
+        let mut keys = targets(&self.initial, &sent);
+        if let Undo::Delete(Some(saved)) = &self.undo {
+            keys.extend(sent);
+            for copy in &saved.copies { keys.extend(targets(&copy.request, &[])); }
         }
         let aliases = store.local::<Aliases>();
         let aliases = aliases.0.lock().unwrap();
-        targets(&self.initial, &sent).into_iter().map(|key| resolve_key(&aliases, key)).collect()
+        keys.into_iter().map(|key| resolve_key(&aliases, key)).collect()
     }
 
     fn pending(&self) -> bool {
@@ -302,9 +403,24 @@ impl Change {
                 let aliases = store.local::<Aliases>();
                 let mut aliases = aliases.0.lock().unwrap();
                 for (old, new) in self.messages.iter().zip(&receipt.messages) {
-                    if old != new { aliases.insert(*old, *new); }
+                    let old = resolve_key(&aliases, *old);
+                    if old != *new { aliases.insert(old, *new); }
                 }
-                self.messages = receipt.messages;
+                self.messages = receipt.messages.clone();
+            }
+            if !flight.applied {
+                if let Undo::Delete(Some(saved)) = &self.undo {
+                    let original = saved.copies[saved.copies.len() - flight.remaining.len() - 1].original;
+                    if let [new] = receipt.messages.as_slice() {
+                        let aliases = store.local::<Aliases>();
+                        let mut aliases = aliases.0.lock().unwrap();
+                        let old = resolve_key(&aliases, original);
+                        if old != *new { aliases.insert(old, *new); }
+                    } else {
+                        self.failed = Some("Telegram did not confirm the restored message".into());
+                        return;
+                    }
+                }
             }
             if let Some(next) = flight.remaining.pop_front() {
                 self.start(store, next, flight.applied, flight.remaining);
@@ -329,6 +445,7 @@ impl Change {
                     VecDeque::from([serde_json::from_str(&requests::delete_messages(chat, &ids, true)).unwrap()])
                 }
                 Undo::Commands(commands) => commands.clone().into(),
+                Undo::Delete(Some(saved)) => saved.copies.iter().map(|copy| copy.request.clone()).collect(),
                 _ => {
                     let error = "Telegram cannot undo this action; its previous state is unavailable";
                     runtime::of(store).operations.report(store, &format!("undo {}", self.label), error);
@@ -416,7 +533,9 @@ fn targets(request: &Value, sent: &[(i64, i64)]) -> Vec<(i64, i64)> {
     let Some(chat) = request["chat_id"].as_i64() else { return Vec::new(); };
     if matches!(request["@type"].as_str(), Some("sendMessage" | "forwardMessages")) {
         let mut keys = sent.to_vec();
-        if let Some(reply) = request["reply_to"]["message_id"].as_i64() { keys.push((chat, reply)); }
+        if let Some(reply) = request["reply_to"]["message_id"].as_i64() {
+            keys.push((request["reply_to"]["chat_id"].as_i64().unwrap_or(chat), reply));
+        }
         if let Some(from) = request["from_chat_id"].as_i64() {
             keys.extend(request["message_ids"].as_array().into_iter().flatten()
                 .filter_map(|id| id.as_i64().map(|id| (from, id))));
@@ -443,7 +562,8 @@ fn resolve(store: &Store, mut request: Value) -> Value {
         if let Some(id) = request[field].as_i64() { request[field] = json!(resolve_key(&aliases, (chat, id)).1); }
     }
     if let Some(id) = request["reply_to"]["message_id"].as_i64() {
-        request["reply_to"]["message_id"] = json!(resolve_key(&aliases, (chat, id)).1);
+        let from = request["reply_to"]["chat_id"].as_i64().unwrap_or(chat);
+        request["reply_to"]["message_id"] = json!(resolve_key(&aliases, (from, id)).1);
     }
     let from = request["from_chat_id"].as_i64().unwrap_or(chat);
     if let Some(ids) = request["message_ids"].as_array_mut() {

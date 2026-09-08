@@ -435,8 +435,8 @@ impl Chat {
 
     // -- deleting -----------------------------------------------------------------------
 
-    /// Deletes lines and records the gesture. Live deletion is irreversible;
-    /// only the offline fixture can restore the same message identities.
+    /// Records deletion; live undo resends saved copies of supported outgoing
+    /// messages. Only the offline fixture restores the original identities.
     pub fn delete(&mut self, s: &mut Session, ids: Vec<MsgId>) {
         if ids.is_empty() {
             return;

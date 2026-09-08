@@ -312,6 +312,30 @@ impl Tracker {
         self.state.lock().unwrap().operations.get(&id).is_some_and(|o| o.status == Status::Pending)
     }
 
+    pub(super) fn preparing_delete(&self, id: u64, waiting: bool) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            if op.status != Status::Pending { return; }
+            let label = if waiting { "saving messages for undo" } else { "deleting messages" };
+            if op.label != label {
+                op.label = label.into();
+                self.changed();
+            }
+            op.changed = Instant::now();
+        }
+    }
+
+    /// A private undo copy completes only its own download. Other downloads
+    /// of this file still need their normal cache completion acknowledgement.
+    pub(super) fn backed_up_file(&self, id: u64) {
+        if let Some(op) = self.state.lock().unwrap().operations.get_mut(&id) {
+            if op.status != Status::Pending { return; }
+            op.status = Status::Done;
+            op.request = None;
+            op.changed();
+            self.changed();
+        }
+    }
+
     /// A save retains its source request for retry while tracking the file's
     /// byte counts. Cache arrival alone must not mark the exported copy done.
     pub(super) fn saving_file(&self, id: u64, file: &Value) {

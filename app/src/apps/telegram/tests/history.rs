@@ -3,6 +3,8 @@ use crate::apps::telegram::{history, operations::Status};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
+mod deletion;
+
 fn receive(inbox: &runtime::Inbox) -> Value {
     serde_json::from_str(&inbox.try_recv().expect("queued command")).unwrap()
 }
@@ -201,14 +203,14 @@ fn adding_an_existing_reaction_never_removes_it_on_undo() {
 }
 
 #[test]
-fn deletes_are_recorded_and_skipped_without_recreating_local_messages() {
+fn incoming_deletes_are_recorded_and_skipped_without_recreating_local_messages() {
     let mut s = session();
     let chat = open_root(&mut s, Chat::id(VERA));
-    let m = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().clone();
+    let m = model::history(s.store(), VERA).iter().find(|m| !m.out && !m.service).unwrap().clone();
     let rt = runtime::of(s.store());
     let inbox = rt.connect();
     with_chat(&s, chat, |c| c.set_cursor(m.id));
-    verb(&mut s, chat, "telegram.delete");
+    history::command(&mut s, &requests::delete_messages(VERA, &[m.id], true)).unwrap();
     assert_eq!(receive(&inbox)["@type"], "deleteMessages");
     let row = s.history().rows().0.last().unwrap().clone();
     assert_eq!(row.kind, "delete");
