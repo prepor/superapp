@@ -170,7 +170,7 @@ pub fn body(store: &Store, id: i64) -> String {
 /// A subscription is retained when removed so undo and re-adding keep its
 /// cached articles and read state. Removed feeds are absent from all lists.
 pub fn add(s: &mut Session, raw: &str) -> Result<i64, String> {
-    let url = parse::web_url(raw)?;
+    let url = parse::feed_url(raw)?;
     let existing: Option<(i64, bool)> = s
         .store()
         .conn()
@@ -390,9 +390,9 @@ pub fn ingest(c: &Connection, id: i64, feed: &parse::Feed, now: f64) -> rusqlite
         params![feed.title, id],
     )?;
     for a in &feed.articles {
-        c.execute("INSERT INTO rss_article(feed,guid,title,url,author,published,html) VALUES(?1,?2,?3,?4,?5,?6,?7)
-            ON CONFLICT(feed,guid) DO UPDATE SET title=excluded.title,url=excluded.url,author=excluded.author,html=excluded.html",
-            params![id,a.guid,a.title,a.url,a.author,a.published.unwrap_or(now),a.html])?;
+        c.execute("INSERT INTO rss_article(feed,guid,title,url,author,published,html,raw,content_type,base_url) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            ON CONFLICT(feed,guid) DO UPDATE SET title=excluded.title,url=excluded.url,author=excluded.author,html=excluded.html,raw=excluded.raw,content_type=excluded.content_type,base_url=excluded.base_url",
+            params![id,a.guid,a.title,a.url,a.author,a.published.unwrap_or(now),a.html,a.raw,a.content_type,a.base_url])?;
     }
     Ok(())
 }

@@ -6,7 +6,7 @@ use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use std::collections::{HashMap, HashSet};
 
-use super::parse::web_url;
+use super::parse::feed_url;
 
 pub const MAX_OPML: usize = 2 << 20;
 
@@ -106,7 +106,7 @@ fn xml(src: &str) -> Result<Document, String> {
                         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
                 if active && name.as_ref() == b"outline" {
                     if let Some(raw) = attrs.get("xmlUrl") {
-                        match web_url(raw) {
+                        match feed_url(raw) {
                             Ok(url) if urls.insert(url.clone()) => {
                                 let title = attrs
                                     .get("title")

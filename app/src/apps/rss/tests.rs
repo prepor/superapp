@@ -208,11 +208,162 @@ fn parser_prefers_full_content_and_resolves_safe_links_and_images() {
     assert!(a.html.contains("https://example.com/two"));
     assert!(a.html.contains("https://example.com/image.png"));
     assert!(!a.html.contains("javascript:") && !a.html.contains("secret()"));
+    assert!(a.raw.contains("javascript:") && a.raw.contains("<script>secret()</script>"));
+    assert!(!a.raw.contains("Summary"));
+    assert_eq!(a.content_type, "text/html");
+    assert_eq!(a.base_url, "https://example.com/posts/one");
     assert!(
         a.html.contains("<pre>") && a.html.contains("let x = 1;"),
         "{}",
         a.html
     );
+}
+
+#[test]
+fn fragment_links_remain_distinct_articles_across_refreshes() {
+    let documents: &[&[u8]] = &[
+        br#"<rss version="2.0"><channel><title>Notes</title>
+            <item><title>First</title><link>https://example.com/notes#post-1</link><description>First body</description></item>
+            <item><title>Second</title><link>https://example.com/notes#post-2</link><description>Second body</description></item>
+            </channel></rss>"#,
+        br#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Notes</title>
+            <entry><title>First</title><link href="https://example.com/notes#post-1"/><content>First body</content></entry>
+            <entry><title>Second</title><link href="https://example.com/notes#post-2"/><content>Second body</content></entry>
+            </feed>"#,
+    ];
+    for xml in documents {
+        let mut s = session();
+        let source = "https://example.com/fragments.xml";
+        let feed_id = model::add(&mut s, &format!("{source}#one")).unwrap();
+        assert!(model::add(&mut s, &format!("{source}#two"))
+            .unwrap_err()
+            .contains("already subscribed"));
+        assert_eq!(
+            model::FEEDS.by_key(s.store(), &feed_id).unwrap().url,
+            source
+        );
+        for _ in 0..2 {
+            let feed = parse::parse(xml, source).unwrap();
+            assert_ne!(feed.articles[0].guid, feed.articles[1].guid);
+            s.store()
+                .write(move |c| model::ingest(c, feed_id, &feed, 100.0))
+                .unwrap();
+        }
+        let count: i64 = s
+            .store()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM rss_article WHERE feed=?",
+                [feed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        for (fragment, body) in [("post-1", "First body"), ("post-2", "Second body")] {
+            let url = format!("https://example.com/notes#{fragment}");
+            let article_id = id(&s, &url);
+            assert_eq!(model::article(s.store(), article_id).unwrap().url, url);
+            assert!(model::body(s.store(), article_id).contains(body));
+        }
+    }
+}
+
+#[test]
+fn sanitizer_upgrades_rebuild_all_cached_articles_from_the_latest_source() {
+    use kernel::store::Store;
+    let store = Store::open(None, &[&super::schema::SCHEMA]).unwrap();
+    let source = "https://example.com/redirected/feed.xml";
+    let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Source</title>
+        <entry><id>html</id><link href="https://example.com/posts/one#section"/>
+            <content type="html"><![CDATA[<p><a href="../two#detail">Original</a></p><script>secret()</script>]]></content></entry>
+        <entry><id>text</id><content type="text">&lt;b&gt;literal&lt;/b&gt; &amp; safe</content></entry>
+        <entry><id>relative</id><content type="html"><![CDATA[<p><a href="two#detail">From feed</a></p><img src="image.png" width="200" height="100">]]></content></entry>
+        </feed>"#;
+    let feed = parse::parse(xml.as_bytes(), source).unwrap();
+    let mut refreshed =
+        parse::parse(xml.replace("Original", "Revised").as_bytes(), source).unwrap();
+    refreshed.articles.truncate(1);
+    store
+        .write(move |c| {
+            c.execute_batch(
+                "INSERT INTO rss_feed(id,url,title) VALUES
+            (1,'https://example.com/feed','Active'),(2,'https://example.com/removed','Removed');",
+            )?;
+            model::ingest(c, 1, &feed, 100.0)?;
+            model::ingest(c, 2, &feed, 200.0)?;
+            c.execute("UPDATE rss_article SET seen=1 WHERE guid='text'", [])?;
+            c.execute("UPDATE rss_feed SET subscribed=0 WHERE id=2", [])?;
+            // Two entries have left the rolling window; the third has been edited.
+            model::ingest(c, 1, &refreshed, 300.0)?;
+            let saved = c
+                .prepare("SELECT id,guid,published,seen,html FROM rss_article ORDER BY id")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, bool>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(saved.len(), 6);
+            assert!(saved[0].4.contains("Revised"));
+            assert!(saved[0].4.contains("https://example.com/two#detail"));
+            assert!(saved[1].4.contains("&lt;b&gt;literal&lt;/b&gt;"));
+            assert!(saved[2]
+                .4
+                .contains("https://example.com/redirected/two#detail"));
+            assert!(saved[2]
+                .4
+                .contains("https://example.com/redirected/image.png"));
+            let raw: String = c.query_row(
+                "SELECT raw FROM rss_article WHERE feed=1 AND guid='html'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert!(raw.contains("Revised") && raw.contains("<script>secret()</script>"));
+            c.execute("UPDATE rss_article SET html='<p>stale cache</p>'", [])?;
+            c.execute("UPDATE meta SET value=0 WHERE key='rss:html'", [])?;
+            super::schema::SCHEMA.apply(c)?;
+            for (id, guid, published, seen, html) in saved {
+                let rebuilt = c.query_row(
+                    "SELECT guid,published,seen,html FROM rss_article WHERE id=?",
+                    [id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, f64>(1)?,
+                            r.get::<_, bool>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )?;
+                assert_eq!(rebuilt, (guid, published, seen, html));
+            }
+            assert!(
+                !c.query_row("SELECT subscribed FROM rss_feed WHERE id=2", [], |r| r
+                    .get::<_, bool>(0))?
+            );
+            let version: i64 =
+                c.query_row("SELECT value FROM meta WHERE key='rss:html'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(version, crate::reader::html::VERSION as i64);
+            // Current caches are not rewritten on every open.
+            c.execute("UPDATE rss_article SET html='current cache'", [])?;
+            super::schema::SCHEMA.apply(c)?;
+            assert_eq!(
+                c.query_row(
+                    "SELECT COUNT(*) FROM rss_article WHERE html='current cache'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                6
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
@@ -277,7 +428,13 @@ fn bad_urls_and_documents_are_rejected_and_empty_feeds_are_valid() {
         assert!(parse::web_url(bad).is_err(), "{bad}");
     }
     assert_eq!(
-        parse::web_url(" HTTPS://EXAMPLE.COM/feed#top ").unwrap(),
+        parse::web_url(" HTTPS://EXAMPLE.COM/feed#top ")
+            .unwrap()
+            .as_str(),
+        "https://example.com/feed#top"
+    );
+    assert_eq!(
+        parse::feed_url(" HTTPS://EXAMPLE.COM/feed#top ").unwrap(),
         "https://example.com/feed"
     );
     assert!(parse::parse(b"<html><body>not a feed</body></html>", seed::NOTES).is_err());

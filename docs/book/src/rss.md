@@ -33,9 +33,18 @@ scale, selectable text, code, links and image loader as
 [mail](./mail.md#html-and-pictures). These components live in
 `app/src/reader/`; mail supplies its own adapter for inline MIME files.
 Relative article links and images resolve against their source URL.
+Article links retain fragments, including when a permalink supplies a
+missing entry ID; subscription URLs ignore fragments for deduplication.
 Full feed content takes precedence over the publisher's summary; feeds
 that only publish a summary show that summary. **open original** opens the
 publisher's page in the browser.
+
+Each article retains the publisher's content before HTML cleanup, its
+content type, and its effective base URL. A shared sanitizer version change
+rebuilds every cached reading on the next open, including articles that
+have left the publisher's feed and removed subscriptions. Older caches
+without source are cleaned again from their saved HTML, and their feeds
+request a full refresh to recover source where it is still available.
 
 Each subscription has a worker that refreshes every fifteen minutes.
 **refresh** requests an immediate pass. HTTP follows up to five redirects,

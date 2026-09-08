@@ -11,6 +11,9 @@ pub struct Article {
     pub author: String,
     pub published: Option<f64>,
     pub html: String,
+    pub raw: String,
+    pub content_type: String,
+    pub base_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -20,16 +23,22 @@ pub struct Feed {
 }
 
 /// Only web addresses are feed sources or article destinations.
-pub fn web_url(raw: &str) -> Result<String, String> {
-    let mut url = url::Url::parse(raw.trim()).map_err(|_| "enter a full feed URL (https://…)")?;
+pub fn web_url(raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw.trim()).map_err(|_| "enter a full feed URL (https://…)")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err("feed URLs must use http or https".into());
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("use a feed URL without embedded credentials".into());
     }
+    Ok(url)
+}
+
+/// A subscription's unique key ignores fragments; article destinations do not.
+pub fn feed_url(raw: &str) -> Result<String, String> {
+    let mut url = web_url(raw)?;
     url.set_fragment(None);
-    Ok(url.to_string())
+    Ok(url.into())
 }
 
 fn link(links: &[Link]) -> Option<String> {
@@ -41,10 +50,10 @@ fn link(links: &[Link]) -> Option<String> {
                 .as_deref()
                 .is_none_or(|t| t == "text/html" || t == "application/xhtml+xml")
         })
-        .find_map(|l| web_url(&l.href).ok())
+        .find_map(|l| web_url(&l.href).ok().map(String::from))
 }
 
-fn reading(text: &str, kind: &str, base: &str) -> String {
+pub(super) fn reading(text: &str, kind: &str, base: &str) -> String {
     if matches!(kind, "text/html" | "application/xhtml+xml") {
         html::sanitize_with_base(text, Some(base))
     } else {
@@ -108,9 +117,11 @@ pub fn parse(bytes: &[u8], source: &str) -> Result<Feed, String> {
                         .as_ref()
                         .map(|s| (s.content.as_str(), s.content_type.to_string()))
                 });
-            let html = body
-                .map(|(text, kind)| reading(text, &kind, base))
-                .unwrap_or_default();
+            let (raw, content_type) = body
+                .map(|(text, kind)| (text.to_string(), kind))
+                .unwrap_or_else(|| (String::new(), "text/plain".into()));
+            let html = reading(&raw, &content_type, base);
+            let base_url = base.to_string();
             let name = title(entry.title.as_ref());
             let published = entry
                 .published
@@ -147,6 +158,9 @@ pub fn parse(bytes: &[u8], source: &str) -> Result<Feed, String> {
                 published,
                 url,
                 html,
+                raw,
+                content_type,
+                base_url,
             }
         })
         .collect();

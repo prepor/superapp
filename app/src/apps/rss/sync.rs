@@ -53,7 +53,7 @@ impl Default for Http {
 
 impl Fetch for Http {
     fn get(&mut self, r: &Request) -> Result<Response, String> {
-        let url = parse::web_url(&r.url)?;
+        let url = parse::feed_url(&r.url)?;
         let mut req=self.0.get(&url).header("Accept","application/atom+xml, application/rss+xml, application/feed+json, application/xml, text/xml;q=0.9, */*;q=0.5");
         if !r.etag.is_empty() {
             req = req.header("If-None-Match", &r.etag);

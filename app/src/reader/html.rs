@@ -8,10 +8,11 @@
 //! text or nothing. Input and output limits keep large or hostile messages
 //! from blocking layout.
 //!
-//! [`sanitize`] runs at **ingest** and the result is stored, so a reading is
-//! only as good as the build that wrote it — which is why [`VERSION`] is a
-//! `Step::Derived` version in [`schema`](super::schema): bump it and every
-//! store narrows its letters again from `raw` on its next open.
+//! [`sanitize`] runs at **ingest** and the result is stored. Mail and RSS
+//! use [`VERSION`] in their [`Step::Derived`](kernel::app::Step::Derived)
+//! migrations to rebuild cached readings from stored source on the next
+//! open. RSS also retains the content type and base URL; legacy RSS entries
+//! without source can only be narrowed again from their saved HTML.
 //!
 //! The repairs a stored reading still needs at the point of use, and the
 //! base64 a `data:` image carries its bytes in, are in [`entities`].
@@ -27,7 +28,8 @@ use simplecss::{AttributeOperator, Declaration, DeclarationTokenizer, PseudoClas
 /// The shape of what [`sanitize`] writes. It runs at ingest and the result
 /// is stored, so a reading is only as good as the build that wrote it:
 /// bump this whenever the narrowing changes what it keeps or how, and the
-/// store redoes every reading it holds from raw on its next open.
+/// app schemas rebuild their cached readings on the next open, from raw
+/// source where available and from saved markup for legacy RSS entries.
 pub const VERSION: u32 = 5;
 
 /// Input past this is cut before parsing: a letter is not a website, and a

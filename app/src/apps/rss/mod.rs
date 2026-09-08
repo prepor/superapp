@@ -54,7 +54,7 @@ impl App for Rss {
     }
     fn describe(&self) -> Option<&'static str> {
         Some("rss_feed: subscriptions, URLs, titles and refresh status. subscribed=0 retains a removed feed for undo. \
-         rss_article: cached entries keyed by (feed,guid), HTML reading, publication date and seen flag. \
+         rss_article: cached entries keyed by (feed,guid), HTML reading, original content in raw with content_type and base_url, publication date and seen flag. HTML is derived from raw; legacy entries have no raw until refreshed. \
          Lists include only subscribed feeds. Articles default to @unseen and sort oldest first.")
     }
     fn as_any(&self) -> &dyn Any {
