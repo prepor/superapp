@@ -363,10 +363,18 @@ it is not excluded from replication. The actual TDLib session files and login
 secrets are separate. Device-local status needs its own persistence policy
 before multi-device authorization can be represented accurately.
 
-The current search provider and message table use substring matching. The
-projection has a tested FTS query, but the UI does not yet use it and there is
-no server search fallback. A short local history does not establish that the
-server has no older messages.
+The search provider and message table share an indexed, Unicode case-insensitive
+substring query. `tg_message_substr` stores character n-grams of lengths 1–3 in
+a contentless FTS5 index, so even the first character can use a posting list.
+Longer queries intersect their trigrams and verify the literal substring only
+in those candidates; punctuation and word order remain significant. Inserts,
+text edits, service-line changes and deletions maintain the index transactionally.
+Short queries count posting lists directly. Broad searches page in date order,
+and a chat filter resolves names once and reads that chat's index; counting and
+sorting no longer require loading every matching message body.
+Existing stores build it once on their next open. The projection's separate
+word-prefix FTS query remains available, and there is no server search fallback.
+A short local history does not establish that the server has no older messages.
 
 Media is held in the bounded blob cache. Some rendering paths resolve cache
 filenames directly and perform synchronous reads, bypassing the cache's

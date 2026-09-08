@@ -10,7 +10,7 @@ use std::rc::Rc;
 use kernel::filter::Op;
 use kernel::panel::{PanelId, Tag};
 use kernel::richtable::{
-    Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, TextIndex, Values,
+    Dir, Sql, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, TextIndex, Values,
 };
 use kernel::store::{Q, Store, Val};
 use kernel::time::fmt_date_long;
@@ -484,8 +484,10 @@ macro_rules! mailbox_spec {
             // index the launcher asks ([`fts_match`]), and it costs what an
             // index costs.
             index: Some(TextIndex {
-                sql: "m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)",
-                query: fts_match,
+                build: |text| Some(Sql {
+                    sql: "m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)".into(),
+                    params: vec![Val::S(fts_match(text)?)],
+                }),
             }),
             tags: &[
                 ("unread", TagSql::Where("m.unread = 1")),

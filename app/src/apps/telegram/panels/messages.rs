@@ -9,12 +9,15 @@ use std::rc::Rc;
 
 use kernel::layout::SlotId;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::richtable::{ListState, SqlSource};
+use kernel::richtable::ListState;
 use kernel::session::Session;
 use kernel::store::Store;
 
-use super::super::model::{self, MsgHit, PeerId, PAGE};
+use super::super::model::{self, PeerId, PAGE};
+#[cfg(test)]
+use super::super::model::MsgHit;
 use super::super::runtime;
+use super::super::search_index::MessageSource;
 
 /// A messages panel.
 pub struct Messages {
@@ -23,7 +26,7 @@ pub struct Messages {
     replies: bool,
     store: Rc<Store>,
     slot: SlotId,
-    list: ListState<&'static SqlSource<MsgHit, i64>>,
+    list: ListState<&'static MessageSource>,
 }
 
 impl Messages {
@@ -75,7 +78,7 @@ impl Messages {
             .flatten()
     }
 
-    pub fn list_mut(&mut self) -> &mut ListState<&'static SqlSource<MsgHit, i64>> {
+    pub fn list_mut(&mut self) -> &mut ListState<&'static MessageSource> {
         &mut self.list
     }
 

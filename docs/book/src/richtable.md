@@ -39,7 +39,7 @@ matches, while the displayed totals still cover the whole conversation.
 | `@not:tag` | `@not:unread` | Opposite of a tag |
 | `(@a @or @b)` | `(@unread @or @html)` | Either expression |
 | `@a @b` | `@unread vera` | Both expressions |
-| `text` | `budget draft` | Substring in searchable columns, and a word in an indexed one |
+| `text` | `budget draft` | Substring in searchable columns; indexed text follows the source's matching rule |
 
 SQL text columns and text tag values match substrings using Unicode case
 folding: `привет` finds `ПРИВЕТ`, and `STRASSE` finds `Straße`. Literal `%`,

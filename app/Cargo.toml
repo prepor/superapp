@@ -33,6 +33,7 @@ superapp-kernel = { path = "../kernel" }
 # `rusqlite::Result`, and a `Deferred` effect is a serde payload.
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+caseless = "0.2.2"
 
 # Mail's real protocols. `Mode::Real` outside a script reaches a server
 # through these; every scripted run keeps the fake.

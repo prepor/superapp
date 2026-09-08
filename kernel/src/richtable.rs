@@ -356,6 +356,10 @@ pub enum TagSql {
     Where(&'static str),
     /// An operator tag: the column (or expression) it compares.
     Col(&'static str),
+    /// A text `:` predicate with one bound, escaped LIKE pattern. Useful for
+    /// resolving matching foreign keys once instead of folding a joined name
+    /// for every row in a large table.
+    TextMatch(&'static str),
 }
 
 /// An index free text is answered by, for text a scan may not read.
@@ -365,21 +369,17 @@ pub enum TagSql {
 /// costs: megabytes a keystroke. This is the other way to ask — a row test
 /// against something already built over the same words.
 ///
-/// `sql` is that test, with a single `?` (`id IN (SELECT rowid FROM …
-/// MATCH ?)`), and `query` turns what was typed into what the index reads.
-/// `None` from it drops the arm, so a query no index can express falls back
-/// to the columns alone.
+/// `build` supplies that test and its bound parameters. It may include a
+/// verification predicate when an index supplies candidates for a substring.
+/// `None` drops the arm, so a query no index can express falls back to the
+/// columns alone.
 ///
-/// What this trades: an index knows words, and a scan knows substrings. The
-/// arm matches by word — with whatever prefix rule `query` writes — so it
-/// belongs beside the columns, not instead of them: the small columns stay
-/// a substring, and the wide text becomes a word.
+/// Each source chooses the matching contract: a word index can sit beside
+/// small substring columns; a substring index can replace the columns entirely.
 #[derive(Debug, Clone, Copy)]
 pub struct TextIndex {
-    /// The row test, one `?`.
-    pub sql: &'static str,
-    /// The typed text as the index reads it; `None` drops the arm.
-    pub query: fn(&str) -> Option<String>,
+    /// The row test and its parameters; `None` drops the arm.
+    pub build: fn(&str) -> Option<Sql>,
 }
 
 /// A SQL-backed table: the fixed parts of its query. The builder adds the
@@ -518,9 +518,9 @@ impl SqlSpec {
                 // to right: the columns are then only read for the rows it
                 // did not already answer for.
                 if let Some(ix) = self.index {
-                    if let Some(q) = (ix.query)(t) {
-                        params.push(Val::S(q));
-                        parts.push(format!("({})", ix.sql));
+                    if let Some(q) = (ix.build)(t) {
+                        params.extend(q.params);
+                        parts.push(format!("({})", q.sql));
                     }
                 }
                 let pat = format!("%{}%", escape_like(t));
@@ -535,9 +535,14 @@ impl SqlSpec {
             }
             Ast::Tag(name) => match self.binding(name)? {
                 TagSql::Where(w) => Some(format!("({w})")),
-                TagSql::Col(_) => None,
+                TagSql::Col(_) | TagSql::TextMatch(_) => None,
             },
             Ast::Op { tag, op, value } => {
+                if let TagSql::TextMatch(sql) = self.binding(tag)? {
+                    if *op != Op::Eq { return None; }
+                    params.push(Val::S(format!("%{}%", escape_like(value))));
+                    return Some(sql.into());
+                }
                 let TagSql::Col(col) = self.binding(tag)? else {
                     return None;
                 };
@@ -1744,10 +1749,12 @@ mod tests {
     /// source whose text is too wide to scan looks like.
     static INDEXED: SqlSpec = SqlSpec {
         index: Some(TextIndex {
-            sql: "id IN (SELECT rowid FROM item_fts WHERE item_fts MATCH ?)",
-            query: |q| {
+            build: |q| {
                 let q = q.trim();
-                (!q.is_empty()).then(|| format!("\"{q}\"*"))
+                (!q.is_empty()).then(|| Sql {
+                    sql: "id IN (SELECT rowid FROM item_fts WHERE item_fts MATCH ?)".into(),
+                    params: vec![Val::S(format!("\"{q}\"*"))],
+                })
             },
         }),
         ..SPEC

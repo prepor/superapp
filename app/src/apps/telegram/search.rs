@@ -1,12 +1,11 @@
 //! The search panel's telegram source: the chats and the people whose names
 //! carry every word, then the messages whose text does.
 //!
-//! The names are sifted in memory — one row a peer — and the messages by
-//! SQLite, round the cache: the parameter is the person's typing, and an
-//! entry a keystroke nothing reads again is not worth keeping.
+//! Names are sifted in memory; messages use the same substring index as the
+//! messages panel. Query results bypass the cache because typing replaces them.
 
 use kernel::search::{Abandoned, Hit, Provider};
-use kernel::store::{Q, Store};
+use kernel::store::{Q, Store, Val};
 
 use super::model::{self, first_name, one_line, PeerId, PeerKind};
 use super::panels::{Chat, Peer, Topics};
@@ -51,14 +50,9 @@ fn named_row(r: &rusqlite::Row) -> rusqlite::Result<Named> {
     })
 }
 
-/// The messages a pattern reaches, latest first, service lines left out.
-const MESSAGES_SQL: &str = "
-    SELECT m.id, m.chat, COALESCE(t.name || ' · ', '') || p.name, COALESCE(s.name, ''), m.out, m.text, m.topic
-    FROM tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender
-    LEFT JOIN tg_topic t ON t.chat = m.chat AND t.id = m.topic
-    WHERE m.service = 0 AND casefold(m.text) LIKE casefold(?1) ESCAPE '\\'
-    ORDER BY m.date DESC, m.id DESC
-    LIMIT ?2";
+/// Indexed message hits, including the topic each one opens.
+const MESSAGES_SELECT: &str = "
+    SELECT m.id, m.chat, COALESCE(t.name || ' · ', '') || p.name, COALESCE(s.name, ''), m.out, m.text, m.topic";
 
 /// The telegram world as a search source.
 pub struct TelegramSearch;
@@ -124,18 +118,23 @@ fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
     if q.is_empty() {
         return Vec::new();
     }
-    let pat = format!(
-        "%{}%",
-        q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-    );
-    let mut stmt = match store.conn().prepare_cached(MESSAGES_SQL) {
+    let Some(mut filter) = super::search_index::predicate(q) else { return Vec::new(); };
+    let from = if super::search_index::short_count(store, q).is_some_and(|n| n >= super::search_index::BROAD) {
+        super::search_index::RECENT_FROM
+    } else { model::MESSAGES.sql.spec.from };
+    let sql = format!("{MESSAGES_SELECT} FROM {from}
+        LEFT JOIN tg_topic t ON t.chat = m.chat AND t.id = m.topic
+        WHERE m.service = 0 AND {} \
+        ORDER BY m.date DESC, m.seq DESC LIMIT ?", filter.sql);
+    filter.params.push(Val::I(LIMIT));
+    let mut stmt = match store.conn().prepare_cached(&sql) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("search: preparing the telegram messages failed: {e}");
             return Vec::new();
         }
     };
-    let rows = stmt.query_map(rusqlite::params![pat, LIMIT], |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(&filter.params), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, PeerId>(1)?,
