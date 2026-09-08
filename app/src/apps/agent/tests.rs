@@ -885,6 +885,56 @@ fn the_switcher_keeps_the_draft_and_saves_the_model_for_later_rounds() {
 }
 
 #[test]
+fn a_chips_only_send_keeps_its_user_turn_on_openai() {
+    for selected in &MODELS[1..] {
+        let mut s = session();
+        let source = open_root(&mut s, Agents::id());
+        let chip = Chip::panel(&s, source).unwrap();
+        let slot = open_root(&mut s, Chat::new_id());
+        with_chat(&s, slot, |c| c.add_chip(chip));
+        verb(&mut s, slot, "agent.model");
+        verb(&mut s, slot, selected.verb);
+        assert_eq!(with_chat(&s, slot, |c| c.draft().to_string()), "");
+        verb(&mut s, slot, "agent.send");
+
+        let req = fake(&s).requests().last().unwrap().clone();
+        assert_eq!(req.model, selected.id);
+        assert!(req.messages[0].text().contains("## what the person is looking at"));
+        let parts = request_parts_with(&selected.provider, "a", "g", "token", &req, false);
+        let body: Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(
+            body["input"].as_array().unwrap().last(),
+            Some(&json!({"role": "user", "content": ""})),
+            "{} keeps the chips-only send as a user turn",
+            selected.label,
+        );
+    }
+}
+
+#[test]
+fn rapid_model_changes_undo_and_redo_one_choice_at_a_time() {
+    let mut s = session();
+    let chat = send_new(&mut s, "hello");
+    let sent = s.history().head();
+    let before = transcript(&s, chat);
+    // The fake clock does not advance: both switches fall within the
+    // history's coalescing window, but each is a separate choice.
+    assert!(model::set_model(&mut s, chat, "gpt-5.6-sol"));
+    assert!(model::set_model(&mut s, chat, "gpt-6-astra"));
+    for expected in ["gpt-5.6-sol", MODEL] {
+        assert!(s.undo());
+        assert_eq!(model::chat(s.store(), chat).unwrap().model, expected);
+        assert_eq!(transcript(&s, chat), before);
+    }
+    assert_eq!(s.history().head(), sent);
+    for expected in ["gpt-5.6-sol", "gpt-6-astra"] {
+        assert!(s.redo());
+        assert_eq!(model::chat(s.store(), chat).unwrap().model, expected);
+        assert_eq!(transcript(&s, chat), before);
+    }
+}
+
+#[test]
 fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
     let mut s = session();
     let chat = send_new(&mut s, "hello");

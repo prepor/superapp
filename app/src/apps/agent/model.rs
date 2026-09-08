@@ -1015,14 +1015,12 @@ pub fn set_model(s: &mut Session, chat_id: ChatId, selected: &str) -> bool {
     }
     let after = selected.to_string();
     let (name, now) = (after.clone(), s.now());
-    let changed = s.act(
-        Action::writing(
-            "agent.model",
-            format!("use {}", super::model_label(selected)),
-            move |tx| set_model_tx(tx, chat_id, &name, now),
-        )
-        .about(chat_entity(chat_id)),
-    );
+    // Each choice gets its own undo step, even during rapid switching.
+    let changed = s.act(Action::writing(
+        "agent.model",
+        format!("use {}", super::model_label(selected)),
+        move |tx| set_model_tx(tx, chat_id, &name, now),
+    ));
     if changed != Some(true) {
         return false;
     }

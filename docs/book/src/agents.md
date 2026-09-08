@@ -189,10 +189,10 @@ stopped`.
 The chat's **model** button (`cmd+m`) offers **GLM**, **Sol**, and **Astra**.
 GLM (`@cf/zai-org/glm-5.3-flash`) remains the default for new chats. Sol uses
 `gpt-5.6-sol`; Astra uses `gpt-6-astra`. All use `medium` reasoning effort.
-The first send saves a blank chat's choice. Later changes update the chat row
-and can be undone; reopening the chat, retrying, and continuing use the saved
-model. Switching is available between runs so all the requests in a tool
-round use the same model.
+The first send saves a blank chat's choice. Later changes update the chat row,
+with each selection as a separate undo step. Reopening the chat, retrying, and
+continuing use the saved model. Switching is available between runs so all the
+requests in a tool round use the same model.
 
 GLM uses Workers AI's **chat-completions API**, streamed as server-sent events:
 

@@ -40,7 +40,11 @@ pub(super) fn request_body(req: &ChatRequest) -> Value {
             }));
             continue;
         }
-        if let Some(text) = message.content.as_ref().filter(|t| !t.is_empty()) {
+        // A chips-only send still has a user turn. Only omit empty text
+        // when an assistant's tool calls carry the message instead.
+        if let Some(text) = message.content.as_ref().filter(|t| {
+            !t.is_empty() || message.role != Role::Assistant || message.tool_calls.is_empty()
+        }) {
             input.push(json!({"role": message.role, "content": text}));
         }
         for call in &message.tool_calls {
@@ -276,6 +280,27 @@ mod tests {
                 "phase": "final_answer", "status": "completed", "content": [
             {"type": "output_text", "text": "Hello.", "annotations": []}
         ]}])
+    }
+
+    #[test]
+    fn an_empty_assistant_message_with_a_tool_call_emits_only_the_call() {
+        let mut message = Message::assistant("");
+        message.tool_calls.push(ToolCall {
+            id: "call_1".to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "test.echo".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        let req = ChatRequest::new("gpt-6-astra", vec![message, Message::tool("call_1", "")]);
+        assert_eq!(
+            request_body(&req)["input"],
+            json!([
+                {"type": "function_call", "call_id": "call_1", "name": "test_2eecho", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": ""},
+            ])
+        );
     }
 
     #[test]

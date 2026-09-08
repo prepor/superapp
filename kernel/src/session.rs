@@ -730,8 +730,10 @@ impl Session {
             }
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
-                // too: half an action is not an action.
+                // too, keeping the screen's unsnapshotted grid.
+                let grid = self.wm.grid;
                 self.wm = Wm::restore(before);
+                self.wm.set_grid(grid);
                 self.unsettle();
                 self.notify(format!("the store refused: {e}"), true);
                 return None;
@@ -1223,6 +1225,8 @@ mod tests {
     #[test]
     fn a_refused_write_puts_the_layout_back() {
         let mut s = Session::fake(APPS);
+        let grid = Grid { w: 4, h: 3 };
+        s.set_grid(grid);
         let first = open(&mut s, note("one"));
         s.take_notes();
         let out: Option<()> = s.act(
@@ -1235,6 +1239,10 @@ mod tests {
         );
         assert!(out.is_none());
         s.settle();
+        assert!(
+            s.ws().wss.iter().all(|ws| ws.grid == grid),
+            "rollback keeps the current screen's grid on every workspace"
+        );
         assert_eq!(s.panels().len(), 1, "the layout went back");
         assert_eq!(s.focus(), Some(first));
         assert!(s.take_notes()[0].msg.starts_with("the store refused"));
