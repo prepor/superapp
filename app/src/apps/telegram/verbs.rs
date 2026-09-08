@@ -1,4 +1,4 @@
-//! Undoable topic preferences, plus edits and deletes for offline fixtures.
+//! Undoable topic preferences and offline message actions.
 //!
 //! Live message changes queue requests and let TDLib updates settle the store.
 //! Topic visibility is this app's preference in both live and offline accounts.
@@ -188,4 +188,75 @@ impl Intent for Deleted {
             .write(move |c| model::delete_lines_tx(c, chat, &ids).map(|_| ()))
             .map_err(|e| e.to_string())
     }
+}
+
+/// Offline reactions obey the same history contract without using a transport.
+pub(super) fn react_demo(s: &mut Session, chat: PeerId, msg: MsgId, emoji: &str) -> bool {
+    let rt = super::runtime::of(s.store());
+    if rt.demo_reacted(chat, msg, emoji) { return true; }
+    let chosen = emoji.to_string();
+    if s.act(Action::writing("react", format!("react {emoji}"), move |tx| {
+        demo_reaction(tx, chat, msg, &chosen, 1)
+    }).claiming(vec![Box::new(DemoReaction { chat, msg, emoji: emoji.into() })])).is_none() {
+        return false;
+    }
+    rt.remember_demo_reaction(chat, msg, emoji);
+    true
+}
+
+struct DemoReaction { chat: PeerId, msg: MsgId, emoji: String }
+
+impl Intent for DemoReaction {
+    fn describe(&self) -> String { format!("react {}", self.emoji) }
+    fn reverse(&self, w: &World) -> Result<(), String> { self.change(w, -1) }
+    fn reapply(&self, w: &World) -> Result<(), String> { self.change(w, 1) }
+}
+
+impl DemoReaction {
+    fn change(&self, w: &World, delta: i64) -> Result<(), String> {
+        let (chat, msg, emoji) = (self.chat, self.msg, self.emoji.clone());
+        w.store().write(move |c| demo_reaction(c, chat, msg, &emoji, delta)).map_err(|e| e.to_string())?;
+        let rt = super::runtime::of(w.store());
+        if delta > 0 { rt.remember_demo_reaction(chat, msg, &self.emoji); }
+        else { rt.forget_demo_reaction(chat, msg, &self.emoji); }
+        Ok(())
+    }
+}
+
+/// A fixture updates the same count line the real projection renders.
+/// Only explicitly offline worlds reach this; a missing worker never does.
+fn demo_reaction(
+    c: &rusqlite::Connection,
+    chat: PeerId,
+    msg: MsgId,
+    emoji: &str,
+    delta: i64,
+) -> rusqlite::Result<()> {
+    let before: Option<String> = c.query_row(
+        "SELECT reactions FROM tg_message WHERE chat = ?1 AND id = ?2",
+        [chat, msg],
+        |r| r.get(0),
+    )?;
+    let mut parts: Vec<String> = before
+        .as_deref()
+        .into_iter()
+        .flat_map(|s| s.split(" · "))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(part) = parts
+        .iter_mut()
+        .find(|p| p.rsplit_once(' ').is_some_and(|(e, _)| e == emoji))
+    {
+        let count = part
+            .rsplit_once(' ')
+            .and_then(|(_, n)| n.parse::<i64>().ok())
+            .unwrap_or(0);
+        *part = format!("{emoji} {}", count.saturating_add(delta).max(0));
+    } else if delta > 0 {
+        parts.push(format!("{emoji} 1"));
+    }
+    parts.retain(|part| !part.ends_with(" 0"));
+    let counts = (!parts.is_empty()).then(|| parts.join(" · "));
+    super::reaction_state::set(c, chat, msg, counts.as_deref())
 }

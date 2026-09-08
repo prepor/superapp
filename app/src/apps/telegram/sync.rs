@@ -170,6 +170,10 @@ impl<T: Td> Account<T> {
             ">> {} request={} chat={}",
             v["@type"], v["@extra"]["operation"], v["chat_id"]
         ));
+        if let Some(snapshot) = super::history::before_send(w.store(), &v) {
+            if !snapshot.is_empty() { self.send(w, &snapshot); }
+            return;
+        }
         self.track_reactions(w, &v);
         self.td.send(&request);
     }
@@ -187,6 +191,16 @@ impl<T: Td> Account<T> {
             return;
         };
         let result = match request["@type"].as_str() {
+            Some("addMessageReaction" | "removeMessageReaction") => {
+                if request["@extra"]["context"].as_str().is_some_and(|c| c.starts_with("reaction:")) {
+                    return; // the initial picker acknowledgement refreshes below
+                }
+                if let Some(message) = request["message_id"].as_i64() {
+                    self.send(w, &get_message(chat, message));
+                    self.counts_after_add(w, chat, message);
+                }
+                return;
+            }
             Some("viewMessages") if request["force_read"] == true => {
                 let Some(through) = request["message_ids"].as_array()
                     .and_then(|ids| ids.iter().filter_map(Value::as_i64).max()) else {
@@ -438,6 +452,7 @@ impl<T: Td> Account<T> {
         self.sync_reactions(w);
         self.pump(w);
         self.sync_counts(w);
+        super::history::pump(w.store());
         n
     }
 
@@ -469,6 +484,10 @@ impl<T: Td> Account<T> {
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
+        }
+        if let Some(request) = super::history::snapshot(w.store(), &v) {
+            if let Some(request) = request { self.send(w, &request); }
+            return;
         }
         if tracked {
             v["@extra"] = v["@extra"]["context"].clone();

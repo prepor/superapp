@@ -21,7 +21,7 @@ use kernel::store::Store;
 use super::super::model::{self, ChatRow, PeerId, PAGE};
 use super::super::{draft_toast, requests, runtime};
 use super::Chat;
-use super::{flip, told, wire, Contacts, Messages};
+use super::{flip, told, Contacts, Messages};
 
 /// A chat list: the chats, its cursor, and its marks.
 pub struct Chats {
@@ -273,7 +273,7 @@ impl Chats {
                 _ => requests::add_chat_to_list(peer, archiving),
             };
             let request = if verb == "telegram.read" { requests::in_topic(request, topic) } else { request };
-            if wire(&store, &request) {
+            if super::super::history::command(s, &request).is_some() {
                 queued.push((peer, topic));
             }
         }

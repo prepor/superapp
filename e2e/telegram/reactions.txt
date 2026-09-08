@@ -29,6 +29,13 @@ wait 300
 click "👍"
 wait 400
 shot reactions-added
+# A reaction is in the shell's tree: undo it, then travel back to its node.
+key cmd+z
+wait 300
+key cmd+u
+wait 400
+click "react 👍"
+wait 400
 # Choosing a fixture emoji closes the picker; the normal actions return.
 key cmd+j
 wait 300

@@ -84,12 +84,15 @@ pub fn live(store: &Store) -> bool {
 /// Queue a live verb, or explain why it did not go. Local changes wait for
 /// the worker's acknowledgement; fixture actions use the offline toast.
 pub fn told(s: &mut Session, request: &str, what: &str) -> bool {
-    if wire(s.store(), request) {
+    if super::history::command(s, request).is_some() {
         s.redraw();
         return true;
     }
     if live(s.store()) {
-        s.notify(format!("{what} failed: Telegram is not connected"), true);
+        let reason = if super::runtime::of(s.store()).can_send() {
+            "the change could not be queued"
+        } else { "Telegram is not connected" };
+        s.notify(format!("{what} failed: {reason}"), true);
     } else {
         s.notify(super::draft_toast(what), false);
     }

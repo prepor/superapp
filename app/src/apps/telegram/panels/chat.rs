@@ -435,23 +435,20 @@ impl Chat {
 
     // -- deleting -----------------------------------------------------------------------
 
-    /// Deletes lines — the marks, or the cursor's own — as one undoable
-    /// action, the cursor stepping off them first.
+    /// Deletes lines and records the gesture. Live deletion is irreversible;
+    /// only the offline fixture can restore the same message identities.
     pub fn delete(&mut self, s: &mut Session, ids: Vec<MsgId>) {
         if ids.is_empty() {
             return;
         }
-        self.lines_gone(&ids);
-        // Over the wire where the build is signed in: `deleteMessages` for
-        // everyone, and TDLib's `updateDeleteMessages` strikes the rows. Off
-        // the wire — the demo, or signed out — the local action deletes them
-        // and undo puts them back. One or the other, never both, so a line is
-        // not deleted twice.
-        if !wire(
-            &self.store,
-            &requests::delete_messages(self.peer, &ids, true),
-        ) && !super::live(&self.store)
-        {
+        if super::live(&self.store) {
+            if super::super::history::command(s, &requests::delete_messages(self.peer, &ids, true)).is_some() {
+                self.lines_gone(&ids);
+            } else {
+                s.notify("delete could not be queued; the messages are kept", true);
+            }
+        } else {
+            self.lines_gone(&ids);
             verbs::delete_lines(s, self.peer, ids);
         }
         s.redraw();
@@ -742,7 +739,7 @@ impl Chat {
                 } else {
                     requests::edit_message_text(self.peer, e.msg, &text)
                 };
-                if !wire(&self.store, &request) {
+                if super::super::history::command(s, &request).is_none() {
                     if super::live(&self.store) {
                         self.editing = Some(e);
                     } else {
@@ -814,8 +811,8 @@ impl Chat {
         }
         let text = self.draft.clone();
         let reply = self.reply_to;
-        let operation = super::queue(
-            &self.store,
+        let operation = super::super::history::command(
+            s,
             &self.request(requests::send_message(self.peer, text.trim(), reply)),
         );
         if operation.is_some() {
@@ -833,7 +830,9 @@ impl Chat {
                 }
             }
         } else {
-            s.notify("send failed: Telegram is not connected; your draft is kept", true);
+            let reason = if runtime::of(&self.store).can_send() { "the change could not be queued" }
+                else { "Telegram is not connected" };
+            s.notify(format!("send failed: {reason}; your draft is kept"), true);
         }
         s.redraw();
         operation
@@ -857,7 +856,7 @@ impl Chat {
                 &file,
                 if i == 0 { &text } else { "" },
             );
-            if !wire(&self.store, &self.request(request)) {
+            if super::super::history::command(s, &self.request(request)).is_none() {
                 self.carrying.push(file);
                 self.carrying.extend(files.map(|(_, file)| file));
                 break;

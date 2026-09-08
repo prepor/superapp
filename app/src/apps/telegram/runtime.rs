@@ -271,6 +271,11 @@ impl Runtime {
         sender.send(self.operations.track(request)).is_ok()
     }
 
+    pub fn can_send(&self) -> bool {
+        let state = self.state();
+        state.sender.is_some() && state.connection_error.is_none()
+    }
+
     pub fn has_worker(&self) -> bool {
         // An inbox that has disconnected still belongs to a live account;
         // its panels must not fall back to simulated fixture actions.
@@ -379,6 +384,10 @@ impl Runtime {
 
     pub fn demo_reacted(&self, chat: PeerId, msg: MsgId, emoji: &str) -> bool {
         self.state().demo_reactions.contains(&(chat, msg, emoji.to_string()))
+    }
+
+    pub fn forget_demo_reaction(&self, chat: PeerId, msg: MsgId, emoji: &str) {
+        self.state().demo_reactions.remove(&(chat, msg, emoji.to_string()));
     }
 
     pub fn remember_demo_reaction(&self, chat: PeerId, msg: MsgId, emoji: &str) {

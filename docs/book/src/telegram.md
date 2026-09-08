@@ -52,6 +52,26 @@ literal.
 
 ## User actions
 
+Sends (including attachments and forwards), edits, reactions, chat notification
+changes, pinning and archiving appear in the undo tree. **Cmd+Z** requests their
+reversal on Telegram; redo reapplies them. A pending command settles before its
+reversal runs, and failures appear in the Telegram status strip and Problems.
+The transcript continues to reflect Telegram's updates throughout.
+
+Undoing a send requests **delete for everyone** using the delivered message ids.
+Redo sends a new message; later edits and reactions in the same history branch
+follow its new id. Undoing an edit restores the previous text or caption with
+its original formatting. Reaction undo removes the added emoji and restores
+your previous selection, including one displaced by Telegram's reaction limit.
+Adding an emoji you had already chosen does not remove it on undo.
+
+Message deletions are recorded as **cannot undo**: Telegram provides deletion,
+but no operation that restores the original message. Undo skips these nodes.
+Other actions also become unavailable for undo if their previous server state
+could not be read, or Telegram rejects the reversal. Pending or uncertain sends
+are never automatically resent. History and its reversal data last only for the
+current session. Offline edits, deletes and reactions remain locally undoable.
+
 A conversation's **about** link opens the person's profile. **Block user**
 prevents incoming messages and hides your status and photo; **unblock user**
 reverses it. A blocked conversation keeps its history and draft, shows
@@ -345,6 +365,7 @@ viewer, including when the window is resized.
 | `model`, `search` | Panel queries, value types, formatting and search provider |
 | `runtime`, `trace` | Store-scoped coordination and local diagnostic output |
 | `panels`, `verbs` | Interaction state, live commands and undoable local actions |
+| `history` | User command intents, previous server state and acknowledged undo/redo |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
 
 A row receives its clock explicitly. Transcript rows also receive a
@@ -396,8 +417,10 @@ retry payloads; unconfirmed projected messages remain visible as failed and ask
 for a delivery check. Login secrets are never retained for retry. Recording
 and location sharing report that they are unavailable in live accounts; attach
 an existing recording instead. The location panel still shows its demo map.
-`verbs` implements undo for topic visibility preferences in all accounts, and
-for local fixture edits and deletes.
+`history` connects the main live message and chat actions to the undo tree;
+`verbs` implements topic visibility preferences and offline edits, deletes and
+reactions. Topic mute/pin/archive, read receipts and profile actions still use
+their existing paths and are outside the live command history.
 
 `tg_session` currently persists authorization status in the replicated store;
 it is not excluded from replication. The actual TDLib session files and login

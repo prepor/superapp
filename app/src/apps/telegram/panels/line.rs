@@ -25,7 +25,7 @@ use super::super::{downloads, requests, runtime, verbs};
 use super::chat::copy_line;
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
-use super::{wire, Chat, Chats, Viewer};
+use super::{Chat, Chats, Viewer};
 
 /// A line's card.
 pub struct Line {
@@ -257,12 +257,14 @@ impl Panel for Line {
             // undoable action, never both.
             "telegram.delete" => {
                 let (chat, msg) = (self.chat, self.msg);
-                self.tell_chat(s, |c| c.lines_gone(&[msg]));
-                if !wire(
-                    self.world.store(),
-                    &requests::delete_messages(chat, &[msg], true),
-                ) && !super::live(self.world.store())
-                {
+                if super::live(self.world.store()) {
+                    if super::super::history::command(s, &requests::delete_messages(chat, &[msg], true)).is_some() {
+                        self.tell_chat(s, |c| c.lines_gone(&[msg]));
+                    } else {
+                        s.notify("delete could not be queued; the message is kept", true);
+                    }
+                } else {
+                    self.tell_chat(s, |c| c.lines_gone(&[msg]));
                     verbs::delete_lines(s, chat, vec![msg]);
                 }
                 s.redraw();
