@@ -1409,7 +1409,7 @@ struct Cursor<D: Datasource> {
     index: usize,
     row: D::Row,
     /// Keep the last resolved reading, including confirmed absence, while
-    /// the retained row refreshes. `row` still records the original rank.
+    /// the retained row refreshes. `row` records its last drawn rank.
     retained_row: RefCell<Option<D::Row>>,
 }
 
@@ -1535,12 +1535,16 @@ impl<D: Datasource> ListState<D> {
     #[must_use]
     pub fn display_cursor_key(&self, store: &Store) -> Option<D::Key> {
         let cursor = self.cursor.as_ref()?;
-        match self.table.source().poll_by_key(store, &cursor.key) {
-            Poll::Ready(None) => self.cursor_index(store)
-                .and_then(|index| self.row(store, index))
-                .map(|row| self.table.key(&row)),
-            _ => Some(cursor.key.clone()),
+        if let Poll::Ready(row) = self.table.source().poll_by_key(store, &cursor.key) {
+            let missing = row.is_none();
+            *cursor.retained_row.borrow_mut() = row;
+            if missing {
+                return self.cursor_index(store)
+                    .and_then(|index| self.row(store, index))
+                    .map(|row| self.table.key(&row));
+            }
         }
+        Some(cursor.key.clone())
     }
 
     /// Remember where the selected row was actually drawn, without treating

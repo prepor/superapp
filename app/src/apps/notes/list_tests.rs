@@ -117,6 +117,12 @@ impl NoteListView {
             }
         }
         rows.sort_by_key(|row| row.0);
+        if rows.iter().any(|(_, _, selected)| *selected) {
+            assert!(
+                !self.widget.widget(&self.cx, ids!(empty_lbl)).visible(),
+                "a visible selected note must not be labelled as an empty list"
+            );
+        }
         rows
     }
 
@@ -146,6 +152,38 @@ fn typing_keeps_the_selected_note_highlighted_during_background_refresh() {
 #[test]
 fn typing_keeps_filtered_notes_stable_during_background_refresh() {
     check_edit_refresh("e");
+}
+
+#[test]
+fn a_note_that_stops_matching_the_filter_keeps_its_latest_visible_title() {
+    let mut view = NoteListView::new("Chosen");
+    view.draw_until(|rows| rows.len() == 1);
+    let selected = view.with_list(|list, store| list.set_cursor(store, 0).unwrap().id);
+    view.draw_until(|rows| rows[0].2);
+    let mut previous = "Chosen".to_owned();
+    for edit in 0..8 {
+        let title = format!("Edited {edit}");
+        model::edit(
+            view.session.store(),
+            selected,
+            title.clone(),
+            10.0 + f64::from(edit),
+        )
+        .unwrap();
+        view.draw_until(|rows| {
+            assert_eq!(rows.len(), 1, "the selected note stays visible: {rows:?}");
+            assert!(rows[0].2, "the note stays highlighted: {rows:?}");
+            assert!(
+                rows[0].1 == previous || rows[0].1 == title,
+                "refreshing must not restore an older title: {rows:?}"
+            );
+            rows[0].1 == title
+        });
+        previous = title;
+    }
+    view.with_list(|list, _| list.clear_cursor());
+    view.draw_until(|rows| rows.is_empty());
+    view.session.shutdown();
 }
 
 fn check_edit_refresh(filter: &str) {

@@ -679,7 +679,10 @@ impl<S: RowSpec> TableView<S> {
 
         let empty_lbl = view.label(cx, EMPTY);
         empty_lbl.set_text(cx, &said);
-        empty_lbl.set_visible(cx, n == 0 && err.is_none() && !said.is_empty());
+        // A count can finish before its page. The old display row remains
+        // visible until that page refreshes, so it must not also say empty.
+        let empty = n == 0 && list.row(&store, 0).is_none();
+        empty_lbl.set_visible(cx, empty && err.is_none() && !said.is_empty());
 
         let mut drawn: Vec<(usize, Option<usize>, WidgetRef, String, PanelId)> = Vec::new();
         let mut drawn_cursor = None;
