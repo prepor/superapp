@@ -26,6 +26,7 @@ use kernel::richtable::{Datasource, ListState, MarkSlot, Table};
 use kernel::session::Session;
 use kernel::store::Store;
 use makepad_widgets::*;
+use std::task::Poll;
 
 use super::super::hosted::{Ask, PanelProps};
 use super::suggest::Suggest;
@@ -87,6 +88,12 @@ pub trait RowSpec: 'static {
 
     /// What the row opens, previews, and is replaced by.
     fn target(r: &RowOf<Self>) -> PanelId;
+
+    /// Follow a restored joined reader back to its row. A pending lookup is
+    /// retried on the next draw; a returned row index is revealed in the list.
+    fn sync_preview(_panel: &mut Self::Panel, _store: &Store, _id: &PanelId) -> Poll<Option<usize>> {
+        Poll::Ready(None)
+    }
 
     /// What the field is seeded with, once, before the first draw. Empty
     /// for most tables; a log opens on a default so that what narrows the
@@ -168,6 +175,9 @@ pub struct TableView<S: RowSpec> {
     /// The filter the last draw drew under. A new one is a new list, and
     /// the viewport the old one left behind means nothing in it.
     query: String,
+    /// The joined reader last reconciled with the cursor. Filter edits do
+    /// not select it again while the reader itself stays unchanged.
+    preview: Option<PanelId>,
 }
 
 impl<S: RowSpec> Default for TableView<S> {
@@ -180,6 +190,7 @@ impl<S: RowSpec> Default for TableView<S> {
             picking: false,
             primed: false,
             query: String::new(),
+            preview: None,
         }
     }
 }
@@ -613,6 +624,9 @@ impl<S: RowSpec> TableView<S> {
         };
 
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
+        let preview = scope.data.get_mut::<Session>().and_then(|s| {
+            s.joined_child(props.slot).and_then(|slot| s.ws().slot(slot).map(|p| p.show.clone()))
+        });
         let field = view.text_input(cx, FILTER);
         if !self.primed {
             self.primed = true;
@@ -650,8 +664,21 @@ impl<S: RowSpec> TableView<S> {
         // What an empty list would say, asked of the instance before the
         // list is borrowed out of it.
         let said = S::empty_line(panel, &text);
+        // Undo restores the reader's identity in the layout. Reconcile its
+        // row as well, including a read row hidden by an unread-only filter.
+        S::list(panel).set_filter(&text);
+        let mut preview_index = None;
+        if preview != self.preview {
+            let synced = match preview.as_ref() {
+                Some(id) => S::sync_preview(panel, &store, id),
+                None => Poll::Ready(None),
+            };
+            if let Poll::Ready(index) = synced {
+                preview_index = index;
+                self.preview = preview;
+            }
+        }
         let list = S::list(panel);
-        list.set_filter(&text);
 
         // What the filter could not read — minus the tag still being typed,
         // which is not wrong yet.
@@ -671,6 +698,9 @@ impl<S: RowSpec> TableView<S> {
         // key each draw. A mark whose row is gone goes with it.
         let marked_before_sync = list.marks().len();
         list.sync(&store);
+        if let Some(index) = preview_index {
+            self.follow(cx, view, list.list_index(index));
+        }
         let marks_changed = list.marks().len() != marked_before_sync;
         let n = list.len(&store);
         let pre = list.prefix();

@@ -132,6 +132,100 @@ fn preview_marks_seen_and_the_selected_row_stays_until_cursor_moves() {
 }
 
 #[test]
+fn undo_reading_returns_to_the_previous_article_one_at_a_time() {
+    let mut s = session();
+    let slot = open(&mut s, panels::Articles::id());
+    let articles = [id(&s, "notes-1"), id(&s, "lab-1"), id(&s, "notes-2")];
+    for article in articles {
+        s.nav(Nav::Preview { from: slot, id: panels::Article::id(article) });
+        s.settle();
+    }
+
+    // Even a quick walk keeps each article's reader and seen flag together.
+    for index in [2, 1] {
+        assert!(s.undo());
+        let reader = s.joined_child(slot).expect("undo keeps the previous article open");
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &panels::Article::id(articles[index - 1]));
+        assert!(!model::article(s.store(), articles[index]).unwrap().seen);
+        assert!(model::article(s.store(), articles[index - 1]).unwrap().seen);
+        assert_eq!(s.focus(), Some(slot));
+    }
+    for index in [1, 2] {
+        assert!(s.redo());
+        let reader = s.joined_child(slot).unwrap();
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &panels::Article::id(articles[index]));
+        assert!(model::article(s.store(), articles[index]).unwrap().seen);
+    }
+}
+
+#[test]
+fn entering_or_reselecting_the_current_article_adds_no_undo_step() {
+    let mut s = session();
+    let slot = open(&mut s, panels::Articles::id());
+    let first = id(&s, "notes-1");
+    let second = id(&s, "lab-1");
+    for article in [first, second] {
+        s.nav(Nav::Preview { from: slot, id: panels::Article::id(article) });
+        s.settle();
+    }
+    let head = s.history().head();
+    let reader = s.joined_child(slot).unwrap();
+    s.nav(Nav::Preview { from: slot, id: panels::Article::id(second) });
+    s.nav(Nav::Open { from: slot, id: panels::Article::id(second), fresh: false });
+    s.settle();
+    assert_eq!(s.focus(), Some(reader));
+    assert_eq!(s.history().head(), head, "enter only focuses the existing reader");
+    assert!(s.undo());
+    assert_eq!(s.panel(reader).unwrap().borrow().id(), &panels::Article::id(first));
+    assert!(!model::article(s.store(), second).unwrap().seen);
+}
+
+#[test]
+fn undo_waits_for_read_commits_and_restores_the_filtered_cursor() {
+    use crate::shell::widgets::table::RowSpec;
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    let mut s = session();
+    let slot = open(&mut s, panels::Articles::id());
+    let first = id(&s, "notes-1");
+    let second = id(&s, "lab-1");
+    let (send, wake) = std::sync::mpsc::channel();
+    s.panel(slot).unwrap().borrow_mut().as_any()
+        .downcast_mut::<panels::Articles>().unwrap().list.set_cursor(s.store(), 1);
+    s.store().attach_ui(move || { let _ = send.send(()); });
+    s.nav(Nav::Preview { from: slot, id: panels::Article::id(first) });
+    let first_visit = s.history().head();
+    s.nav(Nav::Preview { from: slot, id: panels::Article::id(second) });
+    s.settle();
+    assert!(s.undo(), "undo also accepts a visit whose read flag is still committing");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        s.store().poll_external();
+        s.settle();
+        let first_seen = model::article_snapshot(s.store(), first).is_some_and(|a| a.seen);
+        let second_unseen = model::article_snapshot(s.store(), second).is_some_and(|a| !a.seen);
+        if s.history().head() == first_visit && first_seen && second_unseen {
+            let reader = s.joined_child(slot).expect("the previous reader stays open");
+            let showing = s.panel(reader).unwrap().borrow().id().clone();
+            assert_eq!(showing, panels::Article::id(first));
+            let panel = s.panel(slot).unwrap();
+            let mut borrow = panel.borrow_mut();
+            let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
+            if let Poll::Ready(Some(index)) = super::widgets::ArticleRows::sync_preview(p, s.store(), &showing) {
+                assert_eq!(p.list.cursor_key(), Some(&first));
+                assert_eq!(index, 0);
+                break;
+            }
+        }
+        let remaining = deadline.checked_duration_since(Instant::now()).expect("reading undo completed");
+        wake.recv_timeout(remaining).expect("reading undo woke the UI");
+    }
+    s.shutdown();
+}
+
+#[test]
 fn refresh_updates_readings_without_duplicates_or_losing_read_state_and_order() {
     let mut s = session();
     let article = id(&s, "notes-1");

@@ -8,8 +8,10 @@ use crate::shell::widgets::table::{self, RowSpec, TableView};
 use kernel::panel::PanelId;
 use kernel::richtable::{ListState, SqlSource};
 use kernel::session::Session;
+use kernel::store::Store;
 use kernel::time::fmt_date;
 use makepad_widgets::*;
+use std::task::Poll;
 
 pub struct FeedRows;
 impl RowSpec for FeedRows {
@@ -106,6 +108,18 @@ impl RowSpec for ArticleRows {
     }
     fn target(r: &model::Article) -> PanelId {
         Article::id(r.id)
+    }
+    fn sync_preview(p: &mut Articles, store: &Store, id: &PanelId) -> Poll<Option<usize>> {
+        if id.tag != Article::TAG {
+            return Poll::Ready(None);
+        }
+        let Some(key) = id.args.first().and_then(|key| key.parse().ok()) else {
+            return Poll::Ready(None);
+        };
+        if p.list.cursor_key() == Some(&key) {
+            return Poll::Ready(None);
+        }
+        p.list.select_key(store, &key)
     }
     fn empty_line(_: &Articles, filter: &str) -> String {
         if filter.trim() == "@unseen" {

@@ -28,6 +28,12 @@ cursor moves, even after it no longer matches `@unseen`. Use `@seen` and
 `@unseen` in the filter to choose which articles appear. The article filter
 survives session restore.
 
+Each article visit has its own undo step, even when moving quickly through
+the queue. `cmd+z` returns to the previous article and restores the read state
+changed by the visit; the list cursor follows the restored reader.
+`cmd+shift+z` moves forward again. Entering or clicking the current preview
+adds no extra undo step.
+
 The reader uses the same HTML cleanup, proportional typography, heading
 scale, selectable text, code, links and image loader as
 [mail](./mail.md#html-and-pictures). These components live in

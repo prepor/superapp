@@ -1826,6 +1826,30 @@ where
     K: Ord + Clone + Into<Val> + rusqlite::types::FromSql + std::fmt::Display
         + std::str::FromStr + Send + 'static,
 {
+    /// Restore a row by identity, retaining it even when the filter hides it.
+    /// Wait for current row and rank snapshots before moving the cursor.
+    pub fn select_key(&mut self, store: &Store, key: &K) -> Poll<Option<usize>> {
+        let source = self.table.ds;
+        let row = match source.poll_by_key(store, key) {
+            Poll::Ready(Some(row)) => row,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
+        let query = source.spec.rank(source.tags, self.table.ast(), &(source.rank)(&row));
+        let ranks = match store.poll_snapshot_rows_sql_deps(
+            source.spec.id, source.spec.describe, &query.sql, &query.params,
+            source.spec.deps, |row| row.get::<_, i64>(0),
+        ) {
+            Poll::Ready(ranks) => ranks,
+            Poll::Pending => return Poll::Pending,
+        };
+        let Some(rank) = ranks.first() else { return Poll::Ready(None); };
+        let index = (*rank).max(0) as usize;
+        self.cursor = Some(Cursor { key: key.clone(), index, row });
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
+        Poll::Ready(Some(index))
+    }
+
     pub fn after_removal(&self) -> Option<SqlCursor<R, K>> {
         let cursor = self.cursor.as_ref()?;
         Some(SqlCursor { source: self.table.ds, key: cursor.key.clone().into(), ast: self.table.ast.clone(),
@@ -2825,6 +2849,26 @@ mod tests {
         assert_eq!(l.set_cursor(&s, 6).unwrap().id, clicked);
         assert_eq!(l.cursor_index(&s), Some(5), "a click resolves before the old row leaves");
         assert!(!ids(&l).contains(&held));
+    }
+
+    #[test]
+    fn restoring_a_filtered_cursor_by_key_releases_the_later_selection() {
+        let store = store_with(25);
+        let mut list = ListState::new(&SOURCE, 3);
+        list.set_filter("@ok");
+        let first = list.set_cursor(&store, 4).unwrap().id;
+        store.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?", [first])).unwrap();
+        let second = list.move_cursor(&store, 1).unwrap().id;
+        store.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?", [second])).unwrap();
+        list.toggle_mark(&store);
+
+        assert_eq!(list.select_key(&store, &first), Poll::Ready(Some(4)));
+        assert_eq!(list.cursor_key(), Some(&first));
+        assert_eq!(list.row(&store, 4).unwrap().id, first);
+        assert!(list.index_of_key(&store, &second).is_none());
+        assert!(list.marks().has(&second), "following the reader preserves marks");
+        assert_eq!(list.select_key(&store, &i64::MAX), Poll::Ready(None));
+        assert_eq!(list.cursor_key(), Some(&first), "a missing row does not move the cursor");
     }
 
     #[test]

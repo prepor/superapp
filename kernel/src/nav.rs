@@ -91,7 +91,7 @@ impl Session {
     /// a replace whose new instance claimed something of the world, and
     /// `close` for a close — coalescing per originating slot, so a cursor
     /// walk that previews a row at a time is one undo that closes the whole
-    /// walk.
+    /// walk, unless the target kind requests a step for each item.
     pub fn nav(&mut self, n: Nav) {
         if self.defer_navigation(n.clone()) { return; }
         match n {
@@ -143,6 +143,24 @@ impl Session {
     /// its claims travel into the action — so a mail marked read on open
     /// lands on the same undoable node as the layout change.
     fn open_into(&mut self, from: SlotId, id: PanelId, how: Open, fresh: bool) {
+        // Enter on a preview, or another press on the selected row, only
+        // changes attention. Do not replace the reader or record a second
+        // step that would stand between undo and the preceding item.
+        if !fresh && matches!(how, Open::Open | Open::Preview) {
+            if let Some(slot) = self.joined_child(from)
+                .filter(|slot| self.ws().slot(*slot).is_some_and(|p| p.show == id)) {
+                if how == Open::Open || !self.ws().fit_together(from, slot, self.viewport(), self.opts()) {
+                    self.nav(Nav::Focus(slot));
+                } else {
+                    self.show_camera_at(slot);
+                    self.unsettle();
+                }
+                return;
+            }
+        }
+        let entity = self.apps().kind(id.tag)
+            .is_none_or(|kind| kind.coalesce_navigation())
+            .then(|| slot_entity(from));
         let (instance, claimed) = self.open_instance(&id, how);
         let claimed_anything = !claimed.is_empty();
         let label = {
@@ -199,7 +217,9 @@ impl Session {
             // Opening is an immediate layout gesture. Its optional data claim
             // attaches to that exact node only after commit; a failed read flag
             // must neither close the panel nor rewind a later cursor movement.
-            if self.act(Action::new(kind, label).about(slot_entity(from)).moving(layout)).is_some()
+            let mut action = Action::new(kind, label).moving(layout);
+            action.entity = entity;
+            if self.act(action).is_some()
                 && claimed_anything {
                 let node = self.history().head();
                 self.act_async(crate::session::Edit::writing(kind, "opening claims", data)
@@ -208,8 +228,9 @@ impl Session {
                 });
             }
         } else {
-            if let Some(intents) = self.act(Action::writing(kind, label, data)
-                .about(slot_entity(from)).moving(layout)) {
+            let mut action = Action::writing(kind, label, data).moving(layout);
+            action.entity = entity;
+            if let Some(intents) = self.act(action) {
                 self.attach_claims(self.history().head(), intents);
             }
         }
@@ -560,6 +581,34 @@ mod tests {
         assert!(s.redo());
         assert_eq!(seen(&s, 1), 1, "redo claims it again");
         assert!(s.joined_child(list_slot).is_some());
+    }
+
+    #[test]
+    fn entering_an_existing_preview_preserves_its_context_and_history() {
+        let (mut s, list_slot) = session();
+        go(&mut s, Nav::Preview { from: list_slot, id: card(1) });
+        let reader = s.joined_child(list_slot).unwrap();
+        let instance = s.panel(reader).unwrap();
+        go(&mut s, Nav::Open { from: reader, id: card(2), fresh: false });
+        let child = s.joined_child(reader).unwrap();
+        go(&mut s, Nav::Focus(list_slot));
+        let head = s.history().head();
+
+        go(&mut s, Nav::Preview { from: list_slot, id: card(1) });
+        assert_eq!(s.focus(), Some(list_slot));
+        assert_eq!(s.history().head(), head);
+        assert!(Rc::ptr_eq(&instance, &s.panel(reader).unwrap()));
+        assert!(s.panel(child).is_some(), "reselecting the reader preserves its joined context");
+
+        go(&mut s, Nav::Open { from: list_slot, id: card(1), fresh: false });
+        assert_eq!(s.focus(), Some(reader));
+        assert_eq!(s.history().head(), head, "enter only changes focus");
+        assert!(s.panel(child).is_some());
+
+        go(&mut s, Nav::Open { from: list_slot, id: card(1), fresh: true });
+        assert_ne!(s.focus(), Some(reader), "an explicit fresh open still creates a reader");
+        assert_ne!(s.history().head(), head);
+        assert_eq!(s.showing(&card(1)).len(), 2);
     }
 
     /// A replace whose instance claimed something is a `read`; one that

@@ -130,6 +130,12 @@ pub trait PanelKind: Sync + Send {
     /// The persisted spelling. Unique across the app list.
     fn tag(&self) -> Tag;
 
+    /// Whether rapid navigation into this kind may share a history node.
+    /// Readers that need an undo step for each item can opt out.
+    fn coalesce_navigation(&self) -> bool {
+        true
+    }
+
     /// A live instance for `id`. Runs inside the action that is opening,
     /// replacing, or previewing the panel, so what the open claims of the
     /// world (mail marks the thread read) is added through `cx` and lands
