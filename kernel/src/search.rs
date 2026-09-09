@@ -12,7 +12,8 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 
 use crate::layout::SlotId;
 use crate::panel::PanelId;
@@ -133,6 +134,7 @@ pub trait Provider: Send + 'static {
 }
 
 /// A question put to the providers.
+#[derive(Clone)]
 struct Ask {
     gen: u64,
     query: String,
@@ -164,8 +166,8 @@ enum Mode {
     /// Production: a thread each, so one slow source cannot hold up the
     /// rest.
     Threads {
-        asks: Vec<mpsc::Sender<Ask>>,
-        answers: mpsc::Receiver<Answer>,
+        asks: Vec<watch::Sender<Option<Ask>>>,
+        answers: mpsc::UnboundedReceiver<Answer>,
     },
     /// Headless runs, tests and the components library: the same providers,
     /// answered on the calling thread at ask time.
@@ -189,30 +191,23 @@ impl Engine {
     /// database. `notify` wakes the UI thread once an answer is in the
     /// channel (`SignalToUI` upstairs — this module stays makepad-free).
     #[must_use]
-    pub fn threads(
+    pub fn async_io(
         db: &Arc<Db>,
         providers: Vec<Box<dyn Provider>>,
         notify: impl Fn() + Send + Clone + 'static,
     ) -> Engine {
         let newest: Arc<AtomicU64> = Arc::default();
-        let (tx, answers) = mpsc::channel::<Answer>();
+        let (tx, answers) = mpsc::unbounded_channel::<Answer>();
         let (mut asks, mut names) = (Vec::new(), Vec::new());
         for (slot, p) in providers.into_iter().enumerate() {
-            let (ask_tx, ask_rx) = mpsc::channel::<Ask>();
+            let (ask_tx, ask_rx) = watch::channel::<Option<Ask>>(None);
             let (db, tx, newest, notify) = (db.clone(), tx.clone(), newest.clone(), notify.clone());
             let name = p.id();
-            match std::thread::Builder::new()
-                .name(format!("search-{name}"))
-                .spawn(move || provider_loop(db, slot, p, &ask_rx, &tx, &newest, notify))
-            {
-                Ok(_) => {
-                    asks.push(ask_tx);
-                    names.push(name);
-                }
-                // A source that could not be spawned is simply one the list
-                // never shows; the rest still answer.
-                Err(e) => eprintln!("search: {name} did not start: {e}"),
-            }
+            crate::runtime::spawn(async move {
+                provider_loop(db, slot, p, ask_rx, tx, newest, notify).await;
+            });
+            asks.push(ask_tx);
+            names.push(name);
         }
         Engine {
             newest,
@@ -266,10 +261,10 @@ impl Engine {
         match &mut self.mode {
             Mode::Threads { asks, .. } => {
                 for tx in asks.iter() {
-                    let _ = tx.send(Ask {
+                    let _ = tx.send(Some(Ask {
                         gen,
                         query: query.to_string(),
-                    });
+                    }));
                 }
             }
             Mode::Inline { providers, done } => {
@@ -285,7 +280,7 @@ impl Engine {
     /// Everything that has come back since the last call. Never blocks.
     pub fn collect(&mut self) -> Vec<Answer> {
         match &mut self.mode {
-            Mode::Threads { answers, .. } => answers.try_iter().collect(),
+            Mode::Threads { answers, .. } => std::iter::from_fn(|| answers.try_recv().ok()).collect(),
             Mode::Inline { done, .. } => done.drain(..).collect(),
         }
     }
@@ -471,50 +466,35 @@ impl Query {
 ///
 /// It exits when the engine drops — the ask channel closes — which is how a
 /// closing app retires its search threads without a shutdown protocol.
-fn provider_loop(
+async fn provider_loop(
     db: Arc<Db>,
     slot: usize,
-    p: Box<dyn Provider>,
-    asks: &mpsc::Receiver<Ask>,
-    answers: &mpsc::Sender<Answer>,
-    newest: &Arc<AtomicU64>,
+    mut provider: Box<dyn Provider>,
+    mut asks: watch::Receiver<Option<Ask>>,
+    answers: mpsc::UnboundedSender<Answer>,
+    newest: Arc<AtomicU64>,
     notify: impl Fn(),
 ) {
-    // The worker joins the *one* writer — its own reader
-    // over the shared `Db`, never a second writable connection.
-    let Ok(store) = Store::with_db(db) else {
-        return;
-    };
-    while let Ok(mut ask) = asks.recv() {
-        // A fast typist puts several questions before this thread wakes.
-        // Only the last one is worth answering.
-        while let Ok(next) = asks.try_recv() {
-            ask = next;
-        }
-        let abandoned = Abandoned {
-            newest: newest.clone(),
-            mine: ask.gen,
-        };
-        let hits = p.search(&store, &ask.query, &abandoned);
-        if abandoned.yes() {
-            continue; // a newer question is already in the channel
-        }
-        if answers
-            .send(Answer {
-                gen: ask.gen,
-                slot,
-                hits,
-            })
-            .is_err()
-        {
-            return;
-        }
+    while asks.changed().await.is_ok() {
+        let Some(ask) = asks.borrow_and_update().clone() else { continue; };
+        let abandoned = Abandoned { newest: newest.clone(), mine: ask.gen };
+        let db = db.clone();
+        let result = crate::runtime::spawn_blocking(move || {
+            let hits = Store::with_db(db).map(|store| provider.search(&store, &ask.query, &abandoned));
+            (provider, ask.gen, abandoned.yes(), hits)
+        }).await;
+        let Ok((back, gen, abandoned, hits)) = result else { return; };
+        provider = back;
+        if abandoned { continue; }
+        let Ok(hits) = hits else { return; };
+        if answers.send(Answer { gen, slot, hits }).is_err() { return; }
         notify();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -625,7 +605,7 @@ mod tests {
         let db = s.db();
         let woke = Arc::new(AtomicUsize::new(0));
         let w = woke.clone();
-        let mut e = Engine::threads(
+        let mut e = Engine::async_io(
             &db,
             vec![
                 Box::new(Echo {
@@ -722,7 +702,7 @@ mod tests {
         let s = store();
         let (a, release_a) = Held::new("a", 10);
         let (b, release_b) = Held::new("b", 20);
-        let mut q = Query::new(Engine::threads(
+        let mut q = Query::new(Engine::async_io(
             &s.db(),
             vec![Box::new(a), Box::new(b)],
             || {},

@@ -3,7 +3,8 @@
 
 use std::any::Any;
 use std::path::Path;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 
 use kernel::caps::{fmt_size, BlobCache, BlobStats};
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
@@ -133,7 +134,7 @@ impl Snapshot {
 pub struct Stats {
     id: PanelId,
     snapshot: Option<Snapshot>,
-    pending: Option<mpsc::Receiver<Snapshot>>,
+    pending: Option<oneshot::Receiver<Snapshot>>,
     error: Option<String>,
 }
 
@@ -165,28 +166,24 @@ impl Stats {
             self.snapshot = Some(Snapshot::read(db, cache));
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        match std::thread::Builder::new()
-            .name("system-stats".into())
-            .spawn(move || {
-                if tx.send(Snapshot::read(db, cache)).is_ok() {
-                    Cx::post_action(StatsReady);
-                }
-            }) {
-            Ok(_) => self.pending = Some(rx),
-            Err(e) => self.error = Some(format!("Could not refresh stats: {e}")),
-        }
+        let (tx, rx) = oneshot::channel();
+        kernel::runtime::spawn_blocking(move || {
+            if tx.send(Snapshot::read(db, cache)).is_ok() {
+                Cx::post_action(StatsReady);
+            }
+        });
+        self.pending = Some(rx);
     }
 
     /// Only receives prepared values; no SQL, filesystem access, or waiting.
     fn poll(&mut self) -> bool {
-        let Some(rx) = &self.pending else {
+        let Some(rx) = &mut self.pending else {
             return false;
         };
         match rx.try_recv() {
             Ok(snapshot) => self.snapshot = Some(snapshot),
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(oneshot::error::TryRecvError::Empty) => return false,
+            Err(oneshot::error::TryRecvError::Closed) => {
                 self.error = Some("The stats reader stopped. Refresh to try again.".into());
             }
         }

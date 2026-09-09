@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::fake::{Answer, Reply, Script};
 use super::fixtures::{self, events};
-use super::gateway::{request_parts, request_parts_with, stream_completion, Failure, Flow, Parts};
+use super::gateway::{request_parts, request_parts_with, Failure, Flow, Parts};
 use super::wire::{
     Assembler, ChatRequest, Chunk, Completion, Finish, FunctionCall, Message, Role, ToolCall,
     ToolDef, Usage,
@@ -18,9 +18,20 @@ use super::{
     FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER, REASONING_EFFORT,
 };
 
+fn stream_completion(
+    events: impl Iterator<Item = std::io::Result<String>>,
+    on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
+) -> Result<Completion, Failure> {
+    kernel::runtime::block_on(super::gateway::stream_completion(
+        futures_util::stream::iter(events),
+        on,
+    ))
+}
+
 static APPS: &[&dyn App] = &[&AGENT];
 
 mod attachments;
+mod deleting;
 
 /// What a chunk stream comes to, with nothing watching it.
 fn read(raw: &str) -> Result<Completion, Failure> {
@@ -42,6 +53,31 @@ fn assemble(raw: &str) -> Assembler {
 }
 
 // -- the wire ------------------------------------------------------------------
+
+/// Fake edits complete synchronously; keep action-result assertions concise.
+fn completed<T: 'static>(run: impl FnOnce(Box<dyn FnOnce(T)>)) -> T {
+    let value = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let received = value.clone();
+    run(Box::new(move |result| *received.borrow_mut() = Some(result)));
+    value.take().expect("the fixture completed its edit")
+}
+
+fn send_model(s: &mut Session, chat: Option<model::ChatId>, text: &str, carried: Carried) -> Option<(model::ChatId, model::RunId)> {
+    completed(|done| model::send(s, chat, text, carried, move |_, result| done(result)))
+}
+
+fn set_chat_model(s: &mut Session, chat: model::ChatId, selected: &str) -> bool {
+    completed(|done| model::set_model(s, chat, selected, move |_, result| done(result)))
+}
+
+fn retry_model(s: &mut Session, chat: model::ChatId) -> Option<model::RunId> {
+    completed(|done| model::retry(s, chat, move |_, result| done(result)))
+}
+
+fn delete_model_chats(s: &mut Session, chats: &[model::ChatId]) -> bool {
+    completed(|done| s.act_async(model::delete_chats_plan(chats),
+        move |_, result| done(result.is_some_and(|count| count > 0))))
+}
 
 #[test]
 fn a_request_round_trips_through_json() {
@@ -361,7 +397,10 @@ fn openai_models_use_the_stored_gateway_key_and_responses_route() {
         assert_eq!(body["store"], false);
         assert_eq!(body["tools"][0]["name"], "test_2elook");
         assert_eq!(body["tools"][0]["strict"], false);
-        assert_eq!(body["tools"].as_array().unwrap().last(), Some(&json!({"type": "web_search"})));
+        assert_eq!(
+            body["tools"].as_array().unwrap().last(),
+            Some(&json!({"type": "web_search"}))
+        );
         assert!(body.get("messages").is_none());
         req.tools.clear();
         let parts = request_parts_with(&provider, "account", GATEWAY, "cf-token", &req, false);
@@ -432,7 +471,7 @@ fn ask(text: &str) -> ChatRequest {
 
 /// The whole answer, with nothing watching the stream.
 fn say(fake: &mut FakeGateway, req: &ChatRequest) -> Result<Completion, Failure> {
-    fake.complete(req, &mut |_| Flow::Go)
+    kernel::runtime::block_on(fake.complete(req, &mut |_| Flow::Go))
 }
 
 #[test]
@@ -447,12 +486,12 @@ fn a_build_with_nobodys_script_still_answers() {
 fn the_fake_streams_its_answer_a_word_at_a_time() {
     let mut fake = FakeGateway::default_script();
     let mut tails = Vec::new();
-    fake.complete(&ask("hello"), &mut |chunk| {
+    kernel::runtime::block_on(fake.complete(&ask("hello"), &mut |chunk| {
         if let Some(text) = chunk.choices.first().and_then(|c| c.delta.content.clone()) {
             tails.push(text);
         }
         Flow::Go
-    })
+    }))
     .expect("the answer");
     assert_eq!(
         tails,
@@ -589,16 +628,15 @@ fn the_fake_counts_tokens_by_a_rule_a_suite_can_assert_on() {
 fn a_stop_cuts_the_fakes_stream_too() {
     let mut fake = FakeGateway::default_script();
     let mut seen = 0;
-    let why = fake
-        .complete(&ask("hello"), &mut |_| {
-            seen += 1;
-            if seen >= 2 {
-                Flow::Stop
-            } else {
-                Flow::Go
-            }
-        })
-        .expect_err("stopped");
+    let why = kernel::runtime::block_on(fake.complete(&ask("hello"), &mut |_| {
+        seen += 1;
+        if seen >= 2 {
+            Flow::Stop
+        } else {
+            Flow::Go
+        }
+    }))
+    .expect_err("stopped");
     assert_eq!(why.message, "stopped");
     assert_eq!(seen, 2);
 }
@@ -667,9 +705,11 @@ fn a_scripted_world_reaches_the_fake_gateway_under_both_its_names() {
     let done = s
         .world()
         .caps(|c| {
-            c.get::<dyn Gateway>()
-                .expect("the trait")
-                .complete(&ask("hello"), &mut |_| Flow::Go)
+            kernel::runtime::block_on(
+                c.get::<dyn Gateway>()
+                    .expect("the trait")
+                    .complete(&ask("hello"), &mut |_| Flow::Go),
+            )
         })
         .expect("the answer");
     assert_eq!(done.message.text(), "planted");
@@ -758,6 +798,78 @@ fn session() -> Session {
     Session::fake(BUILD)
 }
 
+#[test]
+fn a_pending_first_send_preserves_new_typing_and_cannot_send_twice() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::new_id());
+    with_chat(&s, slot, |chat| chat.set_draft("first question"));
+    s.store().attach_ui(|| {});
+    let (started, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let _blocker = s.store().submit_write(move |_| {
+        started.send(()).unwrap();
+        held.recv_timeout(Duration::from_secs(5)).expect("send did not wait on the UI");
+        Ok(())
+    }).unwrap();
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let instance = s.panel(slot).unwrap().clone();
+    {
+        let mut panel = instance.borrow_mut();
+        let chat = panel.as_any().downcast_mut::<Chat>().unwrap();
+        chat.send(&mut s);
+        assert!(chat.sending());
+        chat.set_draft("a second question being typed");
+        chat.send(&mut s);
+        assert_eq!(chat.draft(), "a second question being typed");
+    }
+    release.send(()).unwrap();
+    s.store().write(|_| Ok(())).unwrap();
+    s.settle();
+    let chat = with_chat(&s, slot, |chat| {
+        assert!(!chat.sending());
+        assert_eq!(chat.draft(), "a second question being typed");
+        chat.chat().unwrap()
+    });
+    let turns = model::turns(s.store(), chat);
+    let sent: Vec<_> = turns.iter().filter(|turn| turn.message.role == Role::User).collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].text(), "first question");
+    s.shutdown();
+}
+
+#[test]
+fn deleting_a_chat_snapshots_the_rows_committed_while_it_was_queued() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut s = session();
+    let (chat, run) = send_model(&mut s, None, "original", Carried::default()).unwrap();
+    s.store().attach_ui(|| {});
+    let (started, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let _blocker = s.store().submit_write(move |tx| {
+        model::add_turn_tx(tx, chat, &model::Turn::new(Message::assistant("last chunk")).by(run), 0.0)?;
+        started.send(()).unwrap();
+        held.recv_timeout(Duration::from_secs(5)).expect("delete did not wait on the UI");
+        Ok(())
+    }).unwrap();
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = std::rc::Rc::new(std::cell::Cell::new(None));
+    let received = result.clone();
+    s.act_async(model::delete_chats_plan(&[chat]),
+        move |_, result| received.set(Some(result.is_some_and(|count| count > 0))));
+    assert_eq!(result.get(), None);
+    release.send(()).unwrap();
+    s.store().write(|_| Ok(())).unwrap();
+    s.settle();
+    assert_eq!(result.get(), Some(true));
+    assert!(model::chat(s.store(), chat).is_none());
+    assert!(s.undo());
+    assert_eq!(model::turns(s.store(), chat).last().unwrap().text(), "last chunk");
+    s.shutdown();
+}
+
 /// This world's gateway — what a test plants a script through.
 fn fake(s: &Session) -> FakeGateway {
     s.world()
@@ -832,7 +944,7 @@ fn transcript(s: &Session, chat: ChatId) -> Vec<(Role, String)> {
 
 /// Sends in a fresh chat and answers which chat it made.
 fn send_new(s: &mut Session, text: &str) -> ChatId {
-    let (chat, _) = model::send(s, None, text, Carried::default()).expect("the send landed");
+    let (chat, _) = send_model(s, None, text, Carried::default()).expect("the send landed");
     s.settle();
     chat
 }
@@ -907,7 +1019,9 @@ fn a_chips_only_send_keeps_its_user_turn_on_openai() {
 
         let req = fake(&s).requests().last().unwrap().clone();
         assert_eq!(req.model, selected.id);
-        assert!(req.messages[0].text().contains("## what the person is looking at"));
+        assert!(req.messages[0]
+            .text()
+            .contains("## what the person is looking at"));
         let parts = request_parts_with(&selected.provider, "a", "g", "token", &req, false);
         let body: Value = serde_json::from_slice(&parts.body).unwrap();
         assert_eq!(
@@ -927,8 +1041,8 @@ fn rapid_model_changes_undo_and_redo_one_choice_at_a_time() {
     let before = transcript(&s, chat);
     // The fake clock does not advance: both switches fall within the
     // history's coalescing window, but each is a separate choice.
-    assert!(model::set_model(&mut s, chat, "gpt-5.6-sol"));
-    assert!(model::set_model(&mut s, chat, "gpt-6-astra"));
+    assert!(set_chat_model(&mut s, chat, "gpt-5.6-sol"));
+    assert!(set_chat_model(&mut s, chat, "gpt-6-astra"));
     for expected in ["gpt-5.6-sol", MODEL] {
         assert!(s.undo());
         assert_eq!(model::chat(s.store(), chat).unwrap().model, expected);
@@ -946,7 +1060,7 @@ fn rapid_model_changes_undo_and_redo_one_choice_at_a_time() {
 fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
     let mut s = session();
     let chat = send_new(&mut s, "hello");
-    assert!(!model::set_model(&mut s, chat, "unknown"));
+    assert!(!set_chat_model(&mut s, chat, "unknown"));
     let run = model::latest_run(s.store(), chat).unwrap().id;
     let slot = open_root(&mut s, Chat::id(chat));
     for status in model::LIVE {
@@ -959,7 +1073,7 @@ fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
                 .map(|_| ())
             })
             .unwrap();
-        assert!(!model::set_model(&mut s, chat, "gpt-5.6-sol"), "{status}");
+        assert!(!set_chat_model(&mut s, chat, "gpt-5.6-sol"), "{status}");
         assert!(!verb_ids(&s, slot).contains(&"agent.model"));
         assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
     }
@@ -970,7 +1084,7 @@ fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
         })
         .unwrap();
     s.store().set_writable(false);
-    assert!(!model::set_model(&mut s, chat, "gpt-6-astra"));
+    assert!(!set_chat_model(&mut s, chat, "gpt-6-astra"));
     assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
 }
 
@@ -982,15 +1096,15 @@ fn retry_and_continue_use_the_chats_selected_model() {
         vec![Reply::always(Answer::Fail("try another model".into()))],
     );
     let chat = send_new(&mut s, "hello");
-    assert!(model::set_model(&mut s, chat, "gpt-5.6-sol"));
+    assert!(set_chat_model(&mut s, chat, "gpt-5.6-sol"));
     plant(
         &s,
         vec![Reply::always(Answer::Cut("half an answer".into()))],
     );
-    model::retry(&mut s, chat).unwrap();
+    retry_model(&mut s, chat).unwrap();
     s.settle();
     assert_eq!(fake(&s).requests().last().unwrap().model, "gpt-5.6-sol");
-    assert!(model::set_model(&mut s, chat, "gpt-6-astra"));
+    assert!(set_chat_model(&mut s, chat, "gpt-6-astra"));
     let slot = open_root(&mut s, Chat::id(chat));
     verb(&mut s, slot, "agent.continue");
     assert_eq!(fake(&s).requests().last().unwrap().model, "gpt-6-astra");
@@ -1180,7 +1294,7 @@ fn a_failed_run_says_why_stands_as_a_problem_and_retries() {
 
     // …and a round that answers clears it.
     plant(&s, vec![Reply::always(Answer::Text("here I am".into()))]);
-    let again = model::retry(&mut s, chat).expect("a fresh round");
+    let again = retry_model(&mut s, chat).expect("a fresh round");
     s.settle();
     assert_ne!(again, run.id, "the failed round stays where it is");
     assert_eq!(
@@ -1198,7 +1312,7 @@ fn a_failed_run_says_why_stands_as_a_problem_and_retries() {
 fn a_run_that_answered_is_nothing_to_retry() {
     let mut s = session();
     let chat = send_new(&mut s, "hello");
-    assert_eq!(model::retry(&mut s, chat), None);
+    assert_eq!(retry_model(&mut s, chat), None);
 }
 
 #[test]
@@ -1793,12 +1907,11 @@ fn the_real_gateway_answers_a_real_request() {
     let mut gateway = super::real::RealGateway::new(&env);
     let req = ChatRequest::new(MODEL, vec![Message::user("Say hi in three words.")]);
     let mut chunks = 0;
-    let answer = gateway
-        .complete(&req, &mut |_| {
-            chunks += 1;
-            Flow::Go
-        })
-        .expect("the gateway answers");
+    let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| {
+        chunks += 1;
+        Flow::Go
+    }))
+    .expect("the gateway answers");
     assert!(chunks > 1, "a stream, not one blob");
     assert!(
         !answer.message.text().is_empty() || answer.message.reasoning_content.is_some(),
@@ -1829,13 +1942,14 @@ fn the_real_gateway_answers_a_real_request() {
         ],
     );
     req.tools = vec![ToolDef::from(&rename)];
-    let answer = gateway
-        .complete(&req, &mut |_| Flow::Go)
+    let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| Flow::Go))
         .expect("the gateway answers a tool round");
     assert_eq!(answer.finish, Finish::ToolCalls, "{answer:?}");
     assert_eq!(answer.message.tool_calls.len(), 1);
     assert_eq!(answer.message.tool_calls[0].function.name, "files.rename");
-    let input = answer.message.tool_calls[0].input().expect("json arguments");
+    let input = answer.message.tool_calls[0]
+        .input()
+        .expect("json arguments");
     assert_eq!(input["name"], json!("readme-old.txt"));
 }
 
@@ -1869,8 +1983,7 @@ fn the_openai_models_use_tools_through_the_real_gateway() {
         ]);
         req.tools = vec![ToolDef::from(&echo)];
         req.reasoning_effort = Some(REASONING_EFFORT.to_string());
-        let answer = gateway
-            .complete(&req, &mut |_| Flow::Go)
+        let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| Flow::Go))
             .unwrap_or_else(|e| panic!("{}: {e}", model.label));
         assert_eq!(answer.finish, Finish::ToolCalls, "{}", model.label);
         assert_eq!(answer.message.tool_calls.len(), 1);
@@ -1879,8 +1992,7 @@ fn the_openai_models_use_tools_through_the_real_gateway() {
         assert_eq!(call.input().unwrap()["text"], "ping");
         req.messages.push(answer.message);
         req.messages.push(Message::tool(call.id, "ping"));
-        let answer = gateway
-            .complete(&req, &mut |_| Flow::Go)
+        let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| Flow::Go))
             .unwrap_or_else(|e| panic!("{} tool continuation: {e}", model.label));
         assert_eq!(answer.finish, Finish::Stop);
         assert!(answer.message.text().to_lowercase().contains("pong"));
@@ -1910,22 +2022,41 @@ fn the_openai_models_search_the_web_through_the_real_gateway() {
             "Search the web for Rust's official book at doc.rust-lang.org/book. Reply in one sentence with a source citation.",
         )]);
         req.reasoning_effort = Some(REASONING_EFFORT.to_string());
-        let answer = gateway.complete(&req, &mut |_| Flow::Go)
+        let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| Flow::Go))
             .unwrap_or_else(|e| panic!("{}: {e}", model.label));
         assert_eq!(answer.finish, Finish::Stop);
-        assert!(answer.message.tool_calls.is_empty(), "hosted search is not an app function");
+        assert!(
+            answer.message.tool_calls.is_empty(),
+            "hosted search is not an app function"
+        );
         let items = &answer.message.response.as_ref().unwrap().items;
-        assert!(items.iter().any(|item| item["type"] == "web_search_call"), "{} searched", model.label);
-        let annotations: Vec<_> = items.iter().filter_map(|item| item["content"].as_array())
-            .flatten().filter_map(|part| part["annotations"].as_array()).flatten().collect();
-        assert!(annotations.iter().any(|annotation| annotation["type"] == "url_citation"));
+        assert!(
+            items.iter().any(|item| item["type"] == "web_search_call"),
+            "{} searched",
+            model.label
+        );
+        let annotations: Vec<_> = items
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter_map(|part| part["annotations"].as_array())
+            .flatten()
+            .collect();
+        assert!(annotations
+            .iter()
+            .any(|annotation| annotation["type"] == "url_citation"));
         req.messages.push(answer.message);
-        req.messages.push(Message::user("What was the URL you just cited? Reply only with that URL; do not search again."));
-        let answer = gateway.complete(&req, &mut |_| Flow::Go)
+        req.messages.push(Message::user(
+            "What was the URL you just cited? Reply only with that URL; do not search again.",
+        ));
+        let answer = kernel::runtime::block_on(gateway.complete(&req, &mut |_| Flow::Go))
             .unwrap_or_else(|e| panic!("{} search continuation: {e}", model.label));
         assert_eq!(answer.finish, Finish::Stop);
         assert!(answer.message.text().contains("doc.rust-lang.org/book"));
-        eprintln!("{}: hosted web search, citations, and continuation passed", model.label);
+        eprintln!(
+            "{}: hosted web search, citations, and continuation passed",
+            model.label
+        );
     }
 }
 
@@ -2018,7 +2149,12 @@ fn one_call(s: &mut Session, ask: &str, name: &str, arguments: Value) -> model::
         })],
     );
     let chat = send_new(s, ask);
-    assert_eq!(calls::run_pending_calls(s, chat), 1, "the one call moved");
+    if s.apps().tool(name).is_some_and(|tool| tool.reader.is_some()) {
+        assert_eq!(calls::run_pending_calls(s, chat), 0, "reads belong to the worker");
+        s.workers().tick();
+    } else {
+        assert_eq!(calls::run_pending_calls(s, chat), 1, "the one call moved");
+    }
     if let Some(asked) = asked_call(s, chat) {
         assert!(calls::allow(s, chat, asked.id), "the person allowed it");
     }
@@ -2183,8 +2319,12 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
         let mut s = Session::fake(WITH_TELEGRAM);
         open_root(&mut s, Agents::id());
         let inbox = telegram::runtime::of(s.store()).connect();
-        let drafted = one_call(&mut s, "write a Telegram draft", "telegram.draft",
-            json!({"chat": telegram::seed::VERA, "text": "see you at seven"}));
+        let drafted = one_call(
+            &mut s,
+            "write a Telegram draft",
+            "telegram.draft",
+            json!({"chat": telegram::seed::VERA, "text": "see you at seven"}),
+        );
         assert_eq!(drafted.status, model::CALL_DONE, "{}", drafted.said());
         let args: Value = serde_json::from_str(drafted.output.as_deref().unwrap()).unwrap();
         let slot = args["slot"].as_u64().unwrap();
@@ -2192,9 +2332,14 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
         assert_eq!(panel.borrow().id(), &TelegramChat::id(telegram::seed::VERA));
         assert!(inbox.try_recv().is_err());
 
-        plant(&s, vec![Reply::always(Answer::Call {
-            name: "telegram.send".into(), arguments: args, then: "The call finished.".into(),
-        })]);
+        plant(
+            &s,
+            vec![Reply::always(Answer::Call {
+                name: "telegram.send".into(),
+                arguments: args,
+                then: "The call finished.".into(),
+            })],
+        );
         let chat = send_new(&mut s, "send the Telegram draft");
         assert_eq!(calls::run_pending_calls(&mut s, chat), 1);
         let waiting = asked_call(&s, chat).unwrap();
@@ -2202,7 +2347,12 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
         assert!(inbox.try_recv().is_err(), "no message before approval");
 
         if decision == "edit" {
-            panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().typed("changed while waiting");
+            panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<TelegramChat>()
+                .unwrap()
+                .typed("changed while waiting");
         }
         if decision == "refuse" {
             assert!(calls::refuse(&mut s, chat, waiting.id));
@@ -2210,17 +2360,36 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
             assert!(calls::allow(&mut s, chat, waiting.id));
         }
         s.settle();
-        let answered = model::calls(s.store(), waiting.run).iter()
-            .find(|c| c.id == waiting.id).unwrap().clone();
+        let answered = model::calls(s.store(), waiting.run)
+            .iter()
+            .find(|c| c.id == waiting.id)
+            .unwrap()
+            .clone();
         if decision == "allow" {
             assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
             let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
             assert_eq!(request["@type"], "sendMessage");
-            assert_eq!(request["input_message_content"]["text"]["text"], "see you at seven");
+            assert_eq!(
+                request["input_message_content"]["text"]["text"],
+                "see you at seven"
+            );
         } else {
-            assert_eq!(answered.status, if decision == "refuse" { model::CALL_REFUSED } else { model::CALL_FAILED });
+            assert_eq!(
+                answered.status,
+                if decision == "refuse" {
+                    model::CALL_REFUSED
+                } else {
+                    model::CALL_FAILED
+                }
+            );
             assert!(inbox.try_recv().is_err(), "{decision}: nothing sent");
-            assert!(!panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().field_text().is_empty());
+            assert!(!panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<TelegramChat>()
+                .unwrap()
+                .field_text()
+                .is_empty());
         }
     }
 }
@@ -2229,28 +2398,45 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
 fn telegram_attachments_wait_for_approval_and_reject_changes_to_the_file_order() {
     use crate::apps::telegram::{self, Chat as TelegramChat};
     static WITH_TELEGRAM: &[&dyn App] = &[&AGENT, &telegram::TELEGRAM];
-    let photo = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/palette.png");
+    let photo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/telegram/palette.png"
+    );
     let other = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/garden.png");
     for decision in ["allow", "refuse", "reorder"] {
         let mut s = Session::fake(WITH_TELEGRAM);
         open_root(&mut s, Agents::id());
         let inbox = telegram::runtime::of(s.store()).connect();
-        let drafted = one_call(&mut s, "attach photos in Telegram", "telegram.draft",
-            json!({"chat": telegram::seed::VERA, "text": "", "files": [photo, other]}));
+        let drafted = one_call(
+            &mut s,
+            "attach photos in Telegram",
+            "telegram.draft",
+            json!({"chat": telegram::seed::VERA, "text": "", "files": [photo, other]}),
+        );
         assert_eq!(drafted.status, model::CALL_DONE, "{}", drafted.said());
         let args: Value = serde_json::from_str(drafted.output.as_deref().unwrap()).unwrap();
         assert_eq!(args["files"], json!([photo, other]));
         let panel = s.panel(args["slot"].as_u64().unwrap()).unwrap();
-        plant(&s, vec![Reply::always(Answer::Call {
-            name: "telegram.send".into(), arguments: args, then: "The call finished.".into(),
-        })]);
+        plant(
+            &s,
+            vec![Reply::always(Answer::Call {
+                name: "telegram.send".into(),
+                arguments: args,
+                then: "The call finished.".into(),
+            })],
+        );
         let chat = send_new(&mut s, "send the photos");
         assert_eq!(calls::run_pending_calls(&mut s, chat), 1);
         let waiting = asked_call(&s, chat).unwrap();
         assert_eq!(waiting.input()["files"], json!([photo, other]));
         assert!(inbox.try_recv().is_err(), "no file before approval");
         if decision == "reorder" {
-            panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().move_carried(0, 1);
+            panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<TelegramChat>()
+                .unwrap()
+                .move_carried(0, 1);
         }
         if decision == "refuse" {
             assert!(calls::refuse(&mut s, chat, waiting.id));
@@ -2258,22 +2444,59 @@ fn telegram_attachments_wait_for_approval_and_reject_changes_to_the_file_order()
             assert!(calls::allow(&mut s, chat, waiting.id));
         }
         s.settle();
-        let answered = model::calls(s.store(), waiting.run).iter()
-            .find(|c| c.id == waiting.id).unwrap().clone();
+        let answered = model::calls(s.store(), waiting.run)
+            .iter()
+            .find(|c| c.id == waiting.id)
+            .unwrap()
+            .clone();
         if decision == "allow" {
             assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
-            assert_eq!(answered.label.as_deref(), Some("send 2 attachments · Vera Kovac"));
+            assert_eq!(
+                answered.label.as_deref(),
+                Some("send 2 attachments · Vera Kovac")
+            );
             let result: Value = serde_json::from_str(answered.output.as_deref().unwrap()).unwrap();
-            let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+            let requests: Vec<Value> = inbox
+                .try_iter()
+                .map(|r| serde_json::from_str(&r).unwrap())
+                .collect();
             assert_eq!(requests.len(), 2);
             assert_eq!(result["operations"].as_array().unwrap().len(), 2);
-            assert_eq!(requests[0]["input_message_content"]["photo"]["photo"]["path"], photo);
-            assert_eq!(requests[1]["input_message_content"]["photo"]["photo"]["path"], other);
-            assert!(panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().carrying().is_empty());
+            assert_eq!(
+                requests[0]["input_message_content"]["photo"]["photo"]["path"],
+                photo
+            );
+            assert_eq!(
+                requests[1]["input_message_content"]["photo"]["photo"]["path"],
+                other
+            );
+            assert!(panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<TelegramChat>()
+                .unwrap()
+                .carrying()
+                .is_empty());
         } else {
-            assert_eq!(answered.status, if decision == "refuse" { model::CALL_REFUSED } else { model::CALL_FAILED });
+            assert_eq!(
+                answered.status,
+                if decision == "refuse" {
+                    model::CALL_REFUSED
+                } else {
+                    model::CALL_FAILED
+                }
+            );
             assert!(inbox.try_recv().is_err(), "{decision}: no files sent");
-            assert_eq!(panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().carrying().len(), 2);
+            assert_eq!(
+                panel
+                    .borrow_mut()
+                    .as_any()
+                    .downcast_mut::<TelegramChat>()
+                    .unwrap()
+                    .carrying()
+                    .len(),
+                2
+            );
         }
     }
 }
@@ -2643,12 +2866,12 @@ fn a_result_written_with_no_pass_live_still_carries_the_round_on() {
     plant(
         &s,
         vec![Reply::always(Answer::Call {
-            name: "files.list".into(),
-            arguments: json!({"dir": "~"}),
+            name: "files.mkdir".into(),
+            arguments: json!({"dir": "~", "name": "result-test-directory"}),
             then: "That is what is there.".into(),
         })],
     );
-    let chat = send_new(&mut s, "what is in my home directory");
+    let chat = send_new(&mut s, "make a directory");
     let run = model::latest_run(s.store(), chat).expect("the round").id;
     assert_eq!(
         model::run(s.store(), run).expect("the round").status,
@@ -2692,16 +2915,17 @@ struct UndoMidStream {
     chat: Option<ChatId>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Gateway for UndoMidStream {
-    fn complete(
+    async fn complete(
         &mut self,
         _req: &ChatRequest,
-        on: &mut dyn FnMut(&Chunk) -> Flow,
+        on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
     ) -> Result<Completion, Failure> {
         let store = kernel::store::Store::with_db(self.db.clone()).expect("a second handle");
         let (run, chat) = (self.run, self.chat);
         store
-            .write(move |c| {
+            .write_async(move |c| {
                 c.execute("DELETE FROM agent_turn WHERE run = ?1", [run])?;
                 c.execute("DELETE FROM agent_run WHERE id = ?1", [run])?;
                 if let Some(chat) = chat {
@@ -2710,8 +2934,10 @@ impl Gateway for UndoMidStream {
                 }
                 Ok(())
             })
+            .await
             .expect("the undo lands");
-        stream_completion(events(fixtures::TEXT).into_iter(), on)
+        super::gateway::stream_completion(futures_util::stream::iter(events(fixtures::TEXT)), on)
+            .await
     }
 }
 
@@ -2744,7 +2970,7 @@ fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
 
         // The pass, by hand: it asks, and what comes back is an answer for a
         // round the person has taken away from under it.
-        worker::RunWorker::new(run, chat).pass(s.world());
+        kernel::runtime::block_on(worker::RunWorker::new(run, chat).pass(s.world()));
         s.settle();
 
         assert!(
@@ -2772,7 +2998,7 @@ fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
 fn a_run_id_is_never_handed_out_twice() {
     let mut s = session();
     let (chat, first) =
-        model::send(&mut s, None, "hello", Carried::default()).expect("the send landed");
+        send_model(&mut s, None, "hello", Carried::default()).expect("the send landed");
     s.settle();
 
     assert!(s.undo(), "the send goes back");
@@ -2914,7 +3140,7 @@ fn a_round_the_stop_caught_is_settled_before_the_next_request() {
 
     model::stop(&mut s, run);
     s.settle();
-    model::retry(&mut s, chat).expect("another round");
+    retry_model(&mut s, chat).expect("another round");
     s.settle();
 
     let call = model::calls(s.store(), run)
@@ -3023,7 +3249,7 @@ fn undoing_a_retry_takes_back_the_run_and_everything_it_said() {
     );
     let before = transcript(&s, chat);
 
-    let again = model::retry(&mut s, chat).expect("another round");
+    let again = retry_model(&mut s, chat).expect("another round");
     s.settle();
     assert_eq!(
         transcript(&s, chat).last().cloned(),
@@ -3067,7 +3293,7 @@ fn a_deleted_chats_round_in_flight_comes_back_stopped() {
         .expect("the rows");
     s.settle();
 
-    assert!(model::delete_chats(&mut s, &[chat]), "the chat goes");
+    assert!(delete_model_chats(&mut s, &[chat]), "the chat goes");
     s.settle();
     assert!(model::chat(s.store(), chat).is_none());
 
@@ -3089,4 +3315,69 @@ fn a_deleted_chats_round_in_flight_comes_back_stopped() {
         "and one nobody had asked for yet was asked: the walk's own kick \
          re-asks for its pass"
     );
+}
+
+#[test]
+fn stopping_a_silent_provider_cancels_the_request_and_finishes_the_run() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    struct Cancelled(Arc<AtomicBool>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct Silent {
+        entered: Arc<tokio::sync::Notify>,
+        cancelled: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Gateway for Silent {
+        async fn complete(
+            &mut self,
+            _: &ChatRequest,
+            _: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
+        ) -> Result<Completion, Failure> {
+            let _cancelled = Cancelled(self.cancelled.clone());
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+    let s = session();
+    let (chat, run) = s
+        .store()
+        .write(|c| {
+            let chat = model::new_chat_tx(c, "silent provider", MODEL, 0.0)?;
+            let run = model::new_run_tx(c, chat, 0.0)?;
+            Ok((chat, run))
+        })
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    s.world().caps(|caps| {
+        caps.insert::<dyn Gateway>(Box::new(Silent {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        }))
+    });
+    let mut worker = worker::RunWorker::new(run, chat);
+    kernel::runtime::block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(worker.pass(s.world()), async {
+                entered.notified().await;
+                s.store()
+                    .write_async(move |c| {
+                        model::set_run_status_tx(c, run, model::STOPPED, None, 0.0)
+                    })
+                    .await
+                    .unwrap();
+            });
+        })
+        .await
+        .expect("stop does not wait for a provider byte or network timeout");
+    });
+    assert!(cancelled.load(Ordering::SeqCst));
+    assert_eq!(model::run(s.store(), run).unwrap().status, model::STOPPED);
 }

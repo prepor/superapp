@@ -75,6 +75,17 @@ impl Datasource for Events {
             .filter(|e| e.end > self.start && self.end.is_none_or(|end| e.start < end))
             .map(|e| self.display(e))
     }
+    fn poll_keys(&self, s: &Store, a: Option<&Ast>) -> std::task::Poll<Option<Vec<i64>>> {
+        EVENTS.poll_keys(s, Some(&self.query(a)))
+    }
+    fn poll_present(&self, s: &Store, a: Option<&Ast>, keys: &[i64]) -> std::task::Poll<Vec<i64>> {
+        EVENTS.poll_present(s, Some(&self.query(a)), keys)
+    }
+    fn poll_by_key(&self, s: &Store, k: &i64) -> std::task::Poll<Option<Event>> {
+        EVENTS.poll_by_key(s, k).map(|row| row
+            .filter(|e| e.end > self.start && self.end.is_none_or(|end| e.start < end))
+            .map(|e| self.display(e)))
+    }
     fn index_of(&self, s: &Store, a: Option<&Ast>, r: &Event) -> Option<usize> {
         EVENTS.index_of(s, Some(&self.query(a)), r)
     }

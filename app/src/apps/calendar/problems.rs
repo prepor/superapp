@@ -11,7 +11,7 @@ impl ProblemSource for Problems {
     fn list(&self, s: &Store) -> Vec<Problem> {
         let mut out = Vec::new();
         for (id, draft, event, error) in s
-            .rows_sql(
+            .snapshot_rows_sql(
                 "calendar failures",
                 "failed Calendar operations",
                 "SELECT id,draft,event,error FROM calendar_change WHERE state='failed'",
@@ -28,35 +28,63 @@ impl ProblemSource for Problems {
             .iter()
         {
             let id = *id;
-            let target = draft
-                .map(panels::Editor::id)
-                .or_else(|| event.map(panels::Event::id))
-                .unwrap_or_else(panels::Timeline::id);
+            let review = sync::needs_review(error);
+            let target = if review {
+                event
+                    .map(panels::Event::id)
+                    .or_else(|| draft.map(panels::Editor::id))
+            } else {
+                draft
+                    .map(panels::Editor::id)
+                    .or_else(|| event.map(panels::Event::id))
+            }
+            .unwrap_or_else(panels::Timeline::id);
             out.push(
                 Problem::new(
                     format!("calendar-change:{id}"),
                     "Calendar change failed",
                     error,
-                    "the draft and operation have been kept",
+                    if review {
+                        "review the latest event before trying the change again"
+                    } else {
+                        "the draft and change have been kept"
+                    },
                 )
                 .with_verbs(vec![
-                    Verb::call("calendar.retry", "retry", None, move |s| {
-                        if let Err(e) = sync::retry(s, id) {
-                            s.notify(e, true);
-                        }
-                    }),
-                    Verb::call("calendar.review", "review", None, move |s| {
-                        s.nav(Nav::Open {
-                            from: 0,
-                            id: target.clone(),
-                            fresh: true,
-                        })
-                    }),
+                    Verb::call(
+                        if review {
+                            "calendar.dismiss"
+                        } else {
+                            "calendar.retry"
+                        },
+                        if review { "dismiss error" } else { "retry" },
+                        None,
+                        move |s| {
+                            let plan = if review {
+                                sync::dismiss_plan(id)
+                            } else {
+                                sync::retry_plan(id)
+                            };
+                            s.act_async(plan, |_, _| {});
+                        },
+                    ),
+                    Verb::call(
+                        "calendar.review",
+                        if review { "review latest" } else { "review" },
+                        None,
+                        move |s| {
+                            s.nav(Nav::Open {
+                                from: 0,
+                                id: target.clone(),
+                                fresh: true,
+                            })
+                        },
+                    ),
                 ]),
             );
         }
         if let Some(error) = s
-            .rows_sql(
+            .snapshot_rows_sql(
                 "calendar sync failure",
                 "Calendar synchronization status",
                 "SELECT error FROM calendar_sync WHERE error<>''",

@@ -42,7 +42,7 @@ script_mod! {
         text_style_bold_italic: mod.widgets.SProseBoldItalicStyle{}
         text_style_fixed: mod.widgets.SMonoStyle{line_spacing: 1.2}
 
-        // The reader uses a compact heading scale (see reader::set_html).
+        // The reader uses a compact heading scale (see reader::HtmlContent).
         // Margins are in ems; the other insets are logical pixels.
         heading_margin: Inset{top: 1.0, bottom: 0.3}
         paragraph_margin: Inset{top: 0.55, bottom: 0.55}

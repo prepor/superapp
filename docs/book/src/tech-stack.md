@@ -26,11 +26,11 @@ The pieces:
   cached queries, SQLite's authorizer records query dependencies, and the
   session extension records changes for device sync.
 - **Serde and serde_json** encode queued effects and device-sync metadata.
-- **imap, lettre, and mail-parser** provide IMAP, SMTP, and MIME support.
+- **Tokio** schedules I/O services, timers and completion channels. Blocking native and CPU work uses its blocking pool.
+- **async-imap, lettre, and mail-parser** provide asynchronous IMAP and SMTP, and MIME parsing.
 - **html5ever, markup5ever_rcdom, and simplecss** narrow HTML mail.
-- **rustls** provides TLS. `ring`, `base64`, `rustls-connector`, and
-  `webpki-roots` support Gmail sign-in, signed R2 requests, and the agent's
-  gateway. The app does not use a general-purpose HTTP client.
+- **reqwest** provides pooled streaming HTTP over **rustls**. `ring`,
+  `base64`, and `webpki-roots` support TLS, OAuth and signed R2 requests.
 - **Makepad's macOS APIs** provide the menu bar. Small gaps such as screen
   geometry, the trash, and window screenshots use `makepad-apple-sys` and
   `makepad-objc-sys`, in `app/src/platform/mac.rs`.
@@ -41,32 +41,30 @@ The pieces:
 - **mise** selects the stable Rust toolchain. The application has no other
   runtime dependency.
 
-There are no Cargo features. Every switch is argv, an environment variable, or
-`cfg(headless)`.
+The default `tdlib` Cargo feature links TDLib. `--no-default-features`
+keeps deterministic Telegram fixtures available without the native library.
+Runtime switches remain argv and environment variables.
 
-## Still no HTTP client
+## Asynchronous services
 
-`kernel::http` is a hand-rolled HTTP/1.1 client and `kernel::sse` is the
-server-sent-events framing over its body reader. Together they are what an
-[agent](./agents.md#no-library-one-small-client)'s long streamed answer arrives
-through.
+`kernel::runtime` owns a Tokio pool and a local service executor. A service
+owns its world and read connection; neither crosses an await into another
+thread. Network waits suspend tasks. Finite filesystem, document parsing,
+image rendering and native keychain operations run on the blocking pool.
+SQLite's single writer and TDLib's process-wide receive loop retain dedicated
+threads because their native APIs block. Platform event loops remain native.
 
-They exist because the alternative is a dependency this tree cannot take:
-`ureq`, `reqwest` and their kin bring an async runtime or a second TLS stack,
-and Android must build the same crate. What is actually needed is one verb, one
-host, no redirects, one long body — the size of the two clients this tree
-already hand-rolls for Gmail sign-in and for R2. So the third one is small
-enough to read in one sitting: a request with headers and a body; a response as
-a status, its headers, and a body that undoes `Transfer-Encoding: chunked` as
-it arrives rather than at the end; timeouts on connect, on the first byte and
-between bytes. The connection is verified against the Mozilla roots and not the
-machine's, because a phone has no machine roots to verify against.
+`kernel::http` wraps reqwest with explicit connection, first-byte and idle
+budgets, streaming body limits and per-use redirect policy. Authenticated
+requests do not follow redirects or automatically retry. RSS has its own
+bounded redirect policy. `kernel::sse` frames the asynchronous body and
+retains partial events across cancellation. Local HTTP servers and in-memory
+streams exercise framing, truncation, timeouts and cancellation without
+external accounts.
 
-The parsing is split from the socket on purpose — the head reader, the chunked
-reader and the event framing are driven by tests over an in-memory cursor — so
-the wire's edge cases are pinned without a network, including the one that
-bites: a multibyte character divided between two frames, which is why a line is
-never turned into text until its newline has arrived.
+The [async I/O experiment](./async-io.md) records the migration boundaries and
+measured results. Async scheduling moves waits away from input handling;
+it does not make SQLite queries or document rendering intrinsically faster.
 
 ## Headless
 
@@ -75,8 +73,8 @@ software renderer, and `app/build.rs` mirrors it into `cfg(headless)` for this
 crate, because the shell has to know which backend it is linked against: a
 window-layer screenshot is meaningless when there is no window.
 
-`cfg(headless)` is what turns on virtual time. Workers run inline from the
-frame loop instead of on threads, the device-sync driver does too, and a
+`cfg(headless)` is what turns on virtual time. Worker futures are driven from the
+frame loop instead of by background services, the device-sync driver does too, and a
 screenshot is a copy of the rasterizer's newest frame rather than a photograph
 of a window. See [Developer Experience](./dev-x.md).
 

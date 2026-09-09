@@ -271,7 +271,7 @@ fn a_letter_lists_its_parts_and_yields_their_bytes() {
     );
 
     // The content snapshot contains descriptors; IMAP supplies the bytes.
-    let bytes = parts::part(s.world(), a).expect("the part downloads from IMAP");
+    let bytes = kernel::runtime::block_on(parts::part(s.world(), a)).expect("the part downloads from IMAP");
     assert!(
         String::from_utf8_lossy(&bytes).starts_with("line,aug,sep,delta"),
         "{:?}",
@@ -394,19 +394,21 @@ fn a_letter_is_measured_by_the_reading_the_panel_draws() {
     // one its text plus the chrome around it — and one line more when the
     // letter carries something, since its parts are listed on their own.
     let budget = mail_named(store, "Q3 infra budget draft");
-    let msgs = model::thread(store, budget);
-    let open: std::collections::BTreeSet<MailId> = msgs.iter().map(|t| t.mail.head.id).collect();
+    let mut display = super::super::display::Conversation::read(store, budget);
+    let open: std::collections::BTreeSet<MailId> = display.letters.iter().map(|t| t.mail.head.id).collect();
     let none = std::collections::BTreeSet::new();
-    let carries = parts::thread_carriers(store, budget);
+    let opened_with_parts = display.lines(&open, 1000);
+    let closed_with_parts = display.lines(&none, 1000);
+    for letter in &mut display.letters { letter.attachments.clear(); }
     assert_eq!(
-        reading::thread_lines(&msgs, &open, &carries, 1000),
-        reading::thread_lines(&msgs, &open, &none, 1000) + 1,
+        opened_with_parts,
+        display.lines(&open, 1000) + 1,
         "the parts line is worth a line"
     );
     // A closed letter lists nothing, so it costs nothing either way.
     assert_eq!(
-        reading::thread_lines(&msgs, &none, &carries, 1000),
-        reading::thread_lines(&msgs, &none, &none, 1000)
+        closed_with_parts,
+        display.lines(&none, 1000)
     );
 }
 

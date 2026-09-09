@@ -3,10 +3,27 @@ use crate::apps::telegram::{seed::BERLIN, topics};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-fn call(s: &mut Session, name: &str, input: Value) -> Result<Value, String> {
+pub(super) fn call(s: &mut Session, name: &str, input: Value) -> Result<Value, String> {
     let tool = s.apps().tool(name).expect("registered tool").clone();
     tool.check(&input)?;
-    let result = (tool.run)(s, &input);
+    let prepare = if let Some(stage) = tool.stager {
+        Some(stage(s, &input)?)
+    } else {
+        tool.preparer.map(|prepare| prepare(&input))
+    };
+    let result = if let Some(prepare) = prepare {
+        let prepared = kernel::runtime::block_on(prepare(s.world()))?;
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let done = answer.clone();
+        prepared.commit(s, move |_, result| *done.borrow_mut() = Some(result));
+        s.settle();
+        let result = answer.borrow_mut().take().expect("fixture tool completes inline");
+        result
+    } else if let Some(reader) = tool.reader {
+        kernel::runtime::block_on(reader(&input)(s.world()))
+    } else {
+        (tool.run)(s, &input)
+    };
     s.settle();
     result
 }

@@ -1,4 +1,4 @@
-//! Server-sent events over any [`Read`], in the one shape a chat completion
+//! Server-sent events over any [`AsyncRead`], in the one shape a chat completion
 //! streams in: `data:` lines, an event ended by a blank line, and a literal
 //! `data: [DONE]` for the end.
 //!
@@ -12,27 +12,31 @@
 //! byte no multibyte character contains, so a complete line is always
 //! complete UTF-8, and anything else is not decoded at all.
 
-use std::io::{Error, ErrorKind, Read};
+use std::io::{Error, ErrorKind};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Reads one event's joined `data` at a time off a byte stream.
-pub struct SseReader<R: Read> {
+pub struct SseReader<R: AsyncRead + Unpin> {
     inner: R,
     /// Bytes read but not yet formed into whole lines. A half-arrived
     /// character lives here, never turned into text, until the rest of it
     /// arrives.
     buf: Vec<u8>,
+    /// Retained across cancelled next_event futures until a separator arrives.
+    data: Vec<String>,
     /// The stream has ended; what is left in the buffer is being drained.
     eof: bool,
     /// `data: [DONE]` was seen; every further call answers `None`.
     done: bool,
 }
 
-impl<R: Read> SseReader<R> {
+impl<R: AsyncRead + Unpin> SseReader<R> {
     #[must_use]
     pub fn new(inner: R) -> SseReader<R> {
         SseReader {
             inner,
             buf: Vec::new(),
+            data: Vec::new(),
             eof: false,
             done: false,
         }
@@ -46,25 +50,25 @@ impl<R: Read> SseReader<R> {
     /// one would stop at a keep-alive. A last event the stream never closed
     /// with a blank line is still delivered — the peer's manners are not the
     /// answer's problem.
+    /// Cancelling this future retains every partially received event.
     ///
     /// # Errors
     ///
     /// If a read of the underlying stream fails, or a whole line of it is not
     /// UTF-8 — which is [`ErrorKind::InvalidData`], not a lossy replacement:
     /// a stream carrying JSON is either text or broken.
-    pub fn next_event(&mut self) -> std::io::Result<Option<String>> {
+    pub async fn next_event(&mut self) -> std::io::Result<Option<String>> {
         if self.done {
             return Ok(None);
         }
-        let mut data: Vec<String> = Vec::new();
         loop {
             while let Some(line) = self.take_line()? {
                 if line.is_empty() {
                     // A blank line ends an event. One that carried no `data`
                     // at all — a stray comment, a lone `event:` — is only a
                     // separator, so keep reading.
-                    if !data.is_empty() {
-                        return Ok(Some(data.join("\n")));
+                    if !self.data.is_empty() {
+                        return Ok(Some(std::mem::take(&mut self.data).join("\n")));
                     }
                     continue;
                 }
@@ -76,13 +80,15 @@ impl<R: Read> SseReader<R> {
                         self.done = true;
                         return Ok(None);
                     }
-                    data.push(value.to_string());
+                    self.data.push(value.to_string());
                 }
             }
             if self.eof {
-                return Ok((!data.is_empty()).then(|| data.join("\n")));
+                return Ok(
+                    (!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n"))
+                );
             }
-            if !self.fill()? {
+            if !self.fill().await? {
                 // The end of the stream. Let a last line with no newline
                 // resolve as a line, and drain it on the next turn.
                 self.eof = true;
@@ -112,10 +118,10 @@ impl<R: Read> SseReader<R> {
 
     /// Reads one more piece onto the buffer. `Ok(false)` at the end of the
     /// stream.
-    fn fill(&mut self) -> std::io::Result<bool> {
+    async fn fill(&mut self) -> std::io::Result<bool> {
         let mut tmp = [0u8; 4096];
         loop {
-            return match self.inner.read(&mut tmp) {
+            return match self.inner.read(&mut tmp).await {
                 Ok(0) => Ok(false),
                 Ok(n) => {
                     self.buf.extend_from_slice(&tmp[..n]);
@@ -155,123 +161,154 @@ mod tests {
         }
     }
 
-    impl Read for Frames {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    impl AsyncRead for Frames {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
             let Some(front) = self.frames.last_mut() else {
-                return Ok(0);
+                return std::task::Poll::Ready(Ok(()));
             };
-            let n = front.len().min(buf.len());
-            buf[..n].copy_from_slice(&front[..n]);
+            let n = front.len().min(buf.remaining());
+            buf.put_slice(&front[..n]);
             front.drain(..n);
             if front.is_empty() {
                 self.frames.pop();
             }
-            Ok(n)
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
     /// Every event of a stream given whole, for the cases where the framing
     /// and not the chunking is what is being read.
-    fn events(raw: &[u8]) -> Vec<String> {
+    async fn events(raw: &[u8]) -> Vec<String> {
         let mut sse = SseReader::new(Cursor::new(raw.to_vec()));
         let mut out = Vec::new();
-        while let Some(e) = sse.next_event().unwrap() {
+        while let Some(e) = sse.next_event().await.unwrap() {
             out.push(e);
         }
         out
     }
 
-    #[test]
-    fn one_event_comes_back_per_data_line() {
-        assert_eq!(events(b"data: one\n\ndata: two\n\n"), ["one", "two"]);
-    }
-
-    #[test]
-    fn multi_line_data_joins_with_newlines() {
-        assert_eq!(events(b"data: first\ndata: second\n\n"), ["first\nsecond"]);
-    }
-
-    #[test]
-    fn crlf_endings_are_taken_the_same_way() {
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_wait_keeps_the_partial_event() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let mut sse = SseReader::new(reader);
+        writer.write_all(b"data: first\n").await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), sse.next_event())
+                .await
+                .is_err()
+        );
+        writer.write_all(b"data: second\n\n").await.unwrap();
         assert_eq!(
-            events(b"data: one\r\n\r\ndata: two\r\n\r\n"),
+            sse.next_event().await.unwrap().as_deref(),
+            Some("first\nsecond")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_event_comes_back_per_data_line() {
+        assert_eq!(events(b"data: one\n\ndata: two\n\n").await, ["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn multi_line_data_joins_with_newlines() {
+        assert_eq!(
+            events(b"data: first\ndata: second\n\n").await,
+            ["first\nsecond"]
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_endings_are_taken_the_same_way() {
+        assert_eq!(
+            events(b"data: one\r\n\r\ndata: two\r\n\r\n").await,
             ["one", "two"]
         );
     }
 
-    #[test]
-    fn comments_and_the_other_fields_are_ignored() {
+    #[tokio::test]
+    async fn comments_and_the_other_fields_are_ignored() {
         let raw = b": keep-alive\nevent: message\nid: 7\nretry: 3000\ndata: {\"a\":1}\n\n";
-        assert_eq!(events(raw), [r#"{"a":1}"#]);
+        assert_eq!(events(raw).await, [r#"{"a":1}"#]);
         // A blank line after nothing but a comment is a separator, not an
         // empty event.
-        assert_eq!(events(b": ping\n\ndata: after\n\n"), ["after"]);
+        assert_eq!(events(b": ping\n\ndata: after\n\n").await, ["after"]);
     }
 
-    #[test]
-    fn data_with_no_space_after_the_colon_is_the_same_data() {
-        assert_eq!(events(b"data:tight\n\ndata:  wide\n\n"), ["tight", " wide"]);
+    #[tokio::test]
+    async fn data_with_no_space_after_the_colon_is_the_same_data() {
+        assert_eq!(
+            events(b"data:tight\n\ndata:  wide\n\n").await,
+            ["tight", " wide"]
+        );
     }
 
-    #[test]
-    fn done_ends_the_stream_and_it_stays_ended() {
+    #[tokio::test]
+    async fn done_ends_the_stream_and_it_stays_ended() {
         let mut sse = SseReader::new(Cursor::new(b"data: one\n\ndata: [DONE]\n\ndata: two\n\n"));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("one"));
-        assert_eq!(sse.next_event().unwrap(), None);
-        assert_eq!(sse.next_event().unwrap(), None);
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("one"));
+        assert_eq!(sse.next_event().await.unwrap(), None);
+        assert_eq!(sse.next_event().await.unwrap(), None);
     }
 
-    #[test]
-    fn a_last_event_with_no_blank_line_is_still_delivered() {
+    #[tokio::test]
+    async fn a_last_event_with_no_blank_line_is_still_delivered() {
         let mut sse = SseReader::new(Cursor::new(b"data: one\n\ndata: cut off"));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("one"));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("cut off"));
-        assert_eq!(sse.next_event().unwrap(), None);
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("one"));
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("cut off"));
+        assert_eq!(sse.next_event().await.unwrap(), None);
     }
 
-    #[test]
-    fn an_event_reassembles_across_reads_of_one_byte() {
+    #[tokio::test]
+    async fn an_event_reassembles_across_reads_of_one_byte() {
         let mut sse = SseReader::new(Frames::byte_at_a_time(b"data: hello world\n\n"));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("hello world"));
-        assert_eq!(sse.next_event().unwrap(), None);
+        assert_eq!(
+            sse.next_event().await.unwrap().as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(sse.next_event().await.unwrap(), None);
     }
 
-    #[test]
-    fn a_character_split_across_reads_is_made_whole() {
+    #[tokio::test]
+    async fn a_character_split_across_reads_is_made_whole() {
         // "café": the two bytes of `é` divided between two frames. A lossy
         // decode of the first frame alone would leave a replacement
         // character behind.
         let mut sse = SseReader::new(Frames::new(&[b"data: caf\xC3", b"\xA9\n\n"]));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("café"));
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("café"));
 
         // The same character, one byte a read.
         let mut sse = SseReader::new(Frames::byte_at_a_time("data: café\n\n".as_bytes()));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("café"));
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("café"));
 
         // A four-byte character with the split inside it, delivered as two
         // slices — the shape `Read::chain` makes.
         let mut sse = SseReader::new(
             Cursor::new(b"data: hi \xF0\x9F".to_vec()).chain(Cursor::new(b"\x99\x82\n\n".to_vec())),
         );
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("hi 🙂"));
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("hi 🙂"));
 
         // And one byte a read, which puts a split at every one of its bytes.
         let mut sse = SseReader::new(Frames::byte_at_a_time("data: hi 🙂\n\n".as_bytes()));
-        assert_eq!(sse.next_event().unwrap().as_deref(), Some("hi 🙂"));
+        assert_eq!(sse.next_event().await.unwrap().as_deref(), Some("hi 🙂"));
     }
 
-    #[test]
-    fn a_whole_line_that_is_not_utf8_is_an_error() {
+    #[tokio::test]
+    async fn a_whole_line_that_is_not_utf8_is_an_error() {
         // 0xFF begins no character at all: this line will never become text,
         // and saying so is better than handing on a replacement character in
         // the middle of someone's JSON.
         let mut sse = SseReader::new(Cursor::new(b"data: broken \xFF\n\n".to_vec()));
-        let e = sse.next_event().unwrap_err();
+        let e = sse.next_event().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidData);
     }
 
-    #[test]
-    fn an_answer_arrives_the_way_a_gateway_sends_one() {
+    #[tokio::test]
+    async fn an_answer_arrives_the_way_a_gateway_sends_one() {
         // Frames as a stream is really cut: two events in one, an event
         // split across two, a keep-alive comment, the terminator.
         let mut sse = SseReader::new(Frames::new(&[
@@ -280,17 +317,17 @@ mod tests {
             b"\ndata: [DONE]\n\n",
         ]));
         assert_eq!(
-            sse.next_event().unwrap().as_deref(),
+            sse.next_event().await.unwrap().as_deref(),
             Some(r#"{"delta":"Hel"}"#)
         );
         assert_eq!(
-            sse.next_event().unwrap().as_deref(),
+            sse.next_event().await.unwrap().as_deref(),
             Some(r#"{"delta":"lo"}"#)
         );
         assert_eq!(
-            sse.next_event().unwrap().as_deref(),
+            sse.next_event().await.unwrap().as_deref(),
             Some(r#"{"delta":" there"}"#)
         );
-        assert_eq!(sse.next_event().unwrap(), None);
+        assert_eq!(sse.next_event().await.unwrap(), None);
     }
 }

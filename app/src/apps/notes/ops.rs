@@ -4,11 +4,10 @@
 use super::model::{self, NoteText, StoredDraft};
 use kernel::effect::World;
 use kernel::history::Intent;
-use kernel::session::{Action, Session};
+use kernel::tool::Prepared;
 use ring::digest::{digest, SHA256};
 use rusqlite::Connection;
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
 
 pub const CHANGED: &str = "the text changed; read it again and use the new revision";
 
@@ -21,13 +20,6 @@ pub fn revision(state: &impl Serialize) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-pub fn ready(s: &Session) -> Result<(), String> {
-    if !s.writable() || !s.store().is_writable() {
-        return Err("the store is read-only — nothing was written".into());
-    }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -97,33 +89,17 @@ impl Edit {
         .map_err(|e| e.to_string())
     }
 
-    pub fn commit(self, s: &mut Session) -> Result<(), String> {
-        ready(s)?;
+    pub fn prepared(self, reply: serde_json::Value) -> Prepared {
         let kind = match &self {
             Self::Note { .. } => "notes.update",
             Self::Draft { before: None, .. } => "notes.create_draft",
             Self::Draft { .. } => "notes.update_draft",
         };
         let edit = self.clone();
-        // Session::act returns Option; keep the actionable error from the
-        // transaction while letting a refusal roll back without a history node.
-        let error = Arc::new(Mutex::new(None));
-        let reported = error.clone();
-        let done = s.act(Action::writing(kind, self.describe(), move |c| {
-            edit.apply(c, true).map_err(|why| {
-                *reported.lock().expect("edit error") = Some(why.clone());
-                sql_error(why)
-            })
-        }));
-        if done.is_none() {
-            return Err(error
-                .lock()
-                .expect("edit error")
-                .take()
-                .unwrap_or_else(|| kernel::tools::refused(s)));
-        }
-        s.claim(Box::new(self));
-        Ok(())
+        Prepared::Edit(kernel::session::Edit::writing(kind, self.describe(), move |c| {
+            edit.apply(c, true).map_err(sql_error)?;
+            Ok(reply)
+        }).claiming(vec![Box::new(self)]))
     }
 
     fn restore(&self, world: &World, forward: bool) -> Result<(), String> {

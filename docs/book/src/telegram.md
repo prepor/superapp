@@ -383,10 +383,18 @@ panel <- model <- SQLite <- project <- updates <---- TDLib JSON
 ```
 
 The worker connects its inbox on its first pass. Panels enqueue JSON commands
-through one `panels::wire` function, including sign-in. Only the worker calls
-TDLib. A successful enqueue means the worker can receive the command; it does
-not mean Telegram accepted it. Dropping the worker disconnects the inbox.
+through one `panels::wire` function, including sign-in. The account sends
+requests asynchronously; a successful enqueue does not mean Telegram accepted
+it. Dropping the worker disconnects the inbox.
 Login codes and passwords never enter the persistent effects queue.
+
+One native bridge thread owns TDLib's process-wide blocking receive queue and
+routes packets by client id into bounded Tokio inboxes. Each account awaits
+updates and commands, then projects up to 128 packets in receive order on the
+shared blocking pool. Its SQLite reader is created inside each projection
+task. Responses remain in the update stream so temporary send responses cannot
+be mistaken for final delivery. Shutdown drains accepted commands, closes the
+native client and keeps projecting until TDLib confirms closure.
 
 History and missing-file requests use a separate deduplicated pending set in
 the same runtime. The worker drains it on each pass and maintains its own
@@ -482,18 +490,18 @@ new step; the existing ladder includes repairs for earlier schema shapes and
 preserves message identity as `(chat, id)` with a separate SQLite row key.
 
 Startup restoration runs on the account worker in batches of at most 128
-updates. A full batch resumes after 10 ms; an idle worker polls after 300 ms.
-Commands, visible-chat requests and UI notifications get a turn between
+updates. Updates and commands wake it immediately; a 300 ms timer maintains
+typing expiry, retry deadlines and settled viewports. Tasks yield between
 batches. UI feedback reads operation summaries without copying request bodies,
-and timeout polling only collects expired request ids. The V18 dialog view
+and timeout checks only collect expired request ids. The V18 dialog view
 starts from joined chats, so drawing the list does not scan unrelated peers
 restored as message senders or mentions.
 
 ## Current limits
 
 There is one live account per process. Admission still uses the real boot
-store's directory because TDLib's modern receive queue is process-wide. This
-is not a multi-account dispatcher.
+store's directory. The native bridge routes by client id, but account
+configuration and admission do not yet expose multiple accounts.
 
 Live commands have store-scoped request ids and pending, completed and failed
 outcomes. Sends wait for final delivery updates, and transfers display byte

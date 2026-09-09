@@ -270,8 +270,11 @@ pub trait Clipboard {
     /// # Errors
     ///
     /// If the system refused the text.
-    fn put(&mut self, text: &str) -> Result<(), String>;
+    fn copy_owned(&mut self, text: String) -> ClipboardCopy;
 }
+
+/// Accepted clipboard work owns its input and can outlive a capability borrow.
+pub type ClipboardCopy = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
 /// A clipboard that keeps what it was given, so a test can read it back.
 /// Shared, like the secrets, because the copy may happen in a worker.
@@ -298,12 +301,10 @@ impl FakeClipboard {
 }
 
 impl Clipboard for FakeClipboard {
-    fn put(&mut self, text: &str) -> Result<(), String> {
-        self.0
-            .lock()
-            .map_err(|_| "the clipboard is poisoned".to_string())?
-            .push(text.to_string());
-        Ok(())
+    fn copy_owned(&mut self, text: String) -> ClipboardCopy {
+        let result = self.0.lock().map_err(|_| "the clipboard is poisoned".to_string())
+            .map(|mut copies| copies.push(text));
+        Box::pin(async move { result })
     }
 }
 
@@ -1067,13 +1068,13 @@ impl Effect for SecretSet<'_> {
 }
 
 /// Put text on the system clipboard.
-pub struct Clip<'a> {
-    pub text: &'a str,
+pub struct Clip {
+    pub text: String,
     /// What the text is, for the description — the text itself may be long.
     pub what: &'static str,
 }
 
-impl Effect for Clip<'_> {
+impl crate::effect::OwnedEffect for Clip {
     const KIND: &'static str = "clip";
     type Reply = ();
     fn describe(&self) -> String {
@@ -1082,8 +1083,8 @@ impl Effect for Clip<'_> {
     fn writes(&self) -> bool {
         true
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
-        cx.cap::<dyn Clipboard>()?.put(self.text)
+    fn start(self, cx: &mut Ctx<'_>) -> Result<ClipboardCopy, String> {
+        Ok(cx.cap::<dyn Clipboard>()?.copy_owned(self.text))
     }
 }
 
@@ -1279,8 +1280,8 @@ mod tests {
     fn the_fake_clipboard_and_screen_record() {
         let c = FakeClipboard::new();
         let mut w = c.clone();
-        w.put("one").unwrap();
-        w.put("two").unwrap();
+        crate::runtime::block_on(w.copy_owned("one".into())).unwrap();
+        crate::runtime::block_on(w.copy_owned("two".into())).unwrap();
         assert_eq!(c.taken(), vec!["one".to_string(), "two".to_string()]);
         assert_eq!(c.last(), Some("two".into()));
 

@@ -1,13 +1,14 @@
 //! Free/busy is permission dependent. Missing/error calendars remain unknown.
 use super::{dates, edit, model};
 use kernel::{
-    session::{Action, Session},
+    session::Edit,
     store::{Store, Val},
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::rc::Rc;
+use std::sync::Arc;
+use super::snapshot::{Snapshot, State};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Query {
@@ -157,7 +158,7 @@ pub fn draft_error(store: &Store, request: i64, q: &Query, draft: Option<i64>) -
         .then(|| "The guest list changed. Check availability again for the current guests.".into())
 }
 
-pub fn recheck(s: &mut Session, id: i64, search: &Search) -> Result<i64, String> {
+pub fn recheck_plan(s: &kernel::effect::World, id: i64, search: &Search) -> Result<Edit<i64>, String> {
     let (old, _, _, draft) = load(s.store(), id).ok_or("availability request missing")?;
     let (account, guests) = if let Some(id) = draft {
         let d = edit::draft(s.store(), id).ok_or("draft missing")?;
@@ -176,7 +177,7 @@ pub fn recheck(s: &mut Session, id: i64, search: &Search) -> Result<i64, String>
             old.guests,
         )
     };
-    request(s, account, search.query(guests)?, draft)
+    request_plan(s, account, search.query(guests)?, draft)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Check {
@@ -343,12 +344,12 @@ pub fn suggest(q: &Query, people: Vec<Person>, now: f64) -> Result<ResultSet, St
         checked: now,
     })
 }
-pub fn request(
-    s: &mut Session,
+pub fn request_plan(
+    s: &kernel::effect::World,
     account: i64,
     mut q: Query,
     draft: Option<i64>,
-) -> Result<i64, String> {
+) -> Result<Edit<i64>, String> {
     q.validate()?;
     if let Some(id) = draft {
         let d = edit::draft(s.store(), id).ok_or("draft missing")?;
@@ -386,7 +387,7 @@ pub fn request(
         return Err("Google allows at most 50 calendars per availability request".into());
     }
     let body = serde_json::to_string(&q).unwrap();
-    s.act(Action::writing(
+    Ok(Edit::writing(
         "calendar.availability",
         "check calendar availability",
         move |c| {
@@ -397,7 +398,6 @@ pub fn request(
             Ok(c.last_insert_rowid())
         },
     ))
-    .ok_or("could not request availability".into())
 }
 pub fn load(s: &Store, id: i64) -> Option<(Query, Option<ResultSet>, String, Option<i64>)> {
     s.rows_sql(
@@ -446,67 +446,57 @@ pub fn preview(
 
 pub struct Preview {
     pub query: Query,
-    pub result: Rc<ResultSet>,
+    pub result: Arc<ResultSet>,
     pub draft: Option<i64>,
 }
 
-/// Pointer movement changes only the proposal. Reuse checked data and candidate
-/// times until their inputs change, a candidate passes, or free/busy expires.
+/// Pointer movement changes only the proposal. Checked data and candidates
+/// are prepared off the UI thread and shared until their inputs change.
 #[derive(Default)]
 pub struct PreviewCache {
-    held: Option<CachedPreview>,
+    display: Snapshot<PreviewKey, Preview, (Vec<u64>, f64)>,
 }
-struct CachedPreview {
+#[derive(Clone, PartialEq)]
+struct PreviewKey {
     request: i64,
     controls: Search,
-    revision: Vec<u64>,
-    next_start: f64,
-    preview: Rc<Preview>,
 }
 impl PreviewCache {
-    pub fn get(
-        &mut self,
-        store: &Store,
-        id: i64,
-        search: &Search,
-        now: f64,
-    ) -> Result<Rc<Preview>, String> {
-        let revision = store.revision(&[
-            "calendar_availability",
-            "calendar_draft",
-            "calendar_source",
-            "account",
-        ]);
-        let next_start = (now / 900.0).ceil() * 900.0;
-        if let Some(held) = &self.held {
-            if held.request == id
-                && &held.controls == search
-                && held.revision == revision
-                && held.next_start == next_start
-                && now - held.preview.result.checked <= 300.0
-            {
-                return Ok(held.preview.clone());
-            }
+    pub fn get(&mut self, store: &Store, id: i64, search: &Search, now: f64) -> Result<Arc<Preview>, String> {
+        let key = PreviewKey { request: id, controls: search.clone() };
+        let revision = (store.revision(&["calendar_availability","calendar_draft","calendar_source","account"]),
+            (now/900.0).ceil()*900.0);
+        let controls = search.clone();
+        match self.display.get(store,key,revision,move |store| {
+            let (query,result,draft) = preview(store,id,&controls,now)?;
+            Ok(Preview { query, result: Arc::new(result), draft })
+        }) {
+            State::Loading => Err("preparing availability…".into()),
+            State::Failed(error) => Err(error),
+            State::Ready(preview) | State::Refreshing(preview) if now-preview.result.checked>300.0 => Err("these times are out of date; check availability again".into()),
+            State::Ready(preview) | State::Refreshing(preview) => Ok(preview),
         }
-        self.held = None;
-        let (query, result, draft) = preview(store, id, search, now)?;
-        let preview = Rc::new(Preview {
-            query,
-            result: Rc::new(result),
-            draft,
-        });
-        self.held = Some(CachedPreview {
-            request: id,
-            controls: search.clone(),
-            revision,
-            next_start,
-            preview: preview.clone(),
-        });
-        Ok(preview)
     }
 }
 
-pub fn apply_time(s: &mut Session, id: i64, search: &Search, start: f64) -> Result<i64, String> {
+pub struct RequestDisplay {
+    pub query: Query,
+    pub result: Option<Arc<ResultSet>>,
+    pub error: String,
+    pub draft: Option<i64>,
+    pub initial: Search,
+    pub dirty: bool,
+}
+impl RequestDisplay {
+    pub fn load(store: &Store, id: i64, persisted: Option<String>) -> Result<Self,String> {
+        let (query,result,error,draft) = load(store,id).ok_or("availability request missing")?;
+        let initial = persisted.and_then(|value|serde_json::from_str(&value).ok()).unwrap_or_else(||Search::from_query(&query));
+        let dirty = initial.reuse(&query).is_err();
+        Ok(Self {query,result:result.map(Arc::new),error,draft,initial,dirty})
+    }
+}
+
+pub fn apply_time_plan(s: &kernel::effect::World, id: i64, search: &Search, start: f64) -> Result<Edit<edit::Draft>, String> {
     let (q, r, draft) = preview(s.store(), id, search, s.now())?;
     let (a, b) = selection(&q, start, s.now()).ok_or("choose a time inside the checked window")?;
     if !r.people.iter().any(|p| p.known) {
@@ -519,8 +509,7 @@ pub fn apply_time(s: &mut Session, id: i64, search: &Search, start: f64) -> Resu
     form.end = dates::editor_time(b, &q.zone);
     form.zone = q.zone;
     form.all_day = false;
-    edit::save(s, d.id, d.revision, d.source, form)?;
-    Ok(d.id)
+    edit::save_plan(s, d.id, d.revision, d.source, form)
 }
 
 pub fn selection(q: &Query, start: f64, now: f64) -> Option<(f64, f64)> {
@@ -558,4 +547,19 @@ pub fn wire(q: &Query) -> Result<Value, String> {
     Ok(
         json!({"timeMin":dates::rfc(a),"timeMax":dates::rfc(b),"calendarExpansionMax":50,"items":q.guests.iter().map(|id|json!({"id":id})).collect::<Vec<_>>()}),
     )
+}
+
+#[cfg(test)]
+pub fn request(s: &mut kernel::session::Session, account: i64, q: Query, draft: Option<i64>) -> Result<i64, String> {
+    edit::fixture(s, move |w| request_plan(w, account, q, draft))
+}
+#[cfg(test)]
+pub fn recheck(s: &mut kernel::session::Session, id: i64, search: &Search) -> Result<i64, String> {
+    let search = search.clone();
+    edit::fixture(s, move |w| recheck_plan(w, id, &search))
+}
+#[cfg(test)]
+pub fn apply_time(s: &mut kernel::session::Session, id: i64, search: &Search, start: f64) -> Result<i64, String> {
+    let search = search.clone();
+    edit::fixture(s, move |w| apply_time_plan(w, id, &search, start)).map(|draft| draft.id)
 }

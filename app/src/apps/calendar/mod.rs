@@ -19,6 +19,7 @@ mod panels;
 mod problems;
 mod schema;
 mod scoped;
+mod snapshot;
 mod seed;
 mod sync;
 #[cfg(test)]

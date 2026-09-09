@@ -7,8 +7,11 @@
 //! type and collects the list ([`Apps::tools`](crate::app::Apps::tools)); the
 //! apps fill it and the chat runs a call by name.
 //! Read-only tools can use [`Tool::reading`] for network and document work on
-//! the agent worker. Their callback returns [`Poll::Pending`] while another
-//! worker downloads the file; no session action runs until the read answers.
+//! the agent worker. Their future awaits downloads and document parsing;
+//! no session action runs until the read answers.
+//! Writing tools can use [`Tool::preparing`] to build a checked transaction
+//! off the UI thread. A [`Prepared::Command`] instead represents native work
+//! whose service must finish or compensate once the session accepts it.
 //!
 //! Undo is the net for nearly all of them, which is why nothing asks the
 //! person first. [`Tool::asks`] is the exception: a call of a tool that
@@ -21,14 +24,54 @@
 //! model can act on — the key that is missing, or the type that was wanted.
 
 use serde_json::Value;
-use std::task::Poll;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::effect::World;
-use crate::session::Session;
+use crate::session::{Edit, Session};
 
-/// One read on the agent worker. Pending downloads retain their state here;
-/// polling never waits for another worker or performs I/O on the UI thread.
-pub type Read = Box<dyn FnMut(&World) -> Poll<Result<Value, String>> + Send>;
+/// One invocation owns its input and creates a future on the service world.
+/// Downloads and parsing can suspend without retaining a UI session.
+pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + 'a>>;
+pub type Read = Box<dyn for<'a> FnOnce(&'a World) -> ReadFuture<'a> + Send>;
+
+/// Preparing an edit owns its inputs but never borrows a UI session. The
+/// service can await I/O and move document processing into the blocking pool.
+pub type PrepareFuture<'a> = Pin<Box<dyn Future<Output = Result<Prepared, String>> + 'a>>;
+pub type Prepare = Box<dyn for<'a> FnOnce(&'a World) -> PrepareFuture<'a> + Send>;
+pub type Stager = fn(&mut Session, &Value) -> Result<Prepare, String>;
+
+/// A native command starts only after the caller accepts its preparation.
+/// Once started, its service owns completion and undo even if the caller stops.
+pub trait Command: Send {
+    fn commit(self: Box<Self>, session: &mut Session, complete: CommandComplete);
+}
+
+pub type CommandComplete = Box<dyn FnOnce(&mut Session, Result<Value, String>)>;
+
+/// The result of preparation. An unchanged document answers without growing
+/// history; a change carries its transaction and undo claims to the session.
+/// The transaction must recheck any state that preparation relied on.
+pub enum Prepared {
+    Reply(Value),
+    Edit(Edit<Value>),
+    Command(Box<dyn Command>),
+}
+
+impl Prepared {
+    /// Commit only after the caller has checked that the invocation is still
+    /// wanted. The callback runs once, after both the write and undo filing.
+    pub fn commit(self, session: &mut Session,
+        complete: impl FnOnce(&mut Session, Result<Value, String>) + 'static) {
+        match self {
+            Self::Reply(reply) => complete(session, Ok(reply)),
+            Self::Edit(edit) => session.act_async_result(edit, move |session, result| {
+                complete(session, result.map_err(|error| error.to_string()));
+            }),
+            Self::Command(command) => command.commit(session, Box::new(complete)),
+        }
+    }
+}
 
 /// The background reads available in one world's app list. A worker must
 /// never dispatch through another session's process-global catalogue.
@@ -55,12 +98,18 @@ pub struct Tool {
     /// write. Every such call is a card that waits; `writes` alone does not
     /// ask, because a rename or an archive is one undo away.
     pub asks: bool,
-    /// The whole behaviour, on the UI thread, with the session: one `act`
-    /// per call, labelled by the tool, so it is one undo.
+    /// Immediate behavior that needs no expensive preparation or I/O. Reads
+    /// and prepared writes use their explicit service contracts instead.
     pub run: fn(&mut Session, &Value) -> Result<Value, String>,
     /// A read that needs network or document processing, driven by the agent
     /// worker instead of `run`. Each invocation gets its own pending state.
     pub reader: Option<fn(&Value) -> Read>,
+    /// A writing tool with expensive preparation. Preparation runs on a
+    /// service world; only its finished transaction reaches the UI session.
+    pub preparer: Option<fn(&Value) -> Prepare>,
+    /// A lightweight UI phase for a tool that needs a live panel or a new slot.
+    /// It returns the same background preparation/atomic commit contract.
+    pub stager: Option<Stager>,
 }
 
 impl Tool {
@@ -82,6 +131,8 @@ impl Tool {
             asks: false,
             run,
             reader: None,
+            preparer: None,
+            stager: None,
         }
     }
 
@@ -98,6 +149,35 @@ impl Tool {
             Err("this read must run on the agent worker".into())
         });
         tool.reader = Some(reader);
+        tool
+    }
+
+    #[must_use]
+    pub fn preparing(
+        name: &'static str,
+        description: &'static str,
+        input: Value,
+        preparer: fn(&Value) -> Prepare,
+    ) -> Tool {
+        let mut tool = Self::new(name, description, input, true, |_, _| {
+            Err("this edit must be prepared before committing".into())
+        });
+        tool.preparer = Some(preparer);
+        tool
+    }
+
+    #[must_use]
+    pub fn staging(
+        name: &'static str,
+        description: &'static str,
+        input: Value,
+        writes: bool,
+        stager: Stager,
+    ) -> Tool {
+        let mut tool = Self::new(name, description, input, writes, |_, _| {
+            Err("this tool must be staged before preparing".into())
+        });
+        tool.stager = Some(stager);
         tool
     }
 

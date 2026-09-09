@@ -13,7 +13,7 @@ fn automatic_coverage_wakes_the_background_worker_by_entity() {
         ..Env::default()
     };
     let (sent, passed) = mpsc::channel();
-    let workers = Workers::threads(
+    let workers = Workers::async_io(
         BACKGROUND,
         initial.store().clone(),
         Mode::Fake,
@@ -30,14 +30,15 @@ fn automatic_coverage_wakes_the_background_worker_by_entity() {
     );
     assert!(!s.workers().is_inline());
     s.workers().kick_all();
-    assert_eq!(s.workers().names(), ["calendar-sync"]);
-    // The initial pass and kick_all's startup kick must both finish before the
-    // request: otherwise a startup pass could accidentally service it.
-    for _ in 0..2 {
+    // Discovery is asynchronous too; a kick does not publish the worker set
+    // synchronously. Let startup notifications settle before this request.
+    while s.workers().names().is_empty() {
         passed
             .recv_timeout(Duration::from_secs(2))
-            .expect("worker startup pass");
+            .expect("worker discovery");
     }
+    assert_eq!(s.workers().names(), ["calendar-sync"]);
+    while passed.recv_timeout(Duration::from_millis(25)).is_ok() {}
     let before = model::coverage(s.store()).unwrap();
     assert!(!before.pending());
     let head = s.history().head();
@@ -48,13 +49,17 @@ fn automatic_coverage_wakes_the_background_worker_by_entity() {
         head,
         "coverage is not an undoable action"
     );
-    passed
-        .recv_timeout(Duration::from_secs(2))
-        .expect("date coverage must wake Calendar without waiting for its 60-second poll");
-    s.store().poll_external();
-    let after = model::coverage(s.store()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let after = loop {
+        passed.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("date coverage must wake Calendar without waiting for its 60-second poll");
+        s.store().poll_external();
+        let after = model::coverage(s.store()).unwrap();
+        if after.end >= end && after.completed == after.requested { break after; }
+    };
     assert_eq!(after.requested, before.requested + 1);
     assert_eq!(after.completed, after.requested);
     assert!(after.end >= end);
     assert!(after.error.is_empty(), "{}", after.error);
+    s.shutdown();
 }

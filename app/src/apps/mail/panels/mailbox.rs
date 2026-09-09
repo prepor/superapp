@@ -6,18 +6,19 @@
 //! changes with the folder it is over.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::rc::Rc;
 
-use kernel::effect::World;
-use kernel::history::Intent;
+use kernel::history::{Intent, UiIntent};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::richtable::{ListState, SqlSource};
-use kernel::session::{Action, Instance, Session};
+use kernel::richtable::{ListState, SqlCursor, SqlLanding, SqlSource};
+use kernel::session::{Edit, Instance, Session};
 use kernel::store::Store;
 
 use super::super::effects::{Filed, PutBack};
+use super::super::filing::{self, Scope};
 use super::super::model::{self, MailId, Role, ThreadHead, MAILBOX_PAGE};
 use super::Message;
 
@@ -28,6 +29,7 @@ pub struct Mailbox {
     store: Rc<Store>,
     slot: SlotId,
     list: ListState<&'static SqlSource<ThreadHead, i64>>,
+    filing: Rc<Cell<bool>>,
 }
 
 impl Mailbox {
@@ -99,14 +101,14 @@ impl Mailbox {
         Some(self.preview(row.target))
     }
 
-    /// The cursor after a row has been filed out from under it: it stays
-    /// where it stood, which is now the row below. Answers the preview of
-    /// whatever it landed on.
-    pub fn advance(&mut self) -> Option<Nav> {
-        let store = self.store.clone();
-        self.list.sync(&store);
-        let i = self.list.cursor_index(&store)?;
-        let row = self.list.set_cursor(&store, i)?;
+    /// Capture the cursor for the writer to resolve after filing.
+    pub(super) fn after_removal(&self) -> Option<SqlCursor<ThreadHead, i64>> {
+        self.list.after_removal()
+    }
+
+    /// Apply the committed successor while this gesture still owns the cursor.
+    pub(super) fn land(&mut self, landing: SqlLanding<ThreadHead>) -> Option<Nav> {
+        let row = self.list.land(landing)?;
         Some(self.preview(row.target))
     }
 
@@ -296,6 +298,7 @@ impl PanelKind for MailboxKind {
             store: cx.session().store().clone(),
             slot: 0,
             list,
+            filing: Rc::new(Cell::new(false)),
         })
     }
 }
@@ -348,83 +351,61 @@ impl Mailbox {
     /// rule puts that preview where the old one was. That walk is part of
     /// the action, not a second one: one undo takes the whole gesture back.
     fn file_marked(&mut self, s: &mut Session, to: To) {
+        if self.filing.get() {
+            return;
+        }
         let keys = self.list.marks().keys();
         if keys.is_empty() {
             return;
         }
-        let store = self.store.clone();
-
-        // Which mails move: the folder's own copies of each marked
-        // conversation, minus the ones there is nowhere to put or nothing
-        // to do for.
-        let mut moving: Vec<(MailId, i64)> = Vec::new();
-        for th in &keys {
-            for id in folder_mails(&store, self.role, *th) {
-                if !movable(&store, id, to) {
-                    continue;
-                }
-                moving.push((id, model::folder_of(&store, id)));
-            }
-        }
-        if moving.is_empty() {
-            s.notify(to.nothing_said(), false);
-            return;
-        }
-
-        // The marks come off before the action, so the bar it redraws has no
-        // count left on it; a refused write puts them straight back.
+        let cursor = self.after_removal();
+        let role = self.role;
+        let threads = keys.clone();
+        let slot = self.slot;
         self.clear_marks();
-
-        let mut intents: Vec<Box<dyn Intent>> = Vec::new();
-        // A mark is context rather than a row, so putting it back is putting
-        // it back *here*: the intent holds the instance this verb is running
-        // on, which the session is holding too.
-        if let Some(inst) = s.panel(self.slot) {
-            intents.push(Box::new(RestoredMarks {
-                panel: inst,
-                keys: keys.clone(),
-            }));
-        }
-        intents.extend(
-            moving
-                .iter()
-                .map(|(mail, from)| moved(&store, *mail, *from, to)),
-        );
-
-        let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
-        let label = format!("{} {}", to.word(), threads_said(keys.len()));
-        let done = s.act(
-            Action::writing("file", label, move |tx| {
-                for id in &ids {
-                    move_tx(tx, *id, to)?;
-                }
-                Ok(())
+        let marks = s.panel(slot).map(|panel| RestoredMarks {
+            panel,
+            keys: keys.clone(),
+        });
+        self.filing.set(true);
+        let filing = self.filing.clone();
+        s.act_async(
+            Edit::writing("file", format!("{} {}", to.word(), threads_said(keys.len())), move |tx| {
+                filing::file(tx, Scope::Mailbox { role, threads }, to, cursor)
             })
-            .claiming(intents),
+            .record_if(|outcome| outcome.changed)
+            .wake_if(|outcome| outcome.changed)
+            .claiming_with(|outcome| std::mem::take(&mut outcome.claims)),
+            move |s, done| {
+                filing.set(false);
+                if done.as_ref().is_some_and(|outcome| outcome.changed) {
+                    if let Some(marks) = marks {
+                        s.claim_ui(Box::new(marks));
+                    }
+                }
+                // Inline worlds complete while the verb still borrows its
+                // panel. Land after that event, on this same action's node.
+                s.after_event(move |s| {
+                    let Some(panel) = s.panel(slot) else { return };
+                    let mut panel = panel.borrow_mut();
+                    let Some(mailbox) = panel.as_any().downcast_mut::<Mailbox>() else { return };
+                    if !Rc::ptr_eq(&mailbox.filing, &filing) { return; }
+                    let nav = match done {
+                        Some(outcome) if outcome.changed => outcome.landing.and_then(|landing| mailbox.land(landing)),
+                        other => {
+                            mailbox.restore_marks(&keys);
+                            if let Some((message, error)) = other.and_then(|outcome| outcome.notice) {
+                                s.notify(message, error);
+                            }
+                            None
+                        }
+                    };
+                    drop(panel);
+                    if let Some(nav) = nav { s.nav_within(nav); }
+                });
+            },
         );
-        if done.is_none() {
-            self.restore_marks(&keys);
-            return;
-        }
-
-        // The cursor stands where it stood; the rows under it may have left,
-        // so it lands on the nearest one that stayed and previews it. It is
-        // the filing arriving at its consequence, so it folds into the
-        // filing's node rather than costing a second undo.
-        if let Some(nav) = self.advance() {
-            s.nav_within(nav);
-        }
     }
-}
-
-/// The mails of one conversation that sit in this mailbox — what filing the
-/// row moves. The row's `target` is a mail of the folder by construction, so
-/// asking the mail what it is filed as cannot disagree with the list.
-fn folder_mails(store: &Store, role: Role, thread: i64) -> Vec<MailId> {
-    let Some(head) = model::thread_head(store, role, thread) else {
-        return Vec::new();
-    };
-    model::thread_siblings(store, head.target)
 }
 
 /// Whether this move would actually move this letter: it needs somewhere to
@@ -454,18 +435,6 @@ pub fn moved(store: &Store, mail: MailId, from: i64, to: To) -> Box<dyn Intent> 
             trash: from,
             to: model::put_back_target(store, mail).unwrap_or(from),
         }),
-    }
-}
-
-/// The move itself, inside the action's transaction.
-///
-/// # Errors
-///
-/// If the store refuses the write.
-pub fn move_tx(c: &rusqlite::Connection, id: MailId, to: To) -> rusqlite::Result<()> {
-    match to {
-        To::Role(role) => model::file_tx(c, id, role).map(|_| ()),
-        To::Back => model::put_back_tx(c, id).map(|_| ()),
     }
 }
 
@@ -512,18 +481,16 @@ impl RestoredMarks {
     }
 }
 
-impl Intent for RestoredMarks {
+impl UiIntent for RestoredMarks {
     fn describe(&self) -> String {
         format!("{} marked", threads_said(self.keys.len()))
     }
 
-    fn reverse(&self, _w: &World) -> Result<(), String> {
+    fn reverse(&self) {
         self.edit(|m| m.restore_marks(&self.keys));
-        Ok(())
     }
 
-    fn reapply(&self, _w: &World) -> Result<(), String> {
+    fn reapply(&self) {
         self.edit(Mailbox::clear_marks);
-        Ok(())
     }
 }

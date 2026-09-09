@@ -7,8 +7,11 @@ leading Markdown heading marker removed. Delete works on the cursor or
 marked notes and can be undone.
 
 Notes are database records, independent of files and directories. Every text
-change is written through the store, including local text undo and redo.
-There is no Save action for a note. Closing a panel retains its text.
+change is queued for the store, including local text undo and redo. Pending
+edits coalesce before a write; the editor shows *saving…* until its latest
+text commits. There is no Save action for a note. Closing a panel lets its
+accepted writes finish, and application shutdown waits for open and closed
+editors to finish their queued writes.
 
 The editor shows plain Markdown source. Delimiters stay visible: `**bold**`
 is bold, `*emphasis*` is italic, and headings are bold at the normal font
@@ -23,7 +26,8 @@ The shell's `SourceInput` specializes the pinned Makepad native input with
 cached style spans. It retains native undo, IME, selection, clipboard,
 wrapping, caret navigation and scrolling. Only glyph fonts and colours
 change; source positions and line geometry stay the same. Parsing happens
-on text changes; styled layout is reused until the text or width changes.
+on a blocking worker after text changes; the UI receives completed style
+spans, and styled layout is reused until the text or width changes.
 Tabs draw at four-column stops while remaining literal tabs in the source.
 The small styling hook currently requires a local copy of Makepad's input,
 with its license beside it, until that hook is available upstream. The shell
@@ -48,6 +52,13 @@ including in mixed-ending files: line alignment keeps unchanged lines'
 endings when lines are inserted or deleted, and replacement lines reuse
 their prior endings. Additional new lines follow the surrounding style.
 Files over 2 MiB, invalid UTF-8 and binary data are refused rather than truncated.
+
+Opening, line-ending alignment, Markdown parsing, autosaves and file saves run
+outside the UI thread. Save is an ordering barrier: it persists that text as a
+draft before touching the file. Typing accepted after Save retains a new draft
+against the saved file's contents. A failed save leaves the draft intact and
+records the error in the effect log even if the editor has closed. Concurrent
+draft changes are not removed by another editor's save cleanup.
 
 | Tag | Arguments | Meaning |
 |---|---|---|
@@ -75,6 +86,12 @@ originals are maintained by the same storage code as the editor.
 | `notes.create_draft` | `path`, `body`, `revision` | Create a draft for an existing text file |
 | `notes.update_draft` | `path`, `body`, `revision` | Replace an existing draft's complete source |
 
+Read tools run on the agent's background worker, including file reads and
+revision hashing. Write preparation also runs in the background: validation,
+original-file reads, revision checks and line-ending conversion finish before
+the session receives a transaction. That transaction rechecks the stored text
+and commits the edit and agent result together. Stopping a run before the
+transaction starts prevents the edit from being applied.
 Read results include `body`, `revision`, `total_bytes` and `next_offset`.
 Each page contains at most 64 KiB and ends on a UTF-8 boundary. Start at
 offset zero, follow `next_offset` until it is null, and check that every

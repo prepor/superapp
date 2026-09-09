@@ -132,8 +132,9 @@ impl SignIn {
         if self.state() != "ready" {
             return None;
         }
-        let c = self.store.conn();
-        let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        let count = |id: &'static str, sql: &str| self.store.snapshot_rows_sql_deps(
+            id, "Telegram synchronization progress", sql, &[], &[], |r| r.get::<_, i64>(0),
+        ).first().copied().unwrap_or(0);
         Some(format!(
             "{}{} chats · {} lines",
             if super::super::runtime::of(&self.store).list_syncing() {
@@ -141,8 +142,8 @@ impl SignIn {
             } else {
                 ""
             },
-            count("SELECT COUNT(*) FROM tg_chat"),
-            count("SELECT COUNT(*) FROM tg_message")
+            count("telegram chat count", "SELECT COUNT(*) FROM tg_chat"),
+            count("telegram message count", "SELECT COUNT(*) FROM tg_message")
         ))
     }
 

@@ -14,7 +14,7 @@
 use kernel::richtable::{Completion, Suggestion, MAX_SUGGESTIONS};
 use kernel::store::Store;
 
-use super::model::senders;
+use super::model::display_senders;
 
 /// The TO field's completion.
 pub struct Recipients;
@@ -41,7 +41,7 @@ impl Completion for Recipients {
 
     fn offer(&self, store: &Store, ctx: &RecipientCtx) -> Vec<Suggestion> {
         let typed = ctx.partial.trim_end();
-        let mut out: Vec<Suggestion> = senders(store)
+        display_senders(store, false)
             .iter()
             .filter(|s| {
                 let email = s.email.to_lowercase();
@@ -51,6 +51,7 @@ impl Completion for Recipients {
                     && !ctx.taken.contains(&email)
                     && (email.contains(typed) || s.name.to_lowercase().contains(typed))
             })
+            .take(MAX_SUGGESTIONS)
             .map(|s| {
                 if s.name.is_empty() {
                     Suggestion::value(s.email.clone())
@@ -58,9 +59,7 @@ impl Completion for Recipients {
                     Suggestion::labeled(s.name.clone(), s.email.clone())
                 }
             })
-            .collect();
-        out.truncate(MAX_SUGGESTIONS);
-        out
+            .collect()
     }
 
     fn splice(

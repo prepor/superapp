@@ -10,8 +10,8 @@ use kernel::app::{Problem, ProblemSource};
 use kernel::effect::MAX_ATTEMPTS;
 use kernel::nav::Nav;
 use kernel::panel::Verb;
-use kernel::session::Action;
-use kernel::store::{Q, Store};
+use kernel::session::Edit;
+use kernel::store::{Store, Q};
 use kernel::time::fmt_date;
 
 use super::accounts;
@@ -58,7 +58,7 @@ pub struct FailingSends;
 
 impl ProblemSource for FailingSends {
     fn list(&self, store: &Store) -> Vec<Problem> {
-        let rows = store.rows(&Q_FAILING_SENDS, &[], |r| {
+        let rows = store.snapshot_rows(&Q_FAILING_SENDS, &[], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -132,10 +132,15 @@ fn verbs(outbox: i64, subject: &str, error: &str, _seed: Seed) -> Vec<Verb> {
     vec![
         Verb::call("mail.retry", "retry", None, move |s| {
             let delay = model::send_delay();
-            let after = s.now() + delay;
-            let done = s.act(
-                Action::writing("send", format!("retry “{said}”"), move |tx| {
-                    model::file_send_tx(tx, outbox, after)
+            let now = s.now();
+            let clock = s.world().factory().map(|factory| factory.clock());
+            s.act_async(
+                Edit::writing("send", format!("retry “{said}”"), move |tx| {
+                    model::file_send_tx(
+                        tx,
+                        outbox,
+                        clock.as_ref().map_or(now, |clock| clock.read()) + delay,
+                    )
                 })
                 .about(outbox_entity(outbox))
                 .claiming(vec![Box::new(Retried {
@@ -143,10 +148,12 @@ fn verbs(outbox: i64, subject: &str, error: &str, _seed: Seed) -> Vec<Verb> {
                     error: why.clone(),
                     delay,
                 })]),
+                move |s, done| {
+                    if done.is_some() {
+                        s.notify(format!("sending in {delay:.0}s"), false);
+                    }
+                },
             );
-            if done.is_some() {
-                s.notify(format!("sending in {delay:.0}s"), false);
-            }
         }),
         // A problem row sits in no slot of its own, so the open has nowhere
         // to join to and lands in a column of its own.

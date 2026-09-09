@@ -61,7 +61,7 @@ is not locked out because the bucket happened to be down before its first join.
 
 The holder releases the lease on sleep and on close. Taking it from a live
 device may discard changes it has not published, so the screen says so. The
-lease driver keeps its own thread and command channel inside the kernel: it
+lease driver keeps its own asynchronous task and command channel inside the kernel: it
 needs acquire, release, and override, not only a kick, which is why it is not
 an ordinary [worker](./apps.md#workers).
 

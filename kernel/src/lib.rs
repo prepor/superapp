@@ -43,6 +43,7 @@ pub mod panel;
 pub mod problems;
 pub mod repl;
 pub mod richtable;
+pub mod runtime;
 pub mod scene;
 pub mod search;
 pub mod session;

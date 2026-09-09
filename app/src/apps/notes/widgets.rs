@@ -122,10 +122,12 @@ impl Widget for EditorPanel {
         if let Event::Actions(actions) = event {
             if let Some(text) = input.changed(actions) {
                 if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Editor>() {
-                    let spans = markdown::spans(&text);
+                    let spans = (!p.background()).then(|| markdown::spans(&text));
                     p.edited(text);
-                    if let Some(mut input) = input.borrow_mut() {
-                        input.set_spans(cx, spans);
+                    if let Some(spans) = spans {
+                        if let Some(mut input) = input.borrow_mut() {
+                            input.set_spans(cx, spans);
+                        }
                     }
                 }
                 if let Some(s) = scope.data.get_mut::<Session>() {
@@ -144,10 +146,17 @@ impl Widget for EditorPanel {
             p.observe();
             if self.shown != Some(p.revision) {
                 input.set_text(cx, &p.text);
-                if let Some(mut input) = input.borrow_mut() {
-                    input.set_spans(cx, markdown::spans(&p.text));
+                if !p.background() {
+                    if let Some(mut input) = input.borrow_mut() {
+                        input.set_spans(cx, markdown::spans(&p.text));
+                    }
                 }
                 self.shown = Some(p.revision);
+            }
+            if let Some(spans) = p.take_spans() {
+                if let Some(mut input) = input.borrow_mut() {
+                    input.set_spans(cx, spans);
+                }
             }
             let read_only = !p.available
                 || !scope

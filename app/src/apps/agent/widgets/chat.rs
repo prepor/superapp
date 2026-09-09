@@ -826,7 +826,7 @@ impl AgentChatPanel {
             let Some(chat) = borrow.as_any().downcast_mut::<Chat>() else {
                 return;
             };
-            if chat.latest_run().as_ref().is_some_and(Run::live) {
+            if chat.sending() || chat.latest_run().as_ref().is_some_and(Run::live) {
                 return;
             }
             chat.send(session);

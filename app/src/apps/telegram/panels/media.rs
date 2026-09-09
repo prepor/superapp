@@ -28,7 +28,7 @@ use kernel::session::Session;
 
 use crate::shell::widgets::media::PlayerState;
 use crate::shell::widgets::viewer::{Controller, Measure, Preview};
-use kernel::caps::{Blobs, FileKind};
+use kernel::caps::FileKind;
 use super::super::{operations::Status, requests, runtime};
 
 use super::super::draft_toast;
@@ -46,7 +46,6 @@ pub struct Viewer {
     playback: Playback,
     viewer: Controller,
     file_request: Option<String>,
-    file_ready: Option<(String, PathBuf)>,
 }
 
 impl Viewer {
@@ -104,12 +103,12 @@ impl Viewer {
                 |max| Some(bytes.iter().take(max).copied().collect())).into());
         }
         if reference.starts_with("tg:") {
-            if let Some((source, path)) = self.file_ready.as_ref().filter(|(source, _)| source == &key) {
-                return (format!("{source}:ready"), Preview::Path { path: path.clone(), name, kind, size: 0 });
-            }
-            if let Ok(Some(path)) = self.world.with_cap::<dyn Blobs, _>(|b| b.get(reference)) {
-                self.file_ready = Some((key.clone(), path.clone()));
+            let reading = super::super::media_cache::read_blob(&self.world, reference);
+            if let Some(path) = reading.clone().paths().and_then(|paths| paths.file) {
                 return (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 });
+            }
+            if matches!(reading, super::super::media_cache::Reading::Pending(_)) {
+                return (format!("{key}:preparing"), Preview::Loading("preparing preview…".into()));
             }
             let rt = runtime::of(self.world.store());
             let context = format!("cache:{}:{}", m.chat, m.id);
@@ -303,7 +302,7 @@ impl Panel for Viewer {
                 let file = self.msg().and_then(|m| self.file_to_open(&m));
                 match file {
                     Some(path) if cfg!(target_os = "macos") => {
-                        let _ = super::super::operations::run_local(
+                        drop(super::super::operations::run_local(
                             self.world.store(),
                             Some(self.chat),
                             "opening media",
@@ -322,7 +321,7 @@ impl Panel for Viewer {
                                     ))
                                 }
                             },
-                        );
+                        ));
                         s.redraw();
                     }
                     Some(_) => s.notify(draft_toast("open with the system"), false),
@@ -356,7 +355,6 @@ impl PanelKind for ViewerKind {
             slot: 0,
             viewer: Controller::default(),
             file_request: None,
-            file_ready: None,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
         })
     }

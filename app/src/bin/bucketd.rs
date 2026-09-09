@@ -11,15 +11,17 @@
 //! # an android emulator: --bucket http://10.0.2.2:9000  (its host alias)
 //! ```
 //!
-//! Thread-per-connection, one lock serialising the read-modify-write so a
+//! A Tokio task per connection, one lock serializing the disk operation so a
 //! CAS is atomic. Not for production — no auth, no TLS — just a demo
 //! transport.
 
-use std::net::TcpListener;
+use tokio::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut dir = PathBuf::from(
         std::env::var("SUPERAPP_BUCKET_DIR").unwrap_or_else(|_| "/tmp/superapp-bucket".into()),
     );
@@ -47,8 +49,8 @@ fn main() {
         }
     }
 
-    std::fs::create_dir_all(&dir).expect("create the bucket directory");
-    let listener = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|e| {
+    tokio::fs::create_dir_all(&dir).await.expect("create the bucket directory");
+    let listener = TcpListener::bind((bind.as_str(), port)).await.unwrap_or_else(|e| {
         eprintln!("bucketd: cannot bind {bind}:{port}: {e}");
         std::process::exit(1);
     });
@@ -56,13 +58,12 @@ fn main() {
 
     // One lock so a compare-and-swap is atomic against concurrent devices.
     let lock = Arc::new(Mutex::new(()));
-    for conn in listener.incoming() {
-        let Ok(mut stream) = conn else { continue };
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else { continue };
         let dir = dir.clone();
         let lock = lock.clone();
-        std::thread::spawn(move || {
-            let _guard = lock.lock().expect("bucket lock");
-            let _ = kernel::repl::object::serve_conn(&dir, &mut stream);
+        tokio::spawn(async move {
+            let _ = kernel::repl::object::serve_conn(&dir, &mut stream, &lock).await;
         });
     }
 }

@@ -127,72 +127,74 @@ pub fn all() -> Vec<Tool> {
 
 fn file(input: &Value) -> kernel::tool::Read {
     let input = input.clone();
-    let mut operation = None;
-    let started = std::time::Instant::now();
-    Box::new(move |world| match read_file(world, &input, &mut operation, started) {
-        Ok(Some(value)) => std::task::Poll::Ready(Ok(value)),
-        Ok(None) => std::task::Poll::Pending,
-        Err(error) => std::task::Poll::Ready(Err(error)),
-    })
+    Box::new(move |world| Box::pin(read_file(world, input)))
 }
 
-fn read_file(
+async fn read_file(
     world: &kernel::effect::World,
-    input: &Value,
-    operation: &mut Option<u64>,
-    started: std::time::Instant,
-) -> Result<Option<Value>, String> {
+    input: Value,
+) -> Result<Value, String> {
     use crate::reader::document;
     use kernel::caps::Blobs;
     use std::io::Read as _;
 
     let chat = input["chat"].as_i64().ok_or("`chat` must be a 64-bit integer")?;
     let message = input["message"].as_i64().ok_or("`message` must be a 64-bit integer")?;
-    let offset = document::offset(input)?;
-    let m = model::line(world.store(), chat, message)
-        .ok_or_else(|| format!("no cached Telegram message at {chat}, {message}"))?;
-    let reference = downloads::reference(&m).ok_or("This message has no downloadable attachment")?;
-    if let Some(path) = world.with_cap::<dyn Blobs, _>(|b| b.get(reference))? {
-        let source = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-        document::check_size(source.metadata().map_err(|error| error.to_string())?.len())?;
-        let mut bytes = Vec::new();
-        source.take(document::MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
-        let name = downloads::name(&m);
-        let mut out = document::read(&bytes, &name, "", offset)?;
-        out["chat"] = json!(chat);
-        out["message"] = json!(message);
-        out["name"] = json!(name);
-        out["size"] = json!(bytes.len());
-        return Ok(Some(out));
-    }
+    let offset = document::offset(&input)?;
     let rt = runtime::of(world.store());
-    if !rt.can_send() {
-        return Err("Telegram is not connected and this file is not cached; reconnect and try again".into());
+    let mut changes = rt.operations.subscribe();
+    let mut operation = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let m = model::line(world.store(), chat, message)
+            .ok_or_else(|| format!("no cached Telegram message at {chat}, {message}"))?;
+        let reference = downloads::reference(&m).ok_or("This message has no downloadable attachment")?;
+        if let Some(path) = world.with_cap::<dyn Blobs, _>(|b| b.get(reference))? {
+            let name = downloads::name(&m);
+            return kernel::runtime::spawn_blocking(move || {
+                let source = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                document::check_size(source.metadata().map_err(|error| error.to_string())?.len())?;
+                let mut bytes = Vec::new();
+                source.take(document::MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+                let mut out = document::read(&bytes, &name, "", offset)?;
+                out["chat"] = json!(chat);
+                out["message"] = json!(message);
+                out["name"] = json!(name);
+                out["size"] = json!(bytes.len());
+                Ok(out)
+            }).await.map_err(|error| format!("reading Telegram attachment: {error}"))?;
+        }
+        if !rt.can_send() {
+            return Err("Telegram is not connected and this file is not cached; reconnect and try again".into());
+        }
+        if let Some(id) = operation {
+            match rt.operations.outcome(id).map(|o| o.status) {
+                Some(Status::Failed { error, .. }) => return Err(error),
+                Some(Status::Done) => return Err("Downloaded file is no longer in the cache; try again".into()),
+                None => return Err("Telegram download is no longer available; try again".into()),
+                Some(Status::Pending) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let error = "Telegram did not finish downloading this file within two minutes; try again";
+                rt.operations.fail(world.store(), id, error, false);
+                return Err(error.into());
+            }
+        } else {
+            let request = rt.operations.track(&requests::cache_file(chat, message));
+            let request_value: Value = serde_json::from_str(&request).map_err(|e| e.to_string())?;
+            let id = request_value["@extra"]["operation"].as_u64().ok_or("download was not tracked")?;
+            if !rt.send(&request) {
+                let error = "Telegram disconnected before the download could start";
+                rt.operations.fail(world.store(), id, error, false);
+                return Err(error.into());
+            }
+            operation = Some(id);
+        }
+        tokio::select! {
+            result = changes.changed() => result.map_err(|_| "Telegram operation closed".to_string())?,
+            _ = tokio::time::sleep_until(deadline) => {},
+        }
     }
-    if let Some(id) = *operation {
-        match rt.operations.outcome(id).map(|o| o.status) {
-            Some(Status::Failed { error, .. }) => return Err(error),
-            Some(Status::Done) => return Err("Downloaded file is no longer in the cache; try again".into()),
-            None => return Err("Telegram download is no longer available; try again".into()),
-            Some(Status::Pending) => {}
-        }
-        if started.elapsed() >= std::time::Duration::from_secs(120) {
-            let error = "Telegram did not finish downloading this file within two minutes; try again";
-            rt.operations.fail(world.store(), id, error, false);
-            return Err(error.into());
-        }
-    } else {
-        let request = rt.operations.track(&requests::cache_file(chat, message));
-        let request_value: Value = serde_json::from_str(&request).map_err(|e| e.to_string())?;
-        let id = request_value["@extra"]["operation"].as_u64().ok_or("download was not tracked")?;
-        if !rt.send(&request) {
-            let error = "Telegram disconnected before the download could start";
-            rt.operations.fail(world.store(), id, error, false);
-            return Err(error.into());
-        }
-        *operation = Some(id);
-    }
-    Ok(None)
 }
 
 fn message_input() -> Value {

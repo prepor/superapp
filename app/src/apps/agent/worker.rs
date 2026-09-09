@@ -12,7 +12,6 @@
 use kernel::app::{Wake, Worker};
 use kernel::effect::{Job, World};
 use kernel::store::Store;
-use std::task::Poll;
 use std::time::Duration;
 
 use super::model::{
@@ -26,16 +25,16 @@ use super::AGENT;
 pub struct RunWorker {
     run: RunId,
     chat: ChatId,
-    reading: Option<(model::CallId, kernel::tool::Read)>,
 }
 
 impl RunWorker {
     #[must_use]
     pub fn new(run: RunId, chat: ChatId) -> RunWorker {
-        RunWorker { run, chat, reading: None }
+        RunWorker { run, chat }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for RunWorker {
     fn name(&self) -> String {
         format!("agent-run-{}", self.run)
@@ -61,13 +60,13 @@ impl Worker for RunWorker {
     /// action re-asked for the set. It waits on a kick and re-sends
     /// nothing: a request costs money, and the only honest word about a
     /// stream nobody is holding is the sweep's at the next open.
-    fn pass(&mut self, w: &World) -> Wake {
+    async fn pass(&mut self, w: &World) -> Wake {
         let Some(run) = model::run_conn(w.store().conn(), self.run) else {
             return Wake::OnKick;
         };
         match run.status.as_str() {
-            model::PENDING => self.ask(w),
-            model::WAITING => self.answered(w),
+            model::PENDING => self.ask(w).await,
+            model::WAITING => self.answered(w).await,
             // `streaming` among them, for the reason above.
             _ => Wake::OnKick,
         }
@@ -76,37 +75,40 @@ impl Worker for RunWorker {
 
 impl RunWorker {
     /// One round: the request, and the row its answer becomes.
-    fn ask(&mut self, w: &World) -> Wake {
+    async fn ask(&mut self, w: &World) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
-        let mine = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
-                return Ok(false);
-            }
-            set_run_status_tx(c, run, model::STREAMING, None, now)?;
-            Ok(true)
-        });
+        let mine = w
+            .store()
+            .write_async(move |c| {
+                if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
+                    return Ok(false);
+                }
+                set_run_status_tx(c, run, model::STREAMING, None, now)?;
+                Ok(true)
+            })
+            .await;
         // The run may have stopped or disappeared since the pass read it,
         // including after writing tool results. A request costs money.
         if !matches!(mine, Ok(true)) {
             return Wake::OnKick;
         }
         let turn = model::turns_conn(w.store().conn(), chat).len() as i64 + 1;
-        let answer = w.run(&Complete { run, chat, turn });
+        let answer = w.run_async(&Complete { run, chat, turn }).await;
         // Read before it is cleared: a stop keeps what had arrived.
         let tail = AGENT.tail(run);
         AGENT.clear_tail(run);
         match answer {
-            Ok(done) => self.landed(w, &done),
+            Ok(done) => self.landed(w, &done).await,
             // The one failure with a row to write: the person stopped it,
             // and what the model had said by then is still worth keeping.
-            Err(why) if why == model::STOPPED => self.was_stopped(w, tail.as_ref()),
-            Err(why) => self.failed(w, &why),
+            Err(why) if why == model::STOPPED => self.was_stopped(w, tail.as_ref()).await,
+            Err(why) => self.failed(w, &why).await,
         }
     }
 
     /// The answer, as rows. A turn either way; calls and a wait where the
     /// model asked for tools, an ending where it did not.
-    fn landed(&mut self, w: &World, done: &Completion) -> Wake {
+    async fn landed(&mut self, w: &World, done: &Completion) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
         let usage = done.usage.as_ref().map(Cost::of);
         // `tool_calls` with no calls on it is a model contradicting itself;
@@ -116,36 +118,42 @@ impl RunWorker {
         if wants_tools {
             let turn = Turn::new(done.message.clone()).by(run);
             let calls = done.message.tool_calls.clone();
-            let _ = w.store().write(move |c| {
-                if !model::run_alive_tx(c, run, chat)? {
-                    return Ok(());
-                }
-                let (turn_id, _) = add_turn_tx(c, chat, &turn, now)?;
-                for call in &calls {
-                    add_call_tx(c, run, turn_id, call, now)?;
-                }
-                set_run_status_tx(c, run, model::WAITING, None, now)?;
-                if let Some(u) = usage {
-                    set_run_usage_tx(c, run, &u)?;
-                }
-                Ok(())
-            });
+            let _ = w
+                .store()
+                .write_async(move |c| {
+                    if !model::run_alive_tx(c, run, chat)? {
+                        return Ok(());
+                    }
+                    let (turn_id, _) = add_turn_tx(c, chat, &turn, now)?;
+                    for call in &calls {
+                        add_call_tx(c, run, turn_id, call, now)?;
+                    }
+                    set_run_status_tx(c, run, model::WAITING, None, now)?;
+                    if let Some(u) = usage {
+                        set_run_usage_tx(c, run, &u)?;
+                    }
+                    Ok(())
+                })
+                .await;
             return Wake::After(Duration::ZERO);
         }
         let turn = Turn::new(done.message.clone())
             .by(run)
             .finishing(done.finish.word());
-        let _ = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? {
-                return Ok(());
-            }
-            add_turn_tx(c, chat, &turn, now)?;
-            set_run_status_tx(c, run, model::DONE, None, now)?;
-            if let Some(u) = usage {
-                set_run_usage_tx(c, run, &u)?;
-            }
-            Ok(())
-        });
+        let _ = w
+            .store()
+            .write_async(move |c| {
+                if !model::run_alive_tx(c, run, chat)? {
+                    return Ok(());
+                }
+                add_turn_tx(c, chat, &turn, now)?;
+                set_run_status_tx(c, run, model::DONE, None, now)?;
+                if let Some(u) = usage {
+                    set_run_usage_tx(c, run, &u)?;
+                }
+                Ok(())
+            })
+            .await;
         Wake::OnKick
     }
 
@@ -158,7 +166,7 @@ impl RunWorker {
     /// reaches a run that has been taken away, and the tail goes with the
     /// rows rather than becoming a turn nobody asked for in a chat that may
     /// itself be gone.
-    fn was_stopped(&mut self, w: &World, tail: Option<&Tail>) -> Wake {
+    async fn was_stopped(&mut self, w: &World, tail: Option<&Tail>) -> Wake {
         let (run, chat, now) = (self.run, self.chat, w.now());
         let mut message = Message::of(Role::Assistant);
         if let Some(t) = tail {
@@ -170,13 +178,16 @@ impl RunWorker {
             }
         }
         let turn = Turn::new(message).by(run).finishing(model::STOPPED);
-        let _ = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? {
-                return Ok(());
-            }
-            add_turn_tx(c, chat, &turn, now)?;
-            set_run_status_tx(c, run, model::STOPPED, None, now)
-        });
+        let _ = w
+            .store()
+            .write_async(move |c| {
+                if !model::run_alive_tx(c, run, chat)? {
+                    return Ok(());
+                }
+                add_turn_tx(c, chat, &turn, now)?;
+                set_run_status_tx(c, run, model::STOPPED, None, now)
+            })
+            .await;
         // Whichever way it went, what had arrived is not arriving any more.
         AGENT.clear_tail(run);
         Wake::OnKick
@@ -184,14 +195,17 @@ impl RunWorker {
 
     /// Nothing came back. The sentence is the gateway's, and the chat
     /// offers *retry*: nothing here retries by itself.
-    fn failed(&mut self, w: &World, why: &str) -> Wake {
+    async fn failed(&mut self, w: &World, why: &str) -> Wake {
         let (run, chat, now, why) = (self.run, self.chat, w.now(), why.to_string());
-        let _ = w.store().write(move |c| {
-            if !model::run_alive_tx(c, run, chat)? {
-                return Ok(());
-            }
-            set_run_status_tx(c, run, model::FAILED, Some(&why), now)
-        });
+        let _ = w
+            .store()
+            .write_async(move |c| {
+                if !model::run_alive_tx(c, run, chat)? {
+                    return Ok(());
+                }
+                set_run_status_tx(c, run, model::FAILED, Some(&why), now)
+            })
+            .await;
         Wake::OnKick
     }
 
@@ -201,8 +215,8 @@ impl RunWorker {
     /// This round's calls, not the run's: a run that has already been round
     /// once still has the earlier rounds' rows, and those were answered
     /// when they were the latest.
-    fn answered(&mut self, w: &World) -> Wake {
-        if let Some(wake) = self.read_calls(w) {
+    async fn answered(&mut self, w: &World) -> Wake {
+        if let Some(wake) = self.read_calls(w).await {
             return wake;
         }
         let calls = model::round_calls_conn(w.store().conn(), self.run);
@@ -221,27 +235,32 @@ impl RunWorker {
             .iter()
             .map(|c| Turn::new(Message::tool(&c.tool_call_id, c.said())).by(run))
             .collect();
-        let wrote = w.store().write(move |c| {
-            // A blocking read may finish after the person stops the run.
-            // Re-check inside the write so that stop cannot go stale.
-            if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
-                return Ok(false);
-            }
-            for turn in &results {
-                add_turn_tx(c, chat, turn, now)?;
-            }
-            Ok(true)
-        });
+        let wrote = w
+            .store()
+            .write_async(move |c| {
+                // A blocking read may finish after the person stops the run.
+                // Re-check inside the write so that stop cannot go stale.
+                if !model::run_alive_tx(c, run, chat)? || model::is_stopped(c, run) {
+                    return Ok(false);
+                }
+                for turn in &results {
+                    add_turn_tx(c, chat, turn, now)?;
+                }
+                Ok(true)
+            })
+            .await;
         if !matches!(wrote, Ok(true)) {
             return Wake::OnKick;
         }
-        self.ask(w)
+        self.ask(w).await
     }
 
     /// Read tools run in the same order as session tools, stopping at either
     /// a pending download or a call that belongs to the UI/approval gate.
-    fn read_calls(&mut self, w: &World) -> Option<Wake> {
-        let tools = w.with_cap::<kernel::tool::Readers, _>(|readers| readers.0.clone()).unwrap_or_default();
+    async fn read_calls(&mut self, w: &World) -> Option<Wake> {
+        let tools = w
+            .with_cap::<kernel::tool::Readers, _>(|readers| readers.0.clone())
+            .unwrap_or_default();
         for call in model::round_calls_conn(w.store().conn(), self.run) {
             if call.status == model::CALL_ASKED {
                 return Some(Wake::OnKick);
@@ -252,35 +271,42 @@ impl RunWorker {
             let tool = tools.iter().find(|t| t.name == call.tool)?;
             let reader = tool.reader.filter(|_| !tool.asks && !tool.writes)?;
             if model::is_stopped(w.store().conn(), self.run) {
-                self.reading = None;
                 return Some(Wake::OnKick);
             }
             let input = call.input();
             let result = match tool.check(&input) {
                 Err(error) => Err(error),
                 Ok(()) => {
-                    if self.reading.as_ref().is_none_or(|(id, _)| *id != call.id) {
-                        self.reading = Some((call.id, reader(&input)));
-                    }
-                    w.store().poll_external();
-                    match (self.reading.as_mut().unwrap().1)(w) {
-                        Poll::Pending => return Some(Wake::After(Duration::from_millis(100))),
-                        Poll::Ready(result) => result,
+                    let mut read = reader(&input)(w);
+                    let period = Duration::from_millis(50);
+                    let mut stop_check = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut read => break result,
+                            _ = stop_check.tick() => {
+                                if model::is_stopped(w.store().conn(), self.run) {
+                                    return Some(Wake::OnKick);
+                                }
+                            }
+                        }
                     }
                 }
             };
-            self.reading = None;
             let (status, output) = match result {
                 Ok(value) => (model::CALL_DONE, value.to_string()),
                 Err(error) => (model::CALL_FAILED, error),
             };
             let (id, run, chat, now) = (call.id, self.run, self.chat, w.now());
-            let _ = w.store().write(move |c| {
-                if model::run_alive_tx(c, run, chat)? {
-                    model::set_call_tx(c, id, status, &output, None, now)?;
-                }
-                Ok(())
-            });
+            let _ = w
+                .store()
+                .write_async(move |c| {
+                    if model::run_alive_tx(c, run, chat)? {
+                        model::set_call_tx(c, id, status, &output, None, now)?;
+                    }
+                    Ok(())
+                })
+                .await;
         }
         None
     }

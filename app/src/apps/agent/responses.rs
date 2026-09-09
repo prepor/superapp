@@ -6,6 +6,7 @@
 //! and tool results; only the model that wrote an output reuses its opaque
 //! reasoning and message phases.
 
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use super::gateway::{Failure, Flow};
@@ -90,13 +91,13 @@ pub(super) fn request_body(req: &ChatRequest) -> Value {
 /// Stream text and reasoning summaries as the same chunks the chat already
 /// draws. The terminal response contains the complete output in order,
 /// including tool calls, their ids, reasoning, and usage.
-pub(super) fn stream(
-    events: impl Iterator<Item = std::io::Result<String>>,
+pub(super) async fn stream(
+    mut events: impl Stream<Item = std::io::Result<String>> + Unpin,
     model: &str,
-    on: &mut dyn FnMut(&Chunk) -> Flow,
+    on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
 ) -> Result<Completion, Failure> {
     let mut summary_started = false;
-    for event in events {
+    while let Some(event) = events.next().await {
         let event = event.map_err(|e| Failure::new(format!("the stream broke: {e}")))?;
         let data = event.trim();
         if data.is_empty() || data == "[DONE]" {
@@ -269,6 +270,14 @@ mod tests {
     use super::super::model::Turn;
     use super::*;
 
+    fn stream(
+        events: impl Iterator<Item = std::io::Result<String>>,
+        model: &str,
+        on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
+    ) -> Result<Completion, Failure> {
+        kernel::runtime::block_on(super::stream(futures_util::stream::iter(events), model, on))
+    }
+
     fn read(events: Vec<Value>) -> Result<Completion, Failure> {
         stream(
             events.into_iter().map(|e| Ok(e.to_string())),
@@ -316,10 +325,13 @@ mod tests {
     #[test]
     fn responses_stream_into_the_live_tail_and_keep_usage() {
         let mut output = text_output();
-        output.as_array_mut().unwrap().insert(0, json!({
-            "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque",
-            "summary": [{"type": "summary_text", "text": "Checking the request."}],
-        }));
+        output.as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque",
+                "summary": [{"type": "summary_text", "text": "Checking the request."}],
+            }),
+        );
         let events = vec![
             json!({"type": "response.created", "response": {"status": "in_progress"}}),
             json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1",
@@ -351,9 +363,15 @@ mod tests {
         );
         assert_eq!(answer.message.text(), tail);
         assert_eq!(reasoning, "Checking the request.");
-        assert_eq!(answer.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+        assert_eq!(
+            answer.message.reasoning_content.as_deref(),
+            Some(reasoning.as_str())
+        );
         let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
-        assert_eq!(turn.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+        assert_eq!(
+            turn.message.reasoning_content.as_deref(),
+            Some(reasoning.as_str())
+        );
         assert_eq!(answer.finish, Finish::Stop);
         let usage = answer.usage.unwrap();
         assert_eq!(
@@ -365,8 +383,14 @@ mod tests {
     #[test]
     fn reasoning_summary_boundaries_match_in_the_live_and_saved_turn() {
         for (summaries, expected) in [
-            (vec![vec!["First part.", "Second part."]], "First part.\nSecond part."),
-            (vec![vec!["First part."], vec!["Second part."]], "First part.\nSecond part."),
+            (
+                vec![vec!["First part.", "Second part."]],
+                "First part.\nSecond part.",
+            ),
+            (
+                vec![vec!["First part."], vec!["Second part."]],
+                "First part.\nSecond part.",
+            ),
             (vec![vec!["", "Second part.", ""]], "\nSecond part.\n"),
         ] {
             let mut events = Vec::new();
@@ -405,11 +429,15 @@ mod tests {
                     }
                     Flow::Go
                 },
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(reasoning, expected, "live summary parts: {summaries:?}");
             assert_eq!(answer.message.reasoning_content.as_deref(), Some(expected));
             let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
-            assert_eq!(turn.message.reasoning_content.as_deref(), Some(reasoning.as_str()));
+            assert_eq!(
+                turn.message.reasoning_content.as_deref(),
+                Some(reasoning.as_str())
+            );
         }
     }
 
@@ -488,24 +516,38 @@ mod tests {
             json!({"type": "response.web_search_call.searching"}),
             json!({"type": "response.web_search_call.completed"}),
             done(output.clone()),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(answer.finish, Finish::Stop);
-        assert!(answer.message.tool_calls.is_empty(), "hosted search never enters the app's tool gate");
+        assert!(
+            answer.message.tool_calls.is_empty(),
+            "hosted search never enters the app's tool gate"
+        );
         let turn: Turn = serde_json::from_str(&Turn::new(answer.message).body()).unwrap();
         assert_eq!(turn.message.text(), text);
-        assert_eq!(turn.message.response.as_ref().unwrap().items, output.as_array().unwrap().clone());
+        assert_eq!(
+            turn.message.response.as_ref().unwrap().items,
+            output.as_array().unwrap().clone()
+        );
         let mut req = ChatRequest::new("gpt-6-astra", vec![turn.message, Message::user("more")]);
         let input = request_body(&req)["input"].as_array().unwrap().clone();
         assert_eq!(&input[..2], output.as_array().unwrap());
 
         req.model = "gpt-5.6-sol".into();
-        assert_eq!(request_body(&req)["input"][0]["content"], text, "switching models keeps source URLs");
+        assert_eq!(
+            request_body(&req)["input"][0]["content"],
+            text,
+            "switching models keeps source URLs"
+        );
         req.model = super::super::MODEL.into();
         let parts = request_parts_with(&Provider::WorkersAi, "a", "g", "token", &req, false);
         let body: Value = serde_json::from_slice(&parts.body).unwrap();
         assert_eq!(body["messages"][0]["content"], text);
         assert!(body["messages"][0].get("response").is_none());
-        assert!(body.get("tools").is_none(), "Workers AI does not receive the hosted tool");
+        assert!(
+            body.get("tools").is_none(),
+            "Workers AI does not receive the hosted tool"
+        );
     }
 
     #[test]

@@ -98,6 +98,16 @@ impl Widget for ComposePanel {
         // again: *attach* comes and goes with the clipboard.
         observe(&props, scope);
 
+        if props
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Compose>()
+            .is_some_and(|compose| compose.busy())
+        {
+            self.reseed(cx, &props);
+            return;
+        }
         let inputs = self.inputs(cx);
         let focused = inputs.iter().position(|t| t.key_focus(cx));
         // The TO field's offer answers first, in both hands. A press on one
@@ -265,7 +275,15 @@ impl ComposePanel {
             t.set_text(cx, s);
         }
         self.shown = draft.clone();
-        land(cx, &inputs, if matches!(seed, Seed::Forward(_)) { 0 } else { 2 });
+        land(
+            cx,
+            &inputs,
+            if matches!(seed, Seed::Forward(_)) {
+                0
+            } else {
+                2
+            },
+        );
     }
 
     /// The instance's text, put back into the fields when it moved without a

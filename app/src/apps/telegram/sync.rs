@@ -12,9 +12,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(any(feature = "tdlib", test))]
-use kernel::app::{Wake, Worker};
+use kernel::app::Wake;
+#[cfg(feature = "tdlib")]
+use kernel::app::Worker;
 use kernel::caps::{Blobs, Secrets};
-#[cfg(any(feature = "tdlib", test))]
+#[cfg(feature = "tdlib")]
 use kernel::effect::Job;
 use kernel::effect::World;
 use rusqlite::Connection;
@@ -58,6 +60,8 @@ const TYPING_FOR: f64 = 6.0;
 pub struct Account<T: Td> {
     td: T,
     commands: std::cell::RefCell<Option<runtime::Inbox>>,
+    /// Retirement projects final updates without initiating new work.
+    closing: std::cell::Cell<bool>,
     /// Media and history stay queued until this client is authorized. The
     /// persisted session row may describe a different running app instance.
     auth_ready: std::cell::Cell<bool>,
@@ -83,8 +87,8 @@ pub struct Account<T: Td> {
     /// server does not reliably send `chatActionCancel` — a client that
     /// waited for one would leave a person typing forever — so every client
     /// gives an action about six seconds and then forgets it, which is what
-    /// [`TYPING_FOR`] and this map are. A `RefCell` because the worker is one
-    /// thread per account and `drain` takes `&self`.
+    /// [`TYPING_FOR`] and this map are. A `RefCell` because each account runs
+    /// one projection batch at a time and `drain` takes `&self`.
     typing: std::cell::RefCell<std::collections::HashMap<PeerId, f64>>,
     /// History pages waiting their turn, front first: the chat just opened
     /// goes to the front, a walk's next page to the back, so opened chats
@@ -146,6 +150,7 @@ impl<T: Td> Account<T> {
 
     /// The single outbound boundary for commands and background requests.
     fn send(&self, w: &World, request: &str) {
+        if self.closing.get() { return; }
         let rt = runtime::of(w.store());
         let request = rt.operations.track(request);
         let Ok(v) = serde_json::from_str::<Value>(&request) else {
@@ -260,6 +265,7 @@ impl<T: Td> Account<T> {
         Account {
             td,
             commands: std::cell::RefCell::new(None),
+            closing: std::cell::Cell::new(false),
             auth_ready: std::cell::Cell::new(false),
             waiting_for_parameters: std::cell::Cell::new(false),
             retry_parameters: std::cell::Cell::new(None),
@@ -425,6 +431,7 @@ impl<T: Td> Account<T> {
     /// says, not the wire, so it belongs to the pass rather than to any
     /// update.
     pub fn drain(&self, w: &World) -> usize {
+        if self.closing.get() { return self.drain_updates(w); }
         // The receiver belongs to this account. Its lifetime is the send
         // permission: a stopped worker cannot leave a live sender behind.
         let mut commands = self.commands.borrow_mut();
@@ -457,12 +464,7 @@ impl<T: Td> Account<T> {
         super::history::preparing(w.store());
         self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
-        let mut n = 0;
-        while n < UPDATES_PER_PASS {
-            let Some(raw) = self.td.receive(0.0) else { break };
-            self.on_update(w, &raw);
-            n += 1;
-        }
+        let n = self.drain_updates(w);
         if self.retry_parameters.get().is_some_and(|at| w.now() >= at) {
             self.retry_parameters.set(None);
             self.parameters(w);
@@ -472,6 +474,30 @@ impl<T: Td> Account<T> {
         self.sync_counts(w);
         super::history::pump(w.store());
         n
+    }
+
+    fn drain_updates(&self, w: &World) -> usize {
+        let mut n = 0;
+        while n < UPDATES_PER_PASS {
+            let Some(raw) = self.td.try_receive() else { break };
+            self.on_update(w, &raw);
+            n += 1;
+        }
+        n
+    }
+
+    /// Forward the final accepted commands before sending native close.
+    /// Authorization and background fetches must not acquire new resources
+    /// while the remaining updates and native databases are being drained.
+    fn begin_shutdown(&self, w: &World) {
+        if self.closing.get() { return; }
+        if let Some(inbox) = self.commands.borrow().as_ref() {
+            for request in inbox.finish() { self.send(w, &request); }
+        }
+        self.closing.set(true);
+        self.auth_ready.set(false);
+        self.waiting_for_parameters.set(false);
+        self.retry_parameters.set(None);
     }
 
     /// One update. An `updateAuthorizationState` drives the sign-in;
@@ -604,6 +630,9 @@ impl<T: Td> Account<T> {
     /// One authorization state: fire what TDLib waits for, or record what the
     /// user must answer to, and write the session row either way.
     fn on_auth(&self, w: &World, st: &Value) {
+        if self.closing.get() && !matches!(st["@type"].as_str(),
+            Some("authorizationStateLoggingOut" | "authorizationStateClosing" | "authorizationStateClosed"))
+        { return; }
         self.auth_ready.set(false);
         self.sync_history_views(w);
         runtime::of(w.store()).set_connection_error(None);
@@ -672,11 +701,16 @@ impl<T: Td> Account<T> {
                 self.on_ready(w);
             }
             Some("authorizationStateLoggingOut") => {
-                runtime::of(w.store()).disconnect();
+                if !self.closing.get() { runtime::of(w.store()).disconnect(); }
                 write(None, "logging_out", None);
             }
             Some("authorizationStateClosing" | "authorizationStateClosed") => {
-                runtime::of(w.store()).disconnect();
+                // Local retirement has already sealed command admission.
+                // Closing can precede final responses; keep their guards
+                // until Closed confirms that no more updates can arrive.
+                if !self.closing.get() || st["@type"] == "authorizationStateClosed" {
+                    runtime::of(w.store()).disconnect();
+                }
                 write(None, "closed", None);
             }
             // States this phase does not sign in through — WaitRegistration,
@@ -1912,6 +1946,7 @@ impl<T: Td> Account<T> {
         if w.with_cap::<dyn Blobs, _>(|b| b.contains(&key))
             .unwrap_or(false)
         {
+            super::media_cache::invalidate(w.store(), &key);
             rt.operations.file_finished(w.store(), file, None);
             return;
         }
@@ -1938,6 +1973,7 @@ impl<T: Td> Account<T> {
         };
         match result {
             Ok(()) => {
+                super::media_cache::invalidate(w.store(), &key);
                 rt.operations.file_finished(w.store(), file, None);
                 if src.starts_with(&self.tdlib_dir) {
                     if let Some(id) = file["id"].as_i64().and_then(|n| i32::try_from(n).ok()) {
@@ -2031,10 +2067,8 @@ fn code_detail(st: &Value) -> Option<String> {
 
 // -- the worker ----------------------------------------------------------------
 
-/// How long the worker sleeps between drains. Short, because a TDLib push
-/// lands on the shared queue and the only way this pass hears of it is to
-/// look — the kernel's pass model fits a brief poll, not a blocking receive
-/// that would hold the thread for a minute.
+/// Housekeeping interval for viewport settling, typing expiry and retry
+/// deadlines. Network input and commands wake the worker immediately.
 const POLL: Duration = Duration::from_millis(300);
 
 /// Restoration can announce every cached peer in one burst. Keep each pass
@@ -2051,21 +2085,6 @@ fn next_pass(updates: usize) -> Wake {
 /// A single account, as the `telegram` file describes; several accounts are a
 /// later phase.
 const ACCOUNT_ENTITY: &str = "telegram";
-
-/// Worker adapter used by the offline protocol tests.
-#[cfg(test)]
-pub struct TgWorker<T: Td> {
-    account: Account<T>,
-}
-
-#[cfg(test)]
-impl<T: Td> TgWorker<T> {
-    /// Runs a fake account through the kernel worker interface.
-    #[must_use]
-    pub fn new(account: Account<T>) -> TgWorker<T> {
-        TgWorker { account }
-    }
-}
 
 /// The real worker. It reads the api_id and phone from the `telegram` file
 /// beside the store and keeps TDLib's binlog in a local `tdlib` directory
@@ -2094,9 +2113,41 @@ impl RealWorker {
             account: None,
         }
     }
+
+    async fn project(&mut self, w: &World, closing: bool) -> Wake {
+        let factory = w.factory().expect("Telegram worker world factory");
+        let mut account = self.account.take();
+        let dir = self.tdlib_dir.clone();
+        // Projection, SQLite and local attachment files are synchronous
+        // native work. Move the account, never a SQLite reader or World,
+        // across the boundary; only one finite batch can run at a time.
+        let (account, result) = kernel::runtime::spawn_blocking(move || {
+            let result = factory.build().map(|world| {
+                let account = account.get_or_insert_with(|| Account::new(
+                    RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
+                    dir, super::config::phone(world.store().dir()),
+                ));
+                if closing {
+                    account.begin_shutdown(&world);
+                    account.td.start_close();
+                }
+                account.drain(&world)
+            });
+            (account, result)
+        }).await.expect("Telegram projection task");
+        self.account = account;
+        match result {
+            Ok(updates) => next_pass(updates),
+            Err(error) => {
+                runtime::of(w.store()).notice(format!("Telegram store unavailable: {error}"), true);
+                Wake::After(POLL)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tdlib")]
+#[async_trait::async_trait(?Send)]
 impl Worker for RealWorker {
     fn name(&self) -> String {
         ACCOUNT_ENTITY.to_string()
@@ -2110,39 +2161,46 @@ impl Worker for RealWorker {
         job.entity.as_deref() == Some(ACCOUNT_ENTITY)
     }
 
-    fn pass(&mut self, w: &World) -> Wake {
-        // Reconciliation creates disposable worker descriptions. Open the
-        // config and native client only in the retained worker's first pass.
-        let account = self.account.get_or_insert_with(|| {
-            Account::new(
-                RealTd::new(),
-                super::config::api_id(w.store().dir()).unwrap_or(0),
-                self.tdlib_dir.clone(),
-                super::config::phone(w.store().dir()),
-            )
-        });
-        next_pass(account.drain(w))
+    async fn pass(&mut self, w: &World) -> Wake {
+        self.project(w, false).await
+    }
+
+    async fn wait(&mut self, w: &World, wake: Wake) {
+        if let Some(account) = &self.account { account.wait(w, wake).await; }
+        else if let Wake::After(delay) = wake { tokio::time::sleep(delay).await; }
+    }
+
+    async fn shutdown(&mut self, w: &World) {
+        // Panel flush can enqueue a final draft or an accepted user command
+        // immediately before the kernel retires this worker.
+        if self.account.is_none() { return; }
+        loop {
+            self.project(w, true).await;
+            let account = self.account.as_ref().expect("closing account");
+            if account.td.is_closed() && !account.td.has_updates() { break; }
+            tokio::select! {
+                () = account.td.ready() => {},
+                () = account.td.closed() => {},
+            }
+        }
+        super::trace::flush().await;
     }
 }
 
-#[cfg(test)]
-impl<T: Td + Send + 'static> Worker for TgWorker<T> {
-    fn name(&self) -> String {
-        ACCOUNT_ENTITY.to_string()
-    }
-
-    fn entity(&self) -> Option<String> {
-        Some(ACCOUNT_ENTITY.to_string())
-    }
-
-    /// This account's own jobs run on the thread holding its transport.
-    fn claims(&self, job: &Job) -> bool {
-        job.entity.as_deref() == Some(ACCOUNT_ENTITY)
-    }
-
-    /// The same bounded drain and backlog pacing as the native worker.
-    fn pass(&mut self, w: &World) -> Wake {
-        next_pass(self.account.drain(w))
+#[cfg(any(feature = "tdlib", test))]
+impl<T: Td> Account<T> {
+    async fn wait(&self, w: &World, wake: Wake) {
+        let rt = runtime::of(w.store());
+        tokio::select! {
+            _ = self.td.ready() => {},
+            _ = rt.ready() => {},
+            _ = async {
+                if let Wake::After(delay) = wake { tokio::time::sleep(delay).await; }
+                else { std::future::pending::<()>().await; }
+            } => {},
+        }
+        // A full receive queue must still let sibling services advance.
+        tokio::task::yield_now().await;
     }
 }
 

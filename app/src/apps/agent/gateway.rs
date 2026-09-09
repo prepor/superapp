@@ -15,6 +15,7 @@
 //! the same for OpenAI's wire; the real gateway connects them to
 //! `kernel::http` and `kernel::sse`.
 
+use futures_util::{Stream, StreamExt};
 use std::fmt;
 
 use super::wire::{Assembler, ChatRequest, Chunk, Completion};
@@ -62,6 +63,7 @@ impl fmt::Display for Failure {
 
 /// The model behind a chat. One implementation per world: the real gateway
 /// on a window's run, the scripted fake everywhere else.
+#[async_trait::async_trait(?Send)]
 pub trait Gateway {
     /// One model request, streamed. `on` is called per chunk as
     /// it arrives and answers whether to go on, which is how *stop* cuts a
@@ -74,10 +76,10 @@ pub trait Gateway {
     ///
     /// If the request never got through, if the gateway refused it, if the
     /// stream broke or said it failed, or if the caller stopped it.
-    fn complete(
+    async fn complete(
         &mut self,
         req: &ChatRequest,
-        on: &mut dyn FnMut(&Chunk) -> Flow,
+        on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
     ) -> Result<Completion, Failure>;
 }
 
@@ -207,12 +209,12 @@ fn log_payload() -> bool {
 /// gateway that answers HTML to a bad account should say so in the run's
 /// row), if a chunk carries the gateway's own error, if the caller stopped
 /// it, or if the assembled call's arguments are not JSON.
-pub fn stream_completion(
-    events: impl Iterator<Item = std::io::Result<String>>,
-    on: &mut dyn FnMut(&Chunk) -> Flow,
+pub async fn stream_completion(
+    mut events: impl Stream<Item = std::io::Result<String>> + Unpin,
+    on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
 ) -> Result<Completion, Failure> {
     let mut assembler = Assembler::new();
-    for event in events {
+    while let Some(event) = events.next().await {
         let event = event.map_err(|e| Failure::new(format!("the stream broke: {e}")))?;
         let data = event.trim();
         // The stream's own full stop, and the blank events around it.

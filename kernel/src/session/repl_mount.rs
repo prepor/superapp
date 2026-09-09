@@ -15,19 +15,55 @@ use crate::repl::{self, object::Object, r2};
 
 /// How device sync runs for this session.
 pub(super) enum Repl {
-    /// A driver thread of its own, over its own reader on the one writer.
-    Threads(repl::Driver),
+    /// A local asynchronous driver, with its own reader on the one writer.
+    Tasks(repl::Driver),
     /// Inline passes on the caller's thread, driven by the frame loop, so a
     /// scripted `wait` advances a handoff exactly the way it advances a
     /// background pass.
     Manual { bucket: Arc<dyn Object> },
+    Connecting(tokio::sync::oneshot::Receiver<Connected>),
 }
 
-/// Which of the two a session mounts. The shell decides: threads in
+pub(super) struct Connected {
+    driver: Option<repl::Driver>,
+    manual: Option<Arc<dyn Object>>,
+    error: Option<String>,
+}
+
+impl Repl {
+    /// The final release owns the mount. No UI reader or session borrow crosses
+    /// into this service, and the driver cannot acquire again after release.
+    pub(super) async fn shutdown(mut self, db: Arc<crate::store::Db>) {
+        loop {
+            match self {
+                Self::Connecting(receive) => {
+                    let Ok(done) = receive.await else { return; };
+                    let Some(next) = done.driver.map(Self::Tasks)
+                        .or_else(|| done.manual.map(|bucket| Self::Manual { bucket })) else { return; };
+                    self = next;
+                }
+                Self::Tasks(driver) => {
+                    driver.release_wait().await;
+                    driver.stop().await;
+                    return;
+                }
+                Self::Manual { bucket } => {
+                    match crate::store::Store::with_db(db) {
+                        Ok(store) => { let _ = repl::release(&store, &*bucket).await; }
+                        Err(error) => eprintln!("shutdown: cannot open device sync reader: {error}"),
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Which of the two a session mounts. The shell decides: tasks in
 /// production, inline under virtual time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMount {
-    Threads,
+    Tasks,
     Inline,
 }
 
@@ -65,6 +101,30 @@ impl Session {
             eprintln!("session: device sync was not mounted; the bucket is ignored");
             return;
         }
+        if let (Some((ReplMount::Tasks, notify)), Some(factory)) = (self.repl_mount.clone(), self.world.factory()) {
+            let url = url.to_owned();
+            let dir = self.store.dir().map(Path::to_path_buf);
+            let db = self.store.db();
+            self.store.set_writable(false);
+            self.lease = repl::Status { device: self.store.device(), ..repl::Status::default() };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.repl = Some(Repl::Connecting(rx));
+            crate::runtime::spawn_local(move || async move {
+                let opened = crate::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|e| e.to_string())?;
+                    world.caps(|caps| match caps.get::<dyn Secrets>() {
+                        Some(secrets) => r2::open(&url, dir.as_deref(), secrets),
+                        None => Err("this world has no Secrets".to_string()),
+                    })
+                }).await.unwrap_or_else(|e| Err(e.to_string()));
+                let bucket = opened.unwrap_or_else(|e| Arc::new(r2::Broken(e)));
+                let wake = notify.clone();
+                let driver = repl::spawn(db, bucket, move || wake());
+                let _ = tx.send(Connected { driver: Some(driver), manual: None, error: None });
+                notify();
+            });
+            return;
+        }
         let dir = self.store.dir().map(Path::to_path_buf);
         let opened = self.world.caps(|c| match c.get::<dyn Secrets>() {
             Some(s) => r2::open(url, dir.as_deref(), s),
@@ -91,8 +151,8 @@ impl Session {
         };
         self.repl = Some(match mount {
             ReplMount::Inline => Repl::Manual { bucket },
-            ReplMount::Threads => {
-                Repl::Threads(repl::spawn(self.store.db(), bucket, move || notify()))
+            ReplMount::Tasks => {
+                Repl::Tasks(repl::spawn(self.store.db(), bucket, move || notify()))
             }
         });
     }
@@ -107,13 +167,25 @@ impl Session {
     /// Runs (or reads) one sync pass and reconciles the result. Called on
     /// every driver signal and, under virtual time, from the frame loop.
     pub fn repl_poll(&mut self) -> ReplChange {
-        let status = match &self.repl {
-            Some(Repl::Threads(d)) => d.status(),
-            Some(Repl::Manual { bucket }) => {
-                let b = bucket.clone();
-                repl::poll(&self.store, &*b)
+        if let Some(Repl::Connecting(rx)) = &mut self.repl {
+            match rx.try_recv() {
+                Ok(done) => {
+                    self.repl = done.driver.map(Repl::Tasks).or_else(|| done.manual.map(|bucket| Repl::Manual { bucket }));
+                    if let Some(error) = done.error { self.notify(error, true); }
+                    else { self.seeded = false; }
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return ReplChange::default(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.repl = None;
+                    self.notify("device sync connection task failed", true);
+                    return ReplChange::default();
+                }
             }
-            None => return ReplChange::default(),
+        }
+        let status = match &self.repl {
+            Some(Repl::Tasks(d)) => d.status(),
+            Some(Repl::Manual { bucket }) => crate::runtime::block_on(repl::poll(&self.store, &**bucket)),
+            Some(Repl::Connecting(_)) | None => return ReplChange::default(),
         };
         self.apply_repl(status)
     }
@@ -147,54 +219,56 @@ impl Session {
     /// holder. Which of the two it is is the driver's to decide.
     pub fn repl_acquire(&mut self) {
         match &self.repl {
-            Some(Repl::Threads(d)) => d.acquire(),
+            Some(Repl::Tasks(d)) => d.acquire(),
             Some(Repl::Manual { bucket }) => {
                 let b = bucket.clone();
-                let s = repl::acquire(&self.store, &*b)
-                    .unwrap_or_else(|_| repl::poll(&self.store, &*b));
+                let s = match crate::runtime::block_on(repl::acquire(&self.store, &*b)) { Ok(s) => s, Err(_) => crate::runtime::block_on(repl::poll(&self.store, &*b)) };
                 self.apply_repl(s);
             }
-            None => {}
+            Some(Repl::Connecting(_)) | None => {}
         }
     }
 
     /// Publishes promptly after an action (or nudges the driver to).
     pub fn repl_kick(&mut self) {
         match &self.repl {
-            Some(Repl::Threads(d)) => d.kick(),
+            Some(Repl::Tasks(d)) => d.kick(),
             Some(Repl::Manual { bucket }) => {
                 let b = bucket.clone();
-                let s = repl::poll(&self.store, &*b);
+                let s = crate::runtime::block_on(repl::poll(&self.store, &*b));
                 self.apply_repl(s);
             }
-            None => {}
+            Some(Repl::Connecting(_)) | None => {}
         }
     }
 
     /// Hands the lease back (best effort).
     pub fn repl_release(&mut self) {
         match &self.repl {
-            Some(Repl::Threads(d)) => d.release(),
+            Some(Repl::Tasks(d)) => d.release(),
             Some(Repl::Manual { bucket }) => {
                 let b = bucket.clone();
-                let s = repl::release(&self.store, &*b)
-                    .unwrap_or_else(|_| repl::poll(&self.store, &*b));
+                let s = match crate::runtime::block_on(repl::release(&self.store, &*b)) { Ok(s) => s, Err(_) => crate::runtime::block_on(repl::poll(&self.store, &*b)) };
                 self.apply_repl(s);
             }
-            None => {}
+            Some(Repl::Connecting(_)) | None => {}
         }
     }
 
-    /// Releases synchronously on the calling thread — the last chance to
-    /// hand back, on close and on sleep.
-    pub fn repl_release_blocking(&self) {
+    /// Completes a pending connection and hands the lease back on shutdown.
+    pub async fn repl_release_wait(&mut self) {
+        if let Some(Repl::Connecting(rx)) = &mut self.repl {
+            if let Ok(done) = rx.await {
+                self.repl = done.driver.map(Repl::Tasks).or_else(|| done.manual.map(|bucket| Repl::Manual { bucket }));
+            }
+        }
         match &self.repl {
-            Some(Repl::Threads(d)) => d.release_blocking(),
+            Some(Repl::Tasks(d)) => d.release_wait().await,
             Some(Repl::Manual { bucket }) => {
                 let b = bucket.clone();
-                let _ = repl::release(&self.store, &*b);
+                let _ = repl::release(&self.store, &*b).await;
             }
-            None => {}
+            Some(Repl::Connecting(_)) | None => {}
         }
     }
 
@@ -209,65 +283,66 @@ impl Session {
     ///
     /// If there is no store file, the form is incomplete, the credentials
     /// cannot be found, or the file cannot be written.
-    pub fn connect_bucket(
-        &mut self,
-        url: &str,
-        key_id: &str,
-        secret: &str,
-    ) -> Result<String, String> {
-        let dir = self
-            .store
-            .dir()
-            .ok_or("no store file — device sync needs one")?
-            .to_path_buf();
-        if url.is_empty() {
-            return Err("the bucket url is required".into());
-        }
-        if url.starts_with("https://") && key_id.is_empty() {
-            return Err("an https bucket needs an access key id".into());
-        }
-        if !secret.is_empty() {
-            if key_id.is_empty() {
-                return Err("a secret needs the key id it belongs to".into());
+    pub fn connect_bucket(&mut self, url: &str, key_id: &str, secret: &str) -> Result<String, String> {
+        let dir = self.store.dir().ok_or("no store file — device sync needs one")?.to_owned();
+        if url.is_empty() { return Err("the bucket url is required".into()); }
+        if url.starts_with("https://") && key_id.is_empty() { return Err("an https bucket needs an access key id".into()); }
+        if !secret.is_empty() && key_id.is_empty() { return Err("a secret needs the key id it belongs to".into()); }
+        if matches!(self.repl, Some(Repl::Connecting(_))) { return Err("device sync is already connecting".into()); }
+        let factory = self.world.factory().ok_or("this world cannot open a background connection")?;
+        let (mount, notify) = self.repl_mount.clone().ok_or("device sync was not mounted")?;
+        let (url, key_id, secret) = (url.to_owned(), key_id.to_owned(), secret.to_owned());
+        let db = self.store.db();
+        let previous = self.repl.take();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.repl = Some(Repl::Connecting(rx));
+        crate::runtime::spawn_local(move || async move {
+            // Keychain, config files and world construction are native work.
+            let opened = crate::runtime::spawn_blocking(move || {
+                let world = factory.build().map_err(|e| e.to_string())?;
+                if !secret.is_empty() {
+                    world.run(&repl::BucketSecret { key_id: &key_id, secret: &secret })?;
+                }
+                world.caps(|caps| match caps.get::<dyn Secrets>() {
+                    Some(secrets) => r2::check(&url, Some(&dir), &key_id, secrets),
+                    None => Err("this world has no Secrets".to_string()),
+                })?;
+                world.run(&WriteFile { path: &r2::config_path(&dir), bytes: &r2::config_bytes(&url, &key_id) })?;
+                world.caps(|caps| match caps.get::<dyn Secrets>() {
+                    Some(secrets) => r2::open(&url, Some(&dir), secrets),
+                    None => Err("this world has no Secrets".to_string()),
+                })
+            }).await.unwrap_or_else(|e| Err(e.to_string()));
+            let mut done = Connected { driver: None, manual: None, error: None };
+            match opened {
+                Ok(bucket) => {
+                    match previous {
+                        Some(Repl::Tasks(driver)) => { driver.release_wait().await; driver.stop().await; }
+                        Some(Repl::Manual { bucket }) => {
+                            if let Ok(store) = crate::store::Store::with_db(db.clone()) { let _ = repl::release(&store, &*bucket).await; }
+                        }
+                        _ => {}
+                    }
+                    match mount {
+                        ReplMount::Tasks => {
+                            let wake = notify.clone();
+                            done.driver = Some(repl::spawn(db, bucket, move || wake()));
+                        }
+                        ReplMount::Inline => done.manual = Some(bucket),
+                    }
+                }
+                Err(error) => {
+                    done.error = Some(error);
+                    match previous {
+                        Some(Repl::Tasks(driver)) => done.driver = Some(driver),
+                        Some(Repl::Manual { bucket }) => done.manual = Some(bucket),
+                        _ => {}
+                    }
+                }
             }
-            // The secret goes first, because the check below has to be able
-            // to find it — and a key in the keychain that nothing points at
-            // is inert, which is not true of a written-down endpoint.
-            self.world
-                .run(&repl::BucketSecret { key_id, secret })
-                .map_err(|e| format!("storing the bucket secret failed: {e}"))?;
-        }
-        // Check *before* anything is written down: a typo that reaches the
-        // `bucket` file is what the next launch will read, and the launch
-        // after that.
-        self.world.caps(|c| match c.get::<dyn Secrets>() {
-            Some(s) => r2::check(url, Some(&dir), key_id, s),
-            None => Err("this world has no Secrets".to_string()),
-        })?;
-
-        self.world
-            .run(&WriteFile {
-                path: &r2::config_path(&dir),
-                bytes: &r2::config_bytes(url, key_id),
-            })
-            .map_err(|e| format!("writing the bucket file failed: {e}"))?;
-
-        // Hand the lease back before the old driver goes — the bucket it
-        // holds it in may not be the one we are moving to — and then *wait*
-        // for it. A dropped handle leaves a thread that is still a device.
-        if let Some(Repl::Threads(d)) = self.repl.take() {
-            d.release_blocking();
-            d.stop();
-        }
-        self.repl = None;
-        self.seeded = false;
-        self.start_repl(url);
-        let host = url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or(url);
-        Ok(format!("device sync: connecting to {host}"))
+            let _ = tx.send(done);
+            notify();
+        });
+        Ok("device sync: connecting".into())
     }
 }

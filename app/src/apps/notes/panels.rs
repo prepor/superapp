@@ -1,4 +1,9 @@
-use super::{file_text, file_text::editable, model};
+use super::{
+    file_text,
+    file_text::editable,
+    io::{self, Source},
+    model,
+};
 use kernel::caps::{basename, display_path, real_path};
 use kernel::effect::World;
 use kernel::layout::SlotId;
@@ -52,6 +57,19 @@ impl Panel for NoteList {
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
             "notes.new" => {
+                if s.store().ui_attached() {
+                    let slot = self.slot;
+                    model::create_async(s, move |s, id| {
+                        if let Some(id) = id {
+                            s.nav_within(Nav::Open {
+                                from: slot,
+                                id: Editor::note(id),
+                                fresh: false,
+                            });
+                        }
+                    });
+                    return;
+                }
                 if let Some(id) = model::create(s) {
                     s.nav_within(Nav::Open {
                         from: self.slot,
@@ -67,7 +85,10 @@ impl Panel for NoteList {
                 } else {
                     marked
                 };
-                if model::delete(s, ids) {
+                if s.store().ui_attached() {
+                    model::delete_async(s, ids);
+                    self.list.clear_marks();
+                } else if model::delete(s, ids) {
                     self.list.clear_marks();
                 }
             }
@@ -96,13 +117,6 @@ impl PanelKind for ListKind {
     }
 }
 
-#[derive(Clone)]
-enum Source {
-    Note(i64),
-    File(String),
-    Invalid,
-}
-
 pub struct Editor {
     id: PanelId,
     world: Rc<World>,
@@ -116,6 +130,13 @@ pub struct Editor {
     failed_autosave: bool,
     dirty: bool,
     observed: Vec<u64>,
+    io: Option<io::Handle>,
+    sequence: u64,
+    completed: u64,
+    loading: bool,
+    saving: Option<u64>,
+    baseline: String,
+    spans: Option<Vec<crate::shell::widgets::source_input::Span>>,
 }
 impl Editor {
     pub const TAG: Tag = Tag("editor");
@@ -145,7 +166,13 @@ impl Editor {
         self.dirty
     }
     pub fn status(&self) -> &str {
-        if !self.available {
+        if self.loading && !self.available {
+            "loading…"
+        } else if self.saving.is_some() {
+            "saving file…"
+        } else if self.io.is_some() && self.sequence > self.completed && !self.failed_autosave {
+            "saving…"
+        } else if !self.available {
             "unavailable"
         } else if self.failed_autosave {
             "not saved — retry by editing"
@@ -162,12 +189,18 @@ impl Editor {
             return;
         }
         self.text = text;
+        if let Some(io) = &self.io {
+            self.sequence += 1;
+            self.dirty = self.is_file() && self.text != self.baseline;
+            self.failed_autosave = false;
+            self.error.clear();
+            io.edit(self.sequence, self.text.clone(), self.world.now());
+            return;
+        }
         let body = self.bytes_text();
         self.dirty = self.is_file() && body != self.original;
         let result = match &self.source {
-            Source::Note(id) => {
-                model::edit(self.world.store(), *id, body, self.world.now())
-            }
+            Source::Note(id) => model::edit(self.world.store(), *id, body, self.world.now()),
             Source::File(path) => model::save_draft(
                 self.world.store(),
                 path.clone(),
@@ -186,7 +219,90 @@ impl Editor {
             .unwrap_or_default();
         self.observed = self.world.store().revision(&["notes_note", "notes_draft"]);
     }
+    pub fn background(&self) -> bool {
+        self.io.is_some()
+    }
+
+    pub fn take_spans(&mut self) -> Option<Vec<crate::shell::widgets::source_input::Span>> {
+        self.spans.take()
+    }
+
+    fn observe_io(&mut self) {
+        let state = self.io.as_mut().and_then(io::Handle::poll);
+        if let Some(state) = state {
+            self.loading = false;
+            let completed_save = self
+                .saving
+                .is_some_and(|sequence| state.save.sequence >= sequence);
+            if completed_save {
+                self.saving = None;
+            }
+            if state.sequence == self.sequence {
+                self.completed = state.sequence;
+                self.available = state.available;
+                self.failed_autosave = state.error.starts_with("could not autosave")
+                    || state.error.contains("draft cleanup failed");
+                self.error = state.error.clone();
+                if self.text != state.text {
+                    self.text = state.text.clone();
+                    self.revision += 1;
+                }
+                if self.original != state.original {
+                    self.original = state.original.clone();
+                }
+                if self.baseline != state.baseline {
+                    self.baseline = state.baseline.clone();
+                }
+                self.spans = Some(state.spans.clone());
+                self.dirty = self.is_file() && self.text != self.baseline;
+            } else if state.save.written {
+                if self.original != state.original {
+                    self.original = state.original.clone();
+                }
+                if self.baseline != state.baseline {
+                    self.baseline = state.baseline.clone();
+                }
+                self.dirty = self.text != self.baseline;
+            }
+            if completed_save && !state.save.error.is_empty() && self.error != state.save.error {
+                // A later successful autosave may be the only snapshot the
+                // UI sees. It must not hide an explicit file-save failure.
+                if !self.error.is_empty() {
+                    self.error.push('\n');
+                }
+                self.error.push_str(&state.save.error);
+            }
+            self.observed = self.world.store().revision(&["notes_note", "notes_draft"]);
+        }
+        // Register full context asynchronously without interpreting an empty
+        // loading snapshot as a deleted note or a missing file draft.
+        match &self.source {
+            Source::Note(id) => {
+                model::note_context(self.world.store(), *id, usize::from(self.available));
+            }
+            Source::File(path) => {
+                model::draft_context(self.world.store(), path, usize::from(self.dirty));
+            }
+            Source::Invalid => {}
+        }
+        let observed = self.world.store().revision(&["notes_note", "notes_draft"]);
+        if observed != self.observed
+            && self.completed == self.sequence
+            && !self.loading
+            && self.saving.is_none()
+            && !self.failed_autosave
+        {
+            self.observed = observed;
+            self.loading = true;
+            self.io.as_ref().unwrap().reload(self.sequence);
+        }
+    }
+
     pub fn observe(&mut self) {
+        if self.io.is_some() {
+            self.observe_io();
+            return;
+        }
         // Register the source on every draw for panel context. Cached Rc
         // results keep idle frames from cloning the document's strings.
         match &self.source {
@@ -243,6 +359,17 @@ impl Editor {
             return;
         };
         if !self.available || !self.dirty() {
+            return;
+        }
+        if let Some(io) = &self.io {
+            if self.saving.is_some() {
+                return;
+            }
+            self.sequence += 1;
+            self.saving = Some(self.sequence);
+            self.error.clear();
+            io.save(self.sequence, self.text.clone(), self.world.now());
+            s.redraw();
             return;
         }
         let path = path.clone();
@@ -343,26 +470,42 @@ impl PanelKind for EditorKind {
             }
             _ => Source::Invalid,
         };
-        let loaded = match &source {
-            Source::Note(id) => model::body(world.store(), *id)
-                .map(|body| model::Draft {
-                    original: body.clone(),
-                    body,
-                })
-                .ok_or_else(|| "this note is unavailable".into()),
-            Source::File(path) => model::draft(world.store(), path)
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    world
-                        .run(&model::ReadFile(path.clone()))
-                        .map(|body| model::Draft {
-                            original: body.clone(),
-                            body,
+        let io = world
+            .store()
+            .ui_attached()
+            .then(|| world.factory())
+            .flatten()
+            .map(|factory| io::Handle::start(factory, world.store().db(), source.clone()));
+        let loading = io.is_some();
+        let loaded = if loading {
+            Ok(model::Draft {
+                original: String::new(),
+                body: String::new(),
+            })
+        } else {
+            match &source {
+                Source::Note(id) => model::body(world.store(), *id)
+                    .map(|body| model::Draft {
+                        original: body.clone(),
+                        body,
+                    })
+                    .ok_or_else(|| "this note is unavailable".into()),
+                Source::File(path) => {
+                    model::draft(world.store(), path)
+                        .map(Ok)
+                        .unwrap_or_else(|| {
+                            world
+                                .run(&model::ReadFile(path.clone()))
+                                .map(|body| model::Draft {
+                                    original: body.clone(),
+                                    body,
+                                })
                         })
-                }),
-            Source::Invalid => Err("invalid editor address".into()),
+                }
+                Source::Invalid => Err("invalid editor address".into()),
+            }
         };
-        let available = loaded.is_ok();
+        let available = loaded.is_ok() && !loading;
         let error = loaded.as_ref().err().cloned().unwrap_or_default();
         let draft = loaded.unwrap_or(model::Draft {
             original: String::new(),
@@ -387,6 +530,13 @@ impl PanelKind for EditorKind {
             failed_autosave: false,
             dirty,
             observed,
+            io,
+            sequence: 0,
+            completed: 0,
+            loading,
+            saving: None,
+            baseline: String::new(),
+            spans: None,
         })
     }
 }

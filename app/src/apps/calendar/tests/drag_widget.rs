@@ -3,6 +3,7 @@
 use super::*;
 use std::cell::Cell;
 
+#[cfg(headless)]
 pub fn exercise(s: &mut Session, slot: kernel::layout::SlotId, q: &availability::Query) {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     let (sheet, track) = cx.with_vm(|vm| {
@@ -157,10 +158,34 @@ pub fn exercise(s: &mut Session, slot: kernel::layout::SlotId, q: &availability:
 
 /// Execute widget layout and draw-list construction directly. There is no OS
 /// initialization, event loop, window or rendering backend.
+#[cfg(headless)]
 pub fn draw_panels(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId) {
+    draw_panels_case(s, editor, sheet, None);
+}
+
+pub fn refresh_during_drag(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId) {
+    draw_panels_case(s, editor, sheet, Some(DrawCase::Refresh));
+}
+
+pub fn hover_during_motion(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId) {
+    draw_panels_case(s, editor, sheet, Some(DrawCase::Hover));
+}
+
+#[derive(Clone, Copy)]
+enum DrawCase { Refresh, Hover }
+
+fn draw_panels_case(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId, case: Option<DrawCase>) {
+    // Participant labels come from the same stored directory the real widget
+    // reads. Keep the long-label/wrapping coverage after its async migration.
+    s.store().write(|tx| tx.execute(
+        "UPDATE calendar_event SET raw=json_set(raw,'$.organizer',json_object('email','nora@studio.example','displayName',?1))",
+        ["Nora with a long display name that wraps the overlap warning onto another line"],
+    )).unwrap();
     use makepad_widgets::makepad_platform::makepad_error_log::{self, LogLevel};
     use std::sync::Mutex;
+    static DRAW_TAP: Mutex<()> = Mutex::new(());
     static ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let _draw_tap = DRAW_TAP.lock().unwrap_or_else(|error| error.into_inner());
     fn capture(message: &str, _: LogLevel) {
         if message.contains("get_rect called on instance_count") {
             let mut errors = ERRORS.lock().unwrap();
@@ -283,14 +308,212 @@ pub fn draw_panels(s: &mut Session, editor: kernel::layout::SlotId, sheet: kerne
             );
         }
     }
-    widgets[1]
-        .borrow_mut::<CalendarAvailabilityPanel>()
-        .unwrap()
-        .directory = vec![Suggestion::labeled(
-        "Nora with a long display name that wraps the overlap warning onto another line",
-        "nora@studio.example",
-    )];
     let (window_id, button) = (WindowId(0, 0), MouseButton::PRIMARY);
+    if matches!(case, Some(DrawCase::Hover)) {
+        let tracks = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().tracks.clone();
+        let (track, _) = tracks.first().expect("own calendar track is drawn");
+        let old_query = track.borrow::<CalendarTimeTrack>().unwrap().track.query.clone().unwrap();
+        let (request, events) = {
+            let mut panel = props[1].panel.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            (panel.request, panel.preview(s.now()).unwrap().result.people.iter()
+                .flat_map(|person| &person.details.events).cloned().collect::<Vec<_>>())
+        };
+        let (notify, woke) = std::sync::mpsc::channel();
+        s.store().attach_ui(move || { let _ = notify.send(()); });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // First finish the participant refresh caused by establishing the
+        // native reader's baseline. Hover then runs with native async policy.
+        loop {
+            s.store().poll_external();
+            redraw(&mut cx, s, size);
+            let query = track.borrow::<CalendarTimeTrack>().unwrap().track.query.clone().unwrap();
+            if !Arc::ptr_eq(&query, &old_query) { break; }
+            assert!(std::time::Instant::now() < deadline, "native participant snapshot completed");
+            woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }
+        let (rect, query) = {
+            let track = track.borrow::<CalendarTimeTrack>().unwrap();
+            (form::drawn_rect(&cx, track.area()).unwrap(), track.track.query.clone().unwrap())
+        };
+        let first = events.iter().find(|event| event.title == "Planning").unwrap();
+        let second = events.iter().find(|event| event.title == "Afternoon check-in").unwrap();
+        let (start, end) = query.validate().unwrap();
+        let point = |at| rect.pos + dvec2((at - start) / (end - start) * rect.size.x, rect.size.y / 2.0);
+        let motion = |cx: &mut Cx, s: &mut Session, at: DVec2, time| {
+            s.store().trace_begin(9003);
+            send(cx, s, Event::MouseMove(MouseMoveEvent {
+                abs: at, lock_delta: Default::default(), window_id,
+                modifiers: Default::default(), time, handled: Cell::default(),
+            }));
+            s.store().trace_end();
+            assert!(s.store().trace_of(9003).is_empty(), "hover input must not query the store");
+            // Event routing above owns the widgets. The no-op Cx handler lets
+            // the public platform dispatcher finish its normal hover cycle,
+            // so subsequent moves produce HoverOver and finally HoverOut.
+            use makepad_widgets::makepad_platform::studio::{RemoteMouseMove, StudioToApp};
+            cx.dispatch_studio_msg(StudioToApp::MouseMove(RemoteMouseMove {
+                x: at.x, y: at.y, time, ..Default::default()
+            }), window_id, DVec2::default());
+        };
+        let painted = |cx: &Cx| {
+            let panel = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap();
+            let area = panel.tooltip.area();
+            (area.redraw_id() == Some(cx.redraw_id) && form::drawn_rect(cx, area).is_some())
+                .then(|| panel.tooltip.label(cx, ids!(body_lbl)).text())
+        };
+        let pos = point(first.start + (first.end - first.start) / 2.0);
+        motion(&mut cx, s, pos, 0.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut expected = loop {
+            redraw(&mut cx, s, size);
+            if let Some(text) = painted(&cx) { break text; }
+            assert!(std::time::Instant::now() < deadline, "first hover details completed");
+            woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            s.store().poll_external();
+        };
+        assert!(expected.contains("Planning") && !expected.contains("Afternoon check-in"));
+        s.take_dirty();
+        for i in 1..120 {
+            let at = first.start + (first.end - first.start) * f64::from(i) / 120.0;
+            motion(&mut cx, s, point(at), f64::from(i) / 60.0);
+            redraw(&mut cx, s, size);
+            assert_eq!(painted(&cx).as_deref(), Some(expected.as_str()),
+                "moving inside one event must paint the same tooltip on every frame (move {i})");
+        }
+        assert!(!s.take_dirty().any(), "hover stays local to the scheduling widget");
+        // Event enrichment arriving under a stationary pointer replaces the
+        // details in place; the old content remains painted during preparation.
+        s.store().write(move |tx| {
+            let raw: String = tx.query_row("SELECT response FROM calendar_availability WHERE id=?1", [request], |row| row.get(0))?;
+            let mut result: availability::ResultSet = serde_json::from_str(&raw).unwrap();
+            for person in &mut result.people {
+                for event in &mut person.details.events {
+                    if event.title == "Planning" { event.title = "Planning updated".into(); }
+                }
+            }
+            tx.execute("UPDATE calendar_availability SET response=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&result).unwrap(), request])?;
+            Ok(())
+        }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            redraw(&mut cx, s, size);
+            let text = painted(&cx).expect("refresh under the pointer must keep the tooltip painted");
+            if text.contains("Planning updated") { expected = text; break; }
+            assert_eq!(text, expected, "only the old or the refreshed event may appear");
+            assert!(std::time::Instant::now() < deadline, "updated hover details completed");
+            woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            s.store().poll_external();
+        }
+        motion(&mut cx, s, point(second.start + 60.0), 3.0);
+        redraw(&mut cx, s, size);
+        let text = painted(&cx).expect("entering a different event paints its ready details immediately");
+        assert!(text.contains("Afternoon check-in") && !text.contains("Planning"));
+        motion(&mut cx, s, point(second.end + 60.0), 4.0);
+        redraw(&mut cx, s, size);
+        assert!(painted(&cx).is_none(), "free time has no event tooltip");
+        motion(&mut cx, s, pos, 5.0);
+        redraw(&mut cx, s, size);
+        assert_eq!(painted(&cx).as_deref(), Some(expected.as_str()));
+        motion(&mut cx, s, rect.pos - dvec2(2.0, 2.0), 6.0);
+        redraw(&mut cx, s, size);
+        assert!(widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().hover.is_none(), "mouse-out clears hover");
+        assert!(painted(&cx).is_none(), "mouse-out does not leave the old tooltip painted");
+        assert!(!cx.fingers.any_areas_captured());
+    } else if matches!(case, Some(DrawCase::Refresh)) {
+        let tracks = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().tracks.clone();
+        assert_eq!(tracks.len(), 2, "warm both participant tracks before attaching async I/O");
+        let identities: Vec<_> = tracks.iter().map(|(track, _)| track.widget_uid()).collect();
+        let (track, rect) = &tracks[0];
+        let query = track.borrow::<CalendarTimeTrack>().unwrap().track.query.clone().unwrap();
+        let proposed = track.borrow::<CalendarTimeTrack>().unwrap().track.proposed.unwrap();
+        let old_preview = props[1].panel.borrow_mut().as_any().downcast_mut::<panels::Availability>()
+            .unwrap().preview(s.now()).unwrap();
+        let mut pos = rect.pos + dvec2((proposed.0 + proposed.1) / 2.0 * rect.size.x, rect.size.y / 2.0);
+        cx.fingers.mouse_down(button, window_id);
+        send(&mut cx, s, Event::MouseDown(MouseDownEvent {
+            abs: pos, button, window_id, modifiers: Default::default(), handled: Cell::default(), time: 0.0,
+        }));
+        assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_some());
+        assert!(cx.fingers.is_area_captured(track.area()));
+        let mut selected = props[1].panel.borrow_mut().as_any().downcast_mut::<panels::Availability>().unwrap().selected;
+        assert!(selected.is_some());
+
+        let (notify, woke) = std::sync::mpsc::channel();
+        s.store().attach_ui(move || { let _ = notify.send(()); });
+        // Attaching a native reader establishes its foreign-commit baseline
+        // once. Consume that invalidation before measuring later writes.
+        while s.store().query_revision() == 0 {
+            woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            s.store().poll_external();
+        }
+        let before = s.store().revision(&["calendar_source"]);
+        s.store().write(|tx| tx.execute("UPDATE calendar_source SET checked=COALESCE(checked,0)+1", [])).unwrap();
+        assert_ne!(s.store().revision(&["calendar_source"]), before);
+        let edits = s.store().revision(&["calendar_draft", "calendar_change"]);
+        let intact = |cx: &Cx, s: &Session, selected| {
+            let current = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().tracks.clone();
+            assert_eq!(current.iter().map(|(track, _)| track.widget_uid()).collect::<Vec<_>>(), identities,
+                "a data-only refresh must keep the visible track widgets");
+            for ((track, _), (_, rect)) in current.iter().zip(&tracks) {
+                assert!(track.visible());
+                assert_eq!(form::drawn_rect(cx, track.area()), Some(*rect), "refresh must not move tracks");
+                assert!(track.area().is_valid(cx));
+            }
+            assert!(cx.fingers.is_area_captured(track.area()), "the current track area retains pointer capture");
+            assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_some());
+            let mut panel = props[1].panel.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            assert_eq!(panel.selected, selected, "background refresh must not reset the current proposal");
+            assert_eq!(panel.search, availability::Search::from_query(&query));
+            assert_eq!(s.store().revision(&["calendar_draft", "calendar_change"]), edits);
+        };
+        // The first async get returns pending even if its task finishes quickly.
+        // This is the frame that used to erase the tracks and their capture.
+        redraw(&mut cx, s, size);
+        intact(&cx, s, selected);
+        pos.x += rect.size.x / 16.0;
+        let expected = availability::snap(&query, track.borrow::<CalendarTimeTrack>().unwrap()
+            .drag.as_ref().unwrap().1.at(pos.x), s.now()).unwrap();
+        assert_ne!(Some(expected), selected);
+        send(&mut cx, s, Event::MouseMove(MouseMoveEvent {
+            abs: pos, lock_delta: dvec2(0.0, 0.0), window_id, modifiers: Default::default(),
+            time: 0.5, handled: Cell::default(),
+        }));
+        selected = Some(expected);
+        redraw(&mut cx, s, size);
+        intact(&cx, s, selected);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "background tracks completed");
+            woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            s.store().poll_external();
+            redraw(&mut cx, s, size);
+            intact(&cx, s, selected);
+            let preview = props[1].panel.borrow_mut().as_any().downcast_mut::<panels::Availability>()
+                .unwrap().preview(s.now()).unwrap();
+            let current_query = track.borrow::<CalendarTimeTrack>().unwrap().track.query.clone().unwrap();
+            if !Arc::ptr_eq(&preview, &old_preview) && !Arc::ptr_eq(&current_query, &query) { break; }
+        }
+        // Continue the same gesture after publication, without another press.
+        pos.x += rect.size.x / 8.0;
+        let expected = availability::snap(&query, track.borrow::<CalendarTimeTrack>().unwrap()
+            .drag.as_ref().unwrap().1.at(pos.x), s.now()).unwrap();
+        assert_ne!(Some(expected), selected);
+        send(&mut cx, s, Event::MouseMove(MouseMoveEvent {
+            abs: pos, lock_delta: dvec2(0.0, 0.0), window_id, modifiers: Default::default(),
+            time: 1.0, handled: Cell::default(),
+        }));
+        redraw(&mut cx, s, size);
+        intact(&cx, s, Some(expected));
+        send(&mut cx, s, Event::MouseUp(MouseUpEvent {
+            abs: pos, button, window_id, modifiers: Default::default(), time: 2.0,
+        }));
+        cx.fingers.mouse_up(button);
+        assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_none());
+        assert!(!cx.fingers.any_areas_captured());
+    } else {
     for (minutes, width) in [("30", 1200.0), ("60", 960.0), ("90", 1200.0)] {
         let size = dvec2(width, size.y);
         {
@@ -400,6 +623,7 @@ pub fn draw_panels(s: &mut Session, editor: kernel::layout::SlotId, sheet: kerne
             s.store().revision(&["calendar_draft", "calendar_change"]),
             revision
         );
+    }
     }
     timings.sort();
     eprintln!(

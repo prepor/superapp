@@ -58,6 +58,18 @@ guests and optional guests, location, notes, Meet, recurrence, visibility,
 busy/free, reminders, guest permissions, and whether to notify guests. Tab and
 Shift-Tab move among fields and reveal the focused field when necessary.
 
+Calendar, Show as, and Visibility open choice menus. Use the pointer or arrow
+keys to browse, Enter to choose, and Escape to dismiss without changing the
+draft. Calendar choices include writable calendars; an existing event keeps
+its original calendar.
+
+Draft preparation and saves run in the background. Typing stays visible while
+the writer is busy; consecutive pending saves keep the newest form. Saving to
+Google waits for those local saves before submitting the reviewed revision.
+Accepted saves continue after the editor closes and drain during shutdown.
+Tools use the same prepared transactions, including a final check of the
+draft revision, event ETag and calendar permissions before the write commits.
+
 Guests autocomplete by name or email using cached event guests and organizers,
 non-spam Mail correspondents, and connected account addresses. Suggestions omit
 people already invited and preserve the `?` prefix for optional guests. Choose
@@ -89,9 +101,14 @@ preserved. Edits use PATCH so provider fields the editor does not expose survive
 
 **save event** queues the reviewed draft revision. Local draft, saving, saved,
 and failed states are distinct. A queued operation is not reported as complete
-until Google accepts it. Conflicts keep the draft and report the changed event;
-ambiguous failures offer retry using the same operation identity. The Problems
-panel also exposes failed changes and synchronization failures.
+until Google accepts it. Conflicts keep the draft and offer **review latest**;
+the rejected version cannot be edited or blindly retried. Reviewing opens the
+current event so a new change can be made deliberately. **Dismiss error** clears
+a rejected conflict locally and preserves its draft and operation history.
+Ambiguous failures offer retry using the same operation identity. The Problems
+panel also exposes failed changes and synchronization failures. When a later
+reviewed deletion of the same occurrence succeeds, obsolete deletion conflicts
+are retired automatically, including ones left by an earlier app version.
 
 Local draft edits participate in undo. Submitted Google changes cannot be
 recalled by workspace history; making a further change requires an explicit
@@ -185,6 +202,12 @@ use it as a deterministic Google event ID; retries recover an accepted request
 whose response was lost. Updates use ETags and an operation marker, and reject
 unreviewed changes. Following-series edits persist the split identity so retry
 can finish a partial split without creating another replacement series.
+An operation retains uncertainty across retries and process restarts: a later
+ETag rejection cannot prove an earlier request was unapplied. These operations
+remain visible and keep their original retry identity. A rejected preflight
+publishes the event version it fetched to the local cache immediately, without
+waiting for a complete calendar refresh. Conflict recovery and history cleanup
+run through the background worker and serialized SQLite writer.
 Tokens stay outside the store, transport rejects redirects, and failures do not
 copy token-bearing requests or provider response bodies into panel context.
 
@@ -220,6 +243,21 @@ writes are not a substitute for a successful Google operation.
 The registered tags are `calendar`, `calendar-month`, `calendar-event`,
 `calendar-edit`, `calendar-availability`, and `calendar-sources`. Timeline and month
 are launcher roots. The panel library includes native scenes.
+
+Event details, draft forms, availability candidates, participant tracks and hover
+details load through explicit background snapshots. Each snapshot permits one
+preparation at a time and discards superseded results; loading data never looks
+like a missing draft or an empty checked schedule. Parsing, sanitizing event
+HTML, resolving names and calculating candidate times happen outside the UI
+thread. Pointer movement shares prepared interval arrays and checks conflicts
+with a binary search. Guest completion filters background SQL results to eight
+suggestions per source and refreshes the unchanged caret when they arrive.
+Source metadata and synchronization status use their own snapshots. Timeline
+and month views wait for the source timezone instead of treating loading as
+an empty calendar list. The month worker prepares counts and at most three
+entries for each of the 42 displayed days; redraws never clone or scan the
+full cached month. Retrying a draft resolves its latest operation inside the
+SQLite transaction.
 
 The deterministic fake supplies recurrence expansion, ETags, CRUD, Meet and
 permission-dependent free/busy. Unit tests cover the write queue, recurring

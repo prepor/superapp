@@ -10,16 +10,15 @@
 use std::any::Any;
 use std::rc::Rc;
 
-use kernel::history::Intent;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::session::{Action, Session};
+use kernel::session::{Edit, Session};
 use kernel::store::Store;
 
 use super::AddAccount;
 use crate::identity::accounts::{self, Account};
-use crate::identity::history::{AccountAdded, AccountRemoved};
+use crate::identity::history::AccountRemoved;
 
 /// The letter the *add account* link wears. The `d` of "add", because `a` is
 /// what every list's *archive* wears and `s` is *sync*.
@@ -31,6 +30,14 @@ pub struct Settings {
     store: Rc<Store>,
     slot: SlotId,
     pub confirming: Option<i64>,
+}
+
+enum ServiceChange {
+    Consent,
+    Changed {
+        before: (bool, bool),
+        after: (bool, bool),
+    },
 }
 
 impl Settings {
@@ -52,57 +59,60 @@ impl Settings {
         accounts::accounts(&self.store)
     }
 
-    /// Removes one account and everything it brought.
-    ///
-    /// Undo cannot bring the mail back and says so ([`AccountRemoved`] is
-    /// blocked): the row goes, its folders and letters go with it, and the
-    /// worker that was syncing them retires on the kick this action ends
-    /// with. Called by the widget, which knows which row was pressed.
+    /// Validates current grants and pending writes in the committing transaction.
     pub fn service(&mut self, s: &mut Session, id: i64, calendar: bool) {
-        let (mail, cal, scopes) = crate::identity::services(s.store().conn(), id);
-        let enabled = if calendar { cal } else { mail };
-        let google = self.accounts().iter().any(|a| a.id == id && a.oauth());
-        let needed = crate::identity::required_scopes(!calendar, calendar);
-        if !enabled
-            && (calendar || google)
-            && needed
-                .split_whitespace()
-                .filter(|scope| scope.starts_with("https://"))
-                .any(|scope| !scopes.split_whitespace().any(|held| held == scope))
-        {
-            s.nav_within(Nav::Open {
-                from: self.slot,
-                id: AddAccount::for_service(id, calendar),
-                fresh: false,
-            });
-            return;
-        }
-        if let Err(e) = crate::identity::pending(s.store().conn(), id) {
-            s.notify(e, true);
-            return;
-        }
-        let done = s.act(Action::writing(
-            "accounts.service",
-            "change account services",
-            move |c| {
-                crate::identity::set_services(
-                    c,
-                    id,
+        let slot = self.slot;
+        s.act_async(
+            Edit::writing("accounts.service", "change account services", move |tx| {
+                let (mail, cal, scopes, auth): (bool, bool, String, Option<String>) = tx
+                    .query_row(
+                        "SELECT mail_enabled,calendar_enabled,scopes,auth FROM account WHERE id=?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?;
+                let enabled = if calendar { cal } else { mail };
+                let google = auth.as_deref() == Some(crate::identity::oauth::GOOGLE.name);
+                let needed = crate::identity::required_scopes(!calendar, calendar);
+                if !enabled
+                    && (calendar || google)
+                    && needed
+                        .split_whitespace()
+                        .filter(|scope| scope.starts_with("https://"))
+                        .any(|scope| !scopes.split_whitespace().any(|held| held == scope))
+                {
+                    return Ok(Ok(ServiceChange::Consent));
+                }
+                if let Err(error) = crate::identity::pending(tx, id) {
+                    return Ok(Err(error));
+                }
+                let after = (
                     if calendar { mail } else { !mail },
                     if calendar { !cal } else { cal },
-                )
+                );
+                crate::identity::set_services(tx, id, after.0, after.1)?;
+                Ok(Ok(ServiceChange::Changed {
+                    before: (mail, cal),
+                    after,
+                }))
+            })
+            .record_if(|done| matches!(done, Ok(ServiceChange::Changed { .. }))),
+            move |s, done| match done {
+                Some(Ok(ServiceChange::Consent)) => s.nav_within(Nav::Open {
+                    from: slot,
+                    id: AddAccount::for_service(id, calendar),
+                    fresh: false,
+                }),
+                Some(Ok(ServiceChange::Changed { before, after })) => {
+                    s.claim(Box::new(crate::identity::ServicesChanged {
+                        account: id,
+                        before,
+                        after,
+                    }))
+                }
+                Some(Err(error)) => s.notify(error, true),
+                None => {}
             },
-        ));
-        if done.is_some() {
-            s.claim(Box::new(crate::identity::ServicesChanged {
-                account: id,
-                before: (mail, cal),
-                after: (
-                    if calendar { mail } else { !mail },
-                    if calendar { !cal } else { cal },
-                ),
-            }));
-        }
+        );
     }
     pub fn reconnect(&mut self, s: &mut Session, id: i64) {
         s.nav_within(Nav::Open {
@@ -120,67 +130,44 @@ impl Settings {
             s.redraw();
         }
     }
+    /// Removes the account only after pending protocol writes have settled.
     pub fn remove(&mut self, s: &mut Session, id: i64) {
-        if let Err(e) = crate::identity::pending(s.store().conn(), id) {
-            s.notify(e, true);
-            return;
-        }
-        let Some(a) = self.accounts().iter().find(|a| a.id == id).cloned() else {
+        let Some(account) = self
+            .accounts()
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+        else {
             return;
         };
         let now = s.now();
-        let email = a.email.clone();
-        let done = s.act(
-            Action::writing("account", format!("remove account {email}"), move |tx| {
-                accounts::remove_account_tx(tx, id, now)
-            })
-            .about(format!("account:{id}"))
-            .claiming(vec![Box::new(AccountRemoved {
-                email: a.email.clone(),
-            }) as Box<dyn Intent>]),
-        );
-        if done.is_some() {
-            s.notify(format!("{email} removed"), false);
-        }
-    }
-
-    /// Files an account row as an undoable action and claims the intent. The
-    /// new row's id comes back from `act`, so the claim needs no shared cell.
-    ///
-    /// Both doors come through here — the password form and the end of a
-    /// Gmail sign-in — because what differs between them is one word.
-    /// Answers the new row's id, or zero when the write was refused.
-    pub fn add(s: &mut Session, email: &str, imap: &str, smtp: &str, auth: &str) -> i64 {
-        let (e, i, sm, au) = (
-            email.to_string(),
-            imap.to_string(),
-            smtp.to_string(),
-            auth.to_string(),
-        );
-        let id = s
-            .act(Action::writing(
+        s.act_async(
+            Edit::writing(
                 "account",
-                format!("add account {email}"),
-                move |tx| accounts::add_account_tx(tx, &e, &i, &sm, &au),
-            ))
-            .unwrap_or(0);
-        if id == 0 {
-            return 0;
-        }
-        // The claim needs the row id the write answered with, so it is added
-        // to the head node after the fact.
-        s.claim(Box::new(AccountAdded {
-            id,
-            email: email.to_string(),
-            imap: imap.to_string(),
-            smtp: smtp.to_string(),
-            auth: auth.to_string(),
-            services: std::sync::Mutex::new(None),
-        }));
-        // A new account is a new sync pass; the kernel re-asks the apps for
-        // the set after every action, so this only has to have happened
-        // inside one.
-        id
+                format!("remove account {}", account.email),
+                move |tx| {
+                    if let Err(error) = crate::identity::pending(tx, id) {
+                        return Ok(Err(error));
+                    }
+                    let email: String =
+                        tx.query_row("SELECT email FROM account WHERE id=?", [id], |r| r.get(0))?;
+                    accounts::remove_account_tx(tx, id, now)?;
+                    Ok(Ok(email))
+                },
+            )
+            .about(format!("account:{id}"))
+            .record_if(Result::is_ok),
+            move |s, done| match done {
+                Some(Ok(email)) => {
+                    s.claim(Box::new(AccountRemoved {
+                        email: email.clone(),
+                    }));
+                    s.notify(format!("{email} removed"), false);
+                }
+                Some(Err(error)) => s.notify(error, true),
+                None => {}
+            },
+        );
     }
 }
 

@@ -156,7 +156,9 @@ fn file() -> serde_json::Value {
 
 #[test]
 fn an_agent_reads_a_remote_pdf_through_the_cache_without_exporting_or_marking_read() {
-    use std::task::Poll;
+    use futures_util::FutureExt;
+    let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = timer.enter();
     let t = DownloadTest::new();
     // The message metadata exists on this device, but the file has never
     // been downloaded and no Telegram panel is open.
@@ -166,9 +168,9 @@ fn an_agent_reads_a_remote_pdf_through_the_cache_without_exporting_or_marking_re
     assert!(!tool.writes && !tool.asks);
     let input = json!({"chat": 7, "message": 42});
     tool.check(&input).unwrap();
-    let mut read = (tool.reader.unwrap())(&input);
-    assert!(read(&t.w).is_pending());
-    assert!(read(&t.w).is_pending(), "polling does not enqueue another request");
+    let mut read = (tool.reader.unwrap())(&input)(&t.w);
+    assert!(read.as_mut().now_or_never().is_none());
+    assert!(read.as_mut().now_or_never().is_none(), "polling does not enqueue another request");
     t.acc.drain(&t.w);
     let source = last_request(&t.td, "getMessage");
     assert_eq!(source["@extra"]["context"], "cache:7:42");
@@ -176,43 +178,45 @@ fn an_agent_reads_a_remote_pdf_through_the_cache_without_exporting_or_marking_re
     let transfer = last_request(&t.td, "downloadFile");
     assert_eq!(transfer["@extra"], source["@extra"]);
     assert_eq!(transfer["file_id"], 77);
-    assert!(read(&t.w).is_pending());
+    assert!(read.as_mut().now_or_never().is_none());
     let completed = t.complete(&transfer);
     let bytes = crate::reader::document::test_pdf("A Telegram PDF for the agent.");
     std::fs::write(completed["local"]["path"].as_str().unwrap(), &bytes).unwrap();
     t.acc.on_update(&t.w, &completed.to_string());
     t.w.store().poll_external();
     assert_eq!(t.op(&source).status, Status::Done);
-    let Poll::Ready(Ok(result)) = read(&t.w) else { panic!("downloaded PDF must be readable"); };
+    let result = timer.block_on(read).expect("downloaded PDF must be readable");
     assert_eq!(result["name"], "letter.pdf");
     assert!(result["text"].as_str().unwrap().contains("A Telegram PDF for the agent."));
     assert!(!t.dir.join("Downloads").exists(), "agent reads leave Downloads alone");
     assert!(t.td.sent().iter().all(|r| !r.contains("viewMessages")));
     runtime::of(t.w.store()).disconnect();
-    let mut cached = (tool.reader.unwrap())(&input);
-    assert_eq!(cached(&t.w), Poll::Ready(Ok(result)), "cached files work offline");
+    let cached = (tool.reader.unwrap())(&input)(&t.w);
+    assert_eq!(timer.block_on(cached), Ok(result), "cached files work offline");
 }
 
 #[test]
 fn agent_file_reads_report_download_errors_and_refuse_missing_or_oversized_sources() {
-    use std::task::Poll;
+    use futures_util::FutureExt;
+    let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = timer.enter();
     let t = DownloadTest::new();
     t.acc.on_new_message(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
         "content": {"@type": "messageDocument", "document": {"file_name": "letter.pdf", "document": file()}}}));
     let tool = crate::apps::telegram::tools::all().into_iter().find(|t| t.name == "telegram.file").unwrap();
-    let mut missing = (tool.reader.unwrap())(&json!({"chat": 8, "message": 42}));
-    assert!(matches!(missing(&t.w), Poll::Ready(Err(_))), "ids are scoped to their chat");
-    let mut read = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}));
-    assert!(read(&t.w).is_pending());
+    let missing = (tool.reader.unwrap())(&json!({"chat": 8, "message": 42}))(&t.w);
+    assert!(timer.block_on(missing).is_err(), "ids are scoped to their chat");
+    let mut read = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}))(&t.w);
+    assert!(read.as_mut().now_or_never().is_none());
     t.acc.drain(&t.w);
     let source = last_request(&t.td, "getMessage");
     t.acc.on_update(&t.w, &json!({"@type": "error", "code": 404,
         "message": "message was deleted", "@extra": source["@extra"]}).to_string());
-    let Poll::Ready(Err(error)) = read(&t.w) else { panic!("download error must reach the agent"); };
+    let error = timer.block_on(read).expect_err("download error must reach the agent");
     assert!(error.contains("deleted"));
 
-    let mut retry = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}));
-    assert!(retry(&t.w).is_pending());
+    let mut retry = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}))(&t.w);
+    assert!(retry.as_mut().now_or_never().is_none());
     t.acc.drain(&t.w);
     let source = last_request(&t.td, "getMessage");
     let mut large = file();
@@ -220,7 +224,7 @@ fn agent_file_reads_report_download_errors_and_refuse_missing_or_oversized_sourc
     t.acc.on_update(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
         "@extra": source["@extra"], "content": {"@type": "messageDocument",
             "document": {"file_name": "large.pdf", "document": large}}}).to_string());
-    let Poll::Ready(Err(error)) = retry(&t.w) else { panic!("oversized source must fail"); };
+    let error = timer.block_on(retry).expect_err("oversized source must fail");
     assert!(error.contains("32 MiB"));
     assert!(t.td.sent().iter().all(|r| !r.contains("downloadFile")));
 }

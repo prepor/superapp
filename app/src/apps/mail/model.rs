@@ -238,6 +238,12 @@ static Q_MAIL: Q = Q {
     describe: "one mail, both readings included, with the line it was addressed to",
 };
 
+static Q_MAIL_HEAD: Q = Q {
+    id: "mail heading",
+    sql: "SELECT id,from_name,from_email,subject,date,unread FROM message WHERE id=?1",
+    describe: "one mail's heading without loading its bodies",
+};
+
 static Q_THREAD: Q = Q {
     id: "thread",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
@@ -390,6 +396,11 @@ pub fn mail(store: &Store, id: MailId) -> Option<MailFull> {
     store.rows(&Q_MAIL, &[Val::I(id)], full_row).first().cloned()
 }
 
+/// Small display metadata used by compose titles and attachment cards.
+pub fn display_head(store: &Store, id: MailId) -> Option<MailHead> {
+    store.snapshot_rows(&Q_MAIL_HEAD, &[Val::I(id)], head_row).first().cloned()
+}
+
 /// The stored content snapshot: MIME reading and remote file descriptors.
 /// `None` for a letter the seed wrote by hand. Read off the connection;
 /// drawings use the derived columns and leave content decoding to workers.
@@ -412,11 +423,10 @@ pub fn senders(store: &Store) -> Rc<Vec<Sender>> {
     store.rows(&Q_SENDERS, &[Val::I(0)], sender_row)
 }
 
-/// The senders of the spam folder — what the spam list's own `@from:`
-/// completes against, and the one place they are offered.
+/// Display-only sender snapshots for recipient and mailbox autocomplete.
 #[must_use]
-pub fn spam_senders(store: &Store) -> Rc<Vec<Sender>> {
-    store.rows(&Q_SENDERS, &[Val::I(1)], sender_row)
+pub fn display_senders(store: &Store, spam: bool) -> Rc<Vec<Sender>> {
+    store.snapshot_rows(&Q_SENDERS, &[Val::I(i64::from(spam))], sender_row)
 }
 
 // -- the mailbox as a rich table ------------------------------------------------
@@ -631,11 +641,12 @@ static MAILBOX_TAGS: &[TagDef] = &[
 /// completes against the people who wrote *to it*.
 fn suggest_mailbox(store: &Store, spam: bool, tag: &str, typed: &str) -> Vec<Suggestion> {
     match tag {
-        "from" => (if spam { spam_senders(store) } else { senders(store) })
+        "from" => display_senders(store, spam)
             .iter()
             .filter(|s| {
                 s.name.to_lowercase().contains(typed) || s.email.to_lowercase().contains(typed)
             })
+            .take(kernel::richtable::MAX_SUGGESTIONS)
             .map(|s| {
                 if s.name.is_empty() {
                     Suggestion::value(s.email.clone())
@@ -826,14 +837,16 @@ pub fn thread(store: &Store, id: MailId) -> Vec<ThreadMail> {
     };
     let rows = store.rows(q, &[Val::I(id)], thread_row);
     let mut out: Vec<ThreadMail> = Vec::with_capacity(rows.len());
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(rows.len());
     for m in rows.iter() {
         if !m.message_id.is_empty() {
-            if let Some(i) = out.iter().position(|o| o.message_id == m.message_id) {
+            if let Some(&i) = positions.get(&m.message_id) {
                 if stands_for(&m.role, &out[i].role) {
                     out[i] = m.clone();
                 }
                 continue;
             }
+            positions.insert(m.message_id.clone(), out.len());
         }
         out.push(m.clone());
     }
@@ -880,6 +893,17 @@ pub fn thread_unread(store: &Store, id: MailId) -> Vec<MailId> {
         .filter(|(_, unread)| *unread)
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// Original unread flags captured inside the same transaction that marks them.
+pub fn thread_unread_in(conn: &rusqlite::Connection, id: MailId) -> rusqlite::Result<Vec<MailId>> {
+    conn.prepare_cached(
+        "SELECT m.id FROM message m JOIN folder f ON f.id=m.folder
+         WHERE m.thread=(SELECT thread FROM message WHERE id=?1) AND m.unread!=0
+           AND (f.role IS NOT 'trash' OR EXISTS(
+             SELECT 1 FROM message a JOIN folder af ON af.id=a.folder WHERE a.id=?1 AND af.role='trash'))
+         ORDER BY m.date,m.id",
+    )?.query_map([id], |row| row.get(0))?.collect()
 }
 
 /// Which folder a mail sits in now — read before filing it, so undo puts it
@@ -1083,10 +1107,10 @@ const Q_PUT_BACK_TARGET: &str = "SELECT COALESCE(
 /// is a mailbox this app never mirrored.
 #[must_use]
 pub fn put_back_target(store: &Store, id: MailId) -> Option<i64> {
-    target_of(store.conn(), id)
+    put_back_target_in(store.conn(), id)
 }
 
-fn target_of(c: &rusqlite::Connection, id: MailId) -> Option<i64> {
+pub(crate) fn put_back_target_in(c: &rusqlite::Connection, id: MailId) -> Option<i64> {
     c.query_row(Q_PUT_BACK_TARGET, [id], |r| r.get::<_, Option<i64>>(0))
         .ok()
         .flatten()
@@ -1099,7 +1123,7 @@ fn target_of(c: &rusqlite::Connection, id: MailId) -> Option<i64> {
 ///
 /// If the store refuses the write.
 pub fn put_back_tx(c: &rusqlite::Connection, id: MailId) -> rusqlite::Result<bool> {
-    let Some(to) = target_of(c, id) else {
+    let Some(to) = put_back_target_in(c, id) else {
         return Ok(false);
     };
     let n = c.execute(
@@ -1375,10 +1399,14 @@ pub fn draft_for(store: &Store, slot: i64, seed: Seed) -> Option<Draft> {
 /// what a reopened send adopts, since the letter that failed already knows
 /// which mail it was written against.
 #[must_use]
+#[cfg(test)]
 pub fn draft_any(store: &Store, slot: i64) -> Option<(Draft, Seed)> {
-    store
-        .conn()
-        .query_row(
+    draft_any_in(store.conn(), slot).ok().flatten()
+}
+
+pub fn draft_any_in(conn: &rusqlite::Connection, slot: i64) -> rusqlite::Result<Option<(Draft, Seed)>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
             "SELECT to_addr, subject, body, re_message, fwd_message FROM draft WHERE panel = ?1",
             [slot],
             |r| {
@@ -1398,7 +1426,7 @@ pub fn draft_any(store: &Store, slot: i64) -> Option<(Draft, Seed)> {
                 Ok((d, seed))
             },
         )
-        .ok()
+        .optional()
 }
 
 /// The transaction-level draft upsert — also part of the send action, so the

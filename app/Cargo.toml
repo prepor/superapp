@@ -26,13 +26,17 @@ default = ["tdlib"]
 tdlib = []
 
 [dependencies]
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "process"] }
+async-trait = "0.1"
+futures-util = { version = "0.3", features = ["io"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
 superapp-kernel = { path = "../kernel" }
 
 # An app writes its own tables and files its own effects, so it names the two
 # crates the kernel's interfaces are spelled in: `App::seed` hands back a
 # `rusqlite::Result`, and a `Deferred` effect is a serde payload.
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 caseless = "0.2.2"
 unicode-segmentation = "1.12"
 # Retain each existing line ending when editing files with mixed LF/CRLF.
@@ -40,9 +44,10 @@ similar = { version = "3.2", default-features = false }
 
 # Mail's real protocols. `Mode::Real` outside a script reaches a server
 # through these; every scripted run keeps the fake.
-imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 imap-proto = "0.16.7"
-lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
 mail-parser = "0.11"
 
 # The HTML reading of a letter: parse it the way a browser would, read the
@@ -66,7 +71,6 @@ regex = { version = "1", default-features = false, features = ["std", "unicode-g
 
 # Syndication parsing and bounded HTTP fetching for the RSS reader.
 feed-rs = "2.4"
-ureq = "3.4"
 quick-xml = "0.41"
 
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
@@ -78,7 +82,6 @@ rrule = "0.14"
 base64 = "0.22"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-connector = "0.19"
 webpki-roots = "1"
 
 # Pin Makepad for repeatable builds. The fork's fixes are listed in the
@@ -86,6 +89,9 @@ webpki-roots = "1"
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 # Reuse Makepad's pinned Markdown parser for answers with source links.
 pulldown-cmark = { git = "https://github.com/prepor/makepad", rev = "c85d1a7a", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

@@ -4,7 +4,7 @@
 use super::{Preview, selection::{append_copy, Span}};
 use crate::reader::pdf::{Document, Page, TextPage};
 use makepad_widgets::{image_cache::decode_image_from_data, SignalToUI};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use tokio::sync::mpsc::{self, Receiver, UnboundedSender as Sender, error::TryRecvError};
 
 pub enum Ready {
     Text(String),
@@ -74,52 +74,57 @@ impl Worker {
             }
             return Ok(worker);
         }
-        let (ask, requests) = mpsc::channel();
-        // A paused UI must not accumulate decoded pages or text in its inbox.
-        let (answer, replies) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("file-viewer".into())
-            .spawn(move || {
-                let send = |result| {
-                    let live = answer.send(result).is_ok();
-                    SignalToUI::set_ui_signal();
-                    live
-                };
-                match guarded(|| load(source)) {
-                    Ok(Loaded::Pdf(pdf)) => {
-                        let sizes = pdf.sizes();
-                        if !send(Ok(Ready::PdfInfo(sizes))) {
-                            return;
+        let (ask, mut requests) = mpsc::unbounded_channel();
+        // Backpressure keeps at most one decoded page awaiting the UI.
+        let (answer, replies) = mpsc::channel(1);
+        kernel::runtime::spawn(async move {
+            let loaded = kernel::runtime::spawn_blocking(move || guarded(|| load(source))).await;
+            let loaded = loaded.unwrap_or_else(|e| Err(format!("File reader failed: {e}")));
+            let send = async |result| {
+                let live = answer.send(result).await.is_ok();
+                SignalToUI::set_ui_signal();
+                live
+            };
+            match loaded {
+                Ok(Loaded::Pdf(mut pdf)) => {
+                    if !send(Ok(Ready::PdfInfo(pdf.sizes()))).await { return; }
+                    let mut copy: Option<CopyJob> = None;
+                    loop {
+                        let request = if copy.is_some() { requests.try_recv() }
+                            else { requests.recv().await.ok_or(TryRecvError::Disconnected) };
+                        if matches!(request, Err(TryRecvError::Disconnected)) { return; }
+                        if let Ok(Request::Copy(span)) = request {
+                            copy = span.map(CopyJob::new);
+                            continue;
                         }
-                        let mut copy: Option<CopyJob> = None;
-                        loop {
-                            let request = if copy.is_some() { requests.try_recv() }
-                                else { requests.recv().map_err(|_| TryRecvError::Disconnected) };
+                        let result = kernel::runtime::spawn_blocking(move || {
                             let result = match request {
-                                Ok(Request::Page(page)) => guarded(|| pdf.render(page).map(Ready::Pdf)),
-                                Ok(Request::Text(page)) => Ok(text_page(&pdf, page)),
-                                Ok(Request::Copy(span)) => { copy = span.map(CopyJob::new); continue; }
+                                Ok(Request::Page(page)) => Some(guarded(|| pdf.render(page).map(Ready::Pdf))),
+                                Ok(Request::Text(page)) => Some(Ok(text_page(&pdf, page))),
                                 Err(TryRecvError::Empty) => {
-                                    let job = copy.as_mut().unwrap();
-                                    let Some(result) = job.step(&pdf) else { continue; };
+                                    let job = copy.as_mut().expect("copy in progress");
                                     let span = job.span;
-                                    copy = None;
-                                    Ok(Ready::Copied(span, result))
+                                    job.step(&pdf).map(|result| {
+                                        copy = None;
+                                        Ok(Ready::Copied(span, result))
+                                    })
                                 }
-                                Err(TryRecvError::Disconnected) => break,
+                                _ => unreachable!(),
                             };
-                            if !send(result) { break; }
+                            (pdf, copy, result)
+                        }).await;
+                        let Ok((next_pdf, next_copy, result)) = result else { return; };
+                        pdf = next_pdf;
+                        copy = next_copy;
+                        if let Some(result) = result {
+                            if !send(result).await { return; }
                         }
-                    }
-                    Ok(Loaded::Ready(ready)) => {
-                        send(Ok(ready));
-                    }
-                    Err(error) => {
-                        send(Err(error));
                     }
                 }
-            })
-            .map_err(|e| format!("Could not start the file viewer: {e}"))?;
+                Ok(Loaded::Ready(ready)) => { send(Ok(ready)).await; }
+                Err(error) => { send(Err(error)).await; }
+            }
+        });
         worker.requests = Some(ask);
         worker.replies = Some(replies);
         Ok(worker)
@@ -154,7 +159,7 @@ impl Worker {
                 }
             }
         }
-        match self.replies.as_ref()?.try_recv() {
+        match self.replies.as_mut()?.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
@@ -244,8 +249,7 @@ mod tests {
     use super::*;
 
     fn receive(worker: &mut Worker) -> Result<Ready, String> {
-        worker.poll().unwrap_or_else(|| worker.replies.as_ref().unwrap()
-            .recv_timeout(std::time::Duration::from_secs(20)).expect("worker answered"))
+        worker.poll().unwrap_or_else(|| kernel::runtime::block_on(async { tokio::time::timeout(std::time::Duration::from_secs(20), worker.replies.as_mut().unwrap().recv()).await.expect("worker answered").expect("worker alive") }))
     }
 
     #[test]
@@ -253,8 +257,8 @@ mod tests {
         use super::super::selection::{Position, Selection};
         let mut worker = Worker::start(Preview::Pdf(crate::reader::pdf::dense_fixture(200, 50, 80))).unwrap();
         assert!(matches!(receive(&mut worker).unwrap(), Ready::PdfInfo(sizes) if sizes.len() == 200));
-        if let Some(replies) = &worker.replies {
-            assert!(matches!(replies.recv_timeout(std::time::Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)),
+        if let Some(replies) = &mut worker.replies {
+            assert!(kernel::runtime::block_on(async { tokio::time::timeout(std::time::Duration::from_millis(30), replies.recv()).await }).is_err(),
                 "opening a long document must not eagerly enqueue text");
         } else { assert!(worker.poll().is_none()); }
         worker.request(Request::Text(0)).unwrap();
@@ -292,12 +296,10 @@ mod tests {
         let receive = |worker: &mut Worker| {
             loop {
                 let result = worker.ready.take().unwrap_or_else(|| {
-                    worker
-                    .replies
-                    .as_ref()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                        .expect("worker answered")
+                    kernel::runtime::block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(10), worker.replies.as_mut().unwrap().recv())
+                            .await.expect("worker answered").expect("worker alive")
+                    })
                 });
                 if !matches!(result, Ok(Ready::PdfText(..))) { break result; }
             }

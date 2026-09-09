@@ -174,10 +174,25 @@ impl Operation {
     }
 }
 
-#[derive(Default)]
 pub struct Tracker {
     dirty: AtomicBool,
     state: Mutex<State>,
+    updates: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for Tracker {
+    fn default() -> Self {
+        Self { dirty: AtomicBool::new(false), state: Mutex::new(State::default()),
+            updates: tokio::sync::watch::channel(()).0 }
+    }
+}
+
+/// Publish after a mutation releases its state lock, including early returns.
+/// Waking before changing state can strand a waiter on the previous value.
+struct Changed<'a>(&'a Tracker);
+
+impl Drop for Changed<'_> {
+    fn drop(&mut self) { self.0.changed(); }
 }
 
 #[derive(Default)]
@@ -211,7 +226,9 @@ impl State {
 impl Tracker {
     pub fn changed(&self) {
         self.dirty.store(true, Ordering::Relaxed);
+        self.updates.send_replace(());
     }
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> { self.updates.subscribe() }
     pub fn take_changed(&self) -> bool {
         self.dirty.swap(false, Ordering::Relaxed)
     }
@@ -223,7 +240,7 @@ impl Tracker {
     }
     /// Add correlation without putting content or credentials in @extra.
     pub fn track(&self, request: &str) -> String {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let Ok(mut v) = serde_json::from_str::<Value>(request) else {
             return request.to_string();
         };
@@ -407,7 +424,7 @@ impl Tracker {
     }
 
     pub fn dismiss(&self, id: u64) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let mut state = self.state.lock().unwrap();
         if state
             .operations
@@ -473,7 +490,7 @@ impl Tracker {
         for key in previous {
             state.settled.retain(|(saved, _)| *saved != key);
         }
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         Some(req.to_string())
     }
 
@@ -488,7 +505,7 @@ impl Tracker {
     }
 
     fn fail_at(&self, dir: Option<&Path>, id: u64, error: &str, uncertain: bool) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let mut state = self.state.lock().unwrap();
         if let Some(op) = state.operations.get_mut(&id) {
             if matches!(&op.status, Status::Failed { error: old, uncertain: u } if old == error && *u == uncertain)
@@ -508,7 +525,7 @@ impl Tracker {
 
     /// Errors without a request (projection, decoding, native player, disk).
     pub fn report(&self, store: &Store, what: &str, error: &str) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let mut state = self.state.lock().unwrap();
         if state.operations.values().any(|o| {
             o.label == what && matches!(&o.status, Status::Failed { error: e, .. } if e == error)
@@ -547,7 +564,7 @@ impl Tracker {
     /// only after Telegram accepted it.
     pub fn reply(&self, store: &Store, v: &Value) -> Option<Value> {
         let id = v["@extra"]["operation"].as_u64()?;
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         if v["@type"] == "error" {
             // loadChats uses 404 as its normal end-of-list sentinel.
             let end = v["code"] == 404
@@ -633,7 +650,7 @@ impl Tracker {
     }
 
     pub fn sent(&self, store: &Store, update: &Value) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let msg = &update["message"];
         let (Some(chat), Some(old)) = (msg["chat_id"].as_i64(), update["old_message_id"].as_i64())
         else {
@@ -705,14 +722,14 @@ impl Tracker {
                 op.files.insert(id, value);
                 if previous != Some(value) {
                     op.changed();
-                    self.dirty.store(true, Ordering::Relaxed);
+                    let _changed = Changed(self);
                 }
             }
         }
     }
 
     pub fn file_finished(&self, store: &Store, file: &Value, error: Option<&str>) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let _changed = Changed(self);
         let Some(id) = file["id"].as_i64() else {
             return;
         };
@@ -768,7 +785,7 @@ impl Tracker {
             .collect();
         for id in done {
             state.retire(id);
-            self.dirty.store(true, Ordering::Relaxed);
+            let _changed = Changed(self);
         }
     }
 }
@@ -983,7 +1000,7 @@ pub fn run_local(
     chat: Option<PeerId>,
     what: &str,
     run: impl FnOnce() -> Result<(), String> + Send + 'static,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> tokio::task::JoinHandle<()> {
     let rt = runtime::of(store);
     let id = {
         let mut state = rt.operations.state.lock().unwrap();
@@ -1013,27 +1030,19 @@ pub fn run_local(
     rt.operations.changed();
     let worker = rt.clone();
     let dir = store.dir().map(Path::to_path_buf);
-    match std::thread::Builder::new()
-        .name(format!("telegram-{what}"))
-        .spawn(move || {
-            match run() {
-                Ok(()) => {
-                    let mut state = worker.operations.state.lock().unwrap();
-                    if let Some(op) = state.operations.get_mut(&id) {
-                        op.status = Status::Done;
-                        op.changed();
-                    }
+    kernel::runtime::spawn_blocking(move || {
+        match run() {
+            Ok(()) => {
+                let mut state = worker.operations.state.lock().unwrap();
+                if let Some(op) = state.operations.get_mut(&id) {
+                    op.status = Status::Done;
+                    op.changed();
                 }
-                Err(error) => worker.operations.fail_at(dir.as_deref(), id, &error, false),
             }
-            worker.operations.changed();
-        }) {
-        Ok(thread) => Some(thread),
-        Err(error) => {
-            rt.operations.fail(store, id, &error.to_string(), false);
-            None
+            Err(error) => worker.operations.fail_at(dir.as_deref(), id, &error, false),
         }
-    }
+        worker.operations.changed();
+    })
 }
 
 #[cfg(test)]
@@ -1250,31 +1259,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn local_work_returns_while_pending_then_reports_its_actual_outcome() {
-        use std::sync::mpsc;
+    #[tokio::test]
+    async fn local_work_returns_while_pending_then_reports_its_actual_outcome() {
+        use tokio::sync::oneshot;
         use std::thread;
 
         let s = store();
         let rt = runtime::of(&s);
         for result in [Ok(()), Err("handler refused the file".to_string())] {
-            let (started, observed) = mpsc::channel();
-            let (release, wait) = mpsc::channel();
+            let (started, observed) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
             let outcome = result.clone();
             let worker = run_local(&s, Some(7), "opening media", move || {
                 started.send(thread::current().id()).unwrap();
-                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                wait.blocking_recv().unwrap();
                 outcome
-            })
-            .unwrap();
-            let thread_id = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let thread_id = tokio::time::timeout(Duration::from_secs(5), observed).await.unwrap().unwrap();
             assert_ne!(thread_id, thread::current().id());
             let op = rt.operations.list().pop().unwrap();
             assert_eq!(op.status, Status::Pending);
             assert!(op.line().contains("opening media…"));
             rt.operations.take_changed();
             release.send(()).unwrap();
-            worker.join().unwrap();
+            worker.await.unwrap();
             assert!(rt.operations.take_changed());
             let op = rt.operations.list().pop().unwrap();
             match result {

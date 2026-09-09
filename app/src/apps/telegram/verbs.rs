@@ -3,12 +3,11 @@
 //! Live message changes queue requests and let TDLib updates settle the store.
 //! Topic visibility is this app's preference in both live and offline accounts.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use rusqlite::OptionalExtension;
 
 use kernel::effect::World;
 use kernel::history::Intent;
-use kernel::session::{Action, Session};
+use kernel::session::{Edit, Session};
 
 use super::model::{self, LineCopy, MsgId, PeerId};
 use super::topics;
@@ -16,27 +15,23 @@ use super::topics;
 /// Each gesture owns only the visibility flags it changes, so undo restores
 /// a mixed selection without changing topic metadata or later discoveries.
 pub fn select_topics(s: &mut Session, chat: PeerId, ids: Vec<i64>, selected: bool) {
-    let wanted: HashSet<_> = ids.into_iter().collect();
-    // Every retained row had !selected; unchanged rows must not be reversed.
-    let ids: Vec<_> = topics::list(s.store(), chat)
-        .iter()
-        .filter(|t| wanted.contains(&t.id) && t.selected != selected)
-        .map(|t| t.id)
-        .collect();
-    if ids.is_empty() {
-        return;
-    }
+    if ids.is_empty() { return; }
     let n = ids.len();
     let word = if selected { "show" } else { "hide" };
-    let write = ids.clone();
-    let _ = s.act(
-        Action::writing(
-            "topic selection",
-            format!("{word} {n} topic{}", if n == 1 { "" } else { "s" }),
-            move |tx| topics::select_tx(tx, chat, &write, selected),
-        )
-        .claiming(vec![Box::new(TopicSelection { chat, ids, selected })]),
-    );
+    s.act_async(Edit::writing(
+        "topic selection",
+        format!("{word} {n} topic{}", if n == 1 { "" } else { "s" }),
+        move |tx| {
+            let mut changed = Vec::new();
+            for id in ids {
+                if tx.execute("UPDATE tg_topic SET selected = ?3 WHERE chat = ?1 AND id = ?2 AND selected != ?3",
+                    rusqlite::params![chat, id, selected])? != 0 { changed.push(id); }
+            }
+            Ok(changed)
+        },
+    ).record_if(|ids| !ids.is_empty()).claiming_with(move |ids| {
+        vec![Box::new(TopicSelection { chat, ids: std::mem::take(ids), selected })]
+    }), |_, _| {});
 }
 
 struct TopicSelection {
@@ -71,27 +66,24 @@ pub fn edit_line(
     chat: PeerId,
     msg: MsgId,
     before: &str,
-    was_edited: bool,
+    _was_edited: bool,
     after: &str,
 ) {
-    let (before, after) = (before.to_string(), after.to_string());
-    let before_entities = model::history(s.store(), chat).iter()
-        .find(|m| m.id == msg).map(|m| m.entities.clone()).unwrap_or_default();
-    let write = after.clone();
-    let _ = s.act(
-        Action::writing("edit", format!("edit “{}”", short(&before)), move |tx| {
-            model::edit_tx(tx, chat, msg, &write, true, None)
-        })
-        .about(format!("chat:{chat}"))
-        .claiming(vec![Box::new(Edited {
-            chat,
-            msg,
-            before,
-            before_entities,
-            was_edited,
-            after,
-        })]),
-    );
+    let after = after.to_string();
+    s.act_async(Edit::writing("edit", format!("edit “{}”", short(before)), move |tx| {
+        let old = tx.query_row("SELECT text, edited, entities, entities_known FROM tg_message WHERE chat = ?1 AND id = ?2",
+            [chat, msg], |row| {
+                let entities = if row.get::<_, bool>(3)? {
+                    Some(serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default())
+                } else { None };
+                Ok((row.get(0)?, row.get(1)?, entities))
+            }).optional()?;
+        let Some((before, was_edited, before_entities)) = old else { return Ok(None); };
+        model::edit_tx(tx, chat, msg, &after, true, None)?;
+        Ok(Some(Edited { chat, msg, before, before_entities, was_edited, after }))
+    }).about(format!("chat:{chat}"))
+        .record_if(Option::is_some)
+        .claiming_with(|edited| vec![Box::new(edited.take().expect("committed edit"))]), |_, _| {});
 }
 
 /// Deletes lines, copied out whole first, so undo puts them back exactly
@@ -101,22 +93,18 @@ pub fn delete_lines(s: &mut Session, chat: PeerId, ids: Vec<MsgId>) {
         return;
     }
     let n = ids.len();
-    let copies: Arc<Mutex<Vec<LineCopy>>> = Arc::default();
-    let fill = Arc::clone(&copies);
-    let gone = ids.clone();
-    let _ = s.act(
-        Action::writing(
-            "delete",
-            format!("delete {n} line{}", if n == 1 { "" } else { "s" }),
-            move |tx| {
-                let rows = model::copy_lines_tx(tx, chat, &gone)?;
-                *fill.lock().expect("the copies of the deleted lines") = rows;
-                model::delete_lines_tx(tx, chat, &gone).map(|_| ())
-            },
-        )
-        .about(format!("chat:{chat}"))
-        .claiming(vec![Box::new(Deleted { chat, ids, copies })]),
-    );
+    s.act_async(Edit::writing(
+        "delete",
+        format!("delete {n} line{}", if n == 1 { "" } else { "s" }),
+        move |tx| {
+            let copies = model::copy_lines_tx(tx, chat, &ids)?;
+            if copies.is_empty() { return Ok(None); }
+            model::delete_lines_tx(tx, chat, &ids)?;
+            Ok(Some(Deleted { chat, ids, copies }))
+        },
+    ).about(format!("chat:{chat}"))
+        .record_if(Option::is_some)
+        .claiming_with(|deleted| vec![Box::new(deleted.take().expect("committed deletion"))]), |_, _| {});
 }
 
 /// The first words of a line, for a label.
@@ -166,7 +154,7 @@ impl Intent for Edited {
 struct Deleted {
     chat: PeerId,
     ids: Vec<MsgId>,
-    copies: Arc<Mutex<Vec<LineCopy>>>,
+    copies: Vec<LineCopy>,
 }
 
 impl Intent for Deleted {
@@ -176,7 +164,7 @@ impl Intent for Deleted {
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let rows = self.copies.lock().expect("the copies of the deleted lines").clone();
+        let rows = self.copies.clone();
         w.store()
             .write(move |c| model::restore_lines_tx(c, &rows))
             .map_err(|e| e.to_string())
@@ -195,13 +183,22 @@ pub(super) fn react_demo(s: &mut Session, chat: PeerId, msg: MsgId, emoji: &str)
     let rt = super::runtime::of(s.store());
     if rt.demo_reacted(chat, msg, emoji) { return true; }
     let chosen = emoji.to_string();
-    if s.act(Action::writing("react", format!("react {emoji}"), move |tx| {
-        demo_reaction(tx, chat, msg, &chosen, 1)
-    }).claiming(vec![Box::new(DemoReaction { chat, msg, emoji: emoji.into() })])).is_none() {
-        return false;
-    }
+    let reaction = DemoReaction { chat, msg, emoji: emoji.into() };
+    // Reserve the reaction while its transaction waits, so a second click
+    // cannot count the same local reaction twice.
     rt.remember_demo_reaction(chat, msg, emoji);
-    true
+    let accepted = std::rc::Rc::new(std::cell::Cell::new(true));
+    let result = accepted.clone();
+    let emoji = emoji.to_string();
+    s.act_async(Edit::writing("react", format!("react {emoji}"), move |tx| {
+        demo_reaction(tx, chat, msg, &chosen, 1)
+    }).claiming(vec![Box::new(reaction)]), move |_, done| {
+        if done.is_none() {
+            rt.forget_demo_reaction(chat, msg, &emoji);
+            result.set(false);
+        }
+    });
+    accepted.get()
 }
 
 struct DemoReaction { chat: PeerId, msg: MsgId, emoji: String }

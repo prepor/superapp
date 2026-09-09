@@ -135,6 +135,7 @@ impl InlineVideo {
         &mut self, cx: &mut Cx, video: &WidgetRef, player: &mut Playback, m: &Msg, now: f64,
     ) -> InlineDrawn {
         self.set_source(cx, m);
+        player.poll(m);
         let native = player.plays_clip(m);
         let file = native.then(|| player.clip_file(m)).flatten();
         let drawn = self.playback.drive(cx, video, file.as_deref(), player.running());

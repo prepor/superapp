@@ -1,7 +1,7 @@
 //! What mail lets an agent do, by name.
 //!
 //! Each one is the verb's own code path over ids instead of over a cursor:
-//! the filing goes through [`move_tx`] and claims the same intents the
+//! the filing goes through [`super::panels::mailbox::move_tx`] and claims the same intents the
 //! mailbox's own *archive* and *put back* claim, the marking goes
 //! through [`model::mark_read_tx`] and claims the same [`MarkRead`] the
 //! reader's open does, and the send files the outbox row the compose
@@ -16,17 +16,18 @@
 //! read**. `mail.draft` opens a compose panel with the letter in it, for the
 //! person to look at; `mail.send` takes only a draft that already exists.
 
+use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
-use kernel::session::{Action, Session};
+use kernel::session::{Edit, Session};
 use kernel::store::Store;
 use kernel::time::fmt_date_long;
-use kernel::tool::Tool;
+use kernel::tool::{Prepare, Prepared, Read, Tool};
 use serde_json::{json, Value};
 
 use super::effects::{outbox_entity, MarkRead, Sent};
 use super::model::{self, Draft, MailId, Role, Seed};
-use super::panels::mailbox::{movable, move_tx, moved, To};
+use super::panels::mailbox::{movable, moved, To};
 use super::panels::Compose;
 use super::reading;
 
@@ -46,7 +47,7 @@ const HITS: i64 = 20;
 #[must_use]
 pub fn all() -> Vec<Tool> {
     vec![
-        Tool::new(
+        Tool::reading(
             "mail.search",
             "Find letters by their words — sender, subject, body. This is the \
              way to turn “the mail from Vera about the budget” into ids you can \
@@ -61,10 +62,9 @@ pub fn all() -> Vec<Tool> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            false,
-            search,
+            |input| read_on_worker(input, search),
         ),
-        Tool::new(
+        Tool::reading(
             "mail.thread",
             "Read a whole conversation: every letter of it, oldest first, with \
              who wrote it, when, and what it says. Call this before answering \
@@ -76,8 +76,7 @@ pub fn all() -> Vec<Tool> {
                 "required": ["thread"],
                 "additionalProperties": false
             }),
-            false,
-            thread,
+            |input| read_on_worker(input, thread),
         ),
         Tool::reading(
             "mail.attachment",
@@ -99,63 +98,57 @@ pub fn all() -> Vec<Tool> {
             }),
             attachment,
         ),
-        Tool::new(
+        Tool::preparing(
             "mail.archive",
             "Archive a conversation out of the inbox — the same thing the \
              archive button does, and the person takes it back with cmd+z. The \
              conversation has to be in the inbox; from anywhere else there is \
              nothing to archive.",
             one("the conversation to archive"),
-            true,
-            |s, input| file(s, input, Role::Inbox, To::Role("archive")),
+            |input| prepare_on_worker(input, |world, input| file(world, input, Role::Inbox, To::Role("archive"))),
         ),
-        Tool::new(
+        Tool::preparing(
             "mail.delete",
             "Put a conversation in the trash — the same thing the delete button \
              does, and undoable the same way. It moves the copies in whichever \
              mailbox holds it.",
             one("the conversation to delete"),
-            true,
-            delete,
+            |input| prepare_on_worker(input, delete),
         )
         // The trash is not the archive: what a person means by *delete* is
         // the one filing they would want to be asked about.
         .asking(),
-        Tool::new(
+        Tool::preparing(
             "mail.not_spam",
             "Take a conversation out of the junk and back into the inbox. It \
              has to be in the spam for there to be anything to do.",
             one("the conversation to take out of the spam"),
-            true,
-            |s, input| file(s, input, Role::Spam, To::Role("inbox")),
+            |input| prepare_on_worker(input, |world, input| file(world, input, Role::Spam, To::Role("inbox"))),
         ),
-        Tool::new(
+        Tool::preparing(
             "mail.put_back",
             "Take a conversation out of the trash and back where it was \
              deleted from — the inbox for a letter that never passed through \
              this device's own delete. It has to be in the trash for there to \
              be anything to do.",
             one("the conversation to put back"),
-            true,
-            |s, input| file(s, input, Role::Trash, To::Back),
+            |input| prepare_on_worker(input, |world, input| file(world, input, Role::Trash, To::Back)),
         ),
-        Tool::new(
+        Tool::preparing(
             "mail.read",
             "Mark every unread letter of a conversation as read, exactly as \
              opening it does.",
             one("the conversation to mark read"),
-            true,
-            read,
+            |input| prepare_on_worker(input, read),
         ),
-        Tool::new(
+        Tool::preparing(
             "mail.unread",
             "Mark a conversation unread again, so it stands out in the mailbox \
              as something to come back to.",
             one("the conversation to mark unread"),
-            true,
-            unread,
+            |input| prepare_on_worker(input, unread),
         ),
-        Tool::new(
+        Tool::staging(
             "mail.draft",
             "Write a letter and open it in a compose panel for the person to \
              read. It is not sent: the person looks at it, edits it if they \
@@ -175,7 +168,7 @@ pub fn all() -> Vec<Tool> {
             true,
             draft,
         ),
-        Tool::new(
+        Tool::staging(
             "mail.send",
             "Send a draft that is already open — the one mail.draft answered \
              with. There is a short window in which cmd+z takes it back; after \
@@ -206,13 +199,61 @@ fn one(what: &str) -> Value {
     })
 }
 
+/// Native preparation/read work owns a factory so SQL and MIME conversion do
+/// not monopolize either the UI or the local network executor.
+fn prepare_on_worker(
+    input: &Value,
+    prepare: fn(&World, &Value) -> Result<Prepared, String>,
+) -> Prepare {
+    let input = input.clone();
+    Box::new(move |world| {
+        Box::pin(async move {
+            if let Some(factory) = world.factory() {
+                kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|e| e.to_string())?;
+                    prepare(&world, &input)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            } else {
+                prepare(world, &input)
+            }
+        })
+    })
+}
+
+fn read_on_worker(input: &Value, read: fn(&World, &Value) -> Result<Value, String>) -> Read {
+    let input = input.clone();
+    Box::new(move |world| {
+        Box::pin(async move {
+            if let Some(factory) = world.factory() {
+                kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|e| e.to_string())?;
+                    read(&world, &input)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            } else {
+                read(world, &input)
+            }
+        })
+    })
+}
+
+fn changed() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+        Some("the conversation changed before this edit; read it again".into()),
+    )
+}
+
 // -- reading -----------------------------------------------------------------------
 
 /// The FTS5 index the launcher's mail source reads, cut by the same
 /// [`model::fts_match`], answering the columns an agent acts on rather than
 /// the label a hit draws. The trash is left out, as it is everywhere else: a
 /// deleted letter is no longer part of the conversation it was in.
-fn search(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn search(s: &World, input: &Value) -> Result<Value, String> {
     let query = text(input, "query")?;
     let limit = int(input, "limit")?.unwrap_or(HITS).clamp(1, MAX_HITS);
     let Some(m) = model::fts_match(query) else {
@@ -252,7 +293,7 @@ fn search(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// reading a person sees — the HTML narrowed to words where the sender sent
 /// one, the plain text otherwise, and the quoted tail folded away, because
 /// the letter above it is already here.
-fn thread(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn thread(s: &World, input: &Value) -> Result<Value, String> {
     let id = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let store = s.store();
     let msgs = model::thread(store, id);
@@ -292,23 +333,32 @@ fn thread(s: &mut Session, input: &Value) -> Result<Value, String> {
 
 fn attachment(input: &Value) -> kernel::tool::Read {
     let input = input.clone();
-    Box::new(move |world| std::task::Poll::Ready((|| {
-        let mail = int(&input, "mail")?.ok_or("`mail` must be an integer")?;
-        let part = int(&input, "part")?.and_then(|n| u32::try_from(n).ok())
-            .ok_or("`part` must be a nonnegative 32-bit integer")?;
-        let offset = crate::reader::document::offset(&input)?;
-        let a = super::parts::attachment(world.store(), mail, part)
-            .ok_or_else(|| format!("no attachment at mail {mail}, part {part}"))?;
-        crate::reader::document::check_size(a.size)?;
-        let bytes = super::parts::part(world, &a)?;
-        let mut out = crate::reader::document::read(&bytes, &a.name, &a.mime, offset)?;
-        out["mail"] = json!(mail);
-        out["part"] = json!(part);
-        out["name"] = json!(a.name);
-        out["mime"] = json!(a.mime);
-        out["size"] = json!(bytes.len());
-        Ok(out)
-    })()))
+    Box::new(move |world| {
+        Box::pin(async move {
+            let mail = int(&input, "mail")?.ok_or("`mail` must be an integer")?;
+            let part = int(&input, "part")?
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("`part` must be a nonnegative 32-bit integer")?;
+            let offset = crate::reader::document::offset(&input)?;
+            let a = super::parts::attachment(world.store(), mail, part)
+                .ok_or_else(|| format!("no attachment at mail {mail}, part {part}"))?;
+            crate::reader::document::check_size(a.size)?;
+            let bytes = super::parts::part(world, &a).await?;
+            let size = bytes.len();
+            let (name, mime) = (a.name.clone(), a.mime.clone());
+            let mut out = kernel::runtime::spawn_blocking(move || {
+                crate::reader::document::read(&bytes, &name, &mime, offset)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            out["mail"] = json!(mail);
+            out["part"] = json!(part);
+            out["name"] = json!(a.name);
+            out["mime"] = json!(a.mime);
+            out["size"] = json!(size);
+            Ok(out)
+        })
+    })
 }
 
 // -- filing --------------------------------------------------------------------------
@@ -322,7 +372,7 @@ fn attachment(input: &Value) -> kernel::tool::Read {
 /// in two mailboxes at once, and archiving from the inbox takes the inbox
 /// copies. A tool has no cursor to read that off, so the verb that only
 /// makes sense from one mailbox names it here.
-fn file(s: &mut Session, input: &Value, from: Role, to: To) -> Result<Value, String> {
+fn file(s: &World, input: &Value, from: Role, to: To) -> Result<Prepared, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let moving = folder_mails(s.store(), from, thread);
     if moving.is_empty() {
@@ -339,7 +389,7 @@ fn file(s: &mut Session, input: &Value, from: Role, to: To) -> Result<Value, Str
 /// copies in whichever mailbox holds the conversation — the mailboxes asked
 /// in the order the launcher lists them, the trash left out because that is
 /// where they are going.
-fn delete(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn delete(s: &World, input: &Value) -> Result<Prepared, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let moving = model::ROLES
         .into_iter()
@@ -355,7 +405,7 @@ fn delete(s: &mut Session, input: &Value) -> Result<Value, String> {
 
 /// The action itself, once the letters are known: one node, labelled by what
 /// the conversation is called, claiming the reversal of every move.
-fn filed(s: &mut Session, thread: i64, letters: &[MailId], to: To) -> Result<Value, String> {
+fn filed(s: &World, thread: i64, letters: &[MailId], to: To) -> Result<Prepared, String> {
     let store = s.store().clone();
     let moving: Vec<(MailId, i64)> = letters
         .iter()
@@ -375,17 +425,33 @@ fn filed(s: &mut Session, thread: i64, letters: &[MailId], to: To) -> Result<Val
     let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
     let n = ids.len();
     let title = topic(&store, thread);
-    let done = s.act(
-        Action::writing("file", format!("{} “{title}”", to.word()), move |tx| {
-            for id in &ids {
-                move_tx(tx, *id, to)?;
-            }
-            Ok(())
+    let expected: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                model::folder_of(&store, *id),
+                model::trashed_from(&store, *id),
+                model::put_back_target(&store, *id),
+            )
         })
-        .claiming(intents),
-    );
-    done.ok_or_else(|| kernel::tools::refused(s))?;
-    Ok(json!({"thread": thread, "letters": n, "mailbox": mailbox_of(to)}))
+        .collect();
+    Ok(Prepared::Edit(Edit::writing("file", format!("{} “{title}”", to.word()), move |tx| {
+        for (id, folder, trashed, back) in &expected {
+            let current: (i64, Option<i64>) = tx.query_row(
+                "SELECT folder,(SELECT folder FROM trashed WHERE message=m.id) FROM message m WHERE id=?",
+                [id], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if current != (*folder, *trashed) || (to == To::Back && model::put_back_target_in(tx, *id) != *back) {
+                return Err(changed());
+            }
+        }
+        for id in &ids {
+            let changed = match to { To::Role(role) => model::file_tx(tx, *id, role)?, To::Back => model::put_back_tx(tx, *id)? };
+            if !changed { return Err(self::changed()); }
+        }
+        Ok(json!({"thread": thread, "letters": n, "mailbox": mailbox_of(to)}))
+    }).claiming(intents)))
 }
 
 /// What the tool answers with as the mailbox a conversation landed in. A put
@@ -414,7 +480,7 @@ fn folder_mails(store: &Store, role: Role, thread: i64) -> Vec<MailId> {
 
 /// Every unread letter of a conversation marked read, one [`MarkRead`] each
 /// — what opening the reader claims, without opening it.
-fn read(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn read(s: &World, input: &Value) -> Result<Prepared, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let store = s.store().clone();
     let unread = model::thread_unread(&store, thread);
@@ -428,21 +494,28 @@ fn read(s: &mut Session, input: &Value) -> Result<Value, String> {
         .collect();
     let marks = unread.clone();
     let title = topic(&store, thread);
-    let done = s.act(
-        Action::writing("read", format!("read “{title}”"), move |tx| {
-            for m in &marks {
-                model::mark_read_tx(tx, *m)?;
+    Ok(Prepared::Edit(
+        Edit::writing("read", format!("read “{title}”"), move |tx| {
+            for mail in &marks {
+                let unread: bool =
+                    tx.query_row("SELECT unread FROM message WHERE id=?", [mail], |r| {
+                        r.get(0)
+                    })?;
+                if !unread {
+                    return Err(changed());
+                }
             }
-            Ok(())
+            for mail in &marks {
+                model::mark_read_tx(tx, *mail)?;
+            }
+            Ok(json!({"thread": thread, "letters": n}))
         })
         .claiming(intents),
-    );
-    done.ok_or_else(|| kernel::tools::refused(s))?;
-    Ok(json!({"thread": thread, "letters": n}))
+    ))
 }
 
 /// The other way: a conversation put back where a person would find it.
-fn unread(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn unread(s: &World, input: &Value) -> Result<Prepared, String> {
     let thread = int(input, "thread")?.ok_or("`thread` must be an integer")?;
     let store = s.store().clone();
     let letters: Vec<MailId> = model::thread(&store, thread)
@@ -460,17 +533,24 @@ fn unread(s: &mut Session, input: &Value) -> Result<Value, String> {
         .collect();
     let marks = letters.clone();
     let title = topic(&store, thread);
-    let done = s.act(
-        Action::writing("read", format!("unread “{title}”"), move |tx| {
-            for m in &marks {
-                mark_unread_tx(tx, *m)?;
+    Ok(Prepared::Edit(
+        Edit::writing("read", format!("unread “{title}”"), move |tx| {
+            for mail in &marks {
+                let unread: bool =
+                    tx.query_row("SELECT unread FROM message WHERE id=?", [mail], |r| {
+                        r.get(0)
+                    })?;
+                if unread {
+                    return Err(changed());
+                }
             }
-            Ok(())
+            for mail in &marks {
+                mark_unread_tx(tx, *mail)?;
+            }
+            Ok(json!({"thread": thread, "letters": n}))
         })
         .claiming(intents),
-    );
-    done.ok_or_else(|| kernel::tools::refused(s))?;
-    Ok(json!({"thread": thread, "letters": n}))
+    ))
 }
 
 /// The mirror of [`model::mark_read_tx`]. Intent only, like its twin: the
@@ -517,15 +597,24 @@ impl kernel::history::Intent for MarkUnread {
 /// The draft row is written the way a keystroke writes it — straight through
 /// the store, not as an action — because typing is the future editor's local
 /// undo, not the workspace's. What is undoable here is the panel.
-fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
-    let d = Draft {
+fn draft(s: &mut Session, input: &Value) -> Result<Prepare, String> {
+    let draft = Draft {
         to: text(input, "to")?.to_string(),
         subject: text(input, "subject")?.to_string(),
         body: text(input, "body")?.to_string(),
     };
     let seed = match int(input, "re")? {
         Some(id) => {
-            if model::mail(s.store(), id).is_none() {
+            let exists: bool = s
+                .store()
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM message WHERE id=?)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
                 return Err(format!("no letter at {id} to answer"));
             }
             Seed::Reply(id)
@@ -536,8 +625,6 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
         .focus()
         .ok_or("no panel has focus, so there is nowhere to put the sheet")?;
     let id = Compose::id(seed);
-    // A blank compose may well be open already; the sheet this call made is
-    // the slot that was not there a moment ago.
     let before: Vec<SlotId> = s.showing(&id);
     s.nav(Nav::Preview {
         from,
@@ -548,11 +635,33 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
         .into_iter()
         .find(|slot| !before.contains(slot))
         .ok_or("the compose sheet did not open")?;
-    let (key, now) = (i64_of(slot), s.now());
-    s.store()
-        .write(move |c| model::upsert_draft_tx(c, key, seed, &d, now))
-        .map_err(|e| e.to_string())?;
-    Ok(json!({"slot": slot}))
+    let key = i64_of(slot);
+    Ok(Box::new(move |world| {
+        Box::pin(async move {
+            let now = world.now();
+            let edit = Edit::writing("draft", "write mail draft", move |tx| {
+                // The sheet was opened before preparation. Typing in that new
+                // sheet takes precedence over the agent's initial draft.
+                if model::draft_any_in(tx, key)?.is_some() {
+                    return Err(changed());
+                }
+                if let Some(source) = seed.source() {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM message WHERE id=?)",
+                        [source],
+                        |r| r.get(0),
+                    )?;
+                    if !exists {
+                        return Err(changed());
+                    }
+                }
+                model::upsert_draft_tx(tx, key, seed, &draft, now)?;
+                Ok(json!({"slot": slot}))
+            })
+            .record_if(|_| false);
+            Ok(Prepared::Edit(edit))
+        })
+    }))
 }
 
 /// The send: the draft as it stands, an outbox row that comes due after the
@@ -560,50 +669,106 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// by slot instead of by button. One action, so one undo takes the letter
 /// back and the panel with it, until the sender has taken the row
 /// ([`Sent::blocked`](super::effects::Sent)).
-fn send(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn send(s: &mut Session, input: &Value) -> Result<Prepare, String> {
     let slot = int(input, "slot")?.ok_or("`slot` must be an integer")?;
     let slot = SlotId::try_from(slot).map_err(|_| format!("no compose panel at slot {slot}"))?;
-    let key = i64_of(slot);
-    let (draft, seed) = model::draft_any(s.store(), key)
-        .ok_or("there is no draft in that slot — write one with mail.draft first")?;
-    if draft.to.trim().is_empty() {
-        return Err("no recipient".to_string());
-    }
-    let title = title_of(s, slot, seed);
-    let delay = model::send_delay();
-    let (now, after) = (s.now(), s.now() + delay);
-    // The sheet goes with the send, as it does when a person presses the
-    // button — and stays put when the panel was already closed.
-    let open = s.panel(slot).is_some();
-    let done = s.act(
-        Action::writing("send", format!("send “{title}”"), move |tx| {
-            model::upsert_draft_tx(tx, key, seed, &draft, now)?;
-            model::file_send_tx(tx, key, after)
-        })
-        .about(outbox_entity(key))
-        .claiming(vec![Box::new(Sent { slot: key, delay })])
-        .moving(move |wm| {
-            if open {
-                wm.close(slot);
+    let captured = if let Some(panel) = s.panel(slot) {
+        let mut panel = panel.borrow_mut();
+        let title = panel.title();
+        let compose = panel
+            .as_any()
+            .downcast_mut::<Compose>()
+            .ok_or("there is no draft in that slot — write one with mail.draft first")?;
+        let (draft, seed, hold) = compose.hold_send()?;
+        Some((draft, seed, title, hold))
+    } else {
+        None
+    };
+    Ok(Box::new(move |world| {
+        Box::pin(async move {
+            let key = i64_of(slot);
+            // Staging flushed any latest coalesced UI text. A prepared send may
+            // read only after that accepted save has passed through the writer.
+            let stored = if world.factory().is_some() {
+                world
+                    .store()
+                    .flush_async()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                world
+                    .store()
+                    .db()
+                    .read_async(move |conn| model::draft_any_in(conn, key))
+                    .await
+                    .map_err(|e| e.to_string())?
+            } else {
+                model::draft_any_in(world.store().conn(), key).map_err(|e| e.to_string())?
+            };
+            let (draft, seed) =
+                stored.ok_or("there is no draft in that slot — write one with mail.draft first")?;
+            if draft.to.trim().is_empty() {
+                return Err("no recipient".into());
             }
-        }),
-    );
-    done.ok_or_else(|| kernel::tools::refused(s))?;
-    Ok(json!({"outbox": key, "sending_in": delay}))
+            let (title, hold) = if let Some((shown, source, title, hold)) = captured {
+                if shown != draft || source != seed {
+                    return Err("the draft changed before sending; review it again".into());
+                }
+                (title, Some(hold))
+            } else {
+                (title_of(world.store(), seed), None)
+            };
+            let delay = model::send_delay();
+            let now = world.now();
+            let clock = world.factory().map(|factory| factory.clock());
+            Ok(Prepared::Edit(
+                Edit::writing("send", format!("send “{title}”"), move |tx| {
+                    if model::draft_any_in(tx, key)? != Some((draft.clone(), seed)) {
+                        return Err(changed());
+                    }
+                    model::file_send_tx(
+                        tx,
+                        key,
+                        clock.as_ref().map_or(now, |clock| clock.read()) + delay,
+                    )?;
+                    Ok(json!({"outbox": key, "sending_in": delay}))
+                })
+                .about(outbox_entity(key))
+                .claiming(vec![Box::new(Sent { slot: key, delay })])
+                .on_commit(move |_| {
+                    Box::new(move |session| {
+                        // The hold identifies this exact sheet even if navigation
+                        // replaced another compose into the same slot meanwhile.
+                        let close = hold.as_ref().is_some_and(|hold| {
+                            session.panel(slot).is_some_and(|panel| {
+                                panel
+                                    .borrow_mut()
+                                    .as_any()
+                                    .downcast_mut::<Compose>()
+                                    .is_some_and(|compose| compose.holds(hold))
+                            })
+                        });
+                        if close {
+                            session.nav_within(Nav::Close {
+                                slot,
+                                label: Some(title),
+                            });
+                        }
+                        drop(hold);
+                    })
+                }),
+            ))
+        })
+    }))
 }
 
 /// What the sheet is called: the panel's own title while it is open, and the
 /// same sentence derived from the seed once it has closed.
-fn title_of(s: &Session, slot: SlotId, seed: Seed) -> String {
-    if let Some(inst) = s.panel(slot) {
-        let title = inst.borrow().title();
-        return title;
-    }
+fn title_of(store: &Store, seed: Seed) -> String {
     match seed {
         Seed::Blank => "new mail".to_string(),
-        Seed::Reply(id) => model::mail(s.store(), id)
+        Seed::Reply(id) => model::mail(store, id)
             .map_or_else(|| "new mail".into(), |m| format!("re: {}", m.head.subject)),
-        Seed::Forward(id) => model::mail(s.store(), id)
+        Seed::Forward(id) => model::mail(store, id)
             .map_or_else(|| "new mail".into(), |m| format!("fwd: {}", m.head.subject)),
     }
 }

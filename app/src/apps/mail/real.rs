@@ -26,10 +26,12 @@ use super::caps::{
 };
 use super::oauth;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Mail's real capabilities for one world. One IMAP session per account and
-/// one submission transport per send; both live on the thread that built the
-/// world, which is what [`Worker::claims`](kernel::app::Worker::claims) keeps
-/// a job on.
+/// one submission transport per send. Each worker owns its sessions on the
+/// local executor; [`Worker::claims`](kernel::app::Worker::claims) routes jobs
+/// to the worker for that account.
 pub fn install(env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Imap>(Box::new(RealServers::default()));
     caps.insert::<dyn Smtp>(Box::new(RealServers::default()));
@@ -50,38 +52,36 @@ impl RealServers {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Imap for RealServers {
     /// The session this account already has, if the server still has it —
     /// a `NOOP` is one round trip and says so. A pass a minute, and the
     /// batches a backfill takes, must not be a sign-in each: providers
     /// count logins, and Gmail counts them narrowly.
-    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
-        if self
-            .sessions
-            .get_mut(&account)
-            .is_some_and(session::Imap::alive)
-        {
-            return Ok(());
+    async fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+        if let Some(session) = self.sessions.get_mut(&account) {
+            if session.alive().await { return Ok(()); }
         }
         self.sessions.remove(&account);
-        let s = session::connect(&c.host, &c.user, &c.auth)?;
+        let s = tokio::time::timeout(CONNECT_TIMEOUT, session::connect(&c.host, &c.user, &c.auth)).await
+            .map_err(|_| "IMAP connection timed out".to_string())??;
         self.sessions.insert(account, s);
         Ok(())
     }
 
-    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
-        self.session(account)?.folders()
+    async fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
+        self.session(account)?.folders().await
     }
 
-    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
-        self.session(account)?.select(folder)
+    async fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
+        self.session(account)?.select(folder).await
     }
 
-    fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
-        self.session(account)?.fetch_from(folder, from)
+    async fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+        self.session(account)?.fetch_from(folder, from).await
     }
 
-    fn fetch_uids(
+    async fn fetch_uids(
         &mut self,
         account: i64,
         folder: &str,
@@ -90,10 +90,10 @@ impl Imap for RealServers {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        self.session(account)?.fetch_set(folder, &seq_set(uids))
+        self.session(account)?.fetch_set(folder, &seq_set(uids)).await
     }
 
-    fn part(
+    async fn part(
         &mut self,
         account: i64,
         folder: &str,
@@ -102,40 +102,40 @@ impl Imap for RealServers {
         section: &str,
     ) -> Result<Vec<u8>, String> {
         let session = self.session(account)?;
-        if session.select(folder)?.uidvalidity != uidvalidity {
+        if session.select(folder).await?.uidvalidity != uidvalidity {
             return Err("mailbox changed; sync before downloading this attachment".into());
         }
-        session.section(uid, section)
+        session.section(uid, section).await
     }
 
-    fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
-        self.session(account)?.uids(folder, which)
+    async fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
+        self.session(account)?.uids(folder, which).await
     }
 
-    fn disconnect(&mut self, account: i64) -> Result<(), String> {
+    async fn disconnect(&mut self, account: i64) -> Result<(), String> {
         // Removed first: whatever `LOGOUT` says, this world is done with the
         // session, and dropping it closes the socket.
         match self.sessions.remove(&account) {
-            Some(mut s) => s.logout(),
+            Some(mut s) => s.logout().await,
             None => Ok(()),
         }
     }
 
-    fn idle(&mut self, account: i64, folder: &str, window: Duration) -> Result<Watched, String> {
-        self.session(account)?.idle(folder, window)
+    async fn idle(&mut self, account: i64, folder: &str, window: Duration, retirement: &kernel::app::Retirement) -> Result<Watched, String> {
+        self.session(account)?.idle(folder, window, retirement).await
     }
 
-    fn move_uid(
+    async fn move_uid(
         &mut self,
         account: i64,
         from: &str,
         to: &str,
         uid: u32,
     ) -> Result<Option<u32>, String> {
-        self.session(account)?.move_uid(from, to, uid)
+        self.session(account)?.move_uid(from, to, uid).await
     }
 
-    fn store_flag(
+    async fn store_flag(
         &mut self,
         account: i64,
         folder: &str,
@@ -143,22 +143,27 @@ impl Imap for RealServers {
         flag: MailFlag,
         on: bool,
     ) -> Result<(), String> {
-        self.session(account)?.store_flag(folder, uid, flag, on)
+        self.session(account)?.store_flag(folder, uid, flag, on).await
     }
 
-    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
-        self.session(account)?.append(folder, raw)
+    async fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
+        self.session(account)?.append(folder, raw).await
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Smtp for RealServers {
-    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
+    async fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
         use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-        use lettre::{SmtpTransport, Transport};
+        use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
         let s = |e: &dyn std::fmt::Display| format!("{e}");
-        let msg = rfc822(&c.user, m)?;
-        let raw = msg.formatted();
-        let mut relay = SmtpTransport::relay(&c.host)
+        let (from, outgoing) = (c.user.clone(), m.clone());
+        let (msg, raw) = kernel::runtime::spawn_blocking(move || {
+            let message = rfc822(&from, &outgoing)?;
+            let raw = message.formatted();
+            Ok::<_, String>((message, raw))
+        }).await.map_err(|e| e.to_string())??;
+        let mut relay = AsyncSmtpTransport::<Tokio1Executor>::relay(&c.host)
             .map_err(|e| s(&e))?
             .credentials(Credentials::new(c.user.clone(), c.secret().to_string()));
         // A bearer token is not a password: offered PLAIN, Gmail's SMTP
@@ -167,7 +172,7 @@ impl Smtp for RealServers {
         if c.auth.is_bearer() {
             relay = relay.authentication(vec![Mechanism::Xoauth2]);
         }
-        relay.build().send(&msg).map_err(|e| s(&e))?;
+        relay.build().send(msg).await.map_err(|e| s(&e))?;
         Ok(raw)
     }
 }
@@ -246,8 +251,9 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
 // -- the grant -------------------------------------------------------------
 
 pub use crate::identity::Tokens as RealOAuth;
+#[async_trait::async_trait(?Send)]
 impl OAuth for RealOAuth {
-    fn access_token(&mut self,email:&str)->Result<String,String>{self.access(email)}
+    async fn access_token(&mut self,email:&str)->Result<String,String>{self.access(email).await}
 }
 
 // -- the roles a server advertises -----------------------------------------
@@ -318,13 +324,42 @@ mod session {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::time::Duration;
 
-    use imap::extensions::idle::WaitOutcome;
-    use imap::types::UnsolicitedResponse;
+    use futures_util::TryStreamExt;
+    use async_imap::extensions::idle::IdleResponse;
 
-    type ImapSession = imap::Session<Box<dyn imap::ImapConnection>>;
+
+    trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug> Connection for T {}
+    /// IMAP commands end at their tagged completion; closing a persistent
+    /// connection cannot finish a command or prove that NOOP succeeded.
+    #[derive(Debug)]
+    struct ImapIo<S>(S);
+
+    impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ImapIo<S> {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let available = buf.remaining();
+            match std::pin::Pin::new(&mut self.0).poll_read(cx, buf) {
+                std::task::Poll::Ready(Ok(())) if available > 0 && buf.filled().len() == before => std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "IMAP connection closed before command completion"))),
+                result => result,
+            }
+        }
+    }
+
+    impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ImapIo<S> {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, bytes: &[u8]) -> std::task::Poll<std::io::Result<usize>> { std::pin::Pin::new(&mut self.0).poll_write(cx, bytes) }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::pin::Pin::new(&mut self.0).poll_flush(cx) }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::pin::Pin::new(&mut self.0).poll_shutdown(cx) }
+    }
+
+    fn client(stream: impl Connection + 'static) -> async_imap::Client<Box<dyn Connection>> {
+        async_imap::Client::new(Box::new(ImapIo(stream)) as Box<dyn Connection>)
+    }
+
+    type ImapSession = async_imap::Session<Box<dyn Connection>>;
 
     pub struct Imap {
-        session: ImapSession,
+        session: Option<ImapSession>,
         selected: Option<String>,
         /// Whether this server offers `IDLE`, asked once. `CAPABILITY` is a
         /// round trip, and the answer does not change inside a session.
@@ -359,8 +394,8 @@ mod session {
     /// flags are permanent" (RFC 3501 §7.1). Between a mark kept local on a
     /// server that said nothing and a mark taken and forgotten by one that
     /// said `()`, keep it local.
-    pub(super) fn keeps_keywords(permanent: &[imap::types::Flag<'_>]) -> bool {
-        use imap::types::Flag;
+    pub(super) fn keeps_keywords(permanent: &[async_imap::types::Flag<'_>]) -> bool {
+        use async_imap::types::Flag;
         permanent.iter().any(|f| match f {
             Flag::MayCreate => true,
             Flag::Custom(k) => k.eq_ignore_ascii_case(FORWARDED),
@@ -377,14 +412,9 @@ mod session {
     /// read, or *this* app just did — its own `STORE` comes back on this
     /// connection — and a pass for that would be a pull per mark. The
     /// interval carries flags, as it did before there was a watch.
-    pub(super) fn worth_a_pass(r: &UnsolicitedResponse) -> bool {
-        matches!(
-            r,
-            UnsolicitedResponse::Exists(_)
-                | UnsolicitedResponse::Recent(_)
-                | UnsolicitedResponse::Expunge(_)
-                | UnsolicitedResponse::Bye { .. }
-        )
+    pub(super) fn worth_a_pass(r: &imap_proto::Response<'_>) -> bool {
+        use imap_proto::{Response, MailboxDatum, Status};
+        matches!(r, Response::MailboxData(MailboxDatum::Exists(_) | MailboxDatum::Recent(_)) | Response::Expunge(_) | Response::Data { status: Status::Bye, .. })
     }
 
     /// The SASL exchange for `AUTHENTICATE XOAUTH2`.
@@ -407,9 +437,9 @@ mod session {
         refused: std::cell::RefCell<Option<String>>,
     }
 
-    impl imap::Authenticator for XOAuth2 {
+    impl async_imap::Authenticator for &mut XOAuth2 {
         type Response = String;
-        fn process(&self, challenge: &[u8]) -> String {
+        fn process(&mut self, challenge: &[u8]) -> String {
             if challenge.is_empty() {
                 return super::oauth::xoauth2(&self.user, &self.token);
             }
@@ -423,17 +453,24 @@ mod session {
     /// # Errors
     ///
     /// If the server is unreachable or refuses the credentials.
-    pub fn connect(host: &str, user: &str, auth: &Auth) -> Result<Imap, String> {
-        let client = imap::ClientBuilder::new(host, 993).connect().map_err(s)?;
+    pub async fn connect(host: &str, user: &str, auth: &Auth) -> Result<Imap, String> {
+        let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions().map_err(s)?.with_root_certificates(roots).with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(s)?;
+        let socket = tokio::net::TcpStream::connect((host, 993)).await.map_err(s)?;
+        let socket = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)).connect(name, socket).await.map_err(s)?;
+        let mut client = client(socket);
+        client.read_response().await.map_err(s)?.ok_or("IMAP server closed before greeting")?;
         let session = match auth {
-            Auth::Password(pass) => client.login(user, pass).map_err(|e| s(e.0))?,
+            Auth::Password(pass) => client.login(user, pass).await.map_err(|e| s(e.0))?,
             Auth::Bearer(token) => {
-                let sasl = XOAuth2 {
+                let mut sasl = XOAuth2 {
                     user: user.to_string(),
                     token: token.clone(),
                     refused: std::cell::RefCell::new(None),
                 };
-                match client.authenticate("XOAUTH2", &sasl) {
+                match client.authenticate("XOAUTH2", &mut sasl).await {
                     Ok(session) => session,
                     Err((e, _)) => {
                         let why = sasl.refused.into_inner();
@@ -446,21 +483,24 @@ mod session {
             }
         };
         Ok(Imap {
-            session,
+            session: Some(session),
             selected: None,
             idle: None,
         })
     }
 
     impl Imap {
+        fn session(&mut self) -> Result<&mut ImapSession, String> {
+            self.session.as_mut().ok_or_else(|| "IMAP session closed".to_string())
+        }
         /// `LOGOUT`, so the server is told rather than left to time the
         /// connection out itself.
-        pub fn logout(&mut self) -> Result<(), String> {
-            self.session.logout().map_err(s)
+        pub async fn logout(&mut self) -> Result<(), String> {
+            self.session()?.logout().await.map_err(s)
         }
 
-        pub fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
-            let mb = self.session.select(name).map_err(s)?;
+        pub async fn select(&mut self, name: &str) -> Result<FolderMeta, String> {
+            let mb = self.session()?.select(name).await.map_err(s)?;
             self.selected = Some(name.to_string());
             Ok(FolderMeta {
                 uidvalidity: mb.uid_validity.unwrap_or(0),
@@ -471,19 +511,34 @@ mod session {
 
         /// Whether the server still has this session. A dead one answers
         /// with an error rather than a lie, which is what makes reuse safe.
-        pub fn alive(&mut self) -> bool {
-            self.session.noop().is_ok()
+        pub async fn alive(&mut self) -> bool {
+            let Some(mut session) = self.session.take() else { return false; };
+            // Reusing a connection has the same finite setup budget as a
+            // new connection. An unanswered read-only NOOP cannot hold worker
+            // retirement forever. Own the stream until its tagged completion:
+            // a timed-out or cancelled probe must never leave it reusable.
+            let alive = matches!(
+                tokio::time::timeout(super::CONNECT_TIMEOUT, session.noop()).await,
+                Ok(Ok(()))
+            );
+            if alive {
+                self.session = Some(session);
+            } else {
+                self.selected = None;
+                self.idle = None;
+            }
+            alive
         }
 
-        fn ensure(&mut self, name: &str) -> Result<(), String> {
+        async fn ensure(&mut self, name: &str) -> Result<(), String> {
             if self.selected.as_deref() != Some(name) {
-                self.select(name)?;
+                self.select(name).await?;
             }
             Ok(())
         }
 
-        pub fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
-            let names = self.session.list(Some(""), Some("*")).map_err(s)?;
+        pub async fn folders(&mut self) -> Result<Vec<RemoteFolder>, String> {
+            let names = self.session()?.list(Some(""), Some("*")).await.map_err(s)?.try_collect::<Vec<_>>().await.map_err(s)?;
             let mut out = Vec::new();
             for n in names.iter() {
                 // The attributes as whole `Debug` renderings, one per entry:
@@ -502,19 +557,19 @@ mod session {
             Ok(out)
         }
 
-        pub fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
-            self.fetch_set(name, &format!("{from}:*"))
+        pub async fn fetch_from(&mut self, name: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+            self.fetch_set(name, &format!("{from}:*")).await
         }
 
         /// Fetch the envelope and MIME structure, then only reading sections.
         /// PEEK keeps both mirroring and attachment downloads from setting Seen.
-        pub fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
+        pub async fn fetch_set(&mut self, name: &str, set: &str) -> Result<Vec<RemoteMail>, String> {
             use super::super::content::FetchPlan;
-            self.ensure(name)?;
+            self.ensure(name).await?;
             let fetches = self
-                .session
-                .uid_fetch(set, "(UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])")
-                .map_err(s)?;
+                .session()?
+                .uid_fetch(set, "(UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])").await
+                .map_err(s)?.try_collect::<Vec<_>>().await.map_err(s)?;
             let mut groups: BTreeMap<Vec<String>, Vec<(RemoteMail, FetchPlan)>> = BTreeMap::new();
             for f in fetches.iter() {
                 let Some(uid) = f.uid else { continue };
@@ -533,10 +588,9 @@ mod session {
                 };
                 let unread = !f
                     .flags()
-                    .iter()
-                    .any(|fl| matches!(fl, imap::types::Flag::Seen));
-                let forwarded = f.flags().iter().any(|fl| {
-                    matches!(fl, imap::types::Flag::Custom(k)
+                    .any(|fl| matches!(fl, async_imap::types::Flag::Seen));
+                let forwarded = f.flags().any(|fl| {
+                    matches!(fl, async_imap::types::Flag::Custom(k)
                             if k.eq_ignore_ascii_case(FORWARDED))
                 });
                 groups.entry(plan.readings.clone()).or_default().push((
@@ -581,9 +635,9 @@ mod session {
                     // Transport/command failures still fail the fetch; bad
                     // content and omitted sections affect only their UID.
                     let replies = self
-                        .session
-                        .uid_fetch(super::seq_set(&uids), query)
-                        .map_err(s)?;
+                        .session()?
+                        .uid_fetch(super::seq_set(&uids), query).await
+                        .map_err(s)?.try_collect::<Vec<_>>().await.map_err(s)?;
                     for reply in replies.iter() {
                         let Some(uid) = reply.uid.filter(|uid| requested.contains(uid)) else {
                             continue;
@@ -613,12 +667,12 @@ mod session {
             Ok(out)
         }
 
-        pub fn section(&mut self, uid: u32, section: &str) -> Result<Vec<u8>, String> {
+        pub async fn section(&mut self, uid: u32, section: &str) -> Result<Vec<u8>, String> {
             let path = section_path(section)?;
             let replies = self
-                .session
-                .uid_fetch(uid.to_string(), format!("(UID BODY.PEEK[{section}])"))
-                .map_err(s)?;
+                .session()?
+                .uid_fetch(uid.to_string(), format!("(UID BODY.PEEK[{section}])")).await
+                .map_err(s)?.try_collect::<Vec<_>>().await.map_err(s)?;
             replies
                 .iter()
                 .filter(|f| f.uid == Some(uid))
@@ -627,78 +681,114 @@ mod session {
                 .ok_or_else(|| "attachment is no longer on the server".into())
         }
 
-        pub fn uids(&mut self, name: &str, which: UidSet) -> Result<HashSet<u32>, String> {
-            self.ensure(name)?;
+        pub async fn uids(&mut self, name: &str, which: UidSet) -> Result<HashSet<u32>, String> {
+            self.ensure(name).await?;
             let query = match which {
                 UidSet::All => "ALL".to_string(),
                 UidSet::Unseen => "UNSEEN".to_string(),
                 UidSet::Forwarded => format!("KEYWORD {FORWARDED}"),
             };
-            self.session.uid_search(query).map_err(s)
+            self.session()?.uid_search(query).await.map_err(s)
         }
 
         /// One `IDLE`, at most `window` long. The selected mailbox is what
         /// the server reports on, so the folder is selected first and stays
         /// selected after — the next fetch on this session skips its own
         /// `SELECT`.
-        pub fn idle(&mut self, folder: &str, window: Duration) -> Result<Watched, String> {
-            if !self.offers_idle()? {
-                return Ok(Watched::Unsupported);
+        pub async fn idle(&mut self, folder: &str, window: Duration, retirement: &kernel::app::Retirement) -> Result<Watched, String> {
+            if retirement.requested() { return Ok(Watched::Quiet); }
+            let ready = tokio::select! {
+                biased;
+                () = retirement.wait() => None,
+                result = async {
+                    if !self.offers_idle().await? { return Ok(false); }
+                    self.ensure(folder).await?;
+                    Ok::<_, String>(true)
+                } => Some(result),
+            };
+            match ready {
+                None => {
+                    // An unfinished read-only command cannot share a session
+                    // with later commands. Retirement closes this watch's link.
+                    self.session = None;
+                    self.selected = None;
+                    return Ok(Watched::Quiet);
+                }
+                Some(Ok(false)) => return Ok(Watched::Unsupported),
+                Some(result) => { result?; }
             }
-            self.ensure(folder)?;
-            let mut handle = self.session.idle();
-            // Ours, not the crate's: it re-issues in the background and
-            // never comes back, and a wait that never returns is a thread
-            // that cannot notice it has been retired.
-            handle.timeout(window).keepalive(false);
-            let outcome = handle.wait_while(|r| !worth_a_pass(&r)).map_err(s)?;
-            Ok(match outcome {
-                WaitOutcome::MailboxChanged => Watched::Changed,
-                WaitOutcome::TimedOut => Watched::Quiet,
-            })
+            let session = self.session.take().ok_or("IMAP session closed")?;
+            let mut handle = session.idle();
+            tokio::select! {
+                biased;
+                () = retirement.wait() => return Ok(Watched::Quiet),
+                result = tokio::time::timeout(Duration::from_secs(30), handle.init()) => {
+                    result.map_err(|_| "IMAP IDLE start timed out")?.map_err(s)?;
+                }
+            }
+            let deadline = tokio::time::Instant::now() + window;
+            let outcome = loop {
+                let (wait, _interrupt) = handle.wait_with_timeout(window);
+                let response = tokio::select! {
+                    biased;
+                    () = retirement.wait() => break Ok(Watched::Quiet),
+                    response = tokio::time::timeout_at(deadline, wait) => response,
+                };
+                match response {
+                    Err(_) | Ok(Ok(IdleResponse::Timeout)) => break Ok(Watched::Quiet),
+                    Ok(Ok(IdleResponse::ManualInterrupt)) => break Err("IMAP IDLE ended unexpectedly".to_string()),
+                    Ok(Ok(IdleResponse::NewData(data))) => {
+                        if worth_a_pass(data.parsed()) {
+                            break Ok(Watched::Changed);
+                        }
+                    }
+                    Ok(Err(e)) => break Err(s(e)),
+                }
+            };
+            // DONE is acknowledged before the connection can serve another command.
+            self.session = Some(tokio::time::timeout(Duration::from_secs(30), handle.done()).await.map_err(|_| "IMAP IDLE completion timed out")?.map_err(s)?);
+            outcome
         }
 
-        fn offers_idle(&mut self) -> Result<bool, String> {
+        async fn offers_idle(&mut self) -> Result<bool, String> {
             if let Some(known) = self.idle {
                 return Ok(known);
             }
-            let yes = self.session.capabilities().map_err(s)?.has_str("IDLE");
+            let yes = self.session()?.capabilities().await.map_err(s)?.has_str("IDLE");
             self.idle = Some(yes);
             Ok(yes)
         }
 
-        pub fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String> {
-            self.ensure(from)?;
-            self.session.uid_mv(uid.to_string(), to).map_err(s)?;
+        pub async fn move_uid(&mut self, from: &str, to: &str, uid: u32) -> Result<Option<u32>, String> {
+            self.ensure(from).await?;
+            self.session()?.uid_mv(uid.to_string(), to).await.map_err(s)?;
             // The crate acks the MOVE but does not surface COPYUID; the new
             // uid arrives via Message-ID adoption on the next fetch.
             Ok(None)
         }
 
-        pub fn store_flag(
+        pub async fn store_flag(
             &mut self,
             folder: &str,
             uid: u32,
             flag: MailFlag,
             on: bool,
         ) -> Result<(), String> {
-            self.ensure(folder)?;
+            self.ensure(folder).await?;
             let name = match flag {
                 MailFlag::Seen => "\\Seen",
                 MailFlag::Forwarded => FORWARDED,
             };
             let sign = if on { '+' } else { '-' };
-            self.session
-                .uid_store(uid.to_string(), format!("{sign}FLAGS ({name})"))
-                .map_err(s)?;
+            self.session()?
+                .uid_store(uid.to_string(), format!("{sign}FLAGS ({name})")).await
+                .map_err(s)?.try_collect::<Vec<_>>().await.map_err(s)?;
             Ok(())
         }
 
-        pub fn append(&mut self, folder: &str, raw: &[u8]) -> Result<(), String> {
-            self.session
-                .append(folder, raw)
-                .flag(imap::types::Flag::Seen)
-                .finish()
+        pub async fn append(&mut self, folder: &str, raw: &[u8]) -> Result<(), String> {
+            self.session()?
+                .append(folder, Some("\\Seen"), None, raw).await
                 .map_err(s)?;
             Ok(())
         }
@@ -707,8 +797,8 @@ mod session {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::{TcpListener, TcpStream};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
 
         const TEXT: &str = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)";
         const MIXED: &str = "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1)(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"file.bin\") NIL NIL \"BASE64\" 8) \"MIXED\" (\"BOUNDARY\" \"x\"))";
@@ -720,39 +810,33 @@ mod session {
             format!("* {uid} FETCH (UID {uid} FLAGS () BODYSTRUCTURE {structure} BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len())
         }
 
-        fn scripted(steps: Vec<(&'static str, String)>) -> (Imap, std::thread::JoinHandle<()>) {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        async fn scripted(steps: Vec<(&'static str, String)>) -> (Imap, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
                 let mut io = BufReader::new(socket);
-                io.get_mut().write_all(b"* OK test server\r\n").unwrap();
+                io.get_mut().write_all(b"* OK test server\r\n").await.unwrap();
                 for (expected, reply) in
                     std::iter::once(("LOGIN \"test\" \"password\"", String::new())).chain(steps)
                 {
                     let mut line = String::new();
-                    io.read_line(&mut line).unwrap();
+                    io.read_line(&mut line).await.unwrap();
                     let (tag, command) = line.trim_end().split_once(' ').expect("command with tag");
                     assert_eq!(command, expected);
-                    write!(io.get_mut(), "{reply}{tag} OK completed\r\n").unwrap();
+                    io.get_mut().write_all(format!("{reply}{tag} OK completed\r\n").as_bytes()).await.unwrap();
                 }
             });
-            let socket = TcpStream::connect(address).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut client = imap::Client::new(Box::new(socket) as Box<dyn imap::ImapConnection>);
-            client.read_greeting().unwrap();
+            let socket = TcpStream::connect(address).await.unwrap();
+            let mut client = client(socket);
+            client.read_response().await.unwrap().unwrap();
             let session = client
-                .login("test", "password")
+                .login("test", "password").await
                 .map_err(|(e, _)| e)
                 .unwrap();
             (
                 Imap {
-                    session,
+                    session: Some(session),
                     selected: None,
                     idle: None,
                 },
@@ -760,10 +844,191 @@ mod session {
             )
         }
 
+        async fn idle_adapter(changed: bool, entered: Option<tokio::sync::oneshot::Sender<()>>) -> (Imap, tokio::task::JoinHandle<()>) {
+            let (client, server) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let mut io = BufReader::new(server);
+                io.get_mut().write_all(b"* OK test server\r\n").await.unwrap();
+                for (expected, reply) in [
+                    ("LOGIN \"test\" \"password\"", ""),
+                    ("CAPABILITY", "* CAPABILITY IMAP4rev1 IDLE\r\n"),
+                    ("SELECT \"INBOX\"", SELECTED),
+                ] {
+                    let mut line = String::new();
+                    io.read_line(&mut line).await.unwrap();
+                    let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                    assert_eq!(command, expected);
+                    io.get_mut().write_all(format!("{reply}{tag} OK completed\r\n").as_bytes()).await.unwrap();
+                }
+                let mut line = String::new();
+                io.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert_eq!(command, "IDLE");
+                let tag = tag.to_owned();
+                io.get_mut().write_all(b"+ idling\r\n* 1 FETCH (FLAGS (\\Seen))\r\n").await.unwrap();
+                if changed { io.get_mut().write_all(b"* 2 EXISTS\r\n").await.unwrap(); }
+                if let Some(entered) = entered { let _ = entered.send(()); }
+                line.clear();
+                io.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "DONE\r\n");
+                io.get_mut().write_all(format!("{tag} OK idle finished\r\n").as_bytes()).await.unwrap();
+                line.clear();
+                io.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert_eq!(command, "NOOP");
+                io.get_mut().write_all(format!("{tag} OK alive\r\n").as_bytes()).await.unwrap();
+            });
+            let mut client = super::client(client);
+            client.read_response().await.unwrap().unwrap();
+            let session = client.login("test", "password").await.map_err(|(e, _)| e).unwrap();
+            (Imap { session: Some(session), selected: None, idle: None }, server)
+        }
+
+        #[tokio::test]
+        async fn idle_filters_flags_and_completes_done_before_reusing_the_connection() {
+            let (mut adapter, server) = idle_adapter(true, None).await;
+            assert_eq!(adapter.idle("INBOX", Duration::from_secs(1), &kernel::app::Retirement::default()).await.unwrap(), Watched::Changed);
+            assert!(adapter.alive().await);
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn idle_expires_without_blocking_the_executor() {
+            let (mut adapter, server) = idle_adapter(false, None).await;
+            let pulse = tokio::spawn(async { tokio::time::sleep(Duration::from_millis(1)).await; 1 });
+            assert_eq!(adapter.idle("INBOX", Duration::from_millis(10), &kernel::app::Retirement::default()).await.unwrap(), Watched::Quiet);
+            assert!(pulse.is_finished(), "IDLE must yield to other tasks");
+            assert_eq!(pulse.await.unwrap(), 1);
+            assert!(adapter.alive().await);
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn retiring_an_idle_watch_sends_done_before_returning_the_live_session() {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (mut adapter, server) = idle_adapter(false, Some(entered)).await;
+            let retirement = kernel::app::Retirement::default();
+            let result = {
+                use futures_util::FutureExt;
+                let idle = adapter.idle("INBOX", Duration::from_secs(5 * 60), &retirement);
+                tokio::pin!(idle);
+                tokio::select! {
+                    result = &mut idle => panic!("the quiet server must keep IDLE pending: {result:?}"),
+                    result = started => result.unwrap(),
+                }
+                // The server has made '+ idling' available. Consume it before
+                // retiring, so this exercises DONE rather than setup cancellation.
+                assert!(idle.as_mut().now_or_never().is_none());
+                retirement.request();
+                tokio::time::timeout(Duration::from_secs(2), idle).await
+                    .expect("retirement must interrupt the five-minute passive wait").unwrap()
+            };
+            assert_eq!(result, Watched::Quiet);
+            assert!(adapter.alive().await, "DONE must complete before the connection is reused");
+            server.await.unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unanswered_liveness_probe_expires_and_discards_the_connection() {
+            use futures_util::FutureExt;
+            use tokio::io::AsyncReadExt;
+
+            let (socket, server) = tokio::io::duplex(4096);
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut io = BufReader::new(server);
+                io.get_mut().write_all(b"* OK test server\r\n").await.unwrap();
+                let mut line = String::new();
+                io.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert_eq!(command, "LOGIN \"test\" \"password\"");
+                io.get_mut().write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
+                line.clear();
+                io.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim_end().split_once(' ').unwrap().1, "NOOP");
+                // An unsolicited update is not the command's tagged reply.
+                io.get_mut().write_all(b"* 2 EXISTS\r\n").await.unwrap();
+                entered.send(()).unwrap();
+                let mut remaining = Vec::new();
+                io.read_to_end(&mut remaining).await.unwrap();
+                assert!(remaining.is_empty(), "the incomplete probe closes instead of issuing another command");
+            });
+            let mut client = super::client(socket);
+            client.read_response().await.unwrap().unwrap();
+            let session = client.login("test", "password").await.map_err(|(error, _)| error).unwrap();
+            let mut adapter = Imap {
+                session: Some(session), selected: Some("INBOX".into()), idle: Some(true),
+            };
+            {
+                let probe = adapter.alive();
+                tokio::pin!(probe);
+                tokio::select! {
+                    result = &mut probe => panic!("unanswered NOOP completed early: {result}"),
+                    result = started => result.unwrap(),
+                }
+                tokio::time::advance(super::super::CONNECT_TIMEOUT - Duration::from_secs(1)).await;
+                assert!(probe.as_mut().now_or_never().is_none());
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert!(!tokio::time::timeout(Duration::from_secs(1), probe).await
+                    .expect("liveness must stop waiting at the connection deadline"));
+            }
+            assert!(adapter.session.is_none());
+            assert!(adapter.selected.is_none());
+            assert!(adapter.idle.is_none());
+            assert!(!adapter.alive().await, "the unacknowledged session is never reused");
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn retirement_closes_silent_read_only_watch_setup() {
+            use tokio::io::AsyncReadExt;
+            for silent in ["CAPABILITY", "SELECT \"INBOX\"", "IDLE"] {
+                let (socket, server) = tokio::io::duplex(4096);
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let mut io = BufReader::new(server);
+                    io.get_mut().write_all(b"* OK test server\r\n").await.unwrap();
+                    for (expected, reply) in [
+                        ("LOGIN \"test\" \"password\"", ""),
+                        ("CAPABILITY", "* CAPABILITY IMAP4rev1 IDLE\r\n"),
+                        ("SELECT \"INBOX\"", SELECTED),
+                        ("IDLE", ""),
+                    ] {
+                        let mut line = String::new();
+                        io.read_line(&mut line).await.unwrap();
+                        let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                        assert_eq!(command, expected);
+                        if command == silent {
+                            entered.send(()).unwrap();
+                            let mut rest = Vec::new();
+                            io.read_to_end(&mut rest).await.unwrap();
+                            assert!(rest.is_empty(), "an incomplete setup closes its connection");
+                            return;
+                        }
+                        io.get_mut().write_all(format!("{reply}{tag} OK completed\r\n").as_bytes()).await.unwrap();
+                    }
+                });
+                let mut client = super::client(socket);
+                client.read_response().await.unwrap().unwrap();
+                let session = client.login("test", "password").await.map_err(|(error, _)| error).unwrap();
+                let mut adapter = Imap { session: Some(session), selected: None, idle: None };
+                let retirement = kernel::app::Retirement::default();
+                let stop = retirement.clone();
+                let retiring = tokio::spawn(async move { started.await.unwrap(); stop.request(); });
+                let result = tokio::time::timeout(Duration::from_secs(2),
+                    adapter.idle("INBOX", Duration::from_secs(5 * 60), &retirement)).await
+                    .expect("silent setup must not keep the closing app alive").unwrap();
+                assert_eq!(result, Watched::Quiet);
+                assert!(adapter.session.is_none(), "retirement discards an unacknowledged command");
+                retiring.await.unwrap();
+                server.await.unwrap();
+            }
+        }
+
         /// Any eager attachment fetch fails the command assertion before
         /// the server provides those bytes.
-        #[test]
-        fn sync_fetches_readings_and_a_download_fetches_only_its_section() {
+        #[tokio::test]
+        async fn sync_fetches_readings_and_a_download_fetches_only_its_section() {
             let (mut adapter, server) = scripted(vec![
                 ("SELECT \"INBOX\"", SELECTED.into()),
                 (
@@ -778,20 +1043,20 @@ mod session {
                     "UID FETCH 42 (UID BODY.PEEK[2])",
                     "* 1 FETCH (UID 42 BODY[2] {8}\r\naGVsbG8=)\r\n".into(),
                 ),
-            ]);
-            let mails = adapter.fetch_set("INBOX", "42").unwrap();
+            ]).await;
+            let mails = adapter.fetch_set("INBOX", "42").await.unwrap();
             assert_eq!(mails.len(), 1);
             assert!(mails[0].unread);
             let parsed = super::super::super::sync::parse_mail(&mails[0].raw).unwrap();
             assert_eq!(parsed.body, "hello");
             assert_eq!(parsed.attachments[0].name, "file.bin");
-            assert_eq!(adapter.section(42, "2").unwrap(), b"aGVsbG8=");
-            assert!(adapter.section(42, "2] BODY[]").is_err());
-            server.join().unwrap();
+            assert_eq!(adapter.section(42, "2").await.unwrap(), b"aGVsbG8=");
+            assert!(adapter.section(42, "2] BODY[]").await.is_err());
+            server.await.unwrap();
         }
 
-        #[test]
-        fn quoted_printable_html_is_fetched_as_the_message_body() {
+        #[tokio::test]
+        async fn quoted_printable_html_is_fetched_as_the_message_body() {
             let body = "<p>caf=C3=A9</p>";
             let structure = format!(
                 "(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"QUOTED-PRINTABLE\" {} 1)",
@@ -807,19 +1072,19 @@ mod session {
                     "UID FETCH 42 (UID BODY.PEEK[1])",
                     format!("* 1 FETCH (UID 42 BODY[1] {{{}}}\r\n{body})\r\n", body.len()),
                 ),
-            ]);
-            let mails = adapter.fetch_set("INBOX", "42").unwrap();
+            ]).await;
+            let mails = adapter.fetch_set("INBOX", "42").await.unwrap();
             assert_eq!(mails.len(), 1);
             assert!(mails[0].unread);
             let parsed = super::super::super::sync::parse_mail(&mails[0].raw).unwrap();
             assert_eq!(parsed.body, "café");
             assert_eq!(parsed.html.as_deref(), Some("<p>café</p>"));
             assert!(parsed.attachments.is_empty());
-            server.join().unwrap();
+            server.await.unwrap();
         }
 
-        #[test]
-        fn readings_are_batched_by_section_list_and_matched_by_uid() {
+        #[tokio::test]
+        async fn readings_are_batched_by_section_list_and_matched_by_uid() {
             // Two hundred common layouts cost one reading fetch. A second
             // layout costs one more, and a standalone file costs neither.
             let mut headers = (1..=200)
@@ -848,8 +1113,8 @@ mod session {
                     "UID FETCH 201:202 (UID BODY.PEEK[1] BODY.PEEK[2])",
                     alternatives,
                 ),
-            ]);
-            let mails = adapter.fetch_set("INBOX", "1:203").unwrap();
+            ]).await;
+            let mails = adapter.fetch_set("INBOX", "1:203").await.unwrap();
             assert_eq!(mails.len(), 203);
             for m in &mails[..200] {
                 let parsed = super::super::super::sync::parse_mail(&m.raw).unwrap();
@@ -865,11 +1130,11 @@ mod session {
                 super::super::super::sync::parse_mail(&mails[202].raw).unwrap().attachments[0].mime,
                 "application/pdf"
             );
-            server.join().unwrap();
+            server.await.unwrap();
         }
 
-        #[test]
-        fn unusable_responses_do_not_discard_good_mail_or_stop_later_folders() {
+        #[tokio::test]
+        async fn unusable_responses_do_not_discard_good_mail_or_stop_later_folders() {
             let mut headers = format!("* 1 FETCH (UID 1 BODYSTRUCTURE {TEXT})\r\n");
             headers += &metadata(2, TEXT).replace(&format!("BODYSTRUCTURE {TEXT} "), "");
             headers += &metadata(3, TEXT);
@@ -883,23 +1148,23 @@ mod session {
                 ("SELECT \"Archive\"", SELECTED.into()),
                 ("UID FETCH 1 (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", metadata(1, TEXT)),
                 ("UID FETCH 1 (UID BODY.PEEK[1])", "* 1 FETCH (UID 1 BODY[1] {5}\r\nlater)\r\n".into()),
-            ]);
-            let mails = adapter.fetch_set("INBOX", "1:4").unwrap();
+            ]).await;
+            let mails = adapter.fetch_set("INBOX", "1:4").await.unwrap();
             assert_eq!(mails.iter().map(|m| m.uid).collect::<Vec<_>>(), [4]);
             assert_eq!(
                 super::super::super::sync::parse_mail(&mails[0].raw).unwrap().body,
                 "hello"
             );
-            let later = adapter.fetch_set("Archive", "1").unwrap();
+            let later = adapter.fetch_set("Archive", "1").await.unwrap();
             assert_eq!(
                 super::super::super::sync::parse_mail(&later[0].raw).unwrap().body,
                 "later"
             );
-            server.join().unwrap();
+            server.await.unwrap();
         }
 
-        #[test]
-        fn a_disconnected_reading_fetch_still_reports_a_transport_error() {
+        #[tokio::test]
+        async fn a_disconnected_reading_fetch_still_reports_a_transport_error() {
             let (mut adapter, server) = scripted(vec![
                 ("SELECT \"INBOX\"", SELECTED.into()),
                 (
@@ -907,9 +1172,9 @@ mod session {
                     metadata(1, TEXT),
                 ),
                 // Close before the reading fetch can finish.
-            ]);
-            assert!(adapter.fetch_set("INBOX", "1").is_err());
-            server.join().unwrap();
+            ]).await;
+            assert!(adapter.fetch_set("INBOX", "1").await.is_err());
+            server.await.unwrap();
         }
     }
 }
@@ -1007,7 +1272,7 @@ mod tests {
     /// a server that said nothing and one that said `()`.
     #[test]
     fn keywords_are_kept_only_where_the_server_says_so() {
-        use imap::types::Flag;
+        use async_imap::types::Flag;
         assert!(session::keeps_keywords(&[Flag::MayCreate]));
         assert!(session::keeps_keywords(&[Flag::Custom("$Forwarded".into())]));
         assert!(session::keeps_keywords(&[Flag::Custom("$forwarded".into())]));
@@ -1021,19 +1286,13 @@ mod tests {
     /// mark.
     #[test]
     fn a_wait_ends_on_mail_and_not_on_a_flag() {
-        use imap::types::UnsolicitedResponse as Said;
-        assert!(session::worth_a_pass(&Said::Exists(3)));
-        assert!(session::worth_a_pass(&Said::Recent(1)));
-        assert!(session::worth_a_pass(&Said::Expunge(2)));
-        assert!(session::worth_a_pass(&Said::Bye {
-            code: None,
-            information: None
-        }));
-        assert!(!session::worth_a_pass(&Said::Fetch {
-            id: 4,
-            attributes: Vec::new()
-        }));
-        assert!(!session::worth_a_pass(&Said::Flags(Vec::new())));
+        let worth = |line: &[u8]| session::worth_a_pass(&imap_proto::parser::parse_response(line).unwrap().1);
+        assert!(worth(b"* 3 EXISTS\r\n"));
+        assert!(worth(b"* 1 RECENT\r\n"));
+        assert!(worth(b"* 2 EXPUNGE\r\n"));
+        assert!(worth(b"* BYE closing\r\n"));
+        assert!(!worth(b"* 4 FETCH (FLAGS (\\Seen))\r\n"));
+        assert!(!worth(b"* FLAGS ()\r\n"));
     }
 
     /// The message a draft goes out as: the threading headers a reply and a

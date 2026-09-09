@@ -17,6 +17,7 @@ use kernel::store::Store;
 pub mod config;
 mod downloads;
 mod history;
+mod media_cache;
 pub mod model;
 pub mod operations;
 pub mod panels;
@@ -119,8 +120,9 @@ impl App for Telegram {
     }
 
     fn poll(&self, s: &mut kernel::session::Session) {
-        if transcript::take_changed(s.store()) { s.redraw(); }
+        if transcript::take_changed(s.store()) || media_cache::take_changed(s.store()) { s.redraw(); }
         let rt = runtime::of(s.store());
+        if rt.poll_writes(s.store()) { s.redraw(); }
         rt.operations.expire(s.store(), std::time::Instant::now());
         if rt.operations.take_changed() {
             let operations = rt.operations.visible();
@@ -147,6 +149,10 @@ impl App for Telegram {
             s.notify(text, error);
             s.redraw();
         }
+    }
+
+    fn flush(&self, _db: std::sync::Arc<kernel::store::Db>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(trace::flush())
     }
 
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {

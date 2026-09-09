@@ -29,7 +29,7 @@ fn id(s: &Session, guid: &str) -> i64 {
 
 fn refresh_pass(s: &Session) {
     for mut worker in RSS.workers(s.store()) {
-        worker.pass(s.world());
+        kernel::runtime::block_on(worker.pass(s.world()));
     }
 }
 
@@ -505,14 +505,13 @@ fn restoring_preserves_an_empty_filter_and_does_not_mark_articles_seen() {
 fn real_feed_can_be_fetched_and_parsed() {
     use sync::Fetch;
     let url = "https://blog.rust-lang.org/feed.xml";
-    let reply = sync::Http::default()
-        .get(&sync::Request {
-            id: 0,
-            url: url.into(),
-            etag: String::new(),
-            modified: String::new(),
-        })
-        .unwrap();
+    let reply = kernel::runtime::block_on(sync::Http::default().get(&sync::Request {
+        id: 0,
+        url: url.into(),
+        etag: String::new(),
+        modified: String::new(),
+    }))
+    .unwrap();
     let sync::Response::Updated { url, bytes, .. } = reply else {
         panic!("first request has content")
     };

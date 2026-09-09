@@ -33,7 +33,16 @@ static Q_TOPICS: Q = Q {
 };
 
 pub fn list(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<Topic>> {
-    store.rows(&Q_TOPICS, &[Val::I(chat)], |r| {
+    store.rows(&Q_TOPICS, &[Val::I(chat)], topic_row)
+}
+
+/// The topic picker can retain its previous snapshot while SQLite refreshes.
+pub fn snapshot(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<Topic>> {
+    store.snapshot_rows_sql_deps(Q_TOPICS.id, Q_TOPICS.describe, Q_TOPICS.sql,
+        &[Val::I(chat)], &[], topic_row)
+}
+
+fn topic_row(r: &rusqlite::Row) -> rusqlite::Result<Topic> {
         Ok(Topic {
             chat: r.get(0)?,
             id: r.get(1)?,
@@ -49,11 +58,13 @@ pub fn list(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<Topic>> {
             pinned: r.get(11)?,
             archived: r.get(12)?,
         })
-    })
 }
 
 pub fn get(store: &Store, chat: PeerId, id: i64) -> Option<Topic> {
-    list(store, chat).iter().find(|t| t.id == id).cloned()
+    let sql = Q_TOPICS.sql.replace("WHERE t.chat = ?1 ORDER BY t.name COLLATE NOCASE, t.id",
+        "WHERE t.chat = ?1 AND t.id = ?2");
+    store.rows_sql("telegram topic", "one forum topic", &sql,
+        &[Val::I(chat), Val::I(id)], topic_row).first().cloned()
 }
 
 pub fn card(store: &Store, chat: PeerId, topic: i64) -> Option<PeerCard> {

@@ -27,6 +27,54 @@ fn snapshot(acc: &sync::Account<FakeTd>, s: &Session, td: &FakeTd, mut message: 
 }
 
 #[test]
+fn a_remote_command_is_refused_while_an_undo_is_still_running() {
+    struct Held {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl kernel::history::Intent for Held {
+        fn describe(&self) -> String { "held undo".into() }
+        fn reverse(&self, _: &kernel::effect::World) -> Result<(), String> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv_timeout(Duration::from_secs(5))
+                .map_err(|e| e.to_string())
+        }
+        fn reapply(&self, _: &kernel::effect::World) -> Result<(), String> { Ok(()) }
+    }
+    let apps = kernel::app::Apps::new(APPS);
+    let store = kernel::store::Store::open(None, &apps.schemas()).unwrap();
+    apps.seed(&store, kernel::app::Mode::Fake).unwrap();
+    let world = std::rc::Rc::new(apps.world(store, kernel::app::Mode::Fake, &kernel::app::Env::default()));
+    let workers = kernel::app::Workers::inline(APPS, world.clone());
+    let mut s = Session::new(apps, world, workers, kernel::app::Mode::Fake);
+    let rt = runtime::of(s.store());
+    let inbox = rt.connect();
+    let (started, observed) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    s.act(Action::new("held", "held undo").claiming(vec![Box::new(Held {
+        started, release: std::sync::Mutex::new(held),
+    })]));
+    s.store().attach_ui(|| {});
+    assert!(s.undo());
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(s.history_busy());
+    let tracked = rt.operations.list().len();
+    let request = requests::send_message(VERA, "wait until undo is complete", None);
+    let error = history::command(&mut s, &request).unwrap_err();
+    assert!(error.reason().contains("undo operation"));
+    assert_eq!(rt.operations.list().len(), tracked, "a refused send owns no orphan operation");
+    assert!(inbox.try_recv().is_err(), "no wire side effect races the history transition");
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.history_busy() {
+        s.settle();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    s.shutdown();
+}
+
+#[test]
 fn send_undo_uses_the_final_id_even_when_delivery_precedes_the_response() {
     for early in [false, true] {
         let mut s = session();
@@ -59,7 +107,10 @@ fn send_undo_uses_the_final_id_even_when_delivery_precedes_the_response() {
         // a fresh send id. It must leave the user's newer draft intact.
         with_chat(&s, slot, |c| c.set_draft("a newer draft"));
         assert!(s.redo());
-        assert!(inbox.try_recv().is_err());
+        let draft = receive(&inbox);
+        assert_eq!(draft["@type"], "setChatDraftMessage");
+        assert_eq!(draft["draft_message"]["input_message_text"]["text"]["text"], "a newer draft");
+        assert!(inbox.try_recv().is_err(), "redo waits for the prior deletion");
         rt.operations.reply(s.store(), &json!({"@type": "ok", "@extra": delete["@extra"]}));
         history::pump(s.store());
         let redo = receive(&inbox);

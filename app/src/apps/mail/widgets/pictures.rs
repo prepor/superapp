@@ -16,7 +16,7 @@ fn hold(held: &mut Held, db: Arc<Db>, reader: parts::Reader) -> Option<&World> {
 }
 
 /// One letter's inline images, under the names used by `html::scope_cids`.
-fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
+async fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
     let mut items = Vec::new();
     let mut failed = Vec::new();
     if let Some(w) = world {
@@ -29,7 +29,7 @@ fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
                 .filter(|p| !p.part.cid.is_empty() && p.part.mime.starts_with("image/"))
             {
                 let key = format!("cid:{scope}/{}", p.part.cid);
-                match parts::download(w, mid, p) {
+                match parts::download(w, mid, p).await {
                     Ok(bytes) => items.push((key, Arc::from(bytes))),
                     Err(_) => failed.push(key),
                 }
@@ -53,15 +53,14 @@ fn cid_parts(world: Option<&World>, mid: MailId, scope: String) -> Ready {
 
 /// One file preview. Failed downloads can retry after a delay; successful
 /// previews keep only as much data as the card can display.
-fn letter_part(world: Option<&World>, mail: MailId, at: u32, k: String) -> Ready {
-    let bytes = world
-        .and_then(|w| parts::attachment(w.store(), mail, at).map(|a| (w, a)))
-        .and_then(|(w, a)| {
-            let limit = if a.kind() == kernel::caps::FileKind::Pdf {
-                kernel::caps::PDF_PREVIEW_MAX + 1
-            } else { kernel::caps::IMAGE_PREVIEW_MAX };
-            parts::part(w, &a).ok().map(|b| (b, limit))
-        });
+async fn letter_part(world: Option<&World>, mail: MailId, at: u32, k: String) -> Ready {
+    let bytes = match world.and_then(|w| parts::attachment(w.store(), mail, at).map(|a| (w, a))) {
+        Some((w, a)) => {
+            let limit = if a.kind() == kernel::caps::FileKind::Pdf { kernel::caps::PDF_PREVIEW_MAX + 1 } else { kernel::caps::IMAGE_PREVIEW_MAX };
+            parts::part(w, &a).await.ok().map(|bytes| (bytes, limit))
+        }
+        None => None,
+    };
     match bytes {
         // Keep only the preview budget, including the extra byte that detects
         // an oversized PDF. PDF data leaves this transient cache after handoff;
@@ -122,14 +121,14 @@ pub fn want_part(cx: &mut Cx, world: &World, mail: MailId, at: u32) -> PartBytes
             return PartBytes::Gone;
         };
         let db = world.store().db();
-        let _ = tx.send(Job::Read(Box::new(move |held| {
-            letter_part(hold(held, db, reader), mail, at, k)
-        })));
+        let _ = tx.send(Job::Read(Box::new(move |held| Box::pin(async move {
+            letter_part(hold(held, db, reader), mail, at, k).await
+        }))));
         return PartBytes::Coming;
     }
     // No reader thread (headless): the run wants its bytes in the frame that
     // asked, which is the bargain the whole module strikes there.
-    let ready = letter_part(Some(world), mail, at, k.clone());
+    let ready = kernel::runtime::block_on(letter_part(Some(world), mail, at, k.clone()));
     let p = cx.global::<Pictures>();
     p.take(&ready);
     match p.bytes.get(&k) {
@@ -140,8 +139,7 @@ pub fn want_part(cx: &mut Cx, world: &World, mail: MailId, at: u32) -> PartBytes
 
 /// Asks for one letter's pictures, deduplicating requests and allowing failed
 /// downloads to retry. The results land in [`landed`].
-pub fn want_cid_parts(cx: &mut Cx, world: &World, mid: MailId) {
-    let key = parts::image_scope(world.store(), mid);
+pub fn want_cid_parts(cx: &mut Cx, world: &World, mid: MailId, key: String) {
     let p = cx.global::<Pictures>();
     p.retry_due(&key);
     if !p.asked.insert(key.clone()) {
@@ -152,11 +150,11 @@ pub fn want_cid_parts(cx: &mut Cx, world: &World, mid: MailId) {
             return;
         };
         let db = world.store().db();
-        let _ = tx.send(Job::Read(Box::new(move |held| {
-            cid_parts(hold(held, db, reader), mid, key)
-        })));
+        let _ = tx.send(Job::Read(Box::new(move |held| Box::pin(async move {
+            cid_parts(hold(held, db, reader), mid, key).await
+        }))));
         return;
     }
-    let ready = cid_parts(Some(world), mid, key);
+    let ready = kernel::runtime::block_on(cid_parts(Some(world), mid, key));
     cx.global::<Pictures>().take(&ready);
 }

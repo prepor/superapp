@@ -4,7 +4,7 @@
 //! connections are read-only. Each transaction records a device-sync
 //! changeset. Applying a changeset does not record it again.
 //!
-//! [`Store::rows`] caches results by SQL and parameters. SQLite reports which
+//! [`Store::rows`] caches results by SQL, parameters, and result type. SQLite reports which
 //! tables a query reads and when those tables change. The in-memory effect log
 //! reports changes itself because it is not a table. Workspace state is saved;
 //! animation and undo history remain in memory.
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use tokio::sync::oneshot;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::functions::FunctionFlags;
@@ -34,6 +35,7 @@ use crate::layout::{self, SlotId};
 use crate::panel::{PanelId, Tag};
 
 mod repl;
+mod queries;
 
 use repl::{replicated_tables, warn_unkeyed, SCHEMA_REPL};
 
@@ -85,6 +87,8 @@ struct Cached {
     rows: Rc<dyn Any>,
 }
 
+type QueryKey = (String, String, TypeId);
+
 /// The store: a read-only view over the one database, plus the reactive
 /// query layer, plus a handle to the [`Db`] gate every write goes through.
 ///
@@ -93,6 +97,8 @@ struct Cached {
 /// submitted to the single writer. `conn` is `query_only`, so a stray write
 /// here fails loudly instead of racing.
 pub struct Store {
+    background: RefCell<Option<queries::Background>>,
+    query_revision: Cell<u64>,
     db: Arc<Db>,
     conn: Connection,
     /// Per-table commit generation — the invalidation clock.
@@ -101,8 +107,8 @@ pub struct Store {
     /// a rich table's queries are *built* from its filter (see
     /// [`crate::richtable`]), so a query is not always a `static`.
     deps: RefCell<HashMap<String, Rc<Vec<String>>>>,
-    /// Result cache per `(sql, params)`.
-    cache: RefCell<HashMap<(String, String), Cached>>,
+    /// Result cache per `(sql, params, result type)`.
+    cache: RefCell<HashMap<QueryKey, Cached>>,
     redraw: Cell<bool>,
     /// Last seen `PRAGMA data_version` (foreign-commit detector).
     data_version: Cell<i64>,
@@ -253,13 +259,13 @@ enum Job {
     /// `repl_log` in the *same* transaction, commit.
     Write {
         run: RunFn,
-        reply: mpsc::Sender<WriteOut>,
+        reply: oneshot::Sender<WriteOut>,
     },
     /// A peer frame: apply a changeset with **no session and no `repl_log`
     /// row**, so applying records nothing and never echoes back.
     Apply {
         changeset: Vec<u8>,
-        reply: mpsc::Sender<rusqlite::Result<()>>,
+        reply: oneshot::Sender<rusqlite::Result<()>>,
     },
     /// A replication-internal operation on the raw connection: no session,
     /// no `writable` check. This is how the sync engine touches `repl`,
@@ -267,7 +273,7 @@ enum Job {
     /// even on a follower whose ordinary writes are closed.
     Raw {
         run: RawFn,
-        reply: mpsc::Sender<rusqlite::Result<Erased>>,
+        reply: oneshot::Sender<rusqlite::Result<Erased>>,
     },
 }
 
@@ -286,7 +292,11 @@ enum Target {
 /// **The one writable connection** — private, single, and living on its own
 /// thread. Every mutation in the process is a closure submitted here and
 /// awaited; every other connection is a reader.
+type Listeners = Arc<Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>>;
+
 pub struct Db {
+    listeners: Listeners,
+    readers: Arc<tokio::sync::Semaphore>,
     jobs: mpsc::Sender<Job>,
     target: Target,
     dir: Option<PathBuf>,
@@ -307,7 +317,7 @@ pub struct Db {
 
 /// Published after commit, before replying to its caller. Readers can validate
 /// derived data without running SQL, including data prepared off the UI thread.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Commits {
     serial: u64,
     reset: u64,
@@ -373,11 +383,15 @@ impl Db {
         let (jobs, rx) = mpsc::channel::<Job>();
         let commits = Arc::new(Mutex::new(Commits::default()));
         let clock = commits.clone();
+        let listeners = Listeners::default();
+        let wake = listeners.clone();
         std::thread::Builder::new()
             .name("store-writer".into())
-            .spawn(move || writer_loop(&conn, &dirty, &replicated, &rx, &clock))
+            .spawn(move || writer_loop(&conn, &dirty, &replicated, &rx, &clock, &wake))
             .expect("spawn the store writer");
         Ok(Arc::new(Db {
+            listeners,
+            readers: Arc::new(tokio::sync::Semaphore::new(4)),
             jobs,
             target,
             dir,
@@ -427,23 +441,57 @@ impl Db {
     /// (the invalidation the caller's [`Store`] consumes) and the changeset
     /// it recorded. A panic inside `f` is caught and returned as an error —
     /// one bad closure must not kill the only writer.
-    fn write<T: Send + 'static>(
+    fn submit_write<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
+    ) -> rusqlite::Result<oneshot::Receiver<WriteOut>> {
         if !self.writable.load(Ordering::Acquire) {
             return Err(store_err(
                 "the store is read-only: another device holds the lease",
             ));
         }
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = oneshot::channel();
         let run: RunFn = Box::new(move |tx| f(tx).map(|v| Box::new(v) as Erased));
         self.jobs
             .send(Job::Write { run, reply })
             .map_err(|_| gone())?;
-        let w = rx.recv().map_err(|_| gone())??;
-        let v = *w.value.downcast::<T>().expect("write result type");
-        Ok((v, w.touched, w.cs))
+        Ok(rx)
+    }
+    fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
+        let w = self.submit_write(f)?.blocking_recv().map_err(|_| gone())??;
+        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
+    }
+
+    async fn write_async<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
+        let w = self.submit_write(f)?.await.map_err(|_| gone())??;
+        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
+    }
+
+    /// Wait for all database operations accepted before this call. The
+    /// barrier works for followers too and does not create a transaction.
+    pub async fn flush_async(&self) -> rusqlite::Result<()> {
+        self.raw_async(|_| Ok(())).await
+    }
+
+    /// Runs an owned query on a read-only connection in the blocking pool.
+    /// Neither a connection nor a statement can escape into an async task.
+    pub async fn read_async<T: Send + 'static>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<T> {
+        let permit = self.readers.clone().acquire_owned().await.map_err(|_| gone())?;
+        let db = self.clone();
+        crate::runtime::spawn_blocking(move || {
+            let _permit = permit;
+            read(&db.reader()?)
+        })
+            .await.map_err(|_| store_err("a reader task panicked"))?
     }
 
 }
@@ -602,8 +650,11 @@ fn writer_loop(
     replicated: &[String],
     rx: &mpsc::Receiver<Job>,
     commits: &Mutex<Commits>,
+    listeners: &Listeners,
 ) {
     while let Ok(job) = rx.recv() {
+        let notify_reply = !matches!(&job, Job::Raw { .. });
+        let before = commits.lock().expect("commit clock").serial;
         match job {
             Job::Write { run, reply } => {
                 let result = do_write(conn, dirty, replicated, run);
@@ -632,6 +683,14 @@ fn writer_loop(
                 });
             }
         }
+        if !notify_reply && commits.lock().expect("commit clock").serial == before { continue; }
+        let callbacks: Vec<_> = {
+            let mut listeners = listeners.lock().expect("commit listeners");
+            let callbacks: Vec<_> = listeners.iter().filter_map(std::sync::Weak::upgrade).collect();
+            listeners.retain(|listener| listener.strong_count() > 0);
+            callbacks
+        };
+        for notify in callbacks { notify(); }
     }
 }
 
@@ -694,6 +753,26 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// A submitted transaction. Polling never waits; dropping the reply does not
+/// cancel an accepted write. Its commit still invalidates every reader.
+pub struct PendingWrite<T> {
+    receive: oneshot::Receiver<WriteOut>,
+    result: std::marker::PhantomData<T>,
+}
+
+impl<T: Send + 'static> PendingWrite<T> {
+    pub fn poll(&mut self, store: &Store) -> Option<rusqlite::Result<T>> {
+        match self.receive.try_recv() {
+            Ok(result) => Some(result.map(|w| {
+                store.bump(&w.touched);
+                *w.value.downcast::<T>().expect("write result type")
+            })),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(gone())),
+        }
+    }
+}
+
 impl Store {
     /// Opens the store over a fresh [`Db`] — the UI thread's constructor, and
     /// what a test's in-memory world uses. `None` is a private in-memory
@@ -717,6 +796,8 @@ impl Store {
     pub fn with_db(db: Arc<Db>) -> rusqlite::Result<Store> {
         let conn = db.reader()?;
         Ok(Store {
+            background: RefCell::new(None),
+            query_revision: Cell::new(0),
             db,
             conn,
             generations: RefCell::default(),
@@ -813,6 +894,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Awaits the same serial writer without blocking the I/O executor.
+    /// Once submitted, a transaction commits or rolls back even if its caller
+    /// is cancelled; dropping a future never interrupts a transaction midway.
+    pub async fn write_async<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<T> {
+        let (out, dirty, _) = self.db.write_async(f).await?;
+        self.bump(&dirty);
+        Ok(out)
+    }
+
+    /// Submits a UI mutation without waiting for the database. The owner must
+    /// poll its reply and surface errors; a submitted write is never replayed.
+    pub fn submit_write<T: Send + 'static>(
+        &self,
+        write: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<PendingWrite<T>> {
+        Ok(PendingWrite { receive: self.db.submit_write(write)?, result: std::marker::PhantomData })
+    }
+
+    /// A barrier after every previously accepted database operation.
+    pub async fn flush_async(&self) -> rusqlite::Result<()> {
+        self.db.flush_async().await
+    }
+
     /// The same write, answering the **changeset** it recorded beside its
     /// value — the very bytes `repl_log` kept, empty when nothing
     /// replicated moved.
@@ -841,6 +948,10 @@ impl Store {
         if !dirty.is_empty() {
             self.redraw.set(true);
         }
+        if self.ui_attached() {
+            self.seen_commit.set(self.db.commits.lock().expect("commit clock").serial);
+            return;
+        }
         let v: i64 = self
             .conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))
@@ -859,6 +970,14 @@ impl Store {
     /// Known writer commits invalidate only their tables. An untracked commit
     /// still invalidates everything, as do replication's raw replacements.
     pub fn poll_external(&self) -> bool {
+        if self.background.borrow().is_some() {
+            let completed = self.poll_background();
+            let mem = self.poll_mem();
+            let serial = self.db.commits.lock().expect("commit clock").serial;
+            let changed = serial != self.seen_commit.replace(serial);
+            if changed { self.redraw.set(true); }
+            return completed || mem || changed;
+        }
         // The ring moves under its own version, and a worker's effects are
         // exactly the kind that arrive without a commit to notice.
         let mem = self.poll_mem();
@@ -935,7 +1054,7 @@ impl Store {
     /// re-runs and re-stamps. Errors surface as an empty result (and a
     /// stderr note) — a draw pass has nowhere better to put them yet.
     /// While a trace is open, every read is recorded against it.
-    pub fn rows<T: 'static>(
+    pub fn rows<T: Send + 'static>(
         &self,
         q: &'static Q,
         params: &[Val],
@@ -950,7 +1069,7 @@ impl Store {
     /// text is the cache key, so two panels on the same filter share one
     /// result, and the context an agent receives shows the SQL that
     /// actually ran.
-    pub fn rows_sql<T: 'static>(
+    pub fn rows_sql<T: Send + 'static>(
         &self,
         id: &'static str,
         describe: &'static str,
@@ -966,7 +1085,7 @@ impl Store {
     /// log's union reads the in-memory ring through a function, and rows
     /// out of memory are invisible to SQLite's read-set. Everything else
     /// about it is the same query, the same cache, the same trace.
-    pub fn rows_sql_deps<T: 'static>(
+    pub fn rows_sql_deps<T: Send + 'static>(
         &self,
         id: &'static str,
         describe: &'static str,
@@ -976,7 +1095,7 @@ impl Store {
         map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
     ) -> Rc<Vec<T>> {
         let pkey = fmt_params(params);
-        let key = (sql.to_string(), pkey.clone());
+        let key = (sql.to_string(), pkey.clone(), TypeId::of::<T>());
         let deps = self.deps_for(id, sql, also);
         let cached: Option<Rc<Vec<T>>> = self.cache.borrow().get(&key).and_then(|c| {
             let fresh = c
@@ -1013,6 +1132,21 @@ impl Store {
             );
             rows
         });
+        self.trace_rows_sql(id, describe, sql, params, rows.len());
+        rows
+    }
+
+    /// A display snapshot: a miss schedules a background query and returns
+    /// the previous snapshot (or an empty initial page). Domain decisions must
+    /// use `rows_sql_deps` or an awaited read, where absence is a real result.
+    pub fn snapshot_rows_sql_deps<T: Send + 'static>(
+        &self, id: &'static str, describe: &'static str, sql: &str,
+        params: &[Val], also: &[&str], map: fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Rc<Vec<T>> {
+        if self.background.borrow().is_none() {
+            return self.rows_sql_deps(id, describe, sql, params, also, map);
+        }
+        let rows = self.background_rows(id, sql, params, also, map);
         self.trace_rows_sql(id, describe, sql, params, rows.len());
         rows
     }

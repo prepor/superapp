@@ -93,29 +93,29 @@ pub enum Cas {
     Mismatch,
 }
 
-/// The transport. Object-safe and `Send + Sync`, because the replication
-/// worker owns one on its own thread.
+/// The transport. Owned handles can cross to the asynchronous service executor.
+#[async_trait::async_trait(?Send)]
 pub trait Object: Send + Sync {
     /// The object at `key`, with its ETag, or `None` if absent.
     ///
     /// # Errors
     ///
     /// If the backend is unreachable or answers malformed.
-    fn get(&self, key: &str) -> Result<Option<Blob>, String>;
+    async fn get(&self, key: &str) -> Result<Option<Blob>, String>;
 
     /// Create `key` only if it does not exist (`If-None-Match: *`).
     ///
     /// # Errors
     ///
     /// If the backend is unreachable.
-    fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String>;
+    async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String>;
 
     /// Replace `key` only if its ETag still matches (`If-Match`).
     ///
     /// # Errors
     ///
     /// If the backend is unreachable.
-    fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String>;
+    async fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String>;
 
     /// How often the replication worker should poll this backend when nothing
     /// kicks it. A local daemon is free, so the default is "often enough that
@@ -153,8 +153,8 @@ pub type StateAt = (State, String);
 /// # Errors
 ///
 /// If the backend errors, or `state` is malformed / an unknown wire version.
-pub fn read_state(obj: &dyn Object) -> Result<Option<StateAt>, String> {
-    let Some(blob) = obj.get(STATE_KEY)? else {
+pub async fn read_state(obj: &dyn Object) -> Result<Option<StateAt>, String> {
+    let Some(blob) = obj.get(STATE_KEY).await? else {
         return Ok(None);
     };
     let state: State = serde_json::from_slice(&blob.bytes)
@@ -192,8 +192,9 @@ impl MemBucket {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Object for MemBucket {
-    fn get(&self, key: &str) -> Result<Option<Blob>, String> {
+    async fn get(&self, key: &str) -> Result<Option<Blob>, String> {
         let g = self.inner.lock().expect("bucket");
         Ok(g.get(key).map(|(bytes, ver)| Blob {
             bytes: bytes.clone(),
@@ -201,7 +202,7 @@ impl Object for MemBucket {
         }))
     }
 
-    fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
+    async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
         let mut g = self.inner.lock().expect("bucket");
         if g.contains_key(key) {
             return Ok(PutNew::Exists);
@@ -210,7 +211,7 @@ impl Object for MemBucket {
         Ok(PutNew::Created("1".to_string()))
     }
 
-    fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
+    async fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
         let mut g = self.inner.lock().expect("bucket");
         match g.get(key) {
             Some((_, ver)) if ver.to_string() == etag => {
@@ -249,29 +250,28 @@ impl HttpBucket {
         HttpBucket { hostport }
     }
 
-    fn request(
+    async fn request(
         &self,
         method: &str,
         key: &str,
         precond: Option<(&str, &str)>,
         body: &[u8],
     ) -> Result<Reply, String> {
-        use std::net::TcpStream;
+        use tokio::net::TcpStream;
         use std::time::Duration;
 
-        let mut stream = TcpStream::connect(&self.hostport)
+        tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = TcpStream::connect(&self.hostport).await
             .map_err(|e| format!("bucket {}: {e}", self.hostport))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(10))))
-            .map_err(|e| e.to_string())?;
+
 
         let host = self.hostport.split(':').next().unwrap_or("localhost");
         let mut headers = vec![("Host".to_string(), host.to_string())];
         if let Some((h, v)) = precond {
             headers.push((h.to_string(), v.to_string()));
         }
-        round_trip(&mut stream, method, &format!("/{key}"), &headers, body)
+        round_trip(&mut stream, method, &format!("/{key}"), &headers, body).await
+        }).await.map_err(|_| "bucket request timed out".to_string())?
     }
 }
 
@@ -290,13 +290,14 @@ pub type Reply = (u16, Option<String>, Vec<u8>);
 /// # Errors
 ///
 /// If the stream fails, or the response cannot be parsed.
-pub fn round_trip<S: std::io::Read + std::io::Write>(
+pub async fn round_trip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     io: &mut S,
     method: &str,
     target: &str,
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    use tokio::io::AsyncWriteExt;
     let mut req = format!("{method} {target} HTTP/1.1\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
@@ -305,12 +306,12 @@ pub fn round_trip<S: std::io::Read + std::io::Write>(
         "Connection: close\r\nContent-Length: {}\r\n\r\n",
         body.len()
     ));
-    io.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-    io.write_all(body).map_err(|e| e.to_string())?;
-    io.flush().map_err(|e| e.to_string())?;
+    io.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    io.write_all(body).await.map_err(|e| e.to_string())?;
+    io.flush().await.map_err(|e| e.to_string())?;
 
     let mut buf = Vec::new();
-    read_to_close(io, &mut buf)?;
+    read_to_close(io, &mut buf).await?;
     parse_response(&buf)
 }
 
@@ -318,11 +319,12 @@ pub fn round_trip<S: std::io::Read + std::io::Write>(
 /// TLS `close_notify` — or resets it after the last byte — has still
 /// delivered a whole response: the framing says where the body ends, not the
 /// socket, so an unclean end is an end and not an error.
-fn read_to_close<S: std::io::Read>(io: &mut S, out: &mut Vec<u8>) -> Result<(), String> {
+async fn read_to_close<S: tokio::io::AsyncRead + Unpin>(io: &mut S, out: &mut Vec<u8>) -> Result<(), String> {
     use std::io::ErrorKind;
+    use tokio::io::AsyncReadExt;
     let mut tmp = [0u8; 8192];
     loop {
-        match io.read(&mut tmp) {
+        match io.read(&mut tmp).await {
             Ok(0) => return Ok(()),
             Ok(n) => out.extend_from_slice(&tmp[..n]),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
@@ -416,9 +418,10 @@ fn dechunk(raw: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Object for HttpBucket {
-    fn get(&self, key: &str) -> Result<Option<Blob>, String> {
-        let (status, etag, body) = self.request("GET", key, None, &[])?;
+    async fn get(&self, key: &str) -> Result<Option<Blob>, String> {
+        let (status, etag, body) = self.request("GET", key, None, &[]).await?;
         match status {
             200 => Ok(Some(Blob {
                 bytes: body,
@@ -429,8 +432,8 @@ impl Object for HttpBucket {
         }
     }
 
-    fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
-        let (status, etag, _) = self.request("PUT", key, Some(("If-None-Match", "*")), body)?;
+    async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
+        let (status, etag, _) = self.request("PUT", key, Some(("If-None-Match", "*")), body).await?;
         match status {
             200 | 201 => Ok(PutNew::Created(etag.unwrap_or_default())),
             412 => Ok(PutNew::Exists),
@@ -438,8 +441,8 @@ impl Object for HttpBucket {
         }
     }
 
-    fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
-        let (status, new_etag, _) = self.request("PUT", key, Some(("If-Match", etag)), body)?;
+    async fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
+        let (status, new_etag, _) = self.request("PUT", key, Some(("If-Match", etag)), body).await?;
         match status {
             200 | 201 => Ok(Cas::Ok(new_etag.unwrap_or_default())),
             412 => Ok(Cas::Mismatch),
@@ -469,7 +472,7 @@ pub struct BucketReq {
 #[must_use]
 pub fn serve(dir: &std::path::Path, req: &BucketReq) -> (u16, Option<String>, Vec<u8>) {
     // Reject traversal; keys are `a/b/c` with no `..`.
-    if req.key.split('/').any(|c| c == ".." || c.is_empty()) && req.method != "GET" {
+    if req.key.split('/').any(|c| c == ".." || c.is_empty()) {
         return (400, None, Vec::new());
     }
     let path = dir.join(&req.key);
@@ -527,8 +530,8 @@ pub fn serve(dir: &std::path::Path, req: &BucketReq) -> (u16, Option<String>, Ve
 /// # Errors
 ///
 /// If the socket read or write fails.
-pub fn serve_conn(dir: &std::path::Path, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
-    use std::io::{Read, Write};
+pub async fn serve_conn(dir: &std::path::Path, stream: &mut tokio::net::TcpStream, lock: &tokio::sync::Mutex<()>) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Read until the header terminator, then the declared body.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -536,13 +539,13 @@ pub fn serve_conn(dir: &std::path::Path, stream: &mut std::net::TcpStream) -> st
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p;
         }
-        let n = stream.read(&mut tmp)?;
+        let n = stream.read(&mut tmp).await?;
         if n == 0 {
             return Ok(()); // client hung up
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 64 * 1024 * 1024 {
-            break buf.len(); // absurd header; give up parsing below
+        if buf.len() > 64 * 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bucket request headers too large"));
         }
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
@@ -568,26 +571,30 @@ pub fn serve_conn(dir: &std::path::Path, stream: &mut std::net::TcpStream) -> st
             }
         }
     }
+    if clen > 64 * 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bucket request body too large"));
+    }
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < clen {
-        let n = stream.read(&mut tmp)?;
+        let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            break;
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "bucket request body cut short"));
         }
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(clen);
 
-    let (status, etag, out) = serve(
-        dir,
-        &BucketReq {
+    let request = BucketReq {
             method,
             key,
             if_none_match,
             if_match,
             body,
-        },
-    );
+        };
+    let owned_dir = dir.to_owned();
+    let guard = lock.lock().await;
+    let (status, etag, out) = tokio::task::spawn_blocking(move || serve(&owned_dir, &request)).await.map_err(std::io::Error::other)?;
+    drop(guard);
     let reason = match status {
         200 => "OK",
         201 => "Created",
@@ -602,42 +609,42 @@ pub fn serve_conn(dir: &std::path::Path, stream: &mut std::net::TcpStream) -> st
         resp.push_str(&format!("ETag: {e}\r\n"));
     }
     resp.push_str("\r\n");
-    stream.write_all(resp.as_bytes())?;
-    stream.write_all(&out)?;
-    stream.flush()
+    stream.write_all(resp.as_bytes()).await?;
+    stream.write_all(&out).await?;
+    stream.flush().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn create_only_and_cas() {
+    #[tokio::test]
+    async fn create_only_and_cas() {
         let b = MemBucket::new();
-        assert!(b.get("k").unwrap().is_none());
+        assert!(b.get("k").await.unwrap().is_none());
 
         // First create wins; a second is refused.
-        assert_eq!(b.put_new("k", b"one").unwrap(), PutNew::Created("1".into()));
-        assert_eq!(b.put_new("k", b"two").unwrap(), PutNew::Exists);
+        assert_eq!(b.put_new("k", b"one").await.unwrap(), PutNew::Created("1".into()));
+        assert_eq!(b.put_new("k", b"two").await.unwrap(), PutNew::Exists);
 
-        let blob = b.get("k").unwrap().unwrap();
+        let blob = b.get("k").await.unwrap().unwrap();
         assert_eq!(blob.bytes, b"one");
 
         // CAS with the wrong ETag is refused; with the right one it advances.
-        assert_eq!(b.cas("k", b"x", "999").unwrap(), Cas::Mismatch);
-        let Cas::Ok(e2) = b.cas("k", b"two", &blob.etag).unwrap() else {
+        assert_eq!(b.cas("k", b"x", "999").await.unwrap(), Cas::Mismatch);
+        let Cas::Ok(e2) = b.cas("k", b"two", &blob.etag).await.unwrap() else {
             panic!("cas should have won");
         };
-        assert_eq!(b.get("k").unwrap().unwrap().bytes, b"two");
+        assert_eq!(b.get("k").await.unwrap().unwrap().bytes, b"two");
         // The old ETag is now stale.
-        assert_eq!(b.cas("k", b"z", &blob.etag).unwrap(), Cas::Mismatch);
+        assert_eq!(b.cas("k", b"z", &blob.etag).await.unwrap(), Cas::Mismatch);
         assert_ne!(e2, blob.etag);
     }
 
-    #[test]
-    fn state_round_trips_and_guards_version() {
+    #[tokio::test]
+    async fn state_round_trips_and_guards_version() {
         let b = MemBucket::new();
-        assert!(read_state(&b).unwrap().is_none());
+        assert!(read_state(&b).await.unwrap().is_none());
         let s = State {
             v: WIRE_V,
             schema: 9,
@@ -653,20 +660,20 @@ mod tests {
                 hash: "abc".into(),
             },
         };
-        b.put_new(STATE_KEY, &encode_state(&s)).unwrap();
-        let (got, _etag) = read_state(&b).unwrap().unwrap();
+        b.put_new(STATE_KEY, &encode_state(&s)).await.unwrap();
+        let (got, _etag) = read_state(&b).await.unwrap().unwrap();
         assert_eq!(got, s);
 
         // An unknown wire version refuses rather than guesses.
         let mut bad = s.clone();
         bad.v = 99;
-        b.cas(STATE_KEY, &encode_state(&bad), &b.get(STATE_KEY).unwrap().unwrap().etag)
+        b.cas(STATE_KEY, &encode_state(&bad), &b.get(STATE_KEY).await.unwrap().unwrap().etag).await
             .unwrap();
-        assert!(read_state(&b).is_err());
+        assert!(read_state(&b).await.is_err());
     }
 
-    #[test]
-    fn keys_are_unique_by_construction() {
+    #[tokio::test]
+    async fn keys_are_unique_by_construction() {
         assert_eq!(batch_key(3, "dev-a", 11, 12), "log/3/dev-a/11-12");
         assert_ne!(batch_key(3, "dev-a", 11, 12), batch_key(4, "dev-a", 11, 12));
         assert_ne!(batch_key(3, "dev-a", 11, 12), batch_key(3, "dev-b", 11, 12));
@@ -675,8 +682,8 @@ mod tests {
 
     /// A response that stops short of its `Content-Length` is refused, not
     /// passed on as a shorter object.
-    #[test]
-    fn a_cut_short_body_is_an_error_not_a_small_one() {
+    #[tokio::test]
+    async fn a_cut_short_body_is_an_error_not_a_small_one() {
         let whole = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"e\"\r\n\r\nhello";
         let (status, etag, body) = parse_response(whole).unwrap();
         assert_eq!((status, etag.as_deref(), &body[..]), (200, Some("\"e\""), &b"hello"[..]));
@@ -691,8 +698,8 @@ mod tests {
         assert!(parse_response(ch_cut).is_err());
     }
 
-    #[test]
-    fn the_hash_is_stable_and_sensitive() {
+    #[tokio::test]
+    async fn the_hash_is_stable_and_sensitive() {
         assert_eq!(hash(b"hello"), hash(b"hello"));
         assert_ne!(hash(b"hello"), hash(b"hell0"));
     }
@@ -700,39 +707,72 @@ mod tests {
     /// The HTTP client and the daemon handler honour the same CAS contract as
     /// `MemBucket`, over a real localhost socket — the round trip a mac and an
     /// emulator make.
-    #[test]
-    fn http_round_trips_the_cas_contract() {
-        use std::net::TcpListener;
+    #[tokio::test]
+    async fn http_round_trips_the_cas_contract() {
+        use tokio::net::TcpListener;
         let dir = std::env::temp_dir().join(format!("superapp-bucket-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let served = dir.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             // Serve exactly the requests this test makes, then stop.
             for _ in 0..8 {
-                let (mut s, _) = listener.accept().unwrap();
-                let _ = serve_conn(&served, &mut s);
+                let (mut s, _) = listener.accept().await.unwrap();
+                let _ = serve_conn(&served, &mut s, &tokio::sync::Mutex::new(())).await;
             }
         });
 
         let b = HttpBucket::new(&format!("http://{addr}"));
-        assert!(b.get("log/1/dev/1-1").unwrap().is_none()); // GET absent → 404
-        let PutNew::Created(_) = b.put_new("state", b"one").unwrap() else {
+        assert!(b.get("log/1/dev/1-1").await.unwrap().is_none()); // GET absent → 404
+        let PutNew::Created(_) = b.put_new("state", b"one").await.unwrap() else {
             panic!("first create wins");
         };
-        assert_eq!(b.put_new("state", b"two").unwrap(), PutNew::Exists); // create-only
-        let blob = b.get("state").unwrap().unwrap();
+        assert_eq!(b.put_new("state", b"two").await.unwrap(), PutNew::Exists); // create-only
+        let blob = b.get("state").await.unwrap().unwrap();
         assert_eq!(blob.bytes, b"one");
-        assert_eq!(b.cas("state", b"x", "wrong").unwrap(), Cas::Mismatch);
-        let Cas::Ok(_) = b.cas("state", b"two", &blob.etag).unwrap() else {
+        assert_eq!(b.cas("state", b"x", "wrong").await.unwrap(), Cas::Mismatch);
+        let Cas::Ok(_) = b.cas("state", b"two", &blob.etag).await.unwrap() else {
             panic!("cas with the current etag wins");
         };
-        assert_eq!(b.get("state").unwrap().unwrap().bytes, b"two");
-        assert_eq!(b.cas("state", b"z", &blob.etag).unwrap(), Cas::Mismatch); // stale etag
+        assert_eq!(b.get("state").await.unwrap().unwrap().bytes, b"two");
+        assert_eq!(b.cas("state", b"z", &blob.etag).await.unwrap(), Cas::Mismatch); // stale etag
 
-        handle.join().unwrap();
+        handle.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Socket waiting must happen outside the CAS lock, while competing
+    /// writes still have exactly one winner.
+    #[tokio::test]
+    async fn a_slow_peer_does_not_block_other_connections_and_cas_stays_atomic() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("superapp-bucket-concurrent-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = dir.clone();
+        let server = tokio::spawn(async move {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (dir, lock) = (served.clone(), lock.clone());
+                tokio::spawn(async move { let _ = serve_conn(&dir, &mut socket, &lock).await; });
+            }
+        });
+        let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+        slow.write_all(b"PUT /slow HTTP/1.1\r\n").await.unwrap();
+        let bucket = HttpBucket::new(&format!("http://{address}"));
+        let created = tokio::time::timeout(std::time::Duration::from_secs(1), bucket.put_new("state", b"initial")).await.unwrap().unwrap();
+        let PutNew::Created(etag) = created else { panic!("fresh state") };
+        let (a, b) = tokio::join!(bucket.cas("state", b"a", &etag), bucket.cas("state", b"b", &etag));
+        let winners = [a.unwrap(), b.unwrap()].into_iter().filter(|r| matches!(r, Cas::Ok(_))).count();
+        assert_eq!(winners, 1);
+        drop(slow);
+        server.abort();
+        let _ = server.await;
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
 }

@@ -4,7 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
 use kernel::store::Store;
 
@@ -77,7 +77,7 @@ struct State {
 #[derive(Default)]
 struct Loader {
     state: Mutex<State>,
-    wake: OnceLock<mpsc::SyncSender<()>>,
+    running: AtomicBool,
     changed: AtomicBool,
 }
 
@@ -114,46 +114,41 @@ impl Loader {
         state.jobs.retain(|j| live.iter().any(|load| load.ptr_eq(&j.load)));
         let pending = !state.jobs.is_empty() || !state.retired.is_empty();
         drop(state);
-        if pending {
-            let wake = self.wake.get_or_init(|| {
-                let (tx, rx) = mpsc::sync_channel(1);
-                let owner = Arc::downgrade(self);
-                let db = Arc::downgrade(&store.db());
-                std::thread::Builder::new().name("telegram-transcripts".into()).spawn(move || {
-                    while rx.recv().is_ok() {
-                        loop {
-                            let Some(owner) = owner.upgrade() else { return };
-                            let (job, retired) = {
-                                let mut state = owner.state.lock().expect("transcript queue");
-                                (state.jobs.pop(), std::mem::take(&mut state.retired))
-                            };
-                            drop(retired);
-                            let Some(job) = job else { break };
-                            let Some(load) = job.load.upgrade() else { continue };
-                            let Some(db) = db.upgrade() else { return };
-                            // Drop the reader before waiting: a database-local service
-                            // must not keep its own database alive through a cycle.
-                            let result = Store::with_db(db).and_then(|reader| {
-                                model::read_history(reader.conn(), job.key.peer, job.key.topic)
-                            });
-                            match result {
-                                Ok(history) => {
-                                    let snapshot = Snapshot::new(history, job.key.first_unread.map(|id| (job.key.peer, id)), job.now);
-                                    *load.snapshot.lock().expect("transcript result") = Arc::new(snapshot);
-                                }
-                                Err(error) => {
-                                    eprintln!("telegram: reading transcript failed: {error}");
-                                    *load.failed_at.lock().expect("transcript retry") = Some(std::time::Instant::now());
-                                }
-                            }
-                            owner.changed.store(true, Ordering::Release);
-                            makepad_widgets::SignalToUI::set_ui_signal();
+        if pending && !self.running.swap(true, Ordering::AcqRel) {
+            let owner = Arc::downgrade(self);
+            let db = Arc::downgrade(&store.db());
+            kernel::runtime::spawn_blocking(move || {
+                loop {
+                    let Some(owner) = owner.upgrade() else { return };
+                    let (job, retired) = {
+                        let mut state = owner.state.lock().expect("transcript queue");
+                        let job = state.jobs.pop();
+                        if job.is_none() { owner.running.store(false, Ordering::Release); }
+                        (job, std::mem::take(&mut state.retired))
+                    };
+                    drop(retired);
+                    let Some(job) = job else { break };
+                    let Some(load) = job.load.upgrade() else { continue };
+                    let Some(db) = db.upgrade() else { return };
+                    // SQLite and row construction stay on the blocking
+                    // pool; no connection crosses an await point.
+                    let result = Store::with_db(db).and_then(|reader| {
+                        model::read_history(reader.conn(), job.key.peer, job.key.topic)
+                    });
+                    match result {
+                        Ok(history) => {
+                            let snapshot = Snapshot::new(history, job.key.first_unread.map(|id| (job.key.peer, id)), job.now);
+                            *load.snapshot.lock().expect("transcript result") = Arc::new(snapshot);
+                        }
+                        Err(error) => {
+                            eprintln!("telegram: reading transcript failed: {error}");
+                            *load.failed_at.lock().expect("transcript retry") = Some(std::time::Instant::now());
                         }
                     }
-                }).expect("spawn transcript reader");
-                tx
+                    owner.changed.store(true, Ordering::Release);
+                    makepad_widgets::SignalToUI::set_ui_signal();
+                }
             });
-            let _ = wake.try_send(());
         }
         snapshot
     }
@@ -192,7 +187,7 @@ impl Transcript {
 
     pub fn get(&self, store: &Store) -> Arc<Snapshot> {
         let key = self.key.get();
-        if store.dir().is_some() && !cfg!(headless) {
+        if store.ui_attached() || (store.dir().is_some() && !cfg!(headless)) {
             let snapshot = store.local::<Loader>().request(store, key, self.now.get());
             model::trace_history(store, key.peer, key.topic, snapshot.history.len());
             return snapshot;
@@ -305,8 +300,7 @@ mod tests {
         let store = store();
         let loader = store.local::<Loader>();
         // Hold the worker so a burst can be inspected independently of timing.
-        let (tx, _rx) = mpsc::sync_channel(1);
-        loader.wake.set(tx).unwrap();
+        loader.running.store(true, Ordering::Release);
         for peer in 1..=100 { loader.request(&store, key(peer), 0.0); }
         let mut state = loader.state.lock().unwrap();
         assert_eq!(state.entries.len(), CAPACITY);

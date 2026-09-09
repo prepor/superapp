@@ -1,0 +1,40 @@
+# args:
+# env:
+# Opening and browsing a select must not edit the local draft. Confirm choices
+# by pointer and keyboard, then dismiss a different highlight with Escape.
+wait 800
+key cmd 2
+wait 400
+type "calendar"
+wait 400
+key enter
+wait 700
+click "new event"
+wait 700
+mouse "event calendar"
+wait 100
+visible "event calendar: Work"
+shot calendar-select
+key escape
+mouse "event calendar"
+wait 100
+mouse "event calendar: Work"
+key tab
+type "Native select review"
+mouse "event busy"
+wait 100
+visible "event busy: Free"
+mouse "event busy: Free"
+key tab
+key space
+wait 100
+visible "event visibility: Private"
+key down
+key enter
+wait 200
+key space
+key down
+key escape
+wait 100
+shot calendar-select-chosen
+quit

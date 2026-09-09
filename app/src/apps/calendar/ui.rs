@@ -144,7 +144,7 @@ script_mod! {
     suggest: mod.widgets.TblSuggest {}
     list := mod.widgets.SList { width: Fill, height: Fill, flow: Down, reuse_items: true
         form := View { width: Fill, height: Fit, flow: Down, spacing: 9
-            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "CALENDAR" } source_btn := mod.widgets.SBtn { width: Fill, text: "choose calendar" } }
+            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "CALENDAR" } source_btn := mod.widgets.SSelect {} }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "TITLE" } title_input := mod.widgets.SField { empty_text: "event title" } }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "START" } start_input := mod.widgets.SField { empty_text: "YYYY-MM-DDTHH:MM" } }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "END" } end_input := mod.widgets.SField { empty_text: "YYYY-MM-DDTHH:MM" } }
@@ -158,8 +158,8 @@ script_mod! {
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "REPEAT" } repeat_btn := mod.widgets.SBtn { text: "does not repeat" } }
             recurrence_input := mod.widgets.SField { width: Fill, empty_text: "custom: FREQ=WEEKLY;BYDAY=MO,WE;COUNT=12" }
             scope_row := mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "EDIT SCOPE" } scope_btn := mod.widgets.SBtn { text: "this event" } }
-            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "SHOW AS" } busy_btn := mod.widgets.SBtn { text: "busy" } }
-            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "VISIBILITY" } visibility_btn := mod.widgets.SBtn { text: "default" } }
+            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "SHOW AS" } busy_btn := mod.widgets.SSelect {} }
+            mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "VISIBILITY" } visibility_btn := mod.widgets.SSelect {} }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "REMINDERS" } reminders_input := mod.widgets.SField { empty_text: "default or popup:10, email:60" } }
             mod.widgets.SSection { text: "NOTES" }
             notes_input := mod.widgets.SField { width: Fill, height: 100, is_multiline: true, empty_text: "event notes" }

@@ -195,10 +195,19 @@ impl<'a> Opening<'a> {
     /// that reverse it. Ignored on restore. Consecutive previews from one
     /// slot coalesce into one node, so a cursor walk is one undo.
     pub fn claim(&mut self, write: Write, intents: Vec<Box<dyn Intent>>) {
+        self.claim_with(Box::new(move |tx| {
+            write(tx)?;
+            Ok(intents)
+        }));
+    }
+
+    /// Capture the prior state and derive its undo inside the same writer
+    /// transaction. Opening a panel need not query the database on the UI.
+    pub fn claim_with(&mut self, claim: Claim) {
         if !self.how.claims() {
             return;
         }
-        self.claimed.push((write, intents));
+        self.claimed.push(claim);
     }
 
     /// Whether anything was claimed — what [`Nav`] reads to decide the
@@ -282,6 +291,9 @@ pub trait Panel: Any {
     /// one method; `act` and `nav` never touch instances (see
     /// [`settle`](Session::settle)).
     fn run(&mut self, _verb: &str, _s: &mut Session) {}
+
+    /// Submits any in-memory draft before the session drains local work.
+    fn flush(&mut self) {}
 
     fn as_any(&mut self) -> &mut dyn Any;
 }

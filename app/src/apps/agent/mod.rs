@@ -157,6 +157,15 @@ impl App for Agent {
         "agent"
     }
 
+    fn poll(&self, s: &mut Session) {
+        for (_, panel) in s.panels() {
+            if let Ok(mut panel) = panel.try_borrow_mut() {
+                if let Some(chat) = panel.as_any().downcast_mut::<Chat>() { chat.poll(s); }
+                if let Some(agents) = panel.as_any().downcast_mut::<Agents>() { agents.poll(s); }
+            }
+        }
+    }
+
     fn kinds(&self) -> &'static [&'static dyn PanelKind] {
         KINDS
     }
@@ -182,6 +191,7 @@ impl App for Agent {
     /// *and* under its own type, so a test can reach `get::<FakeGateway>()`
     /// to plant a script or read what the model was told.
     fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
+        caps.insert::<calls::ActiveCalls>(Box::default());
         if mode == Mode::Deny {
             return;
         }

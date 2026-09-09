@@ -303,6 +303,7 @@ impl Media {
     /// `tg:` file not yet downloaded — so the box stays a label until a redraw
     /// finds the bytes. See [`media_bytes`].
     #[must_use]
+    #[cfg(test)]
     pub fn picture_bytes(&self, store_dir: Option<&Path>) -> Option<Vec<u8>> {
         if !self.has_picture() {
             return None;
@@ -341,6 +342,7 @@ impl Media {
 /// Anything else, and a `tg:` reference with no store dir to look under, is
 /// `None`.
 #[must_use]
+#[cfg(test)]
 pub fn media_bytes(store_dir: Option<&Path>, reference: &str) -> Option<Vec<u8>> {
     if reference.starts_with("tg:") {
         let path = store_dir?
@@ -351,14 +353,12 @@ pub fn media_bytes(store_dir: Option<&Path>, reference: &str) -> Option<Vec<u8>>
     super::seed::demo_bytes(reference).map(<[u8]>::to_vec)
 }
 
-/// The cached file for a media `reference`, as a path — what a player is
-/// pointed at, where [`media_bytes`] hands a drawing widget the bytes.
+/// The cached file for a media reference, checked during background preparation.
 ///
 /// A clip is not read into memory to be played: the platform's player wants
 /// a file, so this answers where the blob cache put one. The same naming
-/// [`media_bytes`] uses — `<store_dir>/blobs/<file_name(reference)>` — and
-/// the same `None` where the download has not landed, which is what a draw
-/// re-asks every frame until it has. A `demo:` reference is bundled in the
+/// the picture loader uses — `<store_dir>/blobs/<file_name(reference)>` — and
+/// the same `None` where the download has not landed. A `demo:` reference is bundled in the
 /// binary and has no path, so it answers `None`.
 #[must_use]
 pub fn media_path(store_dir: Option<&Path>, reference: &str) -> Option<PathBuf> {
@@ -388,13 +388,20 @@ pub fn playable_path(store_dir: Option<&Path>, reference: &str) -> Option<PathBu
     let ext = container_extension(&blob);
     let dir = store_dir?.join("blobs-play");
     let link = dir.join(format!("{}.{ext}", kernel::caps::file_name(reference)));
-    if std::fs::symlink_metadata(&link).is_err() {
-        std::fs::create_dir_all(&dir).ok()?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&blob, &link).ok()?;
-        #[cfg(not(unix))]
-        std::fs::copy(&blob, &link).ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    match std::os::unix::fs::symlink(&blob, &link) {
+        Ok(()) => {},
+        // An invalidated native lookup can finish beside its replacement.
+        // Creating the same link is idempotent; an unrelated file or link
+        // must never be handed to the player as this blob.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read_link(&link).ok()?.as_path() != blob.as_path() { return None; }
+        }
+        Err(_) => return None,
     }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(&link).is_err() { std::fs::copy(&blob, &link).ok()?; }
     Some(link)
 }
 
@@ -1393,7 +1400,7 @@ static Q_FOLDERS: Q = Q {
 /// The folders' names.
 #[must_use]
 pub fn folders(store: &Store) -> std::rc::Rc<Vec<String>> {
-    store.rows(&Q_FOLDERS, &[], |r| r.get(0))
+    store.snapshot_rows(&Q_FOLDERS, &[], |r| r.get(0))
 }
 
 static Q_PEOPLE_NAMES: Q = Q {
@@ -1403,7 +1410,7 @@ static Q_PEOPLE_NAMES: Q = Q {
 };
 
 fn people_names(store: &Store) -> std::rc::Rc<Vec<String>> {
-    store.rows(&Q_PEOPLE_NAMES, &[], |r| r.get(0))
+    store.snapshot_rows(&Q_PEOPLE_NAMES, &[], |r| r.get(0))
 }
 
 static Q_CHAT_TITLES: Q = Q {
@@ -1413,7 +1420,7 @@ static Q_CHAT_TITLES: Q = Q {
 };
 
 fn chat_titles(store: &Store) -> std::rc::Rc<Vec<String>> {
-    store.rows(&Q_CHAT_TITLES, &[], |r| r.get(0))
+    store.snapshot_rows(&Q_CHAT_TITLES, &[], |r| r.get(0))
 }
 
 /// What a peer's name is in a list's filter grammar: quoted where it has a
@@ -1993,6 +2000,43 @@ mod tests {
             Some("webm")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_clip_preparation_reuses_only_the_exact_blob_target() {
+        let dir = std::env::temp_dir().join(format!("superapp-tg-concurrent-play-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let key = "tg:concurrent-clip";
+        let blob = dir.join("blobs").join(kernel::caps::file_name(key));
+        std::fs::write(&blob, b"\0\0\0\x18ftypisom").unwrap();
+        let start = std::sync::Barrier::new(16);
+        let paths = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..16).map(|_| scope.spawn(|| {
+                start.wait();
+                playable_path(Some(&dir), key).expect("every concurrent reader gets its link")
+            })).collect();
+            tasks.into_iter().map(|task| task.join().unwrap()).collect::<Vec<_>>()
+        });
+        let link = &paths[0];
+        assert!(paths.iter().all(|path| path == link));
+        assert_eq!(std::fs::read_link(link).unwrap(), std::fs::canonicalize(&blob).unwrap());
+
+        let other = dir.join("another-file");
+        std::fs::write(&other, b"unrelated content").unwrap();
+        std::fs::remove_file(link).unwrap();
+        std::os::unix::fs::symlink(&other, link).unwrap();
+        assert!(playable_path(Some(&dir), key).is_none(), "a different target is not this clip");
+        assert_eq!(std::fs::read_link(link).unwrap(), other, "conflicts are left untouched");
+        std::fs::remove_file(link).unwrap();
+        std::fs::write(link, b"ordinary file").unwrap();
+        assert!(playable_path(Some(&dir), key).is_none(), "a regular file cannot impersonate the link");
+        assert_eq!(std::fs::read(link).unwrap(), b"ordinary file");
+        std::fs::remove_file(link).unwrap();
+        std::fs::create_dir(link).unwrap();
+        assert!(playable_path(Some(&dir), key).is_none(), "a directory cannot impersonate the link");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

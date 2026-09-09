@@ -28,6 +28,8 @@ pub struct Client {
 }
 
 impl Client {
+    pub(super) fn id(self) -> i32 { self.id }
+
     /// Open a client. `td_create_client_id` mints an id and nothing more — no
     /// socket opens until the first [`send`](Client::send) — so this is cheap
     /// and never blocks. Its answers arrive on the shared queue, so pair it
@@ -64,7 +66,7 @@ impl Client {
 /// Pump the shared queue: the next update or response TDLib has ready, or
 /// `None` when `timeout` seconds pass with nothing. There is one queue for the
 /// whole process, so this is a free function and it must be pumped from a
-/// single thread — the worker's — never two at once.
+/// single native bridge thread, never two at once.
 #[must_use]
 pub fn receive(timeout: f64) -> Option<String> {
     // SAFETY: td_receive returns NULL or a C string TDLib owns only until the

@@ -308,6 +308,18 @@ impl ScriptHook for Stage {
 }
 
 impl Stage {
+    /// The native quit preflight, shared with scripted quit. It may run from
+    /// an existing event callback, where redispatching through Cx would be
+    /// reentrant, so the session lifecycle is entered directly.
+    pub(super) fn begin_quit(&mut self, cx: &mut Cx, sh: &mut Shell) {
+        sh.session.begin_shutdown();
+        sh.session.store().poll_external();
+        if sh.session.poll_shutdown() {
+            cx.quit();
+        }
+        self.redraw_scoped(cx);
+    }
+
     /// Brings the stage up on a world: opens (or creates) its store, seeds
     /// the demo rows, restores the session, and arms a script if there is
     /// one.
@@ -758,6 +770,8 @@ impl Widget for Stage {
             && !matches!(
                 event,
                 Event::Timer(_) | Event::Signal | Event::MacosMenuCommand(_)
+                    | Event::QuitRequested(_) | Event::WindowCloseRequested(_)
+                    | Event::Shutdown
             )
             && !(matches!(event, Event::NextFrame(_)) && self.e2e.is_some())
         {
@@ -766,6 +780,37 @@ impl Widget for Stage {
         let Some(mut sh) = self.shell.take() else {
             return;
         };
+        if !self.mount {
+            match event {
+                Event::QuitRequested(request) => {
+                    request.handle();
+                    self.begin_quit(cx, &mut sh);
+                }
+                Event::WindowCloseRequested(request) => {
+                    request.accept_close.set(false);
+                    self.begin_quit(cx, &mut sh);
+                }
+                Event::Shutdown => {
+                    // Normally complete already; platforms without a quit
+                    // preflight still get the final lifecycle boundary.
+                    sh.session.shutdown();
+                    self.shell = Some(sh);
+                    return;
+                }
+                _ => {},
+            }
+            if sh.session.is_closing() {
+                // Keep processing completion signals, including while the
+                // library covers this stage, without admitting more hosted
+                // input or starting another request from an event handler.
+                sh.session.store().poll_external();
+                if sh.session.poll_shutdown() {
+                    cx.quit();
+                }
+                self.shell = Some(sh);
+                return;
+            }
+        }
         let t0 = super::boot::frame_log().then(std::time::Instant::now);
         self.handle_with(cx, &mut sh, event);
         self.settle(cx, &mut sh);
@@ -793,6 +838,18 @@ impl Widget for Stage {
         let dpi = cx.current_dpi_factor();
         self.measure_cell(cx, dpi);
         self.hits.clear();
+
+        if self.shell.as_ref().is_some_and(|shell| shell.session.is_closing()) {
+            // Hosted drawing may itself request media or SQL. During close
+            // only paint this status, leaving all completion work to the
+            // window's event loop above.
+            self.draw_flat.color = draw::rgba_a(theme::BG, 1.0);
+            self.draw_flat.draw_abs(cx, vp);
+            self.draw_mono.color = draw::rgba_a(theme::INK, 1.0);
+            self.draw_mono.draw_abs(cx, vp.pos + dvec2(theme::PAD_X, theme::PAD_Y), "Closing…");
+            cx.end_turtle_with_area(&mut self.area);
+            return DrawStep::done();
+        }
 
         let mut shell = self.shell.take();
         if let Some(sh) = shell.as_deref_mut() {
@@ -926,8 +983,8 @@ impl Stage {
 
             // The lease's lifecycle: hand it back when this device steps
             // away, so the other can take over without an override, and
-            // re-poll when it returns. On close the release runs
-            // synchronously — the driver may never get another turn.
+            // re-poll when it returns. Closing uses the draining lifecycle
+            // in handle_event before any hosted widget receives the event.
             Event::Background | Event::Pause => sh.session.repl_release(),
             Event::Foreground | Event::Resume => sh.session.repl_kick(),
             // The last chance at both: the layout written, and then the
@@ -935,8 +992,7 @@ impl Stage {
             // anything, so in practice this writes nothing — but a shutdown
             // is the one moment where "in practice" is not good enough.
             Event::Shutdown => {
-                sh.session.save();
-                sh.session.repl_release_blocking();
+                sh.session.shutdown();
             }
 
             // A menu item (macOS menu bar).

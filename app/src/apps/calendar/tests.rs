@@ -7,10 +7,14 @@ use kernel::{
     session::{Action, Session},
 };
 use serde_json::{json, Value};
-#[path = "tests/scheduling.rs"]
-mod scheduling;
 #[path = "tests/loading.rs"]
 mod loading;
+#[path = "tests/recovery.rs"]
+mod recovery;
+#[path = "tests/recovery_ui.rs"]
+mod recovery_ui;
+#[path = "tests/scheduling.rs"]
+mod scheduling;
 static APPS: &[&dyn App] = &[
     &crate::apps::mail::MAIL,
     &crate::apps::accounts::ACCOUNTS,
@@ -23,7 +27,7 @@ fn session() -> Session {
 }
 fn refresh(s: &Session) {
     for _ in 0..5 {
-        sync::Sync.pass(s.world());
+        kernel::runtime::block_on(sync::Sync.pass(s.world()));
     }
 }
 fn event(s: &Session, name: &str) -> model::Event {
@@ -52,6 +56,17 @@ fn form(s: &mut Session) -> (i64, edit::Form) {
 fn run(s: &mut Session, name: &str, v: Value) -> Result<Value, String> {
     let t = s.apps().tool(name).unwrap().clone();
     t.check(&v)?;
+    if let Some(read) = t.reader {
+        return kernel::runtime::block_on(read(&v)(s.world()));
+    }
+    if let Some(prepare) = t.preparer {
+        let prepared = kernel::runtime::block_on(prepare(&v)(s.world()))?;
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let output = result.clone();
+        prepared.commit(s, move |_, result| *output.borrow_mut() = Some(result));
+        let result = result.borrow_mut().take().expect("fixture tool completed");
+        return result;
+    }
     (t.run)(s, &v)
 }
 fn operation(s: &Session, id: i64) -> (String, String) {
@@ -63,6 +78,174 @@ fn operation(s: &Session, id: i64) -> (String, String) {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap()
+}
+
+#[test]
+fn queued_editor_typing_coalesces_and_submission_waits_for_the_last_save_after_close() {
+    let mut s = paused_session();
+    let (draft, mut form) = form(&mut s);
+    let slot = open(&mut s, panels::Editor::id(draft));
+    let (notify,woke) = std::sync::mpsc::channel();
+    s.store().attach_ui(move || {let _ = notify.send(());});
+    let deadline = std::time::Instant::now()+std::time::Duration::from_secs(5);
+    loop {
+        let ready = s.panel(slot).unwrap().borrow_mut().as_any().downcast_mut::<panels::Editor>().unwrap().reading().is_some();
+        if ready {break;}
+        assert!(std::time::Instant::now()<deadline,"editor snapshot loaded");
+        woke.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        s.store().poll_external();
+    }
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let _writer = s.store().submit_write(move |_| { entered.send(()).unwrap(); held.recv().unwrap(); Ok(()) }).unwrap();
+    waiting.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    {
+        let instance = s.panel(slot).unwrap();
+        let mut panel = instance.borrow_mut();
+        let editor = panel.as_any().downcast_mut::<panels::Editor>().unwrap();
+        for n in 0..40 {
+            form.title = format!("Queued draft {n}");
+            editor.save(&mut s, 1, 1, form.clone());
+        }
+        assert_eq!(editor.reading().unwrap().form.title, "Queued draft 39");
+        editor.run("calendar.save", &mut s);
+        assert_eq!(editor.reading().unwrap().state, "pending", "the reviewed form is frozen while saving");
+    }
+    s.nav(Nav::Close { slot, label: None });
+    s.settle();
+    release.send(()).unwrap();
+    s.shutdown();
+    let saved = edit::draft(s.store(), draft).unwrap();
+    assert_eq!(saved.form.title, "Queued draft 39");
+    assert_eq!(saved.revision, 3, "one accepted save plus the newest queued form");
+    assert_eq!(saved.state, "pending");
+    let body: String = s.store().conn().query_row("SELECT body FROM calendar_change WHERE draft=?", [draft], |row| row.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["form"]["title"], "Queued draft 39");
+}
+
+#[test]
+fn editor_refresh_keeps_accepted_text_and_accepts_an_undo_to_an_earlier_revision() {
+    use std::{sync::{mpsc, Arc}, time::{Duration, Instant}};
+
+    fn fresh(s: &mut Session, slot: kernel::layout::SlotId, woke: &mpsc::Receiver<()>) -> Arc<edit::Draft> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            s.store().poll_external();
+            s.settle();
+            if !s.history_busy() {
+                let instance = s.panel(slot).unwrap();
+                let mut panel = instance.borrow_mut();
+                let editor = panel.as_any().downcast_mut::<panels::Editor>().unwrap();
+                if let snapshot::State::Ready(display) = editor.display() {
+                    let reading = editor.reading().unwrap();
+                    assert_eq!(reading.revision, display.revision);
+                    assert_eq!(reading.form.title, display.form.title);
+                    assert!(editor.problem().is_empty());
+                    return reading;
+                }
+            }
+            assert!(Instant::now() < deadline, "the native display completion must arrive");
+            woke.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    let mut s = paused_session();
+    let (draft, form) = form(&mut s);
+    let other = edit::create(&mut s, 1, None).unwrap();
+    let slot = open(&mut s, panels::Editor::id(draft));
+    {
+        let instance = s.panel(slot).unwrap();
+        let mut panel = instance.borrow_mut();
+        let editor = panel.as_any().downcast_mut::<panels::Editor>().unwrap();
+        assert_eq!(editor.reading().unwrap().revision, 1);
+        editor.save(&mut s, 1, 1, form);
+        assert_eq!(editor.reading().unwrap().revision, 2);
+    }
+    let (notify, woke) = mpsc::channel();
+    s.store().attach_ui(move || { let _ = notify.send(()); });
+    s.store().write(move |tx| {
+        tx.execute("UPDATE calendar_draft SET revision=revision+1 WHERE id=?", [other])?;
+        Ok(())
+    }).unwrap();
+    {
+        let instance = s.panel(slot).unwrap();
+        let mut panel = instance.borrow_mut();
+        let editor = panel.as_any().downcast_mut::<panels::Editor>().unwrap();
+        let reading = editor.reading().unwrap();
+        assert_eq!(reading.revision, 2, "another draft must not restore the old parsed form during refresh");
+        assert_eq!(reading.form.title, "New project review");
+        assert!(editor.problem().is_empty(), "status can read the accepted form without borrowing it twice");
+    }
+    assert_eq!(fresh(&mut s, slot, &woke).revision, 2);
+
+    // A recorded data edit restores its previous revision on undo. The fresh
+    // answer must win even when its numeric revision is below the cached one.
+    let tool = s.apps().tool("sql.write").unwrap().clone();
+    let input = json!({
+        "sql": "UPDATE calendar_draft SET revision=revision+1,form=json_set(form,'$.title','Later revision') WHERE id=?",
+        "params": [draft],
+    });
+    tool.check(&input).unwrap();
+    let prepared = kernel::runtime::block_on(tool.preparer.unwrap()(&input)(s.world())).unwrap();
+    let committed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let completed = committed.clone();
+    prepared.commit(&mut s, move |_, result| {
+        assert_eq!(result.unwrap(), json!({"changes": 1}));
+        completed.set(true);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !committed.get() {
+        s.store().poll_external();
+        s.settle();
+        if committed.get() { break; }
+        assert!(Instant::now() < deadline, "the recorded edit must commit");
+        woke.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    assert_eq!(fresh(&mut s, slot, &woke).revision, 3);
+    assert!(s.undo());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.history_busy() {
+        s.store().poll_external();
+        s.settle();
+        if !s.history_busy() { break; }
+        assert!(Instant::now() < deadline, "the data reversal must complete");
+        woke.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    assert_eq!(edit::draft(s.store(), draft).unwrap().revision, 2, "undo restored the database before refreshing the display");
+    let restored = fresh(&mut s, slot, &woke);
+    assert_eq!(restored.revision, 2);
+    assert_eq!(restored.form.title, "New project review");
+
+    s.store().write(move |tx| {
+        tx.execute("UPDATE calendar_draft SET revision=revision+1 WHERE id=?", [other])?;
+        Ok(())
+    }).unwrap();
+    {
+        let instance = s.panel(slot).unwrap();
+        let mut panel = instance.borrow_mut();
+        let editor = panel.as_any().downcast_mut::<panels::Editor>().unwrap();
+        assert_eq!(editor.reading().unwrap().revision, 2, "a later refresh cannot resurrect the value that was undone");
+    }
+    assert_eq!(fresh(&mut s, slot, &woke).revision, 2);
+    s.shutdown();
+}
+
+#[test]
+fn a_prepared_calendar_edit_rechecks_permissions_and_event_revision_in_the_writer() {
+    let mut s = paused_session();
+    let (id, form) = form(&mut s);
+    let plan = edit::save_plan(s.world(), id, 1, 1, form).unwrap();
+    s.store().write(|tx| { tx.execute("UPDATE calendar_source SET role='reader' WHERE id=1", [])?; Ok(()) }).unwrap();
+    let before = s.history().head();
+    assert!(edit::fixture(&mut s, move |_| Ok(plan)).unwrap_err().contains("read-only"));
+    assert_eq!(edit::draft(s.store(), id).unwrap().revision, 1);
+    assert_eq!(s.history().head(), before);
+    s.store().write(|tx| { tx.execute("UPDATE calendar_source SET role='owner' WHERE id=1", [])?; Ok(()) }).unwrap();
+    let event = event(&s, "Design review");
+    let plan = edit::command_plan(s.world(), event.id, &event.etag, "delete", "this", "", true).unwrap();
+    s.store().write(move |tx| { tx.execute("UPDATE calendar_event SET etag='changed' WHERE id=?", [event.id])?; Ok(()) }).unwrap();
+    assert!(edit::fixture(&mut s, move |_| Ok(plan)).unwrap_err().contains("changed"));
+    assert_eq!(s.history().head(), before);
 }
 fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
     s.act(Action::new("test.open", "open Calendar").moving(move |wm| {
@@ -199,8 +382,9 @@ fn timeline_prefetches_at_the_edge_and_scrolls_past_empty_filtered_pages() {
 #[test]
 fn timeline_prefetch_waits_for_sync_and_does_not_advance_after_failure() {
     struct Offline;
+    #[async_trait::async_trait(?Send)]
     impl api::Api for Offline {
-        fn call(&mut self, _: &api::Request) -> Result<Value, String> {
+        async fn call(&mut self, _: &api::Request) -> Result<Value, String> {
             Err("offline".into())
         }
     }
@@ -527,8 +711,9 @@ struct CalendarSnapshot {
     fake: api::Fake,
     reject_trim: bool,
 }
+#[async_trait::async_trait(?Send)]
 impl api::Api for CalendarSnapshot {
-    fn call(&mut self, r: &api::Request) -> Result<Value, String> {
+    async fn call(&mut self, r: &api::Request) -> Result<Value, String> {
         if r.method == "GET" && r.path == "/users/me/calendarList" {
             return Ok(json!({"items":[{
                 "id":"primary", "summary":"Work", "timeZone":self.zone,
@@ -542,7 +727,7 @@ impl api::Api for CalendarSnapshot {
             self.reject_trim = false;
             return Err("HTTP 400: series trim rejected".into());
         }
-        api::Api::call(&mut self.fake, r)
+        api::Api::call(&mut self.fake, r).await
     }
 }
 
@@ -862,9 +1047,10 @@ struct LostResponse {
     on_post: bool,
     on_trim: bool,
 }
+#[async_trait::async_trait(?Send)]
 impl api::Api for LostResponse {
-    fn call(&mut self, request: &api::Request) -> Result<Value, String> {
-        let answer = api::Api::call(&mut self.fake, request)?;
+    async fn call(&mut self, request: &api::Request) -> Result<Value, String> {
+        let answer = api::Api::call(&mut self.fake, request).await?;
         if self.on_post && request.method == "POST" && request.path.ends_with("/events") {
             self.on_post = false;
             return Err("network response lost after Google accepted the event".into());
@@ -988,7 +1174,7 @@ fn an_existing_store_can_sync_calendar_without_demo_seeding_or_mail() {
         })
         .unwrap();
     let world = kernel::app::world_for(SHARED, store, Mode::Fake, &Env::default());
-    sync::Sync.pass(&world);
+    kernel::runtime::block_on(sync::Sync.pass(&world));
     assert_eq!(model::sources(world.store()).len(), 2);
     assert!(model::EVENTS.count(world.store(), None).unwrap() > 0);
     let start = world
@@ -1362,9 +1548,10 @@ struct FreeBusyAccounts {
     replies: std::collections::HashMap<String, Result<Value, String>>,
     calls: std::sync::Arc<std::sync::Mutex<Vec<api::Request>>>,
 }
+#[async_trait::async_trait(?Send)]
 impl api::Api for FreeBusyAccounts {
-    fn call(&mut self, request: &api::Request) -> Result<Value, String> {
-        use kernel::effect::Effect;
+    async fn call(&mut self, request: &api::Request) -> Result<Value, String> {
+        use kernel::effect::AsyncEffect;
         assert!(!request.writes());
         if request.path != "/freeBusy" {
             return Err("Keep the cached calendar catalog for this availability test".into());
@@ -1429,7 +1616,7 @@ fn availability_retries_guests_with_connected_accounts_and_preserves_successful_
         ].into_iter().collect(), calls:calls.clone(),
     })));
     let request = availability::request(&mut s, 1, q, Some(draft)).unwrap();
-    sync::Sync.pass(s.world());
+    kernel::runtime::block_on(sync::Sync.pass(s.world()));
     let (q, result, error, _) = availability::load(s.store(), request).unwrap();
     assert!(error.is_empty(), "{error}");
     let result = result.unwrap();
@@ -1524,7 +1711,7 @@ fn availability_account_failures_do_not_block_other_connected_accounts() {
         ].into_iter().collect(),calls:Default::default(),
     })));
     let request = availability::request(&mut s, 1, q, None).unwrap();
-    sync::Sync.pass(s.world());
+    kernel::runtime::block_on(sync::Sync.pass(s.world()));
     let (_, result, error, _) = availability::load(s.store(), request).unwrap();
     assert!(error.is_empty());
     let result = result.unwrap();
@@ -1571,4 +1758,97 @@ fn availability_retains_google_error_reasons_and_reads_older_results() {
     let old: availability::ResultSet = serde_json::from_value(json!({"people":[{"calendar":"guest@example.com","known":true,"busy":[],"error":""}],"slots":[],"complete":true,"checked":0.0})).unwrap();
     assert!(old.people[0].known);
     assert!(old.people[0].checks.is_empty());
+}
+
+#[test]
+fn guest_suggestions_arrive_without_typing_again_in_calendar_only_and_full_stores() {
+    use kernel::richtable::Completion;
+    use std::{sync::mpsc,time::Duration};
+    static CALENDAR_ONLY: &[&dyn App] = &[&crate::apps::accounts::ACCOUNTS,&CALENDAR];
+    for apps in [CALENDAR_ONLY,APPS] {
+        let mut s = Session::fake(apps);
+        refresh(&s);
+        let field = completion::Field::Guests;
+        let context = field.context("nor",3).unwrap();
+        let expected = field.offer(s.store(),&context);
+        let (notify,woke) = mpsc::channel();
+        s.store().attach_ui(move || {let _ = notify.send(());});
+        assert!(field.offer(s.store(),&context).is_empty());
+        let before = s.store().display_revision();
+        let deadline = std::time::Instant::now()+Duration::from_secs(5);
+        let answer = loop {
+            assert!(std::time::Instant::now()<deadline,"guest snapshots completed");
+            let answer = field.offer(s.store(),&context);
+            if !s.store().queries_pending() && !answer.is_empty() {break answer;}
+            woke.recv_timeout(Duration::from_secs(5)).unwrap();
+            s.store().poll_external();
+        };
+        assert_ne!(before,s.store().display_revision(),"unchanged caret observes completion");
+        assert_eq!(answer.iter().map(|s|(&s.label,&s.value)).collect::<Vec<_>>(),expected.iter().map(|s|(&s.label,&s.value)).collect::<Vec<_>>());
+        assert!(answer.len()<=kernel::richtable::MAX_SUGGESTIONS);
+        s.shutdown();
+    }
+}
+
+#[test]
+fn month_snapshots_wait_for_timezone_and_keep_boundary_counts_with_three_display_rows() {
+    use std::{sync::mpsc,time::Duration};
+    let mut s = paused_session();
+    s.store().write(|tx| {
+        for (id,start,end) in [("bridge","2030-02-28","2030-03-02"),("ends-before","2030-02-28","2030-03-01")] {
+            model::ingest(tx,1,"Europe/Berlin",&json!({"id":id,"summary":id,"start":{"date":start},"end":{"date":end}}))?;
+        }
+        for n in 0..10 {
+            model::ingest(tx,1,"Europe/Berlin",&json!({"id":format!("dense-{n}"),"summary":format!("dense-{n}"),"start":{"date":"2030-03-01"},"end":{"date":"2030-03-02"}}))?;
+        }
+        Ok(())
+    }).unwrap();
+    let (notify,woke) = mpsc::channel();
+    s.store().attach_ui(move || {let _ = notify.send(());});
+    let requested = panels::Month::id("2030-03-01","");
+    let slot = open(&mut s,requested.clone());
+    let instance = s.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let panel = borrow.as_any().downcast_mut::<panels::Month>().unwrap();
+    assert!(!panel.ready(),"a cold source snapshot never implies UTC");
+    assert_eq!(panel.persist(),requested,"loading does not overwrite restored state");
+    let deadline = std::time::Instant::now()+Duration::from_secs(5);
+    let grid = loop {
+        assert!(std::time::Instant::now()<deadline,"month preparation completed");
+        panel.cover(&mut s);
+        match panel.reading() {
+            snapshot::State::Ready(grid)=>break grid,
+            snapshot::State::Loading | snapshot::State::Refreshing(_)=>{
+                woke.recv_timeout(Duration::from_secs(5)).unwrap();
+                s.store().poll_external();
+            }
+            snapshot::State::Failed(error)=>panic!("{error}"),
+        }
+    };
+    assert_eq!(panel.zone,"Europe/Berlin");
+    assert_eq!(grid.count,12);
+    assert_eq!(grid.days.len(),42);
+    let dates = dates::grid("2030-03-01");
+    let day = |date: &str| dates.iter().position(|day|day.to_string()==date).unwrap();
+    assert_eq!(grid.days[day("2030-02-28")].count,2);
+    assert_eq!(grid.days[day("2030-03-01")].count,11,"an exclusive midnight end never spills into the next day");
+    assert_eq!(grid.days[day("2030-03-01")].lines.len(),3);
+    assert_eq!(grid.days[day("2030-03-02")].count,0);
+    assert!(grid.days.iter().all(|day|day.lines.len()<=3));
+    panel.filter = "bridge".into();
+    assert!(matches!(panel.reading(),snapshot::State::Loading),"changed filters never show stale month entries");
+    let filtered = loop {
+        match panel.reading() {
+            snapshot::State::Ready(grid)=>break grid,
+            snapshot::State::Loading | snapshot::State::Refreshing(_)=>{
+                woke.recv_timeout(Duration::from_secs(5)).unwrap();
+                s.store().poll_external();
+            }
+            snapshot::State::Failed(error)=>panic!("{error}"),
+        }
+    };
+    assert_eq!(filtered.count,1);
+    assert_eq!(filtered.days[day("2030-03-01")].count,1);
+    drop(borrow);
+    s.shutdown();
 }

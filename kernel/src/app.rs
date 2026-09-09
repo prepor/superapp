@@ -8,7 +8,8 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::mpsc;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -119,6 +120,12 @@ pub trait App: Any + Sync + Send + 'static {
     /// No app may open a session of its own here; this is the session it
     /// already lives in.
     fn poll(&self, _s: &mut crate::session::Session) {}
+
+    /// Drains accepted local work before shutdown or suspension. This hook
+    /// never starts new network work; apps use it for pending drafts and files.
+    fn flush(&self, _db: Arc<Db>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
 
     /// The panels the launcher offers whether or not they are open, in
     /// the order the app wants them, each with the label and the words a
@@ -375,7 +382,8 @@ pub fn capabilities_for(list: &'static [&'static dyn App], mode: Mode, env: &Env
     let mut caps = Capabilities::default();
     crate::caps::install(mode, env, &mut caps);
     caps.insert::<crate::tool::Readers>(Box::new(crate::tool::Readers(
-        list.iter().flat_map(|app| app.tools()).filter(|tool| tool.reader.is_some()).collect(),
+        crate::tools::all().into_iter().chain(list.iter().flat_map(|app| app.tools()))
+            .filter(|tool| tool.reader.is_some()).collect(),
     )));
     for a in list {
         a.outside(mode, env, &mut caps);
@@ -383,14 +391,36 @@ pub fn capabilities_for(list: &'static [&'static dyn App], mode: Mode, env: &Env
     caps
 }
 
-/// A whole world for one thread.
+/// A recipe for a worker world. Only the recipe crosses threads; connections
+/// and platform capabilities are constructed and dropped where they are used.
+#[derive(Clone)]
+pub struct WorldFactory {
+    apps: &'static [&'static dyn App],
+    db: Arc<Db>,
+    mode: Mode,
+    env: Env,
+}
+
+impl WorldFactory {
+    pub fn clock(&self) -> ClockSource { self.env.clock.clone() }
+
+    /// Opens a reader and the capabilities for one bounded blocking operation.
+    pub fn build(&self) -> rusqlite::Result<World> {
+        Ok(world_for(self.apps, Store::with_db(self.db.clone())?, self.mode, &self.env))
+    }
+}
+
+/// A whole world for one service.
 #[must_use]
 pub fn world_for(list: &'static [&'static dyn App], store: Store, mode: Mode, env: &Env) -> World {
-    World::new(
+    let factory = WorldFactory { apps: list, db: store.db(), mode, env: env.clone() };
+    let mut world = World::new(
         Rc::new(store),
         capabilities_for(list, mode, env),
         registry_for(list),
-    )
+    );
+    world.set_factory(factory);
+    world
 }
 
 // -- capabilities --------------------------------------------------------------
@@ -630,8 +660,8 @@ impl Schema {
 
 // -- workers -------------------------------------------------------------------
 
-/// One background pass with its own thread and its own world (its own store
-/// reader, its own real capabilities).
+/// One asynchronous service with its own world, reader and capabilities.
+#[async_trait::async_trait(?Send)]
 pub trait Worker: Send + 'static {
     /// Unique among running workers (`sync-2`, `sender`); how the kernel
     /// diffs the set after each action.
@@ -653,7 +683,42 @@ pub trait Worker: Send + 'static {
     /// `claims`, notifies the UI, and sleeps as [`Wake`] says or until
     /// kicked. Under virtual time the kernel runs every pass inline from
     /// the frame loop instead, then drains the queue until it stops moving.
-    fn pass(&mut self, w: &World) -> Wake;
+    async fn pass(&mut self, w: &World) -> Wake;
+
+    /// Installs the service's retirement signal before its first pass.
+    /// Only optional waits should end early; accepted writes and their
+    /// protocol acknowledgements still finish through the normal path.
+    fn retiring(&mut self, _retirement: Retirement) {}
+
+    /// Finishes accepted protocol work and closes native resources after
+    /// retirement. Called after the active pass has returned, never concurrently.
+    async fn shutdown(&mut self, _world: &World) {}
+
+    /// Waits for service input between passes. Kicks and retirement interrupt
+    /// this wait; they never cancel a pass or an effect already in progress.
+    async fn wait(&mut self, _world: &World, wake: Wake) {
+        match wake {
+            Wake::After(delay) => tokio::time::sleep(delay).await,
+            Wake::OnKick => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Cooperative service retirement. A worker may end passive network waits
+/// when requested, then finish protocol cleanup and any accepted mutations.
+/// Requesting retirement never drops or aborts the worker's active future.
+#[derive(Clone, Debug)]
+pub struct Retirement(tokio::sync::watch::Sender<bool>);
+impl Default for Retirement {
+    fn default() -> Self { Self(tokio::sync::watch::channel(false).0) }
+}
+impl Retirement {
+    pub fn requested(&self) -> bool { *self.0.borrow() }
+    pub fn request(&self) { self.0.send_replace(true); }
+    pub async fn wait(&self) {
+        let mut requested = self.0.subscribe();
+        let _ = requested.wait_for(|value| *value).await;
+    }
 }
 
 /// When a [`Worker`] wants its next pass.
@@ -665,11 +730,16 @@ pub enum Wake {
     OnKick,
 }
 
-/// One running thread's handle. Dropping the sender closes the channel,
-/// which is how a worker that is no longer wanted retires.
+/// One running service's handles. Closing its kick channel requests retirement;
+/// completion confirms its accepted pass and native shutdown have finished.
 struct Live {
     entity: Option<String>,
     kick: mpsc::Sender<()>,
+    done: Option<tokio::sync::oneshot::Receiver<()>>,
+    retirement: Retirement,
+}
+impl Drop for Live {
+    fn drop(&mut self) { self.retirement.request(); }
 }
 
 /// The running passes' wake channels, and nobody's but [`Workers`]'.
@@ -691,17 +761,22 @@ impl Set {
 
     /// Whether this one is already running.
     fn has(&self, name: &str) -> bool {
-        self.with(|live| live.contains_key(name))
+        self.with(|live| live.get(name).is_some_and(|worker| !worker.kick.is_closed()))
     }
 
     fn insert(&self, name: String, one: Live) {
         self.with(|live| live.insert(name, one));
     }
 
-    /// Retires everyone not in this set: dropping a sender closes the
-    /// channel, and the thread returns on its next wake.
-    fn retain(&self, names: &HashSet<String>) {
-        self.with(|live| live.retain(|name, _| names.contains(name)));
+    /// Requests retirement for everyone outside this set and retains each
+    /// identity beside the completion that releases its native resources.
+    fn retain(&self, names: &HashSet<String>) -> Vec<(String, tokio::sync::oneshot::Receiver<()>)> {
+        self.with(|live| {
+            let retired: Vec<_> = live.iter().filter(|(name, worker)|
+                !names.contains(*name) || worker.kick.is_closed()).map(|(name, _)| name.clone()).collect();
+            retired.into_iter().filter_map(|name| live.remove(&name)
+                .and_then(|mut worker| worker.done.take()).map(|done| (name, done))).collect()
+        })
     }
 
     fn names(&self) -> Vec<String> {
@@ -715,7 +790,7 @@ impl Set {
     fn wake_all(&self) {
         self.with(|live| {
             for l in live.values() {
-                let _ = l.kick.send(());
+                let _ = l.kick.try_send(());
             }
         });
     }
@@ -724,7 +799,7 @@ impl Set {
         self.with(|live| {
             for l in live.values() {
                 if l.entity.as_deref() == Some(entity) {
-                    let _ = l.kick.send(());
+                    let _ = l.kick.try_send(());
                 }
             }
         });
@@ -772,11 +847,10 @@ impl std::fmt::Debug for Kicks {
 
 /// How the passes run.
 enum Mount {
-    /// Production: a thread each, its own world, its own store reader.
-    Threads {
-        mode: Mode,
-        env: Env,
-        notify: Arc<dyn Fn() + Send + Sync>,
+    /// Production: discovery and protocol services run outside the UI.
+    Async {
+        discover: mpsc::Sender<()>,
+        done: tokio::sync::oneshot::Receiver<()>,
         live: Arc<Set>,
     },
     /// Under virtual time: every pass runs from the caller's thread,
@@ -810,11 +884,10 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// Production: a thread per worker, each with its own world over its
-    /// own reader of the one database. `notify` wakes the UI thread once a
-    /// pass has changed something.
+    /// Production: asynchronous service tasks with background discovery.
+    /// `notify` wakes the UI after a pass or worker-set change.
     #[must_use]
-    pub fn threads(
+    pub fn async_io(
         apps: &'static [&'static dyn App],
         store: Rc<Store>,
         mode: Mode,
@@ -826,16 +899,14 @@ impl Workers {
         // a weak handle: the set holds that thread's own channel.
         let live = Arc::new(Set::default());
         env.kicks = Kicks(Arc::downgrade(&live));
-        Workers {
-            apps,
-            store,
-            mount: std::cell::RefCell::new(Mount::Threads {
-                mode,
-                env,
-                notify: Arc::new(notify),
-                live,
-            }),
-        }
+        let (discover, requests) = mpsc::channel(1);
+        let db = store.db();
+        let services = live.clone();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
+        let done = crate::runtime::spawn_local(move || async move {
+            supervise(apps, db, mode, env, notify, services, requests).await;
+        });
+        Workers { apps, store, mount: std::cell::RefCell::new(Mount::Async { discover, done, live }) }
     }
 
     /// Under virtual time: the same passes, run from the caller's thread
@@ -875,7 +946,7 @@ impl Workers {
     #[must_use]
     pub fn any(&self) -> bool {
         match &*self.mount.borrow() {
-            Mount::Threads { live, .. } => !live.is_empty(),
+            Mount::Async { live, .. } => !live.is_empty(),
             Mount::Inline { live, .. } => !live.is_empty(),
             Mount::None => false,
         }
@@ -886,7 +957,7 @@ impl Workers {
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = match &*self.mount.borrow() {
-            Mount::Threads { live, .. } => live.names(),
+            Mount::Async { live, .. } => live.names(),
             Mount::Inline { live, .. } => live.iter().map(|w| w.name()).collect(),
             Mount::None => Vec::new(),
         };
@@ -897,54 +968,18 @@ impl Workers {
     /// Wakes every worker and re-asks the apps for the set. The session
     /// does this itself after every action.
     pub fn kick_all(&self) {
-        let want: Vec<Box<dyn Worker>> = self
-            .apps
-            .iter()
-            .flat_map(|a| a.workers(&self.store))
-            .collect();
-        let names: HashSet<String> = want.iter().map(|w| w.name()).collect();
         let mut mount = self.mount.borrow_mut();
         match &mut *mount {
-            Mount::Threads {
-                mode,
-                env,
-                notify,
-                live,
-            } => {
-                // A missing name retires: dropping its sender closes the
-                // channel, and the thread returns on its next wake.
-                live.retain(&names);
-                for w in want {
-                    let name = w.name();
-                    if live.has(&name) {
-                        continue;
-                    }
-                    let entity = w.entity();
-                    let (kick, rx) = mpsc::channel::<()>();
-                    let (apps, mode, env, notify) = (self.apps, *mode, env.clone(), notify.clone());
-                    let db = self.store.db();
-                    match std::thread::Builder::new()
-                        .name(format!("worker-{name}"))
-                        .spawn(move || worker_loop(apps, db, mode, &env, w, &rx, &*notify))
-                    {
-                        Ok(_) => {
-                            live.insert(name, Live { entity, kick });
-                        }
-                        // A pass that could not be spawned is simply one
-                        // that is not running; the rest still are.
-                        Err(e) => eprintln!("workers: {name} did not start: {e}"),
-                    }
-                }
+            Mount::Async { discover, live, .. } => {
+                let _ = discover.try_send(());
                 live.wake_all();
             }
             Mount::Inline { live, .. } => {
-                live.retain(|w| names.contains(&w.name()));
-                let have: HashSet<String> = live.iter().map(|w| w.name()).collect();
-                for w in want {
-                    if !have.contains(&w.name()) {
-                        live.push(w);
-                    }
-                }
+                let want: Vec<_> = self.apps.iter().flat_map(|app| app.workers(&self.store)).collect();
+                let names: HashSet<_> = want.iter().map(|worker| worker.name()).collect();
+                live.retain(|worker| names.contains(&worker.name()));
+                let have: HashSet<_> = live.iter().map(|worker| worker.name()).collect();
+                live.extend(want.into_iter().filter(|worker| !have.contains(&worker.name())));
                 drop(mount);
                 self.tick();
             }
@@ -956,13 +991,23 @@ impl Workers {
     pub fn kick(&self, entity: &str) {
         let mount = self.mount.borrow();
         match &*mount {
-            Mount::Threads { live, .. } => live.kick(entity),
+            Mount::Async { live, .. } => live.kick(entity),
             Mount::Inline { .. } => {
                 drop(mount);
                 self.tick();
             }
             Mount::None => {}
         }
+    }
+
+    /// Retires services, then waits for each accepted pass to finish. Closing
+    /// kick channels interrupts idle waits without aborting an active effect.
+    pub fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let done = match self.mount.replace(Mount::None) {
+            Mount::Async { discover, done, .. } => { drop(discover); Some(done) }
+            _ => None,
+        };
+        async move { if let Some(done) = done { let _ = done.await; } }
     }
 
     /// One inline round: every pass, then the queue drained until it stops
@@ -975,13 +1020,13 @@ impl Workers {
         };
         let mut moved = false;
         for w in live.iter_mut() {
-            w.pass(world);
-            moved |= world.run_effects_where(|j| w.claims(j)) > 0;
+            crate::runtime::block_on(w.pass(world));
+            moved |= crate::runtime::block_on(world.run_effects_where(|j| w.claims(j))) > 0;
         }
         // Inline, one thread is every thread: whatever the passes filed is
         // drained here, and a job that filed another is drained with it.
         for _ in 0..INLINE_ROUNDS {
-            if world.run_effects() == 0 {
+            if crate::runtime::block_on(world.run_effects()) == 0 {
                 break;
             }
             moved = true;
@@ -999,41 +1044,91 @@ impl std::fmt::Debug for Workers {
     }
 }
 
-/// One worker's thread: its own reader, its own world, its own pass. It
-/// exits when its handle drops — the kick channel closes — which is how a
-/// retired worker stops without a shutdown protocol.
-fn worker_loop(
+/// Coalesced discovery never runs app queries on the UI. Retirement reserves
+/// the worker's name until its accepted pass and native shutdown finish.
+async fn supervise(
+    apps: &'static [&'static dyn App], db: Arc<Db>, mode: Mode, env: Env,
+    notify: Arc<dyn Fn() + Send + Sync>, live: Arc<Set>, mut requests: mpsc::Receiver<()>,
+) {
+    let mut retired: HashMap<String, tokio::sync::oneshot::Receiver<()>> = HashMap::new();
+    loop {
+        tokio::select! {
+            biased;
+            request = requests.recv() => if request.is_none() { break; },
+            name = std::future::poll_fn(|context| {
+                for (name, done) in &mut retired {
+                    if std::future::Future::poll(std::pin::Pin::new(done), context).is_ready() {
+                        return std::task::Poll::Ready(name.clone());
+                    }
+                }
+                std::task::Poll::Pending
+            }) => { retired.remove(&name); },
+        }
+        while requests.try_recv().is_ok() {}
+        let source = db.clone();
+        let want = crate::runtime::spawn_blocking(move || {
+            let store = Store::with_db(source)?;
+            Ok::<_, rusqlite::Error>(apps.iter().flat_map(|app| app.workers(&store)).collect::<Vec<_>>())
+        }).await;
+        if requests.is_closed() { break; }
+        let want = match want {
+            Ok(Ok(want)) => want,
+            result => { eprintln!("worker discovery failed: {}", match result {
+                Ok(Err(error)) => error.to_string(), Err(error) => error.to_string(), _ => unreachable!(),
+            }); continue; }
+        };
+        let names = want.iter().map(|worker| worker.name()).collect();
+        retired.extend(live.retain(&names));
+        retired.retain(|_, done| matches!(done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        for mut worker in want {
+            let name = worker.name();
+            // An accepted pass and native shutdown still own this identity.
+            // Its completion re-runs discovery, even without another UI kick.
+            if live.has(&name) || retired.contains_key(&name) { continue; }
+            let entity = worker.entity();
+            let retirement = Retirement::default();
+            worker.retiring(retirement.clone());
+            let (kick, receive) = mpsc::channel(1);
+            let (db, env, notify) = (db.clone(), env.clone(), notify.clone());
+            let done = crate::runtime::spawn_local(move || async move {
+                worker_loop(apps, db, mode, &env, worker, receive, &*notify).await;
+            });
+            live.insert(name, Live { entity, kick, done: Some(done), retirement });
+        }
+        live.wake_all();
+        notify();
+    }
+    retired.extend(live.retain(&HashSet::new()));
+    for (_, done) in retired { let _ = done.await; }
+}
+
+/// One worker's local world and reader. A closed kick channel stops new passes;
+/// the accepted pass finishes before the worker's shutdown protocol is joined.
+async fn worker_loop(
     apps: &'static [&'static dyn App],
     db: Arc<Db>,
     mode: Mode,
     env: &Env,
     mut worker: Box<dyn Worker>,
-    kicks: &mpsc::Receiver<()>,
+    mut kicks: mpsc::Receiver<()>,
     notify: &(dyn Fn() + Send + Sync),
 ) {
-    let Ok(store) = Store::with_db(db) else {
-        return;
-    };
+    let Ok(store) = Store::with_db(db) else { return; };
     let world = world_for(apps, store, mode, env);
     loop {
-        let wake = worker.pass(&world);
-        world.run_effects_where(|j| worker.claims(j));
+        let wake = worker.pass(&world).await;
+        if kicks.is_closed() { notify(); break; }
+        world.run_effects_where(|j| worker.claims(j)).await;
         notify();
-        let closed = match wake {
-            Wake::After(d) => {
-                matches!(
-                    kicks.recv_timeout(d),
-                    Err(mpsc::RecvTimeoutError::Disconnected)
-                )
-            }
-            Wake::OnKick => kicks.recv().is_err(),
-        };
-        if closed {
-            return;
+        tokio::select! {
+            biased;
+            kick = kicks.recv() => if kick.is_none() { break; },
+            () = worker.wait(&world, wake) => {},
         }
-        // A burst of kicks is one pass.
+        // Coalesce bursts without an unbounded queue or a lost wake.
         while kicks.try_recv().is_ok() {}
     }
+    worker.shutdown(&world).await;
 }
 
 #[cfg(test)]
@@ -1457,6 +1552,7 @@ mod tests {
         filed: bool,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl Worker for Once {
         fn name(&self) -> String {
             self.name.to_string()
@@ -1467,10 +1563,10 @@ mod tests {
         fn claims(&self, job: &Job) -> bool {
             job.kind == "tick"
         }
-        fn pass(&mut self, w: &World) -> Wake {
+        async fn pass(&mut self, w: &World) -> Wake {
             if !self.filed {
                 self.filed = true;
-                let _ = w.enqueue(&Tick(1));
+                let _ = w.enqueue_async(&Tick(1)).await;
             }
             Wake::OnKick
         }
@@ -1572,12 +1668,12 @@ mod tests {
         use crate::caps::Kicker;
         let live = Arc::new(Set::default());
         let reach = Kicks(Arc::downgrade(&live));
-        let (one, heard_one) = mpsc::channel();
-        let (two, heard_two) = mpsc::channel();
+        let (one, mut heard_one) = mpsc::channel(1);
+        let (two, mut heard_two) = mpsc::channel(1);
         let entry = |name: &str, kick| {
             (
                 name.to_string(),
-                Live {
+                Live { done: None, retirement: Retirement::default(),
                     entity: Some(format!("worker:{name}")),
                     kick,
                 },
@@ -1607,7 +1703,7 @@ mod tests {
         assert!(live.is_empty());
         assert!(matches!(
             heard_one.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
+            Err(mpsc::error::TryRecvError::Disconnected)
         ));
     }
 
@@ -1620,10 +1716,10 @@ mod tests {
         use crate::caps::Kicker;
         let live = Arc::new(Set::default());
         let reach = Kicks(Arc::downgrade(&live));
-        let (kick, heard) = mpsc::channel();
+        let (kick, mut heard) = mpsc::channel(1);
         live.insert(
             "one".to_string(),
-            Live {
+            Live { done: None, retirement: Retirement::default(),
                 entity: Some("worker:one".to_string()),
                 kick,
             },
@@ -1632,7 +1728,7 @@ mod tests {
         drop(live);
         assert!(matches!(
             heard.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
+            Err(mpsc::error::TryRecvError::Disconnected)
         ));
         // And the reach that outlived it wakes nobody, rather than holding
         // the set open to say so.
@@ -1690,4 +1786,221 @@ mod tests {
         assert!(c.get::<dyn crate::caps::Clock>().is_none());
         assert!(format!("{c:?}").contains("Capabilities"));
     }
+
+    #[derive(Default)]
+    struct ServiceGates {
+        discovery: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+        closing: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+        wanted: std::sync::atomic::AtomicBool,
+        other_wanted: std::sync::atomic::AtomicBool,
+        started: Mutex<Vec<String>>,
+    }
+    struct Supervised {
+        gates: Arc<ServiceGates>,
+        name: &'static str,
+        started: bool,
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Worker for Supervised {
+        fn name(&self) -> String { self.name.into() }
+        fn claims(&self, _: &Job) -> bool { false }
+        async fn pass(&mut self, _: &World) -> Wake {
+            if !self.started {
+                self.gates.started.lock().unwrap().push(self.name.into());
+                self.started = true;
+            }
+            Wake::OnKick
+        }
+        async fn shutdown(&mut self, _: &World) {
+            if self.name != "supervised" { return; }
+            let close = self.gates.closing.lock().unwrap().take();
+            if let Some((started, release)) = close {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+        }
+    }
+    struct Supervision;
+    impl App for Supervision {
+        fn id(&self) -> &'static str { "supervision" }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] { &[] }
+        fn as_any(&self) -> &dyn Any { self }
+        fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
+            let gates = store.local::<ServiceGates>();
+            if let Some((started, release)) = gates.discovery.lock().unwrap().take() {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let mut wanted: Vec<Box<dyn Worker>> = Vec::new();
+            if gates.wanted.load(std::sync::atomic::Ordering::SeqCst) {
+                wanted.push(Box::new(Supervised { gates: gates.clone(), name: "supervised", started: false }));
+            }
+            if gates.other_wanted.load(std::sync::atomic::Ordering::SeqCst) {
+                wanted.push(Box::new(Supervised { gates, name: "independent", started: false }));
+            }
+            wanted
+        }
+    }
+
+    #[derive(Default)]
+    struct PassiveGates {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        cleanup: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+    }
+    struct PassiveService {
+        gates: Arc<PassiveGates>,
+        retirement: Retirement,
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Worker for PassiveService {
+        fn name(&self) -> String { "passive-read".into() }
+        fn claims(&self, _: &Job) -> bool { false }
+        fn retiring(&mut self, retirement: Retirement) { self.retirement = retirement; }
+        async fn pass(&mut self, world: &World) -> Wake {
+            if let Some(entered) = self.gates.entered.lock().unwrap().take() { let _ = entered.send(()); }
+            tokio::select! {
+                () = self.retirement.wait() => {},
+                () = tokio::time::sleep(Duration::from_secs(5 * 60)) => panic!("idle window expired before retirement"),
+            }
+            let cleanup = self.gates.cleanup.lock().unwrap().take();
+            if let Some((entered, release)) = cleanup {
+                let _ = entered.send(());
+                release.await.unwrap();
+                world.store().write_async(|tx| {
+                    tx.execute("INSERT INTO meta(key,value) VALUES('retirement-cleanup',1)", [])?;
+                    Ok(())
+                }).await.unwrap();
+            }
+            Wake::OnKick
+        }
+    }
+    struct PassiveApp;
+    impl App for PassiveApp {
+        fn id(&self) -> &'static str { "passive" }
+        fn kinds(&self) -> &'static [&'static dyn PanelKind] { &[] }
+        fn as_any(&self) -> &dyn Any { self }
+        fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
+            vec![Box::new(PassiveService { gates: store.local(), retirement: Retirement::default() })]
+        }
+    }
+
+    #[test]
+    fn retirement_interrupts_passive_waits_and_still_joins_accepted_cleanup() {
+        static APP: PassiveApp = PassiveApp;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<PassiveGates>();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (cleanup, cleaning) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        *gates.entered.lock().unwrap() = Some(entered);
+        *gates.cleanup.lock().unwrap() = Some((cleanup, held));
+        let workers = Workers::async_io(APPS, store.clone(), Mode::Deny, Env::default(), || {});
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), started).await.unwrap().unwrap();
+            let shutdown = workers.shutdown();
+            tokio::pin!(shutdown);
+            tokio::select! {
+                () = &mut shutdown => panic!("shutdown must retain the accepted cleanup"),
+                result = tokio::time::timeout(Duration::from_secs(2), cleaning) => {
+                    result.expect("retirement must interrupt a five-minute read").unwrap();
+                }
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut shutdown).await.is_err(),
+                "the cleanup is still accepted work after retirement");
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown).await.unwrap();
+        });
+        assert_eq!(store.conn().query_row("SELECT value FROM meta WHERE key='retirement-cleanup'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn discovery_never_waits_on_ui_and_shutdown_joins_retired_services() {
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<ServiceGates>();
+        gates.wanted.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *gates.discovery.lock().unwrap() = Some((entered, held));
+        let (closing, closed) = tokio::sync::oneshot::channel();
+        let (finish, held) = tokio::sync::oneshot::channel();
+        *gates.closing.lock().unwrap() = Some((closing, held));
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, store, Mode::Deny, Env::default(), move || {
+            let _ = wake.send(());
+        });
+        workers.kick_all();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(workers.names().is_empty(), "UI returned while discovery is held");
+        release.send(()).unwrap();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while workers.names().is_empty() { woke.recv().await.unwrap(); }
+            }).await.unwrap();
+        });
+        gates.wanted.store(false, std::sync::atomic::Ordering::SeqCst);
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), closed).await.unwrap().unwrap();
+            assert!(workers.names().is_empty(), "the service has retired");
+            let shutdown = workers.shutdown();
+            tokio::pin!(shutdown);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut shutdown).await.is_err());
+            finish.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn replacement_waits_for_its_retired_identity_without_holding_other_discovery() {
+        use std::sync::atomic::Ordering;
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<ServiceGates>();
+        gates.wanted.store(true, Ordering::SeqCst);
+        let (closing, closed) = tokio::sync::oneshot::channel();
+        let (finish, held) = tokio::sync::oneshot::channel();
+        *gates.closing.lock().unwrap() = Some((closing, held));
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, store, Mode::Deny, Env::default(), move || {
+            let _ = wake.send(());
+        });
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().is_empty() { woke.recv().await.unwrap(); }
+            }).await.unwrap();
+        });
+        gates.wanted.store(false, Ordering::SeqCst);
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), closed).await.unwrap().unwrap();
+        });
+        gates.wanted.store(true, Ordering::SeqCst);
+        gates.other_wanted.store(true, Ordering::SeqCst);
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !gates.started.lock().unwrap().iter().any(|name| name == "independent") {
+                    woke.recv().await.unwrap();
+                }
+            }).await.unwrap();
+        });
+        assert_eq!(workers.names(), ["independent"], "replacement cannot overlap native shutdown");
+        assert_eq!(gates.started.lock().unwrap().iter().filter(|name| *name == "supervised").count(), 1);
+        finish.send(()).unwrap();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().iter().filter(|name| *name == "supervised").count() != 2 {
+                    woke.recv().await.unwrap();
+                }
+            }).await.unwrap();
+            workers.shutdown().await;
+        });
+    }
+
 }

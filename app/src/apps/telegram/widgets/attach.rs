@@ -50,6 +50,10 @@ pub struct AttachPanel {
     /// The recording strip's camera preview has been drawn.
     #[rust]
     previewed: bool,
+    /// One pending refresh; a visible recording draw renews it. A closed or
+    /// hidden strip leaves no repeating timer behind.
+    #[rust]
+    recording_timer: Timer,
 }
 
 impl Widget for AttachPanel {
@@ -59,6 +63,10 @@ impl Widget for AttachPanel {
         };
         observe(&props, scope);
         let recording = with_attach(&props, |a| a.recording().is_some()).unwrap_or(false);
+        if self.recording_timer.is_event(event).is_some() {
+            self.recording_timer = Timer::default();
+            if recording { self.view.redraw(cx); }
+        }
 
         if let Event::KeyDown(k) = event {
             match k.key_code {
@@ -200,9 +208,13 @@ impl Widget for AttachPanel {
                 props.hits.add(label, r, MouseCursor::Default, props.slot);
             }
         }
-        // The clock moves the strip along; the next frame draws it further.
+        // Native windows sleep between changes. Refresh the elapsed label
+        // once per second without depending on another control's animation.
         if recording.is_some() {
-            self.view.redraw(cx);
+            if self.recording_timer.0 == 0 { self.recording_timer = cx.start_timeout(1.0); }
+        } else if self.recording_timer.0 != 0 {
+            cx.stop_timer(self.recording_timer);
+            self.recording_timer = Timer::default();
         }
         DrawStep::done()
     }

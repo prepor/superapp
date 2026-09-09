@@ -1,5 +1,128 @@
 use super::*;
 
+struct HeldReaders(Vec<std::sync::mpsc::Sender<()>>);
+
+impl HeldReaders {
+    fn new(s: &Session) -> Self {
+        let mut release = Vec::new();
+        // Hold the four bounded SQLite readers. A delete must remain a
+        // pending gesture while unrelated UI events continue to run.
+        for _ in 0..4 {
+            let db = s.store().db();
+            let (started, observed) = std::sync::mpsc::channel();
+            let (resume, held) = std::sync::mpsc::channel();
+            release.push(resume);
+            kernel::runtime::spawn(async move {
+                db.read_async(move |_| {
+                    started.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(5)).expect("reader released");
+                    Ok(())
+                }).await.unwrap();
+            });
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        Self(release)
+    }
+}
+
+impl Drop for HeldReaders {
+    fn drop(&mut self) {
+        for reader in &self.0 { let _ = reader.send(()); }
+    }
+}
+
+#[test]
+fn deletion_prepares_off_ui_and_keeps_the_original_selection() {
+    let mut s = session();
+    let slot = open_root(&mut s, Chat::id(VERA));
+    let mine = model::history(s.store(), VERA).iter().filter(|m| m.out && !m.service)
+        .take(3).map(|m| m.key()).collect::<Vec<_>>();
+    assert_eq!(mine.len(), 3);
+    with_chat(&s, slot, |chat| {
+        for &key in &mine[..2] { chat.set_cursor(key); chat.toggle_mark(); }
+    });
+    let rt = runtime::of(s.store());
+    let inbox = rt.connect();
+    s.store().attach_ui(|| {});
+    wait_transcript(&mut s, slot);
+    let readers = HeldReaders::new(&s);
+    let head = s.history().head();
+    verb(&mut s, slot, "telegram.delete");
+    assert_eq!(s.history().head(), head, "the UI returns before the metadata query can run");
+    assert!(inbox.try_recv().is_err());
+    with_chat(&s, slot, |chat| {
+        assert_eq!(chat.marks().len(), 2, "pending preparation retains the original marks");
+        chat.set_cursor(mine[2]);
+        chat.toggle_mark();
+        chat.typed("typed during deletion preparation");
+    });
+    // Repeating the gesture cannot create a second operation while its
+    // first snapshot is pending, even after selecting an additional row.
+    verb(&mut s, slot, "telegram.delete");
+    assert!(s.notes().iter().any(|note| note.msg.contains("previous Telegram change")),
+        "duplicate refusal: {:?}", s.notes());
+    assert!(inbox.try_recv().is_err());
+    drop(readers);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.history().head() == head || with_chat(&s, slot, |chat| chat.marks().contains(&mine[0])) {
+        s.settle();
+        assert!(Instant::now() < deadline, "prepared deletion completed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let request = receive(&inbox);
+    assert_eq!(request["@type"], "deleteMessages");
+    let expected = mine[..2].iter().map(|key| key.1).collect::<Vec<_>>();
+    assert_eq!(request["message_ids"], json!(expected));
+    assert!(inbox.try_recv().is_err(), "the reserved gesture executes once");
+    assert!(s.history().rows().0.last().unwrap().label.contains("undo resends copies"));
+    with_chat(&s, slot, |chat| {
+        assert_eq!(chat.cursor(), Some(mine[2]));
+        assert_eq!(chat.marks().iter().copied().collect::<Vec<_>>(), vec![mine[2]]);
+        assert_eq!(chat.field_text(), "typed during deletion preparation");
+    });
+    s.shutdown();
+}
+
+#[test]
+fn a_prepared_deletion_survives_panel_closure_and_rechecks_the_lease() {
+    for lost_lease in [false, true] {
+        let mut s = session();
+        let slot = open_root(&mut s, Chat::id(VERA));
+        let key = model::history(s.store(), VERA).iter().find(|m| m.out && !m.service).unwrap().key();
+        with_chat(&s, slot, |chat| chat.set_cursor(key));
+        let inbox = runtime::of(s.store()).connect();
+        s.store().attach_ui(|| {});
+        wait_transcript(&mut s, slot);
+        let readers = HeldReaders::new(&s);
+        verb(&mut s, slot, "telegram.delete");
+        go(&mut s, Nav::Close { slot, label: None });
+        assert!(s.panel(slot).is_none());
+        if lost_lease { s.store().set_writable(false); }
+        drop(readers);
+        // Shutdown owns accepted preparation even when its originating panel
+        // no longer exists, and runs the same admission/error completion.
+        s.shutdown();
+        if lost_lease {
+            assert!(inbox.try_recv().is_err(), "a stale eligibility snapshot cannot bypass the lease");
+            assert!(s.notes().iter().any(|note| note.msg.contains("another device holds the lease")));
+            assert!(s.history().rows().0.iter().all(|row| row.kind != "delete"));
+        } else {
+            let request = receive(&inbox);
+            assert_eq!(request["message_ids"], json!([key.1]));
+            assert!(s.history().rows().0.iter().any(|row| row.kind == "delete"));
+        }
+    }
+}
+
+fn wait_transcript(s: &mut Session, slot: SlotId) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !with_chat(s, slot, |chat| chat.snapshot(0.0).ready) {
+        s.settle();
+        assert!(Instant::now() < deadline, "initial transcript ready");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn message(id: i64, text: &str) -> Value {
     json!({"@type": "message", "chat_id": VERA, "id": id, "is_outgoing": true,
         "sender_id": {"@type": "messageSenderUser", "user_id": 1000},
@@ -226,7 +349,11 @@ fn attachment_bytes_are_saved_before_deletion_and_survive_the_source_disappearin
         delivered(&acc, &s, &td, 901);
         drop(acc);
         drop(s);
-        assert!(!backup.exists(), "session history owns the saved attachment bytes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backup.exists() {
+            assert!(Instant::now() < deadline, "discarded history releases its saved attachment bytes in the pool");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

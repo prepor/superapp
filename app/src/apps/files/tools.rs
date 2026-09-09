@@ -6,11 +6,11 @@
 //! verb here is an `rm` — what a delete takes goes to the trash, and undo
 //! moves it back out.
 //!
-//! The order is the verb's too. The disk is written first, because nothing
-//! watches one and the first honest look is the write itself; then the
-//! lease is asked again ([`Session::give_back`]) and the node recorded, so
-//! a change with no node behind it is a change nobody can undo. Every
-//! listing on screen re-reads afterwards, exactly as it does after a click.
+//! Preparation owns the request but does not mutate the disk. Acceptance
+//! starts a native command on the shared blocking pool; the session owns its
+//! completion, undo record and lease-loss compensation even if the agent
+//! stops meanwhile. Native writes and SQLite tool bookkeeping are separate
+//! commits, so an accepted native operation is never automatically replayed.
 
 use kernel::caps::WriteFile;
 use kernel::effect::World;
@@ -19,7 +19,7 @@ use kernel::layout::SlotId;
 use kernel::panel::PanelId;
 use kernel::session::{Action, Session};
 use kernel::time::fmt_date_long;
-use kernel::tool::Tool;
+use kernel::tool::{Command, CommandComplete, Prepare, Prepared, Read, Tool};
 use serde_json::{json, Value};
 
 use super::model::{basename, is_root, join, list_in, parent, read_in, real_path, stat_in};
@@ -46,7 +46,7 @@ const MAX_REWRITE: usize = 1024 * 1024;
 #[must_use]
 pub fn all() -> Vec<Tool> {
     vec![
-        Tool::new(
+        Tool::reading(
             "files.list",
             "List a directory: what is in it, which entries are directories, \
              how big each one is and when it last changed. Paths are written \
@@ -57,10 +57,9 @@ pub fn all() -> Vec<Tool> {
                 "required": ["dir"],
                 "additionalProperties": false
             }),
-            false,
-            list,
+            |input| background_read(input, list),
         ),
-        Tool::new(
+        Tool::reading(
             "files.read",
             "Read a file as text. The first 64 KiB come back; a picture or an \
              archive comes back as whatever its bytes look like, so ask only \
@@ -71,10 +70,9 @@ pub fn all() -> Vec<Tool> {
                 "required": ["path"],
                 "additionalProperties": false
             }),
-            false,
-            read,
+            |input| background_read(input, read),
         ),
-        Tool::new(
+        Tool::preparing(
             "files.rename",
             "Give a file or a directory another name, where it already is. \
              The new name is a name, not a path — use files.move to put \
@@ -88,28 +86,25 @@ pub fn all() -> Vec<Tool> {
                 "required": ["path", "name"],
                 "additionalProperties": false
             }),
-            true,
-            rename,
+            |input| prepare_command(input, Operation::Rename),
         ),
-        Tool::new(
+        Tool::preparing(
             "files.move",
             "Move a file or a directory into another directory. It keeps its \
              name; a name the destination already has is refused rather than \
              written over.",
             into("the directory to move it into"),
-            true,
-            |s, input| here(s, input, Op::Move),
+            |input| prepare_command(input, Operation::Move),
         ),
-        Tool::new(
+        Tool::preparing(
             "files.copy",
             "Copy a file, or a directory with everything under it, into \
              another directory. Copying into its own directory makes \
              “name copy.ext” beside it.",
             into("the directory to copy it into"),
-            true,
-            |s, input| here(s, input, Op::Copy),
+            |input| prepare_command(input, Operation::Copy),
         ),
-        Tool::new(
+        Tool::preparing(
             "files.trash",
             "Put a file or a directory in the trash. Nothing here is ever \
              removed outright, and cmd+z moves it back out.",
@@ -119,13 +114,12 @@ pub fn all() -> Vec<Tool> {
                 "required": ["path"],
                 "additionalProperties": false
             }),
-            true,
-            trash,
+            |input| prepare_command(input, Operation::Trash),
         )
         // What a person means by *delete*: the file leaves the listing, and
         // undo is the only way back. That is a thing to be asked about.
         .asking(),
-        Tool::new(
+        Tool::preparing(
             "files.mkdir",
             "Make one directory, where nothing is yet. A name the parent \
              already has is refused.",
@@ -138,10 +132,9 @@ pub fn all() -> Vec<Tool> {
                 "required": ["dir", "name"],
                 "additionalProperties": false
             }),
-            true,
-            mkdir,
+            |input| prepare_command(input, Operation::Mkdir),
         ),
-        Tool::new(
+        Tool::preparing(
             "files.write",
             "Write text to a file, making it if it is not there and writing \
              over it if it is. What was there is kept so cmd+z puts it back, \
@@ -156,8 +149,7 @@ pub fn all() -> Vec<Tool> {
                 "required": ["path", "text"],
                 "additionalProperties": false
             }),
-            true,
-            write,
+            |input| prepare_command(input, Operation::Write),
         )
         // Writing over a file is the one verb here that destroys what was
         // there; what undo holds for it is memory, and the person's word
@@ -182,9 +174,9 @@ fn into(what: &str) -> Value {
 // -- reading -------------------------------------------------------------------------
 
 /// One directory, through the world's disk — the same read a listing does.
-fn list(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn list(world: &World, input: &Value) -> Result<Value, String> {
     let dir = text(input, "dir")?;
-    let entries = list_in(s.world(), dir)?;
+    let entries = list_in(world, dir)?;
     let truncated = entries.len() > MAX_ENTRIES;
     let rows: Vec<Value> = entries
         .iter()
@@ -204,12 +196,119 @@ fn list(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// One file as text. The bytes are read as they are and turned into a
 /// string as far as they go: a model asking for a picture should learn that
 /// it asked for a picture, not get an error that says nothing.
-fn read(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn read(world: &World, input: &Value) -> Result<Value, String> {
     let path = text(input, "path")?;
-    let bytes = read_in(s.world(), path, MAX_TEXT + 1)?;
+    let bytes = read_in(world, path, MAX_TEXT + 1)?;
     let truncated = bytes.len() > MAX_TEXT;
     let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TEXT)]).into_owned();
     Ok(json!({"path": path, "text": text, "truncated": truncated}))
+}
+
+fn background_read(input: &Value, read: fn(&World, &Value) -> Result<Value, String>) -> Read {
+    let input = input.clone();
+    Box::new(move |world| Box::pin(async move {
+        if let Some(factory) = world.factory() {
+            kernel::runtime::spawn_blocking(move || {
+                let world = factory.build().map_err(|error| error.to_string())?;
+                read(&world, &input)
+            }).await.map_err(|error| error.to_string())?
+        } else { read(world, &input) }
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum Operation { Rename, Move, Copy, Trash, Mkdir, Write }
+
+struct NativeCommand { operation: Operation, input: Value }
+
+fn prepare_command(input: &Value, operation: Operation) -> Prepare {
+    let input = input.clone();
+    Box::new(move |_| Box::pin(async move {
+        // Preparing carries intent only. Native mutations start after the
+        // caller accepts this command and rechecks cancellation.
+        Ok(Prepared::Command(Box::new(NativeCommand { operation, input })))
+    }))
+}
+
+enum LayoutChange { None, Rename { from: String, to: String }, Trash(String) }
+
+struct Applied {
+    kind: &'static str,
+    label: String,
+    intent: Box<dyn Intent>,
+    layout: LayoutChange,
+    reply: Value,
+}
+
+impl NativeCommand {
+    fn apply(self, world: &World) -> Result<Applied, String> {
+        ready_world(world)?;
+        match self.operation {
+            Operation::Rename => rename(world, &self.input),
+            Operation::Move => here(world, &self.input, Op::Move),
+            Operation::Copy => here(world, &self.input, Op::Copy),
+            Operation::Trash => trash(world, &self.input),
+            Operation::Mkdir => mkdir(world, &self.input),
+            Operation::Write => write(world, &self.input),
+        }
+    }
+}
+
+impl Command for NativeCommand {
+    fn commit(self: Box<Self>, s: &mut Session, complete: CommandComplete) {
+        if let Err(error) = ready(s) { complete(s, Err(error)); return; }
+        s.prepare_work(move |world| Box::pin(async move {
+            if let Some(factory) = world.factory() {
+                kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|error| error.to_string())?;
+                    self.apply(&world)
+                }).await.map_err(|error| error.to_string())?
+            } else { self.apply(world) }
+        }), move |s, result| {
+            match result {
+                Ok(applied) => s.after_history(move |s| applied.finish(s, complete)),
+                Err(error) => complete(s, Err(error)),
+            }
+        });
+    }
+}
+
+impl Applied {
+    fn finish(self, s: &mut Session, complete: CommandComplete) {
+        let Applied { kind, label, intent, layout, reply } = self;
+        super::run::accept(s, intent, move |s, accepted| {
+            match accepted {
+                Ok(intent) => {
+                    let reply = Applied { kind, label, intent, layout, reply }.record(s);
+                    complete(s, Ok(reply));
+                }
+                Err(error) => { panels::refresh(s, None); complete(s, Err(error)); }
+            }
+        });
+    }
+
+    fn record(self, s: &mut Session) -> Value {
+        let mut action = Action::new(self.kind, self.label).claiming(vec![self.intent]);
+        match self.layout {
+            LayoutChange::None => {},
+            LayoutChange::Rename { from, to } => {
+                let moves = renamings(s, &from, &to);
+                action = action.moving(move |wm| { for (slot, id) in moves { wm.replace(slot, id); } });
+            }
+            LayoutChange::Trash(path) => {
+                let closing = showing(s, &path);
+                action = action.moving(move |wm| { for slot in closing { wm.close(slot); } });
+            }
+        }
+        s.act_done(action);
+        panels::refresh(s, None);
+        self.reply
+    }
+}
+
+fn ready_world(world: &World) -> Result<(), String> {
+    if world.store().is_writable() { Ok(()) }
+    else { Err("read-only — another device holds the lease".into()) }
 }
 
 // -- the disk, written ------------------------------------------------------------------
@@ -217,7 +316,7 @@ fn read(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// `rename`: one path under a new name, in the directory it is already in —
 /// the listing's own verb, over a path. Every panel on the old name follows
 /// it, because a panel is on the thing and not on the spelling.
-fn rename(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn rename(world: &World, input: &Value) -> Result<Applied, String> {
     let path = text(input, "path")?.to_string();
     let name = text(input, "name")?.trim().to_string();
     let was = basename(&path).to_string();
@@ -233,104 +332,77 @@ fn rename(s: &mut Session, input: &Value) -> Result<Value, String> {
     ops::check_name(&name)?;
     let dir = parent(&path).ok_or_else(|| format!("“{path}” is a root"))?;
     let to = join(dir, &name);
-    let world = s.world().clone();
-    if stat_in(&world, &path).is_none() {
+    if stat_in(world, &path).is_none() {
         return Err(format!("“{was}” is no longer there"));
     }
-    if stat_in(&world, &to).is_some() {
+    if stat_in(world, &to).is_some() {
         return Err(format!("“{name}” is already here"));
     }
-    ready(s)?;
-    ops::move_in(&world, &path, &to)?;
+    ready_world(world)?;
+    ops::move_in(world, &path, &to)?;
     // Read back the moment after the write: what undo will compare against
     // before it moves anything back.
-    let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(Done::of(&world, &path, &to)));
-    let moves = renamings(s, &path, &to);
-    node(
-        s,
-        Action::new("rename", format!("rename “{was}” to “{name}”"))
-            .claiming(vec![intent])
-            .moving(move |wm| {
-                for (slot, id) in moves {
-                    wm.replace(slot, id);
-                }
-            }),
-    )?;
-    Ok(json!({"path": to}))
+    let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(Done::of(world, &path, &to)));
+    Ok(Applied { kind: "rename", label: format!("rename “{was}” to “{name}”"), intent,
+        layout: LayoutChange::Rename { from: path, to: to.clone() }, reply: json!({"path": to}) })
 }
 
 /// `copy here` / `move here` for one path: the plan the clipboard's verb
 /// makes, performed and claimed the same way. One path, so the plan has one
 /// step or one refusal, and the refusal is the sentence.
-fn here(s: &mut Session, input: &Value, op: Op) -> Result<Value, String> {
+fn here(world: &World, input: &Value, op: Op) -> Result<Applied, String> {
     let path = text(input, "path")?.to_string();
     let dir = text(input, "dir")?.to_string();
-    let world = s.world().clone();
-    if !super::model::is_dir_in(&world, &dir) {
+    if !super::model::is_dir_in(world, &dir) {
         return Err(format!("“{dir}” is not a directory"));
     }
     let clip = Clipboard {
         verb: op,
         paths: vec![path.clone()],
     };
-    let mut plan = ops::plan_here(&world, &clip, &dir);
+    let mut plan = ops::plan_here(world, &clip, &dir);
     let Some(step) = plan.steps.pop() else {
         return Err(plan
             .refused
             .pop()
             .unwrap_or_else(|| format!("there is nothing to {} there", op.verb())));
     };
-    ready(s)?;
+    ready_world(world)?;
     match op {
-        Op::Copy => ops::copy_in(&world, &step.from, &step.to)?,
-        Op::Move => ops::move_in(&world, &step.from, &step.to)?,
+        Op::Copy => ops::copy_in(world, &step.from, &step.to)?,
+        Op::Move => ops::move_in(world, &step.from, &step.to)?,
     }
-    let done = vec![Done::of(&world, &step.from, &step.to)];
+    let done = vec![Done::of(world, &step.from, &step.to)];
     let intent: Box<dyn Intent> = match op {
         Op::Copy => Box::new(ops::Copied::new(done)),
         Op::Move => Box::new(ops::Moved::new(done)),
     };
     let here = basename(&dir).to_string();
     let what = basename(&path).to_string();
-    node(
-        s,
-        Action::new(op.verb(), format!("{} “{what}” into {here}", op.verb()))
-            .claiming(vec![intent]),
-    )?;
-    Ok(json!({"path": step.to}))
+    Ok(Applied { kind: op.verb(), label: format!("{} “{what}” into {here}", op.verb()), intent,
+        layout: LayoutChange::None, reply: json!({"path": step.to}) })
 }
 
 /// `delete`: to the trash, and the panels that were showing it go with it.
-fn trash(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn trash(world: &World, input: &Value) -> Result<Applied, String> {
     let path = text(input, "path")?.to_string();
     if is_root(&path) {
         return Err(format!("“{path}” is a root"));
     }
-    let world = s.world().clone();
-    if stat_in(&world, &path).is_none() {
+    if stat_in(world, &path).is_none() {
         return Err(format!("“{}” is no longer there", basename(&path)));
     }
-    ready(s)?;
-    let landed = ops::trash_in(&world, &path)?;
+    ready_world(world)?;
+    let landed = ops::trash_in(world, &path)?;
     let intent: Box<dyn Intent> =
-        Box::new(ops::Deleted::new(vec![Done::of(&world, &path, &landed)]));
+        Box::new(ops::Deleted::new(vec![Done::of(world, &path, &landed)]));
     let what = basename(&path).to_string();
-    let closing = showing(s, &path);
-    node(
-        s,
-        Action::new("delete", format!("delete “{what}”"))
-            .claiming(vec![intent])
-            .moving(move |wm| {
-                for slot in closing {
-                    wm.close(slot);
-                }
-            }),
-    )?;
-    Ok(json!({"trashed": landed}))
+    Ok(Applied { kind: "delete", label: format!("delete “{what}”"), intent,
+        layout: LayoutChange::Trash(path), reply: json!({"trashed": landed}) })
 }
 
 /// `new dir`: one directory, where nothing is yet.
-fn mkdir(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn mkdir(world: &World, input: &Value) -> Result<Applied, String> {
     let dir = text(input, "dir")?.to_string();
     let name = text(input, "name")?.trim().to_string();
     if name.is_empty() {
@@ -338,19 +410,15 @@ fn mkdir(s: &mut Session, input: &Value) -> Result<Value, String> {
     }
     ops::check_name(&name)?;
     let path = join(&dir, &name);
-    let world = s.world().clone();
-    ready(s)?;
-    ops::make_dir_in(&world, &path)?;
+    ready_world(world)?;
+    ops::make_dir_in(world, &path)?;
     // What the disk has at the path the moment after the write — the one
     // reading that is certainly about the directory this made.
-    let made = Done::of(&world, &path, &path);
+    let made = Done::of(world, &path, &path);
     let intent: Box<dyn Intent> = Box::new(ops::MadeDir::made(&made));
     let here = basename(&dir).to_string();
-    node(
-        s,
-        Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
-    )?;
-    Ok(json!({"path": path}))
+    Ok(Applied { kind: "new dir", label: format!("new dir “{name}/” in {here}"), intent,
+        layout: LayoutChange::None, reply: json!({"path": path}) })
 }
 
 /// A file written whole, with what was there kept so undo can put it back.
@@ -363,7 +431,7 @@ fn mkdir(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// at most that much. A longer text would be a claim that could never
 /// match itself — undo would refuse the file it had just written, saying it
 /// had changed since.
-fn write(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn write(world: &World, input: &Value) -> Result<Applied, String> {
     let path = text(input, "path")?.to_string();
     let body = text(input, "text")?.to_string();
     if is_root(&path) {
@@ -376,8 +444,7 @@ fn write(s: &mut Session, input: &Value) -> Result<Value, String> {
             basename(&path)
         ));
     }
-    let world = s.world().clone();
-    let was = match stat_in(&world, &path) {
+    let was = match stat_in(world, &path) {
         None => None,
         Some(e) if e.is_dir => return Err(format!("“{path}” is a directory")),
         Some(e) if e.size as usize > MAX_REWRITE => {
@@ -387,21 +454,18 @@ fn write(s: &mut Session, input: &Value) -> Result<Value, String> {
                 basename(&path)
             ))
         }
-        Some(_) => Some(read_in(&world, &path, MAX_REWRITE)?),
+        Some(_) => Some(read_in(world, &path, MAX_REWRITE)?),
     };
-    ready(s)?;
-    put(&world, &path, body.as_bytes())?;
+    ready_world(world)?;
+    put(world, &path, body.as_bytes())?;
     let intent: Box<dyn Intent> = Box::new(Wrote {
         path: path.clone(),
         was,
         wrote: body.into_bytes(),
     });
     let what = basename(&path).to_string();
-    node(
-        s,
-        Action::new("write", format!("write “{what}”")).claiming(vec![intent]),
-    )?;
-    Ok(json!({"path": path}))
+    Ok(Applied { kind: "write", label: format!("write “{what}”"), intent,
+        layout: LayoutChange::None, reply: json!({"path": path}) })
 }
 
 /// What `files.write` claimed of the disk: a file's contents, and what was
@@ -462,26 +526,11 @@ fn put(w: &World, path: &str, bytes: &[u8]) -> Result<(), String> {
 /// The write gate, asked before any disk is: a change nobody can undo is
 /// not a change this app makes.
 fn ready(s: &Session) -> Result<(), String> {
-    if s.writable() {
+    if s.writable() && s.store().is_writable() {
         Ok(())
     } else {
         Err("read-only — another device holds the lease".to_string())
     }
-}
-
-/// The node, and the listings after it. The lease is asked again, because
-/// it may have turned over between the disk write and here, and then the
-/// claim is given back rather than recorded.
-fn node(s: &mut Session, action: Action<()>) -> Result<(), String> {
-    if let Some(intent) = action.intents.first() {
-        if let Some(why) = s.give_back(intent.as_ref()) {
-            panels::refresh(s, None);
-            return Err(why);
-        }
-    }
-    s.act_done(action);
-    panels::refresh(s, None);
-    Ok(())
 }
 
 /// Every slot showing this path, as a listing or as a card — what a delete
@@ -517,3 +566,6 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("`{key}` must be a string"))
 }
+
+#[cfg(test)]
+mod native_tests;

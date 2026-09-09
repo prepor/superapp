@@ -10,7 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use kernel::effect::World;
 use kernel::store::Db;
@@ -39,7 +40,7 @@ pub struct Pictures {
     retry_at: HashMap<String, std::time::Instant>,
     /// The reader thread, started with the first letter that has a picture
     /// in it.
-    reader: Option<mpsc::Sender<Job>>,
+    reader: Option<mpsc::UnboundedSender<Job>>,
     /// Where the pictures that stood in a link were drawn, this draw. An
     /// item is minted from a template and can reach neither the panel around
     /// it nor the hit table, so it leaves its rectangle here and the reader
@@ -50,7 +51,7 @@ pub struct Pictures {
 /// A reader job may keep a world on its thread, so several file requests
 /// share a connection without coupling the image cache to an app.
 pub(crate) type Held = Option<(Arc<Db>, World)>;
-type ReadJob = Box<dyn FnOnce(&mut Held) -> Ready + Send>;
+type ReadJob = Box<dyn for<'a> FnOnce(&'a mut Held) -> std::pin::Pin<Box<dyn std::future::Future<Output = Ready> + 'a>> + Send>;
 pub(crate) enum Job {
     Read(ReadJob),
     Data { key: String, src: String },
@@ -113,7 +114,7 @@ impl Pictures {
     /// `MAKEPAD=headless`, where the caller does the work in the frame — a
     /// scripted run wants its pictures in the frame that drew them, which is
     /// the same bargain makepad's own decode strikes under that cfg.
-    pub(crate) fn reader(&mut self) -> Option<mpsc::Sender<Job>> {
+    pub(crate) fn reader(&mut self) -> Option<mpsc::UnboundedSender<Job>> {
         // `cfg!` rather than `#[cfg]` so the thread and its jobs stay
         // compiled under headless: the branch folds away either way, and code
         // the linter can still see is code that cannot rot.
@@ -151,25 +152,18 @@ impl Pictures {
 /// # Panics
 ///
 /// If the thread cannot be spawned.
-fn spawn() -> mpsc::Sender<Job> {
-    let (tx, rx) = mpsc::channel::<Job>();
-    std::thread::Builder::new()
-        .name("pictures".into())
-        .spawn(move || {
-            // Whichever *one* writer the job names, kept for as long as the
-            // jobs keep naming it — one process can have several worlds open
-            // at once (the panels library), and in every other run this opens
-            // exactly once.
-            let mut held: Option<(Arc<Db>, World)> = None;
-            while let Ok(job) = rx.recv() {
-                let ready = match job {
-                    Job::Read(read) => read(&mut held),
-                    Job::Data { key, src } => data_bytes(key, &src),
-                };
-                Cx::post_action(ready);
-            }
-        })
-        .expect("spawn the picture reader");
+fn spawn() -> mpsc::UnboundedSender<Job> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+    kernel::runtime::spawn_local(move || async move {
+        let mut held: Held = None;
+        while let Some(job) = rx.recv().await {
+            let ready = match job {
+                Job::Read(read) => read(&mut held).await,
+                Job::Data { key, src } => kernel::runtime::spawn_blocking(move || data_bytes(key, &src)).await.expect("decode data URL"),
+            };
+            Cx::post_action(ready);
+        }
+    });
     tx
 }
 

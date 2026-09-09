@@ -15,9 +15,8 @@
 //! entry can be borne as a token by whatever else this account owns —
 //! [`gateway`] is the AI gateway asking for exactly that.
 
-use std::net::TcpStream;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::object::{self, Blob, Cas, Object, PutNew};
@@ -444,14 +443,15 @@ pub fn open(
 /// reason reaches the screen rather than only the console.
 pub struct Broken(pub String);
 
+#[async_trait::async_trait(?Send)]
 impl Object for Broken {
-    fn get(&self, _key: &str) -> Result<Option<Blob>, String> {
+    async fn get(&self, _key: &str) -> Result<Option<Blob>, String> {
         Err(self.0.clone())
     }
-    fn put_new(&self, _key: &str, _body: &[u8]) -> Result<PutNew, String> {
+    async fn put_new(&self, _key: &str, _body: &[u8]) -> Result<PutNew, String> {
         Err(self.0.clone())
     }
-    fn cas(&self, _key: &str, _body: &[u8], _etag: &str) -> Result<Cas, String> {
+    async fn cas(&self, _key: &str, _body: &[u8], _etag: &str) -> Result<Cas, String> {
         Err(self.0.clone())
     }
     /// Nothing to poll for, but the role is re-derived each pass and the
@@ -533,7 +533,7 @@ impl R2 {
     }
 
     /// One signed request, over one TLS connection.
-    fn send(
+    async fn send(
         &self,
         method: &str,
         path: &str,
@@ -575,12 +575,14 @@ impl R2 {
         } else {
             format!("{path}?{query}")
         };
-        let mut io = self.connect()?;
-        // Name the endpoint on the way out: a TLS or socket failure reaches a
-        // status line, where "received fatal alert: HandshakeFailure" alone
-        // says nothing about which host refused us.
-        object::round_trip(&mut io, method, &target, &headers, body)
-            .map_err(|e| format!("bucket {}: {e}", self.host))
+        use tokio::io::AsyncReadExt;
+        let url = format!("https://{host}{target}", host = if self.port == 443 { self.host.clone() } else { format!("{}:{}", self.host, self.port) });
+        let headers: Vec<_> = headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let mut response = crate::http::send_with(&crate::http::Request { method, url: &url, headers: &headers, body }, crate::http::Timeouts { connect: TIMEOUT, first_byte: TIMEOUT, idle: TIMEOUT }).await?;
+        let etag = response.header("etag").map(str::to_owned);
+        let mut bytes = Vec::new();
+        response.body.read_to_end(&mut bytes).await.map_err(|e| format!("bucket {}: {e}", self.host))?;
+        Ok((response.status, etag, bytes))
     }
 
     /// One request, with the endpoint's "ask again" answers retried.
@@ -596,7 +598,7 @@ impl R2 {
     /// Retrying is safe for every verb here because every write carries a
     /// precondition: a retry either wins or comes back `412`, which is an
     /// answer.
-    fn send_retrying(
+    async fn send_retrying(
         &self,
         method: &str,
         path: &str,
@@ -607,29 +609,15 @@ impl R2 {
         // Short, and bounded: `release` runs on the way out of the app, where
         // a long wait is its own kind of failure.
         const BACKOFF_MS: [u64; 3] = [200, 600, 1200];
-        let mut last = self.send(method, path, query, extra, body)?;
+        let mut last = self.send(method, path, query, extra, body).await?;
         for wait in BACKOFF_MS {
             if !matches!(last.0, 409 | 429 | 500 | 502 | 503 | 504) {
                 return Ok(last);
             }
-            std::thread::sleep(Duration::from_millis(wait));
-            last = self.send(method, path, query, extra, body)?;
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            last = self.send(method, path, query, extra, body).await?;
         }
         Ok(last)
-    }
-
-    /// A TLS connection to the endpoint, verified against the Mozilla roots.
-    fn connect(&self) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
-        let sock = TcpStream::connect((self.host.as_str(), self.port))
-            .map_err(|e| format!("{}:{}: {e}", self.host, self.port))?;
-        sock.set_read_timeout(Some(TIMEOUT))
-            .and_then(|()| sock.set_write_timeout(Some(TIMEOUT)))
-            .map_err(|e| e.to_string())?;
-        let name = rustls::pki_types::ServerName::try_from(self.host.clone())
-            .map_err(|_| format!("not a server name: {}", self.host))?;
-        let conn = rustls::ClientConnection::new(tls_config(), name)
-            .map_err(|e| format!("tls to {}: {e}", self.host))?;
-        Ok(rustls::StreamOwned::new(conn, sock))
     }
 
     /// What a refusal means, in a line a status bar can hold. S3 answers
@@ -650,7 +638,7 @@ impl R2 {
     /// # Errors
     ///
     /// If the endpoint refuses or answers unparseably.
-    pub fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
         let full = format!("{}{prefix}", self.prefix);
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -663,7 +651,7 @@ impl R2 {
             }
             query.push_str(&format!("list-type=2&prefix={}", uri_encode(&full, true)));
             let path = uri_encode(&format!("/{}", self.bucket), false);
-            let (status, _, body) = self.send_retrying("GET", &path, &query, &[], &[])?;
+            let (status, _, body) = self.send_retrying("GET", &path, &query, &[], &[]).await?;
             if status != 200 {
                 return Err(self.refused("LIST", prefix, status, &body));
             }
@@ -688,8 +676,8 @@ impl R2 {
     /// # Errors
     ///
     /// If the endpoint refuses.
-    pub fn delete(&self, key: &str) -> Result<(), String> {
-        let (status, _, body) = self.send_retrying("DELETE", &self.key_path(key), "", &[], &[])?;
+    pub async fn delete(&self, key: &str) -> Result<(), String> {
+        let (status, _, body) = self.send_retrying("DELETE", &self.key_path(key), "", &[], &[]).await?;
         match status {
             200 | 204 | 404 => Ok(()),
             other => Err(self.refused("DELETE", key, other, &body)),
@@ -697,9 +685,10 @@ impl R2 {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Object for R2 {
-    fn get(&self, key: &str) -> Result<Option<Blob>, String> {
-        let (status, etag, body) = self.send_retrying("GET", &self.key_path(key), "", &[], &[])?;
+    async fn get(&self, key: &str) -> Result<Option<Blob>, String> {
+        let (status, etag, body) = self.send_retrying("GET", &self.key_path(key), "", &[], &[]).await?;
         match status {
             200 => Ok(Some(Blob {
                 bytes: body,
@@ -717,14 +706,14 @@ impl Object for R2 {
         }
     }
 
-    fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
+    async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
         let (status, etag, resp) = self.send_retrying(
             "PUT",
             &self.key_path(key),
             "",
             &[("if-none-match", "*")],
             body,
-        )?;
+        ).await?;
         match status {
             200 | 201 => Ok(PutNew::Created(etag.unwrap_or_default())),
             412 => Ok(PutNew::Exists),
@@ -744,14 +733,14 @@ impl Object for R2 {
         Duration::from_secs(5)
     }
 
-    fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
+    async fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
         let (status, new_etag, resp) = self.send_retrying(
             "PUT",
             &self.key_path(key),
             "",
             &[("if-match", etag)],
             body,
-        )?;
+        ).await?;
         match status {
             200 | 201 => Ok(Cas::Ok(new_etag.unwrap_or_default())),
             // 412: the stored ETag moved — someone else advanced the log,
@@ -761,26 +750,6 @@ impl Object for R2 {
             other => Err(self.refused("CAS", key, other, &resp)),
         }
     }
-}
-
-/// The client TLS configuration, built once: the Mozilla root set, the `ring`
-/// provider (chosen explicitly rather than inherited from whatever the
-/// process installed as its default), and no client certificate.
-fn tls_config() -> Arc<rustls::ClientConfig> {
-    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        Arc::new(cfg)
-    })
-    .clone()
 }
 
 // -- SigV4 ---------------------------------------------------------------------
@@ -1330,12 +1299,12 @@ mod tests {
 
     /// A broken bucket answers every verb with its reason — which is what
     /// keeps a follower locked instead of quietly writable.
-    #[test]
-    fn a_broken_bucket_refuses_everything_with_its_reason() {
+    #[tokio::test]
+    async fn a_broken_bucket_refuses_everything_with_its_reason() {
         let b = Broken("no secret for AK".to_string());
-        assert_eq!(b.get("state").unwrap_err(), "no secret for AK");
-        assert_eq!(b.put_new("state", b"x").unwrap_err(), "no secret for AK");
-        assert_eq!(b.cas("state", b"x", "e").unwrap_err(), "no secret for AK");
+        assert_eq!(b.get("state").await.unwrap_err(), "no secret for AK");
+        assert_eq!(b.put_new("state", b"x").await.unwrap_err(), "no secret for AK");
+        assert_eq!(b.cas("state", b"x", "e").await.unwrap_err(), "no secret for AK");
     }
 
     /// An S3 refusal carries its reason in XML; the status line says it.

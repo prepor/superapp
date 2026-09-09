@@ -41,7 +41,7 @@ pub struct PanelChip {
     pub workspace: usize,
     /// The trace of the panel's last draw. Empty for a chip whose panel was
     /// not open when it was made, or one read back out of a turn — in both
-    /// cases [`Chip::render`] takes the panel's trace as it stands now, if
+    /// cases [`Chip::prepare_context`] takes the panel's trace as it stands now, if
     /// it is open again.
     pub queries: Vec<TraceEntry>,
     /// The panel's own paragraph, in the app's words.
@@ -82,18 +82,23 @@ impl Chip {
     /// only a world can decode, so it is filled in here rather than in the
     /// renderer — which has a store and no world.
     #[must_use]
+    #[cfg(test)]
     pub fn render(&self, s: &Session) -> String {
-        match self {
-            Chip::Panel(p) => {
-                let mut jobs = context::recent_effects(s.store(), &p.id, context::EFFECTS);
-                for job in &mut jobs {
-                    if job.what.is_none() {
-                        job.what = s.world().registry().describe(&job.kind, &job.payload);
-                    }
-                }
-                context::render(s.store(), &p.context(s), &jobs)
-            }
+        Self::render_context(s.world(), &self.prepare_context(s))
+    }
+
+    /// Capture only panel metadata on the UI. SQL is evaluated later using
+    /// the background world's own reader.
+    pub fn prepare_context(&self, s: &Session) -> PanelContext {
+        match self { Chip::Panel(panel) => panel.context(s) }
+    }
+
+    pub fn render_context(world: &kernel::effect::World, panel: &PanelContext) -> String {
+        let mut jobs = context::recent_effects(world.store(), &panel.id, context::EFFECTS);
+        for job in &mut jobs {
+            if job.what.is_none() { job.what = world.registry().describe(&job.kind, &job.payload); }
         }
+        context::render(world.store(), panel, &jobs)
     }
 
     /// The slot showing this chip's panel, if one still is — what a click on

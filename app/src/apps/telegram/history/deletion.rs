@@ -5,11 +5,10 @@ use std::path::PathBuf;
 
 use kernel::caps::Blobs;
 use kernel::effect::World;
-use kernel::store::Store;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 
-use super::super::{downloads, model, updates};
+use super::super::{downloads, updates};
 
 pub(super) struct Copy {
     pub original: (i64, i64),
@@ -31,14 +30,24 @@ fn supported(kind: &str) -> bool {
 
 /// Known incoming and unsupported messages keep the explicit irreversible
 /// action. The full snapshot verifies eligibility again before deletion.
-pub(super) fn eligible(store: &Store, request: &Value) -> bool {
-    let Some(chat) = request["chat_id"].as_i64() else { return false; };
-    let Some(ids) = request["message_ids"].as_array().filter(|ids| !ids.is_empty()) else { return false; };
-    ids.iter().all(|id| id.as_i64().is_some_and(|id| {
-        model::line(store, chat, id).is_none_or(|m| m.out && !m.service
-            && m.sender.is_none_or(|sender| sender > 0)
-            && m.content_type.as_deref().is_none_or(supported))
-    }))
+pub(super) fn eligible(conn: &rusqlite::Connection, request: &Value) -> rusqlite::Result<bool> {
+    let Some(chat) = request["chat_id"].as_i64() else { return Ok(false); };
+    let Some(ids) = request["message_ids"].as_array().filter(|ids| !ids.is_empty()) else { return Ok(false); };
+    if ids.iter().any(|id| id.as_i64().is_none()) { return Ok(false); }
+    // Only the eligibility columns are needed. Unknown rows still require a
+    // complete TDLib snapshot; a SQL error must never authorize deletion.
+    let mut query = conn.prepare(
+        "SELECT out, service, sender, content_type FROM tg_message
+         WHERE chat = ?1 AND id IN (SELECT value FROM json_each(?2))")?;
+    let mut rows = query.query(rusqlite::params![chat, request["message_ids"].to_string()])?;
+    while let Some(row) = rows.next()? {
+        if !row.get::<_, bool>(0)? || row.get::<_, bool>(1)?
+            || row.get::<_, Option<i64>>(2)?.is_some_and(|sender| sender <= 0)
+            || row.get::<_, Option<String>>(3)?.as_deref().is_some_and(|kind| !supported(kind)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl Saved {
@@ -108,7 +117,9 @@ impl Saved {
 
 impl Drop for Saved {
     fn drop(&mut self) {
-        if let Some(path) = &self.directory { let _ = std::fs::remove_dir_all(path); }
+        if let Some(path) = self.directory.take() {
+            kernel::runtime::spawn_blocking(move || { let _ = std::fs::remove_dir_all(path); });
+        }
     }
 }
 
