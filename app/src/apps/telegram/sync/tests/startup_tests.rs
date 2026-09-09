@@ -1,5 +1,33 @@
 use super::*;
 
+#[test]
+fn startup_burst_services_visible_chats_and_commands_between_batches() {
+    use super::super::{BACKLOG_POLL, UPDATES_PER_PASS};
+    let w = world();
+    cached_message(&w, 7);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    acc.on_ready(&w);
+    let _view = watch_messages(&w, 7, vec![42]);
+    td.push(chat_object(7, "restored chat", json!([])));
+    for i in 1..=UPDATES_PER_PASS * 2 {
+        td.push(json!({"@type": "updateChatTitle", "chat_id": 7, "title": format!("title {i}")}).to_string());
+    }
+    let mut worker = TgWorker::new(acc);
+    assert_eq!(worker.pass(&w), Wake::After(BACKLOG_POLL));
+    assert_eq!(crate::apps::telegram::model::peer(w.store(), 7).unwrap().name,
+        format!("title {}", UPDATES_PER_PASS - 1));
+    assert_eq!(last_request(&td, "openChat")["chat_id"], 7,
+        "visible chats are serviced before the startup queue empties");
+
+    assert!(runtime::of(w.store()).send(&json!({"@type": "getOption", "name": "version"}).to_string()));
+    assert_eq!(worker.pass(&w), Wake::After(BACKLOG_POLL));
+    assert_eq!(last_request(&td, "getOption")["name"], "version");
+    assert_eq!(worker.pass(&w), Wake::After(POLL));
+    assert_eq!(crate::apps::telegram::model::peer(w.store(), 7).unwrap().name,
+        format!("title {}", UPDATES_PER_PASS * 2), "all updates land in order");
+}
+
 fn cached_message(w: &World, chat: i64) {
     // A previous worker populated SQLite, not this TDLib client's memory.
     let previous = account(FakeTd::new(), None);

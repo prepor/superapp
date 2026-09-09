@@ -39,6 +39,19 @@ pub struct Outcome {
     pub retryable: bool,
 }
 
+/// The UI's reading of an operation. Request bodies and transfer bookkeeping
+/// stay in the tracker, including the payload retained for an explicit retry.
+pub struct Summary {
+    pub id: u64,
+    pub chat: Option<PeerId>,
+    pub label: String,
+    pub status: Status,
+    pub context: Option<String>,
+    pub line: String,
+    pub retryable: bool,
+    pub foreground: bool,
+}
+
 /// A history intent retains this acknowledgement after the feedback expires.
 /// It keeps final message identities, never message content or credentials.
 #[derive(Clone)]
@@ -279,6 +292,23 @@ impl Tracker {
             .collect()
     }
 
+    pub fn visible(&self) -> Vec<Summary> {
+        self.state.lock().unwrap().operations.values()
+            .filter(|op| op.foreground() || matches!(op.status, Status::Failed { .. }))
+            .map(|op| Summary {
+                id: op.id, chat: op.chat, label: op.label.clone(), status: op.status.clone(),
+                context: op.context().map(str::to_string), line: op.line(),
+                retryable: op.retryable(), foreground: op.foreground(),
+            }).collect()
+    }
+
+    pub fn pending_topics(&self, chat: PeerId) -> bool {
+        self.state.lock().unwrap().operations.values().any(|op| {
+            op.chat == Some(chat) && op.status == Status::Pending
+                && op.context().is_some_and(|c| c.starts_with("topics:"))
+        })
+    }
+
     /// Send status remains queryable after its feedback expires or is dismissed.
     pub fn outcome(&self, id: u64) -> Option<Outcome> {
         let state = self.state.lock().unwrap();
@@ -470,10 +500,9 @@ impl Tracker {
                 uncertain,
             };
             op.changed();
-            trace::error(
-                dir,
-                &format!("request {id} {} chat={:?}: {error}", op.kind, op.chat),
-            );
+            let line = format!("request {id} {} chat={:?}: {error}", op.kind, op.chat);
+            drop(state);
+            trace::error(dir, &line);
         }
     }
 
@@ -510,6 +539,7 @@ impl Tracker {
                 changed: Instant::now(),
             },
         );
+        drop(state);
         trace::error(store.dir(), &format!("{what}: {error}"));
     }
 
@@ -706,23 +736,24 @@ impl Tracker {
     }
 
     pub fn expire(&self, store: &Store, now: Instant) {
-        let pending: Vec<_> = self
-            .list()
-            .into_iter()
+        // This is also polled by the UI. Inspect deadlines in place instead
+        // of cloning every pending request during a startup sync burst.
+        let pending: Vec<_> = self.state.lock().unwrap().operations.values()
             .filter(|o| {
                 o.status == Status::Pending && now.saturating_duration_since(o.changed) >= PATIENCE
             })
+            .map(|op| (op.id, op.sending()))
             .collect();
-        for op in pending {
+        for (id, sending) in pending {
             self.fail(
                 store,
-                op.id,
-                if op.sending() {
+                id,
+                if sending {
                     "No delivery confirmation. Check the chat before sending again."
                 } else {
                     "Telegram did not respond. Try again."
                 },
-                op.sending(),
+                sending,
             );
         }
         let mut state = self.state.lock().unwrap();
@@ -879,7 +910,7 @@ impl ProblemSource for Failures {
     fn list(&self, store: &Store) -> Vec<Problem> {
         runtime::of(store)
             .operations
-            .list()
+            .visible()
             .into_iter()
             .filter_map(|op| {
                 let Status::Failed { ref error, .. } = op.status else {
@@ -887,7 +918,7 @@ impl ProblemSource for Failures {
                 };
                 let id = op.id;
                 let mut verbs = Vec::new();
-                if op.retryable() {
+                if op.retryable {
                     verbs.push(Verb::call("telegram.retry", "retry", None, move |s| {
                         retry(s.store(), id);
                         s.redraw();
@@ -922,7 +953,7 @@ impl ProblemSource for Failures {
                             },
                         ),
                     )
-                    .announcing(op.line())
+                    .announcing(op.line)
                     .with_verbs(verbs),
                 )
             })
@@ -1018,6 +1049,53 @@ mod tests {
     }
     fn refusal(v: &Value) -> Value {
         json!({"@type": "error", "code": 400, "message": "InputFile is not specified", "@extra": v["@extra"]})
+    }
+
+    #[test]
+    fn ui_summaries_omit_background_work_and_preserve_failed_request_retries() {
+        let t = Tracker::default();
+        let s = store();
+        let background = tracked(&t, requests::get_message(7, 42));
+        let topic = tracked(&t, requests::get_forum_topics(7, 0, 0, 0));
+        assert!(t.visible().is_empty());
+        assert!(t.pending_topics(7));
+        assert!(!t.pending_topics(8));
+        let send = tracked(&t, requests::send_message(7, &"message body ".repeat(10_000), None));
+        let id = send["@extra"]["operation"].as_u64().unwrap();
+        let visible = t.visible();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, id);
+        assert_eq!(visible[0].status, Status::Pending);
+        assert!(visible[0].foreground);
+
+        t.reply(&s, &refusal(&send));
+        t.reply(&s, &refusal(&background));
+        let visible = t.visible();
+        assert_eq!(visible.len(), 2, "background failures remain actionable");
+        assert!(visible.iter().all(|op| op.retryable));
+        assert_eq!(serde_json::from_str::<Value>(&t.retry(id).unwrap()).unwrap(), send,
+            "drawing a summary must not discard the retry payload");
+        t.reply(&s, &json!({"@type": "forumTopics", "@extra": topic["@extra"]}));
+        assert!(!t.pending_topics(7));
+    }
+
+    #[test]
+    fn expiry_keeps_live_requests_and_retires_only_finished_feedback() {
+        let t = Tracker::default();
+        let s = store();
+        let done = tracked(&t, requests::get_message(7, 42));
+        t.reply(&s, &json!({"@type": "ok", "@extra": done["@extra"]}));
+        let pending = tracked(&t, requests::get_message(7, 43));
+        let id = pending["@extra"]["operation"].as_u64().unwrap();
+        let now = Instant::now();
+        t.expire(&s, now);
+        assert_eq!(t.list().len(), 2);
+        t.expire(&s, now + Duration::from_secs(6));
+        assert_eq!(t.list().len(), 1);
+        assert!(t.pending(id));
+        t.expire(&s, now + PATIENCE);
+        assert!(matches!(t.outcome(id).unwrap().status, Status::Failed { uncertain: false, .. }));
+        assert_eq!(serde_json::from_str::<Value>(&t.retry(id).unwrap()).unwrap(), pending);
     }
 
     #[test]

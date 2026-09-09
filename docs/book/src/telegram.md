@@ -474,6 +474,14 @@ Migration steps that have already shipped are immutable. Fixes belong in a
 new step; the existing ladder includes repairs for earlier schema shapes and
 preserves message identity as `(chat, id)` with a separate SQLite row key.
 
+Startup restoration runs on the account worker in batches of at most 128
+updates. A full batch resumes after 10 ms; an idle worker polls after 300 ms.
+Commands, visible-chat requests and UI notifications get a turn between
+batches. UI feedback reads operation summaries without copying request bodies,
+and timeout polling only collects expired request ids. The V18 dialog view
+starts from joined chats, so drawing the list does not scan unrelated peers
+restored as message senders or mentions.
+
 ## Current limits
 
 There is one live account per process. Admission still uses the real boot

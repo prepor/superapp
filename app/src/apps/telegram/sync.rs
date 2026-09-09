@@ -416,9 +416,9 @@ impl<T: Td> Account<T> {
         }
     }
 
-    /// Drains every update the engine has ready — `receive(0.0)` until it
-    /// answers `None` — acting on each. Answers how many were consumed.
-    /// Called from the worker's pass; it never blocks.
+    /// Processes at most [`UPDATES_PER_PASS`] ready updates, in wire order.
+    /// A startup backlog must yield to queued commands, visible chats and the
+    /// worker's UI notification. Transport receives do not wait for input.
     ///
     /// The pass begins by letting a stale *typing…* go
     /// ([`expire_typing`](Account::expire_typing)): that is a thing the clock
@@ -458,7 +458,8 @@ impl<T: Td> Account<T> {
         self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
         let mut n = 0;
-        while let Some(raw) = self.td.receive(0.0) {
+        while n < UPDATES_PER_PASS {
+            let Some(raw) = self.td.receive(0.0) else { break };
             self.on_update(w, &raw);
             n += 1;
         }
@@ -2036,6 +2037,16 @@ fn code_detail(st: &Value) -> Option<String> {
 /// that would hold the thread for a minute.
 const POLL: Duration = Duration::from_millis(300);
 
+/// Restoration can announce every cached peer in one burst. Keep each pass
+/// finite and resume promptly, with room for the UI to consume its signal.
+const UPDATES_PER_PASS: usize = 128;
+const BACKLOG_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(any(feature = "tdlib", test))]
+fn next_pass(updates: usize) -> Wake {
+    Wake::After(if updates == UPDATES_PER_PASS { BACKLOG_POLL } else { POLL })
+}
+
 /// The one account this build signs in, in the `action.entity` vocabulary.
 /// A single account, as the `telegram` file describes; several accounts are a
 /// later phase.
@@ -2110,8 +2121,7 @@ impl Worker for RealWorker {
                 super::config::phone(w.store().dir()),
             )
         });
-        account.drain(w);
-        Wake::After(POLL)
+        next_pass(account.drain(w))
     }
 }
 
@@ -2130,12 +2140,9 @@ impl<T: Td + Send + 'static> Worker for TgWorker<T> {
         job.entity.as_deref() == Some(ACCOUNT_ENTITY)
     }
 
-    /// One pass: drain every update TDLib has ready, then ask to be woken in
-    /// [`POLL`] so a fresh push is picked up promptly. The drain never blocks,
-    /// so the thread is handed back at once.
+    /// The same bounded drain and backlog pacing as the native worker.
     fn pass(&mut self, w: &World) -> Wake {
-        self.account.drain(w);
-        Wake::After(POLL)
+        next_pass(self.account.drain(w))
     }
 }
 
