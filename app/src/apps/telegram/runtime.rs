@@ -113,6 +113,7 @@ pub struct Runtime {
 #[derive(Default)]
 struct State {
     sender: Option<mpsc::UnboundedSender<String>>,
+    starting: Option<mpsc::UnboundedReceiver<String>>,
     connection: u64,
     next_action: u64,
     forward: Option<Forward>,
@@ -137,6 +138,7 @@ struct State {
 impl State {
     fn disconnect(&mut self) {
         self.sender = None;
+        self.starting = None;
         for (_, reply) in self.reactions.drain() {
             if let Some(reply) = reply.upgrade() {
                 *reply.lock().expect("reaction reply") = Some(ReactionResult::Error("Telegram is disconnected".into()));
@@ -208,7 +210,12 @@ pub struct Wanted {
 }
 
 pub fn of(store: &Store) -> Arc<Runtime> {
-    store.local()
+    let runtime = store.local::<Runtime>();
+    // Restored panels can draw before asynchronous worker discovery has run.
+    // Only the native account holder admits commands during that first boot;
+    // fixtures and builds without TDLib retain their disconnected default.
+    if cfg!(feature = "tdlib") && super::Telegram::engine_store(store.dir()) { runtime.prepare(); }
+    runtime
 }
 
 impl Runtime {
@@ -296,14 +303,29 @@ impl Runtime {
         out
     }
 
-    /// Called by the worker on its first pass, never by a panel.
-    pub fn connect(self: &Arc<Self>) -> Inbox {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    /// Reserve the first inbox without starting TDLib. Repeated lookups must
+    /// neither replace its queue nor reconnect an account that has stopped.
+    pub(super) fn prepare(&self) {
         let mut state = self.state();
-        state.disconnect();
-        self.reads.lock().unwrap().disconnect();
-        state.connection += 1;
+        if state.connection != 0 { return; }
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.connection = 1;
         state.sender = Some(sender);
+        state.starting = Some(receiver);
+    }
+
+    /// Called by the worker on its first pass. Adopt the initial queue and
+    /// its reply guards; only a replacement cancels the preceding connection.
+    pub fn connect(self: &Arc<Self>) -> Inbox {
+        let mut state = self.state();
+        let receiver = state.starting.take().unwrap_or_else(|| {
+            state.disconnect();
+            self.reads.lock().unwrap().disconnect();
+            let (sender, receiver) = mpsc::unbounded_channel();
+            state.connection += 1;
+            state.sender = Some(sender);
+            receiver
+        });
         Inbox { receiver: Mutex::new(receiver), runtime: Arc::downgrade(self), connection: state.connection }
     }
 
@@ -628,6 +650,40 @@ fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopting_the_startup_inbox_preserves_accepted_actions_and_replies() {
+        let state = Arc::new(Runtime::default());
+        state.prepare();
+        let (_, reply) = state.await_reaction();
+        assert!(state.send_peer_action(7, PeerAction::Block));
+        state.prepare();
+        let inbox = state.connect();
+        assert!(state.peer_action_pending(7));
+        assert!(reply.lock().unwrap().is_none());
+        assert_eq!(inbox.try_iter().count(), 1);
+        state.prepare();
+        assert!(state.send_peer_action(8, PeerAction::Block));
+        assert_eq!(inbox.try_iter().count(), 1, "preparation cannot replace a running worker's queue");
+    }
+
+    #[test]
+    fn preparing_does_not_reopen_a_disconnected_or_retired_startup_queue() {
+        for connected in [false, true] {
+            let state = Arc::new(Runtime::default());
+            state.prepare();
+            assert!(state.send_peer_action(7, PeerAction::Block));
+            if connected { drop(state.connect()); }
+            else { state.disconnect(); }
+            state.prepare();
+            assert!(!state.can_send());
+            assert!(!state.send_peer_action(8, PeerAction::Block));
+            let replacement = state.connect();
+            assert!(replacement.try_recv().is_err(), "a new worker cannot replay abandoned startup commands");
+            assert!(state.send_peer_action(8, PeerAction::Block));
+            assert_eq!(replacement.try_iter().count(), 1);
+        }
+    }
 
     #[test]
     fn retiring_an_inbox_seals_admission_without_invalidating_accepted_replies() {

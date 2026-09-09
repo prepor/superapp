@@ -166,7 +166,7 @@ impl<T: Td> Account<T> {
             return;
         }
         if matches!(v["@type"].as_str(), Some("getMessage" | "getMessages" | "getMessageAvailableReactions"
-            | "getMessageAddedReactions" | "searchChatMembers"))
+            | "getMessageAddedReactions" | "searchChatMembers" | "viewMessages"))
             && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
             let mut pending = self.deferred_reads.borrow_mut();

@@ -398,10 +398,13 @@ panel -> requests -> runtime inbox -> account worker -> TDLib
 panel <- model <- SQLite <- project <- updates <---- TDLib JSON
 ```
 
-The worker connects its inbox on its first pass. Panels enqueue JSON commands
-through one `panels::wire` function, including sign-in. The account sends
-requests asynchronously; a successful enqueue does not mean Telegram accepted
-it. Dropping the worker disconnects the inbox.
+The native account's runtime reserves its first inbox before restored panels
+enqueue requests. The worker adopts that queue and its pending replies on its
+first pass; message reads and read receipts then wait for authorization and
+chat restoration. Panels enqueue JSON commands through `panels::wire`, including
+sign-in. A successful enqueue does not mean Telegram accepted the request.
+Dropping the worker disconnects the inbox, and later panel lookups cannot
+reopen it or replay its commands.
 Login codes and passwords never enter the persistent effects queue.
 
 One native bridge thread owns TDLib's process-wide blocking receive queue and
