@@ -259,15 +259,17 @@ impl Widget for FileViewer {
             let text = image.text_request();
             if self.rendering.is_none() && !self.reading {
                 if let Some(worker) = &mut self.worker {
-                    if let Some(page) = text {
+                    // Fill visible page placeholders before preparing selection
+                    // geometry for pages that already have a bitmap.
+                    if let Some(page) = page {
+                        self.rendering = Some(page);
+                        if let Err(error) = worker.request(Request::Page(page)) { self.take(cx, Err(error)); }
+                        changed = true;
+                    } else if let Some(page) = text {
                         self.reading = true;
                         if let Err(error) = worker.request(Request::Text(page)) {
                             self.take(cx, Ok(Ready::PdfText(page, crate::reader::pdf::TextPage::failed(error))));
                         }
-                        changed = true;
-                    } else if let Some(page) = page {
-                        self.rendering = Some(page);
-                        if let Err(error) = worker.request(Request::Page(page)) { self.take(cx, Err(error)); }
                         changed = true;
                     }
                 }

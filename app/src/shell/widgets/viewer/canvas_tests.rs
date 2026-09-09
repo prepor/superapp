@@ -292,9 +292,9 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
                     "metadata and page requests must schedule a draw from inside drawing");
             }
             if image.borrow().unwrap().surfaces.len() == 2 && !copying {
-                assert!(frames <= 4, "continuous pages must finish without a forced draw loop");
+                assert!(frames <= 3, "both visible pages must render before extracting text");
+                assert!(image.borrow().unwrap().selection.pages.is_empty(), "text extraction waits for page bitmaps");
                 assert!(control.verbs().iter().any(|verb| verb.id == "viewer.fit"));
-                assert!(!image.borrow().unwrap().selection.pages.contains_key(&1));
                 root.handle_event(&mut cx, &Event::KeyDown(KeyEvent { key_code: KeyCode::KeyA,
                     modifiers: KeyModifiers { logo: true, ..Default::default() }, ..Default::default() }),
                     &mut Scope::with_data_props(&mut session, &props));
@@ -425,6 +425,14 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                     let mut worker = super::super::worker::Worker::start(super::super::Preview::Pdf(kernel::caps::demo::PDF.to_vec())).unwrap();
                     assert!(matches!(worker.poll(), Some(Ok(super::super::worker::Ready::PdfInfo(_)))));
                     worker.request(super::super::worker::Request::Copy(Some(span))).unwrap();
+                    // A verb-bar press moves keyboard focus to the shell before
+                    // its command runs. Keep the in-flight copy through both.
+                    for command in [Command::Fit, Command::FitWidth, Command::ZoomIn, Command::ZoomOut] {
+                        send(cx, Event::KeyFocus(KeyFocusEvent { prev: image.area(), focus: Area::Empty }));
+                        assert_eq!(image.copy_request(), Some(span), "{command:?}: toolbar focus must preserve a pending copy");
+                        image.command(cx, command);
+                        assert_eq!(image.copy_request(), Some(span), "{command:?}: changing the view must preserve a pending copy");
+                    }
                     let Some(Ok(super::super::worker::Ready::Copied(span, result))) = worker.poll() else { panic!("copy answered") };
                     image.copied(cx, span, result);
                     assert!(image.borrow().unwrap().selection.text(2).unwrap().contains("Back to page 1"),
@@ -443,6 +451,14 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                     assert!(image.clicked().is_none(), "long-press selection never activates a link");
                 }
                 4 => {
+                    send(cx, Event::KeyDown(KeyEvent { key_code: KeyCode::KeyA,
+                        modifiers: KeyModifiers { logo: true, ..Default::default() }, ..Default::default() }));
+                    send(cx, Event::TextCopy(TextClipboardEvent { response: Rc::new(RefCell::new(None)) }));
+                    let span = image.copy_request().expect("copy waits for the evicted page");
+                    send(cx, Event::Background);
+                    assert!(image.copy_request().is_none(), "leaving the app still cancels a pending copy");
+                    image.copied(cx, span, Ok("obsolete copy".into()));
+                    assert!(image.borrow().unwrap().selection.text(2).is_none(), "a canceled result must not be accepted");
                     image.enable(false);
                     assert!(!image.borrow().unwrap().has_selection());
                 }

@@ -31,8 +31,9 @@ and an ordinary swipe still scrolls. Selection follows zoom and rotation and
 survives page bitmap eviction. Image-only scans need a PDF text layer for
 selection; the viewer does not perform OCR.
 Copying text from pages outside the cache runs in the background and completes
-automatically; the position line shows progress. Changing the selection or
-leaving the viewer cancels a pending copy.
+automatically; the position line shows progress. Fit and zoom keep the copy
+running. Changing the selection, closing the preview, or leaving the app window
+cancels a pending copy.
 
 PDF link annotations are clickable: web and email links open through the
 system, and links to pages or named destinations jump within the document.
@@ -73,9 +74,10 @@ An unavailable page keeps its place and shows its error without hiding other
 pages. Closing or replacing a source drops its receiver, so an obsolete
 worker cannot populate a different file. Headless builds do the same work
 inline for deterministic UI tests.
-The worker extracts Unicode, glyph quadrilaterals, and line bounds on demand
-through Hayro's interpreter. Cursor hits use one rectangle per line. Nearby
-text pages have an 8 MiB cache and a 64-page cap; each extraction is limited to
+Page rendering takes priority over text extraction. The worker extracts Unicode,
+glyph quadrilaterals, and line bounds on demand through Hayro's interpreter.
+Cursor hits use one rectangle per line. Nearby text pages have an 8 MiB cache
+and a 64-page cap; each extraction is limited to
 2 MiB, counting allocated text, glyph, and line storage. Selection endpoints
 remain independent of both caches. A copy retrieves missing pages one at a time
 on the worker, yielding to viewing requests between pages, with a separate

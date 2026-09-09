@@ -331,8 +331,7 @@ impl Widget for ViewerImage {
             }
             Event::KeyFocus(e) if e.prev == self.area && e.focus != self.area => {
                 // A toolbar press temporarily gives focus to the shell. The
-                // document keeps its selection while fit/zoom changes its view.
-                self.selection.cancel_copy();
+                // document keeps its selection and pending copy through fit/zoom.
                 cx.hide_clipboard_actions();
             }
             Event::WindowLostFocus(_) | Event::Background => {
