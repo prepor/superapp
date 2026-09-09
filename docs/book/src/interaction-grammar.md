@@ -27,7 +27,8 @@ base to share this input policy.
 
 A list cursor previews the row it lands on in a joined panel, while focus stays
 in the list. Arrow keys can therefore continue through the rows. Clicking a row
-also moves the cursor there and opens its preview.
+also moves the cursor there and opens its preview. The click's focus change
+belongs to that visit, so undo returns focus to the panel used before the click.
 
 Press `enter` to open the row and take focus with it, which is the solid-link
 rule. Use `cmd+enter` to open the same target as a separate panel.

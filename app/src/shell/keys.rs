@@ -714,7 +714,7 @@ fn un_join(nav: kernel::nav::Nav, fresh: bool) -> kernel::nav::Nav {
         return nav;
     }
     match nav {
-        Nav::Open { from, id, .. } | Nav::Preview { from, id } => Nav::Open {
+        Nav::Open { from, id, .. } | Nav::Preview { from, id } | Nav::Select { from, id, .. } => Nav::Open {
             from,
             id,
             fresh: true,

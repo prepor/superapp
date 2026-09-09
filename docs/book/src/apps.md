@@ -153,9 +153,13 @@ world walks `panels()` and refreshes its own.
 
 ## Navigation
 
-`kernel::nav::Nav` is an intent to open, replace, preview, close, or focus. The
+`kernel::nav::Nav` is an intent to open, replace, preview, select a row, close, or focus. The
 join and replace rules, the preview's focus rule, and the history kind and
 coalescing are applied in the kernel; the shell animates the result.
+
+`Nav::Select` records a row click's focus change with its preview, so undo
+restores the panel focused before the click. Keyboard cursor walks use
+`Nav::Preview`, which keeps the list focused where the reader fits beside it.
 
 Closing is one rule. `Nav::Close` may come from anywhere, closes the slot's
 joined descendants, moves focus by the layout's rules, and inside a verb's

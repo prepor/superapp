@@ -31,6 +31,7 @@ survives session restore.
 Each article visit has its own undo step, even when moving quickly through
 the queue. `cmd+z` returns to the previous article and restores the read state
 changed by the visit; the list cursor follows the restored reader.
+Panel focus returns to where it was before the visit as well.
 `cmd+shift+z` moves forward again. Entering or clicking the current preview
 adds no extra undo step.
 

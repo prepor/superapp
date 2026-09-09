@@ -512,7 +512,6 @@ impl<S: RowSpec> TableView<S> {
         };
         // The keyboard belongs to the rows now, not to the filter.
         leave_field(cx, view);
-        navs.push(Nav::Focus(props.slot));
         // A mark the filter hides is outside the table: opening it moves no
         // cursor.
         if let Some(i) = at {
@@ -520,17 +519,10 @@ impl<S: RowSpec> TableView<S> {
         }
         view.redraw(cx);
         // cmd always opens a fresh, un-joined panel.
-        navs.push(if e.modifiers.logo {
-            Nav::Open {
-                from: props.slot,
-                id: target,
-                fresh: true,
-            }
-        } else {
-            Nav::Preview {
-                from: props.slot,
-                id: target,
-            }
+        navs.push(Nav::Select {
+            from: props.slot,
+            id: target,
+            fresh: e.modifiers.logo,
         });
     }
 

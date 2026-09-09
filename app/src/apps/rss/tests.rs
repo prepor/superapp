@@ -181,7 +181,7 @@ fn entering_or_reselecting_the_current_article_adds_no_undo_step() {
 }
 
 #[test]
-fn undo_waits_for_read_commits_and_restores_the_filtered_cursor() {
+fn undo_waits_for_read_commits_and_restores_reader_focus_and_cursor() {
     use crate::shell::widgets::table::RowSpec;
     use std::task::Poll;
     use std::time::{Duration, Instant};
@@ -194,10 +194,13 @@ fn undo_waits_for_read_commits_and_restores_the_filtered_cursor() {
     s.panel(slot).unwrap().borrow_mut().as_any()
         .downcast_mut::<panels::Articles>().unwrap().list.set_cursor(s.store(), 1);
     s.store().attach_ui(move || { let _ = send.send(()); });
-    s.nav(Nav::Preview { from: slot, id: panels::Article::id(first) });
+    s.nav(Nav::Open { from: slot, id: panels::Article::id(first), fresh: false });
     let first_visit = s.history().head();
-    s.nav(Nav::Preview { from: slot, id: panels::Article::id(second) });
+    let reader = s.joined_child(slot).unwrap();
+    assert_eq!(s.focus(), Some(reader));
+    s.nav(Nav::Select { from: slot, id: panels::Article::id(second), fresh: false });
     s.settle();
+    assert_eq!(s.focus(), Some(slot));
     assert!(s.undo(), "undo also accepts a visit whose read flag is still committing");
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -208,6 +211,7 @@ fn undo_waits_for_read_commits_and_restores_the_filtered_cursor() {
         let second_unseen = model::article_snapshot(s.store(), second).is_some_and(|a| !a.seen);
         if s.history().head() == first_visit && first_seen && second_unseen {
             let reader = s.joined_child(slot).expect("the previous reader stays open");
+            assert_eq!(s.focus(), Some(reader), "undo restores the previous reader's focus");
             let showing = s.panel(reader).unwrap().borrow().id().clone();
             assert_eq!(showing, panels::Article::id(first));
             let panel = s.panel(slot).unwrap();

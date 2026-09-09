@@ -19,11 +19,13 @@ copy "The"
 # A quick walk must still return to the preceding article in one undo.
 key cmd+z
 wait 700
+accel "refresh" r
 visible "article body"
 dblclick "article body"
 copy "Good"
 key cmd+shift+z
 wait 700
+accel "refresh" r
 dblclick "article body"
 copy "The"
 
@@ -44,5 +46,21 @@ key cmd+z
 wait 700
 dblclick "article body"
 copy "Good"
+
+# A row click must remember that the previous article's reader had focus.
+accel "refresh" -
+click "Small tools, lasting habits"
+wait 700
+accel "refresh" r
+key cmd+z
+wait 700
+accel "refresh" -
+dblclick "article body"
+copy "Good"
+key cmd+shift+z
+wait 700
+accel "refresh" r
+dblclick "article body"
+copy "The"
 shot r1-undo
 quit
