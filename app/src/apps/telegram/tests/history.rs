@@ -90,31 +90,24 @@ fn undo_then_redo_before_delivery_does_not_resend_or_delete() {
 }
 
 #[test]
-fn uncertain_send_and_failed_reversal_never_cause_an_automatic_resend() {
-    for fail_send in [true, false] {
-        let mut s = session();
-        let rt = runtime::of(s.store());
-        let inbox = rt.connect();
-        let operation = history::command(&mut s, &requests::send_message(VERA, "once", None)).unwrap();
-        let request = receive(&inbox);
-        if fail_send {
-            rt.operations.fail(s.store(), operation, "delivery unknown", true);
-            s.undo();
-        } else {
-            rt.operations.reply(s.store(), &json!({"@type": "message", "chat_id": VERA,
-                "id": 900, "@extra": request["@extra"]}));
-            assert!(s.undo());
-            let undo = receive(&inbox);
-            rt.operations.reply(s.store(), &json!({"@type": "error", "code": 400,
-                "message": "MESSAGE_DELETE_FORBIDDEN", "@extra": undo["@extra"]}));
-        }
-        history::pump(s.store());
-        s.redo();
-        history::pump(s.store());
-        assert!(inbox.try_recv().is_err());
-        assert_eq!(s.history().rows().0.last().unwrap().state, "expired");
-        assert!(rt.operations.list().iter().any(|op| matches!(op.status, Status::Failed { .. })));
-    }
+fn a_failed_reversal_never_causes_an_automatic_resend() {
+    let mut s = session();
+    let rt = runtime::of(s.store());
+    let inbox = rt.connect();
+    history::command(&mut s, &requests::send_message(VERA, "once", None)).unwrap();
+    let request = receive(&inbox);
+    rt.operations.reply(s.store(), &json!({"@type": "message", "chat_id": VERA,
+        "id": 900, "@extra": request["@extra"]}));
+    assert!(s.undo());
+    let undo = receive(&inbox);
+    rt.operations.reply(s.store(), &json!({"@type": "error", "code": 400,
+        "message": "MESSAGE_DELETE_FORBIDDEN", "@extra": undo["@extra"]}));
+    history::pump(s.store());
+    s.redo();
+    history::pump(s.store());
+    assert!(inbox.try_recv().is_err());
+    assert_eq!(s.history().rows().0.last().unwrap().state, "expired");
+    assert!(rt.operations.list().iter().any(|op| matches!(op.status, Status::Failed { .. })));
 }
 
 #[test]
@@ -407,10 +400,12 @@ fn a_reply_for_another_chat_cannot_make_undo_delete_in_that_chat() {
     let request = receive(&inbox);
     rt.operations.reply(s.store(), &json!({"@type": "message", "chat_id": STELAXIS,
         "id": 900, "@extra": request["@extra"]}));
-    s.undo();
+    assert!(s.undo());
     history::pump(s.store());
     assert!(inbox.try_recv().is_err());
-    assert_eq!(s.history().rows().0.last().unwrap().state, "expired");
+    assert_eq!(s.history().rows().0.last().unwrap().state, "undone");
+    assert!(s.redo());
+    assert!(inbox.try_recv().is_err(), "a malformed confirmation cannot trigger a resend");
 }
 
 #[test]

@@ -171,7 +171,7 @@ fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result
     }
     // One gesture is one transaction and one node. Each request still owns
     // its snapshot and receipt, so a quick undo waits for acknowledgements.
-    let independent_sends = values.len() > 1 && values.iter().all(|v| v["@type"] == "sendMessage");
+    let independent_sends = values.iter().all(|v| v["@type"] == "sendMessage");
     let remote = Remote { label: label.clone(), changes: changes.clone(), independent_sends };
     if s.act(Action::new(kind, label).claiming(vec![Box::new(remote)])).is_none() {
         for (id, _) in tracked {
@@ -575,9 +575,10 @@ impl Remote {
     fn unavailable(&self) -> Option<String> {
         self.changes.iter().find_map(|change| {
             let change = change.lock().unwrap();
-            // An unconfirmed attachment has nothing to reverse and must not
-            // block its delivered siblings. Keep its failed flight: redo
-            // cannot retry it, and a late confirmation still follows undo.
+            // An unconfirmed message consumes its own gesture's undo step,
+            // whether it was sent alone or with other messages. Keep its
+            // failed flight: redo cannot retry it, and a late confirmation
+            // still follows undo without blocking delivered siblings.
             if self.independent_sends && !change.applied
                 && change.flight.as_ref().is_some_and(|flight| flight.applied)
             {

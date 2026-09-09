@@ -1,12 +1,16 @@
 use super::*;
 
-fn attachments(s: &mut Session) -> Vec<u64> {
+fn attachment_requests() -> [String; 2] {
     let photo = model::Carried { path: "/tmp/photo.jpg".into() };
     let document = model::Carried { path: "/tmp/report.txt".into() };
-    history::batch(s, &[
+    [
         requests::send_file(VERA, Some(42), &photo, "caption"),
         requests::send_file(VERA, None, &document, ""),
-    ], "send 2 attachments".into()).unwrap()
+    ]
+}
+
+fn attachments(s: &mut Session) -> Vec<u64> {
+    history::batch(s, &attachment_requests(), "send 2 attachments".into()).unwrap()
 }
 
 fn delivered(s: &Session, request: &Value, id: i64) {
@@ -72,30 +76,35 @@ fn partially_rejected_sends_undo_delivered_files_without_reversing_the_previous_
 }
 
 #[test]
-fn late_attachment_delivery_and_explicit_retries_still_follow_the_groups_undo() {
-    for explicit_retry in [false, true] {
+fn late_attachment_delivery_and_explicit_retries_still_follow_the_sends_undo() {
+    for (grouped, explicit_retry) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut s = session();
         let rt = runtime::of(s.store());
         let inbox = rt.connect();
-        let operations = attachments(&mut s);
-        let requests = [receive(&inbox), receive(&inbox)];
-        delivered(&s, &requests[0], 900);
-        rt.operations.fail(s.store(), operations[1], "upload failed", !explicit_retry);
+        let operations = if grouped { attachments(&mut s) } else {
+            vec![history::command(&mut s, &attachment_requests()[0]).unwrap()]
+        };
+        let requests: Vec<_> = operations.iter().map(|_| receive(&inbox)).collect();
+        let rejected = requests.len() - 1;
+        if grouped { delivered(&s, &requests[0], 900); }
+        rt.operations.fail(s.store(), operations[rejected], "upload failed", !explicit_retry);
         history::pump(s.store());
         assert!(s.undo());
-        let delete = receive(&inbox);
-        assert_eq!(delete["message_ids"], json!([900]));
-        rt.operations.reply(s.store(), &json!({"@type": "ok", "@extra": delete["@extra"]}));
-        history::pump(s.store());
+        if grouped {
+            let delete = receive(&inbox);
+            assert_eq!(delete["message_ids"], json!([900]));
+            rt.operations.reply(s.store(), &json!({"@type": "ok", "@extra": delete["@extra"]}));
+            history::pump(s.store());
+        }
         assert!(inbox.try_recv().is_err());
 
         let request = if explicit_retry {
-            let retry = rt.operations.retry(operations[1]).unwrap();
+            let retry = rt.operations.retry(operations[rejected]).unwrap();
             assert!(rt.send(&retry));
             receive(&inbox)
         } else {
-            assert!(rt.operations.retry(operations[1]).is_none());
-            requests[1].clone()
+            assert!(rt.operations.retry(operations[rejected]).is_none());
+            requests[rejected].clone()
         };
         delivered(&s, &request, 901);
         history::pump(s.store());
@@ -156,22 +165,51 @@ fn a_failed_attachment_deletion_blocks_redo_before_any_sibling_is_resent() {
 }
 
 #[test]
-fn an_entirely_rejected_attachment_send_does_not_undo_the_previous_action_or_retry() {
-    let mut s = session();
-    let rt = runtime::of(s.store());
-    let inbox = rt.connect();
-    history::command(&mut s, &requests::send_message(VERA, "keep this message", None)).unwrap();
-    delivered(&s, &receive(&inbox), 800);
-    let previous = s.history().head();
-    let operations = attachments(&mut s);
-    for operation in operations {
-        receive(&inbox);
-        rt.operations.fail(s.store(), operation, "upload failed", false);
+fn rejected_and_uncertain_sends_consume_their_own_undo_without_retrying() {
+    let [photo, document] = attachment_requests();
+    for requests in [
+        vec![requests::send_message(VERA, "once", None)],
+        vec![photo.clone()], vec![document.clone()], vec![photo, document],
+    ] {
+        for uncertain in [false, true] {
+            for undo_before_failure in [false, true] {
+                let mut s = session();
+                let rt = runtime::of(s.store());
+                let inbox = rt.connect();
+                history::command(&mut s, &requests::send_message(VERA, "keep this message", None)).unwrap();
+                delivered(&s, &receive(&inbox), 800);
+                let previous = s.history().head();
+                let operations = if let [request] = requests.as_slice() {
+                    vec![history::command(&mut s, request).unwrap()]
+                } else {
+                    history::batch(&mut s, &requests, "send attachments".into()).unwrap()
+                };
+                let sent = s.history().head();
+                for _ in &operations { assert_eq!(receive(&inbox)["@type"], "sendMessage"); }
+                if undo_before_failure { assert!(s.undo()); }
+                for operation in &operations {
+                    rt.operations.fail(s.store(), *operation, "send failed", uncertain);
+                }
+                history::pump(s.store());
+                if !undo_before_failure { assert!(s.undo()); }
+                assert_eq!(s.history().head(), previous, "the failed send consumes exactly its own undo step");
+                assert_eq!(s.history().rows().0.last().unwrap().state, "undone");
+                assert!(inbox.try_recv().is_err(), "the previous message stays delivered");
+
+                assert!(s.redo());
+                assert_eq!(s.history().head(), sent);
+                assert_eq!(s.history().rows().0.last().unwrap().state, "applied");
+                assert!(s.undo());
+                assert_eq!(s.history().head(), previous);
+                assert!(inbox.try_recv().is_err(), "redo never retries a rejected or uncertain send");
+                for operation in &operations {
+                    assert_eq!(rt.operations.list().iter().find(|op| op.id == *operation).unwrap().status,
+                        Status::Failed { error: "send failed".into(), uncertain });
+                }
+                assert!(s.undo(), "a separate undo can still reverse the previous action");
+                assert_eq!(receive(&inbox)["message_ids"], json!([800]));
+                assert!(inbox.try_recv().is_err());
+            }
+        }
     }
-    assert!(s.undo());
-    assert_eq!(s.history().head(), previous);
-    assert!(s.redo());
-    assert!(s.undo());
-    assert_eq!(s.history().head(), previous);
-    assert!(inbox.try_recv().is_err());
 }
