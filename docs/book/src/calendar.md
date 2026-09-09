@@ -125,16 +125,34 @@ Participant rows share a single time axis, with
 busy blocks, striped unknown availability, and the selected time outlined across
 every row. Owned calendars are combined in the **You** row.
 
-Select a suggested time, then **use this time** to update the original local
-draft and return to its editor. Selecting a row alone does not change the draft.
+Select a suggested time, or drag the outlined time on any participant track.
+Dragging snaps to fifteen-minute increments, keeps the pointer's position within
+the selection, and fits the whole meeting inside the checked window. Clicking
+empty track space chooses a new start; Escape cancels a drag. Busy overlaps are
+highlighted and named above the tracks. Then **use this time** updates the
+original local draft and returns to its editor. Selecting or dragging alone
+does not change the draft.
 Unknown calendars stay unknown; partial suggestions only cover readable
 calendars, and no suggestions appear if none can be checked. A suggestion is
 not a reservation.
 
+Changing the meeting length immediately resizes the selection and recalculates
+suggestions from the same checked busy intervals. The selected start stays in
+place unless the longer meeting needs to move earlier to fit the window.
+Incomplete duration input can be corrected without losing that start.
+
+Hover a busy block to see the event's title, exact times and location when
+available. Details load after the free/busy result, trying connected accounts
+for readable events without delaying time selection. Private or unreadable
+events remain **Busy**; missing details never make an occupied interval free.
+Hovering the combined **You** row identifies the calendars behind its events.
+
 Editing search controls does not alter an in-flight request. Each check creates
-a new request using the draft's current guests and account. Changed settings,
-changed participants or account, and results older than five minutes require
-another check before applying a time. Search controls survive panel restoration.
+a new request using the draft's current guests and account. Changed dates,
+search hours, time zone, participants or account, and results older than five
+minutes require another check before applying a time. Duration changes and
+event-detail lookups do not renew that timestamp. Search controls survive panel
+restoration.
 
 Google's API supports both features. Reading another person's free/busy depends
 on sharing and Workspace permissions; knowing an email address grants no access.
@@ -142,6 +160,7 @@ Requests are bounded to fourteen days and fifty calendars, with meeting
 lengths from fifteen minutes to eight hours. See Google's
 [conference creation guide](https://developers.google.com/workspace/calendar/api/guides/create-events),
 [FreeBusy reference](https://developers.google.com/workspace/calendar/api/v3/reference/freebusy/query),
+[event-list reference](https://developers.google.com/workspace/calendar/api/v3/reference/events/list),
 and [sharing model](https://developers.google.com/workspace/calendar/api/concepts/sharing).
 
 ## Persistence and synchronization
@@ -153,7 +172,7 @@ and [sharing model](https://developers.google.com/workspace/calendar/api/concept
 | `calendar_draft` | revisioned local form, base snapshot, status, error |
 | `calendar_change` | durable create/update/delete/RSVP operation and result |
 | `calendar_sync` | requested cache range, refresh generations, last status |
-| `calendar_availability` | queued free/busy query, per-calendar coverage, candidate times |
+| `calendar_availability` | queued free/busy query, per-calendar coverage, candidate times and optional shared event details |
 
 A worker processes outgoing changes and availability requests, and refreshes
 the bounded cache every five minutes or on request. Calendar lists and event
@@ -186,11 +205,14 @@ pending; query again once it finishes and inspect `coverage` for any errors.
 | `calendar.commit` | queue the exact reviewed draft revision |
 | `calendar.delete`, `calendar.respond` | delete with explicit scope, or send RSVP |
 | `calendar.operation`, `calendar.retry` | inspect completion and retry the original operation |
-| `calendar.availability`, `calendar.availability_result` | check free/busy across connected identities and inspect coverage, account attempts, errors and times |
+| `calendar.availability`, `calendar.availability_result` | check free/busy across connected identities and inspect coverage, account attempts, errors, times and shared event details; optional `minutes` recalculates fresh results locally |
+| `calendar.use_time` | apply a snapped start and duration to the checked request's original local draft, returning busy conflicts and unknown calendars |
 
 Commit, delete, RSVP, and retry require agent approval because they can notify
 other people. Local draft edits do not send invitations. A draft revision or
-ETag is mandatory on writes. Tools report queued work as queued, and direct SQL
+ETag is mandatory on Google writes. `calendar.use_time` uses the latest local
+draft revision and does not submit to Google; `calendar.commit` remains a
+separate operation. Tools report queued work as queued, and direct SQL
 writes are not a substitute for a successful Google operation.
 
 ## Native panels and verification
@@ -202,7 +224,9 @@ are launcher roots. The panel library includes native scenes.
 The deterministic fake supplies recurrence expansion, ETags, CRUD, Meet and
 permission-dependent free/busy. Unit tests cover the write queue, recurring
 scopes, conflicts, time zones, guest completion, immutable availability requests,
-stale participants, original-draft updates, permission preservation and strict tools. Native
+stale participants, snapped dragging, live duration changes, event-detail
+pagination and account fallback, original-draft updates, permission preservation
+and strict tools. Native
 scripts in `e2e/calendar/` exercise filtering, month navigation, RSVP, editing,
 availability and saving through real widget input paths. Live Google consent
 and an actual account round trip require a configured desktop OAuth client.

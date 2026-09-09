@@ -7,6 +7,8 @@ use kernel::{
     session::{Action, Session},
 };
 use serde_json::{json, Value};
+#[path = "tests/scheduling.rs"]
+mod scheduling;
 static APPS: &[&dyn App] = &[
     &crate::apps::mail::MAIL,
     &crate::apps::accounts::ACCOUNTS,
@@ -66,6 +68,11 @@ fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
     }));
     s.settle();
     s.focus().unwrap()
+}
+fn use_suggestion(s: &mut Session, request: i64, slot: usize) -> Result<i64, String> {
+    let (q, r, _, _) = availability::load(s.store(), request).ok_or("request missing")?;
+    let start = r.ok_or("still checking")?.slots[slot].0;
+    availability::apply_time(s, request, &availability::Search::from_query(&q), start)
 }
 
 #[test]
@@ -703,7 +710,7 @@ fn availability_includes_owner_and_applies_to_persistent_draft() {
     assert!(!r.complete);
     assert!(r.people.len() >= 2);
     assert!(!r.slots.is_empty());
-    availability::apply(&mut s, request, 0).unwrap();
+    use_suggestion(&mut s, request, 0).unwrap();
     assert_eq!(edit::draft(s.store(), id).unwrap().revision, 3);
 }
 #[test]
@@ -961,7 +968,7 @@ fn availability_cannot_apply_an_old_guest_list() {
     let mut form = d.form;
     form.guests = "new-person@example.com".into();
     edit::save(&mut s, id, d.revision, 1, form).unwrap();
-    assert!(availability::apply(&mut s, request, 0)
+    assert!(use_suggestion(&mut s, request, 0)
         .unwrap_err()
         .contains("guest list changed"));
 }
@@ -1207,7 +1214,7 @@ fn availability_tracks_removed_guests_and_account_changes_but_allows_title_edits
     f.guests.clear();
     let d = edit::draft(s.store(), draft).unwrap();
     edit::save(&mut s, draft, d.revision, 1, f.clone()).unwrap();
-    assert!(availability::apply(&mut s, request, 0)
+    assert!(use_suggestion(&mut s, request, 0)
         .unwrap_err()
         .contains("guest list changed"));
     let new = availability::recheck(&mut s, request, &search).unwrap();
@@ -1250,8 +1257,8 @@ fn choosing_a_time_updates_the_original_editor_and_closes_the_scheduling_sheet()
             .downcast_mut::<panels::Availability>()
             .unwrap();
         let (_, r, _, _) = availability::load(s.store(), p.request).unwrap();
-        assert!(!r.unwrap().slots.is_empty());
-        p.selected = Some(0);
+        let start = r.unwrap().slots[0].0;
+        p.select(start, s.now()).unwrap();
         crate::shell::bar::check(&p.verbs());
         p.run("calendar.use_time", &mut s);
     }

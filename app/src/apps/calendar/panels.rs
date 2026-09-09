@@ -690,7 +690,7 @@ pub struct Availability {
     pub error: String,
     pub search: availability::Search,
     pub dirty: bool,
-    pub selected: Option<usize>,
+    pub selected: Option<f64>,
 }
 impl Availability {
     pub const TAG: Tag = Tag("calendar-availability");
@@ -699,9 +699,21 @@ impl Availability {
     }
     pub fn edit_search(&mut self, search: availability::Search) {
         self.search = search;
-        self.dirty = true;
-        self.selected = None;
+        let validation = availability::load(&self.store, self.request)
+            .ok_or("availability request missing".into())
+            .and_then(|(q, _, _, _)| self.search.reuse(&q));
+        self.dirty = validation.is_err();
+        self.error = validation.err().unwrap_or_default();
+    }
+    pub fn select(&mut self, start: f64, now: f64) -> Result<(), String> {
+        let (q, result, draft) =
+            availability::preview(&self.store, self.request, &self.search, now)?;
+        if draft.is_none() || !result.people.iter().any(|p| p.known) {
+            return Err("a draft and checked availability are needed to choose a time".into());
+        }
+        self.selected = Some(availability::snap(&q, start, now).ok_or("no time fits this window")?);
         self.error.clear();
+        Ok(())
     }
     pub fn check(&mut self, s: &mut Session) {
         match availability::recheck(s, self.request, &self.search) {
@@ -715,13 +727,13 @@ impl Availability {
         }
         s.redraw();
     }
-    pub fn apply(&mut self, s: &mut Session, index: usize) {
+    pub fn apply(&mut self, s: &mut Session, start: f64) {
         if self.dirty {
             self.error = "check availability for these settings first".into();
             s.redraw();
             return;
         }
-        match availability::apply(s, self.request, index) {
+        match availability::apply_time(s, self.request, &self.search, start) {
             Ok(id) => {
                 let parent = s.join_parent_of(self.slot).filter(|slot| {
                     s.panel(*slot)
@@ -758,7 +770,7 @@ impl Panel for Availability {
         "find a time".into()
     }
     fn about(&self) -> String {
-        format!("Google free/busy request {}. Search controls: {}. Unchecked edits: {}. Selected slot: {:?}. Select a suggested time, then use this time to update the original draft. Unknown calendars are never free; partial suggestions work only for checked calendars. Result: {}", self.request, serde_json::to_string(&self.search).unwrap(), self.dirty, self.selected, availability::load(&self.store,self.request).and_then(|(_,r,_,_)|r).map(|r|serde_json::to_string(&r).unwrap()).unwrap_or("pending".into()))
+        format!("Google free/busy request {}. Search controls: {}. Unchecked edits: {}. Selected start (Unix seconds): {:?}. Duration changes recalculate checked intervals locally without renewing freshness. Select a suggestion or drag the proposal on participant tracks in 15-minute steps, then use this time to update the original draft. Hover busy blocks for shared event titles and exact times; private or unreadable details stay Busy. Unknown calendars are never free; partial suggestions work only for checked calendars, and dragged times may conflict with busy events. Result: {}", self.request, serde_json::to_string(&self.search).unwrap(), self.dirty, self.selected, availability::load(&self.store,self.request).and_then(|(_,r,_,_)|r).map(|r|serde_json::to_string(&r).unwrap()).unwrap_or("pending".into()))
     }
     fn wish(&self, _: usize) -> (u32, u32) {
         (6, 6)
@@ -814,7 +826,8 @@ impl PanelKind for AvailabilityKind {
             .get(1)
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| original.clone());
-        let dirty = search != original;
+        let dirty = availability::load(&store, request)
+            .is_none_or(|(q, _, _, _)| search.reuse(&q).is_err());
         Box::new(Availability {
             id: id.clone(),
             request,

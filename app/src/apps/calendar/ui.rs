@@ -215,6 +215,12 @@ script_mod! {
     ..mod.widgets.View
     width: Fill, height: Fill, flow: Down, padding: 20
     suggest: mod.widgets.TblSuggest {}
+    tooltip: mod.widgets.CalendarTimeBox {
+        width: 330, height: Fit, flow: Down, padding: 12
+        body_lbl := mod.widgets.SLabel { width: Fill, max_lines: 12
+            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size:9.5} }
+        }
+    }
     list := mod.widgets.SList { width: Fill, height: Fill, flow: Down, reuse_items: true
         controls := View { width: Fill, height: Fit, flow: Down, spacing: 14
             View { width: Fill, height: Fit, flow: Right, spacing: 12, align: Align{y:0.5}
@@ -252,6 +258,10 @@ script_mod! {
                 zone_input := mod.widgets.SField {}
             }
             status_lbl := mod.widgets.SSection { width: Fill, max_lines: 3 }
+            selection_lbl := mod.widgets.SBoldLabel { width: Fill, max_lines: 3 }
+            drag_hint := mod.widgets.SSection { width: Fill, max_lines: 2
+                text: "Drag to change time · snaps every 15 minutes\nHover busy blocks for event details"
+            }
             View { width: Fill, height: Fit, flow: Right, spacing: 8, align: Align{y:0.5}, margin: Inset{top:4,bottom:6}
                 View { width: Fill, height: 1 }
                 mod.widgets.CalendarTimeBox { width: 12, height: 9 }

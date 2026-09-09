@@ -93,6 +93,16 @@ impl Search {
         self.end_day = b.to_string();
         Ok(())
     }
+    /// Duration does not change the interval Google checked. Keep the original
+    /// request immutable and recalculate suggestions locally for the new length.
+    pub fn reuse(&self, checked: &Query) -> Result<Query, String> {
+        let mut query = self.query(checked.guests.clone())?;
+        if query.validate()? != checked.validate()? || query.zone != checked.zone {
+            return Err("Check availability for these dates, hours and time zone first.".into());
+        }
+        query.draft_guests = checked.draft_guests.clone();
+        Ok(query)
+    }
 }
 
 pub fn guests(form: &edit::Form) -> Vec<String> {
@@ -173,6 +183,30 @@ pub struct Check {
     pub error: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BusyEvent {
+    pub id: String,
+    pub title: String,
+    pub location: String,
+    pub start: f64,
+    pub end: f64,
+    pub all_day: bool,
+    pub account: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailState {
+    Pending,
+    Ready,
+    #[default]
+    Unavailable,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Details {
+    pub state: DetailState,
+    pub events: Vec<BusyEvent>,
+    pub error: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Person {
     pub calendar: String,
     pub known: bool,
@@ -180,6 +214,8 @@ pub struct Person {
     pub error: String,
     #[serde(default)]
     pub checks: Vec<Check>,
+    #[serde(default)]
+    pub details: Details,
 }
 impl Person {
     pub fn via(&self) -> Option<&str> {
@@ -244,6 +280,7 @@ pub fn calculate(q: &Query, answer: &Value, now: f64) -> Result<ResultSet, Strin
                 calendar_error(c)
             },
             checks: Vec::new(),
+            details: Details::default(),
         });
     }
     suggest(q, people, now)
@@ -380,21 +417,40 @@ pub fn load(s: &Store, id: i64) -> Option<(Query, Option<ResultSet>, String, Opt
     .first()
     .and_then(|(q, r, e, d)| q.clone().map(|q| (q, r.clone(), e.clone(), *d)))
 }
-pub fn apply(s: &mut Session, id: i64, slot: usize) -> Result<i64, String> {
-    let (q, r, e, draft) = load(s.store(), id).ok_or("availability request missing")?;
+/// Resolve the current controls against the checked participants without
+/// refreshing their timestamp. This is also the validation boundary for a drag.
+pub fn preview(
+    store: &Store,
+    id: i64,
+    search: &Search,
+    now: f64,
+) -> Result<(Query, ResultSet, Option<i64>), String> {
+    let (q, r, e, draft) = load(store, id).ok_or("availability request missing")?;
     if !e.is_empty() {
         return Err(e);
     }
-    if let Some(error) = draft_error(s.store(), id, &q, draft) {
+    if let Some(error) = draft_error(store, id, &q, draft) {
         return Err(error);
     }
     let r = r.ok_or("still checking availability")?;
-    let (a, b) = *r.slots.get(slot).ok_or("time slot missing")?;
-    let d = edit::draft(s.store(), draft.ok_or("this request has no event draft")?)
-        .ok_or("draft missing")?;
-    if a < s.now() || s.now() - r.checked > 300.0 {
+    if now - r.checked > 300.0 {
         return Err("these times are out of date; check availability again".into());
     }
+    let q = search.reuse(&q)?;
+    let checked = r.checked;
+    let mut r = suggest(&q, r.people, now)?;
+    r.checked = checked;
+    Ok((q, r, draft))
+}
+
+pub fn apply_time(s: &mut Session, id: i64, search: &Search, start: f64) -> Result<i64, String> {
+    let (q, r, draft) = preview(s.store(), id, search, s.now())?;
+    let (a, b) = selection(&q, start, s.now()).ok_or("choose a time inside the checked window")?;
+    if !r.people.iter().any(|p| p.known) {
+        return Err("no calendars could be checked".into());
+    }
+    let d = edit::draft(s.store(), draft.ok_or("this request has no event draft")?)
+        .ok_or("draft missing")?;
     let mut form = d.form;
     form.start = dates::editor_time(a, &q.zone);
     form.end = dates::editor_time(b, &q.zone);
@@ -402,6 +458,37 @@ pub fn apply(s: &mut Session, id: i64, slot: usize) -> Result<i64, String> {
     form.all_day = false;
     edit::save(s, d.id, d.revision, d.source, form)?;
     Ok(d.id)
+}
+
+pub fn selection(q: &Query, start: f64, now: f64) -> Option<(f64, f64)> {
+    let (a, b) = q.validate().ok()?;
+    let end = start + f64::from(q.minutes) * 60.0;
+    (start.is_finite() && start >= a.max(now) && end <= b).then_some((start, end))
+}
+
+/// Snap to wall-clock quarter hours, clamping the whole meeting to the checked
+/// window. Applying the zone offset also handles offsets such as Kathmandu's.
+pub fn snap(q: &Query, start: f64, now: f64) -> Option<f64> {
+    use chrono::Offset;
+    let (a, b) = q.validate().ok()?;
+    if !start.is_finite() {
+        return None;
+    }
+    let offset = f64::from(
+        dates::utc(start)
+            .with_timezone(&dates::zone(&q.zone).ok()?)
+            .offset()
+            .fix()
+            .local_minus_utc(),
+    );
+    let first = ((a.max(now) + offset) / 900.0).ceil() * 900.0 - offset;
+    let last = ((b - f64::from(q.minutes) * 60.0 + offset) / 900.0).floor() * 900.0 - offset;
+    (first <= last).then(|| {
+        ((start + offset) / 900.0)
+            .round()
+            .mul_add(900.0, -offset)
+            .clamp(first, last)
+    })
 }
 pub fn wire(q: &Query) -> Result<Value, String> {
     let (a, b) = q.validate()?;

@@ -18,6 +18,141 @@ pub struct Track {
     pub busy: Vec<(f64, f64)>,
     pub proposed: Option<(f64, f64)>,
     pub unknown: bool,
+    pub request: i64,
+    pub query: Option<availability::Query>,
+    pub people: Vec<availability::Person>,
+    pub interactive: bool,
+    pub conflict: bool,
+}
+impl Track {
+    fn new(
+        request: i64,
+        query: &availability::Query,
+        people: Vec<availability::Person>,
+        selected: Option<(f64, f64)>,
+        interactive: bool,
+    ) -> Self {
+        let (a, b) = query.validate().unwrap_or((0.0, 1.0));
+        Self {
+            busy: people
+                .iter()
+                .flat_map(|p| &p.busy)
+                .filter_map(|(s, e)| fraction(*s, *e, a, b))
+                .collect(),
+            proposed: selected.and_then(|(s, e)| fraction(s, e, a, b)),
+            unknown: people.iter().any(|p| !p.known),
+            conflict: selected.is_some_and(|(s, e)| {
+                people
+                    .iter()
+                    .any(|p| p.known && p.busy.iter().any(|(a, b)| s < *b && e > *a))
+            }),
+            request,
+            query: Some(query.clone()),
+            people,
+            interactive,
+        }
+    }
+}
+
+/// Preserve the grab point within an existing proposal; clicking empty space
+/// starts a new proposal at the pointer. Snapping happens in the panel model.
+#[derive(Clone, Debug)]
+pub struct Drag {
+    left: f64,
+    width: f64,
+    start: f64,
+    span: f64,
+    offset: f64,
+    previous: Option<f64>,
+}
+impl Drag {
+    pub fn new(
+        rect: Rect,
+        start: f64,
+        end: f64,
+        proposed: Option<(f64, f64)>,
+        x: f64,
+    ) -> Option<Self> {
+        if rect.size.x <= 0.0 || end <= start {
+            return None;
+        }
+        let at = start + (x - rect.pos.x) / rect.size.x * (end - start);
+        let offset = proposed
+            .filter(|(a, b)| at >= *a && at <= *b)
+            .map_or(0.0, |(a, _)| at - a);
+        Some(Self {
+            left: rect.pos.x,
+            width: rect.size.x,
+            start,
+            span: end - start,
+            offset,
+            previous: proposed.map(|(a, _)| a),
+        })
+    }
+    pub fn at(&self, x: f64) -> f64 {
+        self.start + (x - self.left) / self.width * self.span - self.offset
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+enum TrackAction {
+    #[default]
+    None,
+    Select {
+        request: i64,
+        start: f64,
+    },
+    Cancel {
+        request: i64,
+        previous: Option<f64>,
+    },
+    Hover(DVec2),
+    Leave,
+}
+
+pub fn hover_text(person: &availability::Person, at: f64, zone: &str) -> Option<String> {
+    let (start, end) = *person.busy.iter().find(|(a, b)| at >= *a && at < *b)?;
+    let events: Vec<_> = person
+        .details
+        .events
+        .iter()
+        .filter(|e| at >= e.start && at < e.end)
+        .collect();
+    let time = |a, b| format!("{} – {}", dates::label(a, zone), dates::label(b, zone));
+    let body = if events.is_empty() {
+        format!(
+            "Busy\n{}\n{}",
+            time(start, end),
+            match person.details.state {
+                availability::DetailState::Pending => "Loading event details…",
+                availability::DetailState::Ready | availability::DetailState::Unavailable =>
+                    "Event details unavailable",
+            }
+        )
+    } else {
+        events
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}\n{}{}{}",
+                    if e.title.is_empty() {
+                        "Busy · details unavailable"
+                    } else {
+                        &e.title
+                    },
+                    if e.all_day { "All day · " } else { "" },
+                    time(e.start, e.end),
+                    if e.location.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", e.location)
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    Some(format!("{}\n{}", person.calendar, body))
 }
 /// Fractions shared by the painted busy blocks and the selected proposal.
 pub fn fraction(a: f64, b: f64, start: f64, end: f64) -> Option<(f64, f64)> {
@@ -38,6 +173,8 @@ pub struct CalendarTimeTrack {
     fill: DrawFlat,
     #[rust]
     pub track: Track,
+    #[rust]
+    drag: Option<(i64, Drag)>,
 }
 impl CalendarTimeTrack {
     fn block(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4f) {
@@ -46,10 +183,88 @@ impl CalendarTimeTrack {
     }
 }
 impl Widget for CalendarTimeTrack {
+    fn is_interactive(&self) -> bool {
+        true
+    }
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape) {
+            if let Some((request, drag)) = self.drag.take() {
+                cx.widget_action(
+                    self.widget_uid(),
+                    TrackAction::Cancel {
+                        request,
+                        previous: drag.previous,
+                    },
+                );
+            }
+        }
+        match event.hits(cx, self.view.area()) {
+            Hit::FingerDown(e) if e.is_primary_hit() && self.track.interactive => {
+                if let Some((a, b)) = self.track.query.as_ref().and_then(|q| q.validate().ok()) {
+                    let proposed = self
+                        .track
+                        .proposed
+                        .map(|(s, e)| (a + s * (b - a), a + e * (b - a)));
+                    if let Some(drag) = Drag::new(e.rect, a, b, proposed, e.abs.x) {
+                        cx.set_key_focus(self.view.area());
+                        cx.widget_action(
+                            self.widget_uid(),
+                            TrackAction::Select {
+                                request: self.track.request,
+                                start: drag.at(e.abs.x),
+                            },
+                        );
+                        self.drag = Some((self.track.request, drag));
+                        cx.set_cursor(MouseCursor::Grabbing);
+                    }
+                }
+            }
+            Hit::FingerMove(e) => {
+                if let Some((request, drag)) = &self.drag {
+                    cx.widget_action(
+                        self.widget_uid(),
+                        TrackAction::Select {
+                            request: *request,
+                            start: drag.at(e.abs.x),
+                        },
+                    );
+                    cx.set_cursor(MouseCursor::Grabbing);
+                }
+            }
+            Hit::FingerUp(e) => {
+                if let Some((request, drag)) = self.drag.take() {
+                    cx.widget_action(
+                        self.widget_uid(),
+                        TrackAction::Select {
+                            request,
+                            start: drag.at(e.abs.x),
+                        },
+                    );
+                }
+            }
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
+                cx.set_cursor(if self.track.interactive {
+                    MouseCursor::Grab
+                } else {
+                    MouseCursor::Default
+                });
+                cx.widget_action(self.widget_uid(), TrackAction::Hover(e.abs));
+            }
+            Hit::FingerHoverOut(_) => {
+                cx.widget_action(self.widget_uid(), TrackAction::Leave);
+            }
+            _ => {}
+        }
         self.view.handle_event(cx, event, scope);
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|(id, _)| *id != self.track.request)
+        {
+            self.drag = None;
+        }
         self.view
             .draw_bg
             .set_uniform(cx, live_id!(unknown), &[f32::from(self.track.unknown)]);
@@ -79,7 +294,11 @@ impl Widget for CalendarTimeTrack {
         }
         if let Some((a, b)) = self.track.proposed {
             let (left, width) = (x + a * w, ((b - a) * w).max(1.0));
-            let ink = vec4(0.078, 0.078, 0.078, 1.0);
+            let ink = if self.track.conflict {
+                vec4(0.68, 0.18, 0.08, 1.0)
+            } else {
+                vec4(0.078, 0.078, 0.078, 1.0)
+            };
             self.block(cx, rect(left, y, width, h), vec4(0.078, 0.078, 0.078, 0.07));
             for r in [
                 rect(left, y, 1.0, h),
@@ -128,6 +347,8 @@ pub struct CalendarAvailabilityPanel {
     view: View,
     #[live]
     suggest: View,
+    #[live]
+    tooltip: View,
     #[rust]
     controls: WidgetRef,
     #[rust]
@@ -146,6 +367,10 @@ pub struct CalendarAvailabilityPanel {
     request: i64,
     #[rust]
     directory: Vec<Suggestion>,
+    #[rust]
+    tracks: Vec<(WidgetRef, Rect)>,
+    #[rust]
+    hover: Option<(WidgetUid, DVec2)>,
 }
 impl Widget for CalendarAvailabilityPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
@@ -201,6 +426,65 @@ impl Widget for CalendarAvailabilityPanel {
             }
             self.view.redraw(cx);
         }
+        if let Event::Actions(actions) = event {
+            for (track, _) in &self.tracks {
+                for action in actions.filter_widget_actions(track.widget_uid()) {
+                    match action.cast::<TrackAction>() {
+                        TrackAction::Select { request, start } => {
+                            if let Some(s) = scope.data.get_mut::<Session>() {
+                                if let Some(p) = props
+                                    .panel
+                                    .borrow_mut()
+                                    .as_any()
+                                    .downcast_mut::<panels::Availability>()
+                                {
+                                    if p.request == request {
+                                        if let Err(error) = p.select(start, s.now()) {
+                                            p.error = error;
+                                        }
+                                        s.redraw();
+                                    }
+                                }
+                            }
+                            self.hover = None;
+                        }
+                        TrackAction::Cancel { request, previous } => {
+                            if let Some(p) = props
+                                .panel
+                                .borrow_mut()
+                                .as_any()
+                                .downcast_mut::<panels::Availability>()
+                            {
+                                if p.request == request {
+                                    p.selected = previous;
+                                }
+                            }
+                            if let Some(s) = scope.data.get_mut::<Session>() {
+                                s.redraw();
+                            }
+                        }
+                        TrackAction::Hover(at) => {
+                            if props.hits.at(at).is_some_and(|h| {
+                                h.slot == Some(props.slot)
+                                    && h.label.starts_with("availability track ")
+                            }) {
+                                self.hover = Some((track.widget_uid(), at));
+                            }
+                        }
+                        TrackAction::Leave
+                            if self.hover.is_some_and(|(id, _)| id == track.widget_uid()) =>
+                        {
+                            self.hover = None
+                        }
+                        _ => {}
+                    }
+                    self.view.redraw(cx);
+                }
+            }
+        }
+        if matches!(event, Event::Scroll(_) | Event::MouseDown(_)) {
+            self.hover = None;
+        }
         if let Event::MouseDown(e) = event {
             self.pressed = props
                 .hits
@@ -231,8 +515,20 @@ impl Widget for CalendarAvailabilityPanel {
                 };
                 match pick {
                     Pick::Slot(i) => {
-                        if !p.dirty {
-                            p.selected = Some(i);
+                        if let Some(s) = scope.data.get_mut::<Session>() {
+                            let selected =
+                                availability::preview(&p.store, p.request, &p.search, s.now())
+                                    .and_then(|(_, r, _)| {
+                                        r.slots
+                                            .get(i)
+                                            .map(|(a, _)| *a)
+                                            .ok_or("time slot missing".into())
+                                    })
+                                    .and_then(|start| p.select(start, s.now()));
+                            if let Err(error) = selected {
+                                p.error = error;
+                            }
+                            s.redraw();
                         }
                     }
                     Pick::More => self.expanded = true,
@@ -258,42 +554,45 @@ impl Widget for CalendarAvailabilityPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = scope.data.get::<Session>().map(|s| s.now()).unwrap_or(0.0);
-        let Some((id, search, dirty, error, q, result, selected, store)) = ({
-            let mut p = props.panel.borrow_mut();
-            p.as_any()
+        let Some((id, search, dirty, error, q, result, selected, interactive, store)) = ({
+            let mut borrow = props.panel.borrow_mut();
+            borrow
+                .as_any()
                 .downcast_mut::<panels::Availability>()
                 .and_then(|p| {
-                    let (q, r, err, draft) = availability::load(&p.store, p.request)?;
-                    let stale = r.as_ref().is_some_and(|r| now - r.checked > 300.0);
-                    let draft_error = availability::draft_error(&p.store, p.request, &q, draft);
-                    let result = if p.dirty || stale || draft_error.is_some() || !err.is_empty() {
-                        None
-                    } else {
-                        r
-                    };
-                    if let Some(r) = &result {
-                        if p.selected
-                            .is_none_or(|i| r.slots.get(i).is_none_or(|(a, _)| *a < now))
-                        {
-                            p.selected = r.slots.iter().position(|(a, _)| *a >= now);
+                    let (stored, cached, remote_error, draft) =
+                        availability::load(&p.store, p.request)?;
+                    let resolved = availability::preview(&p.store, p.request, &p.search, now);
+                    let (q, result, error) = match resolved {
+                        Ok((q, result, _)) => (q, Some(result), p.error.clone()),
+                        Err(error) => {
+                            let q = p.search.query(stored.guests.clone()).unwrap_or(stored);
+                            let error = if !p.error.is_empty() {
+                                p.error.clone()
+                            } else if cached.is_none() && remote_error.is_empty() && !p.dirty {
+                                String::new()
+                            } else {
+                                error
+                            };
+                            (q, None, error)
                         }
-                        if draft.is_none() {
+                    };
+                    let interactive = draft.is_some()
+                        && result
+                            .as_ref()
+                            .is_some_and(|r| r.people.iter().any(|p| p.known));
+                    if let Some(r) = &result {
+                        if interactive {
+                            p.selected = p
+                                .selected
+                                .and_then(|start| availability::snap(&q, start, now))
+                                .or_else(|| r.slots.first().map(|(a, _)| *a));
+                        } else {
                             p.selected = None;
                         }
-                    } else {
+                    } else if !p.dirty {
                         p.selected = None;
                     }
-                    let error = if !p.error.is_empty() {
-                        p.error.clone()
-                    } else if !err.is_empty() {
-                        err
-                    } else if let Some(error) = draft_error {
-                        error
-                    } else if stale {
-                        "Availability is out of date. Check again for fresh times.".into()
-                    } else {
-                        String::new()
-                    };
                     Some((
                         p.request,
                         p.search.clone(),
@@ -302,6 +601,7 @@ impl Widget for CalendarAvailabilityPanel {
                         q,
                         result,
                         p.selected,
+                        interactive,
                         p.store.clone(),
                     ))
                 })
@@ -312,12 +612,12 @@ impl Widget for CalendarAvailabilityPanel {
             self.request = id;
             self.expanded = false;
             self.directory = completion::people(&store);
+            self.hover = None;
         }
         let (a, b) = q.validate().unwrap_or((0.0, 1.0));
-        let proposed = result
+        let chosen = result
             .as_ref()
-            .and_then(|r| selected.and_then(|i| r.slots.get(i)))
-            .and_then(|(s, e)| fraction(*s, *e, a, b));
+            .and_then(|_| selected.and_then(|start| availability::selection(&q, start, now)));
         let sources = model::sources(&store);
         let own: Vec<_> = sources
             .iter()
@@ -349,6 +649,7 @@ impl Widget for CalendarAvailabilityPanel {
                         busy: vec![],
                         error: String::new(),
                         checks: vec![],
+                        details: availability::Details::default(),
                     })
                     .collect()
             });
@@ -373,15 +674,13 @@ impl Widget for CalendarAvailabilityPanel {
                     "own calendars checked"
                 }
                 .to_string(),
-                Track {
-                    unknown: mine.iter().any(|p| !p.known),
-                    busy: mine
-                        .iter()
-                        .flat_map(|p| p.busy.iter())
-                        .filter_map(|(s, e)| fraction(*s, *e, a, b))
-                        .collect(),
-                    proposed,
-                },
+                Track::new(
+                    id,
+                    &q,
+                    mine.iter().map(|p| (*p).clone()).collect(),
+                    chosen,
+                    interactive,
+                ),
             ));
         }
         for person in people
@@ -401,18 +700,36 @@ impl Widget for CalendarAvailabilityPanel {
                 } else {
                     person.error.clone()
                 },
-                Track {
-                    unknown: !person.known,
-                    busy: person
-                        .busy
-                        .iter()
-                        .filter_map(|(s, e)| fraction(*s, *e, a, b))
-                        .collect(),
-                    proposed,
-                },
+                Track::new(id, &q, vec![person.clone()], chosen, interactive),
             ));
         }
         let unknown = people.iter().filter(|p| !p.known).count();
+        let conflicts: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, _, track)| track.conflict)
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        let selection = chosen
+            .map(|(start, end)| {
+                format!(
+                    "{} – {} · {} min{}",
+                    dates::label(start, &q.zone),
+                    dates::local(end, &q.zone).get(11..).unwrap_or(""),
+                    q.minutes,
+                    if conflicts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nOverlaps busy time: {}", conflicts.join(", "))
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                if interactive {
+                    "Drag on a track to choose a time".into()
+                } else {
+                    String::new()
+                }
+            });
         let status = if !error.is_empty() {
             error
         } else if dirty {
@@ -463,6 +780,7 @@ impl Widget for CalendarAvailabilityPanel {
             String::new()
         };
         let mut drawn = Vec::new();
+        let mut tracks = Vec::new();
         let mut controls = None;
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let lr = item.as_portal_list();
@@ -496,6 +814,16 @@ impl Widget for CalendarAvailabilityPanel {
                     w.label(cx, ids!(count_lbl))
                         .set_text(cx, &format!("{} people", rows.len()));
                     w.label(cx, ids!(status_lbl)).set_text(cx, &status);
+                    w.label(cx, ids!(selection_lbl)).set_text(cx, &selection);
+                    w.label(cx, ids!(selection_lbl)).set_text_color(
+                        cx,
+                        if conflicts.is_empty() {
+                            vec4(0.078, 0.078, 0.078, 1.0)
+                        } else {
+                            vec4(0.68, 0.18, 0.08, 1.0)
+                        },
+                    );
+                    w.widget(cx, ids!(drag_hint)).set_visible(cx, interactive);
                     for (i, path) in [ids!(t0), ids!(t1), ids!(t2), ids!(t3), ids!(t4)]
                         .iter()
                         .enumerate()
@@ -524,6 +852,10 @@ impl Widget for CalendarAvailabilityPanel {
                         widget.track = track.clone();
                     }
                     w.draw_all(cx, scope);
+                    tracks.push((
+                        w.widget(cx, ids!(track)),
+                        format!("availability track {title}"),
+                    ));
                 } else if i == notice_i {
                     let w = list.item(cx, i, live_id!(notice));
                     w.set_visible(cx, !notice.is_empty());
@@ -538,8 +870,8 @@ impl Widget for CalendarAvailabilityPanel {
                     let (start, end) = slots[n];
                     let w = list.item(cx, i, live_id!(slot));
                     for (path, on) in [
-                        (ids!(normal), selected != Some(n)),
-                        (ids!(selected), selected == Some(n)),
+                        (ids!(normal), selected != Some(start)),
+                        (ids!(selected), selected == Some(start)),
                     ] {
                         let row = w.widget(cx, path);
                         row.set_visible(cx, on);
@@ -581,6 +913,22 @@ impl Widget for CalendarAvailabilityPanel {
         }
         self.picks.clear();
         let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+        self.tracks.clear();
+        for (track, label) in tracks {
+            if let Some(r) = props.hits.add_clipped(
+                label,
+                track.area().rect(cx),
+                clip,
+                if interactive {
+                    MouseCursor::Grab
+                } else {
+                    MouseCursor::Default
+                },
+                props.slot,
+            ) {
+                self.tracks.push((track, r));
+            }
+        }
         for (w, pick, label) in drawn {
             if let Some(r) = props.hits.add_clipped(
                 label,
@@ -633,6 +981,54 @@ impl Widget for CalendarAvailabilityPanel {
         let bounds = self.view.area().rect(cx);
         self.offers
             .draw(cx, scope, &props, &fields, &mut self.suggest, bounds);
+        if let Some((uid, at)) = self.hover {
+            let text = self
+                .tracks
+                .iter()
+                .find(|(track, r)| track.widget_uid() == uid && r.contains(at))
+                .and_then(|(widget, _)| {
+                    let track = widget.borrow::<CalendarTimeTrack>()?;
+                    let rect = track.area().rect(cx);
+                    let time = a + (at.x - rect.pos.x) / rect.size.x * (b - a);
+                    let texts: Vec<_> = track
+                        .track
+                        .people
+                        .iter()
+                        .filter_map(|p| hover_text(p, time, &q.zone))
+                        .collect();
+                    (!texts.is_empty()).then(|| texts.join("\n\n"))
+                });
+            if let Some(text) = text {
+                let width = 330.0f64.min(bounds.size.x);
+                let lines = text
+                    .lines()
+                    .map(|line| {
+                        (line.chars().count() as f64 * 6.5 / (width - 24.0).max(1.0))
+                            .ceil()
+                            .max(1.0)
+                    })
+                    .sum::<f64>()
+                    .min(12.0);
+                let height = (24.0 + 18.0 * lines).min(bounds.size.y);
+                let x = (at.x + 12.0).clamp(bounds.pos.x, bounds.pos.x + bounds.size.x - width);
+                let y = if at.y + 18.0 + height <= bounds.pos.y + bounds.size.y {
+                    at.y + 18.0
+                } else {
+                    (at.y - height - 12.0).max(bounds.pos.y)
+                };
+                self.tooltip.label(cx, ids!(body_lbl)).set_text(cx, &text);
+                self.tooltip.draw_walk_all(
+                    cx,
+                    scope,
+                    Walk {
+                        abs_pos: Some(dvec2(x, y)),
+                        width: Size::Fixed(width),
+                        height: Size::Fixed(height),
+                        ..Walk::fit()
+                    },
+                );
+            }
+        }
         DrawStep::done()
     }
 }

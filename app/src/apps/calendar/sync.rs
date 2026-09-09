@@ -2,7 +2,7 @@
 //! A full page set is committed atomically; a failed fetch keeps the old cache.
 use super::{
     api::{self, Request},
-    availability, dates, edit, model,
+    availability, availability_details, dates, edit, model,
 };
 use kernel::{
     app::{Wake, Worker},
@@ -63,6 +63,7 @@ fn check_availability(
                     busy: Vec::new(),
                     error: error.clone(),
                     checks: Vec::new(),
+                    details: availability::Details::default(),
                 })
                 .collect(),
         };
@@ -80,6 +81,11 @@ fn check_availability(
             });
             result.checks = checks;
             *person = result;
+        }
+    }
+    for person in &mut people {
+        if person.known && !person.busy.is_empty() {
+            person.details.state = availability::DetailState::Pending;
         }
     }
     availability::suggest(q, people, w.now())
@@ -152,6 +158,9 @@ fn pass(w: &World) -> Result<bool, String> {
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
+        return Ok(true);
+    }
+    if availability_details::pass(w)? {
         return Ok(true);
     }
     let state = w
