@@ -5,6 +5,7 @@
 //! grow their loaded window at the end. Cursors and [`Marks`] use stable keys,
 //! so database changes and filters do not silently move the selection.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::task::Poll;
@@ -1407,6 +1408,9 @@ struct Cursor<D: Datasource> {
     key: D::Key,
     index: usize,
     row: D::Row,
+    /// Keep the last resolved reading, including confirmed absence, while
+    /// the retained row refreshes. `row` still records the original rank.
+    retained_row: RefCell<Option<D::Row>>,
 }
 
 impl<D: Datasource> ListState<D> {
@@ -1508,10 +1512,10 @@ impl<D: Datasource> ListState<D> {
         if self.table.row(store, c.index).is_some_and(|row| self.table.key(&row) == c.key) {
             return None;
         }
-        let row = match self.table.source().poll_by_key(store, &c.key) {
-            Poll::Ready(row) => row?,
-            Poll::Pending => c.row.clone(),
-        };
+        if let Poll::Ready(row) = self.table.source().poll_by_key(store, &c.key) {
+            *c.retained_row.borrow_mut() = row;
+        }
+        let row = c.retained_row.borrow().clone()?;
         let at = self.table.source().index_of(store, self.table.ast(), &row)
             .unwrap_or(c.index).min(self.table.len(store));
         Some((at, row))
@@ -1582,6 +1586,7 @@ impl<D: Datasource> ListState<D> {
             key: self.table.key(&row),
             index,
             row: row.clone(),
+            retained_row: RefCell::new(Some(row.clone())),
         });
         self.cursor_revision = self.cursor_revision.wrapping_add(1);
         Some(row)
@@ -1617,7 +1622,10 @@ impl<D: Datasource> ListState<D> {
             self.cursor = None;
             return None;
         };
-        self.cursor = Some(Cursor { key: self.table.key(&row), index, row: row.clone() });
+        self.cursor = Some(Cursor {
+            key: self.table.key(&row), index, row: row.clone(),
+            retained_row: RefCell::new(Some(row.clone())),
+        });
         Some(row)
     }
 
@@ -1845,7 +1853,12 @@ where
         };
         let Some(rank) = ranks.first() else { return Poll::Ready(None); };
         let index = (*rank).max(0) as usize;
-        self.cursor = Some(Cursor { key: key.clone(), index, row });
+        self.cursor = Some(Cursor {
+            key: key.clone(),
+            index,
+            row: row.clone(),
+            retained_row: RefCell::new(Some(row)),
+        });
         self.cursor_revision = self.cursor_revision.wrapping_add(1);
         Poll::Ready(Some(index))
     }
@@ -2851,6 +2864,118 @@ mod tests {
         assert!(!ids(&l).contains(&held));
     }
 
+    /// Let the filtered pages refresh before the selected-row lookup, as
+    /// independently loaded UI snapshots can do.
+    #[derive(Default)]
+    struct RefreshingSource {
+        pending: std::cell::Cell<bool>,
+    }
+
+    impl Datasource for RefreshingSource {
+        type Row = Item;
+        type Key = i64;
+
+        fn tags(&self) -> &'static [TagDef] {
+            SOURCE.tags()
+        }
+        fn key(&self, row: &Item) -> i64 {
+            SOURCE.key(row)
+        }
+        fn key_text(&self, key: &i64) -> String {
+            SOURCE.key_text(key)
+        }
+        fn key_parse(&self, text: &str) -> Option<i64> {
+            SOURCE.key_parse(text)
+        }
+        fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
+            SOURCE.count(store, ast)
+        }
+        fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<Item>> {
+            SOURCE.page(store, ast, offset, limit)
+        }
+        fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[i64]) -> Poll<Vec<i64>> {
+            if self.pending.get() {
+                Poll::Pending
+            } else {
+                SOURCE.poll_present(store, ast, keys)
+            }
+        }
+        fn poll_by_key(&self, store: &Store, key: &i64) -> Poll<Option<Item>> {
+            if self.pending.get() {
+                Poll::Pending
+            } else {
+                SOURCE.poll_by_key(store, key)
+            }
+        }
+        fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &Item) -> Option<usize> {
+            SOURCE.index_of(store, ast, row)
+        }
+    }
+
+    #[test]
+    fn a_retained_row_keeps_its_last_displayed_contents_while_refreshing() {
+        let s = store_with(12);
+        let source = RefreshingSource::default();
+        let mut l = ListState::new(&source, 3);
+        l.set_filter("@ok");
+        let before: Vec<_> = l.rows(&s, 0, l.len(&s)).iter().map(|r| r.id).collect();
+        let selected = l.set_cursor(&s, 1).unwrap();
+        let held = selected.id;
+        s.write(move |c| {
+            c.execute("UPDATE item SET ok = 0, name = 'read' WHERE id = ?1", [held])
+        }).unwrap();
+
+        source.pending.set(true);
+        assert_eq!(l.row(&s, 1), Some(selected), "keep the selection until its first lookup arrives");
+        source.pending.set(false);
+        let mut read = l.row(&s, 1).unwrap();
+        assert!(!read.ok);
+        assert_eq!(read.name, "read");
+
+        for refresh in 1..=3 {
+            let name = format!("read {refresh}");
+            let updated = name.clone();
+            s.write(move |c| {
+                c.execute("UPDATE item SET name = ?1 WHERE id = ?2", rusqlite::params![updated, held])
+            }).unwrap();
+            source.pending.set(true);
+            assert_eq!(l.row(&s, 1), Some(read.clone()), "refresh must not restore the unread appearance");
+            assert_eq!(l.cursor_index(&s), Some(1));
+            assert_eq!(l.rows(&s, 0, l.len(&s)).iter().map(|r| r.id).collect::<Vec<_>>(), before);
+            source.pending.set(false);
+            read = l.row(&s, 1).unwrap();
+            assert_eq!(read.name, name, "completed refreshes still update the selected row");
+            assert!(!read.ok);
+        }
+
+        assert_eq!(l.move_cursor(&s, 1).unwrap().id, before[2]);
+        assert!(!l.rows(&s, 0, l.len(&s)).iter().any(|r| r.id == held));
+    }
+
+    #[test]
+    fn a_deleted_retained_row_stays_gone_while_refreshing() {
+        let s = store_with(2);
+        let source = RefreshingSource::default();
+        let mut l = ListState::new(&source, 3);
+        l.set_filter("@ok");
+        let held = l.set_cursor(&s, 0).unwrap().id;
+        s.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?1", [held])).unwrap();
+        assert_eq!(l.len(&s), 1);
+
+        s.write(move |c| c.execute("DELETE FROM item WHERE id = ?1", [held])).unwrap();
+        assert!(l.is_empty(&s));
+        source.pending.set(true);
+        assert!(l.is_empty(&s), "a later refresh must not resurrect a confirmed deletion");
+        assert_eq!(l.row(&s, 0), None);
+        assert_eq!(l.cursor_index(&s), None);
+
+        source.pending.set(false);
+        s.write(move |c| {
+            c.execute("INSERT INTO item(id, name, n, ok, at) VALUES(?1, 'restored', 0, 0, 0)", [held])
+        }).unwrap();
+        assert_eq!(l.row(&s, 0).unwrap().name, "restored", "undo can restore the selected row");
+    }
+
     #[test]
     fn restoring_a_filtered_cursor_by_key_releases_the_later_selection() {
         let store = store_with(25);
@@ -2869,6 +2994,38 @@ mod tests {
         assert!(list.marks().has(&second), "following the reader preserves marks");
         assert_eq!(list.select_key(&store, &i64::MAX), Poll::Ready(None));
         assert_eq!(list.cursor_key(), Some(&first), "a missing row does not move the cursor");
+    }
+
+    #[test]
+    fn restoring_a_filtered_cursor_keeps_its_row_while_lookup_is_pending() {
+        let store = store_with(25);
+        let mut list = ListState::new(&SOURCE, 3);
+        list.set_filter("@ok");
+        let before: Vec<_> = list.rows(&store, 0, list.len(&store)).iter().map(|row| row.id).collect();
+        let held = list.set_cursor(&store, 4).unwrap().id;
+        store.write(move |c| {
+            c.execute("UPDATE item SET ok = 0, name = 'read' WHERE id = ?", [held])
+        }).unwrap();
+        list.move_cursor(&store, 1).unwrap();
+
+        // The displayed pages have already dropped the row we are restoring.
+        let base = list.table().rows(&store, 0, list.table().len(&store));
+        assert!(!base.iter().any(|row| row.id == held));
+        let read = SOURCE.by_key(&store, &held).unwrap();
+        assert_eq!(list.select_key(&store, &held), Poll::Ready(Some(4)));
+
+        // Invalidate the restored row before its first draw. UI snapshots stay
+        // pending until poll_external publishes them, even if the worker finishes.
+        store.attach_ui(|| {});
+        store.write(move |c| {
+            c.execute("UPDATE item SET name = 'refreshed' WHERE id = ?", [held])
+        }).unwrap();
+        assert!(SOURCE.poll_by_key(&store, &held).is_pending());
+
+        assert_eq!(list.row(&store, 4), Some(read), "the first draw keeps the row resolved by select_key");
+        assert_eq!(list.cursor_index(&store), Some(4));
+        assert_eq!(list.len(&store), before.len());
+        assert_eq!(list.rows(&store, 0, list.len(&store)).iter().map(|row| row.id).collect::<Vec<_>>(), before);
     }
 
     #[test]
