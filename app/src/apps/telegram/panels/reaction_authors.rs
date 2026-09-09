@@ -4,7 +4,7 @@
 use kernel::store::Store;
 use serde_json::Value;
 
-use super::super::{model, panel_read::Read, requests, runtime};
+use super::super::{model, panel_read::Read, requests, runtime::{self, REACTION_REFRESH}};
 use model::{Msg, PeerId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +77,7 @@ impl ReactionAuthors {
         if !visible {
             if self.read.take().is_some() {
                 self.refreshing = None;
-                self.refreshed = now - 30.0;
+                self.refreshed = now - REACTION_REFRESH;
             }
             return;
         }
@@ -90,7 +90,7 @@ impl ReactionAuthors {
             self.read = None;
             self.refreshing = None;
             self.counts = Some(msg.reactions.clone());
-            self.refreshed = now - 30.0;
+            self.refreshed = now - REACTION_REFRESH;
         }
         if msg.reactions.is_none() {
             self.listing = Listing::default();
@@ -133,7 +133,7 @@ impl ReactionAuthors {
                 }
             }
         }
-        if self.read.is_none() && now - self.refreshed >= 30.0 {
+        if self.read.is_none() && now - self.refreshed >= REACTION_REFRESH {
             self.start_refresh(store, msg, now);
         }
     }
@@ -268,17 +268,23 @@ mod tests {
         assert_eq!(before.lines().count(), 150);
         assert_eq!(authors.action(), None);
 
-        authors.refresh(store, &msg, 31.0, true);
+        for second in 1..300 {
+            authors.refresh(store, &msg, f64::from(second), true);
+            assert!(inbox.try_recv().is_err(), "an unchanged card does not poll every thirty seconds");
+            assert_eq!(authors.text(store, &msg), before);
+        }
+
+        authors.refresh(store, &msg, 301.0, true);
         assert_eq!(authors.text(store, &msg), before, "refresh must keep the reading stable");
         reply(&rt, &inbox, "getMessage", json!({"interaction_info": {"reactions": null}}));
-        authors.refresh(store, &msg, 31.1, true);
+        authors.refresh(store, &msg, 301.1, true);
         assert_eq!(authors.text(store, &msg), before, "missing metadata must not replace loaded pages");
         reply(&rt, &inbox, "getMessageAddedReactions", page(1001, 1101, "fresh-page2"));
-        authors.refresh(store, &msg, 31.2, true);
+        authors.refresh(store, &msg, 301.2, true);
         assert_eq!(authors.text(store, &msg), before, "a partial refresh must not replace the list");
         let request = reply(&rt, &inbox, "getMessageAddedReactions", page(1101, 1151, ""));
         assert_eq!(request["offset"], "fresh-page2");
-        authors.refresh(store, &msg, 31.3, true);
+        authors.refresh(store, &msg, 301.3, true);
         let after = authors.text(store, &msg);
         assert_eq!(after.lines().count(), 150);
         assert!(!after.contains("1000"));
@@ -286,12 +292,12 @@ mod tests {
         assert_eq!(authors.action(), None, "a completed list stays completed");
 
         msg.reactions = Some("👍 1".into());
-        authors.refresh(store, &msg, 32.0, true);
+        authors.refresh(store, &msg, 302.0, true);
         assert_eq!(authors.text(store, &msg), "loading reaction authors…", "changed counts invalidate old authors");
         reply(&rt, &inbox, "getMessage", metadata());
-        authors.refresh(store, &msg, 32.1, true);
+        authors.refresh(store, &msg, 302.1, true);
         reply(&rt, &inbox, "getMessageAddedReactions", page(1150, 1151, ""));
-        authors.refresh(store, &msg, 32.2, true);
+        authors.refresh(store, &msg, 302.2, true);
         assert_eq!(authors.text(store, &msg), "👍  1150", "a shorter complete list may replace the loaded pages");
         assert!(inbox.try_recv().is_err());
     }
@@ -316,29 +322,29 @@ mod tests {
         let before = authors.text(store, &msg);
         assert_eq!(before.lines().count(), 200);
 
-        authors.refresh(store, &msg, 31.0, true);
+        authors.refresh(store, &msg, 301.0, true);
         reply(&rt, &inbox, "getMessage", metadata());
-        authors.refresh(store, &msg, 31.1, true);
+        authors.refresh(store, &msg, 301.1, true);
         reply(&rt, &inbox, "getMessageAddedReactions", page(1001, 1101, "fresh-page2"));
-        authors.refresh(store, &msg, 31.2, true);
+        authors.refresh(store, &msg, 301.2, true);
         let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
         let id = panel_read::id(request["@extra"]["context"].as_str().unwrap()).unwrap();
         rt.reads.lock().unwrap().finish(id, Err("temporary failure".into()));
-        authors.refresh(store, &msg, 31.3, true);
+        authors.refresh(store, &msg, 301.3, true);
         assert!(authors.text(store, &msg).starts_with(&before));
         assert_eq!(authors.action(), Some("retry reaction authors"));
 
-        authors.more(store, &msg, 31.4);
+        authors.more(store, &msg, 301.4);
         assert_eq!(authors.text(store, &msg), before);
         let retry = reply(&rt, &inbox, "getMessageAddedReactions", page(1101, 1201, "fresh-page3"));
         assert_eq!(retry["offset"], "fresh-page2");
-        authors.refresh(store, &msg, 31.5, true);
+        authors.refresh(store, &msg, 301.5, true);
         assert_eq!(authors.text(store, &msg).lines().count(), 200);
         assert_eq!(authors.action(), Some("more reaction authors"));
-        authors.more(store, &msg, 31.6);
+        authors.more(store, &msg, 301.6);
         let more = reply(&rt, &inbox, "getMessageAddedReactions", page(1201, 1251, ""));
         assert_eq!(more["offset"], "fresh-page3", "more must continue the refreshed pagination");
-        authors.refresh(store, &msg, 31.7, true);
+        authors.refresh(store, &msg, 301.7, true);
         assert_eq!(authors.text(store, &msg).lines().count(), 250);
         assert_eq!(authors.action(), None);
     }

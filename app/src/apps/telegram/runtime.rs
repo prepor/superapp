@@ -46,6 +46,10 @@ pub type ReactionReply = Arc<Mutex<Option<ReactionResult>>>;
 /// viewport survives a brief arrow-key preview.
 pub const VIEW_SETTLE: f64 = 0.35;
 
+/// Fallback cadence for reaction counts and author lists. Live changes do
+/// not wait for this sweep.
+pub const REACTION_REFRESH: f64 = 5.0 * 60.0;
+
 /// A widget owns its viewport; dropping it cancels work that has not started.
 pub struct Viewport {
     chat: PeerId,

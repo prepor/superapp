@@ -302,8 +302,9 @@ shows recent senders where the complete list is unavailable, and identifies
 reactions whose authors Telegram keeps hidden.
 Missing reaction metadata in a cached message still triggers an author lookup;
 only an explicit denial suppresses it, and failed lookups offer retry.
-Periodic refreshes keep the loaded pages visible until their replacements
-are complete, preserving how far the reader has expanded the author list.
+Author lists refresh immediately when the displayed counts change and every
+five minutes while visible. Refreshes keep loaded pages visible until their
+replacements are complete, preserving how far the reader expanded the list.
 
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
@@ -327,10 +328,11 @@ interaction update means the counts need checking, so the last known counts
 stay visible until a server read confirms a change. Checks retry failures,
 respect rate limits and reject replies that predate newer counts or metadata.
 A fallback sweep every five minutes checks visible messages for missed push
-updates. Initial loads, changed metadata, successful adds and the Line panel's
-reaction author reads request checks without waiting for that sweep, keeping
-the authors and message counts current together. Reconciliation is paced per
-account and honors Telegram's retry delays.
+updates. Initial loads, changed metadata and successful adds request checks
+without waiting for that sweep. A first author page whose total disagrees with
+the displayed counts also requests a check; cached message reads, later pages
+and repeated reports of the same discrepancy do not restart it. Reconciliation
+is paced per account and honors Telegram's retry delays.
 Confirmed empty counts survive restarts and stale message loads.
 A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
 and a text fallback for custom emoji. A refused request

@@ -208,17 +208,6 @@ impl<T: Td> Account<T> {
             return;
         };
         let result = match request["@type"].as_str() {
-            Some("getMessage" | "getMessageAddedReactions") if request["@extra"]["context"]
-                .as_str().and_then(super::panel_read::id).is_some() =>
-            {
-                // The Line panel can receive newer reaction authors than
-                // the durable counts. Reconcile both views after this read;
-                // cached metadata or a partial page cannot supply totals.
-                if let Some(message) = request["message_id"].as_i64() {
-                    self.recheck_counts(w, chat, message);
-                }
-                return;
-            }
             Some("addMessageReaction" | "removeMessageReaction") => {
                 if request["@extra"]["context"].as_str().is_some_and(|c| c.starts_with("reaction:")) {
                     return; // the initial picker acknowledgement refreshes below
@@ -546,6 +535,7 @@ impl<T: Td> Account<T> {
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
+            self.counts_after_author_page(w, &request, &v);
         }
         if let Some(request) = super::history::snapshot(w, &v) {
             if let Some(request) = request { self.send(w, &request); }
