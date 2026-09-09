@@ -1,12 +1,13 @@
 //! The `attachment` panel: one part of a letter, on the shared file card.
 //!
 //! The same card the files app draws a path with, filled from a row instead
-//! of a `stat`. That is the whole of the sharing: what a file *is* — its kind
+//! of a `stat`. The shared viewer renders and measures its content; the kind
 //! word, its size, whether a preview is worth attempting — is the kernel's
 //! (`caps::preview`), so a part and a file on a disk cannot drift apart.
 //!
-//! Its one verb is `open`. A part has no path, so it is written to the app's
-//! scratch directory first and *that* is handed to the OS — one extra step,
+//! Its source verb is `open`; viewing controls come from the shared viewer.
+//! A part has no path, so it is written to the app's scratch directory first
+//! and *that* is handed to the OS — one extra step,
 //! and then it is a file like any other, browsable with the panel that
 //! browses files. There is no copy, no move and no delete: a part is not on a
 //! disk, and the letter is not this panel's to edit.
@@ -20,21 +21,11 @@ use kernel::layout::SlotId;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
+use crate::shell::widgets::viewer::{Controller, Measure};
 use kernel::time::fmt_date;
 
 use super::super::model::{self, MailId};
 use super::super::parts::{self, scratch, Attachment};
-
-/// What the card spends on everything that is not the preview: the name, the
-/// kind line, the date, the media type, the rule and the padding around them,
-/// in lines.
-const CHROME_LINES: usize = 7;
-
-/// How many lines of text one grid row holds, near enough for a wish.
-const ROW_LINES: usize = 6;
-
-/// The rows a card asks for at its shortest, and the most it will ask for.
-const ROWS: (u32, u32) = (3, 6);
 
 /// One part of a letter, shown.
 pub struct Card {
@@ -50,6 +41,7 @@ pub struct Card {
     with: String,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
+    viewer: Controller,
     pending: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
 }
 
@@ -130,6 +122,8 @@ impl Card {
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
+
+    pub fn viewer(&self) -> Controller { self.viewer.clone() }
 
     /// Reads the row again — the description is a row, so it is there at
     /// once; the bytes are the widget's to ask for off the frame.
@@ -241,7 +235,7 @@ impl Panel for Card {
         format!(
             "One part of a letter, on the same card the files app draws a path \
              with: the name, the media type, the size, the letter it came \
-             with, and a preview when it is text or a picture. Its arguments \
+             with, and a viewer for text, images, and PDF pages. Its arguments \
              are the letter's `message.id`, {}, and the part's place in it, \
              {} — a part's own row in `attachment` is derived from the \
              content snapshot and local to a device, so the identity is the \
@@ -254,30 +248,29 @@ impl Panel for Card {
         )
     }
 
-    /// Three rows as the floor, more when the preview needs them. The bytes
-    /// are not here to measure — they come off a thread — so a text part is
-    /// wished at its size and a picture at the box a card gives one.
-    fn wish(&self, _cols: usize) -> (u32, u32) {
-        let lines = match self.kind() {
-            FileKind::Text => (self.size() as usize / 60).min(120),
-            FileKind::Image => 12,
-            _ => 0,
-        };
-        let rows = (CHROME_LINES + lines).div_ceil(ROW_LINES) as u32;
-        (4, rows.clamp(ROWS.0, ROWS.1))
+    /// The shared viewer reports the loaded content's measurement once,
+    /// with a stable reading height throughout a continuous PDF.
+    fn wish(&self, cols: usize) -> (u32, u32) {
+        let measure = self.viewer.measure();
+        if measure == Measure::Empty && self.kind() == FileKind::Pdf {
+            Measure::Pdf(595, 842).wish(cols, 7)
+        } else { measure.wish(cols, 7) }
     }
 
     fn placed(&mut self, slot: SlotId) {
         self.slot = slot;
     }
 
-    /// One verb. A part is not on a disk: there is nothing to copy, nothing
-    /// to move, and the letter is not this panel's to edit.
+    /// Viewer controls and open. A part is not on a disk: nothing to copy,
+    /// nothing to move, and the letter is not this panel's to edit.
     fn verbs(&self) -> Vec<Verb> {
-        vec![Verb::run("mail.open", "open", Some('o'))]
+        let mut verbs = vec![Verb::run("mail.open", "open", Some('o'))];
+        verbs.extend(self.viewer.verbs());
+        verbs
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.viewer.run(verb) { s.redraw(); return; }
         if verb == "mail.open" {
             self.open(s);
         }
@@ -307,6 +300,7 @@ impl PanelKind for CardKind {
             row: None,
             with: String::new(),
             status: None,
+            viewer: Controller::default(),
             pending: None,
         };
         card.reread();

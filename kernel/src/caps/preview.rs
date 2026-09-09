@@ -19,6 +19,9 @@ pub const TEXT_PREVIEW_MAX: usize = 64 * 1024;
 /// alone: a picture nobody can see is not worth the pause it costs to read.
 pub const IMAGE_PREVIEW_MAX: usize = 20 * 1024 * 1024;
 
+/// PDFs need the complete file (including its cross-reference table).
+pub const PDF_PREVIEW_MAX: usize = 64 * 1024 * 1024;
+
 /// How big a file another app may carry out as a part. Past this the attach
 /// refuses on the panel's status line rather than building something no
 /// server will take.
@@ -157,7 +160,23 @@ pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
 pub enum Preview {
     Text(String),
     Image(Vec<u8>),
+    Pdf(Vec<u8>),
+    Error(String),
     None,
+}
+
+/// Decide whether to load a file and how many bytes to request. Async
+/// adapters use this before handing shared bytes to the viewer worker.
+pub fn preview_limit(kind: FileKind, name: &str, size: u64) -> Result<Option<usize>, String> {
+    match kind {
+        FileKind::Pdf if size > PDF_PREVIEW_MAX as u64 =>
+            Err("PDF is too large to preview (64 MB maximum)".into()),
+        FileKind::Pdf => Ok(Some(PDF_PREVIEW_MAX + 1)),
+        FileKind::Text => Ok(Some(TEXT_PREVIEW_MAX)),
+        FileKind::Image if image_format(name).is_some() && size <= IMAGE_PREVIEW_MAX as u64 =>
+            Ok(Some(IMAGE_PREVIEW_MAX)),
+        _ => Ok(None),
+    }
 }
 
 /// The preview a card of this kind wants, read through `read` — which is
@@ -174,18 +193,42 @@ pub fn preview_of(
     size: u64,
     read: impl FnOnce(usize) -> Option<Vec<u8>>,
 ) -> Preview {
+    let max = match preview_limit(kind, name, size) {
+        Ok(Some(max)) => max,
+        Ok(None) => return Preview::None,
+        Err(error) => return Preview::Error(error),
+    };
+    let Some(bytes) = read(max) else {
+        return if kind == FileKind::Pdf {
+            Preview::Error("Could not read this PDF; reopen the file to try again".into())
+        } else { Preview::None };
+    };
     match kind {
-        FileKind::Text => match read(TEXT_PREVIEW_MAX) {
-            Some(b) => Preview::Text(String::from_utf8_lossy(&b).into_owned()),
-            None => Preview::None,
-        },
-        // The name says whether to read it; the bytes say how to decode it.
-        FileKind::Image if image_format(name).is_some() && size <= IMAGE_PREVIEW_MAX as u64 => {
-            match read(IMAGE_PREVIEW_MAX) {
-                Some(b) => Preview::Image(b),
-                None => Preview::None,
-            }
-        }
+        FileKind::Pdf if bytes.len() > PDF_PREVIEW_MAX =>
+            Preview::Error("PDF is too large to preview (64 MB maximum)".into()),
+        FileKind::Pdf => Preview::Pdf(bytes),
+        FileKind::Text => Preview::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        FileKind::Image => Preview::Image(bytes),
         _ => Preview::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdfs_are_complete_or_report_the_limit_including_unknown_sizes() {
+        let bytes = super::super::demo::PDF;
+        assert_eq!(preview_of(FileKind::Pdf, "file.pdf", 0, |max| {
+            assert_eq!(max, PDF_PREVIEW_MAX + 1);
+            Some(bytes.to_vec())
+        }), Preview::Pdf(bytes.to_vec()));
+        assert!(matches!(preview_of(FileKind::Pdf, "large.pdf", PDF_PREVIEW_MAX as u64 + 1,
+            |_| panic!("an oversized PDF must not be read")), Preview::Error(_)));
+        assert!(matches!(preview_of(FileKind::Pdf, "unknown.pdf", 0,
+            |_| Some(vec![0; PDF_PREVIEW_MAX + 1])), Preview::Error(_)));
+        assert!(matches!(preview_of(FileKind::Pdf, "missing.pdf", 0, |_| None), Preview::Error(_)));
+        assert_eq!(FileKind::of_metadata("download", "application/pdf; name=report"), FileKind::Pdf);
     }
 }

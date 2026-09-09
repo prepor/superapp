@@ -12,6 +12,9 @@
 //!              ↕ vertical   → the workspaces overlay, down open, up closed
 //! ```
 //!
+//! A hosted surface may claim raw touches before this state machine runs:
+//! pinch and pan over a file viewer belong to its content for the whole gesture.
+//!
 //! What a finger lands on comes from the same hit table a click resolves
 //! through, so a gesture and a click can never disagree about what is there.
 //! A row is the one thing the shell has to recognise

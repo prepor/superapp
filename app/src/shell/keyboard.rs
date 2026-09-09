@@ -82,6 +82,7 @@ fn selection(widget: &WidgetRef) -> Option<bool> {
         .or_else(|| widget.borrow::<TextFlow>().map(|text| text.has_selection()))
         .or_else(|| widget.borrow::<Html>().map(|text| text.has_selection()))
         .or_else(|| widget.borrow::<Markdown>().map(|text| text.has_selection()))
+        .or_else(|| widget.borrow::<super::widgets::viewer::canvas::ViewerImage>().and_then(|text| text.text_selection()))
 }
 
 /// Walk only visible text. A hidden row variant cannot own the keyboard.

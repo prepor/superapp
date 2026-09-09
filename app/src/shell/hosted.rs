@@ -57,14 +57,16 @@ pub enum Ask {
     Run { at: DVec2, left: bool },
 }
 
-/// The question, and the shared cell the widget answers into.
+/// Gesture questions and shared cells the widget answers into.
 ///
 /// Makepad delivers actions on the next event; the shared cell lets a
-/// gesture read its answer during the event being arbitrated.
+/// gesture read its answer during the event being arbitrated. Content surfaces
+/// also use this to claim raw touch updates before the shell interprets them.
 #[derive(Clone, Default)]
 pub struct Grab {
     ask: Option<Ask>,
     verbs: Rc<Cell<[Option<&'static str>; 2]>>,
+    touch: Rc<Cell<bool>>,
 }
 
 impl Grab {
@@ -74,6 +76,7 @@ impl Grab {
         Grab {
             ask: Some(ask),
             verbs: Rc::new(Cell::new([None, None])),
+            touch: Rc::default(),
         }
     }
 
@@ -95,6 +98,11 @@ impl Grab {
     pub fn answered(&self) -> [Option<&'static str>; 2] {
         self.verbs.get()
     }
+
+    /// A content surface owns this touch update, including its eventual lift.
+    /// The shell must not turn the same fingers into workspace navigation.
+    pub fn claim_touch(&self) { self.touch.set(true); }
+    pub(crate) fn touch_claimed(&self) -> bool { self.touch.get() }
 }
 
 /// The word a curtain says for a verb: the last segment of its id, since a
@@ -215,9 +223,9 @@ impl Stage {
     ///
     /// The widgets are collected first: one of them may navigate, and the
     /// map it was read from would then be mutated under the walk.
-    pub(super) fn forward_to_hosted(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
+    pub(super) fn forward_to_hosted(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) -> bool {
         if self.hosted.is_empty() {
-            return;
+            return false;
         }
         // A press in a hosted control takes its panel with it while the
         // widget keeps the caret. Do this before forwarding: a row or link
@@ -237,9 +245,9 @@ impl Stage {
             .filter(|(slot, _)| !is_overlay(**slot))
             .map(|(slot, w)| (*slot, w.clone()))
             .collect();
-        for (slot, w) in live {
-            self.forward_one(cx, sh, slot, &w, event);
-        }
+        let mut claimed = false;
+        for (slot, w) in live { claimed |= self.forward_one(cx, sh, slot, &w, event); }
+        claimed
     }
 
     /// Keys and text go to the focused panel's widget alone: the pointer is
@@ -267,7 +275,7 @@ impl Stage {
         let Some(w) = self.hosted.get(&slot).cloned() else {
             return;
         };
-        self.forward_one(cx, sh, slot, &w, event)
+        self.forward_one(cx, sh, slot, &w, event);
     }
 
     /// One widget, one event; ownership has already been resolved by the shell.
@@ -278,9 +286,9 @@ impl Stage {
         slot: SlotId,
         w: &WidgetRef,
         event: &Event,
-    ) {
+    ) -> bool {
         let Some(panel) = sh.session.panel(slot) else {
-            return;
+            return false;
         };
         let props = PanelProps {
             slot,
@@ -291,6 +299,7 @@ impl Stage {
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
         w.handle_event(cx, event, &mut scope);
+        props.grab.touch_claimed()
     }
 
     /// Puts one of the touch machine's questions to a slot's widget and

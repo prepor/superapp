@@ -1106,6 +1106,13 @@ impl ChatPanel {
             }
         }
         let Some(md) = m.media.as_ref() else { return };
+        if md.kind == "file" {
+            let label = line.widget(cx, ids!(body.media_lbl));
+            if let Some(r) = rect_of(cx, &label).and_then(|r| visible(r, clip)) {
+                props.hits.add(md.label.as_deref().unwrap_or("file"), r, MouseCursor::Hand, props.slot);
+                self.inner.push(InnerHit { rect: r, act: Inner::View(m.key()) });
+            }
+        }
         if let Some(st) = player {
             let player_w = line.widget(cx, ids!(body.player));
             if let Some(r) = media::play_rect(cx, &player_w).and_then(|r| visible(r, clip)) {

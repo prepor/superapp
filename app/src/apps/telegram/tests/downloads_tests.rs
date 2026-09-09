@@ -2,6 +2,43 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn file_viewer_downloads_on_demand_and_uses_the_cached_file_offline() {
+    use crate::shell::widgets::viewer::Preview;
+    use kernel::caps::Blobs;
+    use super::super::downloads;
+    let mut s = session();
+    let td = FakeTd::new();
+    let acc = sync::Account::new(td.clone(), 17844, std::env::temp_dir().join("tg-viewer"), None);
+    acc.drain(s.world());
+    acc.on_update(s.world(), &json!({"@type": "updateNewMessage", "message": {
+        "@type": "message", "chat_id": ANNA, "id": 4242, "date": s.now(),
+        "content": {"@type": "messageDocument", "document": {"file_name": "report.PDF",
+            "document": {"id": 77, "remote": {"id": "remote", "unique_id": "doc"}}}}
+    }}).to_string());
+    assert!(td.sent().is_empty(), "receiving a document must not fetch it");
+    let rt = runtime::of(s.store());
+    let slot = open_root(&mut s, Viewer::id(ANNA, 4242));
+    let inbox = rt.connect();
+    let instance = s.panel(slot).unwrap();
+    let mut panel = instance.borrow_mut();
+    let viewer = panel.as_any().downcast_mut::<Viewer>().unwrap();
+    let m = viewer.msg().unwrap();
+    assert!(matches!(viewer.file_preview(&m).1, Preview::Loading(_)));
+    let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+    assert_eq!(request["@type"], "getMessage");
+    assert_eq!(request["@extra"]["context"], format!("cache:{ANNA}:4242"));
+    viewer.file_preview(&m);
+    assert!(inbox.try_recv().is_err(), "redraws share a single download");
+    let reference = downloads::reference(&m).unwrap();
+    let path = s.world().with_cap::<dyn Blobs, _>(|b| b.put(reference, kernel::caps::demo::PDF)).unwrap().unwrap();
+    rt.disconnect();
+    let (_, preview) = viewer.file_preview(&m);
+    assert!(matches!(preview, Preview::Path { path: cached, name, kind: kernel::caps::FileKind::Pdf, .. }
+        if cached == path && name == "report.PDF"));
+    assert!(inbox.try_recv().is_err(), "opening a cached document needs no connection");
+}
+
+#[test]
 fn file_download_is_available_in_the_chat_card_and_viewer_and_survives_closing_them() {
     let mut s = session();
     let td = FakeTd::new();

@@ -1,0 +1,56 @@
+# args: --demo-disk
+# env:
+# An attachment renders through the same viewer as disk files.
+wait 900
+key /
+type "invoice"
+wait 600
+key esc
+click "invoice 2026-08"
+wait 700
+click "invoice-2026-08.pdf"
+wait 700
+shot pdf-initial
+click "application/pdf"
+click "page 1 of 2"
+click "pdf page"
+visible "https://example.com/"
+key cmd+a
+wait 200
+copy "A shared PDF viewer\nFiles, mail attachments, and Telegram.\nPage 1 - portrait\nGo to page 2\nhttps://example.com\n\nThe next page\nPage 2 - rotated landscape\nBack to page 1"
+shot pdf-selection
+click "zoom in"
+wait 300
+click "zoom in"
+wait 300
+copy "A shared PDF viewer\nFiles, mail attachments, and Telegram.\nPage 1 - portrait\nGo to page 2\nhttps://example.com\n\nThe next page\nPage 2 - rotated landscape\nBack to page 1"
+shot pdf-zoom
+click "fit page"
+wait 300
+visible "page 1 of 2 · fit page"
+shot pdf-fit
+click "go to page 2"
+wait 700
+click "page 2 of 2"
+click "pdf page"
+shot pdf-attachment
+click "go to page 1"
+wait 700
+click "page 1 of 2"
+click "fit width"
+wait 300
+visible "page 1 of 2 · fit width"
+swipe "pdf page" 0 -700
+wait 300
+click "page 2 of 2"
+click "zoom out"
+wait 300
+click "zoom out"
+wait 300
+visible "PDF page 1"
+visible "PDF page 2"
+shot pdf-continuous
+key cmd+f
+wait 300
+visible "page 1 of 2 · fit page"
+quit

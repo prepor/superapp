@@ -11,7 +11,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use kernel::app::{App, Root, Worker};
+use kernel::app::{App, Capabilities, Env, Mode, Root, Worker};
 use kernel::effect::World;
 use kernel::panel::PanelKind;
 use kernel::session::Session;
@@ -34,6 +34,10 @@ mod tests;
 use model::{basename, plural, watched_at, HOME};
 pub use panels::{Card, Dir};
 pub use ui::UI;
+
+/// The same disk factory as the window, for background file reads.
+#[derive(Clone)]
+pub struct ViewerDisk(pub kernel::caps::DiskFactory);
 
 /// The app.
 pub struct Files {
@@ -77,6 +81,14 @@ static CARD_KIND: panels::card::CardKind = panels::card::CardKind;
 static KINDS: &[&dyn PanelKind] = &[&DIR_KIND, &CARD_KIND];
 
 impl App for Files {
+    fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
+        if mode != Mode::Deny && !env.clock.is_virtual() {
+            if let Some(disk) = &env.disk {
+                caps.insert(Box::new(ViewerDisk(disk.clone())));
+            }
+        }
+    }
+
     fn id(&self) -> &'static str {
         "files"
     }

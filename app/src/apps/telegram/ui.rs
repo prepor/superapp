@@ -770,7 +770,7 @@ script_mod! {
 
     // ---- the viewer -------------------------------------------------------------------
 
-    /** One line's media as large as the grid allows: the picture fitted to
+    /** One line's media sized from its content: the picture fitted to
         the panel, or the clip playing where the file is here, or the word
         where there is neither, the player over a recording, and the caption
         under it. The walk through the chat's media and the system's opener
@@ -782,6 +782,9 @@ script_mod! {
         feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 8
+
+        file_name := mod.widgets.SBoldLabel { visible: false, width: Fill, text: "" }
+        file_view := mod.widgets.FileViewer { visible: false }
 
         // The middle of the panel: the picture fitted to it, or — for what
         // has no face — the sticker's emoji drawn large, or the word over
@@ -815,7 +818,7 @@ script_mod! {
             // so the poster keeps the whole box.
             clip_box := mod.widgets.MediaVideo {}
             player_box := View {
-                width: 480, height: Fit
+                width: Fill, height: Fit
                 player := mod.widgets.MediaPlayer {}
             }
             // Downloaded / total bytes for the clip or picture on its way.

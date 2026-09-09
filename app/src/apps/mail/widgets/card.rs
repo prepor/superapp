@@ -8,9 +8,9 @@
 //! they land the card is its description with the preview still coming, which
 //! is not the same as saying there is none.
 //!
-//! The bar is the instance's, and it is one verb: `open`.
+//! The instance exposes the shared viewing verbs beside its own `open`.
 
-use kernel::caps::{fmt_size, preview_of, FileKind, Preview as Read};
+use kernel::caps::{fmt_size, preview_limit, FileKind};
 use kernel::panel::PanelId;
 use makepad_widgets::*;
 
@@ -30,11 +30,6 @@ const STATUS: &[LiveId] = ids!(status_lbl);
 /// text, which is what tells a part's card from a disk file's (whose line is
 /// a path).
 const DETAIL: &[LiveId] = ids!(detail_txt);
-const PREVIEW: &[LiveId] = ids!(text_box.text_prev);
-/// The picture, when there is one: addressed by one word, since a card draws
-/// at most one and its bytes are nothing a script can name.
-const PICTURE: &[LiveId] = ids!(img_box.img_prev);
-
 /// Which part is on the card, and whether its bytes had landed when it was
 /// filled. A picture is decoded once per filling, so a second draw of the
 /// same one writes nothing — unless it was still waiting, which is the one
@@ -73,6 +68,9 @@ impl Widget for AttachmentPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(control) = props.panel.borrow_mut().as_any().downcast_mut::<Card>().map(|card| card.viewer()) {
+            card::bind(cx, &self.view, control);
+        }
         let opening = {
             let mut panel = props.panel.borrow_mut();
             if let Some(card) = panel.as_any().downcast_mut::<Card>() {
@@ -84,57 +82,54 @@ impl Widget for AttachmentPanel {
         let Some(r) = read(&props) else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        // Only a preview worth having is worth downloading a file for:
-        // the kind decides whether to ask at all, so a card over a 4 MB PDF
-        // costs nothing but its row.
-        let mut waiting = false;
         let mut data = r.data;
         let (mail, at) = r.part;
         let source = scope.data.get_mut::<kernel::session::Session>()
             .map(|s| super::super::parts::image_scope(s.store(), mail))
             .unwrap_or_default();
-        data.preview = match preview_of(r.kind, &r.name, r.size, |max| {
-            let s = scope.data.get_mut::<kernel::session::Session>()?;
-            match pictures::want_part(cx, s.world(), mail, at) {
-                PartBytes::Here(b) => Some(b.iter().take(max).copied().collect()),
-                PartBytes::Coming => {
-                    waiting = true;
-                    None
-                }
-                PartBytes::Gone => None,
-            }
-        }) {
-            Read::Text(t) => Preview::Text(t),
-            Read::Image(b) => Preview::Image(b),
-            Read::None if waiting => Preview::Loading,
-            Read::None => Preview::None,
-        };
-        let (id, status) = (r.id, r.status);
-        let shown = Shown { id, source, waiting };
+        let mut shown = Shown { id: r.id, source, waiting: false };
         if self.shown.as_ref() != Some(&shown) {
-            card::fill(cx, &self.view, &data);
-            self.shown = Some(shown);
+            let mut waiting = false;
+            data.preview = match preview_limit(r.kind, &r.name, r.size) {
+                Err(error) => Preview::Error(error),
+                Ok(None) => Preview::None,
+                Ok(Some(_)) => {
+                    let bytes = scope.data.get_mut::<kernel::session::Session>()
+                        .map(|s| pictures::want_part(cx, s.world(), mail, at));
+                    match bytes {
+                        Some(PartBytes::Here(bytes)) => Preview::Bytes {
+                            bytes, name: r.name, kind: r.kind, size: r.size,
+                        },
+                        Some(PartBytes::Coming) => { waiting = true; Preview::Loading("loading attachment…".into()) }
+                        _ => Preview::Error("Could not load this attachment; reopen it to try again".into()),
+                    }
+                }
+            };
+            shown.waiting = waiting;
+            if self.shown.as_ref() != Some(&shown) {
+                card::fill(cx, &self.view, &data);
+                if r.kind == FileKind::Pdf && !waiting {
+                    pictures::release_part(cx, &shown.source, at);
+                }
+                self.shown = Some(shown);
+            }
         }
+        let status = r.status;
         let lbl = self.view.label(cx, STATUS);
         lbl.set_text(cx, status.as_deref().unwrap_or(""));
         lbl.set_visible(cx, status.is_some());
 
         let step = self.view.draw_walk(cx, scope, walk);
+
         if opening {
             self.view.redraw(cx);
         }
 
         // The media-type line carries its own text as its label, the way a
         // disk card's path does, so a script can say which card this is.
-        for (label, path, cursor) in [
-            (data.detail.as_str(), DETAIL, MouseCursor::Text),
-            ("preview", PREVIEW, MouseCursor::Text),
-            ("picture", PICTURE, MouseCursor::Default),
-        ] {
-            let r = self.view.widget(cx, path).area().rect(cx);
-            if r.size.x > 0.0 && r.size.y > 0.0 && !label.is_empty() {
-                props.hits.add(label, r, cursor, props.slot);
-            }
+        let r = self.view.widget(cx, DETAIL).area().rect(cx);
+        if r.size.x > 0.0 && r.size.y > 0.0 && !data.detail.is_empty() {
+            props.hits.add(data.detail.as_str(), r, MouseCursor::Text, props.slot);
         }
         step
     }

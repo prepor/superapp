@@ -31,8 +31,8 @@ mod preview;
 
 pub use blobs::{file_name, BlobCache, BlobStats, Blobs, BLOB_BUDGET_DEFAULT};
 pub use preview::{
-    fmt_size, image_format, image_size, mime_of, preview_of, ImageFormat, Preview, ATTACH_MAX,
-    IMAGE_PREVIEW_MAX, TEXT_PREVIEW_MAX,
+    fmt_size, image_format, image_size, mime_of, preview_limit, preview_of, ImageFormat, Preview, ATTACH_MAX,
+    IMAGE_PREVIEW_MAX, PDF_PREVIEW_MAX, TEXT_PREVIEW_MAX,
 };
 
 // -- waking a pass -------------------------------------------------------------
@@ -408,6 +408,15 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    /// A MIME type identifies attachments whose names have no extension.
+    #[must_use]
+    pub fn of_metadata(name: &str, mime: &str) -> FileKind {
+        let mime = mime.split(';').next().unwrap_or("").trim();
+        if mime.eq_ignore_ascii_case("application/pdf") { return Self::Pdf; }
+        if mime.to_ascii_lowercase().starts_with("text/") { return Self::Text; }
+        Self::of_name(name)
+    }
+
     #[must_use]
     pub fn of_name(name: &str) -> FileKind {
         let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());

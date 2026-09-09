@@ -261,31 +261,6 @@ script_mod! {
         // Selectable: a path is something one copies into a report.
         detail_txt := mod.widgets.SText { text: "" }
         mod.widgets.SRule {}
-        // A text input carries no `visible` of its own; the box around it
-        // is what shows and hides the preview.
-        text_box := View {
-            visible: false
-            width: Fill, height: Fill
-            text_prev := mod.widgets.SText {
-                width: Fill, height: Fill
-                is_multiline: true
-            }
-        }
-        /* `Image` carries no `visible` of its own either, so the box around
-           it is what shows and hides the picture. Drawn at the text's width,
-           which is the width a card's wish measured its rows against. */
-        img_box := View {
-            visible: false
-            width: Fill, height: Fit
-            img_prev := mod.widgets.Image {
-                width: Fill, height: Fit
-                fit: ImageFit.Horizontal
-            }
-        }
-        none_lbl := mod.widgets.SLabel {
-            visible: false
-            text: "no preview — open shows it"
-            draw_text +: { color: #909090 }
-        }
+        viewer := mod.widgets.FileViewer {}
     }
 }

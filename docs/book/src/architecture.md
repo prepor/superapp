@@ -69,7 +69,7 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `menu.rs` | The macOS menu bar |
 | `context.rs` | `cmd+i`: the focused panel's context, to the clipboard and to a file |
 | `dsl.rs` | The theme and the base widgets every panel is built from |
-| `widgets/` | The shared components a panel embeds: the rich table and the file card |
+| `widgets/` | The shared components a panel embeds: the rich table, file card, and shared file viewer |
 | `app_ui.rs` | `AppUi`: what an app adds to the screen |
 | `catalog.rs` | What a panels-library node comes up as, and the shell's own scenes |
 | `library/` | The zoomable canvas of live scenes |
