@@ -16,7 +16,7 @@
 #   mise exec -- ./target/debug/superapp --library \
 #     --e2e e2e/shell-library.txt --e2e-out /tmp/shots --draws 4000
 
-wait 14000
+wait 30000
 shot lib-01-overview
 
 # -- a scene fits its block --------------------------------------------------

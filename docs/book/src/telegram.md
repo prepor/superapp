@@ -59,6 +59,13 @@ selects its newest message and resumes following new messages; **Home** selects
 the oldest loaded message. In the composer, **Ctrl+E** moves the caret to the
 end of the current line, and **Shift+Ctrl+E** extends the selection to that point.
 
+Typing **@** at the start of a word offers participants' usernames above the
+composer. Suggestions match names and handles, using cached participants first
+and Telegram's mention search for the current chat and topic. Arrow keys choose
+a suggestion; **Enter**, **Tab**, or a click inserts it, and **Escape** dismisses
+the offer. The next Enter sends the completed message. Opening message search
+puts the caret after the initial chat filter, ready for a query.
+
 Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
 answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
 Following several originals keeps each return point, so repeated `back`
@@ -287,6 +294,12 @@ spaced, borderless choices, six at a time; **more** and **back** move through
 them. Choose an emoji to add it, or **cancel** / Escape to close the picker. Moving the chat's
 cursor also closes it. Service messages and pending or failed sends do not
 offer reactions, and marking messages keeps the batch actions on the bar.
+
+When a reaction line appears or disappears, the reacting message grows or
+shrinks upward, keeping the messages below it in place. The line card also
+shows who reacted, with each author's emoji. It loads more authors on request,
+shows recent senders where the complete list is unavailable, and identifies
+reactions whose authors Telegram keeps hidden.
 
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)

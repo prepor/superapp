@@ -453,6 +453,7 @@ script_mod! {
         feedback := mod.widgets.TelegramFeedback {}
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
+        suggest: mod.widgets.TblSuggest {}
 
         // Native events reach one stable player, independent of virtual rows.
         video_source := View {
@@ -765,6 +766,18 @@ script_mod! {
                 visible: false
                 width: Fit, text: "", draw_text +: { color: #909090 }
             }
+        }
+        reaction_authors := mod.widgets.ScrollYView {
+            visible: false
+            width: Fill, height: Fit{max: FitBound.Abs(140)}
+            flow: Down
+            authors_lbl := mod.widgets.SLabel {
+                width: Fill, text: "", draw_text +: { color: #5a5a5a }
+            }
+        }
+        authors_more := mod.widgets.SLabel {
+            visible: false
+            text: "more reaction authors", draw_text +: { color: #5a5a5a }
         }
     }
 

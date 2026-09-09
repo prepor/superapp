@@ -1,0 +1,21 @@
+# Opening search focuses the field after its seeded chat filter, with no
+# click or slash required before typing the query.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+click "about"
+wait 500
+click "search"
+wait 600
+type "meeting"
+wait 500
+shot search-focused
+click "meeting moved to 15:00"
+wait 400
+quit

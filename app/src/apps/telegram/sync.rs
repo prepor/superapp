@@ -159,7 +159,14 @@ impl<T: Td> Account<T> {
             return;
         };
         if self.cached_download(w, &v) { return; }
-        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessages" | "getMessageAvailableReactions"))
+        if v["@extra"]["context"].as_str().and_then(super::panel_read::id)
+            .is_some_and(|id| !rt.reads.lock().unwrap().alive(id))
+        {
+            rt.operations.retire_context(v["@extra"]["context"].as_str().unwrap());
+            return;
+        }
+        if matches!(v["@type"].as_str(), Some("getMessage" | "getMessages" | "getMessageAvailableReactions"
+            | "getMessageAddedReactions" | "searchChatMembers"))
             && v["chat_id"].as_i64().is_some_and(|chat| !self.chat_ready(chat))
         {
             let mut pending = self.deferred_reads.borrow_mut();
@@ -535,6 +542,13 @@ impl<T: Td> Account<T> {
         }
         if tracked {
             v["@extra"] = v["@extra"]["context"].clone();
+        }
+        if let Some(id) = v["@extra"].as_str().and_then(super::panel_read::id) {
+            let result = if v["@type"] == "error" {
+                Err(v["message"].as_str().unwrap_or("Telegram request failed").to_string())
+            } else { Ok(v.clone()) };
+            rt.reads.lock().unwrap().finish(id, result);
+            rt.operations.changed();
         }
         if self.on_count_reply(w, &v) { return; }
         match v["@type"].as_str() {

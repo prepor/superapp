@@ -104,6 +104,7 @@ pub fn want_view_file(view: &Option<MessageView>, remote_id: &str) {
 #[derive(Default)]
 pub struct Runtime {
     state: Mutex<State>,
+    pub(super) reads: Mutex<super::panel_read::Reads>,
     wake: Notify,
     writes: Mutex<Vec<(kernel::store::PendingWrite<()>, &'static str)>>,
     pub operations: super::operations::Tracker,
@@ -189,6 +190,7 @@ impl Drop for Inbox {
             let mut state = runtime.state();
             if state.connection == self.connection {
                 state.disconnect();
+                runtime.reads.lock().unwrap().disconnect();
                 runtime.operations.changed();
             }
         }
@@ -299,6 +301,7 @@ impl Runtime {
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut state = self.state();
         state.disconnect();
+        self.reads.lock().unwrap().disconnect();
         state.connection += 1;
         state.sender = Some(sender);
         Inbox { receiver: Mutex::new(receiver), runtime: Arc::downgrade(self), connection: state.connection }
@@ -308,6 +311,7 @@ impl Runtime {
     /// new account connects, and leave durable peer state to server updates.
     pub fn disconnect(&self) {
         self.state().disconnect();
+        self.reads.lock().unwrap().disconnect();
         self.operations.changed();
     }
 
@@ -445,6 +449,13 @@ impl Runtime {
 
     pub fn demo_reacted(&self, chat: PeerId, msg: MsgId, emoji: &str) -> bool {
         self.state().demo_reactions.contains(&(chat, msg, emoji.to_string()))
+    }
+
+    pub fn demo_reaction_emojis(&self, chat: PeerId, msg: MsgId) -> Vec<String> {
+        let mut emojis: Vec<_> = self.state().demo_reactions.iter()
+            .filter(|(c, m, _)| (*c, *m) == (chat, msg)).map(|(_, _, emoji)| emoji.clone()).collect();
+        emojis.sort();
+        emojis
     }
 
     pub fn forget_demo_reaction(&self, chat: PeerId, msg: MsgId, emoji: &str) {

@@ -183,11 +183,11 @@ mod tests {
                         root.draw_all(&mut cx, &mut Scope::empty());
                         cx.end_turtle();
                         let controls = [
-                            root.widget(&mut cx, ids!(first)),
-                            root.widget(&mut cx, ids!(disabled)),
-                            root.widget(&mut cx, ids!(hidden)),
+                            root.widget(&cx, ids!(first)),
+                            root.widget(&cx, ids!(disabled)),
+                            root.widget(&cx, ids!(hidden)),
                             undrawn.clone(),
-                            root.widget(&mut cx, ids!(last)),
+                            root.widget(&cx, ids!(last)),
                         ];
                         let key = |shift, logo| {
                             Event::KeyDown(KeyEvent {

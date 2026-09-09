@@ -100,6 +100,17 @@ pub(super) fn load_chats(list: ChatList) -> String {
 
 // -- reactions ----------------------------------------------------------------
 
+pub(super) fn get_message_added_reactions(chat: PeerId, msg: MsgId, offset: &str) -> String {
+    json!({"@type": "getMessageAddedReactions", "chat_id": chat, "message_id": msg,
+        "reaction_type": null, "offset": offset, "limit": 100}).to_string()
+}
+
+pub(super) fn search_mention_members(chat: PeerId, topic: i64, query: &str) -> String {
+    json!({"@type": "searchChatMembers", "chat_id": chat, "query": query, "limit": 50,
+        "filter": {"@type": "chatMembersFilterMention", "topic_id":
+            (topic != 0).then(|| json!({"@type": "messageTopicForum", "forum_topic_id": topic}))}}).to_string()
+}
+
 /// Available reactions for this particular message, in Telegram's preferred
 /// order. The correlation id belongs to the panel's in-memory picker.
 #[must_use]
@@ -167,9 +178,9 @@ pub(super) fn parse_added_reaction_extra(extra: &str) -> Option<(u64, PeerId, Ms
 // optimistic local write of our own.
 
 /// The `inputMessageText` a send or an edit carries: the text as a
-/// `formattedText` with no entities of ours — Telegram parses none unasked, so
-/// what the composer holds travels as plain text. Shared so a send and an edit
-/// spell the content the one way.
+/// `formattedText` with no entities of ours. TDLib detects username mentions
+/// and URLs; the composer does not apply Markdown formatting. Shared so a
+/// send and an edit spell the content the same way.
 /// `clear_draft` is what a send says and an edit does not: the draft the
 /// server holds for the chat is the line being sent, and sending it is what
 /// ends it — on every device (review, 2026-09-07).
