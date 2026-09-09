@@ -1,8 +1,9 @@
 //! The switcher: every open panel, then every root, as one list.
 //!
 //! An open panel becomes [`Go::Focus`]; a root nothing is showing becomes
-//! [`Go::Open`]. Nothing is listed twice, and nothing here reads a store, a
-//! layout, or a source: it is a slice of open slots and a slice of roots,
+//! [`Go::Open`]. Roots marked fresh always offer another instance beside
+//! the open panels. Nothing here reads a store, a layout, or a source:
+//! it is a slice of open slots and a slice of roots,
 //! both handed over by the session, sifted by the words in the query.
 //!
 //! Searching *into* what the apps hold — the letters, the people, the files
@@ -76,11 +77,16 @@ pub fn windows(windows: &[Window], roots: &[Root], query: &str) -> Vec<Hit> {
         if !search::matches(&terms, &[&root.label, tag, &root.words]) {
             continue;
         }
+        let existing = if root.fresh {
+            None
+        } else {
+            windows.iter().find(|w| w.id == root.id)
+        };
         hits.push(Hit {
             label: root.label.clone(),
             detail: tag.to_string(),
-            ws: None,
-            go: Go::Open(root.id.clone()),
+            ws: existing.map(|w| w.ws),
+            go: existing.map_or_else(|| Go::Open(root.id.clone()), |w| Go::Focus(w.slot)),
         });
     }
 
@@ -109,6 +115,9 @@ pub struct Search {
     /// person had picked, and enter would open it. So the row is
     /// remembered, and the index is re-derived from it on every merge.
     anchor: Option<Go>,
+    /// Keep the workspace that led on opening first while live focus moves
+    /// between workspaces. Otherwise arrowing through rows reorders them.
+    workspace: Option<usize>,
 }
 
 impl Search {
@@ -123,21 +132,26 @@ impl Search {
     /// commit that landed under it — the selection stays where the person
     /// left it, because only their typing moves it.
     pub fn ask(&mut self, open: &[Window], roots: &[Root], query: &str) {
-        if self.query != query {
+        let changed = self.query != query;
+        if changed {
             self.query = query.to_string();
             self.sel = 0;
             self.anchor = None;
         }
         self.merge(open, roots);
+        if changed {
+            self.anchor = self.selected().map(|hit| hit.go.clone());
+        }
     }
 
-    /// Raised fresh: a blank question and the selection back at the top.
-    /// Reopening is not the same act as re-asking — whatever was picked
-    /// last time is not what this one is about.
-    pub fn open(&mut self, open: &[Window], roots: &[Root]) {
+    /// Raised fresh: a blank question with the current panel selected.
+    /// An empty workspace starts at the top; a previous launcher's query
+    /// and selection do not carry over.
+    pub fn open(&mut self, open: &[Window], roots: &[Root], focus: Option<SlotId>) {
         self.query.clear();
         self.sel = 0;
-        self.anchor = None;
+        self.anchor = focus.map(Go::Focus);
+        self.workspace = open.first().map(|w| w.ws);
         self.merge(open, roots);
     }
 
@@ -147,22 +161,18 @@ impl Search {
         self.merge(open, roots);
     }
 
-    /// The rows, each with its verb: a panel that is already open anywhere
-    /// becomes a *go to* rather than a second copy, and a slot already
-    /// listed is not listed twice.
+    /// Each open slot is listed once. Explicit creation roots keep their
+    /// Open action beside the existing panels' Focus actions.
     fn merge(&mut self, open: &[Window], roots: &[Root]) {
+        let mut open = open.to_vec();
+        if let Some(workspace) = self.workspace {
+            open.sort_by_key(|w| (w.ws != workspace, w.ws));
+        }
         let mut hits: Vec<Hit> = Vec::new();
         let mut seen: Vec<SlotId> = Vec::new();
-        for hit in windows(open, roots, &self.query) {
+        for hit in windows(&open, roots, &self.query) {
             if hits.len() >= MAX_HITS {
                 break;
-            }
-            let mut hit = hit;
-            if let Go::Open(id) = &hit.go {
-                if let Some(w) = open.iter().find(|w| w.id == *id) {
-                    hit.ws = Some(w.ws);
-                    hit.go = Go::Focus(w.slot);
-                }
             }
             if let Go::Focus(slot) = hit.go {
                 if seen.contains(&slot) {
@@ -331,6 +341,100 @@ mod tests {
         assert_eq!(listed[0].ws, Some(2));
     }
 
+    #[test]
+    fn a_fresh_root_stays_available_beside_every_open_instance() {
+        let roots = vec![Root::new(id("terminal"), "new terminal", "shell").fresh()];
+        let open = vec![
+            win(7, 0, "terminal", "terminal: zsh"),
+            win(8, 2, "terminal", "terminal: nvim"),
+        ];
+        let mut search = Search::new();
+        search.ask(&open, &roots, "terminal");
+        let hits = search.hits();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].go, Go::Focus(7));
+        assert_eq!(hits[1].go, Go::Focus(8));
+        assert_eq!(hits[2].go, Go::Open(id("terminal")));
+        assert_eq!(hits[2].label, "new terminal");
+        assert_eq!(hits[2].ws, None);
+        search.ask(&open, &roots, "new terminal");
+        assert_eq!(search.selected().unwrap().go, Go::Open(id("terminal")));
+    }
+
+    #[test]
+    fn normal_and_fresh_roots_can_share_a_panel_identity() {
+        let roots = vec![
+            Root::new(id("terminal"), "terminal", "shell"),
+            Root::new(id("terminal"), "new terminal", "shell").fresh(),
+        ];
+        let open = vec![win(7, 2, "terminal", "terminal: zsh")];
+        let mut search = Search::new();
+        search.ask(&open, &roots, "");
+        assert_eq!(search.hits().len(), 2);
+        assert_eq!(search.hits()[0].go, Go::Focus(7));
+        assert_eq!(search.hits()[1].go, Go::Open(id("terminal")));
+        search.ask(&open, &roots, "shell");
+        assert_eq!(search.hits().len(), 2);
+        assert_eq!(search.hits()[0].go, Go::Focus(7));
+        assert_eq!(search.hits()[1].go, Go::Open(id("terminal")));
+    }
+
+    #[test]
+    fn opening_selects_the_current_slot_even_among_identical_panels() {
+        let mut open = vec![
+            win(1, 0, "terminal", "terminal: zsh"),
+            win(2, 0, "terminal", "terminal: zsh"),
+            win(3, 1, "help", "help"),
+        ];
+        let mut search = Search::new();
+        search.open(&open, &roots(), Some(2));
+        assert_eq!(search.sel(), 1);
+        assert_eq!(search.selected().unwrap().go, Go::Focus(2));
+        open.swap(0, 1);
+        open[0].title = "terminal: cargo".into();
+        search.again(&open, &roots());
+        assert_eq!(search.sel(), 0);
+        assert_eq!(search.selected().unwrap().label, "terminal: cargo");
+        assert_eq!(search.selected().unwrap().go, Go::Focus(2));
+        search.ask(&open, &roots(), "help");
+        assert_eq!(search.selected().unwrap().go, Go::Focus(3));
+        search.open(&open, &roots(), Some(1));
+        assert_eq!(search.query(), "");
+        assert_eq!(search.selected().unwrap().go, Go::Focus(1));
+        search.open(&open, &roots(), None);
+        assert_eq!(search.sel(), 0);
+    }
+
+    #[test]
+    fn following_focus_across_workspaces_keeps_the_result_order() {
+        let a = win(1, 0, "terminal", "terminal: zsh");
+        let b = win(2, 0, "terminal", "terminal: cargo");
+        let c = win(3, 2, "terminal", "terminal: nvim");
+        let roots = vec![Root::new(id("terminal"), "new terminal", "shell").fresh()];
+        let mut search = Search::new();
+        search.open(&[a.clone(), b.clone(), c.clone()], &roots, Some(2));
+        search.ask(&[a.clone(), b.clone(), c.clone()], &roots, "terminal");
+        search.step(2);
+        assert_eq!(search.selected().unwrap().go, Go::Focus(3));
+
+        // Live focus makes workspace 2 lead the session's next window list.
+        let switched = vec![c.clone(), a.clone(), b.clone()];
+        search.again(&switched, &roots);
+        assert_eq!(search.sel(), 2);
+        search.step(-1);
+        assert_eq!(search.selected().unwrap().go, Go::Focus(2));
+        search.step(2);
+        assert_eq!(search.selected().unwrap().go, Go::Open(id("terminal")));
+
+        // A newly typed query anchors its first result too. A title update
+        // introducing another match must not move it to a different shell.
+        search.ask(&switched, &roots, "nvim");
+        assert_eq!(search.selected().unwrap().go, Go::Focus(3));
+        let renamed = win(1, 0, "terminal", "terminal: nvim");
+        search.again(&[renamed, b, c], &roots);
+        assert_eq!(search.selected().unwrap().go, Go::Focus(3));
+    }
+
     /// A panel opening or closing under an open launcher moves the rows;
     /// the selection stays on the row a person picked, not on the number it
     /// sat at — otherwise enter opens something else.
@@ -384,7 +488,7 @@ mod tests {
         assert_eq!(search.sel(), 0);
         // …and raising it fresh does too.
         search.step(0);
-        search.open(&open, &roots());
+        search.open(&open, &roots(), None);
         assert_eq!(search.query(), "");
         assert_eq!(search.sel(), 0);
     }

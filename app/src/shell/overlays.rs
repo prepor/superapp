@@ -55,10 +55,12 @@ impl Stage {
                     // The hits are a ring: past the last is the first.
                     KeyCode::ArrowDown => {
                         sh.launcher.step(1);
+                        self.launcher_follow(sh);
                         sh.session.redraw();
                     }
                     KeyCode::ArrowUp => {
                         sh.launcher.step(-1);
+                        self.launcher_follow(sh);
                         sh.session.redraw();
                     }
                     // The query's own editing, caret and selection belong to
@@ -93,7 +95,7 @@ impl Stage {
             // A blank question, asked now: the switcher is on screen before
             // the key comes back up.
             let (windows, roots) = (sh.session.windows(), sh.session.roots());
-            sh.launcher.open(&windows, &roots);
+            sh.launcher.open(&windows, &roots, sh.session.focus());
             sh.overlay = Overlay::Launcher;
         }
         // Typing lands in the query the moment it opens — but key focus set
@@ -106,11 +108,20 @@ impl Stage {
     pub(super) fn launcher_ask(&mut self, sh: &mut Shell, query: &str) {
         let (windows, roots) = (sh.session.windows(), sh.session.roots());
         sh.launcher.ask(&windows, &roots, query);
+        self.launcher_follow(sh);
         sh.session.redraw();
     }
 
-    /// Activates a hit: go to the panel wherever it lives, or open a fresh
-    /// un-joined one on the active workspace. Never a second copy.
+    /// Existing rows bring their panel into view as the selection moves.
+    /// The overlay keeps the keyboard; creation still waits for Enter.
+    fn launcher_follow(&mut self, sh: &mut Shell) {
+        if let Some(Go::Focus(slot)) = sh.launcher.selected().map(|hit| &hit.go) {
+            sh.session.nav(Nav::Focus(*slot));
+        }
+    }
+
+    /// Activates a hit: focus its exact slot wherever it lives, or create
+    /// a fresh, un-joined panel on the active workspace.
     pub(super) fn launcher_go(&mut self, sh: &mut Shell, go: Go) {
         sh.overlay = Overlay::None;
         match go {

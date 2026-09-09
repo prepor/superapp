@@ -810,8 +810,12 @@ pub struct LauncherOverlay {
 impl Widget for LauncherOverlay {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        // Live panel focus may wake a composer that requests its own caret.
+        // The modal query keeps the keyboard without reseeding its text or
+        // discarding its edit history.
+        let q = self.view.text_input(cx, ids!(query_input));
+        q.set_key_focus(cx);
         if let Event::Actions(actions) = event {
-            let q = self.view.text_input(cx, ids!(query_input));
             if q.changed(actions).is_some() {
                 cx.action(OverlayAction::Query(q.text()));
             }

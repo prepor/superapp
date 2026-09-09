@@ -554,6 +554,11 @@ impl Stage {
             });
         }
         let dirty = sh.session.take_dirty();
+        if sh.overlay == Overlay::Launcher && dirty.any() {
+            // Titles can change while the palette is open, including when
+            // a terminal starts a silent command. Keep the selected slot.
+            sh.launcher.again(&sh.session.windows(), &sh.session.roots());
+        }
         if dirty.layout {
             let titles = draw::titles(&sh.session);
             let active = sh.session.ws().active;

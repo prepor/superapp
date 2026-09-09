@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use makepad_widgets::SignalToUI;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -17,6 +17,7 @@ pub(super) enum Command {
 pub(super) enum Output {
     Ready,
     Data(Vec<u8>),
+    Foreground(String),
     Error(String),
     Exited(String),
 }
@@ -39,10 +40,24 @@ impl Sink {
         if self.output.send(event).is_err() {
             return false;
         }
+        self.wake();
+        true
+    }
+
+    // Metadata may wait for the next poll. A full output queue must not
+    // stall keyboard writes or PTY resizes just to update a title.
+    fn try_send(&self, event: Output) -> bool {
+        if self.output.try_send(event).is_err() {
+            return false;
+        }
+        self.wake();
+        true
+    }
+
+    fn wake(&self) {
         if !self.dirty.swap(true, Ordering::AcqRel) {
             SignalToUI::set_ui_signal();
         }
-        true
     }
 }
 
@@ -140,7 +155,25 @@ fn run(
     let write_thread = std::thread::Builder::new()
         .name("terminal input".into())
         .spawn(move || {
-            while let Ok(command) = commands.recv() {
+            let mut title = String::new();
+            let mut next_title = Instant::now();
+            loop {
+                let now = Instant::now();
+                if now >= next_title {
+                    if let Some(name) = foreground_command(pair.master.as_ref()) {
+                        if name != title && output.try_send(Output::Foreground(name.clone())) {
+                            title = name;
+                        }
+                    }
+                    next_title = now + Duration::from_millis(250);
+                }
+                let command = match commands
+                    .recv_timeout(next_title.saturating_duration_since(Instant::now()))
+                {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 let result = match command {
                     Command::Write(bytes) => writer.write_all(&bytes).map_err(|e| e.to_string()),
                     Command::Resize(size) => pair.master.resize(size).map_err(|e| e.to_string()),
@@ -185,10 +218,30 @@ fn run(
     }
 }
 
+/// Query the foreground job off the UI thread, including silent programs.
+/// Shells and programs can still provide a richer title through OSC 0/2.
+#[cfg(target_os = "macos")]
+fn foreground_command(master: &dyn portable_pty::MasterPty) -> Option<String> {
+    let pid = master.process_group_leader()?;
+    let mut bytes = [0u8; 1024];
+    // SAFETY: proc_name writes at most the supplied buffer size and does
+    // not retain the pointer. The PTY supplies the foreground process id.
+    let len = unsafe { libc::proc_name(pid, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+    let bytes = bytes.get(..usize::try_from(len).ok()?)?;
+    let name = String::from_utf8_lossy(bytes)
+        .trim_end_matches('\0')
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn foreground_command(_master: &dyn portable_pty::MasterPty) -> Option<String> {
+    None
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn until(process: &Process, output: &mut String, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -247,6 +300,38 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreground_titles_follow_a_silent_job_and_return_to_the_shell() {
+        fn until_title(process: &Process, expected: &str) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "foreground never became {expected:?}"
+                );
+                match process.output.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Output::Foreground(name)) if name == expected => break,
+                    Ok(Output::Error(error)) => panic!("{error}"),
+                    Ok(Output::Exited(status)) => panic!("shell exited early: {status}"),
+                    _ => {}
+                }
+            }
+        }
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        cmd.args(["--noprofile", "--norc", "-i"]);
+        cmd.env("PS1", "ready> ");
+        let process = Process::command(cmd, PtySize::default()).unwrap();
+        until_title(&process, "bash");
+        process
+            .input
+            .send(Command::Write(b"sleep 30\r".to_vec()))
+            .unwrap();
+        until_title(&process, "sleep");
+        process.input.send(Command::Write(vec![3])).unwrap();
+        until_title(&process, "bash");
     }
 
     #[test]

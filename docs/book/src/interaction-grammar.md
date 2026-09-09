@@ -205,13 +205,20 @@ in the query must match, by prefix, some word of a panel's title, its tag, or a
 root's extra words.
 
 An open result focuses its existing panel and switches workspace if needed. A
-new result opens as a separate last column in the current workspace. The
-launcher does not create a duplicate of a panel that is already open.
+new result opens as a separate last column in the current workspace. Ordinary
+roots reuse an existing panel; explicit creation actions such as **new terminal**
+stay available and create another independent instance.
 
 With an empty query, open panels appear first, followed by roots in app-list
-order. Arrow keys wrap through results. `enter` opens the selected result;
-`esc`, another double-Cmd, or a click outside closes the launcher. It is also
-available in the macOS menu.
+order. Opening the launcher selects the currently focused panel, or the first
+result when no panel has focus. Live updates keep the selection on its panel;
+typing a new query selects the first match. Arrow keys wrap through results.
+Highlighting an existing result immediately focuses its panel behind the
+launcher, including across workspaces, while the query keeps keyboard input.
+The result order stays stable during this walk. `enter` closes the launcher
+or creates the selected new panel; `esc`, another double-Cmd, or a click
+outside closes it and keeps the last focused panel. The launcher is
+also available in the macOS menu.
 
 ## Search
 

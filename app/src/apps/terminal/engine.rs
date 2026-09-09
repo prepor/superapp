@@ -56,6 +56,7 @@ pub(super) struct Engine {
     process: Option<Process>,
     size: PtySize,
     state: String,
+    command: String,
     done: bool,
     demo: bool,
     demo_line: String,
@@ -76,6 +77,7 @@ impl Engine {
             }
             Mode::Fake | Mode::Deny => {
                 engine.demo = true;
+                engine.command = "demo shell".into();
                 engine.term.vt_write(b"\x1b[1msuperapp terminal\x1b[0m\r\n\r\nDemo shell: try echo, clear, or stty size.\r\n\r\n\x1b[32m$\x1b[0m ");
             }
         }
@@ -104,6 +106,7 @@ impl Engine {
                 pixel_height: 0,
             },
             state: String::new(),
+            command: "shell".into(),
             done: false,
             demo: false,
             demo_line: String::new(),
@@ -112,7 +115,11 @@ impl Engine {
     }
 
     pub fn title(&self) -> &str {
-        self.term.title().unwrap_or("")
+        self.term
+            .title()
+            .ok()
+            .filter(|title| !title.is_empty())
+            .unwrap_or(&self.command)
     }
     pub fn finished(&self) -> bool {
         self.done
@@ -137,6 +144,7 @@ impl Engine {
             match output {
                 Output::Ready => self.state.clear(),
                 Output::Data(bytes) => self.term.vt_write(&bytes),
+                Output::Foreground(name) => self.command = name,
                 Output::Error(error) => {
                     self.state = error;
                     self.done = true;

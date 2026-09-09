@@ -297,7 +297,7 @@ impl Widget for AgentChatPanel {
         });
         cx.extend_actions(actions);
         self.mount(cx, &props, scope);
-        self.follow_focus(cx, &props, scope, event);
+        self.follow_focus(cx, &props, event);
         if matches!(event, Event::MouseUp(_)) && std::mem::take(&mut self.caret) {
             field.set_key_focus(cx);
         }
@@ -764,12 +764,10 @@ impl AgentChatPanel {
     /// reached is a chat one can type in. Applied on the first event that is
     /// not a press, because a press decides for itself where the caret goes
     /// ([`press`](Self::press)), and held until the field has a rectangle.
-    fn follow_focus(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, event: &Event) {
-        let focused = scope
-            .data
-            .get_mut::<Session>()
-            .and_then(|s| s.focus())
-            .is_some_and(|f| f == props.slot);
+    fn follow_focus(&mut self, cx: &mut Cx, props: &PanelProps, event: &Event) {
+        // A launcher preview moves panel focus while keeping its keyboard.
+        // Take the caret when that overlay closes and hands input back.
+        let focused = props.has_keyboard;
         if focused && !self.was_focused {
             self.want_caret = true;
         }

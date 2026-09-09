@@ -167,6 +167,9 @@ pub struct Root {
     pub label: String,
     /// Extra words a query may match ("log queue" for the effects list).
     pub words: String,
+    /// Keep this launcher action available even when its panel is open.
+    /// Activating it creates another independent instance.
+    pub fresh: bool,
 }
 
 impl Root {
@@ -176,7 +179,14 @@ impl Root {
             id,
             label: label.into(),
             words: words.into(),
+            fresh: false,
         }
+    }
+
+    #[must_use]
+    pub fn fresh(mut self) -> Self {
+        self.fresh = true;
+        self
     }
 }
 

@@ -178,7 +178,7 @@ fn reactions_grow_upward_without_moving_the_messages_below() {
         session.settle();
         let slot = session.focus().unwrap();
         let props = PanelProps { slot, panel: session.panel(slot).unwrap(), hits: Default::default(),
-            keyboard: Default::default(), grab: Default::default() };
+            keyboard: Default::default(), has_keyboard: true, grab: Default::default() };
         let finished = Rc::new(Cell::new(false));
         let seen = finished.clone();
         let mut root = WidgetRef::empty();

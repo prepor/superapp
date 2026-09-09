@@ -58,6 +58,11 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `ask` | takes a panel as context: opens whatever this app answers a panel with, joined to it, and says whether it did. The shell offers the focused slot to the apps in list order on `cmd+shift+a` and stops at the first taker |
 | `attach` | the finished registry, once, at the end of boot. An app that needs the *list* — every tool, every data dictionary — copies what it needs here, and may not keep the reference |
 
+A root normally focuses an existing instance when one is open. Add `.fresh()`
+to a `Root::new(...)` declaration for an action that always creates another
+instance, such as **new terminal**. Each open instance still gets its own
+launcher entry that focuses that exact slot.
+
 `AppUi`, in `app/src/shell/app_ui.rs`, is the Makepad half: `script_mod` for
 the app's own template block, `template(tag)` for the widget the shell
 instantiates per slot, and `scenes` for its entries in the panels library.

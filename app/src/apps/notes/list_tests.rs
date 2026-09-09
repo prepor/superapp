@@ -33,6 +33,7 @@ impl NoteListView {
             panel: session.panel(slot).unwrap(),
             hits: Default::default(),
             keyboard: Default::default(),
+            has_keyboard: true,
             grab: Default::default(),
         };
         let (notify, wake) = mpsc::channel();

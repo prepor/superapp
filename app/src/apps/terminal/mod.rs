@@ -30,9 +30,10 @@ impl App for TerminalApp {
     fn roots(&self) -> Vec<Root> {
         vec![Root::new(
             PanelId::bare(TAG),
-            "terminal",
+            "new terminal",
             "shell command line console pty",
-        )]
+        )
+        .fresh()]
     }
     fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
         caps.insert(Box::new(TerminalMode(if env.scripted {
@@ -95,15 +96,11 @@ impl Panel for TerminalPanel {
         &self.id
     }
     fn title(&self) -> String {
-        match self
+        let title = self
             .engine
             .as_ref()
-            .map(|engine| engine.title())
-            .filter(|title| !title.is_empty())
-        {
-            Some(title) => format!("terminal — {title}"),
-            None => "terminal".into(),
-        }
+            .map_or("shell", |engine| engine.title());
+        format!("terminal: {title}")
     }
     fn about(&self) -> String {
         "A local interactive shell. Its process and output live only on this device, in this panel. Closing stops the shell; restoring starts a new one. The width control keeps the same running session.".into()

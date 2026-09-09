@@ -28,6 +28,16 @@ fn text(engine: &mut Engine) -> String {
 }
 
 #[test]
+fn terminal_titles_use_program_titles_with_a_shell_fallback() {
+    let mut engine = Engine::new(Mode::Fake).unwrap();
+    assert_eq!(engine.title(), "demo shell");
+    engine.term.vt_write(b"\x1b]2;nvim main.rs\x07");
+    assert_eq!(engine.title(), "nvim main.rs");
+    engine.term.vt_write(b"\x1b]2;\x07");
+    assert_eq!(engine.title(), "demo shell");
+}
+
+#[test]
 fn parses_colors_unicode_and_alternate_screen_then_reflows() {
     let mut engine = Engine::empty(20, 5).unwrap();
     engine

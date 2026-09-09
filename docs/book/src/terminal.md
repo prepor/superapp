@@ -1,8 +1,14 @@
 # Terminal
 
-Open **terminal** from the launcher. It starts the user's login shell in their
-home directory, in a real PTY. Each open panel has its own shell. The terminal
-requests the full workspace height and starts at half width. **Full width** and
+Choose **new terminal** from the launcher to start another independent login
+shell in the user's home directory, in a real PTY. This action stays available
+when terminals are already open. Existing shells appear as **terminal: …**
+entries that switch to their own panel, including on another workspace. Their
+labels use the shell/program's title, or the foreground program name on macOS;
+silent commands are tracked too. Opening the launcher selects the panel that
+currently has focus; highlighting another existing entry focuses its panel
+immediately while typing stays in the launcher. The terminal requests the
+full workspace height and starts at half width. **Full width** and
 **half width** change the panel's share of the viewport and resize the PTY in
 place, keeping the shell, output, cursor, and partially typed command.
 
