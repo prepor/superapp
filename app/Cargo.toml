@@ -34,6 +34,9 @@ superapp-kernel = { path = "../kernel" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 caseless = "0.2.2"
+unicode-segmentation = "1.12"
+# Retain each existing line ending when editing files with mixed LF/CRLF.
+similar = { version = "3.2", default-features = false }
 
 # Mail's real protocols. `Mode::Real` outside a script reaches a server
 # through these; every scripted run keeps the fake.

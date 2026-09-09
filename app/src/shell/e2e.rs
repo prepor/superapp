@@ -75,7 +75,7 @@ impl Stage {
                 if !area.is_valid(cx) || rect.size.x <= 0.0 || rect.size.y <= 0.0 {
                     return false;
                 }
-                let text = if widget.borrow::<TextInput>().is_some() {
+                let text = if widget.borrow::<TextInput>().is_some() || widget.borrow::<super::widgets::source_input::SourceInput>().is_some() {
                     widget.text()
                 } else {
                     widget.selection_get_full_text()

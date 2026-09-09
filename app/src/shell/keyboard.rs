@@ -10,6 +10,7 @@ use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::widget::WidgetWeakRef;
 
 use super::keys::Letters;
+use super::widgets::source_input;
 
 /// Ordinary inputs keep all letter chords; selectable text keeps the text
 /// chords. A composer can declare a narrower policy for its input once,
@@ -48,7 +49,8 @@ impl Keyboard {
         }
         if widget.key_focus(cx) {
             let input = widget.borrow::<TextInput>();
-            let editable = input.as_ref().is_some_and(|input| !input.is_read_only());
+            let editable = input.as_ref().is_some_and(|input| !input.is_read_only())
+                || widget.borrow::<source_input::SourceInput>().is_some_and(|input| !input.is_read_only());
             if let Some((_, letters)) = self.policies.borrow().get(&widget.widget_uid()) {
                 return Some(Owner { letters: *letters, editable });
             }
@@ -76,6 +78,7 @@ impl Keyboard {
 /// `Some` identifies a native text widget, including an empty selection.
 fn selection(widget: &WidgetRef) -> Option<bool> {
     widget.borrow::<TextInput>().map(|text| !text.selected_text().is_empty())
+        .or_else(|| widget.borrow::<source_input::SourceInput>().map(|text| !text.selected_text().is_empty()))
         .or_else(|| widget.borrow::<TextFlow>().map(|text| text.has_selection()))
         .or_else(|| widget.borrow::<Html>().map(|text| text.has_selection()))
         .or_else(|| widget.borrow::<Markdown>().map(|text| text.has_selection()))
