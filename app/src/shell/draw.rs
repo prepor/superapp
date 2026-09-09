@@ -647,7 +647,7 @@ impl Stage {
         sh.session.store().trace_begin(slot);
         let (title, verbs) = {
             let p = inst.borrow();
-            (p.title(), p.verbs())
+            (p.title(), sh.session.panel_verbs(slot))
         };
         let focused = sh.session.focus() == Some(slot);
         let hover = sh.hover.clone();

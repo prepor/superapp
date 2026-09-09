@@ -571,8 +571,8 @@ impl Stage {
     ) -> R {
         let focus = sh.session.focus();
         let preview = focus.and_then(|s| sh.session.joined_child(s));
-        let verbs = |slot: Option<kernel::layout::SlotId>| slot.and_then(|s| sh.session.panel(s))
-            .map(|p| p.borrow().verbs()).unwrap_or_default();
+        let verbs = |slot: Option<kernel::layout::SlotId>| slot
+            .map(|s| sh.session.panel_verbs(s)).unwrap_or_default();
         let focused_verbs = verbs(focus);
         let preview_verbs = verbs(preview);
         read(focus, preview, bar::Shortcuts {
@@ -627,7 +627,7 @@ impl Stage {
             return;
         };
         let act = {
-            let verbs = inst.borrow().verbs();
+            let verbs = sh.session.panel_verbs(slot);
             verbs.into_iter().find(|v| v.id == id).map(|v| v.act)
         };
         match act {

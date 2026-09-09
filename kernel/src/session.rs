@@ -592,8 +592,12 @@ impl Session {
     pub fn relayout(&mut self) {
         let cols = self.cols;
         let mut wishes: HashMap<PanelId, (u32, u32)> = HashMap::new();
-        for ws in &self.wm.wss {
+        for ws in &mut self.wm.wss {
+            ws.widths.clear();
             for slot in ws.slots.values() {
+                if let Some(width) = self.instances.get(&slot.id).and_then(|i| i.borrow().width()) {
+                    ws.widths.insert(slot.id, width);
+                }
                 let wish = self
                     .instances
                     .get(&slot.id)
@@ -607,6 +611,34 @@ impl Session {
         self.scene = self.wm.scene(self.viewport, self.opts);
         self.dirty.layout = true;
         self.dirty.redraw = true;
+    }
+
+    /// The panel's bar plus controls it opted into through the panel contract.
+    pub fn panel_verbs(&self, slot: SlotId) -> Vec<crate::panel::Verb> {
+        use crate::panel::{PanelWidth, Verb};
+        let Some(instance) = self.panel(slot) else { return Vec::new() };
+        let panel = instance.borrow();
+        let mut verbs = panel.verbs();
+        if let Some(width) = panel.width() {
+            let (id, label, next) = match width {
+                PanelWidth::Half => ("panel.full_width", "full width", PanelWidth::Full),
+                PanelWidth::Full => ("panel.half_width", "half width", PanelWidth::Half),
+            };
+            verbs.push(Verb::call(id, label, None, move |s| { s.set_panel_width(slot, next); }));
+        }
+        verbs
+    }
+
+    /// Resize an opted-in panel without replacing its live instance.
+    pub fn set_panel_width(&mut self, slot: SlotId, width: crate::panel::PanelWidth) {
+        let Some(instance) = self.panel(slot) else { return };
+        {
+            let mut panel = instance.borrow_mut();
+            if panel.width().is_none() { return; }
+            panel.set_width(width);
+        }
+        self.relayout();
+        self.save();
     }
 
     /// What changed since the last look, taken.
@@ -1000,6 +1032,12 @@ impl Session {
     /// An instance the caller built, to be placed on the slot the running
     /// action creates.
     pub(crate) fn place(&mut self, id: PanelId, instance: Box<dyn Panel>) {
+        // Placement consults the new panel's height before it has a slot.
+        // In particular, a full-height panel must not be packed into the
+        // spare half of another column using DEFAULT_WISH.
+        let (w, h) = instance.wish(self.cols);
+        let w = instance.width().map_or(w, |width| width.units(self.wm.grid));
+        self.wm.wish(&id, (w, h));
         self.pending.push((id, Rc::new(RefCell::new(instance))));
     }
 

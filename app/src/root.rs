@@ -15,6 +15,14 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    // The app and its native dependencies are absent on Android. The unused
+    // template still needs a DSL value when this shared window is evaluated.
+    let terminal_body = if #(cfg!(target_os = "android")) {
+        mod.widgets.View
+    } else {
+        mod.widgets.TerminalPanel
+    }
+
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
@@ -59,6 +67,7 @@ script_mod! {
                         rss_import_tpl := mod.widgets.RssImportPanel{}
                         notes_list_tpl := mod.widgets.NotesPanel{}
                         notes_editor_tpl := mod.widgets.NotesEditorPanel{}
+                        terminal_tpl := terminal_body{}
                         // Telegram's ten tags: the address book and a
                         // group's members draw with one widget, hung twice.
                         telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
@@ -141,6 +150,7 @@ script_mod! {
                             rss_import_tpl := mod.widgets.RssImportPanel{}
                             notes_list_tpl := mod.widgets.NotesPanel{}
                             notes_editor_tpl := mod.widgets.NotesEditorPanel{}
+                            terminal_tpl := terminal_body{}
                             telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
                             telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
                             telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}

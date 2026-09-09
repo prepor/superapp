@@ -36,6 +36,10 @@ jobs:
         with:
           components: clippy
 
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig
+
       # Caches the registry, the two makepad git checkouts and `target/`,
       # keyed on the lockfile and the toolchain. `cache-on-failure` because
       # the common failure here is a red clippy or a failed step, and the

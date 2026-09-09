@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+zig_install=$(mise where zig)
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+    zig_sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
+    # Zig 0.15.2 cannot read the arm64e-only libSystem stub in SDK 26.4+.
+    # Prefer a compatible SDK already installed beside the Command Line Tools.
+    if ! head -6 "$zig_sdk/usr/lib/libSystem.tbd" | grep -q 'arm64-macos'; then
+        for candidate in /Library/Developer/CommandLineTools/SDKs/MacOSX1[45]*.sdk \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX1[45]*.sdk; do
+            if [ -f "$candidate/usr/lib/libSystem.tbd" ] && head -6 "$candidate/usr/lib/libSystem.tbd" | grep -q 'arm64-macos'; then
+                SUPERAPP_ZIG_SDK=$candidate
+                export SUPERAPP_ZIG_SDK
+                SDKROOT=$candidate
+                export SDKROOT
+                wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+                PATH="$wrapper_dir/macos-sdk:$PATH"
+                export PATH
+                break
+            fi
+        done
+    fi
+fi
+exec "$zig_install/zig" "$@"

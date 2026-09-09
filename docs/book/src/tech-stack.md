@@ -38,8 +38,10 @@ The pieces:
   not ours: FSEvents through CoreServices on macOS, inotify on android, both
   declared where they are used in `app/src/platform/watch/`. No crate — the
   whole of each is a handful of foreign functions.
-- **mise** selects the stable Rust toolchain. The application has no other
-  runtime dependency.
+- **libghostty-vt** maintains terminal state, with **portable-pty** for the
+  local shell and Makepad for drawing. Both are excluded on Android.
+- **mise** selects the stable Rust toolchain and Zig 0.15.2 for the terminal's
+  static library. Zig is a build dependency only; see [Terminal](./terminal.md).
 
 The default `tdlib` Cargo feature links TDLib. `--no-default-features`
 keeps deterministic Telegram fixtures available without the native library.

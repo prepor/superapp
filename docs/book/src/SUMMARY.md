@@ -25,6 +25,7 @@
 - [Telegram](./telegram.md)
 - [Files](./files.md)
 - [Notes and the text editor](./notes.md)
+- [Terminal](./terminal.md)
 - [Agents](./agents.md)
 
 # Development

@@ -1,0 +1,68 @@
+# args:
+# env:
+
+wait 800
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key enter
+wait 700
+click "terminal input"
+type "echo hello from terminal"
+key enter
+wait 300
+visible "terminal output: hello from terminal"
+shot terminal-half
+
+# Width changes preserve the running shell and its input.
+type "echo still here"
+click "full width"
+wait 700
+key enter
+wait 300
+visible "terminal output: still here"
+accel "half width" -
+shot terminal-full
+click "half width"
+wait 700
+visible "terminal output: still here"
+accel "full width" -
+
+# Terminal text and control keys stay in the focused panel.
+click "terminal input"
+type "echo mistake"
+key ctrl+c
+type "echo recovered"
+key enter
+wait 300
+visible "terminal output: recovered"
+dblclick "terminal output: recovered"
+copy "recovered"
+click "terminal input"
+paste "echo pasted text\n"
+wait 300
+visible "terminal output: pasted text"
+type "exit"
+key enter
+wait 300
+click "restart shell"
+wait 300
+visible "terminal output: superapp terminal"
+
+# An inactive terminal cannot answer another panel's clipboard request.
+key cmd+2
+wait 400
+key cmd 2
+wait 300
+type "notes"
+wait 300
+key enter
+wait 500
+click "new note"
+wait 500
+click "editor"
+type "copy from the note"
+key cmd+a
+copy "copy from the note"
+quit

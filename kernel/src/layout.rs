@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::panel::PanelId;
+use crate::panel::{PanelId, PanelWidth};
 
 /// Stable slot identity.
 pub type SlotId = u64;
@@ -182,6 +182,10 @@ pub struct Ws {
     /// Ephemeral physics, like the camera and the grid: never snapshotted,
     /// re-derived by the session whenever it relayouts.
     pub wishes: HashMap<PanelId, (u32, u32)>,
+    /// Optional width choices, keyed by instance rather than identity so
+    /// two terminals (or two views of one document) resize independently.
+    /// Re-derived by the session alongside wishes; never snapshotted.
+    pub widths: HashMap<SlotId, PanelWidth>,
 }
 
 impl Ws {
@@ -239,6 +243,7 @@ impl Ws {
             .get(&sid)
             .map(|p| self.wish_of(&p.show))
             .unwrap_or((1, 1));
+        let w = self.widths.get(&sid).map_or(w, |width| width.units(self.grid));
         (w.min(self.grid.w), h.min(self.grid.h))
     }
 
