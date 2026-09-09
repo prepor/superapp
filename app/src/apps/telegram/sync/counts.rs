@@ -16,7 +16,7 @@ type Key = (PeerId, MsgId);
 const PATIENCE: f64 = 30.0;
 const GAP: f64 = 1.0;
 // A fallback for missed pushes, separate from initial loads and post-add
-// checks. Sweeping every minute keeps searching even a settled viewport.
+// checks. Periodic sweeps keep searching even a settled viewport.
 const RECHECK: f64 = 5.0 * 60.0;
 
 #[derive(Default)]
@@ -84,11 +84,17 @@ impl<T: Td> Account<T> {
     }
 
     pub(super) fn counts_after_add(&self, w: &World, chat: PeerId, message: MsgId) {
+        self.recheck_counts(w, chat, message);
+        self.counts.borrow_mut().retries.remove(&(chat, message));
+    }
+
+    /// A Line read may expose a missed update. Prioritize a fresh shared
+    /// snapshot, preserving any retry delay Telegram has already imposed.
+    pub(super) fn recheck_counts(&self, w: &World, chat: PeerId, message: MsgId) {
         self.refresh_counts(w, chat, &[message]);
         let mut state = self.counts.borrow_mut();
         state.urgent.insert((chat, message));
-        state.retries.remove(&(chat, message));
-        // A read sent before the add cannot confirm its result.
+        // A snapshot sent before the add or author read cannot confirm it.
         if state.pending.as_ref().is_some_and(|p| p.key == (chat, message)) {
             let pending = state.pending.take().unwrap();
             runtime::of(w.store()).operations.retire_context(&pending.context());

@@ -323,9 +323,10 @@ interaction update means the counts need checking, so the last known counts
 stay visible until a server read confirms a change. Checks retry failures,
 respect rate limits and reject replies that predate newer counts or metadata.
 A fallback sweep every five minutes checks visible messages for missed push
-updates. Initial loads, changed metadata and successful adds request checks
-without waiting for that sweep; reconciliation is paced per account and
-honors Telegram's retry delays.
+updates. Initial loads, changed metadata, successful adds and the Line panel's
+reaction author reads request checks without waiting for that sweep, keeping
+the authors and message counts current together. Reconciliation is paced per
+account and honors Telegram's retry delays.
 Confirmed empty counts survive restarts and stale message loads.
 A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
 and a text fallback for custom emoji. A refused request
