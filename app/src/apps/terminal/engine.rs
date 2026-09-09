@@ -73,7 +73,6 @@ impl Engine {
                     let _ = input.send(Command::Write(bytes.to_vec()));
                 })?;
                 engine.process = Some(process);
-                engine.state = "starting shell…".into();
             }
             Mode::Fake | Mode::Deny => {
                 engine.demo = true;
@@ -118,15 +117,8 @@ impl Engine {
     pub fn finished(&self) -> bool {
         self.done
     }
-    pub fn status(&self) -> String {
-        let prefix = if !self.state.is_empty() {
-            &self.state
-        } else if self.demo {
-            "demo shell"
-        } else {
-            "shell"
-        };
-        format!("{prefix} · {} × {}", self.size.cols, self.size.rows)
+    pub fn status(&self) -> Option<&str> {
+        self.done.then_some(self.state.as_str())
     }
 
     pub fn poll(&mut self) -> bool {

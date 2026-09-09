@@ -260,13 +260,26 @@ impl Widget for TerminalView {
         let cols = ((rect.size.x - PAD * 2.0) / self.cell.x.max(1.0))
             .floor()
             .clamp(2.0, 1000.0) as u16;
-        let rows = ((rect.size.y - PAD * 2.0 - STATUS_H) / self.cell.y.max(1.0))
-            .floor()
-            .clamp(1.0, 1000.0) as u16;
         if let Some(engine) = &mut panel.engine {
             if engine.poll() {
                 self.frame = None;
             }
+        }
+        let status_h = if panel.error.is_some()
+            || panel
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.status())
+                .is_some()
+        {
+            STATUS_H
+        } else {
+            0.0
+        };
+        let rows = ((rect.size.y - PAD * 2.0 - status_h) / self.cell.y.max(1.0))
+            .floor()
+            .clamp(1.0, 1000.0) as u16;
+        if let Some(engine) = &mut panel.engine {
             match engine.resize(
                 cols,
                 rows,
@@ -411,17 +424,21 @@ impl Widget for TerminalView {
             }
             self.frame = Some(frame);
         }
-        let status = panel.error.clone().unwrap_or_else(|| {
-            panel
-                .engine
-                .as_ref()
-                .map_or_else(|| "starting shell…".into(), |engine| engine.status())
-        });
-        self.draw_status.draw_abs(
-            cx,
-            rect.pos + dvec2(PAD, rect.size.y - STATUS_H + 5.0),
-            &status,
-        );
+        let status = panel
+            .error
+            .as_deref()
+            .or_else(|| panel.engine.as_ref().and_then(|engine| engine.status()));
+        if let Some(status) = status {
+            self.draw_status.draw_abs(
+                cx,
+                rect.pos + dvec2(PAD, rect.size.y - STATUS_H + 5.0),
+                status,
+            );
+            // A resize or render error can first appear during this draw.
+            if status_h == 0.0 {
+                cx.redraw_all();
+            }
+        }
         cx.end_turtle_with_area(&mut self.area);
         if focused {
             // Cocoa only emits TextInput while its input context is active.
