@@ -258,7 +258,11 @@ script_mod! {
                 zone_input := mod.widgets.SField {}
             }
             status_lbl := mod.widgets.SSection { width: Fill, max_lines: 3 }
-            selection_lbl := mod.widgets.SBoldLabel { width: Fill, max_lines: 3 }
+            // Reserve all three lines so overlap warnings never move a track
+            // under the pointer, including when the participant names wrap.
+            selection := View { width: Fill, height: 56, flow: Down
+                selection_lbl := mod.widgets.SBoldLabel { width: Fill, max_lines: 3 }
+            }
             drag_hint := mod.widgets.SSection { width: Fill, max_lines: 2
                 text: "Drag to change time · snaps every 15 minutes\nHover busy blocks for event details"
             }

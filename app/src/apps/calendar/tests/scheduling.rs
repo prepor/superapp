@@ -530,3 +530,14 @@ fn dense_pointer_events_do_not_query_or_redraw_the_workspace() {
     let slot = open(&mut s, panels::Availability::id(id));
     availability_ui::test_input::exercise(&mut s, slot, &q);
 }
+
+#[cfg(headless)]
+#[test]
+fn drag_redraws_keep_tracks_stable_and_editor_areas_valid() {
+    let mut s = paused_session();
+    let (id, draft, _) = request(&mut s);
+    refresh(&s);
+    let editor = open(&mut s, panels::Editor::id(draft));
+    let sheet = open(&mut s, panels::Availability::id(id));
+    availability_ui::test_input::draw_panels(&mut s, editor, sheet);
+}

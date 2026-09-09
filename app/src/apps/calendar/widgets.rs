@@ -918,7 +918,11 @@ impl Widget for CalendarEditorPanel {
         else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        self.view.label(cx, ids!(error_lbl)).set_text(cx, &error);
+        let error_label = self.view.label(cx, ids!(error_lbl));
+        // Makepad substitutes a space when drawing an empty label. That has
+        // no glyph instances, so its area cannot be used for hit collection.
+        error_label.set_visible(cx, !error.trim().is_empty());
+        error_label.set_text(cx, &error);
         self.view.label(cx, ids!(status_lbl)).set_text(
             cx,
             &d.as_ref()
@@ -1023,11 +1027,16 @@ impl Widget for CalendarEditorPanel {
             }
         }
         if let Some(w) = drawn {
-            let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+            let Some(clip) = form::drawn_rect(cx, self.view.widget(cx, ids!(list)).area()) else {
+                return DrawStep::done();
+            };
             for (name, path) in FIELDS {
+                let Some(rect) = form::drawn_rect(cx, w.widget(cx, path).area()) else {
+                    continue;
+                };
                 props.hits.add_clipped(
                     name,
-                    w.widget(cx, path).area().rect(cx),
+                    rect,
                     clip,
                     MouseCursor::Text,
                     props.slot,
@@ -1050,20 +1059,25 @@ impl Widget for CalendarEditorPanel {
             }
             self.form = w;
         }
+        let Some(clip) = form::drawn_rect(cx, self.view.area()) else {
+            return DrawStep::done();
+        };
         for path in [ids!(error_lbl), ids!(status_lbl)] {
             let l = self.view.label(cx, path);
-            if !l.text().is_empty() {
+            if l.visible() && !l.text().trim().is_empty() {
+                let Some(rect) = form::drawn_rect(cx, l.area()) else {
+                    continue;
+                };
                 props.hits.add_clipped(
                     l.text(),
-                    l.area().rect(cx),
-                    self.view.area().rect(cx),
+                    rect,
+                    clip,
                     MouseCursor::Default,
                     props.slot,
                 );
             }
         }
         let fields = editor_offers(cx, &self.form);
-        let clip = self.view.area().rect(cx);
         self.offers
             .draw(cx, scope, &props, &fields, &mut self.suggest, clip);
         DrawStep::done()

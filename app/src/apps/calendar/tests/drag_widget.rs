@@ -1,4 +1,5 @@
-//! Memory-only pointer routing: no OS initialization, rendering, window or loop.
+//! Pointer routing and draw-list construction without OS initialization,
+//! rendering, windows or an event loop.
 use super::*;
 use std::cell::Cell;
 
@@ -152,4 +153,262 @@ pub fn exercise(s: &mut Session, slot: kernel::layout::SlotId, q: &availability:
     // A swept area must be ignored before asking Makepad for its rectangle.
     cx.draw_lists[list.id()].rect_areas.clear();
     assert!(form::drawn_rect(&cx, area).is_none());
+}
+
+/// Execute widget layout and draw-list construction directly. There is no OS
+/// initialization, event loop, window or rendering backend.
+pub fn draw_panels(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId) {
+    use makepad_widgets::makepad_platform::makepad_error_log::{self, LogLevel};
+    use std::sync::Mutex;
+    static ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn capture(message: &str, _: LogLevel) {
+        if message.contains("get_rect called on instance_count") {
+            let mut errors = ERRORS.lock().unwrap();
+            if errors.is_empty() {
+                errors.push(format!(
+                    "{message}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                ));
+            }
+        }
+    }
+    struct Tap;
+    impl Drop for Tap {
+        fn drop(&mut self) {
+            makepad_error_log::set_log_tap(None);
+        }
+    }
+    ERRORS.lock().unwrap().clear();
+    makepad_error_log::set_log_tap(Some(capture));
+    let _tap = Tap;
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let widgets = cx.with_vm(|vm| {
+        makepad_widgets::script_mod(vm);
+        crate::shell::script_mod(vm);
+        crate::reader::ui::script_mod(vm);
+        super::super::ui::script_mod(vm);
+        let editor = script_eval!(vm, {mod.widgets.CalendarEditorPanel{}});
+        let sheet = script_eval!(vm, {mod.widgets.CalendarAvailabilityPanel{}});
+        [
+            WidgetRef::script_from_value(vm, editor),
+            WidgetRef::script_from_value(vm, sheet),
+        ]
+    });
+    let props = [editor, sheet].map(|slot| PanelProps {
+        slot,
+        panel: s.panel(slot).unwrap(),
+        hits: Default::default(),
+        keyboard: Default::default(),
+        grab: Default::default(),
+    });
+    let size = dvec2(1200.0, 740.0);
+    let pass = DrawPass::new(&mut cx);
+    pass.set_size(&mut cx, size);
+    let mut list = DrawList::new(&mut cx);
+    let mut frame = 0;
+    let mut timings = Vec::new();
+    let mut redraw = |cx: &mut Cx, s: &mut Session, size: DVec2| {
+        let started = std::time::Instant::now();
+        frame += 1;
+        for props in &props {
+            props.hits.clear();
+        }
+        cx.new_draw_event = DrawEvent::default();
+        pass.set_size(cx, size);
+        let event = DrawEvent {
+            redraw_all: true,
+            time: frame as f64 / 60.0,
+            ..Default::default()
+        };
+        let mut draw = CxDraw::new(cx, &event);
+        draw.begin_pass(&pass, Some(1.0));
+        list.begin_always(&mut draw);
+        {
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_root_turtle(
+                size,
+                Layout {
+                    flow: Flow::right(),
+                    ..Layout::default()
+                },
+            );
+            for (widget, props) in widgets.iter().zip(&props) {
+                widget.draw_walk_all(
+                    &mut cx,
+                    &mut Scope::with_data_props(s, props),
+                    Walk {
+                        width: Size::Fixed(size.x / 2.0),
+                        height: Size::fill(),
+                        ..Walk::default()
+                    },
+                );
+            }
+            cx.end_pass_sized_turtle();
+        }
+        list.end(&mut draw);
+        draw.end_pass(&pass);
+        drop(draw);
+        timings.push(started.elapsed());
+    };
+    let send = |cx: &mut Cx, s: &mut Session, event: Event| {
+        let mut event = event;
+        for _ in 0..8 {
+            let actions = cx.capture_actions(|cx| {
+                for (widget, props) in widgets.iter().zip(&props) {
+                    widget.handle_event(cx, &event, &mut Scope::with_data_props(s, props));
+                }
+            });
+            if actions.is_empty() {
+                return;
+            }
+            event = Event::Actions(actions);
+        }
+        panic!("widget actions did not settle");
+    };
+    // Cover empty, populated, then cleared messages, including text clipped out
+    // of a short viewport. The old hit collector logged once on every frame.
+    for error in ["", "Enter a valid date", "", "   "] {
+        props[0]
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<panels::Editor>()
+            .unwrap()
+            .error = error.into();
+        for size in [size, dvec2(960.0, 40.0), size] {
+            redraw(&mut cx, s, size);
+            assert_eq!(
+                widgets[0].label(&cx, ids!(error_lbl)).visible(),
+                !error.trim().is_empty()
+            );
+        }
+    }
+    widgets[1]
+        .borrow_mut::<CalendarAvailabilityPanel>()
+        .unwrap()
+        .directory = vec![Suggestion::labeled(
+        "Nora with a long display name that wraps the overlap warning onto another line",
+        "nora@studio.example",
+    )];
+    let (window_id, button) = (WindowId(0, 0), MouseButton::PRIMARY);
+    for (minutes, width) in [("30", 1200.0), ("60", 960.0), ("90", 1200.0)] {
+        let size = dvec2(width, size.y);
+        {
+            let mut panel = props[1].panel.borrow_mut();
+            let p = panel
+                .as_any()
+                .downcast_mut::<panels::Availability>()
+                .unwrap();
+            let mut search = p.search.clone();
+            search.minutes = minutes.into();
+            p.edit_search(search);
+        }
+        redraw(&mut cx, s, size);
+        let tracks = widgets[1]
+            .borrow::<CalendarAvailabilityPanel>()
+            .unwrap()
+            .tracks
+            .clone();
+        assert_eq!(tracks.len(), 2, "both participants must be drawn");
+        let (track, _) = &tracks[0];
+        let rect = form::drawn_rect(&cx, track.area()).unwrap();
+        let (q, proposal) = {
+            let track = track.borrow::<CalendarTimeTrack>().unwrap();
+            (
+                track.track.query.clone().unwrap(),
+                track.track.proposed.unwrap(),
+            )
+        };
+        assert_eq!(q.minutes.to_string(), minutes);
+        let mut pos = rect.pos
+            + dvec2(
+                (proposal.0 + proposal.1) / 2.0 * rect.size.x,
+                rect.size.y / 2.0,
+            );
+        assert!(track.area().clipped_rect(&cx).contains(pos));
+        cx.fingers.mouse_down(button, window_id);
+        send(
+            &mut cx,
+            s,
+            Event::MouseDown(MouseDownEvent {
+                abs: pos,
+                button,
+                window_id,
+                modifiers: Default::default(),
+                handled: Cell::default(),
+                time: 0.0,
+            }),
+        );
+        assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_some());
+        let revision = s.store().revision(&["calendar_draft", "calendar_change"]);
+        s.take_dirty();
+        // Retain the actual captured area through repeated mark/sweep cycles,
+        // crossing busy periods and changing the warning/selection text.
+        for i in 0..240 {
+            let step = if i % 120 < 60 { i % 60 } else { 60 - i % 60 };
+            pos.x = rect.pos.x + f64::from(step) / 60.0 * rect.size.x;
+            send(
+                &mut cx,
+                s,
+                Event::MouseMove(MouseMoveEvent {
+                    abs: pos,
+                    lock_delta: dvec2(0.0, 0.0),
+                    window_id,
+                    modifiers: Default::default(),
+                    time: f64::from(i) / 60.0,
+                    handled: Cell::default(),
+                }),
+            );
+            redraw(&mut cx, s, size);
+            let mut panel = props[1].panel.borrow_mut();
+            let selected = panel
+                .as_any()
+                .downcast_mut::<panels::Availability>()
+                .unwrap()
+                .selected
+                .unwrap();
+            assert_eq!(availability::snap(&q, selected, s.now()), Some(selected));
+            assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_some());
+            assert!(track.area().is_valid(&cx), "capture must survive redraw");
+            for (track, rect) in &tracks {
+                assert_eq!(
+                    form::drawn_rect(&cx, track.area()),
+                    Some(*rect),
+                    "overlap warnings must not move any track"
+                );
+            }
+        }
+        send(
+            &mut cx,
+            s,
+            Event::MouseUp(MouseUpEvent {
+                abs: pos + dvec2(1500.0, 900.0),
+                button,
+                window_id,
+                modifiers: Default::default(),
+                time: 5.0,
+            }),
+        );
+        cx.fingers.mouse_up(button);
+        assert!(track.borrow::<CalendarTimeTrack>().unwrap().drag.is_none());
+        assert!(!cx.fingers.any_areas_captured());
+        assert!(
+            !s.take_dirty().any(),
+            "dragging must stay local to the widget"
+        );
+        assert_eq!(
+            s.store().revision(&["calendar_draft", "calendar_change"]),
+            revision
+        );
+    }
+    timings.sort();
+    eprintln!(
+        "{} editor + scheduling draw-list builds: median {:?}, p99 {:?}, max {:?}",
+        timings.len(),
+        timings[timings.len() / 2],
+        timings[timings.len() * 99 / 100],
+        timings.last().unwrap()
+    );
+    let errors = ERRORS.lock().unwrap();
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
