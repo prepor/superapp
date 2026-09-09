@@ -19,6 +19,7 @@ pub(super) struct Status {
     pub fit: Option<Fit>,
     pub selected: bool,
     pub text_pending: bool,
+    pub text_error: Option<String>,
 }
 
 #[derive(Default)]

@@ -1,7 +1,7 @@
 //! One reader per open file. PDF geometry comes first, then requested pages.
 //! Dropping the receiver discards an obsolete result.
 
-use super::Preview;
+use super::{Preview, selection::{append_copy, Span}};
 use crate::reader::pdf::{Document, Page, TextPage};
 use makepad_widgets::{image_cache::decode_image_from_data, SignalToUI};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -16,6 +16,29 @@ pub enum Ready {
     Pdf(Page),
     PdfInfo(Vec<(u32, u32)>),
     PdfText(usize, TextPage),
+    Copied(Span, Result<String, String>),
+}
+
+pub(super) enum Request { Page(usize), Text(usize), Copy(Option<Span>) }
+
+struct CopyJob { span: Span, next: usize, text: String }
+
+impl CopyJob {
+    fn new(span: Span) -> Self { Self { span, next: span.start.page, text: String::new() } }
+
+    /// Yield between pages so a long copy does not starve visible page requests.
+    fn step(&mut self, pdf: &Document) -> Option<Result<String, String>> {
+        let result = guarded(|| {
+            let page = pdf.text(self.next);
+            if let Some(error) = page.error { return Err(error); }
+            let range = self.span.range(self.next, page.text.len());
+            append_copy(&mut self.text, page.text.get(range).ok_or("Could not read the selected text")?)
+        });
+        if let Err(error) = result { return Some(Err(error)); }
+        if self.next == self.span.end.page { return Some(Ok(std::mem::take(&mut self.text))); }
+        self.next += 1;
+        None
+    }
 }
 
 enum Loaded {
@@ -24,12 +47,11 @@ enum Loaded {
 }
 
 pub struct Worker {
-    requests: Option<Sender<usize>>,
+    requests: Option<Sender<Request>>,
     replies: Option<Receiver<Result<Ready, String>>>,
     inline: Option<Document>,
     ready: Option<Result<Ready, String>>,
-    next_text: usize,
-    pages: usize,
+    copy: Option<CopyJob>,
 }
 
 impl Worker {
@@ -39,14 +61,12 @@ impl Worker {
             replies: None,
             inline: None,
             ready: None,
-            next_text: 0,
-            pages: 0,
+            copy: None,
         };
         if cfg!(headless) {
             match guarded(|| load(source))? {
                 Loaded::Pdf(pdf) => {
                     let sizes = pdf.sizes();
-                    worker.pages = sizes.len();
                     worker.ready = Some(Ok(Ready::PdfInfo(sizes)));
                     worker.inline = Some(pdf);
                 }
@@ -55,7 +75,8 @@ impl Worker {
             return Ok(worker);
         }
         let (ask, requests) = mpsc::channel();
-        let (answer, replies) = mpsc::channel();
+        // A paused UI must not accumulate decoded pages or text in its inbox.
+        let (answer, replies) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("file-viewer".into())
             .spawn(move || {
@@ -67,24 +88,23 @@ impl Worker {
                 match guarded(|| load(source)) {
                     Ok(Loaded::Pdf(pdf)) => {
                         let sizes = pdf.sizes();
-                        let count = sizes.len();
                         if !send(Ok(Ready::PdfInfo(sizes))) {
                             return;
                         }
-                        let mut next_text = 0;
+                        let mut copy: Option<CopyJob> = None;
                         loop {
-                            // Visible bitmaps have priority. Otherwise prepare
-                            // text for the whole document, including pages that
-                            // have never needed a bitmap, so copy is complete.
-                            let request = if next_text < count { requests.try_recv() }
+                            let request = if copy.is_some() { requests.try_recv() }
                                 else { requests.recv().map_err(|_| TryRecvError::Disconnected) };
                             let result = match request {
-                                Ok(page) => guarded(|| pdf.render(page).map(Ready::Pdf)),
+                                Ok(Request::Page(page)) => guarded(|| pdf.render(page).map(Ready::Pdf)),
+                                Ok(Request::Text(page)) => Ok(text_page(&pdf, page)),
+                                Ok(Request::Copy(span)) => { copy = span.map(CopyJob::new); continue; }
                                 Err(TryRecvError::Empty) => {
-                                    let text = guarded(|| Ok(pdf.text(next_text))).unwrap_or_default();
-                                    let result = Ok(Ready::PdfText(next_text, text));
-                                    next_text += 1;
-                                    result
+                                    let job = copy.as_mut().unwrap();
+                                    let Some(result) = job.step(&pdf) else { continue; };
+                                    let span = job.span;
+                                    copy = None;
+                                    Ok(Ready::Copied(span, result))
                                 }
                                 Err(TryRecvError::Disconnected) => break,
                             };
@@ -105,15 +125,19 @@ impl Worker {
         Ok(worker)
     }
 
-    pub fn page(&mut self, page: usize) -> Result<(), String> {
+    pub fn request(&mut self, request: Request) -> Result<(), String> {
         if let Some(pdf) = &self.inline {
-            self.ready = Some(guarded(|| pdf.render(page).map(Ready::Pdf)));
+            match request {
+                Request::Page(page) => self.ready = Some(guarded(|| pdf.render(page).map(Ready::Pdf))),
+                Request::Text(page) => self.ready = Some(Ok(text_page(pdf, page))),
+                Request::Copy(span) => self.copy = span.map(CopyJob::new),
+            }
             return Ok(());
         }
         self.requests
             .as_ref()
             .ok_or("The PDF viewer stopped; reopen the file")?
-            .send(page)
+            .send(request)
             .map_err(|_| "The PDF viewer stopped; reopen the file".into())
     }
 
@@ -121,10 +145,14 @@ impl Worker {
         if let Some(result) = self.ready.take() {
             return Some(result);
         }
-        if let Some(pdf) = self.inline.as_ref().filter(|_| self.next_text < self.pages) {
-            let page = self.next_text;
-            self.next_text += 1;
-            return Some(Ok(Ready::PdfText(page, guarded(|| Ok(pdf.text(page))).unwrap_or_default())));
+        if let (Some(pdf), Some(job)) = (&self.inline, &mut self.copy) {
+            loop {
+                if let Some(result) = job.step(pdf) {
+                    let span = job.span;
+                    self.copy = None;
+                    return Some(Ok(Ready::Copied(span, result)));
+                }
+            }
         }
         match self.replies.as_ref()?.try_recv() {
             Ok(result) => Some(result),
@@ -135,6 +163,10 @@ impl Worker {
             }
         }
     }
+}
+
+fn text_page(pdf: &Document, page: usize) -> Ready {
+    Ready::PdfText(page, guarded(|| Ok(pdf.text(page))).unwrap_or_else(TextPage::failed))
 }
 
 fn guarded<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -211,6 +243,49 @@ fn load(source: Preview) -> Result<Loaded, String> {
 mod tests {
     use super::*;
 
+    fn receive(worker: &mut Worker) -> Result<Ready, String> {
+        worker.poll().unwrap_or_else(|| worker.replies.as_ref().unwrap()
+            .recv_timeout(std::time::Duration::from_secs(20)).expect("worker answered"))
+    }
+
+    #[test]
+    fn text_is_requested_and_copy_includes_unvisited_pages_without_retaining_their_geometry() {
+        use super::super::selection::{Position, Selection};
+        let mut worker = Worker::start(Preview::Pdf(crate::reader::pdf::dense_fixture(200, 50, 80))).unwrap();
+        assert!(matches!(receive(&mut worker).unwrap(), Ready::PdfInfo(sizes) if sizes.len() == 200));
+        if let Some(replies) = &worker.replies {
+            assert!(matches!(replies.recv_timeout(std::time::Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)),
+                "opening a long document must not eagerly enqueue text");
+        } else { assert!(worker.poll().is_none()); }
+        worker.request(Request::Text(0)).unwrap();
+        let Ready::PdfText(0, text) = receive(&mut worker).unwrap() else { panic!("requested text") };
+        assert_eq!(text.glyphs.len(), 4000);
+        let mut selection = Selection::default();
+        selection.insert(0, text);
+        selection.select_all();
+        assert!(selection.copy(200).is_none());
+        let span = selection.copy_request().unwrap();
+        worker.request(Request::Copy(Some(span))).unwrap();
+        worker.request(Request::Text(199)).unwrap();
+        assert!(matches!(receive(&mut worker).unwrap(), Ready::PdfText(199, _)), "visible text takes priority over a long copy");
+        let Ready::Copied(copied, text) = receive(&mut worker).unwrap() else { panic!("complete copy") };
+        assert_eq!(copied, span);
+        let text = text.unwrap();
+        assert!(text.starts_with("p000 line000 ") && text.contains("p199 line049 "));
+        assert_eq!(text.lines().filter(|line| line.starts_with('p')).count(), 10_000);
+        assert_eq!(selection.copied(span, Ok(text)).unwrap().len(), 200 * (50 * 81 - 1) + 199 * 2);
+        assert_eq!(selection.pages.len(), 1, "copy must not fill the geometry cache");
+
+        let span = Span { start: Position { page: 2, byte: 13 }, end: Position { page: 4, byte: 25 } };
+        worker.request(Request::Copy(Some(span))).unwrap();
+        let Ready::Copied(_, text) = receive(&mut worker).unwrap() else { panic!("cross-page range") };
+        let text = text.unwrap();
+        assert!(text.starts_with("aaaa") && text.ends_with("p004 line000 aaaaaaaaaaaa"));
+        assert!(text.contains("p003 line049 ") && !text.contains("p001"));
+        worker.request(Request::Text(200)).unwrap();
+        assert!(matches!(receive(&mut worker).unwrap(), Ready::PdfText(200, text) if text.error.is_some()));
+    }
+
     #[test]
     fn worker_delivers_requested_pages_and_recovers_after_a_bad_page_number() {
         let mut worker = Worker::start(Preview::Pdf(kernel::caps::demo::PDF.to_vec())).unwrap();
@@ -229,7 +304,7 @@ mod tests {
         };
         let Ready::PdfInfo(sizes) = receive(&mut worker).unwrap() else { panic!("geometry before pixels") };
         assert_eq!(sizes, vec![(420, 595), (595, 420)]);
-        worker.page(1).unwrap();
+        worker.request(Request::Page(1)).unwrap();
         assert!(matches!(
             receive(&mut worker).unwrap(),
             Ready::Pdf(Page {
@@ -237,9 +312,9 @@ mod tests {
                 ..
             })
         ));
-        worker.page(2).unwrap();
+        worker.request(Request::Page(2)).unwrap();
         assert!(receive(&mut worker).is_err());
-        worker.page(0).unwrap();
+        worker.request(Request::Page(0)).unwrap();
         assert!(matches!(
             receive(&mut worker).unwrap(),
             Ready::Pdf(Page { number: 0, .. })

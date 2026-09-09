@@ -30,6 +30,9 @@ select it, drag to extend, then use the system copy menu. Pinching still zooms
 and an ordinary swipe still scrolls. Selection follows zoom and rotation and
 survives page bitmap eviction. Image-only scans need a PDF text layer for
 selection; the viewer does not perform OCR.
+Copying text from pages outside the cache runs in the background and completes
+automatically; the position line shows progress. Changing the selection or
+leaving the viewer cancels a pending copy.
 
 PDF link annotations are clickable: web and email links open through the
 system, and links to pages or named destinations jump within the document.
@@ -70,11 +73,16 @@ An unavailable page keeps its place and shows its error without hiding other
 pages. Closing or replacing a source drops its receiver, so an obsolete
 worker cannot populate a different file. Headless builds do the same work
 inline for deterministic UI tests.
-Between visible page renders, the worker extracts Unicode and glyph quadrilaterals
-through Hayro's interpreter for every page. The text layer stays independent of
-the texture cache, so copying across pages includes unvisited pages. If selected
-text is still arriving, the position line says so; copy never returns a partial
-document. The shell's shared keyboard ownership recognizes the PDF selection.
+The worker extracts Unicode, glyph quadrilaterals, and line bounds on demand
+through Hayro's interpreter. Cursor hits use one rectangle per line. Nearby
+text pages have an 8 MiB cache and a 64-page cap; each extraction is limited to
+2 MiB, counting allocated text, glyph, and line storage. Selection endpoints
+remain independent of both caches. A copy retrieves missing pages one at a time
+on the worker, yielding to viewing requests between pages, with a separate
+8 MiB output limit. Exceeding a limit reports an error instead of copying a
+partial document. The reply channel holds one result, so a paused UI cannot
+accumulate decoded pages. The shell's shared keyboard ownership recognizes the
+PDF selection.
 `app/src/reader/pdf/links.rs` resolves link annotations and converts their
 rectangles with the renderer's crop and rotation transform. It accepts URI
 actions for HTTP, HTTPS, and email, and local page destinations; executable

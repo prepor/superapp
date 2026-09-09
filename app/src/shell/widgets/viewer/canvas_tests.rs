@@ -251,6 +251,7 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
     let mut pass = None;
     let mut list: Option<DrawList> = None;
     let mut frames = 0;
+    let mut copying = false;
     let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
         Event::Startup => {
             root = cx.with_vm(|vm| {
@@ -284,14 +285,28 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
             assert_eq!(control.measure(), Measure::Pdf(420, 595));
             assert_eq!(session.ws().wish_of(&id), (5, 6), "the opening measures itself without another input");
             let image = root.widget(&cx, ids!(image_box.image)).as_viewer_image();
+            if frames == 2 { cx.set_key_focus(image.area()); }
             if frames == 1 {
                 assert!(session.take_dirty().layout);
                 assert!(cx.new_draw_event.draw_lists.contains(&root.area().draw_list_id().unwrap()),
                     "metadata and page requests must schedule a draw from inside drawing");
             }
-            if image.borrow().unwrap().surfaces.len() == 2 {
+            if image.borrow().unwrap().surfaces.len() == 2 && !copying {
                 assert!(frames <= 4, "continuous pages must finish without a forced draw loop");
                 assert!(control.verbs().iter().any(|verb| verb.id == "viewer.fit"));
+                assert!(!image.borrow().unwrap().selection.pages.contains_key(&1));
+                root.handle_event(&mut cx, &Event::KeyDown(KeyEvent { key_code: KeyCode::KeyA,
+                    modifiers: KeyModifiers { logo: true, ..Default::default() }, ..Default::default() }),
+                    &mut Scope::with_data_props(&mut session, &props));
+                let response = Rc::new(RefCell::new(None));
+                root.handle_event(&mut cx, &Event::TextCopy(TextClipboardEvent { response: response.clone() }),
+                    &mut Scope::with_data_props(&mut session, &props));
+                assert!(response.borrow().is_none());
+                assert!(image.status().text_pending);
+                copying = true;
+            }
+            if copying && !image.status().text_pending {
+                assert!(image.borrow().unwrap().selection.text(2).unwrap().contains("Back to page 1"));
                 seen.set(true);
             }
             list.end(&mut draw);
@@ -299,8 +314,8 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
         }
         _ => {}
     }))));
-    Cx::headless_event_loop_for_draw_cycles(cx, 5);
-    assert!(finished.get(), "initial loading stalled with no user input");
+    Cx::headless_event_loop_for_draw_cycles(cx, 6);
+    assert!(finished.get(), "initial loading or pending copy stalled with no more user input");
 }
 
 #[test]
@@ -327,8 +342,8 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
             let pdf = pdf::Document::open(kernel::caps::demo::PDF.to_vec()).unwrap();
             let image = root.as_viewer_image();
             image.document(cx, pdf.sizes());
-            image.text_page(0, pdf.text(0));
-            image.text_page(1, pdf.text(1));
+            image.text_page(cx, 0, pdf.text(0));
+            image.text_page(cx, 1, pdf.text(1));
             for page in 0..2 {
                 let page = pdf.render(page).unwrap();
                 let texture = super::super::texture(cx, page.width, page.height, page.pixels);
@@ -341,7 +356,7 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
             list = Some(DrawList::new(cx));
             cx.redraw_all();
         }
-        Event::Draw(event) if frame < 6 => {
+        Event::Draw(event) if frame < 7 => {
             props.hits.clear();
             {
                 let mut draw = CxDraw::new(cx, event);
@@ -400,6 +415,21 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                     send(cx, Event::KeyDown(KeyEvent { key_code: KeyCode::KeyA,
                         modifiers: KeyModifiers { logo: true, ..Default::default() }, ..Default::default() }));
                     assert!(image.borrow().unwrap().selection.text(2).unwrap().contains("Back to page 1"));
+                    // The same native copy command must complete after a text
+                    // page has left the cache, without a second key press.
+                    image.borrow_mut().unwrap().selection.pages.remove(&1);
+                    let response = Rc::new(RefCell::new(None));
+                    send(cx, Event::TextCopy(TextClipboardEvent { response: response.clone() }));
+                    assert!(response.borrow().is_none(), "no partial clipboard while text is missing");
+                    let span = image.copy_request().unwrap();
+                    let mut worker = super::super::worker::Worker::start(super::super::Preview::Pdf(kernel::caps::demo::PDF.to_vec())).unwrap();
+                    assert!(matches!(worker.poll(), Some(Ok(super::super::worker::Ready::PdfInfo(_)))));
+                    worker.request(super::super::worker::Request::Copy(Some(span))).unwrap();
+                    let Some(Ok(super::super::worker::Ready::Copied(span, result))) = worker.poll() else { panic!("copy answered") };
+                    image.copied(cx, span, result);
+                    assert!(image.borrow().unwrap().selection.text(2).unwrap().contains("Back to page 1"),
+                        "the complete copy is available without reloading the page geometry");
+                    assert!(!image.status().text_pending);
                     image.borrow_mut().unwrap().surfaces = surfaces;
                     image.command(cx, Command::Fit);
                 }
@@ -424,6 +454,25 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                         modifiers: KeyModifiers { logo: true, ..Default::default() }, ..Default::default() }));
                     assert!(image.borrow().unwrap().text_selection().is_none(), "images do not take text-selection chords");
                     assert!(!image.borrow().unwrap().has_selection());
+                    let pdf = pdf::Document::open(pdf::dense_fixture(1, 50, 80)).unwrap();
+                    image.document(cx, pdf.sizes());
+                    let text = pdf.text(0);
+                    assert_eq!(text.glyphs.len(), 4000);
+                    image.text_page(cx, 0, text);
+                    let page = pdf.render(0).unwrap();
+                    let texture = super::super::texture(cx, page.width, page.height, page.pixels);
+                    image.page(0, Some(texture), page.links, None);
+                    image.borrow_mut().unwrap().camera.resize(dvec2(600.0, 700.0));
+                    image.command(cx, Command::Fit);
+                }
+                6 => {
+                    assert_eq!(props.hits.len(), 52,
+                        "4,000 rendered characters register 50 line hits plus two page hits");
+                    let p = point(0, 0, 0.5);
+                    assert_eq!(props.hits.at(p).unwrap().cursor, MouseCursor::Text);
+                    send(cx, mouse(p, true));
+                    send(cx, mouse(p, false));
+                    assert!(image.borrow().unwrap().press.is_none());
                     finished.set(true);
                 }
                 _ => unreachable!(),
@@ -434,6 +483,6 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
         Event::KeyFocus(_) => root.handle_event(cx, event, &mut Scope::with_data_props(&mut (), &props)),
         _ => {}
     }))));
-    Cx::headless_event_loop_for_draw_cycles(cx, 7);
+    Cx::headless_event_loop_for_draw_cycles(cx, 8);
     assert!(done.get());
 }

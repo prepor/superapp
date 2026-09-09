@@ -16,7 +16,7 @@ pub(crate) mod canvas;
 pub use measure::Measure;
 use canvas::{ViewerImageRef, ViewerImageWidgetRefExt};
 use crate::reader::pdf::Target;
-use worker::{Ready, Worker};
+use worker::{Ready, Request, Worker};
 
 #[derive(Debug, Clone, Default)]
 pub enum Preview {
@@ -70,6 +70,8 @@ pub struct FileViewer {
     #[rust] measure: Measure,
     #[rust] worker: Option<Worker>,
     #[rust] rendering: Option<usize>,
+    #[rust] reading: bool,
+    #[rust] copying: Option<selection::Span>,
     #[rust] text: bool,
     #[rust] picture: bool,
     #[rust] pdf: bool,
@@ -84,6 +86,8 @@ impl FileViewer {
     fn show(&mut self, cx: &mut Cx, preview: Preview) {
         self.worker = None;
         self.rendering = None;
+        self.reading = false;
+        self.copying = None;
         self.text = false;
         self.picture = false;
         self.pdf = false;
@@ -143,7 +147,11 @@ impl FileViewer {
                 let texture = texture(cx, page.width, page.height, page.pixels);
                 self.image(cx).page(page.number, Some(texture), page.links, None);
             }
-            Ok(Ready::PdfText(page, text)) => self.image(cx).text_page(page, text),
+            Ok(Ready::PdfText(page, text)) => {
+                self.reading = false;
+                self.image(cx).text_page(cx, page, text);
+            }
+            Ok(Ready::Copied(span, result)) => self.image(cx).copied(cx, span, result),
             Err(error) => {
                 if let Some(page) = self.rendering.take() {
                     self.image(cx).page(page, None, Vec::new(), Some(error));
@@ -174,6 +182,19 @@ impl FileViewer {
         changed
     }
 
+    fn copy_request(&mut self, cx: &mut Cx) -> bool {
+        let image = self.image(cx);
+        let request = image.copy_request();
+        if request == self.copying { return false; }
+        self.copying = request;
+        if let Some(worker) = &mut self.worker {
+            if let Err(error) = worker.request(Request::Copy(request)) {
+                if let Some(span) = request { image.copied(cx, span, Err(error)); }
+            }
+        }
+        true
+    }
+
     fn publish(&mut self, cx: &mut Cx, scope: &mut Scope) -> bool {
         let resized = self.control.measured(self.measure.clone());
         let status = self.image(cx).status();
@@ -186,6 +207,7 @@ impl FileViewer {
             else if let Measure::Image(w, h) = self.measure { format!("{w} × {h} · {mode}") }
             else { mode };
         if status.text_pending { line.push_str(" · loading selected text…"); }
+        if let Some(error) = &status.text_error { line.push_str(" · "); line.push_str(error); }
         let changed = self.status != line;
         if changed {
             self.status = line;
@@ -223,6 +245,7 @@ impl Widget for FileViewer {
                 Target::Page(page) => image.go_to(cx, page),
             }
         }
+        self.copy_request(cx);
         if self.publish(cx, scope) { self.view.redraw(cx); }
     }
 
@@ -231,15 +254,26 @@ impl Widget for FileViewer {
         let image = self.image(cx);
         for command in self.control.take() { image.command(cx, command); changed = true; }
         let step = self.view.draw_walk(cx, scope, walk);
-        if self.pdf && self.rendering.is_none() {
-            if let Some(page) = image.request() {
+        if self.pdf {
+            let page = image.request();
+            let text = image.text_request();
+            if self.rendering.is_none() && !self.reading {
                 if let Some(worker) = &mut self.worker {
-                    self.rendering = Some(page);
-                    if let Err(error) = worker.page(page) { self.take(cx, Err(error)); }
-                    changed = true;
+                    if let Some(page) = text {
+                        self.reading = true;
+                        if let Err(error) = worker.request(Request::Text(page)) {
+                            self.take(cx, Ok(Ready::PdfText(page, crate::reader::pdf::TextPage::failed(error))));
+                        }
+                        changed = true;
+                    } else if let Some(page) = page {
+                        self.rendering = Some(page);
+                        if let Err(error) = worker.request(Request::Page(page)) { self.take(cx, Err(error)); }
+                        changed = true;
+                    }
                 }
             }
         }
+        changed |= self.copy_request(cx);
         changed |= self.publish(cx, scope);
         if let Some(props) = scope.props.get::<PanelProps>() {
             for (visible, label, path, cursor) in [

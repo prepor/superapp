@@ -62,7 +62,7 @@ fn bounds(page: &Page<'_>, rect: Rect) -> Option<[f64; 4]> {
 fn string(value: &PdfString<'_>) -> String {
     let bytes = value.as_bytes();
     if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        String::from_utf16_lossy(&bytes.chunks_exact(2).map(|b| u16::from_be_bytes([b[0], b[1]])).collect::<Vec<_>>())
+        String::from_utf16_lossy(&bytes.as_chunks::<2>().0.iter().map(|b| u16::from_be_bytes(*b)).collect::<Vec<_>>())
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
 use crate::{reader::pdf::{self, Link, Target, TextPage}, shell::{draw::DrawFlat, hosted::PanelProps}};
-use super::{control::{Command, Fit, Status}, geometry::Camera, selection::Selection};
+use super::{control::{Command, Fit, Status}, geometry::Camera, selection::{Selection, Span}};
 
 #[cfg(all(test, headless))]
 #[path = "canvas_tests.rs"]
@@ -193,7 +193,8 @@ impl ViewerImage {
     fn status(&self) -> Status {
         Status { ready: self.active, page: self.camera.current(),
             pages: if self.pdf { self.camera.sizes.len() } else { 0 }, scale: self.camera.scale, fit: self.camera.fit,
-            selected: self.has_selection(), text_pending: self.selection.pending(self.camera.pages.len()) }
+            selected: self.has_selection(), text_pending: self.selection.copy_request().is_some(),
+            text_error: self.selection.error(self.camera.current()) }
     }
 
     /// Visible pages first, then nearby pages. The working set has a strict
@@ -253,7 +254,7 @@ impl WidgetNode for ViewerImage {
     fn area(&self) -> Area { self.area }
     fn redraw(&mut self, cx: &mut Cx) { self.area.redraw(cx); }
     fn selection_select_all(&mut self) { if self.pdf { self.selection.select_all(); } }
-    fn selection_get_full_text(&self) -> String { self.selection.full_text() }
+    fn selection_get_full_text(&self) -> String { self.selection.full_text(self.camera.pages.len()) }
 }
 
 impl Widget for ViewerImage {
@@ -321,7 +322,7 @@ impl Widget for ViewerImage {
                 if let Some(point) = self.press.as_ref().filter(|p| p.selecting).map(|p| p.last) { self.drag(viewport, point); }
             }
             Event::TextCopy(e) | Event::TextCut(e) if self.pdf && cx.has_key_focus(self.area) => {
-                if let Some(text) = self.selection.text(self.camera.pages.len()).filter(|s| !s.is_empty()) {
+                if let Some(text) = self.selection.copy(self.camera.pages.len()).filter(|s| !s.is_empty()) {
                     *e.response.borrow_mut() = Some(text);
                 }
             }
@@ -331,10 +332,12 @@ impl Widget for ViewerImage {
             Event::KeyFocus(e) if e.prev == self.area && e.focus != self.area => {
                 // A toolbar press temporarily gives focus to the shell. The
                 // document keeps its selection while fit/zoom changes its view.
+                self.selection.cancel_copy();
                 cx.hide_clipboard_actions();
             }
             Event::WindowLostFocus(_) | Event::Background => {
                 self.press = None; self.bar_drag = None; self.touches.clear();
+                self.selection.cancel_copy();
             }
             _ => return,
         }
@@ -374,19 +377,22 @@ impl Widget for ViewerImage {
                 if let Some(props) = props {
                     if self.pdf { props.hits.add_clipped(format!("PDF page {}", page + 1), rect, clip, MouseCursor::Move, props.slot); }
                     if let Some(text) = self.selection.pages.get(&page).filter(|_| surface.is_some_and(|s| s.texture.is_some())) {
+                        for &[x0, y0, x1, y1] in &text.lines {
+                            let bounds = Rect { pos: rect.pos + dvec2(x0, y0) * rect.size,
+                                size: dvec2(x1 - x0, y1 - y0) * rect.size };
+                            props.hits.add_clipped("PDF text", bounds, clip, MouseCursor::Text, props.slot);
+                        }
                         let range = self.selection.range(page);
-                        for glyph in &text.glyphs {
+                        let glyphs = if range.is_empty() { &[][..] } else { text.glyphs.as_slice() };
+                        for glyph in glyphs.iter().filter(|g| g.range.start < range.end && g.range.end > range.start) {
                             let quad = glyph.quad.map(|p| rect.pos + dvec2(p[0], p[1]) * rect.size);
                             let min = quad.iter().fold(dvec2(f64::INFINITY, f64::INFINITY), |a, b| dvec2(a.x.min(b.x), a.y.min(b.y)));
                             let max = quad.iter().fold(dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, b| dvec2(a.x.max(b.x), a.y.max(b.y)));
                             let bounds = Rect { pos: min, size: max - min };
-                            props.hits.add_clipped("PDF text", bounds, clip, MouseCursor::Text, props.slot);
-                            if glyph.range.start < range.end && glyph.range.end > range.start {
-                                let points = quad.map(|p| (p - min).into_vec2());
-                                self.draw_highlight.a = points[0]; self.draw_highlight.b = points[1];
-                                self.draw_highlight.c = points[2]; self.draw_highlight.d = points[3];
-                                self.draw_highlight.draw_abs(cx, bounds);
-                            }
+                            let points = quad.map(|p| (p - min).into_vec2());
+                            self.draw_highlight.a = points[0]; self.draw_highlight.b = points[1];
+                            self.draw_highlight.c = points[2]; self.draw_highlight.d = points[3];
+                            self.draw_highlight.draw_abs(cx, bounds);
                         }
                     }
                     if let Some(surface) = surface {
@@ -434,8 +440,34 @@ impl ViewerImageRef {
         if let Some(mut image) = self.borrow_mut() { image.surfaces.insert(page, Surface { texture, links, error }); }
     }
 
-    pub fn text_page(&self, page: usize, text: TextPage) {
-        if let Some(mut image) = self.borrow_mut() { image.selection.pages.insert(page, text); }
+    pub fn text_page(&self, cx: &Cx, page: usize, text: TextPage) {
+        if let Some(mut image) = self.borrow_mut() {
+            image.selection.insert(page, text);
+            // A selection dragged into a page before its text arrived catches up
+            // without waiting for another pointer movement.
+            if let Some(point) = image.press.as_ref().filter(|p| p.selecting).map(|p| p.last) {
+                let viewport = image.viewport(cx);
+                if let Some((page, point)) = image.text_point(viewport, point, true) { image.selection.extend(page, point); }
+            }
+        }
+    }
+
+    pub fn text_request(&self) -> Option<usize> {
+        let mut image = self.borrow_mut()?;
+        let wanted: Vec<_> = image.wanted().into_iter()
+            .filter(|page| image.surfaces.get(page).is_some_and(|s| s.texture.is_some())).collect();
+        image.selection.request(&wanted)
+    }
+
+    pub(super) fn copy_request(&self) -> Option<Span> { self.borrow()?.selection.copy_request() }
+
+    pub(super) fn copied(&self, cx: &mut Cx, span: Span, result: Result<String, String>) {
+        if let Some(mut image) = self.borrow_mut() {
+            if let Some(text) = image.selection.copied(span, result).filter(|text| !text.is_empty()) {
+                cx.copy_to_clipboard(text);
+            }
+            image.area.redraw(cx);
+        }
     }
 
     pub fn request(&self) -> Option<usize> {

@@ -7,7 +7,7 @@ use hayro::{RenderCache, RenderSettings};
 mod links;
 mod text;
 pub use links::{Link, Target};
-pub use text::{TextGlyph, TextPage};
+pub use text::{TextGlyph, TextPage, TEXT_PAGE_BYTES};
 
 pub struct Document(Pdf);
 
@@ -92,6 +92,39 @@ impl Document {
     }
 
     pub fn text(&self, number: usize) -> TextPage { text::of(&self.0.pages()[number]) }
+}
+
+/// Dense, multi-page text used by extraction, cache, worker and widget regressions.
+#[cfg(test)]
+pub(crate) fn dense_fixture(pages: usize, lines: usize, columns: usize) -> Vec<u8> {
+    use std::fmt::Write;
+    let kids = (0..pages).map(|p| format!("{} 0 R", 4 + p * 2)).collect::<Vec<_>>().join(" ");
+    let mut objects = vec!["<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {pages} >>"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string()];
+    for page in 0..pages {
+        let step = 720.0 / lines as f64;
+        let mut content = format!("BT /F1 {} Tf {step} TL 40 760 Td\n", (step * 0.65).min(10.0));
+        for line in 0..lines {
+            let text = format!("p{page:03} line{line:03} ");
+            writeln!(content, "({text}{}) Tj T*", "a".repeat(columns.saturating_sub(text.len()))).unwrap();
+        }
+        content.push_str("ET");
+        objects.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>", 5 + page * 2));
+        objects.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+    }
+    let mut bytes = "%PDF-1.4\n".to_string();
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(bytes, "{} 0 obj\n{object}\nendobj", i + 1).unwrap();
+    }
+    let xref = bytes.len();
+    let size = objects.len() + 1;
+    writeln!(bytes, "xref\n0 {size}\n0000000000 65535 f ").unwrap();
+    for offset in offsets { writeln!(bytes, "{offset:010} 00000 n ").unwrap(); }
+    write!(bytes, "trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").unwrap();
+    bytes.into_bytes()
 }
 
 #[cfg(test)]

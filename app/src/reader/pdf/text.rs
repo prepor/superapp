@@ -5,6 +5,9 @@ use hayro::hayro_interpret::{self as pdf, font::Glyph, hayro_cmap::BfString, Tra
 use hayro::hayro_syntax::page::Page;
 use hayro::vello_cpu::kurbo::{Affine, BezPath, Point, Rect, Shape};
 
+/// Bounds extracted output even for a single unusually dense page.
+pub const TEXT_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct TextGlyph {
     pub range: Range<usize>,
@@ -16,6 +19,43 @@ pub struct TextGlyph {
 pub struct TextPage {
     pub text: String,
     pub glyphs: Vec<TextGlyph>,
+    /// Normalized bounding rectangles, one per reading line, for cursor hits.
+    pub lines: Vec<[f64; 4]>,
+    pub error: Option<String>,
+}
+
+impl TextPage {
+    pub fn failed(error: String) -> Self { Self { error: Some(error), ..Self::default() } }
+
+    pub fn bytes(&self) -> usize {
+        self.text.capacity() + self.glyphs.capacity() * std::mem::size_of::<TextGlyph>()
+            + self.lines.capacity() * std::mem::size_of::<[f64; 4]>()
+            + self.error.as_ref().map_or(0, String::capacity)
+    }
+
+    fn push(&mut self, text: &str, separator: &str, quad: [[f64; 2]; 4]) -> bool {
+        let new_line = self.lines.is_empty() || separator == "\n";
+        let capacity = |current: usize, needed: usize| if needed > current { needed.max(current * 2).max(16) } else { current };
+        let text_capacity = capacity(self.text.capacity(), self.text.len() + separator.len() + text.len());
+        let glyph_capacity = capacity(self.glyphs.capacity(), self.glyphs.len() + 1);
+        let line_capacity = capacity(self.lines.capacity(), self.lines.len() + usize::from(new_line));
+        if text_capacity + glyph_capacity * std::mem::size_of::<TextGlyph>()
+            + line_capacity * std::mem::size_of::<[f64; 4]>() > TEXT_PAGE_BYTES { return false; }
+        self.text.reserve_exact(text_capacity - self.text.len());
+        self.glyphs.reserve_exact(glyph_capacity - self.glyphs.len());
+        self.lines.reserve_exact(line_capacity - self.lines.len());
+        self.text.push_str(separator);
+        let begin = self.text.len();
+        self.text.push_str(text);
+        self.glyphs.push(TextGlyph { range: begin..self.text.len(), quad });
+        let bounds = quad.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]);
+        if new_line { self.lines.push(bounds); }
+        else if let Some(line) = self.lines.last_mut() {
+            *line = [line[0].min(bounds[0]), line[1].min(bounds[1]), line[2].max(bounds[2]), line[3].max(bounds[3])];
+        }
+        true
+    }
 }
 
 pub(super) fn of(page: &Page<'_>) -> TextPage {
@@ -38,6 +78,7 @@ struct TextDevice {
 impl<'a> pdf::Device<'a> for TextDevice {
     fn draw_glyph(&mut self, glyph: &Glyph<'a>, transform: Affine, glyph_transform: Affine,
         _: &pdf::Paint<'a>, _: &pdf::GlyphDrawMode) {
+        if self.page.error.is_some() { return; }
         let text = match glyph.as_unicode() {
             Some(BfString::Char(c)) => c.to_string(),
             Some(BfString::String(s)) => s,
@@ -57,18 +98,21 @@ impl<'a> pdf::Device<'a> for TextDevice {
         let quad = [(0.0, top), (width, top), (width, bottom), (0.0, bottom)]
             .map(|p| { let p = affine * Point::from(p); [p.x / self.size.0, p.y / self.size.1] });
         if (0..2).any(|axis| quad.iter().all(|p| p[axis] < 0.0) || quad.iter().all(|p| p[axis] > 1.0)) { return; }
+        let mut separator = "";
         if let Some((end, previous, value)) = &self.previous {
             // Fill-and-stroke paints the same glyph twice.
             if *previous == affine && *value == text { return; }
             let delta = affine.inverse() * *end;
             if delta.y.abs() > 650.0 || delta.x > width + 500.0 {
-                if !self.page.text.ends_with('\n') { self.page.text.push('\n'); }
+                separator = "\n";
             } else if delta.x < -150.0 && !self.page.text.ends_with(char::is_whitespace)
-                && !text.starts_with(char::is_whitespace) { self.page.text.push(' '); }
+                && !text.starts_with(char::is_whitespace) { separator = " "; }
         }
-        let begin = self.page.text.len();
-        self.page.text.push_str(&text);
-        self.page.glyphs.push(TextGlyph { range: begin..self.page.text.len(), quad });
+        if !self.page.push(&text, separator, quad) {
+            self.page = TextPage::failed("This page has too much text to select; open it with the system viewer".into());
+            self.previous = None;
+            return;
+        }
         self.previous = Some((affine * Point::new(width, 0.0), affine, text));
     }
 
@@ -93,11 +137,33 @@ mod tests {
         let first = of(&pdf.pages()[0]);
         assert_eq!(first.text, "A shared PDF viewer\nFiles, mail attachments, and Telegram.\nPage 1 - portrait\nGo to page 2\nhttps://example.com");
         assert_eq!(first.glyphs.len(), first.text.chars().filter(|c| *c != '\n').count());
+        assert_eq!(first.lines.len(), 5);
         let second = of(&pdf.pages()[1]);
         assert!(second.text.contains("Back to page 1"));
+        assert_eq!(second.lines.len(), 3);
         let g = &second.glyphs[0];
         assert!((g.quad[1][0] - g.quad[0][0]).abs() < 1e-6);
         assert!(g.quad[1][1] > g.quad[0][1], "rotated text reads down the rendered page");
+    }
+
+    #[test]
+    fn dense_pages_have_line_bounds_and_oversized_extractions_report_an_error() {
+        let pdf = super::super::Document::open(super::super::dense_fixture(1, 50, 80)).unwrap();
+        let page = pdf.text(0);
+        assert!(page.error.is_none());
+        assert_eq!(page.glyphs.len(), 4000);
+        assert_eq!(page.lines.len(), 50);
+        assert!(page.bytes() <= TEXT_PAGE_BYTES);
+        for (line, glyphs) in page.lines.iter().zip(page.glyphs.chunks(80)) {
+            for glyph in glyphs {
+                assert!(glyph.quad.iter().all(|p| p[0] >= line[0] && p[0] <= line[2] && p[1] >= line[1] && p[1] <= line[3]));
+            }
+        }
+        let pdf = super::super::Document::open(super::super::dense_fixture(1, 500, 80)).unwrap();
+        let page = pdf.text(0);
+        assert!(page.error.is_some());
+        assert!(page.text.is_empty() && page.glyphs.is_empty(), "never expose a silently truncated page");
+        assert!(page.bytes() <= TEXT_PAGE_BYTES);
     }
 
     #[test]
