@@ -5,8 +5,9 @@
 //! word, its size, whether a preview is worth attempting — is the kernel's
 //! (`caps::preview`), so a part and a file on a disk cannot drift apart.
 //!
-//! Its one verb is `open`. A part has no path, so it is written to the app's
-//! scratch directory first and *that* is handed to the OS — one extra step,
+//! Its source verb is `open`; viewing controls come from the shared viewer.
+//! A part has no path, so it is written to the app's scratch directory first
+//! and *that* is handed to the OS — one extra step,
 //! and then it is a file like any other, browsable with the panel that
 //! browses files. There is no copy, no move and no delete: a part is not on a
 //! disk, and the letter is not this panel's to edit.
@@ -20,7 +21,7 @@ use kernel::layout::SlotId;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
-use crate::shell::widgets::viewer::Measure;
+use crate::shell::widgets::viewer::{Controller, Measure};
 use kernel::time::fmt_date;
 
 use super::super::model::{self, MailId};
@@ -40,7 +41,7 @@ pub struct Card {
     with: String,
     /// The line under the header: what a verb refused, until the next one.
     status: Option<String>,
-    measure: Measure,
+    viewer: Controller,
     pending: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
 }
 
@@ -122,11 +123,7 @@ impl Card {
         self.status.as_deref()
     }
 
-    pub fn measured(&mut self, measure: Measure) -> bool {
-        if self.measure == measure { return false; }
-        self.measure = measure;
-        true
-    }
+    pub fn viewer(&self) -> Controller { self.viewer.clone() }
 
     /// Reads the row again — the description is a row, so it is there at
     /// once; the bytes are the widget's to ask for off the frame.
@@ -252,22 +249,28 @@ impl Panel for Card {
     }
 
     /// The shared viewer reports the loaded content's measurement once,
-    /// including a PDF page's dimensions whenever the page changes.
+    /// with a stable reading height throughout a continuous PDF.
     fn wish(&self, cols: usize) -> (u32, u32) {
-        self.measure.wish(cols, 7)
+        let measure = self.viewer.measure();
+        if measure == Measure::Empty && self.kind() == FileKind::Pdf {
+            Measure::Pdf(595, 842).wish(cols, 7)
+        } else { measure.wish(cols, 7) }
     }
 
     fn placed(&mut self, slot: SlotId) {
         self.slot = slot;
     }
 
-    /// One verb. A part is not on a disk: there is nothing to copy, nothing
-    /// to move, and the letter is not this panel's to edit.
+    /// Viewer controls and open. A part is not on a disk: nothing to copy,
+    /// nothing to move, and the letter is not this panel's to edit.
     fn verbs(&self) -> Vec<Verb> {
-        vec![Verb::run("mail.open", "open", Some('o'))]
+        let mut verbs = vec![Verb::run("mail.open", "open", Some('o'))];
+        verbs.extend(self.viewer.verbs());
+        verbs
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.viewer.run(verb) { s.redraw(); return; }
         if verb == "mail.open" {
             self.open(s);
         }
@@ -297,7 +300,7 @@ impl PanelKind for CardKind {
             row: None,
             with: String::new(),
             status: None,
-            measure: Measure::Empty,
+            viewer: Controller::default(),
             pending: None,
         };
         card.reread();

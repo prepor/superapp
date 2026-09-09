@@ -10,10 +10,11 @@ click "invoice 2026-08"
 wait 700
 click "invoice-2026-08.pdf"
 wait 700
+shot pdf-initial
 click "application/pdf"
 click "page 1 of 2"
 click "pdf page"
-mouse "https://example.com/"
+visible "https://example.com/"
 click "zoom in"
 wait 300
 click "zoom in"
@@ -21,6 +22,8 @@ wait 300
 shot pdf-zoom
 click "fit page"
 wait 300
+visible "page 1 of 2 · fit page"
+shot pdf-fit
 click "go to page 2"
 wait 700
 click "page 2 of 2"
@@ -29,4 +32,20 @@ shot pdf-attachment
 click "go to page 1"
 wait 700
 click "page 1 of 2"
+click "fit width"
+wait 300
+visible "page 1 of 2 · fit width"
+swipe "pdf page" 0 -700
+wait 300
+click "page 2 of 2"
+click "zoom out"
+wait 300
+click "zoom out"
+wait 300
+visible "PDF page 1"
+visible "PDF page 2"
+shot pdf-continuous
+key cmd+f
+wait 300
+visible "page 1 of 2 · fit page"
 quit

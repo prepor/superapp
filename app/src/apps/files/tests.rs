@@ -2345,13 +2345,13 @@ fn a_card_previews_text_images_and_pdfs() {
         assert!(matches!(c.preview(), Preview::Image(b) if b.starts_with(b"\x89PNG\r\n\x1a\n")));
     });
 
-    // PDF bytes go to the renderer; its measurement arrives after rendering.
+    // PDFs reserve reading space while metadata and pixels load.
     let c = card(&mut s, "~/Downloads/report-q3.pdf");
     with_card(&s, c, |c| {
         assert!(matches!(c.preview(), Preview::Pdf(bytes) if bytes.starts_with(b"%PDF-")));
         assert_eq!(c.kind_line(), "pdf · 1.2 MB");
     });
-    assert_eq!(inst(&s, c).borrow().wish(60), (4, 3));
+    assert_eq!(inst(&s, c).borrow().wish(60), (5, 6));
 }
 
 /// `open` hands the path to the OS and changes nothing of ours, so no

@@ -18,7 +18,7 @@ use super::super::ops;
 use super::super::run;
 use super::super::{Op, Seen, FILES};
 use super::dir;
-use crate::shell::widgets::viewer::{Measure, Preview as ViewPreview};
+use crate::shell::widgets::viewer::{Controller, Measure, Preview as ViewPreview};
 
 /// One file, shown.
 ///
@@ -38,7 +38,7 @@ pub struct Card {
     entry: Option<Entry>,
     /// The inline reading for demo worlds. A native reader uses `viewer_disk`.
     preview: Preview,
-    measure: Measure,
+    viewer: Controller,
     viewer_disk: Option<kernel::caps::DiskFactory>,
     /// The `rename` field, while it is open: the new name as typed.
     renaming: Option<String>,
@@ -146,11 +146,7 @@ impl Card {
         self.preview.clone().into()
     }
 
-    pub fn measured(&mut self, measure: Measure) -> bool {
-        if self.measure == measure { return false; }
-        self.measure = measure;
-        true
-    }
+    pub fn viewer(&self) -> Controller { self.viewer.clone() }
 
     /// The reading, where the preview is a text file's.
     #[cfg(test)]
@@ -251,7 +247,7 @@ impl Card {
             }),
             None => Preview::None,
         };
-        self.measure = Measure::of(&self.preview);
+        self.viewer.measured(Measure::of(&self.preview));
     }
 
     /// Called on every draw and every event, as a list's is: the card asks
@@ -291,7 +287,10 @@ impl Panel for Card {
     /// whole — up to what a grid is likely to hold. The layout clamps it to
     /// the grid there actually is.
     fn wish(&self, cols: usize) -> (u32, u32) {
-        self.measure.wish(cols, 7)
+        let measure = self.viewer.measure();
+        if measure == Measure::Empty && self.kind() == FileKind::Pdf {
+            Measure::Pdf(595, 842).wish(cols, 7)
+        } else { measure.wish(cols, 7) }
     }
 
     fn placed(&mut self, slot: SlotId) {
@@ -329,10 +328,12 @@ impl Panel for Card {
             Verb::run("files.delete", "delete", Some('d')),
             Verb::run("files.copy_path", "copy path", Some('c')),
         ]);
+        v.extend(self.viewer.verbs());
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.viewer.run(verb) { s.redraw(); return; }
         match verb {
             "files.open" => self.open(s),
             "files.copy" => dir::hold(s, Op::Copy, vec![self.path.clone()]),
@@ -452,7 +453,7 @@ impl PanelKind for CardKind {
             world,
             entry: None,
             preview: Preview::None,
-            measure: Measure::Empty,
+            viewer: Controller::default(),
             viewer_disk: cx.session().world().with_cap::<super::super::ViewerDisk, _>(|r| r.0.clone()).ok(),
             renaming: None,
             status: None,

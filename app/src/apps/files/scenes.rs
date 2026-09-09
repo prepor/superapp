@@ -100,7 +100,7 @@ fn file_card() -> Scene<Setup> {
         .about("a PNG or a JPEG, decoded from its bytes and drawn at the text's width")
         .node("PDF pages", panel_fake(|_| Card::id("~/Downloads/report-q3.pdf"), ""))
         .sized((620.0, 760.0))
-        .about("PDF pages, with a page count and previous/next controls")
+        .about("Continuous PDF pages, with fit and zoom in the verb bar")
         .node("gone", panel_fake(|_| Card::id("~/nothing.txt"), ""))
         .sized((520.0, 260.0))
         .about("a file that is not there says so rather than reading as an empty one")

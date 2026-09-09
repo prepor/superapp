@@ -11,12 +11,17 @@ pub struct Document(Pdf);
 
 pub struct Page {
     pub number: usize,
-    pub count: usize,
-    pub size: (u32, u32),
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
     pub links: Vec<Link>,
+}
+
+/// A page is at most 32 MiB, independent of a document's physical size.
+pub(crate) fn bitmap_size(w: f64, h: f64) -> (f64, u16, u16) {
+    let scale = (4096.0 / w.max(h)).min(4.0).min((8_000_000.0 / (w * h)).sqrt());
+    (scale, (w * scale).ceil().clamp(1.0, 4096.0) as u16,
+        (h * scale).ceil().clamp(1.0, 4096.0) as u16)
 }
 
 impl Document {
@@ -36,6 +41,17 @@ impl Document {
         Ok(Self(pdf))
     }
 
+    /// Geometry arrives before any rasterization, so layout never waits for
+    /// a complex first page and every page has a place in the document.
+    pub fn sizes(&self) -> Vec<(u32, u32)> {
+        self.0.pages().iter().map(|page| {
+            let (w, h) = page.render_dimensions();
+            if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+                (w.ceil() as u32, h.ceil() as u32)
+            } else { (612, 792) }
+        }).collect()
+    }
+
     pub fn render(&self, number: usize) -> Result<Page, String> {
         let page = self
             .0
@@ -46,18 +62,14 @@ impl Document {
         if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
             return Err("This PDF page has invalid dimensions".into());
         }
-        // Render enough detail for zooming without re-parsing or rasterizing
-        // during a gesture. Retain only one bitmap, at most 64 MiB.
-        let scale = (4096.0 / w.max(h)).min(4.0);
-        let width = (w * scale).ceil().clamp(1.0, 4096.0) as u16;
-        let height = (h * scale).ceil().clamp(1.0, 4096.0) as u16;
+        let (scale, width, height) = bitmap_size(w as f64, h as f64);
         let pixmap = hayro::render(
             page,
             &RenderCache::new(),
             &InterpreterSettings::default(),
             &RenderSettings {
-                x_scale: scale,
-                y_scale: scale,
+                x_scale: scale as f32,
+                y_scale: scale as f32,
                 width: Some(width),
                 height: Some(height),
                 bg_color: hayro::vello_cpu::color::palette::css::WHITE,
@@ -70,8 +82,6 @@ impl Document {
             .collect();
         Ok(Page {
             number,
-            count: self.0.pages().len(),
-            size: (w.ceil() as u32, h.ceil() as u32),
             width: width as usize,
             height: height as usize,
             pixels,
@@ -88,7 +98,8 @@ mod tests {
     fn renders_actual_page_contents_and_bounds_the_bitmap() {
         let doc = Document::open(crate::reader::document::test_pdf("Hello PDF")).unwrap();
         let page = doc.render(0).unwrap();
-        assert_eq!((page.number, page.count, page.size), (0, 1, (300, 200)));
+        assert_eq!(page.number, 0);
+        assert_eq!(doc.sizes(), vec![(300, 200)]);
         assert_eq!(page.pixels.len(), page.width * page.height);
         assert!(page.pixels.contains(&0xffffffff), "white paper");
         assert!(
@@ -104,11 +115,8 @@ mod tests {
         let doc = Document::open(kernel::caps::demo::PDF.to_vec()).unwrap();
         let first = doc.render(0).unwrap();
         let second = doc.render(1).unwrap();
-        assert_eq!((first.count, first.size), (2, (420, 595)));
-        assert_eq!(
-            (second.count, second.number, second.size),
-            (2, 1, (595, 420))
-        );
+        assert_eq!(doc.sizes(), vec![(420, 595), (595, 420)]);
+        assert_eq!(second.number, 1);
         assert_ne!(first.pixels, second.pixels);
         assert!(doc.render(2).is_err());
     }

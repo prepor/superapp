@@ -8,7 +8,7 @@
 //! they land the card is its description with the preview still coming, which
 //! is not the same as saying there is none.
 //!
-//! The bar is the instance's, and it is one verb: `open`.
+//! The instance exposes the shared viewing verbs beside its own `open`.
 
 use kernel::caps::{fmt_size, preview_limit, FileKind};
 use kernel::panel::PanelId;
@@ -68,6 +68,9 @@ impl Widget for AttachmentPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(control) = props.panel.borrow_mut().as_any().downcast_mut::<Card>().map(|card| card.viewer()) {
+            card::bind(cx, &self.view, control);
+        }
         let opening = {
             let mut panel = props.panel.borrow_mut();
             if let Some(card) = panel.as_any().downcast_mut::<Card>() {
@@ -97,7 +100,7 @@ impl Widget for AttachmentPanel {
                         Some(PartBytes::Here(bytes)) => Preview::Bytes {
                             bytes, name: r.name, kind: r.kind, size: r.size,
                         },
-                        Some(PartBytes::Coming) => { waiting = true; Preview::Loading }
+                        Some(PartBytes::Coming) => { waiting = true; Preview::Loading("loading attachment…".into()) }
                         _ => Preview::Error("Could not load this attachment; reopen it to try again".into()),
                     }
                 }
@@ -117,12 +120,7 @@ impl Widget for AttachmentPanel {
         lbl.set_visible(cx, status.is_some());
 
         let step = self.view.draw_walk(cx, scope, walk);
-        let measure = card::measure(cx, &self.view);
-        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Card>()
-            .is_some_and(|card| card.measured(measure));
-        if changed {
-            if let Some(session) = scope.data.get_mut::<kernel::session::Session>() { session.relayout(); }
-        }
+
         if opening {
             self.view.redraw(cx);
         }

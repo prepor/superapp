@@ -110,6 +110,9 @@ impl Widget for CardPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(control) = props.panel.borrow_mut().as_any().downcast_mut::<Card>().map(|card| card.viewer()) {
+            card::bind(cx, &self.view, control);
+        }
         observe(scope);
         // The line under the header and the run it is about, both read
         // here and before anything asks for either: as a listing's.
@@ -148,12 +151,6 @@ impl Widget for CardPanel {
             .set_visible(cx, !self.rename_field.up());
 
         let step = self.view.draw_walk(cx, scope, walk);
-        let measure = card::measure(cx, &self.view);
-        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Card>()
-            .is_some_and(|card| card.measured(measure));
-        if changed {
-            if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
-        }
 
         // The field, addressable by name — that is all a script needs to put
         // a caret in one. Only while its row is up: a hidden widget keeps
@@ -270,9 +267,7 @@ fn read(props: &PanelProps, preview: bool) -> Option<(CardData, Chrome)> {
             size,
             modified: c.when(),
             detail: c.path().to_string(),
-            // The instance's reading, in the card's own words. The two
-            // enums are the same three cases on either side of the seam:
-            // the app decides what is worth reading, the card decodes.
+            // The app chooses the source; the shared viewer reads it.
             preview: if preview { c.viewer_preview() } else { Preview::None },
         },
         Chrome {

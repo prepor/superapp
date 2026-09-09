@@ -66,8 +66,8 @@ reads *not there any more*.
 The shared [file viewer](./viewers.md) shows text, PNG/JPEG images, and PDF
 pages inside the card. File reads and decoding run on a worker; the panel's
 width and height follow the loaded content. A PNG saved as `.jpg` still draws
-because decoding follows its bytes. PDFs have previous/next page controls and
-a page count, including documents with pages of different sizes or rotation.
+because decoding follows its bytes. PDFs scroll continuously, including pages of different sizes or rotation.
+Fit, zoom, and page navigation live in the panel's verb bar.
 
 `open` (`cmd+o`) hands the path to the operating system. Superapp does not
 execute the file.

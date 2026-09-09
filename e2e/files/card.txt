@@ -2,7 +2,7 @@
 # env:
 #
 # What a card shows under the rule: the first 64 KiB of a text file, a
-# picture decoded from its own bytes, or neither — and the rows each of them
+# picture decoded from its own bytes, or continuous PDF pages — and the rows each
 # asks for, which is why the file itself determines the panel size.
 #
 # Run with `--demo-disk`, so the tree is the fixture rather than whatever
@@ -64,6 +64,14 @@ wait 400
 click "picture"
 wait 500
 shot c2-picture
+click "zoom in"
+wait 300
+drag "picture" -80 -40
+wait 300
+click "fit image"
+wait 300
+visible "32 × 32 · fit image"
+shot c2-picture-fit
 
 # -- the name is not the evidence ---------------------------------------------------
 
@@ -86,8 +94,8 @@ shot c3-sniffed
 
 # -- PDF pages ----------------------------------------------------------------------
 
-# A real PDF renders in the card. Paging preserves the source; the rotated
-# second page asks for a wider panel, and previous returns to the portrait.
+# A PDF keeps one continuous surface. Page verbs and links move within it;
+# fit resets zoom and panning, while the panel keeps its reading dimensions.
 click "go to"
 wait 500
 type "~/Downloads/"
@@ -115,6 +123,7 @@ drag "pdf page" -80 -40
 wait 300
 click "fit page"
 wait 300
+visible "page 1 of 2 · fit page"
 click "go to page 2"
 wait 600
 click "go to page 1"

@@ -1,5 +1,5 @@
-//! One reader per open file. A PDF is parsed once; only its current page is
-//! rasterized and retained. Dropping the receiver discards an obsolete result.
+//! One reader per open file. PDF geometry comes first, then requested pages.
+//! Dropping the receiver discards an obsolete result.
 
 use super::Preview;
 use crate::reader::pdf::{Document, Page};
@@ -14,6 +14,7 @@ pub enum Ready {
         pixels: Vec<u32>,
     },
     Pdf(Page),
+    PdfInfo(Vec<(u32, u32)>),
 }
 
 enum Loaded {
@@ -39,7 +40,7 @@ impl Worker {
         if cfg!(headless) {
             match guarded(|| load(source))? {
                 Loaded::Pdf(pdf) => {
-                    worker.ready = Some(guarded(|| pdf.render(0).map(Ready::Pdf)));
+                    worker.ready = Some(Ok(Ready::PdfInfo(pdf.sizes())));
                     worker.inline = Some(pdf);
                 }
                 Loaded::Ready(ready) => worker.ready = Some(Ok(ready)),
@@ -58,7 +59,7 @@ impl Worker {
                 };
                 match guarded(|| load(source)) {
                     Ok(Loaded::Pdf(pdf)) => {
-                        if !send(guarded(|| pdf.render(0).map(Ready::Pdf))) {
+                        if !send(Ok(Ready::PdfInfo(pdf.sizes()))) {
                             return;
                         }
                         while let Ok(page) = requests.recv() {
@@ -100,9 +101,10 @@ impl Worker {
         match self.replies.as_ref()?.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(
-                "The file viewer stopped; reopen the file to try again".into(),
-            )),
+            Err(TryRecvError::Disconnected) => {
+                self.replies = None;
+                Some(Err("The file viewer stopped; reopen the file to try again".into()))
+            }
         }
     }
 }
@@ -194,20 +196,13 @@ mod tests {
                     .expect("worker answered")
             })
         };
-        assert!(matches!(
-            receive(&mut worker).unwrap(),
-            Ready::Pdf(Page {
-                number: 0,
-                count: 2,
-                ..
-            })
-        ));
+        let Ready::PdfInfo(sizes) = receive(&mut worker).unwrap() else { panic!("geometry before pixels") };
+        assert_eq!(sizes, vec![(420, 595), (595, 420)]);
         worker.page(1).unwrap();
         assert!(matches!(
             receive(&mut worker).unwrap(),
             Ready::Pdf(Page {
                 number: 1,
-                size: (595, 420),
                 ..
             })
         ));
@@ -234,7 +229,7 @@ mod tests {
         let Loaded::Pdf(pdf) = load(source).unwrap() else {
             panic!("PDF from disk")
         };
-        assert_eq!(pdf.render(1).unwrap().size, (595, 420));
+        assert_eq!(pdf.sizes()[1], (595, 420));
         let bytes = kernel::caps::demo::bytes_of("~/Downloads/2026/photo-lisbon.jpg").unwrap();
         assert!(matches!(
             load(Preview::Image(bytes)).unwrap(),

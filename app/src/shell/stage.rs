@@ -823,6 +823,9 @@ impl Widget for Stage {
                 Some(slot) => self.draw_solo(cx, sh, vp, slot),
                 None => self.draw_scene(cx, sh, vp),
             }
+            // A hosted reader may learn its dimensions during this draw.
+            // Apply that layout and schedule its animation before going idle.
+            self.settle(cx, sh);
             if let Some(t0) = t0 {
                 let since = self
                     .last_draw

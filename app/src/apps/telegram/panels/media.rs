@@ -27,7 +27,7 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 
 use crate::shell::widgets::media::PlayerState;
-use crate::shell::widgets::viewer::{Measure, Preview};
+use crate::shell::widgets::viewer::{Controller, Measure, Preview};
 use kernel::caps::{Blobs, FileKind};
 use super::super::{operations::Status, requests, runtime};
 
@@ -44,7 +44,7 @@ pub struct Viewer {
     world: Rc<World>,
     slot: SlotId,
     playback: Playback,
-    measure: Measure,
+    viewer: Controller,
     file_request: Option<String>,
     file_ready: Option<(String, PathBuf)>,
 }
@@ -132,22 +132,18 @@ impl Viewer {
             }
             // A retry from the shared feedback strip owns the latest status.
             let latest = rt.operations.list().into_iter().rev().find(|o| o.context() == Some(&context));
-            let note = match latest.map(|o| o.status) {
-                Some(Status::Failed { error, .. }) => error,
-                Some(Status::Done) => "Downloaded file is no longer cached; reopen it to try again".into(),
-                _ => rt.connection_note().or_else(|| rt.download(reference).map(|d| d.note()))
-                    .unwrap_or_else(|| "downloading preview…".into()),
+            let (note, failed) = match latest.map(|o| o.status) {
+                Some(Status::Failed { error, .. }) => (error, true),
+                Some(Status::Done) => ("Downloaded file is no longer cached; reopen it to try again".into(), true),
+                _ => (rt.connection_note().or_else(|| rt.download(reference).map(|d| d.note()))
+                    .unwrap_or_else(|| "downloading preview…".into()), false),
             };
-            return (format!("{key}:{note}"), Preview::Error(note));
+            return (format!("{key}:{note}"), if failed { Preview::Error(note) } else { Preview::Loading(note) });
         }
         (key, Preview::Error("This attachment is not available on this device".into()))
     }
 
-    pub fn measured(&mut self, measure: Measure) -> bool {
-        if self.measure == measure { return false; }
-        self.measure = measure;
-        true
-    }
+    pub fn viewer(&self) -> Controller { self.viewer.clone() }
 
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
         self.playback.player_state(m, now)
@@ -229,7 +225,11 @@ impl Panel for Viewer {
 
     /// Loaded content supplies its own size; media dimensions seed the wish.
     fn wish(&self, cols: usize) -> (u32, u32) {
-        if self.measure != Measure::Empty { return self.measure.wish(cols, 3); }
+        let measure = self.viewer.measure();
+        if measure != Measure::Empty { return measure.wish(cols, 3); }
+        if self.msg().is_some_and(|m| FileKind::of_name(&downloads::name(&m)) == FileKind::Pdf) {
+            return Measure::Pdf(595, 842).wish(cols, 3);
+        }
         let size = self.msg().and_then(|m| m.media).and_then(|md| Some((md.w?, md.h?)));
         size.filter(|(w, h)| *w > 0 && *h > 0)
             .map_or(Measure::Empty, |(w, h)| Measure::Image(w as u32, h as u32)).wish(cols, 3)
@@ -278,10 +278,12 @@ impl Panel for Viewer {
         }
         v.push(Verb::run("telegram.open", "open", Some('o')));
         v.extend(m.as_ref().and_then(downloads::verb));
+        v.extend(self.viewer.verbs());
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.viewer.run(verb) { s.redraw(); return; }
         let now = s.now();
         match verb {
             "telegram.download" => {
@@ -352,7 +354,7 @@ impl PanelKind for ViewerKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
-            measure: Measure::Empty,
+            viewer: Controller::default(),
             file_request: None,
             file_ready: None,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),

@@ -23,7 +23,7 @@ fn file_viewer_downloads_on_demand_and_uses_the_cached_file_offline() {
     let mut panel = instance.borrow_mut();
     let viewer = panel.as_any().downcast_mut::<Viewer>().unwrap();
     let m = viewer.msg().unwrap();
-    assert!(matches!(viewer.file_preview(&m).1, Preview::Error(_)));
+    assert!(matches!(viewer.file_preview(&m).1, Preview::Loading(_)));
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@type"], "getMessage");
     assert_eq!(request["@extra"]["context"], format!("cache:{ANNA}:4242"));

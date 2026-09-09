@@ -32,6 +32,6 @@ pub fn fill(cx: &mut Cx, card: &View, d: &CardData) {
     card.widget(cx, ids!(viewer)).as_file_viewer().show(cx, d.preview.clone());
 }
 
-pub fn measure(cx: &mut Cx, card: &View) -> super::viewer::Measure {
-    card.widget(cx, ids!(viewer)).as_file_viewer().measure()
+pub fn bind(cx: &mut Cx, card: &View, control: super::viewer::Controller) {
+    card.widget(cx, ids!(viewer)).as_file_viewer().bind(control);
 }

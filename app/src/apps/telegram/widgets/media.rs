@@ -160,7 +160,7 @@ impl Widget for ViewerPanel {
             self.view.widget(cx, ids!(file_view)).as_file_viewer().show(cx,
                 if gone { Preview::Error("This message is no longer available".into()) } else { Preview::None });
             let changed = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
-                .is_some_and(|viewer| viewer.measured(Measure::Empty));
+                .is_some_and(|viewer| viewer.viewer().measured(Measure::Empty));
             if changed {
                 if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
             }
@@ -338,6 +338,9 @@ impl ViewerPanel {
         let input = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
             .map(|viewer| viewer.file_preview(message));
         let viewer = self.view.widget(cx, ids!(file_view)).as_file_viewer();
+        if let Some(control) = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>().map(|panel| panel.viewer()) {
+            viewer.bind(control);
+        }
         if let Some((key, preview)) = input {
             if self.file_shown.as_ref() != Some(&key) {
                 viewer.show(cx, preview);
@@ -351,13 +354,6 @@ impl ViewerPanel {
         caption.set_text(cx, &model::one_line(&message.text));
         caption.set_visible(cx, !message.text.trim().is_empty());
         if let Some(md) = &message.media { viewer.image_label(cx, md.line(super::now(scope))); }
-        let step = self.view.draw_walk(cx, scope, walk);
-        let measure = viewer.measure();
-        let changed = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
-            .is_some_and(|panel| panel.measured(measure));
-        if changed {
-            if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
-        }
-        step
+        self.view.draw_walk(cx, scope, walk)
     }
 }

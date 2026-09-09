@@ -35,6 +35,9 @@ impl Measure {
             Self::Pdf(..) => 5,
             _ => 4,
         };
+        // A continuous document asks for reading room once, independent of
+        // which page is visible. Scrolling never resizes the panel.
+        if matches!(self, Self::Pdf(..)) { return (width, 6); }
         let cols = cols.max(1).saturating_mul(width as usize) / 4;
         let lines = match self {
             Self::Text(lengths) => lengths
